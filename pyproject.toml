@@ -1,0 +1,19 @@
+[project]
+name = "promptpilot"
+version = "0.1.0"
+description = "AI Prompt Scheduler — queue, schedule, and retry prompts for Claude Code CLI"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.34",
+    "click>=8.1",
+    "pydantic>=2.0",
+]
+
+[project.scripts]
+pp = "promptpilot.cli:cli"
+promptpilot = "promptpilot.cli:cli"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"

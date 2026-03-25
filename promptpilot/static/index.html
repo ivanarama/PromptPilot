@@ -1,0 +1,458 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PromptPilot</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --surface: #1a1d27;
+    --surface2: #232733;
+    --border: #2e3348;
+    --text: #e1e4ed;
+    --text2: #8b8fa3;
+    --accent: #6c7ee1;
+    --accent2: #8b9cf7;
+    --green: #4ade80;
+    --red: #f87171;
+    --yellow: #fbbf24;
+    --cyan: #22d3ee;
+    --radius: 8px;
+    --font: 'Inter', -apple-system, system-ui, sans-serif;
+    --mono: 'JetBrains Mono', 'Fira Code', monospace;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: var(--font);
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.5;
+    min-height: 100vh;
+  }
+
+  .container { max-width: 960px; margin: 0 auto; padding: 24px 20px; }
+
+  /* Header */
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 32px;
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+  .logo {
+    font-size: 22px;
+    font-weight: 700;
+    letter-spacing: -0.5px;
+  }
+  .logo span { color: var(--accent2); }
+
+  .badges { display: flex; gap: 8px; flex-wrap: wrap; }
+  .badge {
+    font-size: 12px;
+    padding: 4px 10px;
+    border-radius: 12px;
+    font-weight: 500;
+    background: var(--surface2);
+    color: var(--text2);
+  }
+  .badge[data-status="pending"] { color: var(--text2); }
+  .badge[data-status="running"] { color: var(--cyan); background: #22d3ee18; }
+  .badge[data-status="completed"] { color: var(--green); background: #4ade8018; }
+  .badge[data-status="failed"] { color: var(--red); background: #f8717118; }
+  .badge[data-status="rate_limited"] { color: var(--yellow); background: #fbbf2418; }
+
+  /* Add form */
+  .add-form {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 20px;
+    margin-bottom: 24px;
+  }
+  .add-form textarea {
+    width: 100%;
+    min-height: 80px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 13px;
+    padding: 12px;
+    resize: vertical;
+    margin-bottom: 12px;
+  }
+  .add-form textarea:focus { outline: none; border-color: var(--accent); }
+
+  .form-row {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  .form-row label {
+    font-size: 12px;
+    color: var(--text2);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .form-row select, .form-row input[type="datetime-local"] {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    font-size: 13px;
+    padding: 6px 10px;
+  }
+  .form-row select:focus, .form-row input:focus { outline: none; border-color: var(--accent); }
+
+  .btn {
+    padding: 8px 20px;
+    border: none;
+    border-radius: 6px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: opacity .15s;
+  }
+  .btn:hover { opacity: 0.85; }
+  .btn-primary { background: var(--accent); color: #fff; margin-left: auto; }
+  .btn-sm {
+    padding: 3px 10px;
+    font-size: 11px;
+    border-radius: 4px;
+  }
+  .btn-ghost {
+    background: transparent;
+    color: var(--text2);
+    border: 1px solid var(--border);
+  }
+  .btn-danger { background: transparent; color: var(--red); border: 1px solid var(--border); }
+
+  /* Task list */
+  .task-list { display: flex; flex-direction: column; gap: 6px; }
+
+  .task-row {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 14px 16px;
+    cursor: pointer;
+    transition: border-color .15s;
+  }
+  .task-row:hover { border-color: var(--accent); }
+
+  .task-header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .task-id {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--text2);
+    min-width: 36px;
+  }
+  .task-status {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    padding: 2px 8px;
+    border-radius: 4px;
+  }
+  .task-status[data-s="pending"] { color: var(--text2); background: var(--surface2); }
+  .task-status[data-s="running"] { color: var(--cyan); background: #22d3ee15; animation: pulse 1.5s infinite; }
+  .task-status[data-s="completed"] { color: var(--green); background: #4ade8015; }
+  .task-status[data-s="failed"] { color: var(--red); background: #f8717115; }
+  .task-status[data-s="rate_limited"] { color: var(--yellow); background: #fbbf2415; }
+  .task-status[data-s="cancelled"] { color: var(--text2); background: var(--surface2); }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.5; }
+  }
+
+  .task-prompt {
+    flex: 1;
+    font-size: 13px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .task-priority {
+    font-size: 11px;
+    color: var(--text2);
+    font-family: var(--mono);
+  }
+  .task-time {
+    font-size: 11px;
+    color: var(--text2);
+    min-width: 60px;
+    text-align: right;
+  }
+
+  /* Expanded detail */
+  .task-detail {
+    display: none;
+    margin-top: 14px;
+    padding-top: 14px;
+    border-top: 1px solid var(--border);
+  }
+  .task-row.expanded .task-detail { display: block; }
+
+  .task-detail pre {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 12px;
+    font-family: var(--mono);
+    font-size: 12px;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 300px;
+    overflow-y: auto;
+    margin: 8px 0;
+    color: var(--text);
+  }
+  .detail-label {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text2);
+    margin-top: 10px;
+  }
+  .detail-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 12px;
+  }
+
+  .empty {
+    text-align: center;
+    padding: 60px 20px;
+    color: var(--text2);
+  }
+  .empty-icon { font-size: 36px; margin-bottom: 12px; opacity: 0.3; }
+
+  /* Filter bar */
+  .filter-bar {
+    display: flex;
+    gap: 6px;
+    margin-bottom: 16px;
+    flex-wrap: wrap;
+  }
+  .filter-btn {
+    padding: 5px 14px;
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    background: transparent;
+    color: var(--text2);
+    font-size: 12px;
+    cursor: pointer;
+    transition: all .15s;
+  }
+  .filter-btn:hover { border-color: var(--accent); color: var(--text); }
+  .filter-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <div class="logo">Prompt<span>Pilot</span></div>
+    <div class="badges" id="badges"></div>
+  </header>
+
+  <div class="add-form">
+    <textarea id="promptInput" placeholder="Enter your prompt here..."></textarea>
+    <div class="form-row">
+      <label>Priority
+        <select id="priorityInput">
+          <option value="1">1 (highest)</option>
+          <option value="2">2</option>
+          <option value="3">3</option>
+          <option value="4">4</option>
+          <option value="5" selected>5</option>
+          <option value="6">6</option>
+          <option value="7">7</option>
+          <option value="8">8</option>
+          <option value="9">9</option>
+          <option value="10">10 (lowest)</option>
+        </select>
+      </label>
+      <label>Schedule
+        <input type="datetime-local" id="scheduleInput">
+      </label>
+      <button class="btn btn-primary" onclick="addTask()">Add Task</button>
+    </div>
+  </div>
+
+  <div class="filter-bar" id="filterBar">
+    <button class="filter-btn active" data-filter="">All</button>
+    <button class="filter-btn" data-filter="pending">Pending</button>
+    <button class="filter-btn" data-filter="running">Running</button>
+    <button class="filter-btn" data-filter="completed">Completed</button>
+    <button class="filter-btn" data-filter="failed">Failed</button>
+    <button class="filter-btn" data-filter="rate_limited">Rate Limited</button>
+  </div>
+
+  <div class="task-list" id="taskList"></div>
+</div>
+
+<script>
+const API = '/api';
+let currentFilter = '';
+let expandedId = null;
+
+// --- API calls ---
+async function fetchJSON(url, opts) {
+  const res = await fetch(url, opts);
+  return res.json();
+}
+
+async function loadStats() {
+  const s = await fetchJSON(`${API}/stats`);
+  const el = document.getElementById('badges');
+  el.innerHTML = [
+    ['pending', s.pending],
+    ['running', s.running],
+    ['rate_limited', s.rate_limited],
+    ['completed', s.completed],
+    ['failed', s.failed],
+  ].filter(([, n]) => n > 0)
+   .map(([status, n]) => `<span class="badge" data-status="${status}">${n} ${status.replace('_', ' ')}</span>`)
+   .join('');
+}
+
+async function loadTasks() {
+  const params = currentFilter ? `?status=${currentFilter}&limit=100` : '?limit=100';
+  const tasks = await fetchJSON(`${API}/tasks${params}`);
+  const list = document.getElementById('taskList');
+
+  if (!tasks.length) {
+    list.innerHTML = `<div class="empty">
+      <div class="empty-icon">&#9744;</div>
+      <div>No tasks${currentFilter ? ' with status "' + currentFilter + '"' : ''}.</div>
+    </div>`;
+    return;
+  }
+
+  list.innerHTML = tasks.map(t => {
+    const expanded = t.id === expandedId;
+    const time = timeAgo(t.created_at);
+    return `
+    <div class="task-row${expanded ? ' expanded' : ''}" onclick="toggleTask(${t.id})">
+      <div class="task-header">
+        <span class="task-id">#${t.id}</span>
+        <span class="task-status" data-s="${t.status}">${t.status.replace('_', ' ')}</span>
+        <span class="task-prompt">${esc(t.prompt)}</span>
+        <span class="task-priority">P${t.priority}</span>
+        <span class="task-time">${time}</span>
+      </div>
+      <div class="task-detail">
+        <div class="detail-label">Prompt</div>
+        <pre>${esc(t.prompt)}</pre>
+        ${t.result ? `<div class="detail-label">Result</div><pre>${esc(t.result)}</pre>` : ''}
+        ${t.error ? `<div class="detail-label">Error</div><pre>${esc(t.error)}</pre>` : ''}
+        ${t.scheduled_at ? `<div class="detail-label">Scheduled: ${new Date(t.scheduled_at).toLocaleString()}</div>` : ''}
+        ${t.next_run_at ? `<div class="detail-label">Next retry: ${new Date(t.next_run_at).toLocaleString()}</div>` : ''}
+        <div class="detail-label">Retries: ${t.retry_count}/${t.max_retries}${t.exit_code !== null ? ' | Exit: ' + t.exit_code : ''}</div>
+        <div class="detail-actions">
+          ${['pending','rate_limited'].includes(t.status) ? `<button class="btn btn-sm btn-ghost" onclick="cancelTask(event,${t.id})">Cancel</button>` : ''}
+          <button class="btn btn-sm btn-danger" onclick="deleteTask(event,${t.id})">Delete</button>
+        </div>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+async function addTask() {
+  const prompt = document.getElementById('promptInput').value.trim();
+  if (!prompt) return;
+  const priority = parseInt(document.getElementById('priorityInput').value);
+  const schedule = document.getElementById('scheduleInput').value || null;
+
+  await fetchJSON(`${API}/tasks`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      prompt,
+      priority,
+      scheduled_at: schedule ? new Date(schedule).toISOString() : null,
+    }),
+  });
+
+  document.getElementById('promptInput').value = '';
+  document.getElementById('scheduleInput').value = '';
+  refresh();
+}
+
+async function cancelTask(e, id) {
+  e.stopPropagation();
+  await fetchJSON(`${API}/tasks/${id}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ status: 'cancelled' }),
+  });
+  refresh();
+}
+
+async function deleteTask(e, id) {
+  e.stopPropagation();
+  await fetchJSON(`${API}/tasks/${id}`, { method: 'DELETE' });
+  if (expandedId === id) expandedId = null;
+  refresh();
+}
+
+function toggleTask(id) {
+  expandedId = expandedId === id ? null : id;
+  loadTasks();
+}
+
+// --- Filters ---
+document.getElementById('filterBar').addEventListener('click', e => {
+  if (!e.target.matches('.filter-btn')) return;
+  document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+  e.target.classList.add('active');
+  currentFilter = e.target.dataset.filter;
+  loadTasks();
+});
+
+// --- Helpers ---
+function esc(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+function timeAgo(iso) {
+  const diff = (Date.now() - new Date(iso).getTime()) / 1000;
+  if (diff < 60) return 'now';
+  if (diff < 3600) return Math.floor(diff / 60) + 'm';
+  if (diff < 86400) return Math.floor(diff / 3600) + 'h';
+  return Math.floor(diff / 86400) + 'd';
+}
+
+function refresh() { loadStats(); loadTasks(); }
+
+// --- Ctrl+Enter to submit ---
+document.getElementById('promptInput').addEventListener('keydown', e => {
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+    e.preventDefault();
+    addTask();
+  }
+});
+
+// --- Init ---
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>
