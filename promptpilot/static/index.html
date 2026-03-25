@@ -102,7 +102,7 @@
     align-items: center;
     gap: 6px;
   }
-  .form-row select, .form-row input[type="datetime-local"] {
+  .form-row select, .form-row input {
     background: var(--bg);
     border: 1px solid var(--border);
     border-radius: 6px;
@@ -111,6 +111,7 @@
     padding: 6px 10px;
   }
   .form-row select:focus, .form-row input:focus { outline: none; border-color: var(--accent); }
+  .form-row input[type="text"] { width: 180px; }
 
   .btn {
     padding: 8px 20px;
@@ -134,6 +135,7 @@
     border: 1px solid var(--border);
   }
   .btn-danger { background: transparent; color: var(--red); border: 1px solid var(--border); }
+  .btn-copy { background: transparent; color: var(--accent2); border: 1px solid var(--border); }
 
   /* Task list */
   .task-list { display: flex; flex-direction: column; gap: 6px; }
@@ -143,16 +145,16 @@
     border: 1px solid var(--border);
     border-radius: var(--radius);
     padding: 14px 16px;
-    cursor: pointer;
     transition: border-color .15s;
   }
-  .task-row:hover { border-color: var(--accent); }
 
   .task-header {
     display: flex;
     align-items: center;
     gap: 12px;
+    cursor: pointer;
   }
+  .task-row:hover { border-color: var(--accent); }
   .task-id {
     font-family: var(--mono);
     font-size: 12px;
@@ -186,16 +188,17 @@
     overflow: hidden;
     text-overflow: ellipsis;
   }
-  .task-priority {
+  .task-meta {
     font-size: 11px;
     color: var(--text2);
     font-family: var(--mono);
+    white-space: nowrap;
   }
-  .task-time {
+  .task-schedule {
     font-size: 11px;
-    color: var(--text2);
-    min-width: 60px;
-    text-align: right;
+    color: var(--yellow);
+    font-family: var(--mono);
+    white-space: nowrap;
   }
 
   /* Expanded detail */
@@ -207,20 +210,40 @@
   }
   .task-row.expanded .task-detail { display: block; }
 
-  .task-detail pre {
+  .result-block {
+    position: relative;
+    margin: 8px 0;
+  }
+  .result-block pre {
     background: var(--bg);
     border: 1px solid var(--border);
     border-radius: 6px;
     padding: 12px;
+    padding-right: 70px;
     font-family: var(--mono);
     font-size: 12px;
     white-space: pre-wrap;
     word-break: break-word;
-    max-height: 300px;
+    max-height: 400px;
     overflow-y: auto;
-    margin: 8px 0;
     color: var(--text);
+    user-select: text;
   }
+  .copy-btn {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    padding: 4px 10px;
+    font-size: 11px;
+    border-radius: 4px;
+    background: var(--surface2);
+    color: var(--text2);
+    border: 1px solid var(--border);
+    cursor: pointer;
+    z-index: 2;
+  }
+  .copy-btn:hover { color: var(--text); border-color: var(--accent); }
+
   .detail-label {
     font-size: 11px;
     font-weight: 600;
@@ -229,11 +252,37 @@
     color: var(--text2);
     margin-top: 10px;
   }
+  .detail-info {
+    font-size: 12px;
+    color: var(--text2);
+    margin: 4px 0;
+    font-family: var(--mono);
+  }
+  .detail-info span { color: var(--text); }
   .detail-actions {
     display: flex;
     gap: 8px;
     margin-top: 12px;
   }
+
+  /* Result meta cards */
+  .result-meta {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin: 8px 0;
+  }
+  .meta-card {
+    background: var(--surface2);
+    border-radius: 6px;
+    padding: 6px 12px;
+    font-size: 11px;
+    font-family: var(--mono);
+  }
+  .meta-card .label { color: var(--text2); }
+  .meta-card .value { color: var(--text); font-weight: 600; }
+  .meta-card .value.cost { color: var(--yellow); }
+  .meta-card .value.session { color: var(--cyan); }
 
   .empty {
     text-align: center;
@@ -293,6 +342,9 @@
       <label>Schedule
         <input type="datetime-local" id="scheduleInput">
       </label>
+      <label>Working dir
+        <input type="text" id="workdirInput" placeholder="C:\Projects\MyApp">
+      </label>
       <button class="btn btn-primary" onclick="addTask()">Add Task</button>
     </div>
   </div>
@@ -334,6 +386,66 @@ async function loadStats() {
    .join('');
 }
 
+// --- Parse Claude JSON result into human-readable parts ---
+function parseResult(raw) {
+  if (!raw) return null;
+  try {
+    const data = JSON.parse(raw);
+    return {
+      text: data.result || raw,
+      cost: data.total_cost_usd,
+      session_id: data.session_id,
+      model: data.modelUsage ? Object.keys(data.modelUsage)[0] : null,
+      input_tokens: data.usage?.input_tokens,
+      output_tokens: data.usage?.output_tokens,
+      duration_ms: data.duration_ms,
+      is_error: data.is_error,
+    };
+  } catch {
+    // Not JSON — return as plain text
+    return { text: raw };
+  }
+}
+
+function renderResultMeta(parsed) {
+  if (!parsed) return '';
+  const cards = [];
+  if (parsed.model) cards.push(`<div class="meta-card"><span class="label">Model </span><span class="value">${esc(parsed.model)}</span></div>`);
+  if (parsed.cost != null) cards.push(`<div class="meta-card"><span class="label">Cost </span><span class="value cost">$${parsed.cost.toFixed(4)}</span></div>`);
+  if (parsed.duration_ms != null) cards.push(`<div class="meta-card"><span class="label">Time </span><span class="value">${(parsed.duration_ms / 1000).toFixed(1)}s</span></div>`);
+  if (parsed.input_tokens != null) cards.push(`<div class="meta-card"><span class="label">In </span><span class="value">${parsed.input_tokens}</span></div>`);
+  if (parsed.output_tokens != null) cards.push(`<div class="meta-card"><span class="label">Out </span><span class="value">${parsed.output_tokens}</span></div>`);
+  if (parsed.session_id) cards.push(`<div class="meta-card"><span class="label">Session </span><span class="value session">${esc(parsed.session_id.slice(0, 8))}...</span></div>`);
+  if (!cards.length) return '';
+  return `<div class="result-meta">${cards.join('')}</div>`;
+}
+
+// --- Schedule display ---
+function scheduleInfo(t) {
+  if (t.status === 'completed' || t.status === 'failed' || t.status === 'cancelled') return '';
+  if (t.status === 'running') return '<span class="task-schedule">running now</span>';
+  if (t.next_run_at) {
+    return `<span class="task-schedule">retry ${formatTime(t.next_run_at)}</span>`;
+  }
+  if (t.scheduled_at) {
+    const d = new Date(t.scheduled_at);
+    if (d <= new Date()) return '<span class="task-schedule">queued</span>';
+    return `<span class="task-schedule">${formatTime(t.scheduled_at)}</span>`;
+  }
+  return '<span class="task-schedule">queued</span>';
+}
+
+function formatTime(iso) {
+  const d = new Date(iso);
+  const now = new Date();
+  const diff = d - now;
+  if (diff < 0) return 'now';
+  if (diff < 60000) return 'in <1m';
+  if (diff < 3600000) return `in ${Math.ceil(diff / 60000)}m`;
+  if (diff < 86400000) return `in ${Math.ceil(diff / 3600000)}h`;
+  return d.toLocaleDateString() + ' ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
 async function loadTasks() {
   const params = currentFilter ? `?status=${currentFilter}&limit=100` : '?limit=100';
   const tasks = await fetchJSON(`${API}/tasks${params}`);
@@ -350,24 +462,52 @@ async function loadTasks() {
   list.innerHTML = tasks.map(t => {
     const expanded = t.id === expandedId;
     const time = timeAgo(t.created_at);
+    const parsed = parseResult(t.result);
+    const resultText = parsed ? parsed.text : '';
+
     return `
-    <div class="task-row${expanded ? ' expanded' : ''}" onclick="toggleTask(${t.id})">
-      <div class="task-header">
+    <div class="task-row${expanded ? ' expanded' : ''}">
+      <div class="task-header" onclick="toggleTask(${t.id})">
         <span class="task-id">#${t.id}</span>
         <span class="task-status" data-s="${t.status}">${t.status.replace('_', ' ')}</span>
         <span class="task-prompt">${esc(t.prompt)}</span>
-        ${t.provider ? `<span class="task-priority">${esc(t.provider)}</span>` : ''}
-        <span class="task-priority">P${t.priority}</span>
-        <span class="task-time">${time}</span>
+        ${t.provider ? `<span class="task-meta">${esc(t.provider)}</span>` : ''}
+        ${scheduleInfo(t)}
+        <span class="task-meta">P${t.priority}</span>
+        <span class="task-meta">${time}</span>
       </div>
       <div class="task-detail">
         <div class="detail-label">Prompt</div>
-        <pre>${esc(t.prompt)}</pre>
-        ${t.result ? `<div class="detail-label">Result</div><pre>${esc(t.result)}</pre>` : ''}
-        ${t.error ? `<div class="detail-label">Error</div><pre>${esc(t.error)}</pre>` : ''}
-        ${t.scheduled_at ? `<div class="detail-label">Scheduled: ${new Date(t.scheduled_at).toLocaleString()}</div>` : ''}
-        ${t.next_run_at ? `<div class="detail-label">Next retry: ${new Date(t.next_run_at).toLocaleString()}</div>` : ''}
-        <div class="detail-label">Retries: ${t.retry_count}/${t.max_retries}${t.exit_code !== null ? ' | Exit: ' + t.exit_code : ''}</div>
+        <div class="result-block">
+          <pre>${esc(t.prompt)}</pre>
+          <button class="copy-btn" onclick="copyText(event, ${JSON.stringify(JSON.stringify(t.prompt))})">Copy</button>
+        </div>
+
+        ${t.working_dir ? `<div class="detail-info"><span class="label">Dir: </span><span>${esc(t.working_dir)}</span></div>` : ''}
+
+        ${resultText ? `
+          <div class="detail-label">Result</div>
+          ${renderResultMeta(parsed)}
+          <div class="result-block">
+            <pre>${esc(resultText)}</pre>
+            <button class="copy-btn" onclick="copyText(event, ${JSON.stringify(JSON.stringify(resultText))})">Copy</button>
+          </div>
+        ` : ''}
+
+        ${t.error ? `
+          <div class="detail-label">Error</div>
+          <div class="result-block">
+            <pre>${esc(t.error)}</pre>
+            <button class="copy-btn" onclick="copyText(event, ${JSON.stringify(JSON.stringify(t.error))})">Copy</button>
+          </div>
+        ` : ''}
+
+        ${t.scheduled_at ? `<div class="detail-info"><span class="label">Scheduled: </span><span>${new Date(t.scheduled_at).toLocaleString()}</span></div>` : ''}
+        ${t.started_at ? `<div class="detail-info"><span class="label">Started: </span><span>${new Date(t.started_at).toLocaleString()}</span></div>` : ''}
+        ${t.completed_at ? `<div class="detail-info"><span class="label">Completed: </span><span>${new Date(t.completed_at).toLocaleString()}</span></div>` : ''}
+        ${t.next_run_at ? `<div class="detail-info"><span class="label">Next retry: </span><span>${new Date(t.next_run_at).toLocaleString()}</span></div>` : ''}
+        <div class="detail-info"><span class="label">Retries: </span><span>${t.retry_count}/${t.max_retries}</span>${t.exit_code !== null ? ` <span class="label">| Exit: </span><span>${t.exit_code}</span>` : ''}</div>
+
         <div class="detail-actions">
           ${['pending','rate_limited'].includes(t.status) ? `<button class="btn btn-sm btn-ghost" onclick="cancelTask(event,${t.id})">Cancel</button>` : ''}
           <button class="btn btn-sm btn-danger" onclick="deleteTask(event,${t.id})">Delete</button>
@@ -382,8 +522,8 @@ async function addTask() {
   if (!prompt) return;
   const priority = parseInt(document.getElementById('priorityInput').value);
   const schedule = document.getElementById('scheduleInput').value || null;
-
   const provider = document.getElementById('providerInput').value || null;
+  const workdir = document.getElementById('workdirInput').value.trim() || null;
 
   await fetchJSON(`${API}/tasks`, {
     method: 'POST',
@@ -392,12 +532,12 @@ async function addTask() {
       prompt,
       provider,
       priority,
+      working_dir: workdir,
       scheduled_at: schedule ? new Date(schedule).toISOString() : null,
     }),
   });
 
   document.getElementById('promptInput').value = '';
-  document.getElementById('scheduleInput').value = '';
   refresh();
 }
 
@@ -421,6 +561,15 @@ async function deleteTask(e, id) {
 function toggleTask(id) {
   expandedId = expandedId === id ? null : id;
   loadTasks();
+}
+
+function copyText(e, text) {
+  e.stopPropagation();
+  navigator.clipboard.writeText(text).then(() => {
+    const btn = e.target;
+    btn.textContent = 'Copied!';
+    setTimeout(() => btn.textContent = 'Copy', 1500);
+  });
 }
 
 // --- Filters ---
@@ -449,6 +598,14 @@ function timeAgo(iso) {
 
 function refresh() { loadStats(); loadTasks(); }
 
+// --- Set default schedule to current datetime ---
+function setDefaultSchedule() {
+  const inp = document.getElementById('scheduleInput');
+  const now = new Date();
+  now.setMinutes(now.getMinutes() - now.getTimezoneOffset());
+  inp.value = now.toISOString().slice(0, 16);
+}
+
 // --- Ctrl+Enter to submit ---
 document.getElementById('promptInput').addEventListener('keydown', e => {
   if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
@@ -467,6 +624,7 @@ async function loadProviders() {
 }
 
 // --- Init ---
+setDefaultSchedule();
 loadProviders();
 refresh();
 setInterval(refresh, 5000);
