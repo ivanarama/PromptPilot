@@ -29,8 +29,9 @@ def cli():
 @click.option("-p", "--priority", default=5, type=click.IntRange(1, 10), help="Priority 1-10 (1=highest)")
 @click.option("-a", "--at", "scheduled_at", help="Schedule time (ISO format, e.g. 2026-03-25T03:00)")
 @click.option("-d", "--dir", "working_dir", help="Working directory for claude execution")
+@click.option("-c", "--cli", "provider", default=None, help="CLI provider: claude, claude-z, or custom command")
 @click.option("-r", "--max-retries", default=5, type=int, help="Max retries on rate limit")
-def add(prompt, file_path, priority, scheduled_at, working_dir, max_retries):
+def add(prompt, file_path, priority, scheduled_at, working_dir, provider, max_retries):
     """Add a task (or multiple from file)."""
     from datetime import datetime
 
@@ -50,12 +51,14 @@ def add(prompt, file_path, priority, scheduled_at, working_dir, max_retries):
         task = db.create_task(TaskCreate(
             prompt=p,
             working_dir=working_dir,
+            provider=provider,
             priority=priority,
             scheduled_at=dt,
             max_retries=max_retries,
         ))
+        cli_info = f" [{provider}]" if provider else ""
         time_info = f" at {dt}" if dt else ""
-        click.echo(f"  #{task.id} [P{priority}]{time_info} {p[:70]}")
+        click.echo(f"  #{task.id} [P{priority}]{cli_info}{time_info} {p[:70]}")
 
     click.echo(click.style(f"\n{len(prompts)} task(s) added.", fg="green"))
 
@@ -91,6 +94,7 @@ def status(task_id):
 
     click.echo(f"Task #{task.id}")
     click.echo(f"  Status:    {click.style(task.status.value, fg=_status_color(task.status.value))}")
+    click.echo(f"  Provider:  {task.provider or 'claude (default)'}")
     click.echo(f"  Priority:  {task.priority}")
     click.echo(f"  Created:   {task.created_at}")
     if task.scheduled_at:
@@ -148,6 +152,24 @@ def stats():
     click.echo(f"  Failed:       {s.failed}")
     click.echo(f"  Cancelled:    {s.cancelled}")
     click.echo(f"  Total:        {s.total}")
+
+
+@cli.command()
+def providers():
+    """List available CLI providers."""
+    from .config import DEFAULT_CLI, load_providers
+    provs = load_providers()
+    click.echo("Available providers:\n")
+    for name, info in provs.items():
+        default = " (default)" if name == DEFAULT_CLI else ""
+        desc = info.get("description", "")
+        cmd = " ".join(info["cmd"])
+        click.echo(f"  {click.style(name, fg='cyan')}{default}")
+        if desc:
+            click.echo(f"    {desc}")
+        click.echo(f"    cmd: {cmd}")
+        click.echo()
+    click.echo(f"Custom providers: ~/.promptpilot/providers.json")
 
 
 @cli.command()

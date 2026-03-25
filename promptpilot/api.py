@@ -8,6 +8,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import db
+from .config import load_providers
 from .models import Stats, TaskCreate, TaskInDB, TaskStatus, TaskUpdate
 
 app = FastAPI(title="PromptPilot", version="0.1.0")
@@ -62,6 +63,12 @@ def api_delete_task(task_id: int):
 @app.get("/api/stats", response_model=Stats)
 def api_stats():
     return db.get_stats()
+
+
+@app.get("/api/providers")
+def api_providers():
+    providers = load_providers()
+    return {name: info.get("description", name) for name, info in providers.items()}
 
 
 # --- Frontend ---

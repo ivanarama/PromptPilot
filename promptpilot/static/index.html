@@ -273,6 +273,9 @@
   <div class="add-form">
     <textarea id="promptInput" placeholder="Enter your prompt here..."></textarea>
     <div class="form-row">
+      <label>Provider
+        <select id="providerInput"></select>
+      </label>
       <label>Priority
         <select id="priorityInput">
           <option value="1">1 (highest)</option>
@@ -353,6 +356,7 @@ async function loadTasks() {
         <span class="task-id">#${t.id}</span>
         <span class="task-status" data-s="${t.status}">${t.status.replace('_', ' ')}</span>
         <span class="task-prompt">${esc(t.prompt)}</span>
+        ${t.provider ? `<span class="task-priority">${esc(t.provider)}</span>` : ''}
         <span class="task-priority">P${t.priority}</span>
         <span class="task-time">${time}</span>
       </div>
@@ -379,11 +383,14 @@ async function addTask() {
   const priority = parseInt(document.getElementById('priorityInput').value);
   const schedule = document.getElementById('scheduleInput').value || null;
 
+  const provider = document.getElementById('providerInput').value || null;
+
   await fetchJSON(`${API}/tasks`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       prompt,
+      provider,
       priority,
       scheduled_at: schedule ? new Date(schedule).toISOString() : null,
     }),
@@ -450,7 +457,17 @@ document.getElementById('promptInput').addEventListener('keydown', e => {
   }
 });
 
+// --- Load providers into dropdown ---
+async function loadProviders() {
+  const provs = await fetchJSON(`${API}/providers`);
+  const sel = document.getElementById('providerInput');
+  sel.innerHTML = Object.entries(provs)
+    .map(([name, desc]) => `<option value="${esc(name)}">${esc(name)} — ${esc(desc)}</option>`)
+    .join('');
+}
+
 // --- Init ---
+loadProviders();
 refresh();
 setInterval(refresh, 5000);
 </script>

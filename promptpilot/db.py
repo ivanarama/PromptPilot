@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     prompt TEXT NOT NULL,
     working_dir TEXT,
+    provider TEXT,
     status TEXT NOT NULL DEFAULT 'pending',
     priority INTEGER NOT NULL DEFAULT 5,
     scheduled_at TEXT,
@@ -30,6 +31,10 @@ CREATE TABLE IF NOT EXISTS tasks (
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_runnable ON tasks(status, priority, next_run_at);
 """
+
+MIGRATIONS = [
+    "ALTER TABLE tasks ADD COLUMN provider TEXT",
+]
 
 
 def _now() -> str:
@@ -69,16 +74,23 @@ def _connect():
 def init_db():
     with _connect() as conn:
         conn.executescript(SCHEMA)
+        # Run migrations for existing databases
+        for migration in MIGRATIONS:
+            try:
+                conn.execute(migration)
+            except sqlite3.OperationalError:
+                pass  # Column already exists
 
 
 def create_task(task: TaskCreate) -> TaskInDB:
     with _connect() as conn:
         cur = conn.execute(
-            """INSERT INTO tasks (prompt, working_dir, status, priority, scheduled_at, created_at, max_retries)
-               VALUES (?, ?, 'pending', ?, ?, ?, ?)""",
+            """INSERT INTO tasks (prompt, working_dir, provider, status, priority, scheduled_at, created_at, max_retries)
+               VALUES (?, ?, ?, 'pending', ?, ?, ?, ?)""",
             (
                 task.prompt,
                 task.working_dir,
+                task.provider,
                 task.priority,
                 task.scheduled_at.isoformat() if task.scheduled_at else None,
                 _now(),

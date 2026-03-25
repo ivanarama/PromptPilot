@@ -19,6 +19,7 @@ class TaskStatus(str, Enum):
 class TaskCreate(BaseModel):
     prompt: str
     working_dir: Optional[str] = None
+    provider: Optional[str] = None  # e.g. "claude", "claude-z", or raw command
     priority: int = Field(default=5, ge=1, le=10)
     scheduled_at: Optional[datetime] = None
     max_retries: int = Field(default=5, ge=0, le=50)
@@ -33,6 +34,7 @@ class TaskInDB(BaseModel):
     id: int
     prompt: str
     working_dir: Optional[str] = None
+    provider: Optional[str] = None
     status: TaskStatus = TaskStatus.PENDING
     priority: int = 5
     scheduled_at: Optional[datetime] = None

@@ -8,7 +8,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 from . import db
-from .config import BASE_DELAY, MAX_DELAY, POLL_INTERVAL, TASK_TIMEOUT
+from .config import BASE_DELAY, DEFAULT_CLI, MAX_DELAY, POLL_INTERVAL, TASK_TIMEOUT, get_provider_cmd
 
 RATE_LIMIT_PATTERNS = [
     "rate limit",
@@ -37,8 +37,9 @@ def compute_next_run(retry_count: int) -> datetime:
 
 
 def execute_task(task):
-    """Run claude CLI with the task's prompt."""
-    cmd = ["claude", "-p", "--output-format", "json", task.prompt]
+    """Run CLI with the task's prompt."""
+    provider = task.provider or DEFAULT_CLI
+    cmd = get_provider_cmd(provider) + [task.prompt]
 
     try:
         result = subprocess.run(
@@ -52,7 +53,7 @@ def execute_task(task):
         db.mark_failed(task.id, "Execution timed out", exit_code=-1)
         return
     except FileNotFoundError:
-        db.mark_failed(task.id, "claude CLI not found. Is it installed and in PATH?", exit_code=-1)
+        db.mark_failed(task.id, f"CLI '{provider}' not found. Is it installed and in PATH?", exit_code=-1)
         return
 
     if is_rate_limited(result.stderr, result.returncode):
@@ -97,8 +98,9 @@ def run_worker():
             time.sleep(POLL_INTERVAL)
             continue
 
+        provider = task.provider or DEFAULT_CLI
         prompt_preview = task.prompt[:60].replace("\n", " ")
-        print(f"[#{task.id}] Running: {prompt_preview}...")
+        print(f"[#{task.id}] [{provider}] Running: {prompt_preview}...")
         execute_task(task)
 
     print("Worker stopped.")
