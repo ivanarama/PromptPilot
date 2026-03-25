@@ -18,24 +18,36 @@ MAX_RETRIES = int(os.environ.get("PP_MAX_RETRIES", "5"))
 # Default CLI command
 DEFAULT_CLI = os.environ.get("PP_DEFAULT_CLI", "claude")
 
-# CLI presets — name -> command + args
-# Can be overridden via ~/.promptpilot/providers.json
+# CLI providers — name -> command template with {prompt} placeholder
+# Can be overridden/extended via ~/.promptpilot/providers.json
 BUILTIN_PROVIDERS = {
     "claude": {
-        "cmd": ["claude", "-p", "--output-format", "json"],
+        "cmd": "claude -p --output-format json {prompt}",
         "description": "Claude Code (Anthropic)",
     },
     "claude-z": {
-        "cmd": ["claude-z", "-p", "--output-format", "json"],
+        "cmd": "claude-z -p --output-format json {prompt}",
         "description": "Claude Code (GLM)",
     },
+    "codex": {
+        "cmd": "codex -q {prompt}",
+        "description": "OpenAI Codex",
+    },
+    "qwen": {
+        "cmd": "qwen -p {prompt}",
+        "description": "Qwen Code",
+    },
 }
+
+
+def _providers_file() -> Path:
+    return DB_DIR / "providers.json"
 
 
 def load_providers() -> dict:
     """Load providers: built-in + user overrides from providers.json."""
     providers = dict(BUILTIN_PROVIDERS)
-    user_file = DB_DIR / "providers.json"
+    user_file = _providers_file()
     if user_file.exists():
         try:
             with open(user_file) as f:
@@ -46,13 +58,54 @@ def load_providers() -> dict:
     return providers
 
 
-def get_provider_cmd(provider: str) -> list[str]:
-    """Get command list for a provider name. Falls back to treating it as a raw command."""
+def save_provider(name: str, cmd: str, description: str = ""):
+    """Save a custom provider to providers.json."""
+    DB_DIR.mkdir(parents=True, exist_ok=True)
+    user_file = _providers_file()
+    custom = {}
+    if user_file.exists():
+        try:
+            with open(user_file) as f:
+                custom = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pass
+    custom[name] = {"cmd": cmd, "description": description}
+    with open(user_file, "w") as f:
+        json.dump(custom, f, indent=2)
+
+
+def remove_provider(name: str) -> bool:
+    """Remove a custom provider from providers.json."""
+    user_file = _providers_file()
+    if not user_file.exists():
+        return False
+    try:
+        with open(user_file) as f:
+            custom = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return False
+    if name not in custom:
+        return False
+    del custom[name]
+    with open(user_file, "w") as f:
+        json.dump(custom, f, indent=2)
+    return True
+
+
+def build_cmd(provider: str, prompt: str) -> list[str]:
+    """Build the full command list for a provider + prompt."""
     providers = load_providers()
     if provider in providers:
-        return list(providers[provider]["cmd"])
-    # If not a known preset, treat as a raw command name
-    return [provider, "-p", "--output-format", "json"]
+        template = providers[provider]["cmd"]
+    else:
+        # Unknown provider — assume it's a command name, just pass prompt as arg
+        template = f"{provider} {{prompt}}"
+    # Replace {prompt} placeholder and split into args
+    # We replace {prompt} with a unique marker, split, then replace marker with actual prompt
+    # This way the prompt stays as a single argument
+    marker = "\x00PROMPT\x00"
+    parts = template.replace("{prompt}", marker).split()
+    return [prompt if p == marker else p for p in parts]
 
 
 # Server

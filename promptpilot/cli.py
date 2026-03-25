@@ -155,21 +155,58 @@ def stats():
 
 
 @cli.command()
-def providers():
-    """List available CLI providers."""
-    from .config import DEFAULT_CLI, load_providers
-    provs = load_providers()
-    click.echo("Available providers:\n")
-    for name, info in provs.items():
-        default = " (default)" if name == DEFAULT_CLI else ""
-        desc = info.get("description", "")
-        cmd = " ".join(info["cmd"])
-        click.echo(f"  {click.style(name, fg='cyan')}{default}")
-        if desc:
-            click.echo(f"    {desc}")
-        click.echo(f"    cmd: {cmd}")
-        click.echo()
-    click.echo(f"Custom providers: ~/.promptpilot/providers.json")
+@click.argument("action", required=False, default="list")
+@click.argument("name", required=False)
+@click.option("--cmd", "cmd_template", help='Command template, e.g. "myai --run {prompt}"')
+@click.option("--desc", default="", help="Description")
+def provider(action, name, cmd_template, desc):
+    """Manage CLI providers. Actions: list, add, remove.
+
+    \b
+    Examples:
+      pp provider                              # list all
+      pp provider add myai --cmd "myai {prompt}"
+      pp provider remove myai
+    """
+    from .config import DEFAULT_CLI, load_providers, save_provider, remove_provider
+
+    if action == "list" or (action is None and name is None):
+        provs = load_providers()
+        click.echo("Available providers:\n")
+        for pname, info in provs.items():
+            default = " (default)" if pname == DEFAULT_CLI else ""
+            pdesc = info.get("description", "")
+            click.echo(f"  {click.style(pname, fg='cyan')}{default}")
+            if pdesc:
+                click.echo(f"    {pdesc}")
+            click.echo(f"    cmd: {info['cmd']}")
+            click.echo()
+        click.echo("  Add custom: pp provider add <name> --cmd \"<command> {prompt}\"")
+        click.echo("  Config:     ~/.promptpilot/providers.json")
+
+    elif action == "add":
+        if not name:
+            click.echo("Usage: pp provider add <name> --cmd \"<command> {prompt}\"")
+            return
+        if not cmd_template:
+            # Default: treat name as the command, just append {prompt}
+            cmd_template = f"{name} {{prompt}}"
+        if "{prompt}" not in cmd_template:
+            cmd_template += " {prompt}"
+        save_provider(name, cmd_template, desc)
+        click.echo(click.style(f"Provider '{name}' added: {cmd_template}", fg="green"))
+
+    elif action == "remove":
+        if not name:
+            click.echo("Usage: pp provider remove <name>")
+            return
+        if remove_provider(name):
+            click.echo(f"Provider '{name}' removed.")
+        else:
+            click.echo(f"Provider '{name}' not found in custom providers.")
+
+    else:
+        click.echo(f"Unknown action: {action}. Use: list, add, remove")
 
 
 @cli.command()

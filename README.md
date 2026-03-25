@@ -1,9 +1,12 @@
 # PromptPilot
 
-AI Prompt Scheduler — очередь, планирование и автоматический retry промптов для Claude Code CLI.
+Универсальный планировщик промптов для AI CLI — очередь, планирование и автоматический retry.
+
+Работает с **любым** AI CLI: Claude Code, Codex, Qwen Code и другими.
 
 ## Возможности
 
+- **Мульти-провайдер** — Claude, Codex, Qwen, или любой свой CLI
 - **Очередь задач** с приоритетами (1 — высший, 10 — низший)
 - **Планирование** — запуск промптов в заданное время
 - **Rate limit detection** — автоматическое определение лимитов API
@@ -19,7 +22,7 @@ cd PromptPilot
 pip install -e .
 ```
 
-Требования: Python 3.10+, [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) в PATH.
+Требования: Python 3.10+, хотя бы один AI CLI в PATH (claude, codex, qwen и т.д.).
 
 ## Быстрый старт
 
@@ -38,7 +41,10 @@ pp server
 ## CLI
 
 ```
-pp add "промпт"                        # добавить задачу
+pp add "промпт"                        # добавить задачу (дефолтный провайдер)
+pp add "промпт" -c codex               # через Codex
+pp add "промпт" -c qwen                # через Qwen
+pp add "промпт" -c claude-z            # через кастомный алиас
 pp add "промпт" -p 1                   # с приоритетом (1 = высший)
 pp add "промпт" -a "2026-03-25T03:00"  # запланировать на время
 pp add -f prompts.txt                  # добавить из файла (по строке)
@@ -57,10 +63,34 @@ pp server                              # запустить веб-UI
 pp server -p 9000                      # на другом порту
 ```
 
+## Провайдеры
+
+Встроенные провайдеры:
+
+| Имя | Команда | Описание |
+|---|---|---|
+| `claude` | `claude -p --output-format json {prompt}` | Claude Code (Anthropic) |
+| `claude-z` | `claude-z -p --output-format json {prompt}` | Claude Code (GLM) |
+| `codex` | `codex -q {prompt}` | OpenAI Codex |
+| `qwen` | `qwen -p {prompt}` | Qwen Code |
+
+Управление:
+
+```bash
+pp provider                                          # список всех
+pp provider add myai --cmd "myai run {prompt}" --desc "My AI"  # добавить
+pp provider remove myai                              # удалить
+```
+
+Кастомные провайдеры сохраняются в `~/.promptpilot/providers.json`.
+
+Дефолтный провайдер меняется через переменную `PP_DEFAULT_CLI`.
+
 ## Веб-интерфейс
 
 Минималистичный dark-theme UI на `http://127.0.0.1:8420`:
 
+- Выбор провайдера (Claude, Codex, Qwen и др.)
 - Добавление задач с приоритетом и расписанием (Ctrl+Enter для отправки)
 - Фильтры по статусу
 - Раскрытие задачи — полный промпт, результат, ошибки
@@ -77,6 +107,7 @@ GET    /api/tasks/{id}         — детали задачи
 PATCH  /api/tasks/{id}         — обновить (отменить, сменить приоритет)
 DELETE /api/tasks/{id}         — удалить
 GET    /api/stats              — статистика по статусам
+GET    /api/providers          — список провайдеров
 ```
 
 ## Конфигурация
@@ -91,6 +122,7 @@ GET    /api/stats              — статистика по статусам
 | `PP_BASE_DELAY` | `60` | Начальная задержка retry (сек) |
 | `PP_MAX_DELAY` | `3600` | Максимальная задержка retry (сек) |
 | `PP_MAX_RETRIES` | `5` | Макс. кол-во retry по умолчанию |
+| `PP_DEFAULT_CLI` | `claude` | Провайдер по умолчанию |
 | `PP_HOST` | `127.0.0.1` | Хост веб-сервера |
 | `PP_PORT` | `8420` | Порт веб-сервера |
 
@@ -112,7 +144,7 @@ promptpilot/
 ├── config.py       — настройки
 ├── models.py       — Pydantic-модели
 ├── db.py           — SQLite (очередь, CRUD, планирование)
-├── worker.py       — воркер (subprocess → claude CLI)
+├── worker.py       — воркер (subprocess → любой AI CLI)
 ├── cli.py          — CLI (Click)
 ├── api.py          — REST API (FastAPI)
 └── static/

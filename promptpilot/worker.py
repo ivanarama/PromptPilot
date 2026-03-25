@@ -8,7 +8,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 from . import db
-from .config import BASE_DELAY, DEFAULT_CLI, MAX_DELAY, POLL_INTERVAL, TASK_TIMEOUT, get_provider_cmd
+from .config import BASE_DELAY, DEFAULT_CLI, MAX_DELAY, POLL_INTERVAL, TASK_TIMEOUT, build_cmd
 
 RATE_LIMIT_PATTERNS = [
     "rate limit",
@@ -39,7 +39,7 @@ def compute_next_run(retry_count: int) -> datetime:
 def execute_task(task):
     """Run CLI with the task's prompt."""
     provider = task.provider or DEFAULT_CLI
-    cmd = get_provider_cmd(provider) + [task.prompt]
+    cmd = build_cmd(provider, task.prompt)
 
     try:
         result = subprocess.run(
