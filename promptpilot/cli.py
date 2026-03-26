@@ -225,6 +225,13 @@ def worker():
 
 
 @cli.command()
+def bot():
+    """Start the Telegram bot (requires PP_TG_TOKEN env var)."""
+    from .bot import run_bot
+    run_bot()
+
+
+@cli.command()
 @click.option("-h", "--host", default=None, help="Host (default: 127.0.0.1)")
 @click.option("-p", "--port", default=None, type=int, help="Port (default: 8420)")
 def server(host, port):

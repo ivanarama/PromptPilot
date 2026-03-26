@@ -1,5 +1,6 @@
 """FastAPI web API + static file serving."""
 
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -13,7 +14,11 @@ from .models import Stats, TaskCreate, TaskInDB, TaskStatus, TaskUpdate
 
 app = FastAPI(title="PromptPilot", version="0.1.0")
 
-STATIC_DIR = Path(__file__).parent / "static"
+# When frozen by PyInstaller, __file__ points into the temp extraction dir
+if getattr(sys, "frozen", False):
+    STATIC_DIR = Path(sys._MEIPASS) / "promptpilot" / "static"
+else:
+    STATIC_DIR = Path(__file__).parent / "static"
 
 
 # --- API ---
