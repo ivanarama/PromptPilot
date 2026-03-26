@@ -168,15 +168,16 @@ def mark_failed(task_id: int, error: str, exit_code: int = 1):
         )
 
 
-def mark_rate_limited(task_id: int, next_run_at: datetime):
+def mark_rate_limited(task_id: int, next_run_at: datetime, error: str = None):
     with _connect() as conn:
         conn.execute(
             """UPDATE tasks
                SET status = 'rate_limited',
                    next_run_at = ?,
-                   retry_count = retry_count + 1
+                   retry_count = retry_count + 1,
+                   error = COALESCE(?, error)
                WHERE id = ?""",
-            (next_run_at.isoformat(), task_id),
+            (next_run_at.isoformat(), error, task_id),
         )
 
 
@@ -228,6 +229,16 @@ def recover_running():
         conn.execute(
             "UPDATE tasks SET status = 'pending', started_at = NULL WHERE status = 'running'"
         )
+
+
+def reset_task(task_id: int) -> bool:
+    """Reset a single stuck 'running' task back to 'pending'."""
+    with _connect() as conn:
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'pending', started_at = NULL WHERE id = ? AND status = 'running'",
+            (task_id,),
+        )
+        return cur.rowcount > 0
 
 
 def purge_old(before_days: int = 7) -> int:

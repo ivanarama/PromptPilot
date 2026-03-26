@@ -20,14 +20,24 @@ DEFAULT_CLI = os.environ.get("PP_DEFAULT_CLI", "claude")
 
 # CLI providers — name -> command template with {prompt} placeholder
 # Can be overridden/extended via ~/.promptpilot/providers.json
+CLAUDE_EXE = os.environ.get(
+    "PP_CLAUDE_EXE",
+    str(Path.home() / ".local" / "bin" / "claude.exe"),
+)
+
 BUILTIN_PROVIDERS = {
     "claude": {
-        "cmd": "claude -p --output-format json {prompt}",
+        "cmd": f"{CLAUDE_EXE} -p --verbose --output-format stream-json {{prompt}}",
         "description": "Claude Code (Anthropic)",
     },
     "claude-z": {
-        "cmd": "claude-z -p --output-format json {prompt}",
+        "cmd": f"{CLAUDE_EXE} -p --verbose --output-format stream-json {{prompt}}",
         "description": "Claude Code (GLM)",
+        "env": {
+            "ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-4.7",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": "glm-4.7",
+        },
     },
     "codex": {
         "cmd": "codex -q {prompt}",
@@ -58,7 +68,7 @@ def load_providers() -> dict:
     return providers
 
 
-def save_provider(name: str, cmd: str, description: str = ""):
+def save_provider(name: str, cmd: str, description: str = "", env: dict = None):
     """Save a custom provider to providers.json."""
     DB_DIR.mkdir(parents=True, exist_ok=True)
     user_file = _providers_file()
@@ -69,7 +79,10 @@ def save_provider(name: str, cmd: str, description: str = ""):
                 custom = json.load(f)
         except (json.JSONDecodeError, OSError):
             pass
-    custom[name] = {"cmd": cmd, "description": description}
+    entry = {"cmd": cmd, "description": description}
+    if env:
+        entry["env"] = env
+    custom[name] = entry
     with open(user_file, "w") as f:
         json.dump(custom, f, indent=2)
 
@@ -98,14 +111,21 @@ def build_cmd(provider: str, prompt: str) -> list[str]:
     if provider in providers:
         template = providers[provider]["cmd"]
     else:
-        # Unknown provider — assume it's a command name, just pass prompt as arg
         template = f"{provider} {{prompt}}"
-    # Replace {prompt} placeholder and split into args
-    # We replace {prompt} with a unique marker, split, then replace marker with actual prompt
-    # This way the prompt stays as a single argument
     marker = "\x00PROMPT\x00"
     parts = template.replace("{prompt}", marker).split()
     return [prompt if p == marker else p for p in parts]
+
+
+def get_provider_env(provider: str) -> dict:
+    """Get extra environment variables for a provider (merged with current env)."""
+    providers = load_providers()
+    extra = providers.get(provider, {}).get("env", {})
+    if not extra:
+        return os.environ.copy()
+    env = os.environ.copy()
+    env.update(extra)
+    return env
 
 
 # Server

@@ -159,7 +159,8 @@ def stats():
 @click.argument("name", required=False)
 @click.option("--cmd", "cmd_template", help='Command template, e.g. "myai --run {prompt}"')
 @click.option("--desc", default="", help="Description")
-def provider(action, name, cmd_template, desc):
+@click.option("--env", "env_vars", multiple=True, help='Env vars: KEY=VALUE (repeat for multiple)')
+def provider(action, name, cmd_template, desc, env_vars):
     """Manage CLI providers. Actions: list, add, remove.
 
     \b
@@ -193,8 +194,15 @@ def provider(action, name, cmd_template, desc):
             cmd_template = f"{name} {{prompt}}"
         if "{prompt}" not in cmd_template:
             cmd_template += " {prompt}"
-        save_provider(name, cmd_template, desc)
+        env = {}
+        for kv in env_vars:
+            if "=" in kv:
+                k, v = kv.split("=", 1)
+                env[k.strip()] = v.strip()
+        save_provider(name, cmd_template, desc, env=env)
         click.echo(click.style(f"Provider '{name}' added: {cmd_template}", fg="green"))
+        if env:
+            click.echo(f"  Env: {', '.join(env.keys())}")
 
     elif action == "remove":
         if not name:

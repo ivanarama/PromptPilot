@@ -386,36 +386,43 @@ async function loadStats() {
    .join('');
 }
 
-// --- Parse Claude JSON result into human-readable parts ---
+// --- Parse result text (worker already formats it, but extract meta if present) ---
 function parseResult(raw) {
   if (!raw) return null;
-  try {
-    const data = JSON.parse(raw);
-    return {
-      text: data.result || raw,
-      cost: data.total_cost_usd,
-      session_id: data.session_id,
-      model: data.modelUsage ? Object.keys(data.modelUsage)[0] : null,
-      input_tokens: data.usage?.input_tokens,
-      output_tokens: data.usage?.output_tokens,
-      duration_ms: data.duration_ms,
-      is_error: data.is_error,
-    };
-  } catch {
-    // Not JSON — return as plain text
-    return { text: raw };
+
+  // Split text and meta section
+  const metaSep = '--- Meta ---';
+  const metaIdx = raw.indexOf(metaSep);
+
+  let text, metaBlock;
+  if (metaIdx !== -1) {
+    text = raw.slice(0, metaIdx).trim();
+    metaBlock = raw.slice(metaIdx + metaSep.length).trim();
+  } else {
+    text = raw;
+    metaBlock = '';
   }
+
+  // Parse meta lines into key-value
+  const meta = {};
+  for (const line of metaBlock.split('\n')) {
+    const m = line.match(/^(\w[\w ]*?):\s*(.+)/);
+    if (m) meta[m[1].toLowerCase()] = m[2];
+  }
+
+  return { text, meta, metaBlock };
 }
 
 function renderResultMeta(parsed) {
-  if (!parsed) return '';
+  if (!parsed || !parsed.metaBlock) return '';
+  const m = parsed.meta;
   const cards = [];
-  if (parsed.model) cards.push(`<div class="meta-card"><span class="label">Model </span><span class="value">${esc(parsed.model)}</span></div>`);
-  if (parsed.cost != null) cards.push(`<div class="meta-card"><span class="label">Cost </span><span class="value cost">$${parsed.cost.toFixed(4)}</span></div>`);
-  if (parsed.duration_ms != null) cards.push(`<div class="meta-card"><span class="label">Time </span><span class="value">${(parsed.duration_ms / 1000).toFixed(1)}s</span></div>`);
-  if (parsed.input_tokens != null) cards.push(`<div class="meta-card"><span class="label">In </span><span class="value">${parsed.input_tokens}</span></div>`);
-  if (parsed.output_tokens != null) cards.push(`<div class="meta-card"><span class="label">Out </span><span class="value">${parsed.output_tokens}</span></div>`);
-  if (parsed.session_id) cards.push(`<div class="meta-card"><span class="label">Session </span><span class="value session">${esc(parsed.session_id.slice(0, 8))}...</span></div>`);
+  if (m.model) cards.push(`<div class="meta-card"><span class="label">Model </span><span class="value">${esc(m.model)}</span></div>`);
+  if (m.cost) cards.push(`<div class="meta-card"><span class="label">Cost </span><span class="value cost">${esc(m.cost)}</span></div>`);
+  if (m.time) cards.push(`<div class="meta-card"><span class="label">Time </span><span class="value">${esc(m.time)}</span></div>`);
+  if (m.tokens) cards.push(`<div class="meta-card"><span class="label">Tokens </span><span class="value">${esc(m.tokens)}</span></div>`);
+  if (m.session) cards.push(`<div class="meta-card"><span class="label">Session </span><span class="value session">${esc(m.session.slice(0, 12))}...</span></div>`);
+  if (m['rate limit resets']) cards.push(`<div class="meta-card"><span class="label">Limit resets </span><span class="value cost">${esc(m['rate limit resets'])}</span></div>`);
   if (!cards.length) return '';
   return `<div class="result-meta">${cards.join('')}</div>`;
 }
@@ -463,7 +470,28 @@ async function loadTasks() {
     const expanded = t.id === expandedId;
     const time = timeAgo(t.created_at);
     const parsed = parseResult(t.result);
-    const resultText = parsed ? parsed.text : '';
+
+    // Build result section
+    let resultHTML = '';
+    if (parsed) {
+      resultHTML += `<div class="detail-label">Result</div>`;
+      resultHTML += renderResultMeta(parsed);
+
+      const displayText = parsed.text || (parsed.metaBlock ? 'Task completed (no text output)' : '');
+      if (displayText) {
+        const copyable = parsed.text || '';
+        resultHTML += `<div class="result-block">
+          <pre>${esc(displayText)}</pre>
+          ${copyable ? `<button class="copy-btn" onclick="copyText(event, ${JSON.stringify(JSON.stringify(copyable))})">Copy</button>` : ''}
+        </div>`;
+      }
+    } else if (t.result) {
+      resultHTML += `<div class="detail-label">Result</div>`;
+      resultHTML += `<div class="result-block">
+        <pre>${esc(t.result)}</pre>
+        <button class="copy-btn" onclick="copyText(event, ${JSON.stringify(JSON.stringify(t.result))})">Copy</button>
+      </div>`;
+    }
 
     return `
     <div class="task-row${expanded ? ' expanded' : ''}">
@@ -485,14 +513,7 @@ async function loadTasks() {
 
         ${t.working_dir ? `<div class="detail-info"><span class="label">Dir: </span><span>${esc(t.working_dir)}</span></div>` : ''}
 
-        ${resultText ? `
-          <div class="detail-label">Result</div>
-          ${renderResultMeta(parsed)}
-          <div class="result-block">
-            <pre>${esc(resultText)}</pre>
-            <button class="copy-btn" onclick="copyText(event, ${JSON.stringify(JSON.stringify(resultText))})">Copy</button>
-          </div>
-        ` : ''}
+        ${resultHTML}
 
         ${t.error ? `
           <div class="detail-label">Error</div>
@@ -510,6 +531,7 @@ async function loadTasks() {
 
         <div class="detail-actions">
           ${['pending','rate_limited'].includes(t.status) ? `<button class="btn btn-sm btn-ghost" onclick="cancelTask(event,${t.id})">Cancel</button>` : ''}
+          ${t.status === 'running' ? `<button class="btn btn-sm btn-ghost" onclick="resetTask(event,${t.id})">Reset to pending</button>` : ''}
           <button class="btn btn-sm btn-danger" onclick="deleteTask(event,${t.id})">Delete</button>
         </div>
       </div>
@@ -538,6 +560,12 @@ async function addTask() {
   });
 
   document.getElementById('promptInput').value = '';
+  refresh();
+}
+
+async function resetTask(e, id) {
+  e.stopPropagation();
+  await fetchJSON(`${API}/tasks/${id}/reset`, { method: 'POST' });
   refresh();
 }
 

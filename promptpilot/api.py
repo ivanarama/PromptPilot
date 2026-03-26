@@ -60,6 +60,13 @@ def api_delete_task(task_id: int):
     return {"ok": True}
 
 
+@app.post("/api/tasks/{task_id}/reset", response_model=dict)
+def api_reset_task(task_id: int):
+    if not db.reset_task(task_id):
+        raise HTTPException(400, "Task not found or not in running state")
+    return {"ok": True}
+
+
 @app.get("/api/stats", response_model=Stats)
 def api_stats():
     return db.get_stats()

@@ -67,24 +67,79 @@ pp server -p 9000                      # на другом порту
 
 Встроенные провайдеры:
 
-| Имя | Команда | Описание |
-|---|---|---|
-| `claude` | `claude -p --output-format json {prompt}` | Claude Code (Anthropic) |
-| `claude-z` | `claude-z -p --output-format json {prompt}` | Claude Code (GLM) |
-| `codex` | `codex -q {prompt}` | OpenAI Codex |
-| `qwen` | `qwen -p {prompt}` | Qwen Code |
+| Имя | Описание |
+|---|---|
+| `claude` | Claude Code (Anthropic) — дефолт |
+| `claude-z` | Claude Code с альтернативным API (GLM, z.ai и др.) |
+| `codex` | OpenAI Codex |
+| `qwen` | Qwen Code |
 
-Управление:
+Команды управления:
 
 ```bash
-pp provider                                          # список всех
-pp provider add myai --cmd "myai run {prompt}" --desc "My AI"  # добавить
-pp provider remove myai                              # удалить
+pp provider                   # список всех
+pp provider add <name> ...    # добавить
+pp provider remove <name>     # удалить
 ```
 
 Кастомные провайдеры сохраняются в `~/.promptpilot/providers.json`.
 
-Дефолтный провайдер меняется через переменную `PP_DEFAULT_CLI`.
+Дефолтный провайдер: переменная `PP_DEFAULT_CLI` (по умолчанию `claude`).
+
+Путь к `claude.exe` по умолчанию: `~/.local/bin/claude.exe`. Переопределяется через `PP_CLAUDE_EXE`.
+
+### Добавление кастомного провайдера
+
+```bash
+python -m promptpilot provider add myai \
+  --cmd "myai run {prompt}" \
+  --desc "My AI Tool"
+```
+
+Или с переменными окружения (`--env` можно повторять):
+
+```bash
+python -m promptpilot provider add myai \
+  --cmd "myai run {prompt}" \
+  --desc "My AI Tool" \
+  --env "API_KEY=your-key-here" \
+  --env "API_URL=https://api.example.com"
+```
+
+### PowerShell-алиасы и Windows
+
+Если твой провайдер определён как PowerShell-функция (например `claude-z`), он **не доступен** напрямую через `subprocess`. В этом случае нужно указать путь к реальному исполняемому файлу и передать нужные переменные окружения явно.
+
+Пример для `claude-z` (функция в PowerShell-профиле, которая меняет `ANTHROPIC_BASE_URL` и запускает `claude.exe`):
+
+```powershell
+python -m promptpilot provider add claude-z `
+  --cmd "C:\Users\<username>\.local\bin\claude.exe -p --verbose --output-format stream-json {prompt}" `
+  --desc "Claude Code (GLM via z.ai)" `
+  --env "ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic" `
+  --env "ANTHROPIC_AUTH_TOKEN=your-token-here" `
+  --env "ANTHROPIC_DEFAULT_SONNET_MODEL=glm-4.7" `
+  --env "ANTHROPIC_DEFAULT_OPUS_MODEL=glm-4.7"
+```
+
+Это запишет конфиг в `~/.promptpilot/providers.json`. Воркер будет вызывать `claude.exe` напрямую с нужными переменными — без PowerShell.
+
+Итоговый `providers.json` выглядит так:
+
+```json
+{
+  "claude-z": {
+    "cmd": "C:\\Users\\<username>\\.local\\bin\\claude.exe -p --verbose --output-format stream-json {prompt}",
+    "description": "Claude Code (GLM via z.ai)",
+    "env": {
+      "ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic",
+      "ANTHROPIC_AUTH_TOKEN": "your-token-here",
+      "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-4.7",
+      "ANTHROPIC_DEFAULT_OPUS_MODEL": "glm-4.7"
+    }
+  }
+}
+```
 
 ## Веб-интерфейс
 
