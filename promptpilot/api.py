@@ -8,8 +8,10 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+import os
+
 from . import db
-from .config import load_providers
+from .config import load_providers, PROJECTS_ROOT
 from .models import Stats, TaskCreate, TaskInDB, TaskStatus, TaskUpdate
 
 app = FastAPI(title="PromptPilot", version="0.1.0")
@@ -81,6 +83,22 @@ def api_stats():
 def api_providers():
     providers = load_providers()
     return {name: info.get("description", name) for name, info in providers.items()}
+
+
+@app.get("/api/projects")
+def api_projects():
+    """Return sorted list of {name, path} for subdirs under PP_PROJECTS_ROOT."""
+    if not PROJECTS_ROOT:
+        return []
+    try:
+        entries = []
+        for d in sorted(os.listdir(PROJECTS_ROOT)):
+            full = os.path.join(PROJECTS_ROOT, d)
+            if os.path.isdir(full) and not d.startswith("."):
+                entries.append({"name": d, "path": full})
+        return entries
+    except OSError:
+        return []
 
 
 # --- Frontend ---

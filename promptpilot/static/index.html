@@ -342,7 +342,8 @@
       <label>Schedule
         <input type="datetime-local" id="scheduleInput">
       </label>
-      <label>Working dir
+      <label id="workdirLabel">Dir
+        <select id="workdirSelect" style="display:none" onchange="onProjectSelect()"></select>
         <input type="text" id="workdirInput" placeholder="C:\Projects\MyApp">
       </label>
       <button class="btn btn-primary" onclick="addTask()">Add Task</button>
@@ -545,7 +546,9 @@ async function addTask() {
   const priority = parseInt(document.getElementById('priorityInput').value);
   const schedule = document.getElementById('scheduleInput').value || null;
   const provider = document.getElementById('providerInput').value || null;
-  const workdir = document.getElementById('workdirInput').value.trim() || null;
+  const sel = document.getElementById('workdirSelect');
+  const selVal = sel.style.display !== 'none' && sel.value && sel.value !== '__custom__' ? sel.value : null;
+  const workdir = selVal || document.getElementById('workdirInput').value.trim() || null;
 
   await fetchJSON(`${API}/tasks`, {
     method: 'POST',
@@ -651,9 +654,42 @@ async function loadProviders() {
     .join('');
 }
 
+// --- Load projects into dir select ---
+async function loadProjects() {
+  const projects = await fetchJSON(`${API}/projects`);
+  const sel = document.getElementById('workdirSelect');
+  const inp = document.getElementById('workdirInput');
+  if (!projects || !projects.length) return;
+
+  sel.innerHTML = [
+    '<option value="">— Select project —</option>',
+    ...projects.map(p => `<option value="${esc(p.path)}">${esc(p.name)}</option>`),
+    '<option value="__custom__">✏️ Custom path...</option>',
+  ].join('');
+
+  sel.style.display = '';
+  inp.style.display = 'none';
+  inp.placeholder = '';
+}
+
+function onProjectSelect() {
+  const sel = document.getElementById('workdirSelect');
+  const inp = document.getElementById('workdirInput');
+  if (sel.value === '__custom__') {
+    inp.style.display = '';
+    inp.placeholder = 'C:\\Projects\\MyApp';
+    inp.value = '';
+    inp.focus();
+  } else {
+    inp.style.display = 'none';
+    inp.value = '';
+  }
+}
+
 // --- Init ---
 setDefaultSchedule();
 loadProviders();
+loadProjects();
 refresh();
 setInterval(refresh, 5000);
 </script>
