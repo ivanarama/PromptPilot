@@ -408,16 +408,14 @@ async def add_task_got_provider(update: Update, context: ContextTypes.DEFAULT_TY
     return ASK_PRIORITY
 
 
-def _list_projects() -> list[str]:
+def _list_projects():
     """Return sorted list of immediate subdirectories under PROJECTS_ROOT."""
-    import os as _os
     if not PROJECTS_ROOT:
         return []
-    root = PROJECTS_ROOT
     try:
         return sorted(
-            d for d in _os.listdir(root)
-            if _os.path.isdir(_os.path.join(root, d)) and not d.startswith(".")
+            d for d in os.listdir(PROJECTS_ROOT)
+            if os.path.isdir(os.path.join(PROJECTS_ROOT, d)) and not d.startswith(".")
         )
     except OSError:
         return []
@@ -473,8 +471,7 @@ async def add_task_got_dir_btn(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return ASK_DIR_MANUAL
     else:
-        import os as _os
-        full_path = _os.path.join(PROJECTS_ROOT, value)
+        full_path = os.path.join(PROJECTS_ROOT, value)
         context.user_data["new_dir"] = full_path
         await query.edit_message_text(f"Директория: `{full_path}`", parse_mode="Markdown")
         return await _ask_schedule_from_query(query, context)
