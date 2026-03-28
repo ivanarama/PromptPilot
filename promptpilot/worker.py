@@ -190,9 +190,11 @@ def execute_task(task):
         return
 
     # Parse output
+    model_used = None
     if is_stream_json(result.stdout):
         parsed = parse_stream_json(result.stdout)
         output = format_result(parsed)
+        model_used = parsed["meta"].get("model")
         # Check for rate limit in stream events
         rl = parsed.get("rate_limit_info")
         if rl and rl.get("status") != "allowed":
@@ -207,7 +209,7 @@ def execute_task(task):
         # Plain text output (non-Claude CLIs)
         output = result.stdout
 
-    db.mark_completed(task.id, output, exit_code=0)
+    db.mark_completed(task.id, output, exit_code=0, model_used=model_used)
     text_preview = output[:80].replace("\n", " ").strip()
     print(f"  -> Completed: {text_preview}")
 

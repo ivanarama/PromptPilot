@@ -25,7 +25,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     error TEXT,
     retry_count INTEGER NOT NULL DEFAULT 0,
     max_retries INTEGER NOT NULL DEFAULT 5,
-    exit_code INTEGER
+    exit_code INTEGER,
+    model_used TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
@@ -34,6 +35,7 @@ CREATE INDEX IF NOT EXISTS idx_tasks_runnable ON tasks(status, priority, next_ru
 
 MIGRATIONS = [
     "ALTER TABLE tasks ADD COLUMN provider TEXT",
+    "ALTER TABLE tasks ADD COLUMN model_used TEXT",
 ]
 
 
@@ -152,11 +154,11 @@ def get_next_runnable() -> Optional[TaskInDB]:
         return None
 
 
-def mark_completed(task_id: int, result: str, exit_code: int = 0):
+def mark_completed(task_id: int, result: str, exit_code: int = 0, model_used: str = None):
     with _connect() as conn:
         conn.execute(
-            "UPDATE tasks SET status = 'completed', result = ?, exit_code = ?, completed_at = ? WHERE id = ?",
-            (result, exit_code, _now(), task_id),
+            "UPDATE tasks SET status = 'completed', result = ?, exit_code = ?, completed_at = ?, model_used = ? WHERE id = ?",
+            (result, exit_code, _now(), model_used, task_id),
         )
 
 

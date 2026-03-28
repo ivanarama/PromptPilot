@@ -47,6 +47,7 @@ class TaskInDB(BaseModel):
     retry_count: int = 0
     max_retries: int = 5
     exit_code: Optional[int] = None
+    model_used: Optional[str] = None
 
 
 class Stats(BaseModel):

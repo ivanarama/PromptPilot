@@ -169,6 +169,9 @@ def get_provider_env(provider: str) -> dict:
     return env
 
 
+# Projects root — optional directory whose subdirectories are offered as project choices
+PROJECTS_ROOT = os.environ.get("PP_PROJECTS_ROOT", "")
+
 # Server
 HOST = os.environ.get("PP_HOST", "127.0.0.1")
 PORT = int(os.environ.get("PP_PORT", "8420"))

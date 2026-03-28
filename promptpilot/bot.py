@@ -27,14 +27,14 @@ from telegram.ext import (
 )
 
 from . import db
-from .config import load_providers
+from .config import load_providers, PROJECTS_ROOT
 from .models import TaskCreate, TaskStatus
 from .tg_auth import authorize_user, is_authorized, load_allowed_phones
 
 logger = logging.getLogger(__name__)
 
 # Conversation states
-ASK_PROMPT, ASK_PROVIDER, ASK_PRIORITY, ASK_DIR, ASK_SCHEDULE = range(5)
+ASK_PROMPT, ASK_PROVIDER, ASK_PRIORITY, ASK_DIR, ASK_DIR_MANUAL, ASK_SCHEDULE = range(6)
 
 PAGE_SIZE = 5
 
@@ -234,17 +234,34 @@ async def cb_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"*Задача \\#{task.id}*\n"
         f"Статус: {icon} {task.status.value}\n"
         f"Провайдер: {provider_str}\n"
+    )
+    if task.model_used:
+        text += f"Модель: `{_esc(task.model_used)}`\n"
+    text += (
         f"Приоритет: {task.priority}\n"
         f"Создана: {created}\n"
         f"Retry: {task.retry_count}/{task.max_retries}"
     )
     if task.working_dir:
-        text += f"\nДир: `{task.working_dir}`"
+        text += f"\nДир: `{_esc(task.working_dir)}`"
+    if task.status.value == "rate_limited" and task.next_run_at:
+        reset_str = task.next_run_at.strftime("%d\\.%m\\.%Y %H:%M UTC")
+        text += f"\nСброс: {reset_str}"
 
     text += f"\n\n*Промпт:*\n{_esc(task.prompt[:500])}"
 
     if task.result:
-        text += f"\n\n*Результат:*\n{_esc(task.result[:800])}"
+        # Show result text only (strip --- Meta --- block)
+        result_text = task.result.split("\n--- Meta ---")[0].strip()
+        if result_text:
+            text += f"\n\n*Результат:*\n{_esc(result_text[:800])}"
+        # Show model/cost summary from meta block
+        meta_block = task.result[task.result.find("--- Meta ---"):]
+        if "--- Meta ---" in task.result:
+            for line in meta_block.splitlines():
+                line = line.strip()
+                if line.startswith(("Model:", "Cost:", "Time:", "Tokens:", "Rate limit resets:")):
+                    text += f"\n{_esc(line)}"
     if task.error:
         text += f"\n\n*Ошибка:*\n{_esc(task.error[:300])}"
 
@@ -391,16 +408,76 @@ async def add_task_got_provider(update: Update, context: ContextTypes.DEFAULT_TY
     return ASK_PRIORITY
 
 
+def _list_projects() -> list[str]:
+    """Return sorted list of immediate subdirectories under PROJECTS_ROOT."""
+    import os as _os
+    if not PROJECTS_ROOT:
+        return []
+    root = PROJECTS_ROOT
+    try:
+        return sorted(
+            d for d in _os.listdir(root)
+            if _os.path.isdir(_os.path.join(root, d)) and not d.startswith(".")
+        )
+    except OSError:
+        return []
+
+
 async def add_task_got_priority(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     context.user_data["new_priority"] = int(query.data.split(":")[1])
 
-    await query.edit_message_text(
-        "Рабочая директория для выполнения задачи:\n"
-        "Введите путь или /skip чтобы пропустить."
-    )
-    return ASK_DIR
+    projects = _list_projects()
+    if projects:
+        # Show project selector
+        buttons = []
+        row = []
+        for proj in projects:
+            row.append(InlineKeyboardButton(proj, callback_data=f"dir:{proj}"))
+            if len(row) == 2:
+                buttons.append(row)
+                row = []
+        if row:
+            buttons.append(row)
+        buttons.append([
+            InlineKeyboardButton("✏️ Ввести вручную", callback_data="dir:__manual__"),
+            InlineKeyboardButton("⏭ Пропустить", callback_data="dir:__skip__"),
+        ])
+        await query.edit_message_text(
+            "Выберите рабочую директорию:",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return ASK_DIR
+    else:
+        await query.edit_message_text(
+            "Рабочая директория для выполнения задачи:\n"
+            "Введите путь или /skip чтобы пропустить."
+        )
+        return ASK_DIR_MANUAL
+
+
+async def add_task_got_dir_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle directory selection from inline keyboard."""
+    query = update.callback_query
+    await query.answer()
+    value = query.data.split(":", 1)[1]
+
+    if value == "__skip__":
+        context.user_data["new_dir"] = None
+        await query.edit_message_text("Директория: не указана")
+        return await _ask_schedule_from_query(query, context)
+    elif value == "__manual__":
+        await query.edit_message_text(
+            "Введите путь к директории или /skip чтобы пропустить:"
+        )
+        return ASK_DIR_MANUAL
+    else:
+        import os as _os
+        full_path = _os.path.join(PROJECTS_ROOT, value)
+        context.user_data["new_dir"] = full_path
+        await query.edit_message_text(f"Директория: `{full_path}`", parse_mode="Markdown")
+        return await _ask_schedule_from_query(query, context)
 
 
 async def add_task_got_dir(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -411,6 +488,27 @@ async def add_task_got_dir(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def add_task_skip_dir(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["new_dir"] = None
     return await _ask_schedule(update, context)
+
+
+async def _ask_schedule_from_query(query, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("▶ Сейчас", callback_data="sched:now"),
+            InlineKeyboardButton("+1ч",      callback_data="sched:+1h"),
+            InlineKeyboardButton("+3ч",      callback_data="sched:+3h"),
+        ],
+        [
+            InlineKeyboardButton("+8ч",      callback_data="sched:+8h"),
+            InlineKeyboardButton("+24ч",     callback_data="sched:+24h"),
+        ],
+    ])
+    await query.message.reply_text(
+        "Когда запустить?\n"
+        "Выберите или введите время вручную (формат: `2026-03-27T03:00`)",
+        reply_markup=keyboard,
+        parse_mode="Markdown",
+    )
+    return ASK_SCHEDULE
 
 
 async def _ask_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -567,6 +665,9 @@ def run_bot():
                 CallbackQueryHandler(add_task_got_priority, pattern=r"^pri:")
             ],
             ASK_DIR: [
+                CallbackQueryHandler(add_task_got_dir_btn, pattern=r"^dir:"),
+            ],
+            ASK_DIR_MANUAL: [
                 CommandHandler("skip", add_task_skip_dir),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, add_task_got_dir),
             ],
