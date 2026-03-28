@@ -228,36 +228,34 @@ async def cb_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     icon = STATUS_ICON.get(task.status.value, "•")
     created = task.created_at.strftime("%d.%m.%Y %H:%M") if task.created_at else "—"
-    provider_str = task.provider or "claude \\(по умолчанию\\)"
+    provider_str = _esc(task.provider) if task.provider else "claude \\(по умолчанию\\)"
 
     text = (
         f"*Задача \\#{task.id}*\n"
-        f"Статус: {icon} {task.status.value}\n"
+        f"Статус: {icon} {_esc(task.status.value)}\n"
         f"Провайдер: {provider_str}\n"
     )
     if task.model_used:
         text += f"Модель: `{_esc(task.model_used)}`\n"
     text += (
         f"Приоритет: {task.priority}\n"
-        f"Создана: {created}\n"
+        f"Создана: {_esc(created)}\n"
         f"Retry: {task.retry_count}/{task.max_retries}"
     )
     if task.working_dir:
         text += f"\nДир: `{_esc(task.working_dir)}`"
     if task.status.value == "rate_limited" and task.next_run_at:
-        reset_str = task.next_run_at.strftime("%d\\.%m\\.%Y %H:%M UTC")
-        text += f"\nСброс: {reset_str}"
+        reset_str = task.next_run_at.strftime("%d.%m.%Y %H:%M UTC")
+        text += f"\nСброс: {_esc(reset_str)}"
 
     text += f"\n\n*Промпт:*\n{_esc(task.prompt[:500])}"
 
     if task.result:
-        # Show result text only (strip --- Meta --- block)
         result_text = task.result.split("\n--- Meta ---")[0].strip()
         if result_text:
             text += f"\n\n*Результат:*\n{_esc(result_text[:800])}"
-        # Show model/cost summary from meta block
-        meta_block = task.result[task.result.find("--- Meta ---"):]
         if "--- Meta ---" in task.result:
+            meta_block = task.result[task.result.find("--- Meta ---"):]
             for line in meta_block.splitlines():
                 line = line.strip()
                 if line.startswith(("Model:", "Cost:", "Time:", "Tokens:", "Rate limit resets:")):
