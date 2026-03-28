@@ -11,6 +11,20 @@ $ErrorActionPreference = "Stop"
 $pidFile = "$PSScriptRoot\.pp-pids.json"
 $logDir  = "$PSScriptRoot\logs"
 
+# Load .env if present (same logic as config.py)
+$envFile = "$PSScriptRoot\.env"
+if (Test-Path $envFile) {
+    Get-Content $envFile | ForEach-Object {
+        if ($_ -match '^\s*([^#][^=]*?)\s*=\s*"?([^"]*)"?\s*$') {
+            $k = $Matches[1].Trim(); $v = $Matches[2].Trim()
+            if ($k -and -not [System.Environment]::GetEnvironmentVariable($k, 'Process')) {
+                [System.Environment]::SetEnvironmentVariable($k, $v, 'Process')
+            }
+        }
+    }
+    Write-Host "Loaded .env" -ForegroundColor DarkGray
+}
+
 # Check if already running
 if (Test-Path $pidFile) {
     $old = Get-Content $pidFile | ConvertFrom-Json

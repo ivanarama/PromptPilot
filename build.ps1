@@ -1,14 +1,18 @@
 # Build pp.exe with PyInstaller
-# Usage: .\build.ps1
+# Usage: .\build.ps1           — normal build
+#        .\build.ps1 -Debug    — verbose output for troubleshooting
+
+param([switch]$Debug)
 
 $ErrorActionPreference = "Stop"
 
 Write-Host "=== PromptPilot Build ===" -ForegroundColor Cyan
 
 # Install pyinstaller if missing
-if (-not (Get-Command pyinstaller -ErrorAction SilentlyContinue)) {
+python -m PyInstaller --version 2>$null | Out-Null
+if ($LASTEXITCODE -ne 0) {
     Write-Host "Installing PyInstaller..." -ForegroundColor Yellow
-    pip install pyinstaller
+    python -m pip install pyinstaller
 }
 
 # Clean previous build
@@ -16,8 +20,13 @@ if (Test-Path dist) { Remove-Item dist -Recurse -Force }
 if (Test-Path build) { Remove-Item build -Recurse -Force }
 
 # Build
-Write-Host "Building pp.exe..." -ForegroundColor Yellow
-pyinstaller pp.spec --clean
+if ($Debug) {
+    Write-Host "Building pp.exe (debug)..." -ForegroundColor Yellow
+    python -m PyInstaller pp.spec --clean --debug all
+} else {
+    Write-Host "Building pp.exe..." -ForegroundColor Yellow
+    python -m PyInstaller pp.spec --clean
+}
 
 if (Test-Path "dist\pp.exe") {
     $size = [math]::Round((Get-Item "dist\pp.exe").Length / 1MB, 1)

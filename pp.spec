@@ -5,7 +5,7 @@
 block_cipher = None
 
 a = Analysis(
-    ['promptpilot/__main__.py'],
+    ['main.py'],
     pathex=[],
     binaries=[],
     datas=[
@@ -35,6 +35,12 @@ a = Analysis(
         # telegram bot
         'telegram',
         'telegram.ext',
+        # tray
+        'pystray._win32',
+        'PIL',
+        'PIL.Image',
+        'PIL.ImageDraw',
+        'PIL.ImageFont',
     ],
     hookspath=[],
     hooksconfig={},

@@ -17,10 +17,14 @@ def _status_color(status: str) -> str:
     }.get(status, "white")
 
 
-@click.group()
-def cli():
+@click.group(invoke_without_command=True)
+@click.pass_context
+def cli(ctx):
     """PromptPilot — AI Prompt Scheduler"""
-    pass
+    if ctx.invoked_subcommand is None:
+        # Default: launch tray app when run without arguments
+        from .tray import run_tray
+        run_tray()
 
 
 @cli.command()
@@ -232,6 +236,13 @@ def bot():
 
 
 @cli.command()
+def tray():
+    """Start the system tray launcher (default when run without arguments)."""
+    from .tray import run_tray
+    run_tray()
+
+
+@cli.command()
 @click.option("-h", "--host", default=None, help="Host (default: 127.0.0.1)")
 @click.option("-p", "--port", default=None, type=int, help="Port (default: 8420)")
 def server(host, port):
@@ -241,8 +252,9 @@ def server(host, port):
 
     h = host or HOST
     p = port or PORT
+    from .api import app
     click.echo(f"PromptPilot UI: http://{h}:{p}")
-    uvicorn.run("promptpilot.api:app", host=h, port=p, log_level="info")
+    uvicorn.run(app, host=h, port=p, log_level="info")
 
 
 if __name__ == "__main__":

@@ -2,7 +2,48 @@
 
 import json
 import os
+import sys
 from pathlib import Path
+
+
+def _load_dotenv():
+    """Load .env file into os.environ (only for keys not already set).
+
+    Search order:
+      1. Directory of pp.exe  (when running as PyInstaller bundle)
+      2. Current working directory
+      3. ~/.promptpilot/.env  (permanent user config)
+    """
+    candidates = []
+
+    if getattr(sys, "frozen", False):
+        # Running as pp.exe — look next to the binary first
+        candidates.append(Path(sys.executable).parent / ".env")
+
+    candidates.append(Path.cwd() / ".env")
+    candidates.append(Path.home() / ".promptpilot" / ".env")
+
+    for env_file in candidates:
+        if env_file.exists():
+            try:
+                with open(env_file, encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("#"):
+                            continue
+                        if "=" in line:
+                            key, _, value = line.partition("=")
+                            key = key.strip()
+                            value = value.strip().strip('"').strip("'")
+                            if key and key not in os.environ:
+                                os.environ[key] = value
+            except OSError:
+                pass
+            break  # use the first .env found
+
+
+# Load .env BEFORE reading any os.environ values
+_load_dotenv()
 
 # Database
 DB_DIR = Path(os.environ.get("PP_DATA_DIR", Path.home() / ".promptpilot"))

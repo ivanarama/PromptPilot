@@ -34,7 +34,7 @@ from .tg_auth import authorize_user, is_authorized, load_allowed_phones
 logger = logging.getLogger(__name__)
 
 # Conversation states
-ASK_PROMPT, ASK_PROVIDER, ASK_PRIORITY, ASK_DIR = range(4)
+ASK_PROMPT, ASK_PROVIDER, ASK_PRIORITY, ASK_DIR, ASK_SCHEDULE = range(5)
 
 PAGE_SIZE = 5
 
@@ -228,11 +228,12 @@ async def cb_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     icon = STATUS_ICON.get(task.status.value, "•")
     created = task.created_at.strftime("%d.%m.%Y %H:%M") if task.created_at else "—"
+    provider_str = task.provider or "claude \\(по умолчанию\\)"
 
     text = (
         f"*Задача \\#{task.id}*\n"
         f"Статус: {icon} {task.status.value}\n"
-        f"Провайдер: {task.provider or 'claude \\(по умолчанию\\)'}\n"
+        f"Провайдер: {provider_str}\n"
         f"Приоритет: {task.priority}\n"
         f"Создана: {created}\n"
         f"Retry: {task.retry_count}/{task.max_retries}"
@@ -403,40 +404,133 @@ async def add_task_got_priority(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def add_task_got_dir(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    working_dir = update.message.text.strip() or None
-    return await _finish_add_task(update, context, working_dir)
+    context.user_data["new_dir"] = update.message.text.strip() or None
+    return await _ask_schedule(update, context)
 
 
 async def add_task_skip_dir(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    return await _finish_add_task(update, context, None)
+    context.user_data["new_dir"] = None
+    return await _ask_schedule(update, context)
 
 
-async def _finish_add_task(update: Update, context: ContextTypes.DEFAULT_TYPE, working_dir):
+async def _ask_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("▶ Сейчас", callback_data="sched:now"),
+            InlineKeyboardButton("+1ч",      callback_data="sched:+1h"),
+            InlineKeyboardButton("+3ч",      callback_data="sched:+3h"),
+        ],
+        [
+            InlineKeyboardButton("+8ч",      callback_data="sched:+8h"),
+            InlineKeyboardButton("+24ч",     callback_data="sched:+24h"),
+        ],
+    ])
+    await update.message.reply_text(
+        "Когда запустить?\n"
+        "Выберите или введите время вручную (формат: `2026-03-27T03:00`)",
+        reply_markup=keyboard,
+        parse_mode="Markdown",
+    )
+    return ASK_SCHEDULE
+
+
+async def add_task_got_schedule_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from datetime import datetime, timedelta, timezone
+    query = update.callback_query
+    await query.answer()
+
+    value = query.data.split(":", 1)[1]
+    now = datetime.now(timezone.utc)
+    offsets = {"+1h": 1, "+3h": 3, "+8h": 8, "+24h": 24}
+
+    if value == "now":
+        scheduled_at = None
+    elif value in offsets:
+        scheduled_at = now + timedelta(hours=offsets[value])
+    else:
+        scheduled_at = None
+
+    context.user_data["new_schedule"] = scheduled_at
+    await query.edit_message_text(
+        "Время выбрано: " + (scheduled_at.strftime("%d.%m.%Y %H:%M UTC") if scheduled_at else "сейчас")
+    )
+    return await _finish_add_task_from_query(query, context)
+
+
+async def add_task_got_schedule_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from datetime import datetime
+    text = update.message.text.strip()
+    try:
+        scheduled_at = datetime.fromisoformat(text)
+    except ValueError:
+        await update.message.reply_text(
+            "Не удалось распознать время. Используй формат `2026-03-27T03:00` или выбери кнопку.",
+            parse_mode="Markdown",
+        )
+        return ASK_SCHEDULE
+
+    context.user_data["new_schedule"] = scheduled_at
+    return await _finish_add_task(update, context)
+
+
+async def _finish_add_task_from_query(query, context):
+    """Called after inline button — uses query.message for reply."""
+    from .models import TaskCreate
     prompt = context.user_data.pop("new_prompt", "")
     provider = context.user_data.pop("new_provider", None)
     priority = context.user_data.pop("new_priority", 5)
+    working_dir = context.user_data.pop("new_dir", None)
+    scheduled_at = context.user_data.pop("new_schedule", None)
 
     task = db.create_task(TaskCreate(
         prompt=prompt,
         working_dir=working_dir,
         provider=provider,
         priority=priority,
+        scheduled_at=scheduled_at,
     ))
 
-    prov_str = provider or "claude (по умолчанию)"
-    dir_str = working_dir or "не указана"
+    sched_str = scheduled_at.strftime("%d.%m.%Y %H:%M UTC") if scheduled_at else "сейчас"
+    await query.message.reply_text(
+        f"✅ Задача #{task.id} добавлена!\n"
+        f"Провайдер: {provider or 'claude (по умолчанию)'}\n"
+        f"Приоритет: {priority}\n"
+        f"Директория: {working_dir or 'не указана'}\n"
+        f"Запуск: {sched_str}",
+        reply_markup=_main_menu(),
+    )
+    return ConversationHandler.END
+
+
+async def _finish_add_task(update: Update, context: ContextTypes.DEFAULT_TYPE, working_dir=None):
+    prompt = context.user_data.pop("new_prompt", "")
+    provider = context.user_data.pop("new_provider", None)
+    priority = context.user_data.pop("new_priority", 5)
+    working_dir = working_dir or context.user_data.pop("new_dir", None)
+    scheduled_at = context.user_data.pop("new_schedule", None)
+
+    task = db.create_task(TaskCreate(
+        prompt=prompt,
+        working_dir=working_dir,
+        provider=provider,
+        priority=priority,
+        scheduled_at=scheduled_at,
+    ))
+
+    sched_str = scheduled_at.strftime("%d.%m.%Y %H:%M UTC") if scheduled_at else "сейчас"
     await update.message.reply_text(
         f"✅ Задача #{task.id} добавлена!\n"
-        f"Провайдер: {prov_str}\n"
+        f"Провайдер: {provider or 'claude (по умолчанию)'}\n"
         f"Приоритет: {priority}\n"
-        f"Директория: {dir_str}",
+        f"Директория: {working_dir or 'не указана'}\n"
+        f"Запуск: {sched_str}",
         reply_markup=_main_menu(),
     )
     return ConversationHandler.END
 
 
 async def add_task_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    for key in ("new_prompt", "new_provider", "new_priority"):
+    for key in ("new_prompt", "new_provider", "new_priority", "new_dir", "new_schedule"):
         context.user_data.pop(key, None)
     await update.message.reply_text("Отменено.", reply_markup=_main_menu())
     return ConversationHandler.END
@@ -475,6 +569,10 @@ def run_bot():
             ASK_DIR: [
                 CommandHandler("skip", add_task_skip_dir),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, add_task_got_dir),
+            ],
+            ASK_SCHEDULE: [
+                CallbackQueryHandler(add_task_got_schedule_btn, pattern=r"^sched:"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_task_got_schedule_text),
             ],
         },
         fallbacks=[CommandHandler("cancel", add_task_cancel)],
