@@ -23,6 +23,7 @@ class TaskCreate(BaseModel):
     priority: int = Field(default=5, ge=1, le=10)
     scheduled_at: Optional[datetime] = None
     max_retries: int = Field(default=5, ge=0, le=50)
+    skip_permissions: bool = False
 
 
 class TaskUpdate(BaseModel):
@@ -48,6 +49,7 @@ class TaskInDB(BaseModel):
     max_retries: int = 5
     exit_code: Optional[int] = None
     model_used: Optional[str] = None
+    skip_permissions: bool = False
 
 
 class Stats(BaseModel):

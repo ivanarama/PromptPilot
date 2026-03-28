@@ -26,7 +26,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     retry_count INTEGER NOT NULL DEFAULT 0,
     max_retries INTEGER NOT NULL DEFAULT 5,
     exit_code INTEGER,
-    model_used TEXT
+    model_used TEXT,
+    skip_permissions INTEGER DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
@@ -36,6 +37,7 @@ CREATE INDEX IF NOT EXISTS idx_tasks_runnable ON tasks(status, priority, next_ru
 MIGRATIONS = [
     "ALTER TABLE tasks ADD COLUMN provider TEXT",
     "ALTER TABLE tasks ADD COLUMN model_used TEXT",
+    "ALTER TABLE tasks ADD COLUMN skip_permissions INTEGER DEFAULT 0",
 ]
 
 
@@ -87,8 +89,8 @@ def init_db():
 def create_task(task: TaskCreate) -> TaskInDB:
     with _connect() as conn:
         cur = conn.execute(
-            """INSERT INTO tasks (prompt, working_dir, provider, status, priority, scheduled_at, created_at, max_retries)
-               VALUES (?, ?, ?, 'pending', ?, ?, ?, ?)""",
+            """INSERT INTO tasks (prompt, working_dir, provider, status, priority, scheduled_at, created_at, max_retries, skip_permissions)
+               VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?)""",
             (
                 task.prompt,
                 task.working_dir,
@@ -97,6 +99,7 @@ def create_task(task: TaskCreate) -> TaskInDB:
                 task.scheduled_at.isoformat() if task.scheduled_at else None,
                 _now(),
                 task.max_retries,
+                int(task.skip_permissions),
             ),
         )
         return get_task(cur.lastrowid, conn=conn)
@@ -117,7 +120,7 @@ def list_tasks(
     status: Optional[TaskStatus] = None,
     limit: int = 50,
     offset: int = 0,
-) -> list[TaskInDB]:
+):
     with _connect() as conn:
         if status:
             rows = conn.execute(

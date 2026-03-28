@@ -346,6 +346,10 @@
         <select id="workdirSelect" style="display:none" onchange="onProjectSelect()"></select>
         <input type="text" id="workdirInput" placeholder="C:\Projects\MyApp">
       </label>
+      <label style="flex-direction:row;align-items:center;gap:8px;cursor:pointer">
+        <input type="checkbox" id="skipPermissions" style="width:auto;margin:0">
+        <span style="font-size:13px;color:var(--yellow)">--dangerously-skip-permissions</span>
+      </label>
       <button class="btn btn-primary" onclick="addTask()">Add Task</button>
     </div>
   </div>
@@ -549,6 +553,7 @@ async function addTask() {
   const sel = document.getElementById('workdirSelect');
   const selVal = sel.style.display !== 'none' && sel.value && sel.value !== '__custom__' ? sel.value : null;
   const workdir = selVal || document.getElementById('workdirInput').value.trim() || null;
+  const skipPermissions = document.getElementById('skipPermissions').checked;
 
   await fetchJSON(`${API}/tasks`, {
     method: 'POST',
@@ -558,6 +563,7 @@ async function addTask() {
       provider,
       priority,
       working_dir: workdir,
+      skip_permissions: skipPermissions,
       scheduled_at: schedule ? new Date(schedule).toISOString() : null,
     }),
   });

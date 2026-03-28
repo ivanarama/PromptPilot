@@ -34,7 +34,7 @@ from .tg_auth import authorize_user, is_authorized, load_allowed_phones
 logger = logging.getLogger(__name__)
 
 # Conversation states
-ASK_PROMPT, ASK_PROVIDER, ASK_PRIORITY, ASK_DIR, ASK_DIR_MANUAL, ASK_SCHEDULE = range(6)
+ASK_PROMPT, ASK_PROVIDER, ASK_PRIORITY, ASK_SKIP_PERMS, ASK_DIR, ASK_DIR_MANUAL, ASK_SCHEDULE = range(7)
 
 PAGE_SIZE = 5
 
@@ -424,6 +424,25 @@ async def add_task_got_priority(update: Update, context: ContextTypes.DEFAULT_TY
     await query.answer()
     context.user_data["new_priority"] = int(query.data.split(":")[1])
 
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Да (--dangerously-skip-permissions)", callback_data="skipper:yes"),
+            InlineKeyboardButton("❌ Нет", callback_data="skipper:no"),
+        ]
+    ])
+    await query.edit_message_text(
+        "Запустить с `--dangerously-skip-permissions`?",
+        reply_markup=keyboard,
+        parse_mode="MarkdownV2",
+    )
+    return ASK_SKIP_PERMS
+
+
+async def add_task_got_skip_perms(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data["new_skip_permissions"] = query.data == "skipper:yes"
+
     projects = _list_projects()
     if projects:
         # Show project selector
@@ -574,6 +593,7 @@ async def _finish_add_task_from_query(query, context):
     priority = context.user_data.pop("new_priority", 5)
     working_dir = context.user_data.pop("new_dir", None)
     scheduled_at = context.user_data.pop("new_schedule", None)
+    skip_permissions = context.user_data.pop("new_skip_permissions", False)
 
     task = db.create_task(TaskCreate(
         prompt=prompt,
@@ -581,15 +601,17 @@ async def _finish_add_task_from_query(query, context):
         provider=provider,
         priority=priority,
         scheduled_at=scheduled_at,
+        skip_permissions=skip_permissions,
     ))
 
     sched_str = scheduled_at.strftime("%d.%m.%Y %H:%M UTC") if scheduled_at else "сейчас"
+    skip_str = " ⚠️ --dangerously-skip-permissions" if skip_permissions else ""
     await query.message.reply_text(
         f"✅ Задача #{task.id} добавлена!\n"
         f"Провайдер: {provider or 'claude (по умолчанию)'}\n"
         f"Приоритет: {priority}\n"
         f"Директория: {working_dir or 'не указана'}\n"
-        f"Запуск: {sched_str}",
+        f"Запуск: {sched_str}{skip_str}",
         reply_markup=_main_menu(),
     )
     return ConversationHandler.END
@@ -601,6 +623,7 @@ async def _finish_add_task(update: Update, context: ContextTypes.DEFAULT_TYPE, w
     priority = context.user_data.pop("new_priority", 5)
     working_dir = working_dir or context.user_data.pop("new_dir", None)
     scheduled_at = context.user_data.pop("new_schedule", None)
+    skip_permissions = context.user_data.pop("new_skip_permissions", False)
 
     task = db.create_task(TaskCreate(
         prompt=prompt,
@@ -608,15 +631,17 @@ async def _finish_add_task(update: Update, context: ContextTypes.DEFAULT_TYPE, w
         provider=provider,
         priority=priority,
         scheduled_at=scheduled_at,
+        skip_permissions=skip_permissions,
     ))
 
     sched_str = scheduled_at.strftime("%d.%m.%Y %H:%M UTC") if scheduled_at else "сейчас"
+    skip_str = " ⚠️ --dangerously-skip-permissions" if skip_permissions else ""
     await update.message.reply_text(
         f"✅ Задача #{task.id} добавлена!\n"
         f"Провайдер: {provider or 'claude (по умолчанию)'}\n"
         f"Приоритет: {priority}\n"
         f"Директория: {working_dir or 'не указана'}\n"
-        f"Запуск: {sched_str}",
+        f"Запуск: {sched_str}{skip_str}",
         reply_markup=_main_menu(),
     )
     return ConversationHandler.END
@@ -658,6 +683,9 @@ def run_bot():
             ],
             ASK_PRIORITY: [
                 CallbackQueryHandler(add_task_got_priority, pattern=r"^pri:")
+            ],
+            ASK_SKIP_PERMS: [
+                CallbackQueryHandler(add_task_got_skip_perms, pattern=r"^skipper:"),
             ],
             ASK_DIR: [
                 CallbackQueryHandler(add_task_got_dir_btn, pattern=r"^dir:"),
