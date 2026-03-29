@@ -1,7 +1,7 @@
 # Start PromptPilot services (worker + server + optional bot)
 # Usage:
-#   .\start.ps1           — worker + server
-#   .\start.ps1 -Bot      — worker + server + bot (requires PP_TG_TOKEN)
+#   .\start.ps1           - worker + server
+#   .\start.ps1 -Bot      - worker + server + bot (requires PP_TG_TOKEN)
 
 param(
     [switch]$Bot
