@@ -905,13 +905,9 @@ async def cb_skills_dir(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     rows = list(keyboard.inline_keyboard)
     rows.append([InlineKeyboardButton("◀ Назад", callback_data="skills_proj_picker")])
-    try:
-        await query.edit_message_text(
-            text, parse_mode="MarkdownV2", reply_markup=InlineKeyboardMarkup(rows)
-        )
-    except Exception as e:
-        logger.error("cb_skills_dir edit failed: %s", e)
-        await query.edit_message_text(f"Ошибка: {e}")
+    await query.edit_message_text(
+        text, parse_mode="MarkdownV2", reply_markup=InlineKeyboardMarkup(rows)
+    )
 
 
 async def cb_skills_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1053,6 +1049,13 @@ def run_bot():
         fallbacks=[CommandHandler("cancel", reply_cancel)],
     )
 
+    # Group -1: skills navigation runs before ConversationHandlers (group 0).
+    # ConversationHandler eats all callbacks when in an active state, so
+    # skills_dir / skills_proj_picker / skills_back must be in a higher-priority group.
+    app.add_handler(CallbackQueryHandler(cb_skills_proj_picker, pattern=r"^skills_proj_picker$"), group=-1)
+    app.add_handler(CallbackQueryHandler(cb_skills_dir, pattern=r"^skills_dir:"), group=-1)
+    app.add_handler(CallbackQueryHandler(cb_skills_back, pattern=r"^skills_back$"), group=-1)
+
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("skills", cmd_skills))
     app.add_handler(MessageHandler(filters.CONTACT, handle_contact))
@@ -1062,9 +1065,6 @@ def run_bot():
     app.add_handler(MessageHandler(filters.Regex("^📊 Статистика$"), show_stats))
     app.add_handler(MessageHandler(filters.Regex("^🔌 Провайдеры$"), show_providers))
     app.add_handler(MessageHandler(filters.Regex("^⚡ Скилы$"), cmd_skills))
-    app.add_handler(CallbackQueryHandler(cb_skills_proj_picker, pattern=r"^skills_proj_picker$"))
-    app.add_handler(CallbackQueryHandler(cb_skills_dir, pattern=r"^skills_dir:"))
-    app.add_handler(CallbackQueryHandler(cb_skills_back, pattern=r"^skills_back$"))
     app.add_handler(CallbackQueryHandler(cb_task, pattern=r"^task:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_page, pattern=r"^page:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_cancel_task, pattern=r"^cancel_task:\d+$"))
