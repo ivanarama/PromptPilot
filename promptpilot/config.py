@@ -70,10 +70,12 @@ BUILTIN_PROVIDERS = {
     "claude": {
         "cmd": f"{CLAUDE_EXE} -p --verbose --output-format stream-json {{prompt}}",
         "description": "Claude Code (Anthropic)",
+        "supports_skills": True,
     },
     "claude-z": {
         "cmd": f"{CLAUDE_EXE} -p --verbose --output-format stream-json {{prompt}}",
         "description": "Claude Code (GLM)",
+        "supports_skills": True,
         "env": {
             "ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic",
             "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-4.7",
@@ -83,10 +85,12 @@ BUILTIN_PROVIDERS = {
     "codex": {
         "cmd": "codex -q {prompt}",
         "description": "OpenAI Codex",
+        "supports_skills": False,
     },
     "qwen": {
         "cmd": "qwen -p {prompt}",
         "description": "Qwen Code",
+        "supports_skills": False,
     },
 }
 
@@ -96,14 +100,23 @@ def _providers_file() -> Path:
 
 
 def load_providers() -> dict:
-    """Load providers: built-in + user overrides from providers.json."""
+    """Load providers: built-in + user overrides from providers.json.
+
+    When a custom provider overrides a built-in one, it inherits supports_skills
+    from the built-in if not explicitly set (so claude-z stays skill-capable even
+    if the custom entry in providers.json doesn't repeat the flag).
+    """
     providers = dict(BUILTIN_PROVIDERS)
     user_file = _providers_file()
     if user_file.exists():
         try:
             with open(user_file) as f:
                 custom = json.load(f)
-            providers.update(custom)
+            for name, info in custom.items():
+                if name in providers and "supports_skills" not in info:
+                    info = dict(info)
+                    info["supports_skills"] = providers[name].get("supports_skills", False)
+                providers[name] = info
         except (json.JSONDecodeError, OSError):
             pass
     return providers
@@ -177,6 +190,72 @@ def get_provider_env(provider: str) -> dict:
     env = os.environ.copy()
     env.update(extra)
     return env
+
+
+def _parse_frontmatter(path: Path) -> dict:
+    """Parse YAML-style frontmatter (---...---) from a markdown file."""
+    try:
+        content = path.read_text(encoding="utf-8")
+        if not content.startswith("---"):
+            return {}
+        end = content.find("\n---", 3)
+        if end == -1:
+            return {}
+        result = {}
+        for line in content[3:end].splitlines():
+            if ":" in line:
+                key, _, value = line.partition(":")
+                result[key.strip()] = value.strip()
+        return result
+    except OSError:
+        return {}
+
+
+def get_skills(working_dir: str = None) -> list:
+    """Return list of available Claude Code skills from ~/.claude/commands/ and plugins.
+
+    Each item: {name, description, argument_hint, source}
+    Skills are invoked as /skill-name [args] when passed as a task prompt to Claude Code.
+    Only relevant for providers with supports_skills=True (claude, claude-z).
+    """
+    skills = []
+    seen = set()
+
+    def _add_from_dir(dir_path: Path, source: str):
+        if not dir_path.is_dir():
+            return
+        for cmd_file in sorted(dir_path.glob("*.md")):
+            if cmd_file.name.lower() == "readme.md":
+                continue
+            name = cmd_file.stem
+            if name in seen:
+                continue
+            seen.add(name)
+            fm = _parse_frontmatter(cmd_file)
+            skills.append({
+                "name": name,
+                "description": fm.get("description", ""),
+                "argument_hint": fm.get("argument-hint", ""),
+                "source": source,
+            })
+
+    # Global user commands
+    _add_from_dir(Path.home() / ".claude" / "commands", "user")
+
+    # Plugin commands — scan all directories named "commands" under ~/.claude/plugins/
+    # but skip any that are inside a "skills/" documentation path
+    plugins_dir = Path.home() / ".claude" / "plugins"
+    if plugins_dir.is_dir():
+        for cmd_dir in sorted(plugins_dir.rglob("commands")):
+            if cmd_dir.is_dir() and "skills" not in cmd_dir.parts:
+                plugin_name = cmd_dir.parent.name
+                _add_from_dir(cmd_dir, f"plugin:{plugin_name}")
+
+    # Project-local commands
+    if working_dir:
+        _add_from_dir(Path(working_dir) / ".claude" / "commands", "local")
+
+    return skills
 
 
 # Projects root — optional directory whose subdirectories are offered as project choices

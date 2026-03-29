@@ -11,7 +11,7 @@ from fastapi.staticfiles import StaticFiles
 import os
 
 from . import db
-from .config import load_providers, PROJECTS_ROOT
+from .config import get_skills, load_providers, PROJECTS_ROOT
 from .models import Stats, TaskCreate, TaskInDB, TaskStatus, TaskUpdate
 
 app = FastAPI(title="PromptPilot", version="0.1.0")
@@ -82,7 +82,23 @@ def api_stats():
 @app.get("/api/providers")
 def api_providers():
     providers = load_providers()
-    return {name: info.get("description", name) for name, info in providers.items()}
+    return {
+        name: {
+            "description": info.get("description", name),
+            "supports_skills": info.get("supports_skills", False),
+        }
+        for name, info in providers.items()
+    }
+
+
+@app.get("/api/skills")
+def api_skills(provider: Optional[str] = None, workdir: Optional[str] = None):
+    """Return available Claude Code skills. Empty list if provider doesn't support skills."""
+    if provider is not None:
+        providers = load_providers()
+        if not providers.get(provider, {}).get("supports_skills", False):
+            return []
+    return get_skills(working_dir=workdir)
 
 
 @app.get("/api/projects")

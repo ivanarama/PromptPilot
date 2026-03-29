@@ -310,6 +310,51 @@
   }
   .filter-btn:hover { border-color: var(--accent); color: var(--text); }
   .filter-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+
+  /* Skills panel */
+  .skills-toggle-row {
+    display: none;
+    margin-bottom: 8px;
+    align-items: center;
+    gap: 8px;
+  }
+  .skills-toggle-row.visible { display: flex; }
+  .btn-skills {
+    padding: 4px 12px;
+    font-size: 12px;
+    border-radius: 4px;
+    background: transparent;
+    color: var(--accent2);
+    border: 1px solid var(--accent);
+    cursor: pointer;
+    transition: all .15s;
+  }
+  .btn-skills:hover, .btn-skills.open { background: var(--accent); color: #fff; }
+  .skills-hint { font-size: 11px; color: var(--text2); }
+
+  .skills-panel {
+    display: none;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    margin-bottom: 12px;
+    max-height: 220px;
+    overflow-y: auto;
+  }
+  .skills-panel.open { display: block; }
+  .skill-item {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    padding: 7px 12px;
+    cursor: pointer;
+    border-bottom: 1px solid var(--border);
+  }
+  .skill-item:last-child { border-bottom: none; }
+  .skill-item:hover { background: var(--surface2); }
+  .skill-name { font-family: var(--mono); font-size: 12px; color: var(--accent2); min-width: 120px; }
+  .skill-arghint { font-size: 11px; color: var(--yellow); }
+  .skill-desc { font-size: 11px; color: var(--text2); }
 </style>
 </head>
 <body>
@@ -321,6 +366,11 @@
 
   <div class="add-form">
     <textarea id="promptInput" placeholder="Enter your prompt here..."></textarea>
+    <div class="skills-toggle-row" id="skillsToggleRow">
+      <button type="button" class="btn-skills" id="skillsToggleBtn" onclick="toggleSkills()">⚡ Skills</button>
+      <span class="skills-hint">Claude Code only · /skill-name [args]</span>
+    </div>
+    <div class="skills-panel" id="skillsPanel"></div>
     <div class="form-row">
       <label>Provider
         <select id="providerInput"></select>
@@ -370,6 +420,9 @@
 const API = '/api';
 let currentFilter = '';
 let expandedId = null;
+let providersData = {};
+let skillsCache = {};
+let skillsPanelOpen = false;
 
 // --- API calls ---
 async function fetchJSON(url, opts) {
@@ -653,11 +706,76 @@ document.getElementById('promptInput').addEventListener('keydown', e => {
 
 // --- Load providers into dropdown ---
 async function loadProviders() {
-  const provs = await fetchJSON(`${API}/providers`);
+  providersData = await fetchJSON(`${API}/providers`);
   const sel = document.getElementById('providerInput');
-  sel.innerHTML = Object.entries(provs)
-    .map(([name, desc]) => `<option value="${esc(name)}">${esc(name)} — ${esc(desc)}</option>`)
+  sel.innerHTML = Object.entries(providersData)
+    .map(([name, info]) => `<option value="${esc(name)}">${esc(name)} — ${esc(info.description || info)}</option>`)
     .join('');
+  sel.addEventListener('change', () => { skillsCache = {}; updateSkillsToggle(); closeSkillsPanel(); });
+  updateSkillsToggle();
+}
+
+function updateSkillsToggle() {
+  const sel = document.getElementById('providerInput');
+  const prov = providersData[sel ? sel.value : ''] || {};
+  const row = document.getElementById('skillsToggleRow');
+  if (prov.supports_skills) row.classList.add('visible');
+  else row.classList.remove('visible');
+}
+
+function closeSkillsPanel() {
+  skillsPanelOpen = false;
+  const panel = document.getElementById('skillsPanel');
+  const btn = document.getElementById('skillsToggleBtn');
+  panel.innerHTML = '';
+  panel.classList.remove('open');
+  btn.classList.remove('open');
+}
+
+async function toggleSkills() {
+  if (skillsPanelOpen) { closeSkillsPanel(); return; }
+
+  const panel = document.getElementById('skillsPanel');
+  const btn = document.getElementById('skillsToggleBtn');
+  panel.innerHTML = '<div style="padding:8px 12px;color:var(--text2)">Loading...</div>';
+  panel.classList.add('open');
+  btn.classList.add('open');
+  skillsPanelOpen = true;
+
+  const sel = document.getElementById('workdirSelect');
+  const inp = document.getElementById('workdirInput');
+  const workdir = (sel.style.display !== 'none' && sel.value && sel.value !== '__custom__')
+    ? sel.value : inp.value.trim();
+  const provider = document.getElementById('providerInput').value;
+
+  const cacheKey = provider + '|' + workdir;
+  if (!skillsCache[cacheKey]) {
+    const params = new URLSearchParams({ provider });
+    if (workdir) params.set('workdir', workdir);
+    skillsCache[cacheKey] = await fetchJSON(`${API}/skills?${params}`);
+  }
+
+  const skills = skillsCache[cacheKey] || [];
+  if (!skills.length) {
+    panel.innerHTML = '<div style="padding:8px 12px;color:var(--text2)">No skills found in ~/.claude/commands/ or plugins.</div>';
+    return;
+  }
+
+  panel.innerHTML = skills.map(s =>
+    `<div class="skill-item" onclick="selectSkill(${JSON.stringify(s.name)})">
+      <span class="skill-name">/${esc(s.name)}</span>
+      ${s.argument_hint ? `<span class="skill-arghint">[${esc(s.argument_hint)}]</span>` : ''}
+      ${s.description ? `<span class="skill-desc">${esc(s.description)}</span>` : ''}
+    </div>`
+  ).join('');
+}
+
+function selectSkill(name) {
+  const prompt = document.getElementById('promptInput');
+  prompt.value = '/' + name + ' ';
+  prompt.focus();
+  prompt.setSelectionRange(prompt.value.length, prompt.value.length);
+  closeSkillsPanel();
 }
 
 // --- Load projects into dir select ---

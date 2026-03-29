@@ -27,14 +27,14 @@ from telegram.ext import (
 )
 
 from . import db
-from .config import load_providers, PROJECTS_ROOT, TASK_PASSWORD
+from .config import DEFAULT_CLI, get_skills, load_providers, PROJECTS_ROOT, TASK_PASSWORD
 from .models import TaskCreate, TaskStatus
 from .tg_auth import authorize_user, is_authorized, load_allowed_phones
 
 logger = logging.getLogger(__name__)
 
 # Conversation states
-ASK_PASSWORD, ASK_PROMPT, ASK_PROVIDER, ASK_PRIORITY, ASK_SKIP_PERMS, ASK_DIR, ASK_DIR_MANUAL, ASK_SCHEDULE, ASK_REPLY = range(9)
+ASK_PASSWORD, ASK_PROMPT, ASK_PROVIDER, ASK_PRIORITY, ASK_SKIP_PERMS, ASK_DIR, ASK_DIR_MANUAL, ASK_SCHEDULE, ASK_REPLY, ASK_SKILL_ARGS = range(10)
 
 PAGE_SIZE = 5
 
@@ -745,6 +745,129 @@ async def reply_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
+# Skills (/skills command + skill task creation)
+# ---------------------------------------------------------------------------
+
+def _best_claude_provider() -> str | None:
+    """Return the best available Claude provider (prefers DEFAULT_CLI if it supports skills)."""
+    providers = load_providers()
+    claude_providers = [name for name, info in providers.items() if info.get("supports_skills", False)]
+    if not claude_providers:
+        return None
+    return DEFAULT_CLI if DEFAULT_CLI in claude_providers else claude_providers[0]
+
+
+def _priority_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("1 ⬆ высший", callback_data="pri:1"),
+            InlineKeyboardButton("3", callback_data="pri:3"),
+            InlineKeyboardButton("5 норм", callback_data="pri:5"),
+        ],
+        [
+            InlineKeyboardButton("7", callback_data="pri:7"),
+            InlineKeyboardButton("10 ⬇ низший", callback_data="pri:10"),
+        ],
+    ])
+
+
+async def cmd_skills(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_user.id):
+        await _deny(update)
+        return
+
+    if not _best_claude_provider():
+        await update.message.reply_text(
+            "Нет Claude-провайдера с поддержкой скилов.",
+            reply_markup=_main_menu(),
+        )
+        return
+
+    skills = get_skills()
+    if not skills:
+        await update.message.reply_text(
+            "Скилы не найдены\\. Добавьте команды в `~/\\.claude/commands/` "
+            "или установите плагины через Claude Code\\.",
+            parse_mode="MarkdownV2",
+            reply_markup=_main_menu(),
+        )
+        return
+
+    lines = ["*Доступные скилы:*\n"]
+    for s in skills:
+        hint = f" `[{_esc(s['argument_hint'])}]`" if s.get("argument_hint") else ""
+        desc = f" — {_esc(s['description'])}" if s.get("description") else ""
+        lines.append(f"`/{_esc(s['name'])}`{hint}{desc}")
+
+    buttons = []
+    row = []
+    for s in skills:
+        row.append(InlineKeyboardButton(f"/{s['name']}", callback_data=f"skill_pick:{s['name']}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode="MarkdownV2",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def skill_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Entry point for skill conversation — triggered when user taps a skill button."""
+    query = update.callback_query
+    await query.answer()
+
+    skill_name = query.data.split(":", 1)[1]
+    provider = _best_claude_provider()
+    if not provider:
+        await query.edit_message_text("Нет Claude-провайдера для выполнения скилов.")
+        return ConversationHandler.END
+
+    context.user_data["new_provider"] = provider
+    context.user_data["new_skill_name"] = skill_name
+
+    skills = get_skills()
+    skill = next((s for s in skills if s["name"] == skill_name), None)
+    arg_hint = skill.get("argument_hint", "") if skill else ""
+
+    if arg_hint:
+        await query.edit_message_text(
+            f"Скил: `/{_esc(skill_name)}`\n"
+            f"Аргументы: _{_esc(arg_hint)}_\n\n"
+            f"Введите аргументы или /skip:",
+            parse_mode="MarkdownV2",
+        )
+        return ASK_SKILL_ARGS
+
+    context.user_data["new_prompt"] = f"/{skill_name}"
+    await query.edit_message_text(
+        f"Скил: `/{_esc(skill_name)}`\nПровайдер: {_esc(provider)}\n\nВыберите приоритет:",
+        parse_mode="MarkdownV2",
+        reply_markup=_priority_keyboard(),
+    )
+    return ASK_PRIORITY
+
+
+async def skill_got_args(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    skill_name = context.user_data.get("new_skill_name", "")
+    args = update.message.text.strip()
+    context.user_data["new_prompt"] = f"/{skill_name} {args}" if args else f"/{skill_name}"
+    await update.message.reply_text("Выберите приоритет:", reply_markup=_priority_keyboard())
+    return ASK_PRIORITY
+
+
+async def skill_skip_args(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    skill_name = context.user_data.get("new_skill_name", "")
+    context.user_data["new_prompt"] = f"/{skill_name}"
+    await update.message.reply_text("Выберите приоритет:", reply_markup=_priority_keyboard())
+    return ASK_PRIORITY
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -762,9 +885,14 @@ def run_bot():
 
     add_conv = ConversationHandler(
         entry_points=[
-            MessageHandler(filters.Regex("^➕ Добавить задачу$"), add_task_start)
+            MessageHandler(filters.Regex("^➕ Добавить задачу$"), add_task_start),
+            CallbackQueryHandler(skill_selected, pattern=r"^skill_pick:"),
         ],
         states={
+            ASK_SKILL_ARGS: [
+                CommandHandler("skip", skill_skip_args),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, skill_got_args),
+            ],
             ASK_PASSWORD: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, add_task_got_password)
             ],
@@ -808,6 +936,7 @@ def run_bot():
     )
 
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("skills", cmd_skills))
     app.add_handler(MessageHandler(filters.CONTACT, handle_contact))
     app.add_handler(reply_conv)
     app.add_handler(add_conv)
