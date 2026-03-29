@@ -239,21 +239,22 @@ def get_skills(working_dir: str = None) -> list:
                 "source": source,
             })
 
-    # Global user commands
+    # Global user commands/skills (~/.claude/commands/ and ~/.claude/skills/)
     _add_from_dir(Path.home() / ".claude" / "commands", "user")
+    _add_from_dir(Path.home() / ".claude" / "skills", "user")
 
     # Plugin commands — scan all directories named "commands" under ~/.claude/plugins/
-    # but skip any that are inside a "skills/" documentation path
     plugins_dir = Path.home() / ".claude" / "plugins"
     if plugins_dir.is_dir():
         for cmd_dir in sorted(plugins_dir.rglob("commands")):
-            if cmd_dir.is_dir() and "skills" not in cmd_dir.parts:
+            if cmd_dir.is_dir():
                 plugin_name = cmd_dir.parent.name
                 _add_from_dir(cmd_dir, f"plugin:{plugin_name}")
 
-    # Project-local commands
+    # Project-local commands/skills
     if working_dir:
         _add_from_dir(Path(working_dir) / ".claude" / "commands", "local")
+        _add_from_dir(Path(working_dir) / ".claude" / "skills", "local")
 
     return skills
 
