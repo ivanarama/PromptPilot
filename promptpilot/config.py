@@ -83,7 +83,7 @@ BUILTIN_PROVIDERS = {
         },
     },
     "codex": {
-        "cmd": "codex {prompt}",
+        "cmd": "codex exec {prompt}",
         "description": "OpenAI Codex",
         "supports_skills": False,
     },
