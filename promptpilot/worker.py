@@ -152,7 +152,7 @@ def is_stream_json(stdout: str) -> bool:
 def execute_task(task):
     """Run CLI with the task's prompt."""
     provider = task.provider or DEFAULT_CLI
-    cmd = build_cmd(provider, task.prompt, skip_permissions=task.skip_permissions)
+    cmd = build_cmd(provider, task.prompt, skip_permissions=task.skip_permissions, session_id=task.session_id)
 
     env = get_provider_env(provider)
 
@@ -191,10 +191,12 @@ def execute_task(task):
 
     # Parse output
     model_used = None
+    session_id = None
     if is_stream_json(result.stdout):
         parsed = parse_stream_json(result.stdout)
         output = format_result(parsed)
         model_used = parsed["meta"].get("model")
+        session_id = parsed["meta"].get("session_id")
         # Check for rate limit in stream events
         rl = parsed.get("rate_limit_info")
         if rl and rl.get("status") != "allowed":
@@ -209,7 +211,7 @@ def execute_task(task):
         # Plain text output (non-Claude CLIs)
         output = result.stdout
 
-    db.mark_completed(task.id, output, exit_code=0, model_used=model_used)
+    db.mark_completed(task.id, output, exit_code=0, model_used=model_used, session_id=session_id)
     text_preview = output[:80].replace("\n", " ").strip()
     print(f"  -> Completed: {text_preview}")
 

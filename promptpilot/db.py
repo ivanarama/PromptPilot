@@ -27,7 +27,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     max_retries INTEGER NOT NULL DEFAULT 5,
     exit_code INTEGER,
     model_used TEXT,
-    skip_permissions INTEGER DEFAULT 0
+    skip_permissions INTEGER DEFAULT 0,
+    session_id TEXT,
+    parent_task_id INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
@@ -38,6 +40,8 @@ MIGRATIONS = [
     "ALTER TABLE tasks ADD COLUMN provider TEXT",
     "ALTER TABLE tasks ADD COLUMN model_used TEXT",
     "ALTER TABLE tasks ADD COLUMN skip_permissions INTEGER DEFAULT 0",
+    "ALTER TABLE tasks ADD COLUMN session_id TEXT",
+    "ALTER TABLE tasks ADD COLUMN parent_task_id INTEGER",
 ]
 
 
@@ -89,8 +93,8 @@ def init_db():
 def create_task(task: TaskCreate) -> TaskInDB:
     with _connect() as conn:
         cur = conn.execute(
-            """INSERT INTO tasks (prompt, working_dir, provider, status, priority, scheduled_at, created_at, max_retries, skip_permissions)
-               VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?)""",
+            """INSERT INTO tasks (prompt, working_dir, provider, status, priority, scheduled_at, created_at, max_retries, skip_permissions, session_id, parent_task_id)
+               VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)""",
             (
                 task.prompt,
                 task.working_dir,
@@ -100,6 +104,8 @@ def create_task(task: TaskCreate) -> TaskInDB:
                 _now(),
                 task.max_retries,
                 int(task.skip_permissions),
+                task.session_id,
+                task.parent_task_id,
             ),
         )
         return get_task(cur.lastrowid, conn=conn)
@@ -157,11 +163,11 @@ def get_next_runnable() -> Optional[TaskInDB]:
         return None
 
 
-def mark_completed(task_id: int, result: str, exit_code: int = 0, model_used: str = None):
+def mark_completed(task_id: int, result: str, exit_code: int = 0, model_used: str = None, session_id: str = None):
     with _connect() as conn:
         conn.execute(
-            "UPDATE tasks SET status = 'completed', result = ?, exit_code = ?, completed_at = ?, model_used = ? WHERE id = ?",
-            (result, exit_code, _now(), model_used, task_id),
+            "UPDATE tasks SET status = 'completed', result = ?, exit_code = ?, completed_at = ?, model_used = ?, session_id = COALESCE(?, session_id) WHERE id = ?",
+            (result, exit_code, _now(), model_used, session_id, task_id),
         )
 
 

@@ -34,7 +34,7 @@ from .tg_auth import authorize_user, is_authorized, load_allowed_phones
 logger = logging.getLogger(__name__)
 
 # Conversation states
-ASK_PASSWORD, ASK_PROMPT, ASK_PROVIDER, ASK_PRIORITY, ASK_SKIP_PERMS, ASK_DIR, ASK_DIR_MANUAL, ASK_SCHEDULE = range(8)
+ASK_PASSWORD, ASK_PROMPT, ASK_PROVIDER, ASK_PRIORITY, ASK_SKIP_PERMS, ASK_DIR, ASK_DIR_MANUAL, ASK_SCHEDULE, ASK_REPLY = range(9)
 
 PAGE_SIZE = 5
 
@@ -97,6 +97,8 @@ def _task_detail_keyboard(task) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton("❌ Отменить", callback_data=f"cancel_task:{task.id}")])
     if task.status.value == "running":
         rows.append([InlineKeyboardButton("🔁 Сбросить (stuck)", callback_data=f"reset_task:{task.id}")])
+    if task.status.value == "completed" and task.session_id:
+        rows.append([InlineKeyboardButton("💬 Ответить", callback_data=f"reply_task:{task.id}")])
     rows.append([InlineKeyboardButton("🗑 Удалить", callback_data=f"delete_task:{task.id}")])
     return InlineKeyboardMarkup(rows)
 
@@ -683,6 +685,66 @@ async def add_task_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
+# Reply to task (continue session)
+# ---------------------------------------------------------------------------
+
+async def cb_reply_task_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    task_id = int(query.data.split(":")[1])
+    task = db.get_task(task_id)
+    if not task or not task.session_id:
+        await query.edit_message_text("Сессия не найдена.")
+        return ConversationHandler.END
+
+    context.user_data["reply_task_id"] = task_id
+    context.user_data["reply_session_id"] = task.session_id
+    context.user_data["reply_provider"] = task.provider
+    context.user_data["reply_dir"] = task.working_dir
+    context.user_data["reply_skip_permissions"] = task.skip_permissions
+
+    await query.message.reply_text(
+        f"Продолжение задачи \\#{task_id}\\.\nВведите ваш ответ:\n\\(/cancel — отменить\\)",
+        reply_markup=ReplyKeyboardRemove(),
+        parse_mode="MarkdownV2",
+    )
+    return ASK_REPLY
+
+
+async def reply_got_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    prompt = update.message.text
+    parent_id = context.user_data.pop("reply_task_id", None)
+    session_id = context.user_data.pop("reply_session_id", None)
+    provider = context.user_data.pop("reply_provider", None)
+    working_dir = context.user_data.pop("reply_dir", None)
+    skip_permissions = context.user_data.pop("reply_skip_permissions", False)
+
+    task = db.create_task(TaskCreate(
+        prompt=prompt,
+        working_dir=working_dir,
+        provider=provider,
+        priority=5,
+        session_id=session_id,
+        parent_task_id=parent_id,
+        skip_permissions=skip_permissions,
+    ))
+
+    await update.message.reply_text(
+        f"✅ Задача #{task.id} добавлена (продолжение #{parent_id})!",
+        reply_markup=_main_menu(),
+    )
+    return ConversationHandler.END
+
+
+async def reply_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    for key in ("reply_task_id", "reply_session_id", "reply_provider", "reply_dir", "reply_skip_permissions"):
+        context.user_data.pop(key, None)
+    await update.message.reply_text("Отменено.", reply_markup=_main_menu())
+    return ConversationHandler.END
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -733,8 +795,21 @@ def run_bot():
         fallbacks=[CommandHandler("cancel", add_task_cancel)],
     )
 
+    reply_conv = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(cb_reply_task_start, pattern=r"^reply_task:\d+$")
+        ],
+        states={
+            ASK_REPLY: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, reply_got_text)
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", reply_cancel)],
+    )
+
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(MessageHandler(filters.CONTACT, handle_contact))
+    app.add_handler(reply_conv)
     app.add_handler(add_conv)
     app.add_handler(MessageHandler(filters.Regex("^📋 Задачи$"), show_tasks))
     app.add_handler(MessageHandler(filters.Regex("^📊 Статистика$"), show_stats))

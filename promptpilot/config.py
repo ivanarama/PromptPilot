@@ -146,7 +146,7 @@ def remove_provider(name: str) -> bool:
     return True
 
 
-def build_cmd(provider: str, prompt: str, skip_permissions: bool = False):
+def build_cmd(provider: str, prompt: str, skip_permissions: bool = False, session_id: str = None):
     """Build the full command list for a provider + prompt."""
     providers = load_providers()
     if provider in providers:
@@ -156,10 +156,15 @@ def build_cmd(provider: str, prompt: str, skip_permissions: bool = False):
     marker = "\x00PROMPT\x00"
     parts = template.replace("{prompt}", marker).split()
     cmd = [prompt if p == marker else p for p in parts]
+    # Insert extra flags before the prompt argument
+    extras = []
+    if session_id:
+        extras += ["--resume", session_id]
     if skip_permissions:
-        # Insert --dangerously-skip-permissions before the prompt argument
+        extras.append("--dangerously-skip-permissions")
+    if extras:
         prompt_idx = cmd.index(prompt)
-        cmd.insert(prompt_idx, "--dangerously-skip-permissions")
+        cmd[prompt_idx:prompt_idx] = extras
     return cmd
 
 
