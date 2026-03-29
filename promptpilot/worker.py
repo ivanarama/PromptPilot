@@ -2,6 +2,7 @@
 
 import json
 import random
+import shutil
 import signal
 import subprocess
 import sys
@@ -155,6 +156,13 @@ def execute_task(task):
     cmd = build_cmd(provider, task.prompt, skip_permissions=task.skip_permissions, session_id=task.session_id)
 
     env = get_provider_env(provider)
+
+    # On Windows, .cmd/.bat wrappers (e.g. npm-installed CLIs like qwen) are
+    # invisible to subprocess without shell=True.  shutil.which() resolves the
+    # full path including extension so subprocess can find and run them directly.
+    resolved = shutil.which(cmd[0], path=env.get("PATH"))
+    if resolved:
+        cmd[0] = resolved
 
     try:
         result = subprocess.run(
