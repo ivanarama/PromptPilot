@@ -7,3 +7,5 @@ build/
 .env
 .pp-pids.json
 logs/
+.claude/
+article_habr.md
