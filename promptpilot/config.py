@@ -195,20 +195,23 @@ def get_provider_env(provider: str) -> dict:
 def _parse_frontmatter(path: Path) -> dict:
     """Parse YAML-style frontmatter (---...---) from a markdown file."""
     try:
-        content = path.read_text(encoding="utf-8")
-        if not content.startswith("---"):
+        content = path.read_text(encoding="utf-8-sig")  # utf-8-sig handles BOM
+    except (UnicodeDecodeError, OSError):
+        try:
+            content = path.read_text(encoding="cp1251")
+        except (UnicodeDecodeError, OSError):
             return {}
-        end = content.find("\n---", 3)
-        if end == -1:
-            return {}
-        result = {}
-        for line in content[3:end].splitlines():
-            if ":" in line:
-                key, _, value = line.partition(":")
-                result[key.strip()] = value.strip()
-        return result
-    except OSError:
+    if not content.startswith("---"):
         return {}
+    end = content.find("\n---", 3)
+    if end == -1:
+        return {}
+    result = {}
+    for line in content[3:end].splitlines():
+        if ":" in line:
+            key, _, value = line.partition(":")
+            result[key.strip()] = value.strip().strip('"').strip("'")
+    return result
 
 
 def get_skills(working_dir: str = None) -> list:
@@ -222,16 +225,41 @@ def get_skills(working_dir: str = None) -> list:
     seen = set()
 
     def _add_from_dir(dir_path: Path, source: str):
+        """Scan dir_path for skill definitions in two layouts:
+        - Flat:  <dir>/<skill-name>.md        (name = file stem)
+        - Subdir: <dir>/<skill-name>/<any>.md  (name = subdirectory name)
+        """
         if not dir_path.is_dir():
             return
+        # Flat .md files directly in the directory
         for cmd_file in sorted(dir_path.glob("*.md")):
             if cmd_file.name.lower() == "readme.md":
                 continue
             name = cmd_file.stem
+            if name.upper() == "SKILL":
+                continue  # this is a subdir-style file, skip here
             if name in seen:
                 continue
             seen.add(name)
             fm = _parse_frontmatter(cmd_file)
+            skills.append({
+                "name": name,
+                "description": fm.get("description", ""),
+                "argument_hint": fm.get("argument-hint", ""),
+                "source": source,
+            })
+        # Subdir-style: <dir>/<skill-name>/*.md (Claude uses directory name as skill name)
+        for sub in sorted(dir_path.iterdir()):
+            if not sub.is_dir():
+                continue
+            md_files = sorted(sub.glob("*.md"))
+            if not md_files:
+                continue
+            name = sub.name
+            if name in seen:
+                continue
+            seen.add(name)
+            fm = _parse_frontmatter(md_files[0])
             skills.append({
                 "name": name,
                 "description": fm.get("description", ""),

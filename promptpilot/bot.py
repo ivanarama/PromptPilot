@@ -450,14 +450,26 @@ def _list_projects():
 
 
 def _list_projects_with_skills():
-    """Return projects that have local skill files in .claude/commands/ or .claude/skills/."""
+    """Return projects that have local skill files in .claude/commands/ or .claude/skills/.
+
+    Supports both layouts:
+    - Flat:   .claude/skills/*.md
+    - Subdir: .claude/skills/<skill-name>/*.md
+    """
     from pathlib import Path
     result = []
     for proj in _list_projects():
-        full = os.path.join(PROJECTS_ROOT, proj)
+        full = Path(PROJECTS_ROOT) / proj
         for sub in ("commands", "skills"):
-            skill_dir = Path(full) / ".claude" / sub
-            if skill_dir.is_dir() and any(skill_dir.glob("*.md")):
+            skill_dir = full / ".claude" / sub
+            if not skill_dir.is_dir():
+                continue
+            # Flat .md files
+            if any(f for f in skill_dir.glob("*.md") if f.name.lower() != "readme.md"):
+                result.append(proj)
+                break
+            # Subdir-style: subdirectory containing at least one .md file
+            if any(d for d in skill_dir.iterdir() if d.is_dir() and any(d.glob("*.md"))):
                 result.append(proj)
                 break
     return result
