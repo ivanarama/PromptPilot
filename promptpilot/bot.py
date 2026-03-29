@@ -780,7 +780,7 @@ def _priority_keyboard():
 
 def _build_skills_message(skills: list, title: str, show_proj_btn: bool = False):
     """Return (text, InlineKeyboardMarkup) for a skills list."""
-    lines = [f"*{title}*\n"]
+    lines = [f"*{_esc(title)}*\n"]
     for s in skills:
         local_mark = " 📁" if s.get("source") == "local" else ""
         hint = f" `\\[{_esc(s['argument_hint'])}\\]`" if s.get("argument_hint") else ""
@@ -836,7 +836,7 @@ async def cb_skills_proj_picker(update: Update, context: ContextTypes.DEFAULT_TY
 
     projects = _list_projects()
     if not projects:
-        await query.answer("PP_PROJECTS_ROOT не настроен.", show_alert=True)
+        await query.edit_message_text("PP_PROJECTS_ROOT не настроен.")
         return
 
     buttons = []
