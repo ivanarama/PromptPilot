@@ -936,12 +936,10 @@ async def skill_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     skill_name = query.data.split(":", 1)[1]
-    provider = _best_claude_provider()
-    if not provider:
+    if not _best_claude_provider():
         await query.edit_message_text("Нет Claude-провайдера для выполнения скилов.")
         return ConversationHandler.END
 
-    context.user_data["new_provider"] = provider
     context.user_data["new_skill_name"] = skill_name
 
     # If user browsed to a project's skills, pre-fill working directory and skip dir step
@@ -962,19 +960,34 @@ async def skill_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ASK_SKILL_ARGS
 
 
+def _skill_provider_keyboard() -> InlineKeyboardMarkup:
+    """Inline keyboard with only skill-capable (Claude) providers."""
+    providers = load_providers()
+    skill_providers = {n: i for n, i in providers.items() if i.get("supports_skills", False)}
+    row, buttons = [], []
+    for name in skill_providers:
+        row.append(InlineKeyboardButton(name, callback_data=f"prov:{name}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    return InlineKeyboardMarkup(buttons)
+
+
 async def skill_got_args(update: Update, context: ContextTypes.DEFAULT_TYPE):
     skill_name = context.user_data.get("new_skill_name", "")
     args = update.message.text.strip()
     context.user_data["new_prompt"] = f"/{skill_name} {args}" if args else f"/{skill_name}"
-    await update.message.reply_text("Выберите приоритет:", reply_markup=_priority_keyboard())
-    return ASK_PRIORITY
+    await update.message.reply_text("Выберите провайдера:", reply_markup=_skill_provider_keyboard())
+    return ASK_PROVIDER
 
 
 async def skill_skip_args(update: Update, context: ContextTypes.DEFAULT_TYPE):
     skill_name = context.user_data.get("new_skill_name", "")
     context.user_data["new_prompt"] = f"/{skill_name}"
-    await update.message.reply_text("Выберите приоритет:", reply_markup=_priority_keyboard())
-    return ASK_PRIORITY
+    await update.message.reply_text("Выберите провайдера:", reply_markup=_skill_provider_keyboard())
+    return ASK_PROVIDER
 
 
 # ---------------------------------------------------------------------------
