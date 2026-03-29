@@ -473,6 +473,13 @@ async def add_task_got_skip_perms(update: Update, context: ContextTypes.DEFAULT_
     await query.answer()
     context.user_data["new_skip_permissions"] = query.data == "skipper:yes"
 
+    # Directory pre-filled (e.g. from project skills picker) — skip dir step
+    if "new_dir" in context.user_data:
+        pre_dir = context.user_data["new_dir"]
+        label = pre_dir if pre_dir else "не указана"
+        await query.edit_message_text(f"Директория: `{_esc(label)}`", parse_mode="MarkdownV2")
+        return await _ask_schedule_from_query(query, context)
+
     projects = _list_projects()
     if projects:
         # Show project selector
@@ -771,6 +778,31 @@ def _priority_keyboard():
     ])
 
 
+def _build_skills_message(skills: list, title: str, show_proj_btn: bool = False):
+    """Return (text, InlineKeyboardMarkup) for a skills list."""
+    lines = [f"*{title}*\n"]
+    for s in skills:
+        local_mark = " 📁" if s.get("source") == "local" else ""
+        hint = f" `\\[{_esc(s['argument_hint'])}\\]`" if s.get("argument_hint") else ""
+        desc = f" — {_esc(s['description'])}" if s.get("description") else ""
+        lines.append(f"`/{_esc(s['name'])}`{local_mark}{hint}{desc}")
+
+    buttons = []
+    row = []
+    for s in skills:
+        label = ("📁 " if s.get("source") == "local" else "") + f"/{s['name']}"
+        row.append(InlineKeyboardButton(label, callback_data=f"skill_pick:{s['name']}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    if show_proj_btn and _list_projects():
+        buttons.append([InlineKeyboardButton("📁 Скилы проекта...", callback_data="skills_proj_picker")])
+
+    return "\n".join(lines), InlineKeyboardMarkup(buttons)
+
+
 async def cmd_skills(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update.effective_user.id):
         await _deny(update)
@@ -793,27 +825,75 @@ async def cmd_skills(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    lines = ["*Доступные скилы:*\n"]
-    for s in skills:
-        hint = f" `[{_esc(s['argument_hint'])}]`" if s.get("argument_hint") else ""
-        desc = f" — {_esc(s['description'])}" if s.get("description") else ""
-        lines.append(f"`/{_esc(s['name'])}`{hint}{desc}")
+    text, keyboard = _build_skills_message(skills, "Доступные скилы:", show_proj_btn=True)
+    await update.message.reply_text(text, parse_mode="MarkdownV2", reply_markup=keyboard)
+
+
+async def cb_skills_proj_picker(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show project selector so user can load project-local skills."""
+    query = update.callback_query
+    await query.answer()
+
+    projects = _list_projects()
+    if not projects:
+        await query.answer("PP_PROJECTS_ROOT не настроен.", show_alert=True)
+        return
 
     buttons = []
     row = []
-    for s in skills:
-        row.append(InlineKeyboardButton(f"/{s['name']}", callback_data=f"skill_pick:{s['name']}"))
+    for proj in projects:
+        row.append(InlineKeyboardButton(proj, callback_data=f"skills_dir:{proj}"))
         if len(row) == 2:
             buttons.append(row)
             row = []
     if row:
         buttons.append(row)
+    buttons.append([InlineKeyboardButton("◀ Назад", callback_data="skills_back")])
 
-    await update.message.reply_text(
-        "\n".join(lines),
-        parse_mode="MarkdownV2",
+    await query.edit_message_text(
+        "Выберите проект для загрузки его скилов:",
         reply_markup=InlineKeyboardMarkup(buttons),
     )
+
+
+async def cb_skills_dir(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Load and show global + project-local skills for the selected project."""
+    query = update.callback_query
+    await query.answer()
+
+    proj_name = query.data.split(":", 1)[1]
+    workdir = os.path.join(PROJECTS_ROOT, proj_name)
+    context.user_data["skills_workdir"] = workdir
+
+    skills = get_skills(working_dir=workdir)
+    if not skills:
+        await query.edit_message_text(f"Скилы не найдены ни глобально, ни в `{proj_name}`.")
+        return
+
+    text, keyboard = _build_skills_message(
+        skills, f"Скилы ({proj_name}):", show_proj_btn=False
+    )
+    # Add back button
+    rows = list(keyboard.inline_keyboard)
+    rows.append([InlineKeyboardButton("◀ Назад", callback_data="skills_proj_picker")])
+    await query.edit_message_text(
+        text, parse_mode="MarkdownV2", reply_markup=InlineKeyboardMarkup(rows)
+    )
+
+
+async def cb_skills_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Return to global skills list."""
+    query = update.callback_query
+    await query.answer()
+    context.user_data.pop("skills_workdir", None)
+
+    skills = get_skills()
+    if not skills:
+        await query.edit_message_text("Скилы не найдены.")
+        return
+
+    text, keyboard = _build_skills_message(skills, "Доступные скилы:", show_proj_btn=True)
+    await query.edit_message_text(text, parse_mode="MarkdownV2", reply_markup=keyboard)
 
 
 async def skill_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -830,8 +910,13 @@ async def skill_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["new_provider"] = provider
     context.user_data["new_skill_name"] = skill_name
 
-    skills = get_skills()
-    skill = next((s for s in skills if s["name"] == skill_name), None)
+    # If user browsed to a project's skills, pre-fill working directory and skip dir step
+    workdir = context.user_data.pop("skills_workdir", None)
+    if workdir:
+        context.user_data["new_dir"] = workdir
+
+    all_skills = get_skills(working_dir=workdir) if workdir else get_skills()
+    skill = next((s for s in all_skills if s["name"] == skill_name), None)
     arg_hint = skill.get("argument_hint", "") if skill else ""
 
     if arg_hint:
@@ -944,6 +1029,9 @@ def run_bot():
     app.add_handler(MessageHandler(filters.Regex("^📊 Статистика$"), show_stats))
     app.add_handler(MessageHandler(filters.Regex("^🔌 Провайдеры$"), show_providers))
     app.add_handler(MessageHandler(filters.Regex("^⚡ Скилы$"), cmd_skills))
+    app.add_handler(CallbackQueryHandler(cb_skills_proj_picker, pattern=r"^skills_proj_picker$"))
+    app.add_handler(CallbackQueryHandler(cb_skills_dir, pattern=r"^skills_dir:"))
+    app.add_handler(CallbackQueryHandler(cb_skills_back, pattern=r"^skills_back$"))
     app.add_handler(CallbackQueryHandler(cb_task, pattern=r"^task:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_page, pattern=r"^page:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_cancel_task, pattern=r"^cancel_task:\d+$"))
