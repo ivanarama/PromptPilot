@@ -953,22 +953,13 @@ async def skill_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     skill = next((s for s in all_skills if s["name"] == skill_name), None)
     arg_hint = skill.get("argument_hint", "") if skill else ""
 
-    if arg_hint:
-        await query.edit_message_text(
-            f"Скил: `/{_esc_code(skill_name)}`\n"
-            f"Аргументы: _{_esc(arg_hint)}_\n\n"
-            f"Введите аргументы или /skip:",
-            parse_mode="MarkdownV2",
-        )
-        return ASK_SKILL_ARGS
-
-    context.user_data["new_prompt"] = f"/{skill_name}"
+    hint_line = f"\nАргументы: _{_esc(arg_hint)}_" if arg_hint else ""
     await query.edit_message_text(
-        f"Скил: `/{_esc_code(skill_name)}`\nПровайдер: {_esc(provider)}\n\nВыберите приоритет:",
+        f"Скил: `/{_esc_code(skill_name)}`{hint_line}\n\n"
+        f"Введите текст для скила или /skip:",
         parse_mode="MarkdownV2",
-        reply_markup=_priority_keyboard(),
     )
-    return ASK_PRIORITY
+    return ASK_SKILL_ARGS
 
 
 async def skill_got_args(update: Update, context: ContextTypes.DEFAULT_TYPE):
