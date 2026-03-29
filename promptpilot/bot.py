@@ -449,6 +449,20 @@ def _list_projects():
         return []
 
 
+def _list_projects_with_skills():
+    """Return projects that have local skill files in .claude/commands/ or .claude/skills/."""
+    from pathlib import Path
+    result = []
+    for proj in _list_projects():
+        full = os.path.join(PROJECTS_ROOT, proj)
+        for sub in ("commands", "skills"):
+            skill_dir = Path(full) / ".claude" / sub
+            if skill_dir.is_dir() and any(skill_dir.glob("*.md")):
+                result.append(proj)
+                break
+    return result
+
+
 async def add_task_got_priority(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -797,7 +811,7 @@ def _build_skills_message(skills: list, title: str, show_proj_btn: bool = False)
             row = []
     if row:
         buttons.append(row)
-    if show_proj_btn and _list_projects():
+    if show_proj_btn and _list_projects_with_skills():
         buttons.append([InlineKeyboardButton("📁 Скилы проекта...", callback_data="skills_proj_picker")])
 
     return "\n".join(lines), InlineKeyboardMarkup(buttons)
@@ -834,9 +848,13 @@ async def cb_skills_proj_picker(update: Update, context: ContextTypes.DEFAULT_TY
     query = update.callback_query
     await query.answer()
 
-    projects = _list_projects()
+    projects = _list_projects_with_skills()
     if not projects:
-        await query.edit_message_text("PP_PROJECTS_ROOT не настроен.")
+        await query.edit_message_text(
+            "Нет проектов с локальными скилами\\.\n"
+            "Добавьте `.md` файлы в `<project>/.claude/commands/` или `<project>/.claude/skills/`",
+            parse_mode="MarkdownV2",
+        )
         return
 
     buttons = []
