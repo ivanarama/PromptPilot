@@ -279,6 +279,11 @@ def _esc(text: str) -> str:
     return text
 
 
+def _esc_code(text: str) -> str:
+    """Escape for text inside MarkdownV2 backtick code spans (only backtick and backslash)."""
+    return text.replace("\\", "\\\\").replace("`", "\\`")
+
+
 async def cb_cancel_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     task_id = int(query.data.split(":")[1])
@@ -809,9 +814,9 @@ def _build_skills_message(skills: list, title: str, show_proj_btn: bool = False)
     lines = [f"*{_esc(title)}*\n"]
     for s in skills:
         local_mark = " 📁" if s.get("source") == "local" else ""
-        hint = f" `\\[{_esc(s['argument_hint'])}\\]`" if s.get("argument_hint") else ""
+        hint = f" `[{_esc_code(s['argument_hint'])}]`" if s.get("argument_hint") else ""
         desc = f" — {_esc(s['description'])}" if s.get("description") else ""
-        lines.append(f"`/{_esc(s['name'])}`{local_mark}{hint}{desc}")
+        lines.append(f"`/{_esc_code(s['name'])}`{local_mark}{hint}{desc}")
 
     buttons = []
     row = []
@@ -950,7 +955,7 @@ async def skill_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if arg_hint:
         await query.edit_message_text(
-            f"Скил: `/{_esc(skill_name)}`\n"
+            f"Скил: `/{_esc_code(skill_name)}`\n"
             f"Аргументы: _{_esc(arg_hint)}_\n\n"
             f"Введите аргументы или /skip:",
             parse_mode="MarkdownV2",
@@ -959,7 +964,7 @@ async def skill_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data["new_prompt"] = f"/{skill_name}"
     await query.edit_message_text(
-        f"Скил: `/{_esc(skill_name)}`\nПровайдер: {_esc(provider)}\n\nВыберите приоритет:",
+        f"Скил: `/{_esc_code(skill_name)}`\nПровайдер: {_esc(provider)}\n\nВыберите приоритет:",
         parse_mode="MarkdownV2",
         reply_markup=_priority_keyboard(),
     )
@@ -1071,5 +1076,9 @@ def run_bot():
     app.add_handler(CallbackQueryHandler(cb_reset_task, pattern=r"^reset_task:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_delete_task, pattern=r"^delete_task:\d+$"))
 
+    async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        logger.error("Unhandled exception for update %s", update, exc_info=context.error)
+
+    app.add_error_handler(error_handler)
     logger.info("PromptPilot Telegram bot started.")
     app.run_polling(drop_pending_updates=True)

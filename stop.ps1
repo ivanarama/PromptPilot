@@ -22,4 +22,14 @@ foreach ($prop in $services.PSObject.Properties) {
 }
 
 Remove-Item $pidFile
+
+# Kill any orphaned pp.exe processes not tracked in the pid file
+$orphans = Get-Process -Name "pp" -ErrorAction SilentlyContinue
+foreach ($p in $orphans) {
+    try {
+        Stop-Process -Id $p.Id -Force -ErrorAction Stop
+        Write-Host "Killed orphaned pp.exe (PID $($p.Id))" -ForegroundColor Yellow
+    } catch {}
+}
+
 Write-Host "PromptPilot stopped." -ForegroundColor Cyan
