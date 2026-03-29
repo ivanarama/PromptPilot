@@ -17,7 +17,7 @@ foreach ($prop in $services.PSObject.Properties) {
         Stop-Process -Id $id -Force -ErrorAction Stop
         Write-Host "Stopped $name (PID $id)" -ForegroundColor Green
     } catch {
-        Write-Host "$name (PID $id) — already stopped" -ForegroundColor DarkGray
+        Write-Host "$name (PID $id) - already stopped" -ForegroundColor DarkGray
     }
 }
 
