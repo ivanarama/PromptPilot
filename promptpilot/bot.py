@@ -27,14 +27,14 @@ from telegram.ext import (
 )
 
 from . import db
-from .config import load_providers, PROJECTS_ROOT
+from .config import load_providers, PROJECTS_ROOT, TASK_PASSWORD
 from .models import TaskCreate, TaskStatus
 from .tg_auth import authorize_user, is_authorized, load_allowed_phones
 
 logger = logging.getLogger(__name__)
 
 # Conversation states
-ASK_PROMPT, ASK_PROVIDER, ASK_PRIORITY, ASK_SKIP_PERMS, ASK_DIR, ASK_DIR_MANUAL, ASK_SCHEDULE = range(7)
+ASK_PASSWORD, ASK_PROMPT, ASK_PROVIDER, ASK_PRIORITY, ASK_SKIP_PERMS, ASK_DIR, ASK_DIR_MANUAL, ASK_SCHEDULE = range(8)
 
 PAGE_SIZE = 5
 
@@ -358,6 +358,34 @@ async def add_task_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _deny(update)
         return ConversationHandler.END
 
+    if TASK_PASSWORD:
+        await update.message.reply_text(
+            "Введите пароль для создания задачи:\n(/cancel — отменить)",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return ASK_PASSWORD
+
+    await update.message.reply_text(
+        "Введите промпт для задачи:\n(/cancel — отменить)",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    return ASK_PROMPT
+
+
+async def add_task_got_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    entered = update.message.text.strip()
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
+    if entered != TASK_PASSWORD:
+        await update.message.reply_text(
+            "Неверный пароль. Создание задачи отменено.",
+            reply_markup=_main_menu(),
+        )
+        return ConversationHandler.END
+
     await update.message.reply_text(
         "Введите промпт для задачи:\n(/cancel — отменить)",
         reply_markup=ReplyKeyboardRemove(),
@@ -675,6 +703,9 @@ def run_bot():
             MessageHandler(filters.Regex("^➕ Добавить задачу$"), add_task_start)
         ],
         states={
+            ASK_PASSWORD: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_task_got_password)
+            ],
             ASK_PROMPT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, add_task_got_prompt)
             ],
