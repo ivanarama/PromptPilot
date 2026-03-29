@@ -903,12 +903,15 @@ async def cb_skills_dir(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text, keyboard = _build_skills_message(
         skills, f"Скилы ({proj_name}):", show_proj_btn=False
     )
-    # Add back button
     rows = list(keyboard.inline_keyboard)
     rows.append([InlineKeyboardButton("◀ Назад", callback_data="skills_proj_picker")])
-    await query.edit_message_text(
-        text, parse_mode="MarkdownV2", reply_markup=InlineKeyboardMarkup(rows)
-    )
+    try:
+        await query.edit_message_text(
+            text, parse_mode="MarkdownV2", reply_markup=InlineKeyboardMarkup(rows)
+        )
+    except Exception as e:
+        logger.error("cb_skills_dir edit failed: %s", e)
+        await query.edit_message_text(f"Ошибка: {e}")
 
 
 async def cb_skills_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
