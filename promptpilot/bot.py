@@ -56,7 +56,7 @@ def _main_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
             ["📋 Задачи", "➕ Добавить задачу"],
-            ["📊 Статистика", "🔌 Провайдеры"],
+            ["📊 Статистика", "🔌 Провайдеры", "⚡ Скилы"],
         ],
         resize_keyboard=True,
     )
@@ -943,6 +943,7 @@ def run_bot():
     app.add_handler(MessageHandler(filters.Regex("^📋 Задачи$"), show_tasks))
     app.add_handler(MessageHandler(filters.Regex("^📊 Статистика$"), show_stats))
     app.add_handler(MessageHandler(filters.Regex("^🔌 Провайдеры$"), show_providers))
+    app.add_handler(MessageHandler(filters.Regex("^⚡ Скилы$"), cmd_skills))
     app.add_handler(CallbackQueryHandler(cb_task, pattern=r"^task:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_page, pattern=r"^page:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_cancel_task, pattern=r"^cancel_task:\d+$"))
