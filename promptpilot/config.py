@@ -71,7 +71,6 @@ BUILTIN_PROVIDERS = {
         "cmd": f"{CLAUDE_EXE} -p --verbose --output-format stream-json {{prompt}}",
         "description": "Claude Code (Anthropic)",
         "supports_skills": True,
-        "models": ["sonnet", "opus", "haiku"],
     },
     "claude-z": {
         "cmd": f"{CLAUDE_EXE} -p --verbose --output-format stream-json {{prompt}}",

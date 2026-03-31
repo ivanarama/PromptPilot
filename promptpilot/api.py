@@ -82,11 +82,12 @@ def api_stats():
 @app.get("/api/providers")
 def api_providers():
     providers = load_providers()
+    default_models = ["sonnet", "opus", "haiku"]
     return {
         name: {
             "description": info.get("description", name),
             "supports_skills": info.get("supports_skills", False),
-            "models": info.get("models", []),
+            "models": info.get("models", default_models if info.get("supports_skills") else []),
         }
         for name, info in providers.items()
     }

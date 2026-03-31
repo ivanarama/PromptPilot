@@ -421,12 +421,16 @@ async def add_task_got_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE
     return ASK_PROVIDER
 
 
+_DEFAULT_MODELS = ["sonnet", "opus", "haiku"]
+
+
 def _model_keyboard(provider: str) -> InlineKeyboardMarkup:
-    """Return model selection keyboard for providers that declare models, else None."""
+    """Return model selection keyboard for all Claude Code providers (supports_skills=True)."""
     providers = load_providers()
-    models = providers.get(provider or DEFAULT_CLI, {}).get("models", [])
-    if not models:
+    info = providers.get(provider or DEFAULT_CLI, {})
+    if not info.get("supports_skills", False):
         return None
+    models = info.get("models", _DEFAULT_MODELS)
     buttons = [[InlineKeyboardButton("По умолчанию", callback_data="model:")]]
     row = []
     for m in models:
