@@ -86,6 +86,7 @@ def api_providers():
         name: {
             "description": info.get("description", name),
             "supports_skills": info.get("supports_skills", False),
+            "models": info.get("models", []),
         }
         for name, info in providers.items()
     }

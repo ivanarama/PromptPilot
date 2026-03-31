@@ -34,7 +34,7 @@ from .tg_auth import authorize_user, is_authorized, load_allowed_phones
 logger = logging.getLogger(__name__)
 
 # Conversation states
-ASK_PASSWORD, ASK_PROMPT, ASK_PROVIDER, ASK_PRIORITY, ASK_SKIP_PERMS, ASK_DIR, ASK_DIR_MANUAL, ASK_SCHEDULE, ASK_REPLY, ASK_SKILL_ARGS = range(10)
+ASK_PASSWORD, ASK_PROMPT, ASK_PROVIDER, ASK_PRIORITY, ASK_SKIP_PERMS, ASK_DIR, ASK_DIR_MANUAL, ASK_SCHEDULE, ASK_REPLY, ASK_SKILL_ARGS, ASK_MODEL = range(11)
 
 PAGE_SIZE = 5
 
@@ -421,23 +421,45 @@ async def add_task_got_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE
     return ASK_PROVIDER
 
 
+def _model_keyboard(provider: str) -> InlineKeyboardMarkup:
+    """Return model selection keyboard for providers that declare models, else None."""
+    providers = load_providers()
+    models = providers.get(provider or DEFAULT_CLI, {}).get("models", [])
+    if not models:
+        return None
+    buttons = [[InlineKeyboardButton("По умолчанию", callback_data="model:")]]
+    row = []
+    for m in models:
+        row.append(InlineKeyboardButton(m, callback_data=f"model:{m}"))
+        if len(row) == 3:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    return InlineKeyboardMarkup(buttons)
+
+
 async def add_task_got_provider(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    context.user_data["new_provider"] = query.data.split(":", 1)[1] or None
+    provider = query.data.split(":", 1)[1] or None
+    context.user_data["new_provider"] = provider
 
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("1 ⬆ высший", callback_data="pri:1"),
-            InlineKeyboardButton("3", callback_data="pri:3"),
-            InlineKeyboardButton("5 норм", callback_data="pri:5"),
-        ],
-        [
-            InlineKeyboardButton("7", callback_data="pri:7"),
-            InlineKeyboardButton("10 ⬇ низший", callback_data="pri:10"),
-        ],
-    ])
-    await query.edit_message_text("Выберите приоритет:", reply_markup=keyboard)
+    kb = _model_keyboard(provider)
+    if kb:
+        await query.edit_message_text("Выберите модель:", reply_markup=kb)
+        return ASK_MODEL
+
+    await query.edit_message_text("Выберите приоритет:", reply_markup=_priority_keyboard())
+    return ASK_PRIORITY
+
+
+async def add_task_got_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    model = query.data.split(":", 1)[1] or None
+    context.user_data["new_model"] = model
+    await query.edit_message_text("Выберите приоритет:", reply_markup=_priority_keyboard())
     return ASK_PRIORITY
 
 
@@ -662,6 +684,7 @@ async def _finish_add_task_from_query(query, context):
     working_dir = context.user_data.pop("new_dir", None)
     scheduled_at = context.user_data.pop("new_schedule", None)
     skip_permissions = context.user_data.pop("new_skip_permissions", False)
+    model = context.user_data.pop("new_model", None)
 
     task = db.create_task(TaskCreate(
         prompt=prompt,
@@ -670,6 +693,7 @@ async def _finish_add_task_from_query(query, context):
         priority=priority,
         scheduled_at=scheduled_at,
         skip_permissions=skip_permissions,
+        model=model,
     ))
 
     sched_str = scheduled_at.strftime("%d.%m.%Y %H:%M UTC") if scheduled_at else "сейчас"
@@ -692,6 +716,7 @@ async def _finish_add_task(update: Update, context: ContextTypes.DEFAULT_TYPE, w
     working_dir = working_dir or context.user_data.pop("new_dir", None)
     scheduled_at = context.user_data.pop("new_schedule", None)
     skip_permissions = context.user_data.pop("new_skip_permissions", False)
+    model = context.user_data.pop("new_model", None)
 
     task = db.create_task(TaskCreate(
         prompt=prompt,
@@ -700,6 +725,7 @@ async def _finish_add_task(update: Update, context: ContextTypes.DEFAULT_TYPE, w
         priority=priority,
         scheduled_at=scheduled_at,
         skip_permissions=skip_permissions,
+        model=model,
     ))
 
     sched_str = scheduled_at.strftime("%d.%m.%Y %H:%M UTC") if scheduled_at else "сейчас"
@@ -1037,6 +1063,9 @@ def run_bot():
             ASK_DIR_MANUAL: [
                 CommandHandler("skip", add_task_skip_dir),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, add_task_got_dir),
+            ],
+            ASK_MODEL: [
+                CallbackQueryHandler(add_task_got_model, pattern=r"^model:"),
             ],
             ASK_SCHEDULE: [
                 CallbackQueryHandler(add_task_got_schedule_btn, pattern=r"^sched:"),

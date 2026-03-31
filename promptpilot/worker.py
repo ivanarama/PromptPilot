@@ -153,7 +153,7 @@ def is_stream_json(stdout: str) -> bool:
 def execute_task(task):
     """Run CLI with the task's prompt."""
     provider = task.provider or DEFAULT_CLI
-    cmd = build_cmd(provider, task.prompt, skip_permissions=task.skip_permissions, session_id=task.session_id)
+    cmd = build_cmd(provider, task.prompt, skip_permissions=task.skip_permissions, session_id=task.session_id, model=task.model)
 
     env = get_provider_env(provider)
 

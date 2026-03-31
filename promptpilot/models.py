@@ -24,6 +24,7 @@ class TaskCreate(BaseModel):
     scheduled_at: Optional[datetime] = None
     max_retries: int = Field(default=5, ge=0, le=50)
     skip_permissions: bool = False
+    model: Optional[str] = None  # e.g. "sonnet", "opus", "haiku"
     session_id: Optional[str] = None  # Claude session to resume (--resume)
     parent_task_id: Optional[int] = None  # Task this is a reply to
 
@@ -52,6 +53,7 @@ class TaskInDB(BaseModel):
     exit_code: Optional[int] = None
     model_used: Optional[str] = None
     skip_permissions: bool = False
+    model: Optional[str] = None
     session_id: Optional[str] = None
     parent_task_id: Optional[int] = None
 

@@ -71,6 +71,7 @@ BUILTIN_PROVIDERS = {
         "cmd": f"{CLAUDE_EXE} -p --verbose --output-format stream-json {{prompt}}",
         "description": "Claude Code (Anthropic)",
         "supports_skills": True,
+        "models": ["sonnet", "opus", "haiku"],
     },
     "claude-z": {
         "cmd": f"{CLAUDE_EXE} -p --verbose --output-format stream-json {{prompt}}",
@@ -159,7 +160,7 @@ def remove_provider(name: str) -> bool:
     return True
 
 
-def build_cmd(provider: str, prompt: str, skip_permissions: bool = False, session_id: str = None):
+def build_cmd(provider: str, prompt: str, skip_permissions: bool = False, session_id: str = None, model: str = None):
     """Build the full command list for a provider + prompt."""
     providers = load_providers()
     if provider in providers:
@@ -171,6 +172,8 @@ def build_cmd(provider: str, prompt: str, skip_permissions: bool = False, sessio
     cmd = [prompt if p == marker else p for p in parts]
     # Insert extra flags before the prompt argument
     extras = []
+    if model:
+        extras += ["--model", model]
     if session_id:
         extras += ["--resume", session_id]
     if skip_permissions:

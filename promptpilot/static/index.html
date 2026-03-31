@@ -375,6 +375,9 @@
       <label>Provider
         <select id="providerInput"></select>
       </label>
+      <label id="modelLabel" style="display:none">Model
+        <select id="modelInput"></select>
+      </label>
       <label>Priority
         <select id="priorityInput">
           <option value="1">1 (highest)</option>
@@ -603,6 +606,7 @@ async function addTask() {
   const priority = parseInt(document.getElementById('priorityInput').value);
   const schedule = document.getElementById('scheduleInput').value || null;
   const provider = document.getElementById('providerInput').value || null;
+  const model = document.getElementById('modelInput').value || null;
   const sel = document.getElementById('workdirSelect');
   const selVal = sel.style.display !== 'none' && sel.value && sel.value !== '__custom__' ? sel.value : null;
   const workdir = selVal || document.getElementById('workdirInput').value.trim() || null;
@@ -614,6 +618,7 @@ async function addTask() {
     body: JSON.stringify({
       prompt,
       provider,
+      model,
       priority,
       working_dir: workdir,
       skip_permissions: skipPermissions,
@@ -711,8 +716,25 @@ async function loadProviders() {
   sel.innerHTML = Object.entries(providersData)
     .map(([name, info]) => `<option value="${esc(name)}">${esc(name)} — ${esc(info.description || info)}</option>`)
     .join('');
-  sel.addEventListener('change', () => { skillsCache = {}; updateSkillsToggle(); closeSkillsPanel(); });
+  sel.addEventListener('change', () => { skillsCache = {}; updateSkillsToggle(); closeSkillsPanel(); updateModelSelect(); });
   updateSkillsToggle();
+  updateModelSelect();
+}
+
+function updateModelSelect() {
+  const sel = document.getElementById('providerInput');
+  const prov = providersData[sel ? sel.value : ''] || {};
+  const models = prov.models || [];
+  const label = document.getElementById('modelLabel');
+  const modelSel = document.getElementById('modelInput');
+  if (models.length > 0) {
+    modelSel.innerHTML = '<option value="">Default</option>' +
+      models.map(m => `<option value="${esc(m)}">${esc(m)}</option>`).join('');
+    label.style.display = '';
+  } else {
+    label.style.display = 'none';
+    modelSel.value = '';
+  }
 }
 
 function updateSkillsToggle() {

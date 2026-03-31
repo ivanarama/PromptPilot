@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     exit_code INTEGER,
     model_used TEXT,
     skip_permissions INTEGER DEFAULT 0,
+    model TEXT,
     session_id TEXT,
     parent_task_id INTEGER
 );
@@ -42,6 +43,7 @@ MIGRATIONS = [
     "ALTER TABLE tasks ADD COLUMN skip_permissions INTEGER DEFAULT 0",
     "ALTER TABLE tasks ADD COLUMN session_id TEXT",
     "ALTER TABLE tasks ADD COLUMN parent_task_id INTEGER",
+    "ALTER TABLE tasks ADD COLUMN model TEXT",
 ]
 
 
@@ -93,8 +95,8 @@ def init_db():
 def create_task(task: TaskCreate) -> TaskInDB:
     with _connect() as conn:
         cur = conn.execute(
-            """INSERT INTO tasks (prompt, working_dir, provider, status, priority, scheduled_at, created_at, max_retries, skip_permissions, session_id, parent_task_id)
-               VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)""",
+            """INSERT INTO tasks (prompt, working_dir, provider, status, priority, scheduled_at, created_at, max_retries, skip_permissions, model, session_id, parent_task_id)
+               VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 task.prompt,
                 task.working_dir,
@@ -104,6 +106,7 @@ def create_task(task: TaskCreate) -> TaskInDB:
                 _now(),
                 task.max_retries,
                 int(task.skip_permissions),
+                task.model,
                 task.session_id,
                 task.parent_task_id,
             ),
