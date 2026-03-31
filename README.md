@@ -420,3 +420,8 @@ pp.spec             — конфиг PyInstaller
 ```
 
 Воркер и сервер — два отдельных процесса, работающих с одной SQLite БД. Воркер последовательно выполняет задачи (одна за раз), чтобы не упираться в rate limits.
+
+
+
+[**Этот инструмент описан в статье**](https://infostart.ru/1c/articles/2653416).
+![alt text](https://infostart.ru/bitrix/templates/sandbox_empty/assets/tpl/abo/img/logo.svg)
