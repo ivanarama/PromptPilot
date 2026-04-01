@@ -12,7 +12,8 @@ import os
 
 from . import db
 from .config import get_skills, load_providers, PROJECTS_ROOT
-from .models import Stats, TaskCreate, TaskInDB, TaskStatus, TaskUpdate
+from .models import CostStats, Stats, TaskCreate, TaskInDB, TaskStatus, TaskUpdate
+from .version import check_for_update
 
 app = FastAPI(title="PromptPilot", version="0.1.0")
 
@@ -77,6 +78,33 @@ def api_reset_task(task_id: int):
 @app.get("/api/stats", response_model=Stats)
 def api_stats():
     return db.get_stats()
+
+
+@app.get("/api/stats/costs", response_model=CostStats)
+def api_cost_stats():
+    return db.get_cost_stats()
+
+
+@app.get("/api/worker/status")
+def api_worker_status():
+    return {"paused": db.is_paused()}
+
+
+@app.post("/api/worker/pause")
+def api_worker_pause():
+    db.set_setting("worker_paused", "1")
+    return {"ok": True, "paused": True}
+
+
+@app.post("/api/worker/resume")
+def api_worker_resume():
+    db.set_setting("worker_paused", "0")
+    return {"ok": True, "paused": False}
+
+
+@app.get("/api/version")
+def api_version():
+    return check_for_update()
 
 
 @app.get("/api/providers")

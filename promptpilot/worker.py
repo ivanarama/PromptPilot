@@ -223,6 +223,24 @@ def execute_task(task):
     text_preview = output[:80].replace("\n", " ").strip()
     print(f"  -> Completed: {text_preview}")
 
+    if task.recurrence:
+        next_dt = db.parse_recurrence(task.recurrence)
+        if next_dt:
+            from .models import TaskCreate
+            db.create_task(TaskCreate(
+                prompt=task.prompt,
+                working_dir=task.working_dir,
+                provider=task.provider,
+                priority=task.priority,
+                scheduled_at=next_dt,
+                max_retries=task.max_retries,
+                skip_permissions=task.skip_permissions,
+                model=task.model,
+                recurrence=task.recurrence,
+                tg_chat_id=task.tg_chat_id,
+            ))
+            print(f"  -> Recurring: next run at {next_dt.strftime('%Y-%m-%d %H:%M UTC')}")
+
 
 def run_worker():
     """Main worker loop."""
@@ -244,6 +262,10 @@ def run_worker():
     print("Waiting for tasks...\n")
 
     while running:
+        if db.is_paused():
+            time.sleep(POLL_INTERVAL)
+            continue
+
         task = db.get_next_runnable()
         if task is None:
             time.sleep(POLL_INTERVAL)

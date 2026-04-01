@@ -34,7 +34,7 @@ from .tg_auth import authorize_user, is_authorized, load_allowed_phones
 logger = logging.getLogger(__name__)
 
 # Conversation states
-ASK_PASSWORD, ASK_PROMPT, ASK_PROVIDER, ASK_PRIORITY, ASK_SKIP_PERMS, ASK_DIR, ASK_DIR_MANUAL, ASK_SCHEDULE, ASK_REPLY, ASK_SKILL_ARGS, ASK_MODEL = range(11)
+ASK_PASSWORD, ASK_PROMPT, ASK_PROVIDER, ASK_PRIORITY, ASK_SKIP_PERMS, ASK_DIR, ASK_DIR_MANUAL, ASK_SCHEDULE, ASK_REPLY, ASK_SKILL_ARGS, ASK_MODEL, ASK_RECURRENCE = range(12)
 
 PAGE_SIZE = 5
 
@@ -53,10 +53,12 @@ STATUS_ICON = {
 # ---------------------------------------------------------------------------
 
 def _main_menu() -> ReplyKeyboardMarkup:
+    pause_label = "▶ Продолжить" if db.is_paused() else "⏸ Пауза"
     return ReplyKeyboardMarkup(
         [
             ["📋 Задачи", "➕ Добавить задачу"],
             ["📊 Статистика", "🔌 Провайдеры", "⚡ Скилы"],
+            [pause_label],
         ],
         resize_keyboard=True,
     )
@@ -324,6 +326,7 @@ async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     s = db.get_stats()
+    costs = db.get_cost_stats()
     text = (
         "*Статистика PromptPilot*\n\n"
         f"⏳ Ожидают:      {s.pending}\n"
@@ -334,7 +337,25 @@ async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🚫 Отменены:     {s.cancelled}\n"
         f"📦 Всего:        {s.total}"
     )
+    if costs["total"] > 0:
+        text += (
+            f"\n\n💰 Сегодня:  ${costs['today']:.4f}\n"
+            f"💰 За неделю: ${costs['week']:.4f}\n"
+            f"💰 Всего:     ${costs['total']:.4f}"
+        )
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=_main_menu())
+
+
+async def toggle_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_user.id):
+        await _deny(update)
+        return
+    if db.is_paused():
+        db.set_setting("worker_paused", "0")
+        await update.message.reply_text("▶ Воркер возобновлён.", reply_markup=_main_menu())
+    else:
+        db.set_setting("worker_paused", "1")
+        await update.message.reply_text("⏸ Воркер на паузе. Текущие задачи завершатся, новые не запустятся.", reply_markup=_main_menu())
 
 
 # ---------------------------------------------------------------------------
@@ -660,7 +681,13 @@ async def add_task_got_schedule_btn(update: Update, context: ContextTypes.DEFAUL
     await query.edit_message_text(
         "Время выбрано: " + (scheduled_at.strftime("%d.%m.%Y %H:%M UTC") if scheduled_at else "сейчас")
     )
-    return await _finish_add_task_from_query(query, context)
+    await query.message.reply_text(
+        "Повторять задачу?\n"
+        "Примеры: `1h`, `6h`, `24h`, `daily@09:00`\n"
+        "Или /skip чтобы не повторять.",
+        parse_mode="Markdown",
+    )
+    return ASK_RECURRENCE
 
 
 async def add_task_got_schedule_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -676,6 +703,30 @@ async def add_task_got_schedule_text(update: Update, context: ContextTypes.DEFAU
         return ASK_SCHEDULE
 
     context.user_data["new_schedule"] = scheduled_at
+    await update.message.reply_text(
+        "Повторять задачу?\n"
+        "Примеры: `1h`, `6h`, `24h`, `daily@09:00`\n"
+        "Или /skip чтобы не повторять.",
+        parse_mode="Markdown",
+    )
+    return ASK_RECURRENCE
+
+
+async def add_task_got_recurrence(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    from . import db as _db
+    if _db.parse_recurrence(text) is None:
+        await update.message.reply_text(
+            "Не понял формат. Примеры: `1h`, `6h`, `daily@09:00`. Или /skip.",
+            parse_mode="Markdown",
+        )
+        return ASK_RECURRENCE
+    context.user_data["new_recurrence"] = text
+    return await _finish_add_task(update, context)
+
+
+async def add_task_skip_recurrence(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["new_recurrence"] = None
     return await _finish_add_task(update, context)
 
 
@@ -689,6 +740,7 @@ async def _finish_add_task_from_query(query, context):
     scheduled_at = context.user_data.pop("new_schedule", None)
     skip_permissions = context.user_data.pop("new_skip_permissions", False)
     model = context.user_data.pop("new_model", None)
+    recurrence = context.user_data.pop("new_recurrence", None)
 
     task = db.create_task(TaskCreate(
         prompt=prompt,
@@ -699,6 +751,7 @@ async def _finish_add_task_from_query(query, context):
         skip_permissions=skip_permissions,
         model=model,
         tg_chat_id=query.message.chat_id,
+        recurrence=recurrence,
     ))
 
     sched_str = scheduled_at.strftime("%d.%m.%Y %H:%M UTC") if scheduled_at else "сейчас"
@@ -722,6 +775,7 @@ async def _finish_add_task(update: Update, context: ContextTypes.DEFAULT_TYPE, w
     scheduled_at = context.user_data.pop("new_schedule", None)
     skip_permissions = context.user_data.pop("new_skip_permissions", False)
     model = context.user_data.pop("new_model", None)
+    recurrence = context.user_data.pop("new_recurrence", None)
 
     task = db.create_task(TaskCreate(
         prompt=prompt,
@@ -732,6 +786,7 @@ async def _finish_add_task(update: Update, context: ContextTypes.DEFAULT_TYPE, w
         skip_permissions=skip_permissions,
         model=model,
         tg_chat_id=update.message.chat_id,
+        recurrence=recurrence,
     ))
 
     sched_str = scheduled_at.strftime("%d.%m.%Y %H:%M UTC") if scheduled_at else "сейчас"
@@ -1114,6 +1169,10 @@ def run_bot():
                 CallbackQueryHandler(add_task_got_schedule_btn, pattern=r"^sched:"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, add_task_got_schedule_text),
             ],
+            ASK_RECURRENCE: [
+                CommandHandler("skip", add_task_skip_recurrence),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_task_got_recurrence),
+            ],
         },
         fallbacks=[CommandHandler("cancel", add_task_cancel)],
     )
@@ -1146,6 +1205,7 @@ def run_bot():
     app.add_handler(MessageHandler(filters.Regex("^📊 Статистика$"), show_stats))
     app.add_handler(MessageHandler(filters.Regex("^🔌 Провайдеры$"), show_providers))
     app.add_handler(MessageHandler(filters.Regex("^⚡ Скилы$"), cmd_skills))
+    app.add_handler(MessageHandler(filters.Regex(r"^(⏸ Пауза|▶ Продолжить)$"), toggle_pause))
     app.add_handler(CallbackQueryHandler(cb_task, pattern=r"^task:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_page, pattern=r"^page:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_cancel_task, pattern=r"^cancel_task:\d+$"))

@@ -28,6 +28,7 @@ class TaskCreate(BaseModel):
     session_id: Optional[str] = None  # Claude session to resume (--resume)
     parent_task_id: Optional[int] = None  # Task this is a reply to
     tg_chat_id: Optional[int] = None  # Telegram chat to notify on completion
+    recurrence: Optional[str] = None  # e.g. "6h", "daily@09:00"
 
 
 class TaskUpdate(BaseModel):
@@ -59,6 +60,7 @@ class TaskInDB(BaseModel):
     parent_task_id: Optional[int] = None
     tg_chat_id: Optional[int] = None
     notified_at: Optional[datetime] = None
+    recurrence: Optional[str] = None
 
 
 class Stats(BaseModel):
@@ -69,3 +71,10 @@ class Stats(BaseModel):
     rate_limited: int = 0
     cancelled: int = 0
     total: int = 0
+
+
+class CostStats(BaseModel):
+    today: float = 0.0
+    week: float = 0.0
+    total: float = 0.0
+    by_provider: dict = {}

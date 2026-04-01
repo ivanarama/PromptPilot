@@ -1,8 +1,9 @@
 """SQLite database layer."""
 
+import re
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from .config import DB_DIR, DB_PATH
@@ -32,7 +33,13 @@ CREATE TABLE IF NOT EXISTS tasks (
     session_id TEXT,
     parent_task_id INTEGER,
     tg_chat_id INTEGER,
-    notified_at TEXT
+    notified_at TEXT,
+    recurrence TEXT
+);
+
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
@@ -48,6 +55,8 @@ MIGRATIONS = [
     "ALTER TABLE tasks ADD COLUMN model TEXT",
     "ALTER TABLE tasks ADD COLUMN tg_chat_id INTEGER",
     "ALTER TABLE tasks ADD COLUMN notified_at TEXT",
+    "ALTER TABLE tasks ADD COLUMN recurrence TEXT",
+    "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
 ]
 
 
@@ -99,8 +108,8 @@ def init_db():
 def create_task(task: TaskCreate) -> TaskInDB:
     with _connect() as conn:
         cur = conn.execute(
-            """INSERT INTO tasks (prompt, working_dir, provider, status, priority, scheduled_at, created_at, max_retries, skip_permissions, model, session_id, parent_task_id, tg_chat_id)
-               VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            """INSERT INTO tasks (prompt, working_dir, provider, status, priority, scheduled_at, created_at, max_retries, skip_permissions, model, session_id, parent_task_id, tg_chat_id, recurrence)
+               VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 task.prompt,
                 task.working_dir,
@@ -114,6 +123,7 @@ def create_task(task: TaskCreate) -> TaskInDB:
                 task.session_id,
                 task.parent_task_id,
                 task.tg_chat_id,
+                task.recurrence,
             ),
         )
         return get_task(cur.lastrowid, conn=conn)
@@ -240,6 +250,82 @@ def get_stats() -> Stats:
             cancelled=data.get("cancelled", 0),
             total=total,
         )
+
+
+def get_setting(key: str, default: str = None) -> Optional[str]:
+    with _connect() as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else default
+
+
+def set_setting(key: str, value: str):
+    with _connect() as conn:
+        conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
+
+
+def is_paused() -> bool:
+    return get_setting("worker_paused", "0") == "1"
+
+
+def parse_recurrence(recurrence: str) -> Optional[datetime]:
+    """Parse recurrence string and return next run datetime (UTC).
+
+    Supported formats:
+      "30m"          — every 30 minutes
+      "6h"           — every 6 hours
+      "daily@09:00"  — every day at 09:00 UTC
+    """
+    if not recurrence:
+        return None
+    s = recurrence.strip().lower()
+    # Nh or Nm
+    m = re.fullmatch(r"(\d+)([mh])", s)
+    if m:
+        n, unit = int(m.group(1)), m.group(2)
+        delta = timedelta(minutes=n) if unit == "m" else timedelta(hours=n)
+        return datetime.now(timezone.utc) + delta
+    # daily@HH:MM
+    m = re.fullmatch(r"daily@(\d{1,2}):(\d{2})", s)
+    if m:
+        hour, minute = int(m.group(1)), int(m.group(2))
+        now = datetime.now(timezone.utc)
+        candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if candidate <= now:
+            candidate += timedelta(days=1)
+        return candidate
+    return None
+
+
+def get_cost_stats() -> dict:
+    """Parse Cost lines from completed task results and aggregate."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT result, provider, completed_at FROM tasks WHERE status='completed' AND result LIKE '%Cost: $%' AND completed_at IS NOT NULL"
+        ).fetchall()
+
+    now = datetime.now(timezone.utc)
+    today_str = now.date().isoformat()
+    week_ago = (now - timedelta(days=7)).isoformat()
+
+    total = today = week = 0.0
+    by_provider: dict = {}
+
+    for row in rows:
+        m = re.search(r"Cost: \$(\d+\.\d+)", row["result"] or "")
+        if not m:
+            continue
+        cost = float(m.group(1))
+        completed = row["completed_at"] or ""
+        provider = row["provider"] or "claude"
+
+        total += cost
+        by_provider[provider] = round(by_provider.get(provider, 0.0) + cost, 6)
+        if completed[:10] == today_str:
+            today += cost
+        if completed >= week_ago:
+            week += cost
+
+    return {"today": round(today, 6), "week": round(week, 6), "total": round(total, 6), "by_provider": by_provider}
 
 
 def get_pending_notifications() -> list:

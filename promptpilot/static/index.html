@@ -311,6 +311,50 @@
   .filter-btn:hover { border-color: var(--accent); color: var(--text); }
   .filter-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
 
+  /* Pause button */
+  .btn-pause {
+    padding: 5px 14px;
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    background: transparent;
+    color: var(--text2);
+    font-size: 12px;
+    cursor: pointer;
+    transition: all .15s;
+  }
+  .btn-pause:hover { border-color: var(--yellow); color: var(--yellow); }
+  .btn-pause.paused { border-color: var(--yellow); color: var(--yellow); background: #fbbf2410; }
+
+  /* Update banner */
+  .update-banner {
+    display: none;
+    background: #22d3ee12;
+    border: 1px solid #22d3ee40;
+    border-radius: var(--radius);
+    padding: 10px 16px;
+    margin-bottom: 20px;
+    font-size: 13px;
+    color: var(--cyan);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .update-banner.hidden { display: none !important; }
+
+  /* Cost bar */
+  .cost-bar {
+    display: none;
+    gap: 16px;
+    margin-bottom: 16px;
+    flex-wrap: wrap;
+  }
+  .cost-bar.visible { display: flex; }
+  .cost-item {
+    font-size: 12px;
+    color: var(--text2);
+  }
+  .cost-item span { color: var(--yellow); font-weight: 600; font-family: var(--mono); }
+
   /* Skills panel */
   .skills-toggle-row {
     display: none;
@@ -364,6 +408,13 @@
     <div class="badges" id="badges"></div>
   </header>
 
+  <div id="updateBanner" class="update-banner hidden">
+    <span id="updateMsg"></span>
+    <button onclick="document.getElementById('updateBanner').classList.add('hidden')" style="background:transparent;border:none;color:var(--cyan);cursor:pointer;font-size:16px">✕</button>
+  </div>
+
+  <div class="cost-bar" id="costBar"></div>
+
   <div class="add-form">
     <textarea id="promptInput" placeholder="Enter your prompt here..."></textarea>
     <div class="skills-toggle-row" id="skillsToggleRow">
@@ -399,6 +450,9 @@
         <select id="workdirSelect" style="display:none" onchange="onProjectSelect()"></select>
         <input type="text" id="workdirInput" placeholder="C:\Projects\MyApp">
       </label>
+      <label>Recur
+        <input type="text" id="recurrenceInput" placeholder="6h / daily@09:00" style="width:140px">
+      </label>
       <label style="flex-direction:row;align-items:center;gap:8px;cursor:pointer">
         <input type="checkbox" id="skipPermissions" style="width:auto;margin:0">
         <span style="font-size:13px;color:var(--yellow)">--dangerously-skip-permissions</span>
@@ -414,6 +468,7 @@
     <button class="filter-btn" data-filter="completed">Completed</button>
     <button class="filter-btn" data-filter="failed">Failed</button>
     <button class="filter-btn" data-filter="rate_limited">Rate Limited</button>
+    <button id="pauseBtn" class="btn-pause" onclick="toggleWorkerPause()" style="margin-left:auto">⏸ Pause</button>
   </div>
 
   <div class="task-list" id="taskList"></div>
@@ -584,6 +639,7 @@ async function loadTasks() {
           </div>
         ` : ''}
 
+        ${t.recurrence ? `<div class="detail-info"><span class="label">Recurrence: </span><span>${esc(t.recurrence)}</span></div>` : ''}
         ${t.scheduled_at ? `<div class="detail-info"><span class="label">Scheduled: </span><span>${new Date(t.scheduled_at).toLocaleString()}</span></div>` : ''}
         ${t.started_at ? `<div class="detail-info"><span class="label">Started: </span><span>${new Date(t.started_at).toLocaleString()}</span></div>` : ''}
         ${t.completed_at ? `<div class="detail-info"><span class="label">Completed: </span><span>${new Date(t.completed_at).toLocaleString()}</span></div>` : ''}
@@ -611,6 +667,7 @@ async function addTask() {
   const selVal = sel.style.display !== 'none' && sel.value && sel.value !== '__custom__' ? sel.value : null;
   const workdir = selVal || document.getElementById('workdirInput').value.trim() || null;
   const skipPermissions = document.getElementById('skipPermissions').checked;
+  const recurrence = document.getElementById('recurrenceInput').value.trim() || null;
 
   await fetchJSON(`${API}/tasks`, {
     method: 'POST',
@@ -623,10 +680,12 @@ async function addTask() {
       working_dir: workdir,
       skip_permissions: skipPermissions,
       scheduled_at: schedule ? new Date(schedule).toISOString() : null,
+      recurrence,
     }),
   });
 
   document.getElementById('promptInput').value = '';
+  document.getElementById('recurrenceInput').value = '';
   refresh();
 }
 
@@ -832,12 +891,67 @@ function onProjectSelect() {
   }
 }
 
+// --- Worker pause ---
+async function loadWorkerStatus() {
+  const s = await fetchJSON(`${API}/worker/status`);
+  const btn = document.getElementById('pauseBtn');
+  if (s.paused) {
+    btn.textContent = '▶ Resume';
+    btn.classList.add('paused');
+  } else {
+    btn.textContent = '⏸ Pause';
+    btn.classList.remove('paused');
+  }
+}
+
+async function toggleWorkerPause() {
+  const btn = document.getElementById('pauseBtn');
+  const isPaused = btn.classList.contains('paused');
+  await fetchJSON(`${API}/worker/${isPaused ? 'resume' : 'pause'}`, { method: 'POST' });
+  loadWorkerStatus();
+}
+
+// --- Version check ---
+async function loadVersion() {
+  try {
+    const v = await fetchJSON(`${API}/version`);
+    if (v.update_available) {
+      const banner = document.getElementById('updateBanner');
+      document.getElementById('updateMsg').textContent =
+        `Update available: v${v.current} → v${v.latest}`;
+      banner.classList.remove('hidden');
+    }
+  } catch (_) {}
+}
+
+// --- Cost stats ---
+async function loadCosts() {
+  try {
+    const c = await fetchJSON(`${API}/stats/costs`);
+    if (c.total <= 0) return;
+    const bar = document.getElementById('costBar');
+    bar.innerHTML = [
+      `<div class="cost-item">Today: <span>$${c.today.toFixed(4)}</span></div>`,
+      `<div class="cost-item">Week: <span>$${c.week.toFixed(4)}</span></div>`,
+      `<div class="cost-item">Total: <span>$${c.total.toFixed(4)}</span></div>`,
+      ...Object.entries(c.by_provider).map(([p, v]) =>
+        `<div class="cost-item">${esc(p)}: <span>$${v.toFixed(4)}</span></div>`),
+    ].join('');
+    bar.classList.add('visible');
+  } catch (_) {}
+}
+
 // --- Init ---
 setDefaultSchedule();
 loadProviders();
 loadProjects();
+loadWorkerStatus();
+loadVersion();
+loadCosts();
 refresh();
 setInterval(refresh, 5000);
+setInterval(loadWorkerStatus, 10000);
+setInterval(loadCosts, 30000);
 </script>
 </body>
 </html>
