@@ -1,6 +1,6 @@
 [project]
 name = "promptpilot"
-version = "0.1.0"
+version = "0.2.0"
 description = "AI Prompt Scheduler — queue, schedule, and retry prompts for Claude Code CLI"
 requires-python = ">=3.10"
 dependencies = [

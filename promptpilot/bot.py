@@ -698,6 +698,7 @@ async def _finish_add_task_from_query(query, context):
         scheduled_at=scheduled_at,
         skip_permissions=skip_permissions,
         model=model,
+        tg_chat_id=query.message.chat_id,
     ))
 
     sched_str = scheduled_at.strftime("%d.%m.%Y %H:%M UTC") if scheduled_at else "сейчас"
@@ -730,6 +731,7 @@ async def _finish_add_task(update: Update, context: ContextTypes.DEFAULT_TYPE, w
         scheduled_at=scheduled_at,
         skip_permissions=skip_permissions,
         model=model,
+        tg_chat_id=update.message.chat_id,
     ))
 
     sched_str = scheduled_at.strftime("%d.%m.%Y %H:%M UTC") if scheduled_at else "сейчас"
@@ -1024,6 +1026,39 @@ async def skill_skip_args(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Entry point
 # ---------------------------------------------------------------------------
 
+async def _notify_loop(bot):
+    """Background loop: send notifications for completed/failed tasks every 10s."""
+    import asyncio
+    while True:
+        await asyncio.sleep(10)
+        for task in db.get_pending_notifications():
+            try:
+                if task.status.value == "completed":
+                    icon, status_word = "✅", "выполнена"
+                    body = ""
+                    if task.result:
+                        preview = task.result.split("\n--- Meta ---")[0].strip()
+                        if preview:
+                            body = f"\n\n{preview[:600]}"
+                        meta_lines = []
+                        if "--- Meta ---" in task.result:
+                            for line in task.result[task.result.find("--- Meta ---"):].splitlines():
+                                line = line.strip()
+                                if line.startswith(("Model:", "Cost:", "Time:")):
+                                    meta_lines.append(line)
+                        if meta_lines:
+                            body += "\n" + " · ".join(meta_lines)
+                else:
+                    icon, status_word = "❌", "завершилась с ошибкой"
+                    body = f"\n\n{task.error[:300]}" if task.error else ""
+
+                text = f"{icon} Задача #{task.id} {status_word}{body}"
+                await bot.send_message(chat_id=task.tg_chat_id, text=text)
+                db.mark_notified(task.id)
+            except Exception as e:
+                logger.warning("Failed to notify task %s: %s", task.id, e)
+
+
 def run_bot():
     token = os.environ.get("PP_TG_TOKEN")
     if not token:
@@ -1034,7 +1069,11 @@ def run_bot():
         level=logging.INFO,
     )
 
-    app = Application.builder().token(token).build()
+    async def post_init(application):
+        import asyncio
+        asyncio.create_task(_notify_loop(application.bot))
+
+    app = Application.builder().token(token).post_init(post_init).build()
 
     add_conv = ConversationHandler(
         entry_points=[
@@ -1117,5 +1156,6 @@ def run_bot():
         logger.error("Unhandled exception for update %s", update, exc_info=context.error)
 
     app.add_error_handler(error_handler)
+
     logger.info("PromptPilot Telegram bot started.")
     app.run_polling(drop_pending_updates=True)

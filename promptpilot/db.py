@@ -30,7 +30,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     skip_permissions INTEGER DEFAULT 0,
     model TEXT,
     session_id TEXT,
-    parent_task_id INTEGER
+    parent_task_id INTEGER,
+    tg_chat_id INTEGER,
+    notified_at TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
@@ -44,6 +46,8 @@ MIGRATIONS = [
     "ALTER TABLE tasks ADD COLUMN session_id TEXT",
     "ALTER TABLE tasks ADD COLUMN parent_task_id INTEGER",
     "ALTER TABLE tasks ADD COLUMN model TEXT",
+    "ALTER TABLE tasks ADD COLUMN tg_chat_id INTEGER",
+    "ALTER TABLE tasks ADD COLUMN notified_at TEXT",
 ]
 
 
@@ -95,8 +99,8 @@ def init_db():
 def create_task(task: TaskCreate) -> TaskInDB:
     with _connect() as conn:
         cur = conn.execute(
-            """INSERT INTO tasks (prompt, working_dir, provider, status, priority, scheduled_at, created_at, max_retries, skip_permissions, model, session_id, parent_task_id)
-               VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)""",
+            """INSERT INTO tasks (prompt, working_dir, provider, status, priority, scheduled_at, created_at, max_retries, skip_permissions, model, session_id, parent_task_id, tg_chat_id)
+               VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 task.prompt,
                 task.working_dir,
@@ -109,6 +113,7 @@ def create_task(task: TaskCreate) -> TaskInDB:
                 task.model,
                 task.session_id,
                 task.parent_task_id,
+                task.tg_chat_id,
             ),
         )
         return get_task(cur.lastrowid, conn=conn)
@@ -234,6 +239,26 @@ def get_stats() -> Stats:
             rate_limited=data.get("rate_limited", 0),
             cancelled=data.get("cancelled", 0),
             total=total,
+        )
+
+
+def get_pending_notifications() -> list:
+    """Return completed/failed tasks with a tg_chat_id that haven't been notified yet."""
+    with _connect() as conn:
+        rows = conn.execute(
+            """SELECT * FROM tasks
+               WHERE tg_chat_id IS NOT NULL
+                 AND notified_at IS NULL
+                 AND status IN ('completed', 'failed')""",
+        ).fetchall()
+        return [_row_to_task(r) for r in rows]
+
+
+def mark_notified(task_id: int):
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE tasks SET notified_at = ? WHERE id = ?",
+            (_now(), task_id),
         )
 
 

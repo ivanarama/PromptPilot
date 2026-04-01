@@ -27,6 +27,7 @@ class TaskCreate(BaseModel):
     model: Optional[str] = None  # e.g. "sonnet", "opus", "haiku"
     session_id: Optional[str] = None  # Claude session to resume (--resume)
     parent_task_id: Optional[int] = None  # Task this is a reply to
+    tg_chat_id: Optional[int] = None  # Telegram chat to notify on completion
 
 
 class TaskUpdate(BaseModel):
@@ -56,6 +57,8 @@ class TaskInDB(BaseModel):
     model: Optional[str] = None
     session_id: Optional[str] = None
     parent_task_id: Optional[int] = None
+    tg_chat_id: Optional[int] = None
+    notified_at: Optional[datetime] = None
 
 
 class Stats(BaseModel):
