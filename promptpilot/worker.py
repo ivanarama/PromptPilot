@@ -205,9 +205,9 @@ def execute_task(task):
         output = format_result(parsed)
         model_used = parsed["meta"].get("model")
         session_id = parsed["meta"].get("session_id")
-        # Check for rate limit in stream events
+        # Check for rate limit in stream events — only if no text was returned
         rl = parsed.get("rate_limit_info")
-        if rl and rl.get("status") != "allowed":
+        if rl and not parsed["text"]:
             if task.retry_count >= task.max_retries:
                 db.mark_failed(task.id, f"Rate limited.\n{output}")
                 return

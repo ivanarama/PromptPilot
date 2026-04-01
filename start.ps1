@@ -17,8 +17,8 @@ if (Test-Path $envFile) {
     Get-Content $envFile | ForEach-Object {
         if ($_ -match '^\s*([^#][^=]*?)\s*=\s*"?([^"]*)"?\s*$') {
             $k = $Matches[1].Trim(); $v = $Matches[2].Trim()
-            if ($k -and -not [System.Environment]::GetEnvironmentVariable($k, 'Process')) {
-                [System.Environment]::SetEnvironmentVariable($k, $v, 'Process')
+            if ($k -and -not (Test-Path "env:$k")) {
+                Set-Item -Path "env:$k" -Value $v
             }
         }
     }
