@@ -57,6 +57,8 @@ jobs:
   release:
     needs: [build-exe, build-wheel]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
