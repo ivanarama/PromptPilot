@@ -92,6 +92,16 @@ BUILTIN_PROVIDERS = {
         "description": "Qwen Code",
         "supports_skills": False,
     },
+    "cursor": {
+        "cmd": "cursor-agent --print --output-format text -f {prompt}",
+        "description": "Cursor Agent",
+        "supports_skills": False,
+        "env": {
+            "CURSOR_API_KEY": os.environ.get("CURSOR_API_KEY", ""),
+            # Ensure rg (ripgrep) is on PATH — required by cursor-agent
+            "PATH": os.environ.get("PATH", ""),
+        },
+    },
 }
 
 
