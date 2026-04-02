@@ -86,6 +86,26 @@ def _cursor_agent_cmd() -> str:
     return "cursor-agent"
 
 
+def _find_rg_dir() -> str:
+    """Find ripgrep (rg) directory from Windows registry PATH if not in current PATH."""
+    import shutil
+    import subprocess as _sp
+    if shutil.which("rg"):
+        return ""
+    try:
+        result = _sp.run(
+            ["powershell", "-Command", '[System.Environment]::GetEnvironmentVariable("PATH","User")'],
+            capture_output=True, text=True, timeout=5,
+        )
+        for entry in result.stdout.strip().split(";"):
+            entry = entry.strip()
+            if entry and Path(entry, "rg.exe").exists():
+                return entry
+    except Exception:
+        pass
+    return ""
+
+
 BUILTIN_PROVIDERS = {
     "claude": {
         "cmd": f"{CLAUDE_EXE} -p --verbose --output-format stream-json {{prompt}}",
@@ -118,7 +138,7 @@ BUILTIN_PROVIDERS = {
         "supports_skills": False,
         "env": {
             "CURSOR_API_KEY": os.environ.get("CURSOR_API_KEY", ""),
-            "PATH": os.environ.get("PATH", ""),
+            "PATH": os.pathsep.join(filter(None, [_find_rg_dir(), os.environ.get("PATH", "")])),
         },
     },
 }
