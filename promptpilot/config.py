@@ -66,6 +66,26 @@ CLAUDE_EXE = os.environ.get(
     str(Path.home() / ".local" / "bin" / "claude.exe"),
 )
 
+def _cursor_agent_cmd() -> str:
+    """Return command to invoke cursor-agent.
+
+    On Windows the npm runner (runner.mjs) spawns the vendor .cmd file without
+    shell:true and gets EINVAL.  We bypass it by calling the vendor node.exe +
+    index.js directly.  Falls back to 'cursor-agent' if vendor not found.
+    """
+    try:
+        sdk_root = Path.home() / "AppData" / "Roaming" / "npm" / "node_modules" / "@nothumanwork" / "cursor-agents-sdk"
+        manifest = json.loads((sdk_root / "vendor" / "manifest.json").read_text())
+        vendor_dir = (sdk_root / manifest["path"]).parent
+        node_exe = vendor_dir / "node.exe"
+        index_js = vendor_dir / "index.js"
+        if node_exe.exists() and index_js.exists():
+            return f"{node_exe} {index_js}"
+    except Exception:
+        pass
+    return "cursor-agent"
+
+
 BUILTIN_PROVIDERS = {
     "claude": {
         "cmd": f"{CLAUDE_EXE} -p --verbose --output-format stream-json {{prompt}}",
@@ -93,12 +113,11 @@ BUILTIN_PROVIDERS = {
         "supports_skills": False,
     },
     "cursor": {
-        "cmd": "cursor-agent --print --output-format text -f {prompt}",
+        "cmd": f"{_cursor_agent_cmd()} --print --output-format text -f {{prompt}}",
         "description": "Cursor Agent",
         "supports_skills": False,
         "env": {
             "CURSOR_API_KEY": os.environ.get("CURSOR_API_KEY", ""),
-            # Ensure rg (ripgrep) is on PATH — required by cursor-agent
             "PATH": os.environ.get("PATH", ""),
         },
     },
