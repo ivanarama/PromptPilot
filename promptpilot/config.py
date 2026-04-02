@@ -239,7 +239,8 @@ def get_provider_env(provider: str) -> dict:
     if not extra:
         return os.environ.copy()
     env = os.environ.copy()
-    env.update(extra)
+    # Skip empty values — don't override existing env vars with empty strings
+    env.update({k: v for k, v in extra.items() if v})
     return env
 
 
