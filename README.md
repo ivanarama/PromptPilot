@@ -2,7 +2,7 @@
 
 > **Background task queue for AI CLIs** — schedule prompts, retry on rate limits, manage everything via Web UI or Telegram bot.
 >
-> Works with Claude Code, OpenAI Codex, Qwen Code, or any CLI that accepts a prompt argument.
+> Works with Claude Code, OpenAI Codex, Qwen Code, Cursor Agent, or any CLI that accepts a prompt argument.
 
 ---
 
@@ -12,7 +12,7 @@
 
 ## Возможности
 
-- **Мульти-провайдер** — Claude, Codex, Qwen, или любой свой CLI
+- **Мульти-провайдер** — Claude, Codex, Qwen, Cursor Agent, или любой свой CLI
 - **Очередь задач** с приоритетами (1 — высший, 10 — низший)
 - **Планирование** — запуск промптов в заданное время
 - **Выбор модели** — для Claude Code провайдеров: sonnet / opus / haiku (Web UI + бот)
@@ -288,6 +288,7 @@ PP_TASK_PASSWORD=mysecretpassword
 | `claude-z` | Claude Code с альтернативным API (GLM, z.ai и др.) | ✅ | ✅ sonnet / opus / haiku |
 | `codex` | OpenAI Codex | — | — |
 | `qwen` | Qwen Code | — | — |
+| `cursor` | Cursor Agent | — | — |
 
 > Любой провайдер с `supports_skills=True` считается Claude Code-совместимым и получает выбор модели автоматически.
 
@@ -326,6 +327,20 @@ pp provider add claude-z `
 ```
 
 > **Windows:** `subprocess` не видит PowerShell-функции и алиасы — нужен полный путь к исполняемому файлу. `.cmd`/`.bat`-обёртки (npm-инструменты вроде `qwen`, `codex`) находятся автоматически через `shutil.which`.
+
+### Настройка Cursor Agent
+
+```powershell
+npm install -g @nothumanwork/cursor-agents-sdk
+winget install BurntSushi.ripgrep.MSVC
+```
+
+Добавь в `.env`:
+```
+CURSOR_API_KEY=crsr_your_key_here
+```
+
+Ключ: **cursor.com/settings** → **API Keys**. Первый запуск занимает ~60 секунд.
 
 ## Скилы Claude Code
 
