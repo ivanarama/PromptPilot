@@ -5,7 +5,7 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 _RELEASES_URL = "https://api.github.com/repos/ivanarama/PromptPilot/releases/latest"
 _CACHE_FILE = Path.home() / ".promptpilot" / "version-check.json"
