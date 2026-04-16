@@ -11,7 +11,7 @@ def _users_file() -> Path:
     return DB_DIR / "tg_users.json"
 
 
-def load_allowed_phones() -> list[str]:
+def load_allowed_phones() -> list:
     """Load allowed phone numbers from PP_TG_ALLOWED_PHONES env or tg_config.json."""
     env_val = os.environ.get("PP_TG_ALLOWED_PHONES", "")
     if env_val:
@@ -64,6 +64,6 @@ def is_authorized(chat_id: int) -> bool:
     return str(chat_id) in _load_users()
 
 
-def list_authorized() -> dict[str, str]:
+def list_authorized() -> dict:
     """Return all authorized users as {chat_id: phone}."""
     return _load_users()

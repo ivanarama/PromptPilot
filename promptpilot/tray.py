@@ -55,7 +55,7 @@ def _status_color() -> str:
 # Process management
 # ---------------------------------------------------------------------------
 
-def _cmd(service: str) -> list[str]:
+def _cmd(service: str):
     """Build command for a service using the current executable."""
     if getattr(sys, "frozen", False):
         return [sys.executable, service]
