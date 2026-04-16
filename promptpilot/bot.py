@@ -7,6 +7,7 @@ After authorization all task management features are available.
 
 import logging
 import os
+from typing import Optional
 
 from telegram import (
     InlineKeyboardButton,
@@ -873,7 +874,7 @@ async def reply_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Skills (/skills command + skill task creation)
 # ---------------------------------------------------------------------------
 
-def _best_claude_provider() -> str | None:
+def _best_claude_provider() -> Optional[str]:
     """Return the best available Claude provider (prefers DEFAULT_CLI if it supports skills)."""
     providers = load_providers()
     claude_providers = [name for name, info in providers.items() if info.get("supports_skills", False)]
