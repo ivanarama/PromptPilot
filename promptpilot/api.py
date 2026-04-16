@@ -2,7 +2,7 @@
 
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
@@ -26,7 +26,7 @@ else:
 
 # --- API ---
 
-@app.get("/api/tasks", response_model=list[TaskInDB])
+@app.get("/api/tasks", response_model=List[TaskInDB])
 def api_list_tasks(status: Optional[TaskStatus] = None, limit: int = 50, offset: int = 0):
     return db.list_tasks(status=status, limit=limit, offset=offset)
 
