@@ -2,16 +2,21 @@
 # PyInstaller spec for PromptPilot
 # Build: pyinstaller pp.spec  (or run build.ps1)
 
+from PyInstaller.utils.hooks import collect_all
+
 block_cipher = None
+
+tg_datas, tg_binaries, tg_hiddenimports = collect_all('telegram')
+httpx_datas, httpx_binaries, httpx_hiddenimports = collect_all('httpx')
 
 a = Analysis(
     ['main.py'],
     pathex=[],
-    binaries=[],
+    binaries=[] + tg_binaries + httpx_binaries,
     datas=[
         # Bundle the web UI static files
         ('promptpilot/static', 'promptpilot/static'),
-    ],
+    ] + tg_datas + httpx_datas,
     hiddenimports=[
         # uvicorn dynamic imports
         'uvicorn.logging',
@@ -32,16 +37,13 @@ a = Analysis(
         'click',
         # pydantic
         'pydantic',
-        # telegram bot
-        'telegram',
-        'telegram.ext',
         # tray
         'pystray._win32',
         'PIL',
         'PIL.Image',
         'PIL.ImageDraw',
         'PIL.ImageFont',
-    ],
+    ] + tg_hiddenimports + httpx_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

@@ -77,8 +77,11 @@ def _start(service: str):
         if _is_running(service):
             return
         if service == "bot":
+            import datetime
             log_path = _bot_log_path()
             log_file = open(log_path, "a", encoding="utf-8")
+            log_file.write(f"\n--- bot start {datetime.datetime.now():%Y-%m-%d %H:%M:%S} ---\n")
+            log_file.flush()
             _procs[service] = subprocess.Popen(
                 _cmd(service),
                 stdout=log_file,
