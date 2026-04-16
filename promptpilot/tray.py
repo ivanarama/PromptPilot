@@ -19,7 +19,7 @@ from .config import HOST, PORT
 
 _LOG_DIR = Path.home() / ".promptpilot"
 
-_procs: dict[str, subprocess.Popen] = {}
+_procs = {}  # service name -> Popen
 _lock = threading.Lock()
 
 
