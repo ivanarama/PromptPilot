@@ -598,14 +598,14 @@ async function loadTasks() {
         const copyable = parsed.text || '';
         resultHTML += `<div class="result-block">
           <pre>${esc(displayText)}</pre>
-          ${copyable ? `<button class="copy-btn" onclick="copyText(event, ${JSON.stringify(JSON.stringify(copyable))})">Copy</button>` : ''}
+          ${copyable ? `<button class="copy-btn" data-copy="${escAttr(copyable)}" onclick="copyText(event)">Copy</button>` : ''}
         </div>`;
       }
     } else if (t.result) {
       resultHTML += `<div class="detail-label">Result</div>`;
       resultHTML += `<div class="result-block">
         <pre>${esc(t.result)}</pre>
-        <button class="copy-btn" onclick="copyText(event, ${JSON.stringify(JSON.stringify(t.result))})">Copy</button>
+        <button class="copy-btn" data-copy="${escAttr(t.result)}" onclick="copyText(event)">Copy</button>
       </div>`;
     }
 
@@ -624,7 +624,7 @@ async function loadTasks() {
         <div class="detail-label">Prompt</div>
         <div class="result-block">
           <pre>${esc(t.prompt)}</pre>
-          <button class="copy-btn" onclick="copyText(event, ${JSON.stringify(JSON.stringify(t.prompt))})">Copy</button>
+          <button class="copy-btn" data-copy="${escAttr(t.prompt)}" onclick="copyText(event)">Copy</button>
         </div>
 
         ${t.working_dir ? `<div class="detail-info"><span class="label">Dir: </span><span>${esc(t.working_dir)}</span></div>` : ''}
@@ -635,7 +635,7 @@ async function loadTasks() {
           <div class="detail-label">Error</div>
           <div class="result-block">
             <pre>${esc(t.error)}</pre>
-            <button class="copy-btn" onclick="copyText(event, ${JSON.stringify(JSON.stringify(t.error))})">Copy</button>
+            <button class="copy-btn" data-copy="${escAttr(t.error)}" onclick="copyText(event)">Copy</button>
           </div>
         ` : ''}
 
@@ -719,7 +719,8 @@ function toggleTask(id) {
 
 function copyText(e, text) {
   e.stopPropagation();
-  navigator.clipboard.writeText(text).then(() => {
+  const copyStr = text !== undefined ? text : e.target.dataset.copy;
+  navigator.clipboard.writeText(copyStr).then(() => {
     const btn = e.target;
     btn.textContent = 'Copied!';
     setTimeout(() => btn.textContent = 'Copy', 1500);
@@ -740,6 +741,10 @@ function esc(s) {
   const d = document.createElement('div');
   d.textContent = s;
   return d.innerHTML;
+}
+
+function escAttr(s) {
+  return esc(s).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
 function timeAgo(iso) {

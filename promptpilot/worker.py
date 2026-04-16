@@ -83,12 +83,22 @@ def parse_stream_json(stdout: str) -> dict:
             model_usage = event.get("modelUsage", {})
             if model_usage:
                 meta["model"] = list(model_usage.keys())[0]
-            # If result has text and we didn't capture any
-            if event.get("result") and not text_parts:
-                text_parts.append(event["result"])
+            # Extract result text (always for errors, fallback for empty output)
+            if event.get("result"):
+                if event.get("is_error") or not text_parts:
+                    text_parts.append(event["result"])
             for d in event.get("permission_denials", []):
                 desc = d.get("tool_input", {}).get("description") or d.get("tool_input", {}).get("command", "")
                 denials.append(f"[{d.get('tool_name', '?')}] {desc}")
+
+        elif etype == "system":
+            # System events (api_retry, errors, etc.)
+            subtype = event.get("subtype", "")
+            error_msg = event.get("error", "")
+            if subtype == "api_retry" and error_msg:
+                attempt = event.get("attempt", "?")
+                status = event.get("error_status", "")
+                text_parts.append(f"API retry #{attempt} (status {status}): {error_msg}")
 
         elif etype == "rate_limit_event":
             rate_limit_info = event.get("rate_limit_info", {})
@@ -184,16 +194,32 @@ def execute_task(task):
         return
 
     if is_rate_limited(result.stderr, result.returncode):
+        # Extract readable error from stream-json if possible
+        rl_error = result.stderr or result.stdout
+        if is_stream_json(rl_error):
+            parsed = parse_stream_json(rl_error)
+            rl_error = format_result(parsed) or rl_error
+        elif is_stream_json(result.stdout):
+            parsed = parse_stream_json(result.stdout)
+            rl_error = format_result(parsed) or rl_error
         if task.retry_count >= task.max_retries:
-            db.mark_failed(task.id, f"Rate limited, max retries ({task.max_retries}) exceeded.\n{result.stderr}")
+            db.mark_failed(task.id, f"Rate limited, max retries ({task.max_retries}) exceeded.\n{rl_error}")
             return
         next_run = compute_next_run(task.retry_count)
-        db.mark_rate_limited(task.id, next_run, error=result.stderr or "Rate limited")
+        db.mark_rate_limited(task.id, next_run, error=rl_error or "Rate limited")
         print(f"  -> Rate limited. Retry #{task.retry_count + 1} at {next_run.strftime('%H:%M:%S')}")
         return
 
     if result.returncode != 0:
-        db.mark_failed(task.id, result.stderr or result.stdout, exit_code=result.returncode)
+        error_text = result.stderr or result.stdout
+        # Try to extract readable error from stream-json output
+        if is_stream_json(error_text):
+            parsed = parse_stream_json(error_text)
+            error_text = format_result(parsed) or error_text
+        elif is_stream_json(result.stdout):
+            parsed = parse_stream_json(result.stdout)
+            error_text = format_result(parsed) or error_text
+        db.mark_failed(task.id, error_text, exit_code=result.returncode)
         print(f"  -> Failed (exit {result.returncode})")
         return
 

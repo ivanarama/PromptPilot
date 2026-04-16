@@ -11,14 +11,17 @@ def _load_dotenv():
 
     Search order:
       1. Directory of pp.exe  (when running as PyInstaller bundle)
-      2. Current working directory
-      3. ~/.promptpilot/.env  (permanent user config)
+      2. Parent of pp.exe directory (e.g. project root when exe is in dist/)
+      3. Current working directory
+      4. ~/.promptpilot/.env  (permanent user config)
     """
     candidates = []
 
     if getattr(sys, "frozen", False):
-        # Running as pp.exe — look next to the binary first
-        candidates.append(Path(sys.executable).parent / ".env")
+        # Running as pp.exe — look next to the binary first, then one level up
+        exe_dir = Path(sys.executable).parent
+        candidates.append(exe_dir / ".env")
+        candidates.append(exe_dir.parent / ".env")
 
     candidates.append(Path.cwd() / ".env")
     candidates.append(Path.home() / ".promptpilot" / ".env")

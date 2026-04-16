@@ -10,11 +10,14 @@ import subprocess
 import sys
 import threading
 import webbrowser
+from pathlib import Path
 
 import pystray
 from PIL import Image, ImageDraw, ImageFont
 
 from .config import HOST, PORT
+
+_LOG_DIR = Path.home() / ".promptpilot"
 
 _procs: dict[str, subprocess.Popen] = {}
 _lock = threading.Lock()
@@ -64,11 +67,25 @@ def _is_running(service: str) -> bool:
     return p is not None and p.poll() is None
 
 
+def _bot_log_path() -> Path:
+    _LOG_DIR.mkdir(parents=True, exist_ok=True)
+    return _LOG_DIR / "bot.log"
+
+
 def _start(service: str):
     with _lock:
         if _is_running(service):
             return
-        _procs[service] = subprocess.Popen(_cmd(service))
+        if service == "bot":
+            log_path = _bot_log_path()
+            log_file = open(log_path, "a", encoding="utf-8")
+            _procs[service] = subprocess.Popen(
+                _cmd(service),
+                stdout=log_file,
+                stderr=log_file,
+            )
+        else:
+            _procs[service] = subprocess.Popen(_cmd(service))
 
 
 def _stop(service: str):
@@ -123,8 +140,11 @@ def _build_menu(icon: pystray.Icon) -> pystray.Menu:
 
     def toggle_bot(i, it):
         if not os.environ.get("PP_TG_TOKEN"):
-            # Show hint in tooltip — token not configured
-            i.title = "PromptPilot: PP_TG_TOKEN не задан в .env"
+            if getattr(sys, "frozen", False):
+                env_hint = str(Path(sys.executable).parent / ".env")
+            else:
+                env_hint = str(Path.cwd() / ".env")
+            i.title = f"PromptPilot: PP_TG_TOKEN не задан\nДобавьте в: {env_hint}"
             return
         _toggle("bot", i)
 
@@ -143,12 +163,20 @@ def _build_menu(icon: pystray.Icon) -> pystray.Menu:
         _stop_all()
         i.stop()
 
+    def open_bot_log(i, it):
+        log_path = _bot_log_path()
+        if log_path.exists():
+            os.startfile(str(log_path))
+        else:
+            i.title = "PromptPilot: лог бота пока пуст"
+
     items = [
         pystray.MenuItem("PromptPilot", None, enabled=False),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem(_label("worker"), toggle_fn("worker")),
         pystray.MenuItem(_label("server"), toggle_fn("server")),
         pystray.MenuItem(_label("bot"),    toggle_bot),
+        pystray.MenuItem("  Лог бота...", open_bot_log),
     ]
 
     items += [
