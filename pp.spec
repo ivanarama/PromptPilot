@@ -2,11 +2,12 @@
 # PyInstaller spec for PromptPilot
 # Build: pyinstaller pp.spec  (or run build.ps1)
 
-from PyInstaller.utils.hooks import collect_all
+from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 block_cipher = None
 
 tg_datas, tg_binaries, tg_hiddenimports = collect_all('telegram')
+tg_hiddenimports += collect_submodules('telegram')
 httpx_datas, httpx_binaries, httpx_hiddenimports = collect_all('httpx')
 
 a = Analysis(
