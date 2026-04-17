@@ -174,6 +174,30 @@ def execute_task(task):
     if resolved:
         cmd[0] = resolved
 
+    # Detached mode: start process and return immediately — for servers/bots that run forever
+    if task.detached:
+        import platform
+        kwargs = {"cwd": task.working_dir, "env": env, "stdin": subprocess.DEVNULL}
+        if platform.system() == "Windows":
+            kwargs["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            kwargs["start_new_session"] = True
+        try:
+            proc = subprocess.Popen(cmd, **kwargs)
+            db.mark_completed(task.id, f"Запущен в фоне (PID {proc.pid})", exit_code=0)
+            print(f"  -> Detached (PID {proc.pid})")
+        except FileNotFoundError:
+            db.mark_failed(task.id, f"Command not found: {cmd[0]}", exit_code=-1)
+        return
+
+    # Determine effective timeout
+    if task.task_timeout == 0:
+        effective_timeout = None   # no limit
+    elif task.task_timeout is not None:
+        effective_timeout = task.task_timeout
+    else:
+        effective_timeout = TASK_TIMEOUT
+
     try:
         result = subprocess.run(
             cmd,
@@ -181,13 +205,13 @@ def execute_task(task):
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=TASK_TIMEOUT,
+            timeout=effective_timeout,
             cwd=task.working_dir,
             stdin=subprocess.DEVNULL,
             env=env,
         )
     except subprocess.TimeoutExpired:
-        db.mark_failed(task.id, "Execution timed out", exit_code=-1)
+        db.mark_failed(task.id, f"Execution timed out after {effective_timeout}s", exit_code=-1)
         return
     except FileNotFoundError:
         db.mark_failed(task.id, f"CLI '{provider}' not found. Is it installed and in PATH?", exit_code=-1)
@@ -264,6 +288,8 @@ def execute_task(task):
                 model=task.model,
                 recurrence=task.recurrence,
                 tg_chat_id=task.tg_chat_id,
+                task_timeout=task.task_timeout,
+                detached=task.detached,
             ))
             print(f"  -> Recurring: next run at {next_dt.strftime('%Y-%m-%d %H:%M UTC')}")
 

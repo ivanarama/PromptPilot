@@ -29,6 +29,8 @@ class TaskCreate(BaseModel):
     parent_task_id: Optional[int] = None  # Task this is a reply to
     tg_chat_id: Optional[int] = None  # Telegram chat to notify on completion
     recurrence: Optional[str] = None  # e.g. "6h", "daily@09:00"
+    task_timeout: Optional[int] = None  # per-task timeout in seconds; None = use global TASK_TIMEOUT; 0 = no limit
+    detached: bool = False  # if True: start process and mark completed immediately (for servers/bots)
 
 
 class TaskUpdate(BaseModel):
@@ -61,6 +63,8 @@ class TaskInDB(BaseModel):
     tg_chat_id: Optional[int] = None
     notified_at: Optional[datetime] = None
     recurrence: Optional[str] = None
+    task_timeout: Optional[int] = None
+    detached: bool = False
 
 
 class Stats(BaseModel):

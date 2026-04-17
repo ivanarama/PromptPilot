@@ -35,7 +35,7 @@ from .tg_auth import authorize_user, is_authorized, load_allowed_phones
 logger = logging.getLogger(__name__)
 
 # Conversation states
-ASK_PASSWORD, ASK_PROMPT, ASK_PROVIDER, ASK_PRIORITY, ASK_SKIP_PERMS, ASK_DIR, ASK_DIR_MANUAL, ASK_SCHEDULE, ASK_REPLY, ASK_SKILL_ARGS, ASK_MODEL, ASK_RECURRENCE = range(12)
+ASK_PASSWORD, ASK_PROMPT, ASK_PROVIDER, ASK_PRIORITY, ASK_SKIP_PERMS, ASK_DIR, ASK_DIR_MANUAL, ASK_SCHEDULE, ASK_REPLY, ASK_SKILL_ARGS, ASK_MODEL, ASK_RECURRENCE, ASK_DETACHED = range(13)
 
 PAGE_SIZE = 5
 
@@ -723,12 +723,38 @@ async def add_task_got_recurrence(update: Update, context: ContextTypes.DEFAULT_
         )
         return ASK_RECURRENCE
     context.user_data["new_recurrence"] = text
-    return await _finish_add_task(update, context)
+    return await _ask_detached(update.message)
 
 
 async def add_task_skip_recurrence(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["new_recurrence"] = None
-    return await _finish_add_task(update, context)
+    return await _ask_detached(update.message)
+
+
+async def _ask_detached(message):
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("▶ Обычно (ждать результата)", callback_data="detached:0"),
+            InlineKeyboardButton("🔁 Фоново (сервер/бот)", callback_data="detached:1"),
+        ],
+    ])
+    await message.reply_text(
+        "Как запустить?\n"
+        "• *Обычно* — ждать завершения, получить результат\n"
+        "• *Фоново* — запустить и сразу завершить задачу \\(для серверов, ботов, polling\\)",
+        parse_mode="MarkdownV2",
+        reply_markup=keyboard,
+    )
+    return ASK_DETACHED
+
+
+async def add_task_got_detached(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    detached = query.data == "detached:1"
+    context.user_data["new_detached"] = detached
+    await query.edit_message_reply_markup(reply_markup=None)
+    return await _finish_add_task_from_query(query, context)
 
 
 async def _finish_add_task_from_query(query, context):
@@ -742,6 +768,7 @@ async def _finish_add_task_from_query(query, context):
     skip_permissions = context.user_data.pop("new_skip_permissions", False)
     model = context.user_data.pop("new_model", None)
     recurrence = context.user_data.pop("new_recurrence", None)
+    detached = context.user_data.pop("new_detached", False)
 
     task = db.create_task(TaskCreate(
         prompt=prompt,
@@ -753,16 +780,18 @@ async def _finish_add_task_from_query(query, context):
         model=model,
         tg_chat_id=query.message.chat_id,
         recurrence=recurrence,
+        detached=detached,
     ))
 
     sched_str = scheduled_at.strftime("%d.%m.%Y %H:%M UTC") if scheduled_at else "сейчас"
     skip_str = " ⚠️ --dangerously-skip-permissions" if skip_permissions else ""
+    detached_str = " 🔁 фоновый" if detached else ""
     await query.message.reply_text(
         f"✅ Задача #{task.id} добавлена!\n"
         f"Провайдер: {provider or 'claude (по умолчанию)'}\n"
         f"Приоритет: {priority}\n"
         f"Директория: {working_dir or 'не указана'}\n"
-        f"Запуск: {sched_str}{skip_str}",
+        f"Запуск: {sched_str}{skip_str}{detached_str}",
         reply_markup=_main_menu(),
     )
     return ConversationHandler.END
@@ -777,6 +806,7 @@ async def _finish_add_task(update: Update, context: ContextTypes.DEFAULT_TYPE, w
     skip_permissions = context.user_data.pop("new_skip_permissions", False)
     model = context.user_data.pop("new_model", None)
     recurrence = context.user_data.pop("new_recurrence", None)
+    detached = context.user_data.pop("new_detached", False)
 
     task = db.create_task(TaskCreate(
         prompt=prompt,
@@ -788,23 +818,25 @@ async def _finish_add_task(update: Update, context: ContextTypes.DEFAULT_TYPE, w
         model=model,
         tg_chat_id=update.message.chat_id,
         recurrence=recurrence,
+        detached=detached,
     ))
 
     sched_str = scheduled_at.strftime("%d.%m.%Y %H:%M UTC") if scheduled_at else "сейчас"
     skip_str = " ⚠️ --dangerously-skip-permissions" if skip_permissions else ""
+    detached_str = " 🔁 фоновый" if detached else ""
     await update.message.reply_text(
         f"✅ Задача #{task.id} добавлена!\n"
         f"Провайдер: {provider or 'claude (по умолчанию)'}\n"
         f"Приоритет: {priority}\n"
         f"Директория: {working_dir or 'не указана'}\n"
-        f"Запуск: {sched_str}{skip_str}",
+        f"Запуск: {sched_str}{skip_str}{detached_str}",
         reply_markup=_main_menu(),
     )
     return ConversationHandler.END
 
 
 async def add_task_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    for key in ("new_prompt", "new_provider", "new_priority", "new_dir", "new_schedule"):
+    for key in ("new_prompt", "new_provider", "new_priority", "new_dir", "new_schedule", "new_recurrence", "new_detached"):
         context.user_data.pop(key, None)
     await update.message.reply_text("Отменено.", reply_markup=_main_menu())
     return ConversationHandler.END
@@ -1173,6 +1205,9 @@ def run_bot():
             ASK_RECURRENCE: [
                 CommandHandler("skip", add_task_skip_recurrence),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, add_task_got_recurrence),
+            ],
+            ASK_DETACHED: [
+                CallbackQueryHandler(add_task_got_detached, pattern=r"^detached:"),
             ],
         },
         fallbacks=[CommandHandler("cancel", add_task_cancel)],

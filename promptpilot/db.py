@@ -34,7 +34,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     parent_task_id INTEGER,
     tg_chat_id INTEGER,
     notified_at TEXT,
-    recurrence TEXT
+    recurrence TEXT,
+    task_timeout INTEGER,
+    detached INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS settings (
@@ -57,6 +59,8 @@ MIGRATIONS = [
     "ALTER TABLE tasks ADD COLUMN notified_at TEXT",
     "ALTER TABLE tasks ADD COLUMN recurrence TEXT",
     "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+    "ALTER TABLE tasks ADD COLUMN task_timeout INTEGER",
+    "ALTER TABLE tasks ADD COLUMN detached INTEGER NOT NULL DEFAULT 0",
 ]
 
 
@@ -108,8 +112,8 @@ def init_db():
 def create_task(task: TaskCreate) -> TaskInDB:
     with _connect() as conn:
         cur = conn.execute(
-            """INSERT INTO tasks (prompt, working_dir, provider, status, priority, scheduled_at, created_at, max_retries, skip_permissions, model, session_id, parent_task_id, tg_chat_id, recurrence)
-               VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            """INSERT INTO tasks (prompt, working_dir, provider, status, priority, scheduled_at, created_at, max_retries, skip_permissions, model, session_id, parent_task_id, tg_chat_id, recurrence, task_timeout, detached)
+               VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 task.prompt,
                 task.working_dir,
@@ -124,6 +128,8 @@ def create_task(task: TaskCreate) -> TaskInDB:
                 task.parent_task_id,
                 task.tg_chat_id,
                 task.recurrence,
+                task.task_timeout,
+                int(task.detached),
             ),
         )
         return get_task(cur.lastrowid, conn=conn)
