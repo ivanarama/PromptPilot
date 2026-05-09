@@ -145,7 +145,7 @@ BUILTIN_PROVIDERS = {
         },
     },
     "opencode": {
-        "cmd": "opencode run --format json {prompt}",
+        "cmd": "opencode -p {prompt} -f json -q",
         "description": "OpenCode AI",
         "supports_skills": False,
         "models": [
