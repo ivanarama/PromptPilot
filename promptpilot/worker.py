@@ -39,7 +39,7 @@ def compute_next_run(retry_count: int) -> datetime:
 
 
 def parse_stream_json(stdout: str) -> dict:
-    """Parse stream-json output from Claude CLI.
+    """Parse stream-json output from Claude CLI or OpenCode.
 
     Extracts text from assistant messages, metadata from result event,
     and rate limit info.
@@ -63,14 +63,20 @@ def parse_stream_json(stdout: str) -> dict:
         etype = event.get("type")
 
         if etype == "assistant":
-            # Extract text content from assistant messages
+            # Claude Code: Extract text content from assistant messages
             msg = event.get("message", {})
             for block in msg.get("content", []):
                 if block.get("type") == "text":
                     text_parts.append(block["text"])
 
+        elif etype == "text":
+            # OpenCode: Extract text from part.text
+            part = event.get("part", {})
+            if part.get("text"):
+                text_parts.append(part["text"])
+
         elif etype == "result":
-            # Final result event — metadata
+            # Claude Code: Final result event — metadata
             meta["cost"] = event.get("total_cost_usd")
             meta["session_id"] = event.get("session_id")
             meta["duration_ms"] = event.get("duration_ms")
@@ -90,6 +96,19 @@ def parse_stream_json(stdout: str) -> dict:
             for d in event.get("permission_denials", []):
                 desc = d.get("tool_input", {}).get("description") or d.get("tool_input", {}).get("command", "")
                 denials.append(f"[{d.get('tool_name', '?')}] {desc}")
+
+        elif etype == "step_finish":
+            # OpenCode: Final step event — metadata
+            part = event.get("part", {})
+            if part.get("cost") is not None:
+                meta["cost"] = part["cost"]
+            if event.get("sessionID"):
+                meta["session_id"] = event["session_id"]
+            tokens = part.get("tokens", {})
+            if tokens:
+                meta["input_tokens"] = tokens.get("input")
+                meta["output_tokens"] = tokens.get("output")
+                meta["total_tokens"] = tokens.get("total")
 
         elif etype == "system":
             # System events (api_retry, errors, etc.)

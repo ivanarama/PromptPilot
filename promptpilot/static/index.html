@@ -453,6 +453,9 @@
       <label>Recur
         <input type="text" id="recurrenceInput" placeholder="6h / daily@09:00" style="width:140px">
       </label>
+      <label>Timeout
+        <input type="number" id="timeoutInput" placeholder="300" min="0" style="width:80px" title="Per-task timeout in seconds (0 = no limit, empty = use default)">
+      </label>
       <label style="flex-direction:row;align-items:center;gap:8px;cursor:pointer">
         <input type="checkbox" id="skipPermissions" style="width:auto;margin:0">
         <span style="font-size:13px;color:var(--yellow)">--dangerously-skip-permissions</span>
@@ -668,6 +671,8 @@ async function addTask() {
   const workdir = selVal || document.getElementById('workdirInput').value.trim() || null;
   const skipPermissions = document.getElementById('skipPermissions').checked;
   const recurrence = document.getElementById('recurrenceInput').value.trim() || null;
+  const timeoutVal = document.getElementById('timeoutInput').value.trim();
+  const taskTimeout = timeoutVal !== '' ? parseInt(timeoutVal) : null;
 
   await fetchJSON(`${API}/tasks`, {
     method: 'POST',
@@ -681,11 +686,13 @@ async function addTask() {
       skip_permissions: skipPermissions,
       scheduled_at: schedule ? new Date(schedule).toISOString() : null,
       recurrence,
+      task_timeout: taskTimeout,
     }),
   });
 
   document.getElementById('promptInput').value = '';
   document.getElementById('recurrenceInput').value = '';
+  document.getElementById('timeoutInput').value = '';
   refresh();
 }
 

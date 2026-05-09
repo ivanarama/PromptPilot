@@ -144,6 +144,24 @@ BUILTIN_PROVIDERS = {
             "PATH": os.pathsep.join(filter(None, [_find_rg_dir(), os.environ.get("PATH", "")])),
         },
     },
+    "opencode": {
+        "cmd": "opencode run --format json {prompt}",
+        "description": "OpenCode AI",
+        "supports_skills": False,
+        "models": [
+            "openai/gpt-4o",
+            "openai/gpt-4o-mini",
+            "openai/gpt-5",
+            "openai/gpt-5-mini",
+            "openai/o1",
+            "openai/o1-mini",
+            "openai/o3",
+            "openai/o3-mini",
+            "opencode/big-pickle",
+            "opencode/minimax-m2.5-free",
+            "opencode/nemotron-3-super-free",
+        ],
+    },
 }
 
 
