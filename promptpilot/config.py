@@ -115,12 +115,18 @@ def _find_opencode() -> str:
     resolved = shutil.which("opencode")
     if resolved:
         return resolved
-    # Fallback: npm global bin on Windows
-    npm_bin = Path.home() / "AppData" / "Roaming" / "npm"
-    for ext in (".CMD", ".cmd", ""):
-        candidate = npm_bin / f"opencode{ext}"
-        if candidate.exists():
-            return str(candidate)
+    # Fallback: common npm global bin locations
+    candidates = [
+        Path.home() / "AppData" / "Roaming" / "npm",          # Windows
+        Path("/usr/local/bin"),                                  # macOS / Linux (system npm)
+        Path.home() / ".npm-global" / "bin",                    # Linux (user npm)
+        Path.home() / ".local" / "bin",                         # generic
+    ]
+    for npm_bin in candidates:
+        for ext in (".CMD", ".cmd", ""):
+            candidate = npm_bin / f"opencode{ext}"
+            if candidate.exists():
+                return str(candidate)
     return "opencode"
 
 
