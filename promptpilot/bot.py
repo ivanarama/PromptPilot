@@ -28,7 +28,7 @@ from telegram.ext import (
 )
 
 from . import db
-from .config import DEFAULT_CLI, get_skills, load_providers, PROJECTS_ROOT, TASK_PASSWORD
+from .config import DEFAULT_CLI, get_skills, load_providers, load_providers_detailed, PROJECTS_ROOT, TASK_PASSWORD
 from .models import TaskCreate, TaskStatus
 from .tg_auth import authorize_user, is_authorized, load_allowed_phones
 
@@ -287,6 +287,14 @@ def _esc_code(text: str) -> str:
     return text.replace("\\", "\\\\").replace("`", "\\`")
 
 
+def _mask_secret(name: str, value: str) -> str:
+    """Mask values that look like API keys/tokens."""
+    secret_hints = ("key", "token", "secret", "password", "auth")
+    if any(h in name.lower() for h in secret_hints) and len(value) > 8:
+        return f"{value[:4]}...{value[-3:]}"
+    return value
+
+
 async def cb_cancel_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     task_id = int(query.data.split(":")[1])
@@ -368,13 +376,84 @@ async def show_providers(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _deny(update)
         return
 
-    providers = load_providers()
-    lines = ["*Провайдеры:*\n"]
+    providers = load_providers_detailed()
+    buttons = []
     for name, info in providers.items():
         desc = info.get("description", "")
-        lines.append(f"• `{name}` — {desc}")
+        label = f"{name} — {desc}" if desc else name
+        buttons.append([InlineKeyboardButton(label, callback_data=f"prov_detail:{name}")])
+
     await update.message.reply_text(
-        "\n".join(lines), parse_mode="Markdown", reply_markup=_main_menu()
+        "*Провайдеры:*\nНажмите для просмотра настроек",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def cb_provider_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_authorized(query.from_user.id):
+        await query.answer("Нет доступа.", show_alert=True)
+        return
+
+    name = query.data.split(":", 1)[1]
+    providers = load_providers_detailed()
+    info = providers.get(name)
+    if not info:
+        await query.answer("Провайдер не найден.", show_alert=True)
+        return
+
+    lines = [f"*{_esc(name)}* — {_esc(info.get('description', ''))}\n"]
+
+    cmd = info.get("cmd", "")
+    lines.append(f"🔧 Команда:\n`{_esc_code(cmd)}`\n")
+
+    models = info.get("models")
+    if models:
+        lines.append("🏷 Модели: " + ", ".join(f"`{_esc_code(m)}`" for m in models))
+    else:
+        lines.append("🏷 Модели: по умолчанию \\(sonnet, opus, haiku\\)")
+    lines.append("")
+
+    env = info.get("env")
+    if env:
+        lines.append("🔐 Переменные:")
+        for k, v in env.items():
+            masked = _mask_secret(k, str(v))
+            lines.append(f"  {_esc(k)}: `{_esc_code(masked)}`")
+        lines.append("")
+
+    source = info.get("_source", "builtin")
+    lines.append(f"📁 Источник: {_esc(source)}")
+    source_path = info.get("_source_path")
+    if source_path:
+        lines.append(f"   `{_esc_code(source_path)}`")
+
+    buttons = [[InlineKeyboardButton("← Назад", callback_data="prov_list")]]
+    await query.edit_message_text(
+        "\n".join(lines),
+        parse_mode="MarkdownV2",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def cb_provider_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_authorized(query.from_user.id):
+        await query.answer("Нет доступа.", show_alert=True)
+        return
+
+    providers = load_providers_detailed()
+    buttons = []
+    for pname, info in providers.items():
+        desc = info.get("description", "")
+        label = f"{pname} — {desc}" if desc else pname
+        buttons.append([InlineKeyboardButton(label, callback_data=f"prov_detail:{pname}")])
+
+    await query.edit_message_text(
+        "*Провайдеры:*\nНажмите для просмотра настроек",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(buttons),
     )
 
 
@@ -428,13 +507,13 @@ async def add_task_got_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE
     providers = load_providers()
     row, buttons = [], []
     for name in providers:
-        row.append(InlineKeyboardButton(name, callback_data=f"prov:{name}"))
+        row.append(InlineKeyboardButton(name, callback_data=f"pickprov:{name}"))
         if len(row) == 2:
             buttons.append(row)
             row = []
     if row:
         buttons.append(row)
-    buttons.append([InlineKeyboardButton("⬛ По умолчанию", callback_data="prov:")])
+    buttons.append([InlineKeyboardButton("⬛ По умолчанию", callback_data="pickprov:")])
 
     await update.message.reply_text(
         "Выберите провайдера:",
@@ -1180,7 +1259,7 @@ def run_bot():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, add_task_got_prompt)
             ],
             ASK_PROVIDER: [
-                CallbackQueryHandler(add_task_got_provider, pattern=r"^prov:")
+                CallbackQueryHandler(add_task_got_provider, pattern=r"^pickprov:")
             ],
             ASK_PRIORITY: [
                 CallbackQueryHandler(add_task_got_priority, pattern=r"^pri:")
@@ -1247,6 +1326,8 @@ def run_bot():
     app.add_handler(CallbackQueryHandler(cb_cancel_task, pattern=r"^cancel_task:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_reset_task, pattern=r"^reset_task:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_delete_task, pattern=r"^delete_task:\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_provider_detail, pattern=r"^prov_detail:"))
+    app.add_handler(CallbackQueryHandler(cb_provider_list, pattern=r"^prov_list$"))
 
     async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.error("Unhandled exception for update %s", update, exc_info=context.error)

@@ -192,6 +192,45 @@ def load_providers() -> dict:
     return providers
 
 
+def load_providers_detailed() -> dict:
+    """Load providers with source tracking.
+
+    Each provider entry gets extra fields:
+      _source: "builtin", "providers.json", or "builtin + providers.json"
+      _source_path: path to providers.json (if applicable)
+    """
+    providers = {}
+    builtin_names = set(BUILTIN_PROVIDERS)
+
+    for name, info in BUILTIN_PROVIDERS.items():
+        entry = dict(info)
+        entry["_source"] = "builtin"
+        entry["_source_path"] = None
+        providers[name] = entry
+
+    user_file = _providers_file()
+    custom_names = set()
+    if user_file.exists():
+        try:
+            with open(user_file) as f:
+                custom = json.load(f)
+            for name, info in custom.items():
+                custom_names.add(name)
+                entry = dict(info)
+                if name in providers:
+                    if "supports_skills" not in entry:
+                        entry["supports_skills"] = providers[name].get("supports_skills", False)
+                    entry["_source"] = "builtin + providers.json"
+                else:
+                    entry["_source"] = "providers.json"
+                entry["_source_path"] = str(user_file)
+                providers[name] = entry
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    return providers
+
+
 def save_provider(name: str, cmd: str, description: str = "", env: dict = None):
     """Save a custom provider to providers.json."""
     DB_DIR.mkdir(parents=True, exist_ok=True)
