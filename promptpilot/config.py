@@ -109,6 +109,21 @@ def _find_rg_dir() -> str:
     return ""
 
 
+def _find_opencode() -> str:
+    """Find opencode CLI — resolves full path to avoid PATH issues in worker."""
+    import shutil
+    resolved = shutil.which("opencode")
+    if resolved:
+        return resolved
+    # Fallback: npm global bin on Windows
+    npm_bin = Path.home() / "AppData" / "Roaming" / "npm"
+    for ext in (".CMD", ".cmd", ""):
+        candidate = npm_bin / f"opencode{ext}"
+        if candidate.exists():
+            return str(candidate)
+    return "opencode"
+
+
 BUILTIN_PROVIDERS = {
     "claude": {
         "cmd": f"{CLAUDE_EXE} -p --verbose --output-format stream-json {{prompt}}",
@@ -145,7 +160,7 @@ BUILTIN_PROVIDERS = {
         },
     },
     "opencode": {
-        "cmd": "opencode run {prompt}",
+        "cmd": f"{_find_opencode()} run {{prompt}}",
         "description": "OpenCode AI",
         "supports_skills": False,
         "models": [
