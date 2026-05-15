@@ -454,7 +454,7 @@
         <input type="text" id="recurrenceInput" placeholder="6h / daily@09:00" style="width:140px">
       </label>
       <label>Timeout
-        <input type="number" id="timeoutInput" placeholder="300" min="0" style="width:80px" title="Per-task timeout in seconds (0 = no limit, empty = use default)">
+        <input type="number" id="timeoutInput" placeholder="0 = no limit" min="0" style="width:80px" title="Per-task timeout in seconds (0 = no limit, empty = default)">
       </label>
       <label style="flex-direction:row;align-items:center;gap:8px;cursor:pointer">
         <input type="checkbox" id="skipPermissions" style="width:auto;margin:0">
@@ -618,6 +618,7 @@ async function loadTasks() {
         <span class="task-id">#${t.id}</span>
         <span class="task-status" data-s="${t.status}">${t.status.replace('_', ' ')}</span>
         <span class="task-prompt">${esc(t.prompt)}</span>
+        ${t.working_dir ? `<span class="task-meta">📁 ${esc(t.working_dir.split(/[/\\]/).filter(Boolean).pop() || t.working_dir)}</span>` : ''}
         ${t.provider ? `<span class="task-meta">${esc(t.provider)}</span>` : ''}
         ${scheduleInfo(t)}
         <span class="task-meta">P${t.priority}</span>
@@ -855,7 +856,7 @@ async function toggleSkills() {
   }
 
   panel.innerHTML = skills.map(s =>
-    `<div class="skill-item" onclick="selectSkill(${JSON.stringify(s.name)})">
+    `<div class="skill-item" onclick='selectSkill(${JSON.stringify(s.name)})'>
       <span class="skill-name">/${esc(s.name)}</span>
       ${s.argument_hint ? `<span class="skill-arghint">[${esc(s.argument_hint)}]</span>` : ''}
       ${s.description ? `<span class="skill-desc">${esc(s.description)}</span>` : ''}
