@@ -209,11 +209,13 @@ def execute_task(task):
             db.mark_failed(task.id, f"Command not found: {cmd[0]}", exit_code=-1)
         return
 
-    # Determine effective timeout
+    # Determine effective timeout (0 = no limit)
     if task.task_timeout == 0:
-        effective_timeout = None   # no limit
+        effective_timeout = None
     elif task.task_timeout is not None:
         effective_timeout = task.task_timeout
+    elif TASK_TIMEOUT == 0:
+        effective_timeout = None
     else:
         effective_timeout = TASK_TIMEOUT
 
@@ -329,7 +331,7 @@ def run_worker():
     db.recover_running()
 
     print(f"PromptPilot worker started (poll every {POLL_INTERVAL}s)")
-    print(f"Timeout: {TASK_TIMEOUT}s | Backoff: {BASE_DELAY}-{MAX_DELAY}s")
+    print(f"Timeout: {'no limit' if TASK_TIMEOUT == 0 else f'{TASK_TIMEOUT}s'} | Backoff: {BASE_DELAY}-{MAX_DELAY}s")
     print("Waiting for tasks...\n")
 
     while running:

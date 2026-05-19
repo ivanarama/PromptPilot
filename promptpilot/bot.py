@@ -35,7 +35,7 @@ from .tg_auth import authorize_user, is_authorized, load_allowed_phones
 logger = logging.getLogger(__name__)
 
 # Conversation states
-ASK_PASSWORD, ASK_PROMPT, ASK_PROVIDER, ASK_PRIORITY, ASK_SKIP_PERMS, ASK_DIR, ASK_DIR_MANUAL, ASK_SCHEDULE, ASK_REPLY, ASK_SKILL_ARGS, ASK_MODEL, ASK_RECURRENCE, ASK_TIMEOUT, ASK_DETACHED = range(14)
+ASK_PASSWORD, ASK_PROMPT, ASK_PROVIDER, ASK_PRIORITY, ASK_SKIP_PERMS, ASK_DIR, ASK_DIR_MANUAL, ASK_SCHEDULE, ASK_REPLY, ASK_SKILL_ARGS, ASK_MODEL, ASK_RECURRENCE, ASK_DETACHED = range(13)
 
 PAGE_SIZE = 5
 
@@ -73,14 +73,23 @@ def _contact_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
+def _project_name(working_dir):
+    """Extract short project name from working_dir path."""
+    if not working_dir:
+        return None
+    return os.path.basename(working_dir.rstrip("/\\"))
+
+
 def _tasks_keyboard(tasks, page: int, total: int) -> InlineKeyboardMarkup:
     keyboard = []
     for t in tasks:
         icon = STATUS_ICON.get(t.status.value, "•")
-        label = t.prompt[:38].replace("\n", " ")
+        proj = _project_name(t.working_dir)
+        proj_tag = f"[{proj}] " if proj else ""
+        label = t.prompt[:32].replace("\n", " ")
         keyboard.append([
             InlineKeyboardButton(
-                f"{icon} #{t.id} {label}",
+                f"{icon} #{t.id} {proj_tag}{label}",
                 callback_data=f"task:{t.id}",
             )
         ])
@@ -235,11 +244,14 @@ async def cb_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     created = task.created_at.strftime("%d.%m.%Y %H:%M") if task.created_at else "—"
     provider_str = _esc(task.provider) if task.provider else "claude \\(по умолчанию\\)"
 
+    proj = _project_name(task.working_dir)
     text = (
         f"*Задача \\#{task.id}*\n"
         f"Статус: {icon} {_esc(task.status.value)}\n"
         f"Провайдер: {provider_str}\n"
     )
+    if proj:
+        text += f"Проект: {_esc(proj)}\n"
     if task.model_used:
         text += f"Модель: `{_esc(task.model_used)}`\n"
     text += (
@@ -802,47 +814,11 @@ async def add_task_got_recurrence(update: Update, context: ContextTypes.DEFAULT_
         )
         return ASK_RECURRENCE
     context.user_data["new_recurrence"] = text
-    return await _ask_timeout(update.message)
+    return await _ask_detached(update.message)
 
 
 async def add_task_skip_recurrence(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["new_recurrence"] = None
-    return await _ask_timeout(update.message)
-
-
-async def _ask_timeout(message):
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("По умолчанию (300s)", callback_data="timeout:"),
-            InlineKeyboardButton("600s", callback_data="timeout:600"),
-            InlineKeyboardButton("1800s", callback_data="timeout:1800"),
-        ],
-        [
-            InlineKeyboardButton("Без лимита", callback_data="timeout:0"),
-        ],
-    ])
-    await message.reply_text(
-        "Таймаут выполнения:\n"
-        "• По умолчанию — 300s \\(из PP\\_TASK\\_TIMEOUT\\)\n"
-        "• Без лимита — задача не прерывается\n"
-        "Или /skip для значения по умолчанию\\.",
-        parse_mode="MarkdownV2",
-        reply_markup=keyboard,
-    )
-    return ASK_TIMEOUT
-
-
-async def add_task_got_timeout(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    val = query.data.split(":", 1)[1]
-    context.user_data["new_task_timeout"] = int(val) if val else None
-    await query.edit_message_reply_markup(reply_markup=None)
-    return await _ask_detached(query.message)
-
-
-async def add_task_skip_timeout(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["new_task_timeout"] = None
     return await _ask_detached(update.message)
 
 
@@ -884,7 +860,6 @@ async def _finish_add_task_from_query(query, context):
     model = context.user_data.pop("new_model", None)
     recurrence = context.user_data.pop("new_recurrence", None)
     detached = context.user_data.pop("new_detached", False)
-    task_timeout = context.user_data.pop("new_task_timeout", None)
 
     task = db.create_task(TaskCreate(
         prompt=prompt,
@@ -897,19 +872,17 @@ async def _finish_add_task_from_query(query, context):
         tg_chat_id=query.message.chat_id,
         recurrence=recurrence,
         detached=detached,
-        task_timeout=task_timeout,
     ))
 
     sched_str = scheduled_at.strftime("%d.%m.%Y %H:%M UTC") if scheduled_at else "сейчас"
     skip_str = " ⚠️ --dangerously-skip-permissions" if skip_permissions else ""
     detached_str = " 🔁 фоновый" if detached else ""
-    timeout_str = f" | Таймаут: {task_timeout}s" if task_timeout is not None else ""
     await query.message.reply_text(
         f"✅ Задача #{task.id} добавлена!\n"
         f"Провайдер: {provider or 'claude (по умолчанию)'}\n"
         f"Приоритет: {priority}\n"
         f"Директория: {working_dir or 'не указана'}\n"
-        f"Запуск: {sched_str}{skip_str}{detached_str}{timeout_str}",
+        f"Запуск: {sched_str}{skip_str}{detached_str}",
         reply_markup=_main_menu(),
     )
     return ConversationHandler.END
@@ -925,7 +898,6 @@ async def _finish_add_task(update: Update, context: ContextTypes.DEFAULT_TYPE, w
     model = context.user_data.pop("new_model", None)
     recurrence = context.user_data.pop("new_recurrence", None)
     detached = context.user_data.pop("new_detached", False)
-    task_timeout = context.user_data.pop("new_task_timeout", None)
 
     task = db.create_task(TaskCreate(
         prompt=prompt,
@@ -938,26 +910,24 @@ async def _finish_add_task(update: Update, context: ContextTypes.DEFAULT_TYPE, w
         tg_chat_id=update.message.chat_id,
         recurrence=recurrence,
         detached=detached,
-        task_timeout=task_timeout,
     ))
 
     sched_str = scheduled_at.strftime("%d.%m.%Y %H:%M UTC") if scheduled_at else "сейчас"
     skip_str = " ⚠️ --dangerously-skip-permissions" if skip_permissions else ""
     detached_str = " 🔁 фоновый" if detached else ""
-    timeout_str = f" | Таймаут: {task_timeout}s" if task_timeout is not None else ""
     await update.message.reply_text(
         f"✅ Задача #{task.id} добавлена!\n"
         f"Провайдер: {provider or 'claude (по умолчанию)'}\n"
         f"Приоритет: {priority}\n"
         f"Директория: {working_dir or 'не указана'}\n"
-        f"Запуск: {sched_str}{skip_str}{detached_str}{timeout_str}",
+        f"Запуск: {sched_str}{skip_str}{detached_str}",
         reply_markup=_main_menu(),
     )
     return ConversationHandler.END
 
 
 async def add_task_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    for key in ("new_prompt", "new_provider", "new_priority", "new_dir", "new_schedule", "new_recurrence", "new_task_timeout", "new_detached"):
+    for key in ("new_prompt", "new_provider", "new_priority", "new_dir", "new_schedule", "new_recurrence", "new_detached"):
         context.user_data.pop(key, None)
     await update.message.reply_text("Отменено.", reply_markup=_main_menu())
     return ConversationHandler.END
@@ -1261,7 +1231,9 @@ async def _notify_loop(bot):
                     icon, status_word = "❌", "завершилась с ошибкой"
                     body = f"\n\n{task.error[:300]}" if task.error else ""
 
-                text = f"{icon} Задача #{task.id} {status_word}{body}"
+                proj = _project_name(task.working_dir)
+                proj_str = f" [{proj}]" if proj else ""
+                text = f"{icon} Задача #{task.id}{proj_str} {status_word}{body}"
                 await bot.send_message(chat_id=task.tg_chat_id, text=text)
                 db.mark_notified(task.id)
             except Exception as e:
@@ -1326,10 +1298,6 @@ def run_bot():
             ASK_RECURRENCE: [
                 CommandHandler("skip", add_task_skip_recurrence),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, add_task_got_recurrence),
-            ],
-            ASK_TIMEOUT: [
-                CallbackQueryHandler(add_task_got_timeout, pattern=r"^timeout:"),
-                CommandHandler("skip", add_task_skip_timeout),
             ],
             ASK_DETACHED: [
                 CallbackQueryHandler(add_task_got_detached, pattern=r"^detached:"),

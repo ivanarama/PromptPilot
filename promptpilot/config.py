@@ -54,7 +54,7 @@ DB_PATH = DB_DIR / "promptpilot.db"
 
 # Worker
 POLL_INTERVAL = int(os.environ.get("PP_POLL_INTERVAL", "5"))
-TASK_TIMEOUT = int(os.environ.get("PP_TASK_TIMEOUT", "300"))
+TASK_TIMEOUT = int(os.environ.get("PP_TASK_TIMEOUT", "0"))
 BASE_DELAY = int(os.environ.get("PP_BASE_DELAY", "60"))
 MAX_DELAY = int(os.environ.get("PP_MAX_DELAY", "3600"))
 MAX_RETRIES = int(os.environ.get("PP_MAX_RETRIES", "5"))
