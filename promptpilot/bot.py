@@ -242,6 +242,7 @@ async def cb_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     icon = STATUS_ICON.get(task.status.value, "•")
     created = task.created_at.strftime("%d.%m.%Y %H:%M") if task.created_at else "—"
+    completed = task.completed_at.strftime("%d.%m.%Y %H:%M") if task.completed_at else None
     provider_str = _esc(task.provider) if task.provider else "claude \\(по умолчанию\\)"
 
     proj = _project_name(task.working_dir)
@@ -257,6 +258,7 @@ async def cb_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text += (
         f"Приоритет: {task.priority}\n"
         f"Создана: {_esc(created)}\n"
+        f"Выполнена: {_esc(completed or '—')}\n"
         f"Retry: {task.retry_count}/{task.max_retries}"
     )
     if task.working_dir:

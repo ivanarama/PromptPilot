@@ -763,7 +763,7 @@ function timeAgo(iso) {
   return Math.floor(diff / 86400) + 'd';
 }
 
-function refresh() { loadStats(); loadTasks(); }
+function refresh() { loadStats(); if (!expandedId) loadTasks(); }
 
 // --- Set default schedule to current datetime ---
 function setDefaultSchedule() {
