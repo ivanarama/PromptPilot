@@ -7,6 +7,7 @@ After authorization all task management features are available.
 
 import logging
 import os
+from datetime import datetime, timezone
 from typing import Optional
 
 from telegram import (
@@ -71,6 +72,16 @@ def _contact_keyboard() -> ReplyKeyboardMarkup:
         resize_keyboard=True,
         one_time_keyboard=True,
     )
+
+
+def _local_str(dt, fmt="%d.%m.%Y %H:%M") -> str:
+    """Convert UTC datetime to local time string."""
+    if dt is None:
+        return "—"
+    if dt.tzinfo is None:
+        # naive — assume UTC
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone().strftime(fmt)
 
 
 def _project_name(working_dir):
@@ -241,8 +252,8 @@ async def cb_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     icon = STATUS_ICON.get(task.status.value, "•")
-    created = task.created_at.strftime("%d.%m.%Y %H:%M") if task.created_at else "—"
-    completed = task.completed_at.strftime("%d.%m.%Y %H:%M") if task.completed_at else None
+    created = _local_str(task.created_at)
+    completed = _local_str(task.completed_at) if task.completed_at else None
     provider_str = _esc(task.provider) if task.provider else "claude \\(по умолчанию\\)"
 
     proj = _project_name(task.working_dir)
