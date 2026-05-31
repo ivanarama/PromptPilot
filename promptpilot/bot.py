@@ -606,6 +606,17 @@ def _list_projects():
         return []
 
 
+def _list_subdirs(parent_path):
+    """Return sorted list of immediate subdirectories inside *parent_path*."""
+    try:
+        return sorted(
+            d for d in os.listdir(parent_path)
+            if os.path.isdir(os.path.join(parent_path, d)) and not d.startswith(".")
+        )
+    except OSError:
+        return []
+
+
 def _list_projects_with_skills():
     """Return projects that have local skill files in .claude/commands/ or .claude/skills/.
 
@@ -665,11 +676,15 @@ async def add_task_got_skip_perms(update: Update, context: ContextTypes.DEFAULT_
 
     projects = _list_projects()
     if projects:
-        # Show project selector
+        # Show project selector — folders with subdirs get 📁 marker
         buttons = []
         row = []
         for proj in projects:
-            row.append(InlineKeyboardButton(proj, callback_data=f"dir:{proj}"))
+            full = os.path.join(PROJECTS_ROOT, proj)
+            if _list_subdirs(full):
+                row.append(InlineKeyboardButton(f"{proj} 📁", callback_data=f"dir_open:{proj}"))
+            else:
+                row.append(InlineKeyboardButton(proj, callback_data=f"dir:{proj}"))
             if len(row) == 2:
                 buttons.append(row)
                 row = []
@@ -692,11 +707,73 @@ async def add_task_got_skip_perms(update: Update, context: ContextTypes.DEFAULT_
         return ASK_DIR_MANUAL
 
 
+async def cb_dir_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Expand a folder showing its subdirectories."""
+    query = update.callback_query
+    await query.answer()
+    proj_name = query.data.split(":", 1)[1]
+    full = os.path.join(PROJECTS_ROOT, proj_name)
+    subs = _list_subdirs(full)
+
+    buttons = [[InlineKeyboardButton(f"📁 {proj_name} (выбрать эту папку)", callback_data=f"dir:{proj_name}")]]
+    row = []
+    for sub in subs:
+        row.append(InlineKeyboardButton(sub, callback_data=f"dir_sub:{proj_name}/{sub}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton("← Назад", callback_data="dir_back")])
+
+    await query.edit_message_text(
+        f"📂 {proj_name}:",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+    return ASK_DIR
+
+
 async def add_task_got_dir_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle directory selection from inline keyboard."""
     query = update.callback_query
     await query.answer()
-    value = query.data.split(":", 1)[1]
+    data = query.data
+
+    # Back to top-level project list
+    if data == "dir_back":
+        projects = _list_projects()
+        buttons = []
+        row = []
+        for proj in projects:
+            full = os.path.join(PROJECTS_ROOT, proj)
+            if _list_subdirs(full):
+                row.append(InlineKeyboardButton(f"{proj} 📁", callback_data=f"dir_open:{proj}"))
+            else:
+                row.append(InlineKeyboardButton(proj, callback_data=f"dir:{proj}"))
+            if len(row) == 2:
+                buttons.append(row)
+                row = []
+        if row:
+            buttons.append(row)
+        buttons.append([
+            InlineKeyboardButton("✏️ Ввести вручную", callback_data="dir:__manual__"),
+            InlineKeyboardButton("⏭ Пропустить", callback_data="dir:__skip__"),
+        ])
+        await query.edit_message_text(
+            "Выберите рабочую директорию:",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return ASK_DIR
+
+    # Subdirectory selected (dir_sub:ParentName/SubName)
+    if data.startswith("dir_sub:"):
+        rel = data.split(":", 1)[1]
+        full_path = os.path.join(PROJECTS_ROOT, rel.replace("/", os.sep))
+        context.user_data["new_dir"] = full_path
+        await query.edit_message_text(f"Директория: `{full_path}`", parse_mode="Markdown")
+        return await _ask_schedule_from_query(query, context)
+
+    value = data.split(":", 1)[1]
 
     if value == "__skip__":
         context.user_data["new_dir"] = None
@@ -1101,7 +1178,11 @@ async def cb_skills_proj_picker(update: Update, context: ContextTypes.DEFAULT_TY
     buttons = []
     row = []
     for proj in projects:
-        row.append(InlineKeyboardButton(proj, callback_data=f"skills_dir:{proj}"))
+        full = os.path.join(PROJECTS_ROOT, proj)
+        if _list_subdirs(full):
+            row.append(InlineKeyboardButton(f"{proj} 📁", callback_data=f"skills_dir_open:{proj}"))
+        else:
+            row.append(InlineKeyboardButton(proj, callback_data=f"skills_dir:{proj}"))
         if len(row) == 2:
             buttons.append(row)
             row = []
@@ -1115,22 +1196,55 @@ async def cb_skills_proj_picker(update: Update, context: ContextTypes.DEFAULT_TY
     )
 
 
+async def cb_skills_dir_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Expand a folder in skills project picker showing its subdirectories."""
+    query = update.callback_query
+    await query.answer()
+    proj_name = query.data.split(":", 1)[1]
+    full = os.path.join(PROJECTS_ROOT, proj_name)
+
+    buttons = [[InlineKeyboardButton(f"📁 {proj_name} (эта папка)", callback_data=f"skills_dir:{proj_name}")]]
+    row = []
+    for sub in _list_subdirs(full):
+        row.append(InlineKeyboardButton(sub, callback_data=f"skills_dir_sub:{proj_name}/{sub}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton("← Назад", callback_data="skills_proj_picker")])
+
+    await query.edit_message_text(
+        f"📂 {proj_name}:",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
 async def cb_skills_dir(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Load and show global + project-local skills for the selected project."""
     query = update.callback_query
     await query.answer()
 
-    proj_name = query.data.split(":", 1)[1]
-    workdir = os.path.join(PROJECTS_ROOT, proj_name)
+    data = query.data
+
+    # Subdirectory selected
+    if data.startswith("skills_dir_sub:"):
+        rel = data.split(":", 1)[1]
+        workdir = os.path.join(PROJECTS_ROOT, rel.replace("/", os.sep))
+    else:
+        proj_name = data.split(":", 1)[1]
+        workdir = os.path.join(PROJECTS_ROOT, proj_name)
+
     context.user_data["skills_workdir"] = workdir
+    short = os.path.relpath(workdir, PROJECTS_ROOT)
 
     skills = get_skills(working_dir=workdir)
     if not skills:
-        await query.edit_message_text(f"Скилы не найдены ни глобально, ни в `{proj_name}`.")
+        await query.edit_message_text(f"Скилы не найдены ни глобально, ни в `{short}`.")
         return
 
     text, keyboard = _build_skills_message(
-        skills, f"Скилы ({proj_name}):", show_proj_btn=False
+        skills, f"Скилы ({short}):", show_proj_btn=False
     )
     rows = list(keyboard.inline_keyboard)
     rows.append([InlineKeyboardButton("◀ Назад", callback_data="skills_proj_picker")])
@@ -1295,6 +1409,9 @@ def run_bot():
                 CallbackQueryHandler(add_task_got_skip_perms, pattern=r"^skipper:"),
             ],
             ASK_DIR: [
+                CallbackQueryHandler(cb_dir_open, pattern=r"^dir_open:"),
+                CallbackQueryHandler(add_task_got_dir_btn, pattern=r"^dir_sub:"),
+                CallbackQueryHandler(add_task_got_dir_btn, pattern=r"^dir_back"),
                 CallbackQueryHandler(add_task_got_dir_btn, pattern=r"^dir:"),
             ],
             ASK_DIR_MANUAL: [
@@ -1335,6 +1452,8 @@ def run_bot():
     # ConversationHandler eats all callbacks when in an active state, so
     # skills_dir / skills_proj_picker / skills_back must be in a higher-priority group.
     app.add_handler(CallbackQueryHandler(cb_skills_proj_picker, pattern=r"^skills_proj_picker$"), group=-1)
+    app.add_handler(CallbackQueryHandler(cb_skills_dir_open, pattern=r"^skills_dir_open:"), group=-1)
+    app.add_handler(CallbackQueryHandler(cb_skills_dir, pattern=r"^skills_dir_sub:"), group=-1)
     app.add_handler(CallbackQueryHandler(cb_skills_dir, pattern=r"^skills_dir:"), group=-1)
     app.add_handler(CallbackQueryHandler(cb_skills_back, pattern=r"^skills_back$"), group=-1)
 
