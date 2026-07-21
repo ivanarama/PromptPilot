@@ -35,6 +35,37 @@ jobs:
           name: windows-zip
           path: "PromptPilot-${{ github.ref_name }}-windows.zip"
 
+  build-exe-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install pyinstaller
+
+      - name: Build binary
+        run: python -m PyInstaller pp.spec --clean
+
+      - name: Create Linux archive
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          cp .env.example dist/.env
+          tar -czf "PromptPilot-${REF_NAME}-linux.tar.gz" \
+            -C dist pp .env
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-tar
+          path: "PromptPilot-${{ github.ref_name }}-linux.tar.gz"
+
   build-wheel:
     runs-on: ubuntu-latest
     steps:
@@ -55,7 +86,7 @@ jobs:
           path: dist/
 
   release:
-    needs: [build-exe, build-wheel]
+    needs: [build-exe, build-exe-linux, build-wheel]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -63,6 +94,10 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: windows-zip
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-tar
 
       - uses: actions/download-artifact@v4
         with:
@@ -82,6 +117,19 @@ jobs:
             3. Заполни `.env` (шаблон уже внутри архива)
             4. Запусти `start.ps1` или `pp.exe server`
 
+            ### Linux (standalone binary)
+            ```bash
+            tar -xzf PromptPilot-${{ github.ref_name }}-linux.tar.gz
+            cp .env.example .env  # заполнить при необходимости
+            ./pp server
+            ```
+
+            ### Docker
+            ```bash
+            docker compose up -d --build
+            # Web UI: http://localhost:8420
+            ```
+
             ### Linux / Mac / Python
             ```bash
             pip install promptpilot-*.whl
@@ -93,6 +141,7 @@ jobs:
             ```
           files: |
             PromptPilot-${{ github.ref_name }}-windows.zip
+            PromptPilot-${{ github.ref_name }}-linux.tar.gz
             python-dist/*.whl
             python-dist/*.tar.gz
           draft: false

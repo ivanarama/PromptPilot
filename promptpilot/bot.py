@@ -27,9 +27,10 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from telegram.request import HTTPXRequest
 
 from . import db
-from .config import DEFAULT_CLI, get_skills, load_providers, load_providers_detailed, PROJECTS_ROOT, TASK_PASSWORD
+from .config import DEFAULT_CLI, get_provider_models, get_proxy_url, get_skills, load_providers, load_providers_detailed, PROJECTS_ROOT, TASK_PASSWORD
 from .models import TaskCreate, TaskStatus
 from .tg_auth import authorize_user, is_authorized, load_allowed_phones
 
@@ -433,7 +434,7 @@ async def cb_provider_detail(update: Update, context: ContextTypes.DEFAULT_TYPE)
     cmd = info.get("cmd", "")
     lines.append(f"🔧 Команда:\n`{_esc_code(cmd)}`\n")
 
-    models = info.get("models")
+    models = get_provider_models(name)
     if models:
         lines.append("🏷 Модели: " + ", ".join(f"`{_esc_code(m)}`" for m in models))
     else:
@@ -553,10 +554,11 @@ _DEFAULT_MODELS = ["sonnet", "opus", "haiku"]
 def _model_keyboard(provider: str) -> InlineKeyboardMarkup:
     """Return model selection keyboard for all Claude Code providers (supports_skills=True)."""
     providers = load_providers()
-    info = providers.get(provider or DEFAULT_CLI, {})
+    name = provider or DEFAULT_CLI
+    info = providers.get(name, {})
     if not info.get("supports_skills", False):
         return None
-    models = info.get("models", _DEFAULT_MODELS)
+    models = get_provider_models(name)
     buttons = [[InlineKeyboardButton("По умолчанию", callback_data="model:")]]
     row = []
     for m in models:
@@ -1381,7 +1383,25 @@ def run_bot():
         import asyncio
         asyncio.create_task(_notify_loop(application.bot))
 
-    app = Application.builder().token(token).post_init(post_init).build()
+    builder = Application.builder().token(token).post_init(post_init)
+
+    proxy = get_proxy_url()
+    if proxy:
+        # python-telegram-bot 21.x dropped the .proxy_url() builder helpers;
+        # pass an HTTPXRequest with a proxy for both the bot and get_updates
+        # channels (the same proxy is reused for both).
+        proxy_request = HTTPXRequest(proxy=proxy)
+        builder = builder.request(proxy_request)
+        builder = builder.get_updates_request(HTTPXRequest(proxy=proxy))
+        logger.info("Using proxy for Telegram API: %s", proxy)
+    else:
+        logger.warning(
+            "No proxy configured. If Telegram API is unreachable, set "
+            "PP_TG_PROXY (or https_proxy/all_proxy) — Docker does not inherit "
+            "host env vars automatically."
+        )
+
+    app = builder.build()
 
     add_conv = ConversationHandler(
         entry_points=[

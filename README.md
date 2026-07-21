@@ -61,6 +61,24 @@ pip install promptpilot-X.X.X-py3-none-any.whl
 
 Требования: Python 3.10+, хотя бы один AI CLI в PATH (claude, codex, qwen и т.д.).
 
+### Вариант 3 — Docker (Linux сервер)
+
+```bash
+git clone https://github.com/ivanarama/PromptPilot.git
+cd PromptPilot
+docker compose up -d --build
+```
+
+Web UI откроется на http://localhost:8420. Воркер и сервер запускаются отдельными
+контейнерами с общей SQLite БД на volume. Подробности — в разделе [Linux и Docker](#linux-и-docker).
+
+### Вариант 4 — Standalone бинар под Linux
+
+```bash
+./build.sh            # собрать dist/pp
+./dist/pp server      # запустить веб-UI
+```
+
 ## Быстрый старт
 
 ```bash
@@ -170,6 +188,64 @@ $env:PP_TG_ALLOWED_PHONES = "+79001234567"
 
 Скрипт автоматически использует `dist\pp.exe` если он собран, иначе `pp` из PATH.
 
+## Linux и Docker
+
+Весь код кроссплатформенный — те же команды `pp worker`, `pp server`, `pp bot`
+работают на Linux без изменений. Дефолтный путь к Claude автоматически
+`~/.local/bin/claude` (без `.exe`); переопределяется через `PP_CLAUDE_EXE`.
+
+### Запуск через Docker Compose
+
+Минимальный запуск (воркер + сервер):
+
+```bash
+docker compose up -d --build
+# Web UI: http://localhost:8420
+# Логи:  docker compose logs -f
+# Остановить: docker compose down
+```
+
+`docker-compose.yml` поднимает два сервиса с общим томом `promptpilot-data`
+(БД сохраняется между перезапусками):
+
+- **server** — веб-UI и REST API (порт `8420`).
+- **worker** — выполняет задачи из очереди.
+
+> **Безопасность:** порт по умолчанию публикуется только на `127.0.0.1:8420`,
+> т.к. у HTTP API нет встроенной авторизации. Чтобы открыть доступ в сеть —
+> поменяйте порт на `"8420:8420"` **и** задайте `PP_API_TOKEN` (запросы к `/api/*`
+> тогда потребуют заголовок `Authorization: Bearer <token>`), либо поставьте
+> сервис за reverse-proxy с авторизацией.
+
+Для включения Telegram-бота раскомментируйте блок `bot` в `docker-compose.yml`
+и задайте `PP_TG_TOKEN`. Все настройки передаются через `environment` (или через
+`.env`-файл рядом с `docker-compose.yml`).
+
+### Где искать AI CLI в контейнере?
+
+Воркер запускает AI CLI как подпроцессы внутри контейнера. Базовый образ уже
+включает `git`, `ripgrep`, `curl`. Чтобы добавить нужный CLI (claude, codex, qwen …),
+допишите его установку в `Dockerfile`:
+
+```dockerfile
+RUN npm install -g @anthropic-ai/claude-code
+ENV PP_CLAUDE_EXE=/usr/local/bin/claude
+```
+
+Либо соберите образ как есть и монтируйте CLI с хоста через volume.
+
+### Standalone бинар под Linux (без Python)
+
+```bash
+./build.sh           # → dist/pp
+./dist/pp server
+./dist/pp worker
+```
+
+Используется тот же `pp.spec`, что и для Windows (кроссплатформенный).
+В Linux-сборку не входят tray-зависимости (`pystray`/`Pillow`) — команда
+`pp tray` сообщит об этом и предложит `pp worker`/`pp server`/`pp bot`.
+
 ## Сборка .exe
 
 Сборка standalone-бинаря (не требует Python на целевой машине):
@@ -188,6 +264,14 @@ $env:PP_TG_ALLOWED_PHONES = "+79001234567"
 ```
 
 > **Примечание:** при первом запуске `pp.exe` может занять несколько секунд — PyInstaller распаковывает бандл во временную папку.
+
+**Под Linux:**
+
+```bash
+./build.sh          # → dist/pp (standalone бинар)
+```
+
+Тот же `pp.spec`, что и под Windows — код сборки не дублируется.
 
 ## CLI
 
@@ -336,7 +420,8 @@ pp provider remove <name>     # удалить
 
 Дефолтный провайдер: переменная `PP_DEFAULT_CLI` (по умолчанию `claude`).
 
-Путь к `claude.exe` по умолчанию: `~/.local/bin/claude.exe`. Переопределяется через `PP_CLAUDE_EXE`.
+Путь к `claude` по умолчанию: `~/.local/bin/claude.exe` на Windows и
+`~/.local/bin/claude` на Linux/macOS. Переопределяется через `PP_CLAUDE_EXE`.
 
 ### Добавление кастомного провайдера
 
@@ -434,11 +519,12 @@ GET    /api/projects           — проекты из PP_PROJECTS_ROOT
 | `PP_DEFAULT_CLI` | `claude` | Провайдер по умолчанию |
 | `PP_HOST` | `127.0.0.1` | Хост веб-сервера |
 | `PP_PORT` | `8420` | Порт веб-сервера |
+| `PP_API_TOKEN` | — | Общий секрет API: если задан, `/api/*` требуют заголовок `Authorization: Bearer <token>` (для публикации в сеть) |
 | `PP_TG_TOKEN` | — | Токен Telegram бота |
 | `PP_TG_ALLOWED_PHONES` | — | Разрешённые номера (через запятую) |
 | `PP_TASK_PASSWORD` | — | Пароль для создания задач через бота |
 | `PP_PROJECTS_ROOT` | — | Корневая папка проектов для быстрого выбора директории |
-| `PP_CLAUDE_EXE` | `~/.local/bin/claude.exe` | Путь к claude.exe |
+| `PP_CLAUDE_EXE` | `~/.local/bin/claude[.exe]` | Путь к Claude CLI (`.exe` только на Windows) |
 
 ## Статусы задач
 
@@ -466,10 +552,13 @@ promptpilot/
 └── static/
     └── index.html  — веб-интерфейс
 
-start.ps1           — запустить все сервисы
-stop.ps1            — остановить все сервисы
-build.ps1           — собрать dist\pp.exe
-pp.spec             — конфиг PyInstaller
+start.ps1           — запустить все сервисы (Windows)
+stop.ps1            — остановить все сервисы (Windows)
+build.ps1           — собрать dist\pp.exe (Windows)
+build.sh            — собрать dist/pp (Linux/macOS)
+pp.spec             — конфиг PyInstaller (кроссплатформенный)
+Dockerfile          — образ для Docker
+docker-compose.yml  — server + worker (+ опц. bot)
 ```
 
 Воркер и сервер — два отдельных процесса, работающих с одной SQLite БД. Воркер выполняет задачи последовательно (одна за раз), чтобы не упираться в rate limits.

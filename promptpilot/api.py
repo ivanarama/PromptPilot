@@ -1,21 +1,37 @@
 """FastAPI web API + static file serving."""
 
+import os
+import secrets
 import sys
 from pathlib import Path
 from typing import List, Optional
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-import os
-
 from . import db
-from .config import get_skills, load_providers, PROJECTS_ROOT
+from .config import API_TOKEN, fetch_available_models, get_skills, load_providers, PROJECTS_ROOT
 from .models import CostStats, Stats, TaskCreate, TaskInDB, TaskStatus, TaskUpdate
 from .version import check_for_update
 
 app = FastAPI(title="PromptPilot", version="0.1.0")
+
+
+@app.middleware("http")
+async def _api_auth(request: Request, call_next):
+    """Require a Bearer token for /api/* routes when PP_API_TOKEN is set.
+
+    The web UI index page (/) and static assets are always public so the
+    browser can load the app; only the data endpoints are gated. When
+    PP_API_TOKEN is empty, all routes remain open (intended for loopback).
+    """
+    if API_TOKEN and request.url.path.startswith("/api"):
+        header = request.headers.get("authorization", "")
+        token = header[len("Bearer "):].strip() if header.startswith("Bearer ") else ""
+        if not secrets.compare_digest(token, API_TOKEN):
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+    return await call_next(request)
 
 # When frozen by PyInstaller, __file__ points into the temp extraction dir
 if getattr(sys, "frozen", False):
@@ -110,15 +126,21 @@ def api_version():
 @app.get("/api/providers")
 def api_providers():
     providers = load_providers()
+    # Fetched once per call group — the cache makes subsequent reads instant.
+    dynamic = fetch_available_models()
     default_models = ["sonnet", "opus", "haiku"]
-    return {
-        name: {
+    result = {}
+    for name, info in providers.items():
+        if info.get("supports_skills"):
+            models = dynamic if dynamic else default_models
+        else:
+            models = info.get("models", [])
+        result[name] = {
             "description": info.get("description", name),
             "supports_skills": info.get("supports_skills", False),
-            "models": info.get("models", default_models if info.get("supports_skills") else []),
+            "models": models,
         }
-        for name, info in providers.items()
-    }
+    return result
 
 
 @app.get("/api/skills")

@@ -1,0 +1,89 @@
+# PromptPilot — Docker Compose
+#
+# Quick start:
+#   cp .env.example .env        # fill in tokens / LiteLLM endpoint
+#   docker compose up -d --build
+#   → Web UI: http://localhost:8420
+#
+# The worker and server are separate processes sharing one SQLite DB
+# (stored on the `promptpilot-data` volume). The Telegram bot runs by default.
+#
+# Configuration: create a `.env` file next to this file (see .env.example) and
+# fill in the LiteLLM endpoint, the Telegram bot token and PP_API_TOKEN.
+
+services:
+  server:
+    build: .
+    image: promptpilot
+    command: server
+    # Port published to the network — PP_API_TOKEN is mandatory so the HTTP API
+    # requires `Authorization: Bearer <token>` on every /api/* request.
+    # To keep it loopback-only, switch back to "127.0.0.1:8420:8420".
+    ports:
+      - "8420:8420"
+    environment:
+      - PP_HOST=0.0.0.0
+      - PP_PORT=8420
+      - PP_DEFAULT_CLI=claude
+      - PP_API_TOKEN=${PP_API_TOKEN}
+      - PP_TASK_PASSWORD=${PP_TASK_PASSWORD:-}
+      # ── LiteLLM proxy (Anthropic-compatible endpoint) ──
+      # Claude Code inherits these from the container env; the builtin `claude`
+      # provider passes os.environ through to the spawned process (config.get_provider_env).
+      - ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL}
+      - ANTHROPIC_AUTH_TOKEN=${ANTHROPIC_AUTH_TOKEN}
+      - ANTHROPIC_DEFAULT_SONNET_MODEL=${ANTHROPIC_DEFAULT_SONNET_MODEL:-}
+      - ANTHROPIC_DEFAULT_OPUS_MODEL=${ANTHROPIC_DEFAULT_OPUS_MODEL:-}
+      - ANTHROPIC_DEFAULT_HAIKU_MODEL=${ANTHROPIC_DEFAULT_HAIKU_MODEL:-}
+      - PP_MODELS_URL=${PP_MODELS_URL:-}
+      - PP_MODELS_TOKEN=${PP_MODELS_TOKEN:-}
+    volumes:
+      - promptpilot-data:/data
+    restart: unless-stopped
+
+  worker:
+    build: .
+    image: promptpilot
+    command: worker
+    environment:
+      - PP_DEFAULT_CLI=claude
+      - ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL}
+      - ANTHROPIC_AUTH_TOKEN=${ANTHROPIC_AUTH_TOKEN}
+      - ANTHROPIC_DEFAULT_SONNET_MODEL=${ANTHROPIC_DEFAULT_SONNET_MODEL:-}
+      - ANTHROPIC_DEFAULT_OPUS_MODEL=${ANTHROPIC_DEFAULT_OPUS_MODEL:-}
+      - ANTHROPIC_DEFAULT_HAIKU_MODEL=${ANTHROPIC_DEFAULT_HAIKU_MODEL:-}
+    volumes:
+      - promptpilot-data:/data
+    restart: unless-stopped
+
+  bot:
+    build: .
+    image: promptpilot
+    command: bot
+    environment:
+      - PP_TG_TOKEN=${PP_TG_TOKEN}
+      - PP_TG_ALLOWED_PHONES=${PP_TG_ALLOWED_PHONES}
+      - PP_TASK_PASSWORD=${PP_TASK_PASSWORD:-}
+      - PP_DEFAULT_CLI=claude
+      - ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL}
+      - ANTHROPIC_AUTH_TOKEN=${ANTHROPIC_AUTH_TOKEN}
+      - ANTHROPIC_DEFAULT_SONNET_MODEL=${ANTHROPIC_DEFAULT_SONNET_MODEL:-}
+      - ANTHROPIC_DEFAULT_OPUS_MODEL=${ANTHROPIC_DEFAULT_OPUS_MODEL:-}
+      - ANTHROPIC_DEFAULT_HAIKU_MODEL=${ANTHROPIC_DEFAULT_HAIKU_MODEL:-}
+      - PP_MODELS_URL=${PP_MODELS_URL:-}
+      - PP_MODELS_TOKEN=${PP_MODELS_TOKEN:-}
+      # ── Proxy for Telegram API (blocked in some corporate networks) ──
+      # Docker does NOT inherit host env vars, so pass the proxy explicitly.
+      # PP_TG_PROXY takes priority; otherwise the standard *_proxy names below
+      # are picked up automatically. Interpolated from the host shell / .env.
+      - PP_TG_PROXY=${PP_TG_PROXY:-}
+      - http_proxy=${http_proxy:-${HTTP_PROXY:-}}
+      - https_proxy=${https_proxy:-${HTTPS_PROXY:-}}
+      - all_proxy=${all_proxy:-${ALL_PROXY:-}}
+      - no_proxy=${no_proxy:-${NO_PROXY:-localhost,127.0.0.1}}
+    volumes:
+      - promptpilot-data:/data
+    restart: unless-stopped
+
+volumes:
+  promptpilot-data:

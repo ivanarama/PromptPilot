@@ -23,7 +23,12 @@ def cli(ctx):
     """PromptPilot — AI Prompt Scheduler"""
     if ctx.invoked_subcommand is None:
         # Default: launch tray app when run without arguments
-        from .tray import run_tray
+        try:
+            from .tray import run_tray
+        except ImportError:
+            click.echo("Tray-режим недоступен в этой сборке (нет pystray/GUI).")
+            click.echo("Используйте: pp worker, pp server, pp bot")
+            ctx.exit(1)
         run_tray()
 
 
@@ -238,7 +243,11 @@ def bot():
 @cli.command()
 def tray():
     """Start the system tray launcher (default when run without arguments)."""
-    from .tray import run_tray
+    try:
+        from .tray import run_tray
+    except ImportError:
+        click.echo("Tray-режим недоступен в этой сборке (нет pystray/GUI).")
+        raise SystemExit(1)
     run_tray()
 
 

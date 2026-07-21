@@ -168,10 +168,15 @@ def _build_menu(icon: pystray.Icon) -> pystray.Menu:
 
     def open_bot_log(i, it):
         log_path = _bot_log_path()
-        if log_path.exists():
-            os.startfile(str(log_path))
-        else:
+        if not log_path.exists():
             i.title = "PromptPilot: лог бота пока пуст"
+            return
+        if sys.platform == "win32":
+            os.startfile(str(log_path))
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(log_path)])
+        else:
+            subprocess.Popen(["xdg-open", str(log_path)])
 
     items = [
         pystray.MenuItem("PromptPilot", None, enabled=False),

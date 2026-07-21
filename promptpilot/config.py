@@ -64,10 +64,14 @@ DEFAULT_CLI = os.environ.get("PP_DEFAULT_CLI", "claude")
 
 # CLI providers — name -> command template with {prompt} placeholder
 # Can be overridden/extended via ~/.promptpilot/providers.json
-CLAUDE_EXE = os.environ.get(
-    "PP_CLAUDE_EXE",
-    str(Path.home() / ".local" / "bin" / "claude.exe"),
-)
+def _default_claude_exe() -> str:
+    """OS-aware default path to the Claude Code CLI binary."""
+    if sys.platform == "win32":
+        return str(Path.home() / ".local" / "bin" / "claude.exe")
+    return str(Path.home() / ".local" / "bin" / "claude")
+
+
+CLAUDE_EXE = os.environ.get("PP_CLAUDE_EXE", _default_claude_exe())
 
 def _cursor_agent_cmd() -> str:
     """Return command to invoke cursor-agent.
@@ -76,6 +80,8 @@ def _cursor_agent_cmd() -> str:
     shell:true and gets EINVAL.  We bypass it by calling the vendor node.exe +
     index.js directly.  Falls back to 'cursor-agent' if vendor not found.
     """
+    if sys.platform != "win32":
+        return "cursor-agent"
     try:
         sdk_root = Path.home() / "AppData" / "Roaming" / "npm" / "node_modules" / "@nothumanwork" / "cursor-agents-sdk"
         manifest = json.loads((sdk_root / "vendor" / "manifest.json").read_text())
@@ -94,6 +100,8 @@ def _find_rg_dir() -> str:
     import shutil
     import subprocess as _sp
     if shutil.which("rg"):
+        return ""
+    if sys.platform != "win32":
         return ""
     try:
         result = _sp.run(
@@ -115,16 +123,26 @@ def _find_opencode() -> str:
     resolved = shutil.which("opencode")
     if resolved:
         return resolved
-    # Fallback: common npm global bin locations
-    candidates = [
-        Path.home() / "AppData" / "Roaming" / "npm",          # Windows
-        Path("/usr/local/bin"),                                  # macOS / Linux (system npm)
-        Path.home() / ".npm-global" / "bin",                    # Linux (user npm)
-        Path.home() / ".local" / "bin",                         # generic
-    ]
-    for npm_bin in candidates:
-        for ext in (".CMD", ".cmd", ""):
-            candidate = npm_bin / f"opencode{ext}"
+    if sys.platform == "win32":
+        # Windows npm global bin locations with .cmd/.bat wrappers
+        candidates = [
+            Path.home() / "AppData" / "Roaming" / "npm",
+        ]
+        for npm_bin in candidates:
+            for ext in (".CMD", ".cmd", ""):
+                candidate = npm_bin / f"opencode{ext}"
+                if candidate.exists():
+                    return str(candidate)
+    else:
+        # Unix npm/system bin locations (no extension)
+        candidates = [
+            Path("/usr/local/bin"),                # system npm
+            Path("/usr/bin"),
+            Path.home() / ".local" / "bin",        # generic
+            Path.home() / ".npm-global" / "bin",   # user npm
+        ]
+        for npm_bin in candidates:
+            candidate = npm_bin / "opencode"
             if candidate.exists():
                 return str(candidate)
     return "opencode"
@@ -325,6 +343,91 @@ def get_provider_env(provider: str) -> dict:
     return env
 
 
+# ── Dynamic model discovery ────────────────────────────────────────────────
+# Fetch the actual available models from a provider's /models endpoint (e.g. a
+# LiteLLM proxy) instead of hardcoding the sonnet/opus/haiku tiers. Claude Code
+# is then invoked with `--model <real-id>` and routes the request correctly.
+
+MODELS_URL = os.environ.get("PP_MODELS_URL", "").strip()
+MODELS_TOKEN = os.environ.get("PP_MODELS_TOKEN", "").strip()
+
+import time as _time
+import urllib.request as _ureq
+
+_MODELS_CACHE = {"ts": 0.0, "data": None}
+_MODELS_TTL = 300  # seconds
+_CLAUDE_TIERS = ["sonnet", "opus", "haiku"]
+
+
+def _resolve_models_url() -> str:
+    """Return the URL to query for available models.
+
+    Priority: explicit PP_MODELS_URL > derived from ANTHROPIC_BASE_URL.
+    A LiteLLM proxy serves the OpenAI-compatible list at /v1/models on its root,
+    while ANTHROPIC_BASE_URL usually points at the /anthropic passthrough route.
+    """
+    if MODELS_URL:
+        return MODELS_URL
+    base = os.environ.get("ANTHROPIC_BASE_URL", "").strip()
+    if not base:
+        return ""
+    root = base.rstrip("/")
+    for suffix in ("/anthropic", "/v1"):
+        if root.endswith(suffix):
+            root = root[: -len(suffix)]
+            break
+    return root + "/v1/models"
+
+
+def fetch_available_models():
+    """Fetch available model IDs from the provider's /models endpoint.
+
+    Returns a sorted list of model id strings, or None when no endpoint is
+    configured or the request fails (caller then falls back to the tiers).
+    Cached for _MODELS_TTL seconds; stale cache is served on transient errors.
+    """
+    url = _resolve_models_url()
+    if not url:
+        return None
+    now = _time.time()
+    if _MODELS_CACHE["data"] is not None and now - _MODELS_CACHE["ts"] < _MODELS_TTL:
+        return _MODELS_CACHE["data"]
+    token = MODELS_TOKEN or os.environ.get("ANTHROPIC_AUTH_TOKEN", "")
+    try:
+        req = _ureq.Request(url)
+        if token:
+            req.add_header("Authorization", f"Bearer {token}")
+        with _ureq.urlopen(req, timeout=5) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        models = sorted({m["id"] for m in payload.get("data", []) if m.get("id")})
+        if not models:
+            return _MODELS_CACHE["data"]
+        _MODELS_CACHE["data"] = models
+        _MODELS_CACHE["ts"] = now
+        return models
+    except (ValueError, OSError):
+        return _MODELS_CACHE["data"]
+
+
+def get_provider_models(provider: str) -> list:
+    """Return the model list for a provider.
+
+    For Claude-type providers (supports_skills=True) with a configured models
+    endpoint, returns the dynamically fetched list. Otherwise falls back to the
+    provider's own `models` field or the sonnet/opus/haiku tiers.
+    """
+    providers = load_providers()
+    info = providers.get(provider, {})
+    if "models" in info:
+        return list(info["models"])
+    if info.get("supports_skills", False):
+        dynamic = fetch_available_models()
+        if dynamic:
+            return dynamic
+        return list(_CLAUDE_TIERS)
+    return []
+
+
 def _parse_frontmatter(path: Path) -> dict:
     """Parse YAML-style frontmatter (---...---) from a markdown file."""
     try:
@@ -429,3 +532,30 @@ TASK_PASSWORD = os.environ.get("PP_TASK_PASSWORD", "")
 # Server
 HOST = os.environ.get("PP_HOST", "127.0.0.1")
 PORT = int(os.environ.get("PP_PORT", "8420"))
+
+# Optional shared secret for the HTTP API. When set, all /api/* requests must
+# include `Authorization: Bearer <token>`. Leave empty to disable (loopback only).
+API_TOKEN = os.environ.get("PP_API_TOKEN", "")
+
+
+# ── Outbound proxy (Telegram bot) ──────────────────────────────────────────
+# Telegram API endpoints are often blocked in corporate networks; route the bot
+# through an HTTP(S) or SOCKS5 proxy. Note: Docker does NOT inherit host env
+# vars, so the proxy must be passed into the container explicitly (PP_TG_PROXY
+# or the standard *_proxy names — see docker-compose.yml).
+
+_PROXY_KEYS = (
+    "PP_TG_PROXY",          # explicit override (highest priority)
+    "https_proxy", "HTTPS_PROXY",
+    "all_proxy", "ALL_PROXY",
+    "http_proxy", "HTTP_PROXY",
+)
+
+
+def get_proxy_url() -> str:
+    """Return a proxy URL for the Telegram bot, or '' when none is configured."""
+    for key in _PROXY_KEYS:
+        val = os.environ.get(key, "").strip()
+        if val:
+            return val
+    return ""

@@ -1,6 +1,8 @@
 # -*- mode: python ; coding: utf-8 -*-
-# PyInstaller spec for PromptPilot
-# Build: pyinstaller pp.spec  (or run build.ps1)
+# PyInstaller spec for PromptPilot (cross-platform)
+# Build: pyinstaller pp.spec  (or run build.ps1 on Windows / build.sh on Linux)
+
+import sys
 
 from PyInstaller.utils.hooks import collect_all, collect_submodules
 
@@ -9,6 +11,18 @@ block_cipher = None
 tg_datas, tg_binaries, tg_hiddenimports = collect_all('telegram')
 tg_hiddenimports += collect_submodules('telegram')
 httpx_datas, httpx_binaries, httpx_hiddenimports = collect_all('httpx')
+
+# Tray GUI deps are Windows-only; skip them on headless Linux/macOS builds.
+if sys.platform == 'win32':
+    tray_hiddenimports = [
+        'pystray._win32',
+        'PIL',
+        'PIL.Image',
+        'PIL.ImageDraw',
+        'PIL.ImageFont',
+    ]
+else:
+    tray_hiddenimports = []
 
 a = Analysis(
     ['main.py'],
@@ -38,13 +52,7 @@ a = Analysis(
         'click',
         # pydantic
         'pydantic',
-        # tray
-        'pystray._win32',
-        'PIL',
-        'PIL.Image',
-        'PIL.ImageDraw',
-        'PIL.ImageFont',
-    ] + tg_hiddenimports + httpx_hiddenimports,
+    ] + tg_hiddenimports + httpx_hiddenimports + tray_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
