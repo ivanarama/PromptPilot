@@ -447,7 +447,7 @@ def run_worker():
         # Auto-reload: pick up code updates between tasks (dev-friendly —
         # a stale worker silently ignoring new features is worse than a restart)
         if code_snapshot is not None and _code_snapshot() != code_snapshot:
-            print("Код обновился — перезапускаю worker...")
+            print("Код обновился — перезапускаю worker...", flush=True)
             os.execv(sys.executable, [sys.executable, "-m", "promptpilot", "worker"])
 
         if db.is_paused():
