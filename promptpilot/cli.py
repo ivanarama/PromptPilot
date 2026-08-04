@@ -210,9 +210,10 @@ def stats():
 @click.option("--executor", type=click.Choice(["herdr"]), help="Run via an executor instead of a command template")
 @click.option("--kind", default=None, help="Agent kind for --executor herdr (claude, codex, gemini, cursor, opencode, grok, ...)")
 @click.option("--keep-pane", is_flag=True, help="herdr: keep the pane open after a successful task")
+@click.option("--models", "models_csv", default="", help='Model list for the picker, comma-separated: "a,b,c"')
 @click.option("--desc", default="", help="Description")
 @click.option("--env", "env_vars", multiple=True, help='Env vars: KEY=VALUE (repeat for multiple)')
-def provider(action, name, cmd_template, executor, kind, keep_pane, desc, env_vars):
+def provider(action, name, cmd_template, executor, kind, keep_pane, models_csv, desc, env_vars):
     """Manage CLI providers. Actions: list, add, remove, hide, unhide.
 
     \b
@@ -260,9 +261,10 @@ def provider(action, name, cmd_template, executor, kind, keep_pane, desc, env_va
             if "=" in kv:
                 k, v = kv.split("=", 1)
                 env[k.strip()] = v.strip()
+        models = [m.strip() for m in models_csv.split(",") if m.strip()]
         if executor:
             save_provider(name, description=desc, env=env, executor=executor,
-                          kind=kind, keep_pane=keep_pane)
+                          kind=kind, keep_pane=keep_pane, models=models)
             extra = ", keep pane" if keep_pane else ""
             click.echo(click.style(f"Provider '{name}' added: executor {executor}, kind {kind or 'claude'}{extra}", fg="green"))
         else:
@@ -271,7 +273,7 @@ def provider(action, name, cmd_template, executor, kind, keep_pane, desc, env_va
                 cmd_template = f"{name} {{prompt}}"
             if "{prompt}" not in cmd_template:
                 cmd_template += " {prompt}"
-            save_provider(name, cmd_template, desc, env=env)
+            save_provider(name, cmd_template, desc, env=env, models=models)
             click.echo(click.style(f"Provider '{name}' added: {cmd_template}", fg="green"))
         if env:
             click.echo(f"  Env: {', '.join(env.keys())}")

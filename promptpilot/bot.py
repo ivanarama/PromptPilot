@@ -567,12 +567,13 @@ _DEFAULT_MODELS = ["sonnet", "opus", "haiku"]
 
 
 def _model_keyboard(provider: str) -> InlineKeyboardMarkup:
-    """Return model selection keyboard for all Claude Code providers (supports_skills=True)."""
+    """Model keyboard: Claude Code providers (supports_skills) or any provider
+    with an explicit models list (e.g. opencode in herdr)."""
     providers = load_providers()
     info = providers.get(provider or DEFAULT_CLI, {})
-    if not info.get("supports_skills", False):
+    models = info.get("models") or (_DEFAULT_MODELS if info.get("supports_skills") else None)
+    if not models:
         return None
-    models = info.get("models", _DEFAULT_MODELS)
     buttons = [[InlineKeyboardButton("По умолчанию", callback_data="model:")]]
     row = []
     for m in models:

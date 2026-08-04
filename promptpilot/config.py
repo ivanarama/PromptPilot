@@ -127,6 +127,7 @@ def _find_opencode() -> str:
         return resolved
     # Fallback: common npm global bin locations
     candidates = [
+        Path.home() / ".opencode" / "bin",                      # official install script
         Path.home() / "AppData" / "Roaming" / "npm",          # Windows
         Path("/usr/local/bin"),                                  # macOS / Linux (system npm)
         Path.home() / ".npm-global" / "bin",                    # Linux (user npm)
@@ -279,10 +280,13 @@ def _write_custom_providers(custom: dict):
 
 
 def save_provider(name: str, cmd: str = None, description: str = "", env: dict = None,
-                  executor: str = None, kind: str = None, keep_pane: bool = False):
+                  executor: str = None, kind: str = None, keep_pane: bool = False,
+                  models: list = None):
     """Save a custom provider (cmd-template or executor-based) to providers.json."""
     custom = _load_custom_providers()
     entry = {"description": description}
+    if models:
+        entry["models"] = models
     if executor:
         entry["executor"] = executor
         entry["kind"] = kind or "claude"

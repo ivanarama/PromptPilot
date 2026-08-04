@@ -506,6 +506,7 @@
         <input id="pfKind" placeholder="агент: claude, codex, gemini, cursor, opencode, grok...">
         <label><input type="checkbox" id="pfKeep"> Оставлять сессию открытой после задачи (keep pane)</label>
       </div>
+      <input id="pfModels" placeholder="модели для выбора (через запятую), например: opencode/big-pickle, opencode/mimo-v2.5-free">
       <textarea id="pfEnv" rows="2" placeholder="переменные окружения, по одной на строку: KEY=VALUE"></textarea>
       <button class="btn btn-primary" type="submit" style="align-self:flex-start">Добавить</button>
       <div id="pfError" style="color:var(--red); font-size:13px"></div>
@@ -795,9 +796,10 @@ async function renderProvList() {
     badges.push(`<span class="prov-badge">${p.source === 'builtin' ? 'встроенный' : 'кастомный'}</span>`);
     if (!p.available) badges.push('<span class="prov-badge" style="color:var(--red)">не установлен</span>');
     if (p.hidden) badges.push('<span class="prov-badge" style="color:var(--yellow)">скрыт</span>');
-    const what = p.executor
+    const what = (p.executor
       ? `executor: ${esc(p.executor)}, агент: ${esc(p.kind || 'claude')}${p.keep_pane ? ', keep pane' : ''}`
-      : esc(p.cmd);
+      : esc(p.cmd))
+      + (p.models && p.models.length ? `<br>модели: ${esc(p.models.join(', '))}` : '');
     const canDelete = p.source !== 'builtin';
     return `<div class="prov-row${(!p.available || p.hidden) ? ' dim' : ''}">
       <span class="prov-name">${esc(name)}</span>${badges.join('')}
@@ -844,6 +846,7 @@ async function provAdd(e) {
     name: document.getElementById('pfName').value.trim(),
     description: document.getElementById('pfDesc').value.trim(),
     env,
+    models: document.getElementById('pfModels').value.split(',').map(s => s.trim()).filter(Boolean),
   };
   if (herdr) {
     body.executor = 'herdr';
@@ -864,6 +867,7 @@ async function provAdd(e) {
     document.getElementById('pfDesc').value = '';
     document.getElementById('pfCmd').value = '';
     document.getElementById('pfEnv').value = '';
+    document.getElementById('pfModels').value = '';
     await renderProvList();
     await loadProviders();
   } catch (err) {

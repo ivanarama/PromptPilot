@@ -389,16 +389,28 @@ AI-агентов. PromptPilot умеет выполнять задачи не h
 }
 ```
 
-или командой:
+Добавить можно тремя способами:
+
+**Web UI** — кнопка **⚙ Providers** → форма «Добавить провайдер» → тип
+«herdr-сессия» → указать имя, агента (kind) и, при желании, список моделей
+через запятую — тогда при создании задачи появится выпадашка выбора модели.
+
+**CLI**:
 
 ```bash
 pp provider add claude-herdr --executor herdr --kind claude --desc "Claude в herdr"
-pp provider add codex-herdr  --executor herdr --kind codex  --desc "Codex в herdr"
+pp provider add opencode-herdr --executor herdr --kind opencode \
+  --desc "OpenCode в herdr" \
+  --models "opencode/big-pickle,opencode/mimo-v2.5-free,opencode/deepseek-v4-flash-free"
 ```
+
+**providers.json** — вручную, поле `"models": [...]` опционально.
 
 `kind` — любой агент, который поддерживает herdr: `claude`, `codex`, `gemini`,
 `cursor`, `opencode`, `grok`, `copilot`, `droid`, `amp`, `kilo` и другие
-(полный список: `herdr agent start --help`).
+(полный список: `herdr agent start --help`). Список доступных моделей opencode:
+`opencode models`. Выбранная модель передаётся агенту флагом `--model` при
+старте сессии.
 
 Режимы завершения:
 
