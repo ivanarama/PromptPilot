@@ -41,7 +41,7 @@ from .tg_auth import authorize_user, is_authorized, list_authorized, load_allowe
 logger = logging.getLogger(__name__)
 
 # Conversation states
-ASK_PASSWORD, ASK_PROMPT, ASK_PROVIDER, ASK_PRIORITY, ASK_SKIP_PERMS, ASK_DIR, ASK_DIR_MANUAL, ASK_SCHEDULE, ASK_REPLY, ASK_SKILL_ARGS, ASK_MODEL, ASK_RECURRENCE, ASK_DETACHED, ASK_HERDR_REPLY = range(14)
+ASK_PASSWORD, ASK_PROMPT, ASK_PROVIDER, ASK_PRIORITY, ASK_SKIP_PERMS, ASK_DIR, ASK_DIR_MANUAL, ASK_SCHEDULE, ASK_REPLY, ASK_SKILL_ARGS, ASK_MODEL, ASK_RECURRENCE, ASK_DETACHED, ASK_HERDR_REPLY, ASK_KEEP_PANE = range(15)
 
 PAGE_SIZE = 5
 
@@ -684,6 +684,29 @@ async def add_task_got_skip_perms(update: Update, context: ContextTypes.DEFAULT_
     await query.answer()
     context.user_data["new_skip_permissions"] = query.data == "skipper:yes"
 
+    provider = context.user_data.get("new_provider") or DEFAULT_CLI
+    if load_providers().get(provider, {}).get("executor") == "herdr":
+        await query.edit_message_text(
+            "Оставить herdr-сессию открытой после задачи?\n"
+            "(можно вернуться, прочитать и продолжить диалог)",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🖥 Оставить (рекомендуется)", callback_data="keeppane:yes"),
+                InlineKeyboardButton("Закрыть после", callback_data="keeppane:no"),
+            ]]),
+        )
+        return ASK_KEEP_PANE
+
+    return await _ask_dir(query, context)
+
+
+async def add_task_got_keep_pane(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data["new_keep_pane"] = query.data == "keeppane:yes"
+    return await _ask_dir(query, context)
+
+
+async def _ask_dir(query, context):
     # Directory pre-filled (e.g. from project skills picker) — skip dir step
     if "new_dir" in context.user_data:
         pre_dir = context.user_data["new_dir"]
@@ -967,6 +990,7 @@ async def _finish_add_task_from_query(query, context):
     model = context.user_data.pop("new_model", None)
     recurrence = context.user_data.pop("new_recurrence", None)
     detached = context.user_data.pop("new_detached", False)
+    keep_pane = context.user_data.pop("new_keep_pane", True)
 
     task = db.create_task(TaskCreate(
         prompt=prompt,
@@ -979,6 +1003,7 @@ async def _finish_add_task_from_query(query, context):
         tg_chat_id=query.message.chat_id,
         recurrence=recurrence,
         detached=detached,
+        keep_pane=keep_pane,
     ))
 
     sched_str = scheduled_at.strftime("%d.%m.%Y %H:%M UTC") if scheduled_at else "сейчас"
@@ -1005,6 +1030,7 @@ async def _finish_add_task(update: Update, context: ContextTypes.DEFAULT_TYPE, w
     model = context.user_data.pop("new_model", None)
     recurrence = context.user_data.pop("new_recurrence", None)
     detached = context.user_data.pop("new_detached", False)
+    keep_pane = context.user_data.pop("new_keep_pane", True)
 
     task = db.create_task(TaskCreate(
         prompt=prompt,
@@ -1017,6 +1043,7 @@ async def _finish_add_task(update: Update, context: ContextTypes.DEFAULT_TYPE, w
         tg_chat_id=update.message.chat_id,
         recurrence=recurrence,
         detached=detached,
+        keep_pane=keep_pane,
     ))
 
     sched_str = scheduled_at.strftime("%d.%m.%Y %H:%M UTC") if scheduled_at else "сейчас"
@@ -1034,7 +1061,7 @@ async def _finish_add_task(update: Update, context: ContextTypes.DEFAULT_TYPE, w
 
 
 async def add_task_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    for key in ("new_prompt", "new_provider", "new_priority", "new_dir", "new_schedule", "new_recurrence", "new_detached"):
+    for key in ("new_prompt", "new_provider", "new_priority", "new_dir", "new_schedule", "new_recurrence", "new_detached", "new_keep_pane"):
         context.user_data.pop(key, None)
     await update.message.reply_text("Отменено.", reply_markup=_main_menu())
     return ConversationHandler.END
@@ -1592,6 +1619,9 @@ def run_bot():
             ],
             ASK_SKIP_PERMS: [
                 CallbackQueryHandler(add_task_got_skip_perms, pattern=r"^skipper:"),
+            ],
+            ASK_KEEP_PANE: [
+                CallbackQueryHandler(add_task_got_keep_pane, pattern=r"^keeppane:"),
             ],
             ASK_DIR: [
                 CallbackQueryHandler(cb_dir_open, pattern=r"^dir_open:"),

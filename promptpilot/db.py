@@ -36,7 +36,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     notified_at TEXT,
     recurrence TEXT,
     task_timeout INTEGER,
-    detached INTEGER NOT NULL DEFAULT 0
+    detached INTEGER NOT NULL DEFAULT 0,
+    keep_pane INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS settings (
@@ -70,6 +71,7 @@ MIGRATIONS = [
     "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
     "ALTER TABLE tasks ADD COLUMN task_timeout INTEGER",
     "ALTER TABLE tasks ADD COLUMN detached INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE tasks ADD COLUMN keep_pane INTEGER NOT NULL DEFAULT 1",
     """CREATE TABLE IF NOT EXISTS notifications (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         task_id INTEGER,
@@ -129,8 +131,8 @@ def init_db():
 def create_task(task: TaskCreate) -> TaskInDB:
     with _connect() as conn:
         cur = conn.execute(
-            """INSERT INTO tasks (prompt, working_dir, provider, status, priority, scheduled_at, created_at, max_retries, skip_permissions, model, session_id, parent_task_id, tg_chat_id, recurrence, task_timeout, detached)
-               VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            """INSERT INTO tasks (prompt, working_dir, provider, status, priority, scheduled_at, created_at, max_retries, skip_permissions, model, session_id, parent_task_id, tg_chat_id, recurrence, task_timeout, detached, keep_pane)
+               VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 task.prompt,
                 task.working_dir,
@@ -147,6 +149,7 @@ def create_task(task: TaskCreate) -> TaskInDB:
                 task.recurrence,
                 task.task_timeout,
                 int(task.detached),
+                int(task.keep_pane),
             ),
         )
         return get_task(cur.lastrowid, conn=conn)

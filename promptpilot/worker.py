@@ -244,7 +244,8 @@ def _execute_herdr_task(task, provider_cfg):
 
     outcome = run_in_herdr(task, provider_cfg, on_blocked=on_blocked,
                            timeout=_effective_timeout(task),
-                           cancel_check=lambda: db.is_cancel_requested(task.id))
+                           cancel_check=lambda: db.is_cancel_requested(task.id),
+                           keep_pane=task.keep_pane)
 
     if outcome.get("cancelled"):
         db.clear_cancel_request(task.id)

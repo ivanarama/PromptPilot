@@ -145,6 +145,7 @@ def api_providers():
             "models": info.get("models", default_models if info.get("supports_skills") else []),
             "available": provider_available(info),
             "hidden": bool(info.get("hidden")),
+            "executor": info.get("executor", ""),
         }
         for name, info in providers.items()
     }

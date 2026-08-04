@@ -176,7 +176,7 @@ def _wait_settled(name, until_args, deadline, cancel_check):
 
 
 def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
-                 cancel_check=None) -> dict:
+                 cancel_check=None, keep_pane: bool = None) -> dict:
     """Run a task in a herdr-managed agent session.
 
     on_blocked(pane_id) is called once when the agent first enters ``blocked``.
@@ -312,7 +312,8 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
             outcome["error"] = cleaned
             return outcome
 
-        if provider_cfg.get("keep_pane") or HERDR_KEEP_PANE:
+        keep = keep_pane if keep_pane is not None else (provider_cfg.get("keep_pane") or HERDR_KEEP_PANE)
+        if keep:
             # Keep the live session for follow-up work. Rename the agent out of
             # the pp-t* namespace so the Telegram bridge watches the continued
             # session, and relabel the tab so a task re-run won't close it as

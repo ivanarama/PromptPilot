@@ -31,6 +31,7 @@ class TaskCreate(BaseModel):
     recurrence: Optional[str] = None  # e.g. "6h", "daily@09:00"
     task_timeout: Optional[int] = None  # per-task timeout in seconds; None = use global TASK_TIMEOUT; 0 = no limit
     detached: bool = False  # if True: start process and mark completed immediately (for servers/bots)
+    keep_pane: bool = True  # herdr executor: keep the live session open after success
 
 
 class TaskUpdate(BaseModel):
@@ -65,6 +66,7 @@ class TaskInDB(BaseModel):
     recurrence: Optional[str] = None
     task_timeout: Optional[int] = None
     detached: bool = False
+    keep_pane: bool = True
 
 
 class Stats(BaseModel):

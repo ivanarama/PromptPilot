@@ -473,6 +473,10 @@
         <input type="checkbox" id="skipPermissions" style="width:auto;margin:0">
         <span style="font-size:13px;color:var(--yellow)">--dangerously-skip-permissions</span>
       </label>
+      <label id="keepPaneLabel" style="flex-direction:row;align-items:center;gap:8px;cursor:pointer;display:none">
+        <input type="checkbox" id="keepPane" checked style="width:auto;margin:0">
+        <span style="font-size:13px" title="Панель herdr останется открытой — можно вернуться и продолжить диалог">🖥 оставить сессию открытой</span>
+      </label>
       <button class="btn btn-primary" onclick="addTask()">Add Task</button>
     </div>
   </div>
@@ -723,6 +727,7 @@ async function addTask() {
       priority,
       working_dir: workdir,
       skip_permissions: skipPermissions,
+      keep_pane: document.getElementById('keepPane').checked,
       scheduled_at: schedule ? new Date(schedule).toISOString() : null,
       recurrence,
       task_timeout: taskTimeout,
@@ -949,9 +954,17 @@ async function loadProviders() {
     .filter(([name, info]) => info.available !== false && !info.hidden)
     .map(([name, info]) => `<option value="${esc(name)}">${esc(name)} — ${esc(info.description || info)}</option>`)
     .join('');
-  sel.addEventListener('change', () => { skillsCache = {}; updateSkillsToggle(); closeSkillsPanel(); updateModelSelect(); });
+  sel.addEventListener('change', () => { skillsCache = {}; updateSkillsToggle(); closeSkillsPanel(); updateModelSelect(); updateKeepPane(); });
   updateSkillsToggle();
   updateModelSelect();
+  updateKeepPane();
+}
+
+function updateKeepPane() {
+  const sel = document.getElementById('providerInput');
+  const prov = providersData[sel ? sel.value : ''] || {};
+  document.getElementById('keepPaneLabel').style.display =
+    prov.executor === 'herdr' ? 'flex' : 'none';
 }
 
 function updateModelSelect() {
