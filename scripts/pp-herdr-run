@@ -1,0 +1,230 @@
+#!/usr/bin/env bash
+# PromptPilot provider wrapper: run a prompt in a live herdr-managed agent session.
+#
+# Usage (as a PromptPilot provider):
+#   ~/.promptpilot/providers.json:
+#     "claude-herdr": {
+#       "cmd": "/path/to/scripts/pp-herdr-run {prompt}",
+#       "description": "Claude Code в herdr-сессии",
+#       "supports_skills": true
+#     }
+#
+# PromptPilot's build_cmd() may inject --model X / --resume ID /
+# --dangerously-skip-permissions before the prompt argument; they are parsed
+# here and forwarded to the agent CLI.
+#
+# Environment knobs:
+#   PP_HERDR_KIND                agent kind for `herdr agent start` (default: claude)
+#   PP_HERDR_START_TIMEOUT_MS    agent startup readiness timeout (default: 60000)
+#   PP_HERDR_TIMEOUT_MS          prompt wait timeout; empty = wait indefinitely
+#   PP_HERDR_PROMPT_RETRIES      max total submit attempts on agent_prompt_stalled (default: 3)
+#   PP_HERDR_READ_LINES          terminal lines to read for the result (default: 300)
+#   PP_HERDR_ON_BLOCKED          wait | fail  (default: wait)
+#   PP_HERDR_BLOCKED_TIMEOUT_MS  give up if still blocked after this; empty = wait forever
+#   PP_HERDR_KEEP_PANE           1 = do not close the pane after success (default: 0)
+#
+# Failure policy: on errors the pane is kept for inspection (attach with
+# `herdr`); on an in-session usage/rate limit the pane is closed and the run
+# exits non-zero with a "rate limit" marker on stderr so PromptPilot's
+# backoff-retry engages.
+#
+# Known Phase-0 limitations (by design of the interactive mode):
+#   - no cost/session_id in the result (no stream-json), so PromptPilot's
+#     cost dashboard and 💬-reply are inactive for this provider;
+#   - SIGKILL (e.g. worker task timeout) cannot be trapped: the agent keeps
+#     running in its pane until closed manually;
+#   - rate-limit detection is textual and may rarely misfire if the agent's
+#     own answer contains the marker phrases.
+
+set -u
+
+KIND="${PP_HERDR_KIND:-claude}"
+START_TIMEOUT_MS="${PP_HERDR_START_TIMEOUT_MS:-60000}"
+TIMEOUT_MS="${PP_HERDR_TIMEOUT_MS:-}"
+PROMPT_RETRIES="${PP_HERDR_PROMPT_RETRIES:-3}"
+READ_LINES="${PP_HERDR_READ_LINES:-300}"
+ON_BLOCKED="${PP_HERDR_ON_BLOCKED:-wait}"
+BLOCKED_TIMEOUT_MS="${PP_HERDR_BLOCKED_TIMEOUT_MS:-}"
+KEEP_PANE="${PP_HERDR_KEEP_PANE:-0}"
+
+die() { echo "pp-herdr-run: $*" >&2; exit 1; }
+
+command -v herdr >/dev/null 2>&1 || die "herdr not found in PATH"
+command -v python3 >/dev/null 2>&1 || die "python3 not found in PATH"
+
+# --- Parse args: flags injected by PromptPilot, then the prompt itself -------
+AGENT_ARGS=()
+PROMPT=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --model|--resume)
+            [ $# -ge 2 ] || die "$1 requires a value"
+            AGENT_ARGS+=("$1" "$2"); shift 2 ;;
+        --dangerously-skip-permissions)
+            AGENT_ARGS+=("$1"); shift ;;
+        *)
+            [ -z "$PROMPT" ] || die "unexpected extra argument: $1"
+            PROMPT="$1"; shift ;;
+    esac
+done
+[ -n "$PROMPT" ] || die "no prompt given"
+
+json_get() {  # json_get '<python expr over d>' — reads JSON from stdin
+    python3 -c "import json,sys; d=json.load(sys.stdin); print($1)" 2>/dev/null
+}
+
+# --- Ensure the herdr server is running --------------------------------------
+server_running() {
+    herdr status server --json 2>/dev/null | json_get "d.get('running') is True" | grep -q True
+}
+if ! server_running; then
+    setsid nohup herdr server >/dev/null 2>&1 &
+    for _ in $(seq 1 20); do
+        sleep 0.5
+        server_running && break
+    done
+    server_running || die "herdr server is not running and could not be started"
+fi
+
+# --- Create an off-screen tab in the task's working directory ----------------
+AGENT="pp-$$-$RANDOM"   # PID alone can collide with a kept pane after PID reuse
+TAB_JSON="$(herdr tab create --cwd "$PWD" --label "$AGENT" --no-focus 2>&1)" \
+    || die "tab create failed: $TAB_JSON"
+PANE_ID="$(printf '%s' "$TAB_JSON" | json_get "d['result']['root_pane']['pane_id']")"
+TAB_ID="$(printf '%s' "$TAB_JSON" | json_get "d['result']['tab']['tab_id']")"
+[ -n "$PANE_ID" ] && [ -n "$TAB_ID" ] || die "could not parse pane/tab id from: $TAB_JSON"
+
+cleanup_tab() { herdr tab close "$TAB_ID" >/dev/null 2>&1; }
+fail_keep_pane() {
+    trap - TERM INT HUP
+    echo "pp-herdr-run: $* (pane $PANE_ID kept for inspection — attach with 'herdr')" >&2
+    exit 1
+}
+
+# External termination (worker Ctrl+C / SIGTERM): don't leave an unsupervised
+# agent running — close its tab. SIGKILL (worker timeout) cannot be caught.
+on_term() {
+    echo "pp-herdr-run: terminated externally, closing pane $PANE_ID" >&2
+    cleanup_tab
+    exit 143
+}
+trap on_term TERM INT HUP
+
+# --- Start the agent in the pane ---------------------------------------------
+if [ ${#AGENT_ARGS[@]} -gt 0 ]; then
+    START_JSON="$(herdr agent start "$AGENT" --kind "$KIND" --pane "$PANE_ID" \
+        --timeout "$START_TIMEOUT_MS" -- "${AGENT_ARGS[@]}" 2>&1)"
+else
+    START_JSON="$(herdr agent start "$AGENT" --kind "$KIND" --pane "$PANE_ID" \
+        --timeout "$START_TIMEOUT_MS" 2>&1)"
+fi
+[ $? -eq 0 ] || { trap - TERM INT HUP; cleanup_tab; die "agent start failed: $START_JSON"; }
+
+# --- Submit the prompt; retry on agent_prompt_stalled ------------------------
+PROMPT_CMD=(herdr agent prompt "$AGENT" "$PROMPT" --wait)
+[ -n "$TIMEOUT_MS" ] && PROMPT_CMD+=(--timeout "$TIMEOUT_MS")
+
+STATE=""
+attempt=1
+while :; do
+    PROMPT_JSON="$("${PROMPT_CMD[@]}" 2>&1)"
+    if [ $? -eq 0 ]; then
+        STATE="$(printf '%s' "$PROMPT_JSON" | json_get "d['result']['agent']['agent_status']")"
+        break
+    fi
+    ERR_CODE="$(printf '%s' "$PROMPT_JSON" | json_get "d.get('error',{}).get('code','')")"
+    [ "$ERR_CODE" = "agent_prompt_stalled" ] || fail_keep_pane "agent prompt failed: $PROMPT_JSON"
+    # The stall may be late delivery: if the agent is already working, the
+    # prompt DID land — resubmitting would double it. Wait instead.
+    CUR="$(herdr agent get "$AGENT" 2>/dev/null | json_get "d['result']['agent']['agent_status']")"
+    if [ "$CUR" = "working" ]; then
+        WAIT_JSON="$(herdr agent wait "$AGENT" 2>&1)" \
+            || fail_keep_pane "wait after stalled submit failed: $WAIT_JSON"
+        STATE="$(printf '%s' "$WAIT_JSON" | json_get "d['result']['agent']['agent_status']")"
+        break
+    fi
+    [ "$attempt" -lt "$PROMPT_RETRIES" ] || fail_keep_pane "agent prompt stalled after $attempt attempts: $PROMPT_JSON"
+    attempt=$((attempt + 1))
+    sleep 2
+done
+
+# --- Blocked handling --------------------------------------------------------
+# blocked = the agent is waiting for a human (permission dialog etc.).
+while [ "$STATE" = "blocked" ]; do
+    [ "$ON_BLOCKED" != "fail" ] || fail_keep_pane "agent is blocked and PP_HERDR_ON_BLOCKED=fail"
+    echo "pp-herdr-run: agent blocked — approve in pane $PANE_ID (attach with 'herdr'), waiting..." >&2
+    WAIT_CMD=(herdr agent wait "$AGENT" --until idle --until done)
+    [ -n "$BLOCKED_TIMEOUT_MS" ] && WAIT_CMD+=(--timeout "$BLOCKED_TIMEOUT_MS")
+    WAIT_JSON="$("${WAIT_CMD[@]}" 2>&1)" \
+        || fail_keep_pane "still blocked / wait failed: $WAIT_JSON"
+    STATE="$(printf '%s' "$WAIT_JSON" | json_get "d['result']['agent']['agent_status']")"
+done
+
+# --- Read the result ---------------------------------------------------------
+RAW="$(herdr agent read "$AGENT" --source recent-unwrapped --lines "$READ_LINES" --format text 2>&1)" \
+    || fail_keep_pane "agent read failed: $RAW"
+
+# Best-effort cleanup: keep the transcript from the last submitted prompt on,
+# drop the trailing input box / status bar. RAW goes via stdin (env vars are
+# capped at ~128 KiB per string); on any filter error fall back to raw text.
+FILTER_PY='
+import os, sys
+
+raw = sys.stdin.read()
+prompt = os.environ.get("PP_PROMPT", "")
+lines = raw.splitlines()
+
+# Find the last echo of our prompt in the transcript ("> <prompt>").
+start = 0
+probe = prompt.strip().splitlines()[0][:60] if prompt.strip() else ""
+for i, line in enumerate(lines):
+    if probe and line.lstrip().startswith("❯") and probe in line:
+        start = i
+
+# The bottom input box begins at the first full-width ─ separator after start.
+end = len(lines)
+for i in range(start + 1, len(lines)):
+    s = lines[i].strip()
+    if s and set(s) <= {"─"}:
+        end = i
+        break
+
+# Trim trailing chrome above the input box (status/effort hints, blanks).
+def chrome(s):
+    s = s.strip()
+    return (not s or s == "❯" or s.startswith("⏸")
+            or "? for shortcuts" in s or "· /effort" in s)
+
+while end > start and chrome(lines[end - 1]):
+    end -= 1
+
+out = "\n".join(lines[start:end]).strip()
+print(out if out else raw.strip())
+'
+CLEANED="$(printf '%s\n' "$RAW" | PP_PROMPT="$PROMPT" python3 -c "$FILTER_PY")" \
+    || CLEANED="$RAW"
+[ -n "$CLEANED" ] || CLEANED="$RAW"
+
+# --- In-session usage/rate limit → hand off to PromptPilot's backoff-retry ---
+# Interactive sessions exit 0 even when the provider is rate-limited; the
+# worker only retries when exit != 0 and stderr matches its patterns
+# (worker.RATE_LIMIT_PATTERNS — "rate limit" below is what triggers it).
+if printf '%s' "$CLEANED" | grep -qiE \
+    "reached your usage limit|usage limit reached|rate_limit_error|overloaded_error|too many requests|quota exceeded"; then
+    trap - TERM INT HUP
+    cleanup_tab
+    echo "pp-herdr-run: rate limit detected in session output" >&2
+    printf '%s\n' "$CLEANED" >&2
+    exit 1
+fi
+
+trap - TERM INT HUP
+printf '%s\n' "$CLEANED"
+
+if [ "$KEEP_PANE" = "1" ]; then
+    echo ""
+    echo "[pp-herdr-run] pane $PANE_ID kept (PP_HERDR_KEEP_PANE=1)"
+else
+    cleanup_tab
+fi
+exit 0

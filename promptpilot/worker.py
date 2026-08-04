@@ -10,7 +10,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 from . import db
-from .config import BASE_DELAY, DEFAULT_CLI, MAX_DELAY, POLL_INTERVAL, TASK_TIMEOUT, build_cmd, get_provider_env
+from .config import BASE_DELAY, DEFAULT_CLI, MAX_DELAY, POLL_INTERVAL, TASK_TIMEOUT, build_cmd, get_provider_env, load_providers
 
 RATE_LIMIT_PATTERNS = [
     "rate limit",
@@ -179,9 +179,85 @@ def is_stream_json(stdout: str) -> bool:
         return False
 
 
+def _effective_timeout(task):
+    """Per-task timeout in seconds; None = no limit (0 disables the global one)."""
+    if task.task_timeout == 0:
+        return None
+    if task.task_timeout is not None:
+        return task.task_timeout
+    return None if TASK_TIMEOUT == 0 else TASK_TIMEOUT
+
+
+def _maybe_recur(task):
+    """After a successful run, enqueue the next occurrence of a recurring task."""
+    if not task.recurrence:
+        return
+    next_dt = db.parse_recurrence(task.recurrence)
+    if not next_dt:
+        return
+    from .models import TaskCreate
+    db.create_task(TaskCreate(
+        prompt=task.prompt,
+        working_dir=task.working_dir,
+        provider=task.provider,
+        priority=task.priority,
+        scheduled_at=next_dt,
+        max_retries=task.max_retries,
+        skip_permissions=task.skip_permissions,
+        model=task.model,
+        recurrence=task.recurrence,
+        tg_chat_id=task.tg_chat_id,
+        task_timeout=task.task_timeout,
+        detached=task.detached,
+    ))
+    print(f"  -> Recurring: next run at {next_dt.strftime('%Y-%m-%d %H:%M UTC')}")
+
+
+def _execute_herdr_task(task, provider_cfg):
+    """Run the task in a live herdr session (providers with executor=herdr)."""
+    from .herdr_exec import run_in_herdr
+
+    def on_blocked(pane_id):
+        print(f"  -> Blocked, waiting for approval in pane {pane_id}")
+        if task.tg_chat_id:
+            db.add_notification(
+                task.tg_chat_id,
+                f"⏸ Задача #{task.id} ждёт подтверждения в herdr (панель {pane_id}).\n"
+                f"Подключись командой: herdr — подтверди действие, задача продолжится.",
+                task_id=task.id,
+            )
+
+    outcome = run_in_herdr(task, provider_cfg, on_blocked=on_blocked, timeout=_effective_timeout(task))
+
+    if outcome["rate_limited"]:
+        if task.retry_count >= task.max_retries:
+            db.mark_failed(task.id, f"Rate limited, max retries ({task.max_retries}) exceeded.\n{outcome['error']}")
+            return
+        next_run = compute_next_run(task.retry_count)
+        db.mark_rate_limited(task.id, next_run, error=outcome["error"] or "Rate limited")
+        print(f"  -> Rate limited. Retry #{task.retry_count + 1} at {next_run.strftime('%H:%M:%S')}")
+        return
+
+    if not outcome["ok"]:
+        db.mark_failed(task.id, outcome["error"], exit_code=1)
+        print("  -> Failed (herdr)")
+        return
+
+    db.mark_completed(task.id, outcome["output"], exit_code=0)
+    text_preview = outcome["output"][:80].replace("\n", " ").strip()
+    print(f"  -> Completed: {text_preview}")
+    _maybe_recur(task)
+
+
 def execute_task(task):
     """Run CLI with the task's prompt."""
     provider = task.provider or DEFAULT_CLI
+
+    provider_cfg = load_providers().get(provider, {})
+    if provider_cfg.get("executor") == "herdr":
+        _execute_herdr_task(task, provider_cfg)
+        return
+
     cmd = build_cmd(provider, task.prompt, skip_permissions=task.skip_permissions, session_id=task.session_id, model=task.model)
 
     env = get_provider_env(provider)
@@ -209,15 +285,7 @@ def execute_task(task):
             db.mark_failed(task.id, f"Command not found: {cmd[0]}", exit_code=-1)
         return
 
-    # Determine effective timeout (0 = no limit)
-    if task.task_timeout == 0:
-        effective_timeout = None
-    elif task.task_timeout is not None:
-        effective_timeout = task.task_timeout
-    elif TASK_TIMEOUT == 0:
-        effective_timeout = None
-    else:
-        effective_timeout = TASK_TIMEOUT
+    effective_timeout = _effective_timeout(task)
 
     try:
         result = subprocess.run(
@@ -294,25 +362,7 @@ def execute_task(task):
     text_preview = output[:80].replace("\n", " ").strip()
     print(f"  -> Completed: {text_preview}")
 
-    if task.recurrence:
-        next_dt = db.parse_recurrence(task.recurrence)
-        if next_dt:
-            from .models import TaskCreate
-            db.create_task(TaskCreate(
-                prompt=task.prompt,
-                working_dir=task.working_dir,
-                provider=task.provider,
-                priority=task.priority,
-                scheduled_at=next_dt,
-                max_retries=task.max_retries,
-                skip_permissions=task.skip_permissions,
-                model=task.model,
-                recurrence=task.recurrence,
-                tg_chat_id=task.tg_chat_id,
-                task_timeout=task.task_timeout,
-                detached=task.detached,
-            ))
-            print(f"  -> Recurring: next run at {next_dt.strftime('%Y-%m-%d %H:%M UTC')}")
+    _maybe_recur(task)
 
 
 def run_worker():

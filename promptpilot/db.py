@@ -44,6 +44,15 @@ CREATE TABLE IF NOT EXISTS settings (
     value TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS notifications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id INTEGER,
+    tg_chat_id INTEGER NOT NULL,
+    message TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    sent_at TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_runnable ON tasks(status, priority, next_run_at);
 """
@@ -61,6 +70,14 @@ MIGRATIONS = [
     "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
     "ALTER TABLE tasks ADD COLUMN task_timeout INTEGER",
     "ALTER TABLE tasks ADD COLUMN detached INTEGER NOT NULL DEFAULT 0",
+    """CREATE TABLE IF NOT EXISTS notifications (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id INTEGER,
+        tg_chat_id INTEGER NOT NULL,
+        message TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        sent_at TEXT
+    )""",
 ]
 
 
@@ -354,6 +371,32 @@ def mark_notified(task_id: int):
         )
 
 
+def add_notification(tg_chat_id: int, message: str, task_id: int = None):
+    """Queue a free-form message for the bot's notify loop (e.g. blocked agent)."""
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO notifications (task_id, tg_chat_id, message, created_at) VALUES (?, ?, ?, ?)",
+            (task_id, tg_chat_id, message, _now()),
+        )
+
+
+def get_unsent_notifications() -> list:
+    """Return queued notifications not yet delivered, oldest first."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM notifications WHERE sent_at IS NULL ORDER BY id",
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def mark_notification_sent(notification_id: int):
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE notifications SET sent_at = ? WHERE id = ?",
+            (_now(), notification_id),
+        )
+
+
 def recover_running():
     """Reset any 'running' tasks back to 'pending' (crash recovery)."""
     with _connect() as conn:
@@ -379,6 +422,10 @@ def purge_old(before_days: int = 7) -> int:
         cutoff = (cutoff - timedelta(days=before_days)).isoformat()
         cur = conn.execute(
             "DELETE FROM tasks WHERE status IN ('completed', 'failed', 'cancelled') AND completed_at < ?",
+            (cutoff,),
+        )
+        conn.execute(
+            "DELETE FROM notifications WHERE sent_at IS NOT NULL AND sent_at < ?",
             (cutoff,),
         )
         return cur.rowcount

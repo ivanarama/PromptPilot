@@ -64,10 +64,20 @@ DEFAULT_CLI = os.environ.get("PP_DEFAULT_CLI", "claude")
 
 # CLI providers — name -> command template with {prompt} placeholder
 # Can be overridden/extended via ~/.promptpilot/providers.json
-CLAUDE_EXE = os.environ.get(
-    "PP_CLAUDE_EXE",
-    str(Path.home() / ".local" / "bin" / "claude.exe"),
-)
+def _find_claude() -> str:
+    """Find Claude Code CLI — claude on POSIX, claude.exe on Windows."""
+    import shutil
+    resolved = shutil.which("claude")
+    if resolved:
+        return resolved
+    for name in ("claude.exe", "claude"):
+        candidate = Path.home() / ".local" / "bin" / name
+        if candidate.exists():
+            return str(candidate)
+    return "claude"
+
+
+CLAUDE_EXE = os.environ.get("PP_CLAUDE_EXE", _find_claude())
 
 def _cursor_agent_cmd() -> str:
     """Return command to invoke cursor-agent.
@@ -419,6 +429,16 @@ def get_skills(working_dir: str = None) -> list:
 
     return skills
 
+
+# herdr executor (providers with "executor": "herdr" in providers.json)
+HERDR_BIN = os.environ.get("PP_HERDR_BIN", "herdr")
+HERDR_READ_LINES = int(os.environ.get("PP_HERDR_READ_LINES", "300"))
+HERDR_START_TIMEOUT_MS = int(os.environ.get("PP_HERDR_START_TIMEOUT_MS", "60000"))
+
+# herdr → Telegram bridge: the bot watches ALL herdr agents (not only
+# PromptPilot tasks) and notifies when one is blocked or finishes unseen.
+HERDR_WATCH = os.environ.get("PP_HERDR_WATCH", "1") == "1"
+HERDR_WATCH_INTERVAL = int(os.environ.get("PP_HERDR_WATCH_INTERVAL", "10"))
 
 # Projects root — optional directory whose subdirectories are offered as project choices
 PROJECTS_ROOT = os.environ.get("PP_PROJECTS_ROOT", "")
