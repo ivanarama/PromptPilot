@@ -41,7 +41,7 @@ from .tg_auth import authorize_user, is_authorized, list_authorized, load_allowe
 logger = logging.getLogger(__name__)
 
 # Conversation states
-ASK_PASSWORD, ASK_PROMPT, ASK_PROVIDER, ASK_PRIORITY, ASK_SKIP_PERMS, ASK_DIR, ASK_DIR_MANUAL, ASK_SCHEDULE, ASK_REPLY, ASK_SKILL_ARGS, ASK_MODEL, ASK_RECURRENCE, ASK_DETACHED, ASK_HERDR_REPLY, ASK_KEEP_PANE = range(15)
+ASK_PASSWORD, ASK_PROMPT, ASK_PROVIDER, ASK_PRIORITY, ASK_SKIP_PERMS, ASK_DIR, ASK_DIR_MANUAL, ASK_SCHEDULE, ASK_REPLY, ASK_SKILL_ARGS, ASK_MODEL, ASK_RECURRENCE, ASK_DETACHED, ASK_HERDR_REPLY, ASK_KEEP_PANE, ASK_HERDR_TARGET = range(16)
 
 PAGE_SIZE = 5
 
@@ -592,11 +592,35 @@ async def add_task_got_provider(update: Update, context: ContextTypes.DEFAULT_TY
     provider = query.data.split(":", 1)[1] or None
     context.user_data["new_provider"] = provider
 
+    if load_providers().get(provider or DEFAULT_CLI, {}).get("session_target"):
+        data = await _herdr_json("agent", "list")
+        agents = ((data or {}).get("result") or {}).get("agents") or []
+        agents = [a for a in agents if a.get("pane_id")]
+        if not agents:
+            await query.edit_message_text("Нет открытых herdr-сессий. Открой панель с агентом и попробуй снова.")
+            return ConversationHandler.END
+        buttons = [[InlineKeyboardButton(
+            f"{a.get('pane_id')} · {a.get('agent') or '?'} · {a.get('agent_status')}"
+            + (f" · {a['name']}" if a.get('name') else ""),
+            callback_data=f"hstarget:{a.get('name') or a.get('pane_id')}")]
+            for a in agents[:20]]
+        await query.edit_message_text("В какую сессию отправить промпт?",
+                                      reply_markup=InlineKeyboardMarkup(buttons))
+        return ASK_HERDR_TARGET
+
     kb = _model_keyboard(provider)
     if kb:
         await query.edit_message_text("Выберите модель:", reply_markup=kb)
         return ASK_MODEL
 
+    await query.edit_message_text("Выберите приоритет:", reply_markup=_priority_keyboard())
+    return ASK_PRIORITY
+
+
+async def add_task_got_herdr_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data["new_herdr_target"] = query.data.split(":", 1)[1]
     await query.edit_message_text("Выберите приоритет:", reply_markup=_priority_keyboard())
     return ASK_PRIORITY
 
@@ -664,6 +688,10 @@ async def add_task_got_priority(update: Update, context: ContextTypes.DEFAULT_TY
     query = update.callback_query
     await query.answer()
     context.user_data["new_priority"] = int(query.data.split(":")[1])
+
+    if context.user_data.get("new_herdr_target"):
+        # existing session: permissions/keep/directory don't apply
+        return await _ask_schedule_from_query(query, context)
 
     keyboard = InlineKeyboardMarkup([
         [
@@ -991,6 +1019,7 @@ async def _finish_add_task_from_query(query, context):
     recurrence = context.user_data.pop("new_recurrence", None)
     detached = context.user_data.pop("new_detached", False)
     keep_pane = context.user_data.pop("new_keep_pane", True)
+    herdr_target = context.user_data.pop("new_herdr_target", None)
 
     task = db.create_task(TaskCreate(
         prompt=prompt,
@@ -1004,6 +1033,7 @@ async def _finish_add_task_from_query(query, context):
         recurrence=recurrence,
         detached=detached,
         keep_pane=keep_pane,
+        herdr_target=herdr_target,
     ))
 
     sched_str = scheduled_at.strftime("%d.%m.%Y %H:%M UTC") if scheduled_at else "сейчас"
@@ -1031,6 +1061,7 @@ async def _finish_add_task(update: Update, context: ContextTypes.DEFAULT_TYPE, w
     recurrence = context.user_data.pop("new_recurrence", None)
     detached = context.user_data.pop("new_detached", False)
     keep_pane = context.user_data.pop("new_keep_pane", True)
+    herdr_target = context.user_data.pop("new_herdr_target", None)
 
     task = db.create_task(TaskCreate(
         prompt=prompt,
@@ -1044,6 +1075,7 @@ async def _finish_add_task(update: Update, context: ContextTypes.DEFAULT_TYPE, w
         recurrence=recurrence,
         detached=detached,
         keep_pane=keep_pane,
+        herdr_target=herdr_target,
     ))
 
     sched_str = scheduled_at.strftime("%d.%m.%Y %H:%M UTC") if scheduled_at else "сейчас"
@@ -1063,7 +1095,7 @@ async def _finish_add_task(update: Update, context: ContextTypes.DEFAULT_TYPE, w
 async def add_task_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for key in ("new_prompt", "new_provider", "new_priority", "new_dir", "new_schedule",
                 "new_recurrence", "new_detached", "new_keep_pane", "new_model",
-                "new_skip_permissions", "new_skill_name"):
+                "new_skip_permissions", "new_skill_name", "new_herdr_target"):
         context.user_data.pop(key, None)
     await update.message.reply_text("Отменено.", reply_markup=_main_menu())
     return ConversationHandler.END
@@ -1625,6 +1657,9 @@ def run_bot():
             ],
             ASK_KEEP_PANE: [
                 CallbackQueryHandler(add_task_got_keep_pane, pattern=r"^keeppane:"),
+            ],
+            ASK_HERDR_TARGET: [
+                CallbackQueryHandler(add_task_got_herdr_target, pattern=r"^hstarget:"),
             ],
             ASK_DIR: [
                 CallbackQueryHandler(cb_dir_open, pattern=r"^dir_open:"),

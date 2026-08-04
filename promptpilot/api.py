@@ -146,9 +146,37 @@ def api_providers():
             "available": provider_available(info),
             "hidden": bool(info.get("hidden")),
             "executor": info.get("executor", ""),
+            "session_target": bool(info.get("session_target")),
         }
         for name, info in providers.items()
     }
+
+
+@app.get("/api/herdr/agents")
+def api_herdr_agents():
+    """Live herdr agents for the session-target picker."""
+    import json as _json
+    import subprocess as _sp
+    from .config import HERDR_BIN
+    try:
+        proc = _sp.run([HERDR_BIN, "agent", "list"], capture_output=True, text=True,
+                       timeout=10, stdin=_sp.DEVNULL)
+        data = _json.loads(proc.stdout.strip() or "{}")
+    except (OSError, ValueError, _sp.TimeoutExpired):
+        return []
+    agents = ((data.get("result") or {}).get("agents")) or []
+    return [
+        {
+            "target": a.get("name") or a.get("pane_id"),
+            "pane_id": a.get("pane_id"),
+            "name": a.get("name"),
+            "agent": a.get("display_agent") or a.get("agent") or "",
+            "status": a.get("agent_status"),
+            "title": (a.get("terminal_title_stripped") or "")[:80],
+        }
+        for a in agents
+        if a.get("pane_id")
+    ]
 
 
 import re as _re

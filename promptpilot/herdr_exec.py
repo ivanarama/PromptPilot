@@ -192,24 +192,39 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
 
     try:
         _ensure_server()
-        _close_stale_tabs(task.id)
 
-        name = f"pp-t{task.id}-{int(time.time()) % 100000}"
-        cwd = task.working_dir or "."
-        tab_cmd = ["tab", "create", "--cwd", cwd, "--label", name, "--no-focus"]
-        for k, v in (provider_cfg.get("env") or {}).items():
-            if v:
-                tab_cmd += ["--env", f"{k}={v}"]
-        rc, data, raw = _run(tab_cmd)
-        pane_id = _dig(data, "result", "root_pane", "pane_id")
-        tab_id = _dig(data, "result", "tab", "tab_id")
-        if rc != 0 or not pane_id or not tab_id:
-            outcome["error"] = f"herdr tab create failed: {raw}"
-            return outcome
-        outcome["pane_id"] = pane_id
+        target = getattr(task, "herdr_target", None)
+        if target:
+            # Target mode: send the prompt into an EXISTING session. The pane
+            # belongs to the user — never close or rename it.
+            rc, data, raw = _run(["agent", "get", target])
+            if rc != 0 or not _agent_status(data):
+                outcome["error"] = (f"herdr-сессия «{target}» не найдена — панель закрыта? "
+                                    f"({raw[:200]})")
+                return outcome
+            name = target
+            pane_id = _dig(data, "result", "agent", "pane_id") or target
+            tab_id = None
+            outcome["pane_id"] = pane_id
+        else:
+            _close_stale_tabs(task.id)
+            name = f"pp-t{task.id}-{int(time.time()) % 100000}"
+            cwd = task.working_dir or "."
+            tab_cmd = ["tab", "create", "--cwd", cwd, "--label", name, "--no-focus"]
+            for k, v in (provider_cfg.get("env") or {}).items():
+                if v:
+                    tab_cmd += ["--env", f"{k}={v}"]
+            rc, data, raw = _run(tab_cmd)
+            pane_id = _dig(data, "result", "root_pane", "pane_id")
+            tab_id = _dig(data, "result", "tab", "tab_id")
+            if rc != 0 or not pane_id or not tab_id:
+                outcome["error"] = f"herdr tab create failed: {raw}"
+                return outcome
+            outcome["pane_id"] = pane_id
 
         def close_tab():
-            _run(["tab", "close", tab_id])
+            if tab_id:
+                _run(["tab", "close", tab_id])
 
         def fail(msg, keep_pane=True):
             if keep_pane:
@@ -220,6 +235,7 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
             return outcome
 
         # Start the agent, forwarding per-task flags to its CLI.
+        # (target mode: the agent is already running — nothing to start)
         kind = provider_cfg.get("kind", "claude")
         # provider-level extra CLI args (e.g. ["--effort", "max"] for claude)
         agent_args = list(provider_cfg.get("args") or [])
@@ -229,21 +245,22 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
             agent_args += ["--resume", task.session_id]
         if task.skip_permissions:
             agent_args.append("--dangerously-skip-permissions")
-        cmd = ["agent", "start", name, "--kind", kind, "--pane", pane_id,
-               "--timeout", str(HERDR_START_TIMEOUT_MS)]
-        if agent_args:
-            cmd += ["--", *agent_args]
-        # A freshly created pane needs a moment to spawn its shell; until then
-        # agent start fails with agent_pane_busy — retry briefly.
-        for _ in range(20):
-            rc, data, raw = _run(cmd)
-            if rc == 0 or _error_code(data) != "agent_pane_busy":
-                break
-            time.sleep(0.5)
-        if rc != 0:
-            close_tab()
-            outcome["error"] = f"herdr agent start failed: {raw}"
-            return outcome
+        if not target:
+            cmd = ["agent", "start", name, "--kind", kind, "--pane", pane_id,
+                   "--timeout", str(HERDR_START_TIMEOUT_MS)]
+            if agent_args:
+                cmd += ["--", *agent_args]
+            # A freshly created pane needs a moment to spawn its shell; until
+            # then agent start fails with agent_pane_busy — retry briefly.
+            for _ in range(20):
+                rc, data, raw = _run(cmd)
+                if rc == 0 or _error_code(data) != "agent_pane_busy":
+                    break
+                time.sleep(0.5)
+            if rc != 0:
+                close_tab()
+                outcome["error"] = f"herdr agent start failed: {raw}"
+                return outcome
 
         # Detached: submit the prompt, confirm it landed, leave the pane open.
         if task.detached:
@@ -252,7 +269,8 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
             if rc != 0 and _error_code(data) not in ("timeout", "agent_prompt_stalled"):
                 return fail(f"herdr agent prompt failed: {raw}")
             outcome["ok"] = True
-            outcome["output"] = f"Запущен в herdr (панель {pane_id}) — подключись командой: herdr"
+            outcome["output"] = (f"Отправлено в сессию {name} (панель {pane_id})" if target
+                                 else f"Запущен в herdr (панель {pane_id}) — подключись командой: herdr")
             return outcome
 
         # Submit the prompt. Waits are chunked (10s) so a user cancel or the
@@ -307,12 +325,18 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
         cleaned = _trim_transcript(raw, task.prompt)
 
         if _looks_rate_limited(cleaned):
-            close_tab()
+            close_tab()  # no-op for target mode (foreign pane)
             outcome["rate_limited"] = True
             outcome["error"] = cleaned
             return outcome
 
         # task checkbox decides; provider flag / env force keep-open regardless
+        if target:
+            outcome["ok"] = True
+            outcome["output"] = (f"{cleaned}\n\n--- Meta ---\n"
+                                 f"Executor: herdr (сессия {name}, pane {pane_id})")
+            return outcome
+
         keep = bool(keep_pane) or provider_cfg.get("keep_pane") or HERDR_KEEP_PANE
         if keep:
             # Keep the live session for follow-up work. Rename the agent out of

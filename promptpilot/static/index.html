@@ -442,6 +442,9 @@
       <label id="modelLabel" style="display:none">Model
         <select id="modelInput"></select>
       </label>
+      <label id="herdrTargetLabel" style="display:none">Сессия
+        <select id="herdrTargetInput" style="max-width:280px"></select>
+      </label>
       <label>Priority
         <select id="priorityInput">
           <option value="1">1 (highest)</option>
@@ -713,6 +716,9 @@ async function addTask() {
   const selVal = sel.style.display !== 'none' && sel.value && sel.value !== '__custom__' ? sel.value : null;
   const workdir = selVal || document.getElementById('workdirInput').value.trim() || null;
   const skipPermissions = document.getElementById('skipPermissions').checked;
+  const provInfo = providersData[provider] || {};
+  const herdrTarget = provInfo.session_target ? document.getElementById('herdrTargetInput').value : null;
+  if (provInfo.session_target && !herdrTarget) { alert('Нет открытой herdr-сессии для отправки.'); return; }
   const recurrence = document.getElementById('recurrenceInput').value.trim() || null;
   const timeoutVal = document.getElementById('timeoutInput').value.trim();
   const taskTimeout = timeoutVal !== '' ? parseInt(timeoutVal) : null;
@@ -728,6 +734,7 @@ async function addTask() {
       working_dir: workdir,
       skip_permissions: skipPermissions,
       keep_pane: document.getElementById('keepPane').checked,
+      herdr_target: herdrTarget,
       scheduled_at: schedule ? new Date(schedule).toISOString() : null,
       recurrence,
       task_timeout: taskTimeout,
@@ -964,7 +971,22 @@ function updateKeepPane() {
   const sel = document.getElementById('providerInput');
   const prov = providersData[sel ? sel.value : ''] || {};
   document.getElementById('keepPaneLabel').style.display =
-    prov.executor === 'herdr' ? 'flex' : 'none';
+    (prov.executor === 'herdr' && !prov.session_target) ? 'flex' : 'none';
+  const tl = document.getElementById('herdrTargetLabel');
+  tl.style.display = prov.session_target ? 'flex' : 'none';
+  if (prov.session_target) loadHerdrAgents();
+}
+
+async function loadHerdrAgents() {
+  const sel = document.getElementById('herdrTargetInput');
+  try {
+    const agents = await fetchJSON(`${API}/herdr/agents`);
+    sel.innerHTML = agents.length
+      ? agents.map(a => `<option value="${esc(a.target)}">${esc(a.pane_id)} · ${esc(a.agent)} · ${esc(a.status)}${a.name ? ' · ' + esc(a.name) : ''}</option>`).join('')
+      : '<option value="">— нет открытых сессий —</option>';
+  } catch (e) {
+    sel.innerHTML = '<option value="">— herdr недоступен —</option>';
+  }
 }
 
 function updateModelSelect() {

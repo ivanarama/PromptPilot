@@ -142,6 +142,11 @@ def _find_opencode() -> str:
 
 
 BUILTIN_PROVIDERS = {
+    "herdr-session": {
+        "executor": "herdr",
+        "session_target": True,
+        "description": "Продолжение открытой herdr-сессии (промпт в живую панель)",
+    },
     "claude": {
         "cmd": f"{CLAUDE_EXE} -p --verbose --output-format stream-json {{prompt}}",
         "description": "Claude Code (Anthropic)",

@@ -32,6 +32,7 @@ class TaskCreate(BaseModel):
     task_timeout: Optional[int] = None  # per-task timeout in seconds; None = use global TASK_TIMEOUT; 0 = no limit
     detached: bool = False  # if True: start process and mark completed immediately (for servers/bots)
     keep_pane: bool = True  # herdr executor: keep the live session open after success
+    herdr_target: Optional[str] = None  # herdr: send the prompt into an EXISTING session (agent name or pane id)
 
 
 class TaskUpdate(BaseModel):
@@ -67,6 +68,7 @@ class TaskInDB(BaseModel):
     task_timeout: Optional[int] = None
     detached: bool = False
     keep_pane: bool = True
+    herdr_target: Optional[str] = None
 
 
 class Stats(BaseModel):
