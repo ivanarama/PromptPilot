@@ -410,6 +410,18 @@ def execute_task(task):
     _maybe_recur(task)
 
 
+def _code_snapshot():
+    """Mtimes of the package's .py files; None when frozen (code can't change)."""
+    if getattr(sys, "frozen", False):
+        return None
+    from pathlib import Path
+    base = Path(__file__).parent
+    try:
+        return {str(f): f.stat().st_mtime for f in base.glob("*.py")}
+    except OSError:
+        return None
+
+
 def run_worker():
     """Main worker loop."""
     running = True
@@ -425,11 +437,19 @@ def run_worker():
     # Recover any tasks stuck in 'running' from a previous crash
     db.recover_running()
 
+    code_snapshot = _code_snapshot()
+
     print(f"PromptPilot worker started (poll every {POLL_INTERVAL}s)")
     print(f"Timeout: {'no limit' if TASK_TIMEOUT == 0 else f'{TASK_TIMEOUT}s'} | Backoff: {BASE_DELAY}-{MAX_DELAY}s")
     print("Waiting for tasks...\n")
 
     while running:
+        # Auto-reload: pick up code updates between tasks (dev-friendly —
+        # a stale worker silently ignoring new features is worse than a restart)
+        if code_snapshot is not None and _code_snapshot() != code_snapshot:
+            print("Код обновился — перезапускаю worker...")
+            os.execv(sys.executable, [sys.executable, "-m", "promptpilot", "worker"])
+
         if db.is_paused():
             time.sleep(POLL_INTERVAL)
             continue
