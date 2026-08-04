@@ -221,7 +221,8 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
 
         # Start the agent, forwarding per-task flags to its CLI.
         kind = provider_cfg.get("kind", "claude")
-        agent_args = []
+        # provider-level extra CLI args (e.g. ["--effort", "max"] for claude)
+        agent_args = list(provider_cfg.get("args") or [])
         if task.model:
             agent_args += ["--model", task.model]
         if task.session_id:

@@ -211,9 +211,10 @@ def stats():
 @click.option("--kind", default=None, help="Agent kind for --executor herdr (claude, codex, gemini, cursor, opencode, grok, ...)")
 @click.option("--keep-pane", is_flag=True, help="herdr: keep the pane open after a successful task")
 @click.option("--models", "models_csv", default="", help='Model list for the picker, comma-separated: "a,b,c"')
+@click.option("--args", "args_str", default="", help='herdr: extra agent CLI args, e.g. "--effort max"')
 @click.option("--desc", default="", help="Description")
 @click.option("--env", "env_vars", multiple=True, help='Env vars: KEY=VALUE (repeat for multiple)')
-def provider(action, name, cmd_template, executor, kind, keep_pane, models_csv, desc, env_vars):
+def provider(action, name, cmd_template, executor, kind, keep_pane, models_csv, args_str, desc, env_vars):
     """Manage CLI providers. Actions: list, add, remove, hide, unhide.
 
     \b
@@ -262,9 +263,11 @@ def provider(action, name, cmd_template, executor, kind, keep_pane, models_csv, 
                 k, v = kv.split("=", 1)
                 env[k.strip()] = v.strip()
         models = [m.strip() for m in models_csv.split(",") if m.strip()]
+        import shlex
+        extra_args = shlex.split(args_str) if args_str else None
         if executor:
             save_provider(name, description=desc, env=env, executor=executor,
-                          kind=kind, keep_pane=keep_pane, models=models)
+                          kind=kind, keep_pane=keep_pane, models=models, args=extra_args)
             extra = ", keep pane" if keep_pane else ""
             click.echo(click.style(f"Provider '{name}' added: executor {executor}, kind {kind or 'claude'}{extra}", fg="green"))
         else:

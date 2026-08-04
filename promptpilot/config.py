@@ -281,12 +281,14 @@ def _write_custom_providers(custom: dict):
 
 def save_provider(name: str, cmd: str = None, description: str = "", env: dict = None,
                   executor: str = None, kind: str = None, keep_pane: bool = False,
-                  models: list = None):
+                  models: list = None, args: list = None):
     """Save a custom provider (cmd-template or executor-based) to providers.json."""
     custom = _load_custom_providers()
     entry = {"description": description}
     if models:
         entry["models"] = models
+    if args:
+        entry["args"] = args
     if executor:
         entry["executor"] = executor
         entry["kind"] = kind or "claude"

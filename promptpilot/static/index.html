@@ -504,6 +504,7 @@
       <input id="pfCmd" placeholder='например: myai run {prompt}'>
       <div id="pfHerdr" style="display:none; flex-direction:column; gap:8px">
         <input id="pfKind" placeholder="агент: claude, codex, gemini, cursor, opencode, grok...">
+        <input id="pfArgs" placeholder='доп. аргументы CLI агента, например: --effort max'>
         <label><input type="checkbox" id="pfKeep"> Оставлять сессию открытой после задачи (keep pane)</label>
       </div>
       <input id="pfModels" placeholder="модели для выбора (через запятую), например: opencode/big-pickle, opencode/mimo-v2.5-free">
@@ -789,8 +790,11 @@ async function openProviders() {
 }
 function closeProviders() { document.getElementById('provModal').classList.remove('open'); }
 
+let provManageData = {};
+
 async function renderProvList() {
   const data = await fetchJSON(`${API}/providers/manage`);
+  provManageData = data;
   document.getElementById('provList').innerHTML = Object.entries(data).map(([name, p]) => {
     const badges = [];
     badges.push(`<span class="prov-badge">${p.source === 'builtin' ? 'встроенный' : 'кастомный'}</span>`);
@@ -806,6 +810,7 @@ async function renderProvList() {
       <div class="prov-cmd">${esc(p.description || '')}</div>
       <div class="prov-cmd">${what}</div>
       <div class="prov-actions">
+        <button class="btn btn-sm btn-ghost" onclick="provEdit('${esc(name)}')">Изменить</button>
         <button class="btn btn-sm btn-ghost" onclick="provToggleHide('${esc(name)}', ${p.hidden})">${p.hidden ? 'Показать' : 'Скрыть'}</button>
         ${canDelete ? `<button class="btn btn-sm btn-danger" onclick="provDelete('${esc(name)}')">${p.source === 'builtin + providers.json' ? 'Сбросить к встроенному' : 'Удалить'}</button>` : ''}
       </div>
@@ -824,6 +829,28 @@ async function provDelete(name) {
   await fetchJSON(`${API}/providers/${encodeURIComponent(name)}`, { method: 'DELETE' });
   await renderProvList();
   await loadProviders();
+}
+
+function provEdit(name) {
+  const p = provManageData[name];
+  if (!p) return;
+  document.getElementById('pfName').value = name;
+  document.getElementById('pfDesc').value = p.description || '';
+  const herdr = !!p.executor;
+  document.querySelector(`input[name="pfType"][value="${herdr ? 'herdr' : 'cmd'}"]`).checked = true;
+  document.getElementById('pfCmd').value = p.cmd || '';
+  document.getElementById('pfKind').value = p.kind || '';
+  document.getElementById('pfArgs').value = (p.args || []).join(' ');
+  document.getElementById('pfKeep').checked = !!p.keep_pane;
+  document.getElementById('pfModels').value = (p.models || []).join(', ');
+  // secrets are masked in the listing — don't round-trip *** back into the config
+  document.getElementById('pfEnv').value = Object.entries(p.env || {})
+    .filter(([, v]) => v !== '***').map(([k, v]) => `${k}=${v}`).join('\n');
+  const masked = Object.values(p.env || {}).includes('***');
+  document.getElementById('pfError').textContent =
+    'Сохранение с этим именем перезапишет провайдера.' + (masked ? ' Скрытые env-секреты нужно ввести заново.' : '');
+  document.getElementById('pfName').scrollIntoView({ behavior: 'smooth', block: 'center' });
+  pfTypeChange();
 }
 
 function pfTypeChange() {
@@ -852,6 +879,7 @@ async function provAdd(e) {
     body.executor = 'herdr';
     body.kind = document.getElementById('pfKind').value.trim() || 'claude';
     body.keep_pane = document.getElementById('pfKeep').checked;
+    body.args = document.getElementById('pfArgs').value.trim().split(/\s+/).filter(Boolean);
   } else {
     body.cmd = document.getElementById('pfCmd').value.trim();
   }
@@ -868,6 +896,7 @@ async function provAdd(e) {
     document.getElementById('pfCmd').value = '';
     document.getElementById('pfEnv').value = '';
     document.getElementById('pfModels').value = '';
+    document.getElementById('pfArgs').value = '';
     await renderProvList();
     await loadProviders();
   } catch (err) {

@@ -164,6 +164,7 @@ class ProviderCreate(_BaseModel):
     keep_pane: bool = False
     env: dict = {}
     models: list = []
+    args: list = []
 
 
 @app.get("/api/providers/manage")
@@ -179,6 +180,7 @@ def api_providers_manage():
             "kind": info.get("kind", ""),
             "keep_pane": bool(info.get("keep_pane")),
             "models": info.get("models") or [],
+            "args": info.get("args") or [],
             "supports_skills": info.get("supports_skills", False),
             "env": {k: ("***" if any(s in k.upper() for s in ("TOKEN", "KEY", "SECRET")) else v)
                     for k, v in (info.get("env") or {}).items()},
@@ -200,12 +202,12 @@ def api_provider_create(p: ProviderCreate):
             raise HTTPException(400, "Поддерживаемый executor: herdr")
         save_provider(p.name, description=p.description, env=p.env or None,
                       executor=p.executor, kind=p.kind, keep_pane=p.keep_pane,
-                      models=p.models or None)
+                      models=p.models or None, args=p.args or None)
     else:
         if not p.cmd or "{prompt}" not in p.cmd:
             raise HTTPException(400, "cmd обязателен и должен содержать {prompt}")
         save_provider(p.name, p.cmd, p.description, env=p.env or None,
-                      models=p.models or None)
+                      models=p.models or None)  # for cmd providers flags live in cmd
     return {"ok": True}
 
 
