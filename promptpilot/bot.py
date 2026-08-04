@@ -1061,7 +1061,9 @@ async def _finish_add_task(update: Update, context: ContextTypes.DEFAULT_TYPE, w
 
 
 async def add_task_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    for key in ("new_prompt", "new_provider", "new_priority", "new_dir", "new_schedule", "new_recurrence", "new_detached", "new_keep_pane"):
+    for key in ("new_prompt", "new_provider", "new_priority", "new_dir", "new_schedule",
+                "new_recurrence", "new_detached", "new_keep_pane", "new_model",
+                "new_skip_permissions", "new_skill_name"):
         context.user_data.pop(key, None)
     await update.message.reply_text("Отменено.", reply_markup=_main_menu())
     return ConversationHandler.END
@@ -1111,6 +1113,7 @@ async def reply_got_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         session_id=session_id,
         parent_task_id=parent_id,
         skip_permissions=skip_permissions,
+        tg_chat_id=update.effective_chat.id,
     ))
 
     await update.message.reply_text(
@@ -1348,7 +1351,7 @@ def _skill_provider_keyboard() -> InlineKeyboardMarkup:
     skill_providers = {n: i for n, i in providers.items() if i.get("supports_skills", False)}
     row, buttons = [], []
     for name in skill_providers:
-        row.append(InlineKeyboardButton(name, callback_data=f"prov:{name}"))
+        row.append(InlineKeyboardButton(name, callback_data=f"pickprov:{name}"))
         if len(row) == 2:
             buttons.append(row)
             row = []

@@ -312,7 +312,8 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
             outcome["error"] = cleaned
             return outcome
 
-        keep = keep_pane if keep_pane is not None else (provider_cfg.get("keep_pane") or HERDR_KEEP_PANE)
+        # task checkbox decides; provider flag / env force keep-open regardless
+        keep = bool(keep_pane) or provider_cfg.get("keep_pane") or HERDR_KEEP_PANE
         if keep:
             # Keep the live session for follow-up work. Rename the agent out of
             # the pp-t* namespace so the Telegram bridge watches the continued
