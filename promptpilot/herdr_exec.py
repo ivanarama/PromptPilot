@@ -157,16 +157,38 @@ def _looks_rate_limited(cleaned: str) -> bool:
     return bool(RATE_LIMIT_RE.search(response_only))
 
 
-def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None) -> dict:
+def _wait_settled(name, until_args, deadline, cancel_check):
+    """Wait for the agent in 10s chunks so cancel/timeout stay responsive.
+
+    Returns (state, raw): state is an agent status or one of the pseudo-states
+    "__cancel__" / "__timeout__" / "__error__".
+    """
+    while True:
+        if cancel_check and cancel_check():
+            return "__cancel__", ""
+        if deadline and time.monotonic() > deadline:
+            return "__timeout__", ""
+        rc, data, raw = _run(["agent", "wait", name, *until_args, "--timeout", "10000"])
+        if rc == 0:
+            return _agent_status(data), raw
+        if _error_code(data) != "timeout":
+            return "__error__", raw
+
+
+def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
+                 cancel_check=None) -> dict:
     """Run a task in a herdr-managed agent session.
 
     on_blocked(pane_id) is called once when the agent first enters ``blocked``.
-    timeout (seconds) bounds the prompt turn (herdr-side, clean abort).
+    timeout (seconds) bounds the ACTIVE prompt turn; time spent in ``blocked``
+    is human time and is not counted. cancel_check() → True aborts the run
+    (pane is closed) — the worker maps it to the cancelled status.
 
-    Returns {"ok", "rate_limited", "output", "error", "pane_id"}.
+    Returns {"ok", "rate_limited", "cancelled", "output", "error", "pane_id"}.
     Raises nothing: all herdr failures are reported via the outcome dict.
     """
-    outcome = {"ok": False, "rate_limited": False, "output": "", "error": "", "pane_id": ""}
+    outcome = {"ok": False, "rate_limited": False, "cancelled": False,
+               "output": "", "error": "", "pane_id": ""}
 
     try:
         _ensure_server()
@@ -232,11 +254,13 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None)
             outcome["output"] = f"Запущен в herdr (панель {pane_id}) — подключись командой: herdr"
             return outcome
 
-        # Submit the prompt. On agent_prompt_stalled: if the agent is already
-        # working the prompt DID land (resubmit would double it) — wait instead.
-        prompt_cmd = ["agent", "prompt", name, task.prompt, "--wait"]
-        if timeout:
-            prompt_cmd += ["--timeout", str(timeout * 1000)]
+        # Submit the prompt. Waits are chunked (10s) so a user cancel or the
+        # task timeout stays responsive; the herdr-side 10s "timeout" error
+        # here just means "agent still working". On agent_prompt_stalled: if
+        # the agent is already working the prompt DID land (resubmit would
+        # double it) — wait instead.
+        deadline = time.monotonic() + timeout if timeout else None
+        prompt_cmd = ["agent", "prompt", name, task.prompt, "--wait", "--timeout", "10000"]
         state = ""
         for attempt in range(1, PROMPT_STALL_RETRIES + 1):
             rc, data, raw = _run(prompt_cmd)
@@ -245,28 +269,34 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None)
                 break
             code = _error_code(data)
             if code == "timeout":
-                return fail(f"herdr: таймаут задачи ({timeout}s)", keep_pane=False)
+                # prompt landed, agent is busy — fall into the chunked wait
+                state, raw = _wait_settled(name, [], deadline, cancel_check)
+                break
             if code != "agent_prompt_stalled":
                 return fail(f"herdr agent prompt failed: {raw}")
             rc2, data2, _ = _run(["agent", "get", name])
             if rc2 == 0 and _agent_status(data2) == "working":
-                rc3, data3, raw3 = _run(["agent", "wait", name])
-                if rc3 != 0:
-                    return fail(f"herdr agent wait failed: {raw3}")
-                state = _agent_status(data3)
+                state, raw = _wait_settled(name, [], deadline, cancel_check)
                 break
             if attempt == PROMPT_STALL_RETRIES:
                 return fail(f"herdr: prompt stalled after {attempt} attempts: {raw}")
             time.sleep(2)
 
-        # blocked = waiting for a human (permission dialog etc.).
+        # blocked = waiting for a human (permission dialog etc.) — no deadline.
         if state == "blocked" and on_blocked:
             on_blocked(pane_id)
         while state == "blocked":
-            rc, data, raw = _run(["agent", "wait", name, "--until", "idle", "--until", "done"])
-            if rc != 0:
-                return fail(f"herdr wait after blocked failed: {raw}")
-            state = _agent_status(data)
+            state, raw = _wait_settled(name, ["--until", "idle", "--until", "done"],
+                                       None, cancel_check)
+
+        if state == "__cancel__":
+            close_tab()
+            outcome["cancelled"] = True
+            return outcome
+        if state == "__timeout__":
+            return fail(f"herdr: таймаут задачи ({timeout}s)", keep_pane=False)
+        if state == "__error__":
+            return fail(f"herdr agent wait failed: {raw}")
 
         rc, _, raw = _run(["agent", "read", name, "--source", "recent-unwrapped",
                            "--lines", str(HERDR_READ_LINES), "--format", "text"])

@@ -324,6 +324,19 @@
   }
   .btn-pause:hover { border-color: var(--yellow); color: var(--yellow); }
   .btn-pause.paused { border-color: var(--yellow); color: var(--yellow); background: #fbbf2410; }
+  .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: none; z-index: 50; }
+  .modal-overlay.open { display: flex; align-items: flex-start; justify-content: center; padding: 40px 16px; overflow-y: auto; }
+  .modal { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; max-width: 780px; width: 100%; padding: 20px; max-height: 85vh; overflow-y: auto; }
+  .modal h2 { font-size: 16px; margin-bottom: 14px; display: flex; align-items: center; }
+  .prov-row { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; }
+  .prov-row.dim { opacity: .55; }
+  .prov-name { font-weight: 600; }
+  .prov-badge { font-size: 11px; padding: 1px 7px; border-radius: 10px; border: 1px solid var(--border); margin-left: 6px; color: var(--text2); }
+  .prov-cmd { font-family: monospace; font-size: 12px; color: var(--text2); margin-top: 4px; word-break: break-all; }
+  .prov-actions { margin-top: 6px; display: flex; gap: 6px; }
+  .prov-form { border-top: 1px solid var(--border); margin-top: 14px; padding-top: 14px; display: flex; flex-direction: column; gap: 8px; }
+  .prov-form input, .prov-form textarea { background: var(--surface2); border: 1px solid var(--border); border-radius: 6px; color: inherit; padding: 7px 10px; font-size: 13px; }
+  .prov-form label { font-size: 13px; color: var(--text2); }
 
   /* Update banner */
   .update-banner {
@@ -472,9 +485,32 @@
     <button class="filter-btn" data-filter="failed">Failed</button>
     <button class="filter-btn" data-filter="rate_limited">Rate Limited</button>
     <button id="pauseBtn" class="btn-pause" onclick="toggleWorkerPause()" style="margin-left:auto">⏸ Pause</button>
+    <button class="btn-pause" onclick="openProviders()" style="margin-left:8px">⚙ Providers</button>
   </div>
 
   <div class="task-list" id="taskList"></div>
+</div>
+
+<div class="modal-overlay" id="provModal" onclick="if(event.target===this)closeProviders()">
+  <div class="modal">
+    <h2>Провайдеры <button class="btn btn-sm btn-ghost" style="margin-left:auto" onclick="closeProviders()">✕ Закрыть</button></h2>
+    <div id="provList"></div>
+    <form class="prov-form" onsubmit="return provAdd(event)">
+      <b style="font-size:14px">Добавить провайдер</b>
+      <input id="pfName" placeholder="имя (латиница, цифры, - _)" required>
+      <input id="pfDesc" placeholder="описание">
+      <label><input type="radio" name="pfType" value="cmd" checked onchange="pfTypeChange()"> Команда (шаблон с {prompt})</label>
+      <label><input type="radio" name="pfType" value="herdr" onchange="pfTypeChange()"> herdr-сессия (живая, blocked ждёт человека)</label>
+      <input id="pfCmd" placeholder='например: myai run {prompt}'>
+      <div id="pfHerdr" style="display:none; flex-direction:column; gap:8px">
+        <input id="pfKind" placeholder="агент: claude, codex, gemini, cursor, opencode, grok...">
+        <label><input type="checkbox" id="pfKeep"> Оставлять сессию открытой после задачи (keep pane)</label>
+      </div>
+      <textarea id="pfEnv" rows="2" placeholder="переменные окружения, по одной на строку: KEY=VALUE"></textarea>
+      <button class="btn btn-primary" type="submit" style="align-self:flex-start">Добавить</button>
+      <div id="pfError" style="color:var(--red); font-size:13px"></div>
+    </form>
+  </div>
 </div>
 
 <script>
@@ -651,7 +687,7 @@ async function loadTasks() {
         <div class="detail-info"><span class="label">Retries: </span><span>${t.retry_count}/${t.max_retries}</span>${t.exit_code !== null ? ` <span class="label">| Exit: </span><span>${t.exit_code}</span>` : ''}</div>
 
         <div class="detail-actions">
-          ${['pending','rate_limited'].includes(t.status) ? `<button class="btn btn-sm btn-ghost" onclick="cancelTask(event,${t.id})">Cancel</button>` : ''}
+          ${['pending','rate_limited','running'].includes(t.status) ? `<button class="btn btn-sm btn-ghost" onclick="cancelTask(event,${t.id})">Cancel</button>` : ''}
           ${t.status === 'running' ? `<button class="btn btn-sm btn-ghost" onclick="resetTask(event,${t.id})">Reset to pending</button>` : ''}
           <button class="btn btn-sm btn-danger" onclick="deleteTask(event,${t.id})">Delete</button>
         </div>
@@ -745,6 +781,97 @@ document.getElementById('filterBar').addEventListener('click', e => {
 });
 
 // --- Helpers ---
+// --- Providers settings modal ---
+async function openProviders() {
+  document.getElementById('provModal').classList.add('open');
+  await renderProvList();
+}
+function closeProviders() { document.getElementById('provModal').classList.remove('open'); }
+
+async function renderProvList() {
+  const data = await fetchJSON(`${API}/providers/manage`);
+  document.getElementById('provList').innerHTML = Object.entries(data).map(([name, p]) => {
+    const badges = [];
+    badges.push(`<span class="prov-badge">${p.source === 'builtin' ? 'встроенный' : 'кастомный'}</span>`);
+    if (!p.available) badges.push('<span class="prov-badge" style="color:var(--red)">не установлен</span>');
+    if (p.hidden) badges.push('<span class="prov-badge" style="color:var(--yellow)">скрыт</span>');
+    const what = p.executor
+      ? `executor: ${esc(p.executor)}, агент: ${esc(p.kind || 'claude')}${p.keep_pane ? ', keep pane' : ''}`
+      : esc(p.cmd);
+    const canDelete = p.source !== 'builtin';
+    return `<div class="prov-row${(!p.available || p.hidden) ? ' dim' : ''}">
+      <span class="prov-name">${esc(name)}</span>${badges.join('')}
+      <div class="prov-cmd">${esc(p.description || '')}</div>
+      <div class="prov-cmd">${what}</div>
+      <div class="prov-actions">
+        <button class="btn btn-sm btn-ghost" onclick="provToggleHide('${esc(name)}', ${p.hidden})">${p.hidden ? 'Показать' : 'Скрыть'}</button>
+        ${canDelete ? `<button class="btn btn-sm btn-danger" onclick="provDelete('${esc(name)}')">${p.source === 'builtin + providers.json' ? 'Сбросить к встроенному' : 'Удалить'}</button>` : ''}
+      </div>
+    </div>`;
+  }).join('');
+}
+
+async function provToggleHide(name, hidden) {
+  await fetchJSON(`${API}/providers/${encodeURIComponent(name)}/${hidden ? 'unhide' : 'hide'}`, { method: 'POST' });
+  await renderProvList();
+  await loadProviders();
+}
+
+async function provDelete(name) {
+  if (!confirm(`Удалить провайдер «${name}»?`)) return;
+  await fetchJSON(`${API}/providers/${encodeURIComponent(name)}`, { method: 'DELETE' });
+  await renderProvList();
+  await loadProviders();
+}
+
+function pfTypeChange() {
+  const herdr = document.querySelector('input[name="pfType"]:checked').value === 'herdr';
+  document.getElementById('pfHerdr').style.display = herdr ? 'flex' : 'none';
+  document.getElementById('pfCmd').style.display = herdr ? 'none' : '';
+}
+
+async function provAdd(e) {
+  e.preventDefault();
+  const errBox = document.getElementById('pfError');
+  errBox.textContent = '';
+  const herdr = document.querySelector('input[name="pfType"]:checked').value === 'herdr';
+  const env = {};
+  document.getElementById('pfEnv').value.split('\n').forEach(line => {
+    const i = line.indexOf('=');
+    if (i > 0) env[line.slice(0, i).trim()] = line.slice(i + 1).trim();
+  });
+  const body = {
+    name: document.getElementById('pfName').value.trim(),
+    description: document.getElementById('pfDesc').value.trim(),
+    env,
+  };
+  if (herdr) {
+    body.executor = 'herdr';
+    body.kind = document.getElementById('pfKind').value.trim() || 'claude';
+    body.keep_pane = document.getElementById('pfKeep').checked;
+  } else {
+    body.cmd = document.getElementById('pfCmd').value.trim();
+  }
+  try {
+    const resp = await fetch(`${API}/providers`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    });
+    if (!resp.ok) {
+      const d = await resp.json().catch(() => ({}));
+      throw new Error(d.detail || `HTTP ${resp.status}`);
+    }
+    document.getElementById('pfName').value = '';
+    document.getElementById('pfDesc').value = '';
+    document.getElementById('pfCmd').value = '';
+    document.getElementById('pfEnv').value = '';
+    await renderProvList();
+    await loadProviders();
+  } catch (err) {
+    errBox.textContent = err.message;
+  }
+  return false;
+}
+
 function esc(s) {
   const d = document.createElement('div');
   d.textContent = s;

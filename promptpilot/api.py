@@ -74,8 +74,12 @@ def api_update_task(task_id: int, update: TaskUpdate):
         raise HTTPException(404, "Task not found")
 
     if update.status == TaskStatus.CANCELLED:
-        if not db.cancel_task(task_id):
-            raise HTTPException(400, "Can only cancel pending or rate_limited tasks")
+        if task.status == TaskStatus.RUNNING:
+            # running: ask the worker to kill the process (it polls every ~2s)
+            if not db.request_cancel(task_id):
+                raise HTTPException(400, "Task is no longer running")
+        elif not db.cancel_task(task_id):
+            raise HTTPException(400, "Can only cancel pending, rate_limited or running tasks")
 
     if update.priority is not None:
         if not db.update_priority(task_id, update.priority):
@@ -144,6 +148,85 @@ def api_providers():
         }
         for name, info in providers.items()
     }
+
+
+import re as _re
+
+from pydantic import BaseModel as _BaseModel
+
+
+class ProviderCreate(_BaseModel):
+    name: str
+    description: str = ""
+    cmd: Optional[str] = None
+    executor: Optional[str] = None  # "herdr"
+    kind: Optional[str] = None
+    keep_pane: bool = False
+    env: dict = {}
+
+
+@app.get("/api/providers/manage")
+def api_providers_manage():
+    """Full provider info for the settings UI."""
+    from .config import load_providers_detailed
+    providers = load_providers_detailed()
+    return {
+        name: {
+            "description": info.get("description", ""),
+            "cmd": info.get("cmd", ""),
+            "executor": info.get("executor", ""),
+            "kind": info.get("kind", ""),
+            "keep_pane": bool(info.get("keep_pane")),
+            "supports_skills": info.get("supports_skills", False),
+            "env": {k: ("***" if any(s in k.upper() for s in ("TOKEN", "KEY", "SECRET")) else v)
+                    for k, v in (info.get("env") or {}).items()},
+            "available": provider_available(info),
+            "hidden": bool(info.get("hidden")),
+            "source": info.get("_source", "builtin"),
+        }
+        for name, info in providers.items()
+    }
+
+
+@app.post("/api/providers", status_code=201)
+def api_provider_create(p: ProviderCreate):
+    from .config import save_provider
+    if not _re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,31}", p.name):
+        raise HTTPException(400, "Имя: латиница/цифры/-/_, до 32 символов")
+    if p.executor:
+        if p.executor != "herdr":
+            raise HTTPException(400, "Поддерживаемый executor: herdr")
+        save_provider(p.name, description=p.description, env=p.env or None,
+                      executor=p.executor, kind=p.kind, keep_pane=p.keep_pane)
+    else:
+        if not p.cmd or "{prompt}" not in p.cmd:
+            raise HTTPException(400, "cmd обязателен и должен содержать {prompt}")
+        save_provider(p.name, p.cmd, p.description, env=p.env or None)
+    return {"ok": True}
+
+
+@app.delete("/api/providers/{name}")
+def api_provider_delete(name: str):
+    from .config import remove_provider
+    if not remove_provider(name):
+        raise HTTPException(404, "Провайдер не найден среди кастомных (встроенные можно только скрыть)")
+    return {"ok": True}
+
+
+@app.post("/api/providers/{name}/hide")
+def api_provider_hide(name: str):
+    from .config import set_provider_hidden
+    if not set_provider_hidden(name, True):
+        raise HTTPException(404, "Провайдер не найден")
+    return {"ok": True}
+
+
+@app.post("/api/providers/{name}/unhide")
+def api_provider_unhide(name: str):
+    from .config import set_provider_hidden
+    if not set_provider_hidden(name, False):
+        raise HTTPException(404, "Провайдер не найден")
+    return {"ok": True}
 
 
 @app.get("/api/skills")

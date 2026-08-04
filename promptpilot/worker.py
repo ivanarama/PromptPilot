@@ -1,6 +1,7 @@
 """Worker — executes tasks from the queue."""
 
 import json
+import os
 import random
 import shutil
 import signal
@@ -179,6 +180,20 @@ def is_stream_json(stdout: str) -> bool:
         return False
 
 
+def _kill_process_tree(proc):
+    """Kill the task's process and its children (process group on POSIX)."""
+    try:
+        if os.name == "posix":
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        else:
+            proc.kill()
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
 def _effective_timeout(task):
     """Per-task timeout in seconds; None = no limit (0 disables the global one)."""
     if task.task_timeout == 0:
@@ -227,7 +242,15 @@ def _execute_herdr_task(task, provider_cfg):
                 task_id=task.id,
             )
 
-    outcome = run_in_herdr(task, provider_cfg, on_blocked=on_blocked, timeout=_effective_timeout(task))
+    outcome = run_in_herdr(task, provider_cfg, on_blocked=on_blocked,
+                           timeout=_effective_timeout(task),
+                           cancel_check=lambda: db.is_cancel_requested(task.id))
+
+    if outcome.get("cancelled"):
+        db.clear_cancel_request(task.id)
+        db.mark_cancelled(task.id, "Отменена пользователем во время выполнения")
+        print("  -> Cancelled by user")
+        return
 
     if outcome["rate_limited"]:
         if task.retry_count >= task.max_retries:
@@ -288,23 +311,44 @@ def execute_task(task):
     effective_timeout = _effective_timeout(task)
 
     try:
-        result = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=effective_timeout,
             cwd=task.working_dir,
             stdin=subprocess.DEVNULL,
             env=env,
+            start_new_session=(os.name == "posix"),
         )
-    except subprocess.TimeoutExpired:
-        db.mark_failed(task.id, f"Execution timed out after {effective_timeout}s", exit_code=-1)
-        return
     except FileNotFoundError:
         db.mark_failed(task.id, f"CLI '{provider}' not found. Is it installed and in PATH?", exit_code=-1)
         return
+
+    # Poll instead of blocking: allows user-requested cancellation of a
+    # RUNNING task (Web UI/bot) and the per-task timeout.
+    started = time.monotonic()
+    while True:
+        try:
+            stdout, stderr = proc.communicate(timeout=2)
+            break
+        except subprocess.TimeoutExpired:
+            if db.is_cancel_requested(task.id):
+                _kill_process_tree(proc)
+                proc.communicate()
+                db.clear_cancel_request(task.id)
+                db.mark_cancelled(task.id, "Отменена пользователем во время выполнения")
+                print("  -> Cancelled by user")
+                return
+            if effective_timeout and time.monotonic() - started > effective_timeout:
+                _kill_process_tree(proc)
+                proc.communicate()
+                db.mark_failed(task.id, f"Execution timed out after {effective_timeout}s", exit_code=-1)
+                return
+
+    result = subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
 
     if is_rate_limited(result.stderr, result.returncode):
         # Extract readable error from stream-json if possible

@@ -233,6 +233,36 @@ def mark_rate_limited(task_id: int, next_run_at: datetime, error: str = None):
         )
 
 
+def request_cancel(task_id: int) -> bool:
+    """Ask the worker to kill a RUNNING task's process (worker polls this)."""
+    with _connect() as conn:
+        row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if not row or row["status"] != "running":
+            return False
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, '1')",
+            (f"cancel_task:{task_id}",),
+        )
+        return True
+
+
+def is_cancel_requested(task_id: int) -> bool:
+    return get_setting(f"cancel_task:{task_id}") == "1"
+
+
+def clear_cancel_request(task_id: int):
+    with _connect() as conn:
+        conn.execute("DELETE FROM settings WHERE key = ?", (f"cancel_task:{task_id}",))
+
+
+def mark_cancelled(task_id: int, note: str = None):
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE tasks SET status = 'cancelled', completed_at = ?, error = COALESCE(?, error) WHERE id = ?",
+            (_now(), note, task_id),
+        )
+
+
 def cancel_task(task_id: int) -> bool:
     with _connect() as conn:
         cur = conn.execute(

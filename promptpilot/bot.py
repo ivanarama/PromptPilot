@@ -121,7 +121,7 @@ def _tasks_keyboard(tasks, page: int, total: int) -> InlineKeyboardMarkup:
 
 def _task_detail_keyboard(task) -> InlineKeyboardMarkup:
     rows = []
-    if task.status.value in ("pending", "rate_limited"):
+    if task.status.value in ("pending", "rate_limited", "running"):
         rows.append([InlineKeyboardButton("❌ Отменить", callback_data=f"cancel_task:{task.id}")])
     if task.status.value == "running":
         rows.append([InlineKeyboardButton("🔁 Сбросить (stuck)", callback_data=f"reset_task:{task.id}")])
@@ -328,7 +328,15 @@ def _mask_secret(name: str, value: str) -> str:
 async def cb_cancel_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     task_id = int(query.data.split(":")[1])
-    if db.cancel_task(task_id):
+    task = db.get_task(task_id)
+    if task and task.status.value == "running":
+        # running: worker убьёт процесс в течение пары секунд
+        if db.request_cancel(task_id):
+            await query.answer("Останавливаю…")
+            await query.edit_message_text(f"Задача #{task_id} останавливается (процесс будет убит).")
+        else:
+            await query.answer("Задача уже не выполняется.", show_alert=True)
+    elif db.cancel_task(task_id):
         await query.answer("Отменено.")
         await query.edit_message_text(f"Задача #{task_id} отменена.")
     else:
