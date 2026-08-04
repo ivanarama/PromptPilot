@@ -434,6 +434,8 @@ def get_skills(working_dir: str = None) -> list:
 HERDR_BIN = os.environ.get("PP_HERDR_BIN", "herdr")
 HERDR_READ_LINES = int(os.environ.get("PP_HERDR_READ_LINES", "300"))
 HERDR_START_TIMEOUT_MS = int(os.environ.get("PP_HERDR_START_TIMEOUT_MS", "60000"))
+# Keep the pane open after a successful task (also per-provider "keep_pane")
+HERDR_KEEP_PANE = os.environ.get("PP_HERDR_KEEP_PANE", "0") == "1"
 
 # herdr → Telegram bridge: the bot watches ALL herdr agents (not only
 # PromptPilot tasks) and notifies when one is blocked or finishes unseen.

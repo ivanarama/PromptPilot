@@ -28,7 +28,7 @@ import re
 import subprocess
 import time
 
-from .config import HERDR_BIN, HERDR_READ_LINES, HERDR_START_TIMEOUT_MS
+from .config import HERDR_BIN, HERDR_KEEP_PANE, HERDR_READ_LINES, HERDR_START_TIMEOUT_MS
 
 # Distinctive in-session usage/rate-limit banners (interactive sessions exit 0
 # even when the provider is limited, so detection is textual by necessity).
@@ -279,6 +279,20 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None)
             close_tab()
             outcome["rate_limited"] = True
             outcome["error"] = cleaned
+            return outcome
+
+        if provider_cfg.get("keep_pane") or HERDR_KEEP_PANE:
+            # Keep the live session for follow-up work. Rename the agent out of
+            # the pp-t* namespace so the Telegram bridge watches the continued
+            # session, and relabel the tab so a task re-run won't close it as
+            # stale. Both renames are best-effort.
+            _run(["agent", "rename", name, f"t{task.id}"])
+            _run(["tab", "rename", tab_id, f"pp-kept-{task.id}"])
+            outcome["ok"] = True
+            outcome["output"] = (
+                f"{cleaned}\n\n--- Meta ---\nExecutor: herdr (pane {pane_id}, "
+                f"сессия оставлена — открой herdr и продолжай в ней)"
+            )
             return outcome
 
         close_tab()
