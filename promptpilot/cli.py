@@ -1,5 +1,32 @@
 """CLI interface."""
 
+import locale
+import os
+import sys
+
+
+def _ensure_utf8():
+    """Re-exec with PYTHONUTF8=1 when the locale would garble non-ASCII argv.
+
+    SSH sessions without a UTF-8 locale make Python decode argv as Latin-1/
+    ASCII, so Cyrillic prompts get stored double-encoded. Re-executing in
+    UTF-8 Mode restores the original bytes (locale codecs round-trip argv).
+    POSIX only: on Windows argv is Unicode natively.
+    """
+    if os.name != "posix" or sys.flags.utf8_mode:
+        return
+    enc = locale.getpreferredencoding(False) or ""
+    if "utf" in enc.lower():
+        return
+    os.environ["PYTHONUTF8"] = "1"
+    try:
+        os.execv(sys.executable, [sys.executable, "-m", "promptpilot", *sys.argv[1:]])
+    except OSError:
+        pass  # keep going with the current (possibly lossy) encoding
+
+
+_ensure_utf8()
+
 import click
 
 from . import db
