@@ -500,7 +500,7 @@
     <h2>Провайдеры <button class="btn btn-sm btn-ghost" style="margin-left:auto" onclick="closeProviders()">✕ Закрыть</button></h2>
     <div id="provList"></div>
     <form class="prov-form" onsubmit="return provAdd(event)">
-      <b style="font-size:14px">Добавить провайдер</b>
+      <b style="font-size:14px">Добавить / изменить провайдера</b>
       <input id="pfName" placeholder="имя (латиница, цифры, - _)" required>
       <input id="pfDesc" placeholder="описание">
       <label><input type="radio" name="pfType" value="cmd" checked onchange="pfTypeChange()"> Команда (шаблон с {prompt})</label>
@@ -513,7 +513,7 @@
       </div>
       <input id="pfModels" placeholder="модели для выбора (через запятую), например: opencode/big-pickle, opencode/mimo-v2.5-free">
       <textarea id="pfEnv" rows="2" placeholder="переменные окружения, по одной на строку: KEY=VALUE"></textarea>
-      <button class="btn btn-primary" type="submit" style="align-self:flex-start">Добавить</button>
+      <button class="btn btn-primary" type="submit" style="align-self:flex-start">Сохранить</button>
       <div id="pfError" style="color:var(--red); font-size:13px"></div>
     </form>
   </div>
