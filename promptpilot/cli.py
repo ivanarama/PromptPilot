@@ -33,6 +33,23 @@ from . import db
 from .models import TaskCreate, TaskStatus
 
 
+def _fix_mojibake(text: str) -> str:
+    """Repair UTF-8 text that was mis-decoded as Latin-1 on the way in
+    (broken terminal/clipboard paste): 'Ð¿ÑÐ¸Ð²ÐµÑ' → 'привет'.
+
+    Only rewrites when the round-trip is byte-exact AND yields non-Latin
+    script (Cyrillic etc.) — legit text like 'mañana' is left untouched.
+    """
+    try:
+        repaired = text.encode("latin-1").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return text
+    if repaired != text and any(ord(c) >= 0x400 for c in repaired):
+        click.secho("⚠ Текст пришёл в битой кодировке — исправлено автоматически.", fg="yellow")
+        return repaired
+    return text
+
+
 def _status_color(status: str) -> str:
     return {
         "pending": "white",
@@ -68,13 +85,14 @@ def add(prompt, file_path, priority, scheduled_at, working_dir, provider, max_re
 
     prompts = []
     if file_path:
-        with open(file_path) as f:
+        with open(file_path, encoding="utf-8") as f:
             prompts = [line.strip() for line in f if line.strip()]
     elif prompt:
         prompts = [prompt]
     else:
         click.echo("Provide a prompt or --file")
         return
+    prompts = [_fix_mojibake(p) for p in prompts]
 
     dt = datetime.fromisoformat(scheduled_at) if scheduled_at else None
 
