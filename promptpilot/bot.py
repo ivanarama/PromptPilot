@@ -5,6 +5,7 @@ against PP_TG_ALLOWED_PHONES env var (comma-separated) or ~/.promptpilot/tg_conf
 After authorization all task management features are available.
 """
 
+import json
 import logging
 import os
 from datetime import datetime, timezone
@@ -29,14 +30,17 @@ from telegram.ext import (
 )
 
 from . import db
-from .config import DEFAULT_CLI, get_skills, load_providers, load_providers_detailed, PROJECTS_ROOT, TASK_PASSWORD
+from .config import (
+    DEFAULT_CLI, HERDR_BIN, HERDR_WATCH, HERDR_WATCH_INTERVAL,
+    get_skills, load_providers, load_providers_detailed, PROJECTS_ROOT, TASK_PASSWORD,
+)
 from .models import TaskCreate, TaskStatus
-from .tg_auth import authorize_user, is_authorized, load_allowed_phones
+from .tg_auth import authorize_user, is_authorized, list_authorized, load_allowed_phones
 
 logger = logging.getLogger(__name__)
 
 # Conversation states
-ASK_PASSWORD, ASK_PROMPT, ASK_PROVIDER, ASK_PRIORITY, ASK_SKIP_PERMS, ASK_DIR, ASK_DIR_MANUAL, ASK_SCHEDULE, ASK_REPLY, ASK_SKILL_ARGS, ASK_MODEL, ASK_RECURRENCE, ASK_DETACHED = range(13)
+ASK_PASSWORD, ASK_PROMPT, ASK_PROVIDER, ASK_PRIORITY, ASK_SKIP_PERMS, ASK_DIR, ASK_DIR_MANUAL, ASK_SCHEDULE, ASK_REPLY, ASK_SKILL_ARGS, ASK_MODEL, ASK_RECURRENCE, ASK_DETACHED, ASK_HERDR_REPLY = range(14)
 
 PAGE_SIZE = 5
 
@@ -431,7 +435,10 @@ async def cb_provider_detail(update: Update, context: ContextTypes.DEFAULT_TYPE)
     lines = [f"*{_esc(name)}* — {_esc(info.get('description', ''))}\n"]
 
     cmd = info.get("cmd", "")
-    lines.append(f"🔧 Команда:\n`{_esc_code(cmd)}`\n")
+    if cmd:
+        lines.append(f"🔧 Команда:\n`{_esc_code(cmd)}`\n")
+    elif info.get("executor"):
+        lines.append(f"🔧 Исполнитель: {_esc(info['executor'])} \\(kind: {_esc(info.get('kind', 'claude'))}\\)\n")
 
     models = info.get("models")
     if models:
@@ -1329,6 +1336,165 @@ async def skill_skip_args(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
+# herdr → Telegram bridge
+# ---------------------------------------------------------------------------
+# The bot polls `herdr agent list` and notifies authorized users when ANY
+# herdr agent (not only PromptPilot tasks) gets blocked on a dialog or
+# finishes unseen (herdr's `done` = idle after unseen background work).
+# The poll interval doubles as a debounce: dialogs the user resolves within
+# seconds while working in herdr never surface here.
+
+async def _herdr_cli(*args, timeout=15):
+    """Run a herdr CLI command. Returns raw stdout text or None on failure."""
+    import asyncio
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            HERDR_BIN, *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            stdin=asyncio.subprocess.DEVNULL,
+        )
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except (FileNotFoundError, OSError, asyncio.TimeoutError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return (out or err or b"").decode("utf-8", "replace")
+
+
+async def _herdr_json(*args, timeout=15):
+    raw = await _herdr_cli(*args, timeout=timeout)
+    if raw is None:
+        return None
+    try:
+        return json.loads(raw.strip())
+    except ValueError:
+        return None
+
+
+def _herdr_agent_label(a: dict) -> str:
+    kind = a.get("display_agent") or a.get("agent") or "агент"
+    name = a.get("name")
+    return f"{kind} ({name})" if name else kind
+
+
+async def _herdr_notify(bot, pane_id: str, status: str, agent: dict):
+    label = _herdr_agent_label(agent)
+    if status == "blocked":
+        text = f"⏸ herdr: {label} в панели {pane_id} ждёт подтверждения"
+        buttons = [
+            [InlineKeyboardButton("✅ Подтвердить (Enter)", callback_data=f"hd_enter:{pane_id}"),
+             InlineKeyboardButton("📺 Экран", callback_data=f"hd_screen:{pane_id}")],
+            [InlineKeyboardButton("✍️ Ответить", callback_data=f"hd_reply:{pane_id}")],
+        ]
+    else:
+        text = f"✅ herdr: {label} в панели {pane_id} завершил работу"
+        buttons = [
+            [InlineKeyboardButton("📺 Экран", callback_data=f"hd_screen:{pane_id}"),
+             InlineKeyboardButton("✍️ Ответить", callback_data=f"hd_reply:{pane_id}")],
+        ]
+    title = (agent.get("terminal_title_stripped") or "").strip()
+    if title:
+        text += f"\n{title[:120]}"
+    for chat_id in list_authorized():
+        try:
+            await bot.send_message(chat_id=int(chat_id), text=text,
+                                   reply_markup=InlineKeyboardMarkup(buttons))
+        except Exception as e:
+            logger.warning("herdr notify to %s failed: %s", chat_id, e)
+
+
+async def _herdr_watch_loop(bot):
+    import asyncio
+    notified = {}  # pane_id -> status already notified about
+    while True:
+        await asyncio.sleep(HERDR_WATCH_INTERVAL)
+        data = await _herdr_json("agent", "list")
+        if data is None:
+            continue  # herdr not installed / server down — stay quiet
+        agents = ((data.get("result") or {}).get("agents")) or []
+        current = {}
+        for a in agents:
+            pane = a.get("pane_id")
+            name = a.get("name") or ""
+            if not pane or name.startswith("pp-t"):
+                continue  # PromptPilot's own tasks notify via the worker
+            current[pane] = a
+        for pane, a in current.items():
+            status = a.get("agent_status")
+            if status in ("blocked", "done"):
+                if notified.get(pane) != status:
+                    await _herdr_notify(bot, pane, status, a)
+                    notified[pane] = status
+            else:
+                notified.pop(pane, None)
+        for pane in list(notified):
+            if pane not in current:
+                notified.pop(pane)
+
+
+async def cb_herdr_enter(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_authorized(query.from_user.id):
+        await query.answer("Нет доступа.", show_alert=True)
+        return
+    pane = query.data.split(":", 1)[1]
+    res = await _herdr_json("agent", "send-keys", pane, "enter")
+    if res and res.get("result"):
+        await query.answer("Enter отправлен ✓")
+    else:
+        await query.answer("Не удалось — агент ещё существует?", show_alert=True)
+
+
+async def cb_herdr_screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_authorized(query.from_user.id):
+        await query.answer("Нет доступа.", show_alert=True)
+        return
+    pane = query.data.split(":", 1)[1]
+    raw = await _herdr_cli("agent", "read", pane, "--source", "visible", "--format", "text")
+    if raw is None:
+        await query.answer("Не удалось прочитать экран.", show_alert=True)
+        return
+    await query.answer()
+    lines = [l.rstrip() for l in raw.splitlines()]
+    while lines and not lines[-1]:
+        lines.pop()
+    tail = "\n".join(lines[-25:])[-3500:] or "(пусто)"
+    await query.message.reply_text(f"📺 {pane}:\n{tail}")
+
+
+async def cb_herdr_reply_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_authorized(query.from_user.id):
+        await query.answer("Нет доступа.", show_alert=True)
+        return ConversationHandler.END
+    pane = query.data.split(":", 1)[1]
+    context.user_data["herdr_reply_pane"] = pane
+    await query.answer()
+    await query.message.reply_text(f"Текст для агента в панели {pane} (или /cancel):")
+    return ASK_HERDR_REPLY
+
+
+async def herdr_reply_got_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pane = context.user_data.pop("herdr_reply_pane", None)
+    if not pane:
+        return ConversationHandler.END
+    res = await _herdr_json("agent", "prompt", pane, update.message.text)
+    if res and res.get("result"):
+        await update.message.reply_text("Отправлено ✓")
+    else:
+        await update.message.reply_text("Не удалось отправить — агент ещё существует?")
+    return ConversationHandler.END
+
+
+async def herdr_reply_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("herdr_reply_pane", None)
+    await update.message.reply_text("Отменено.")
+    return ConversationHandler.END
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -1337,6 +1503,13 @@ async def _notify_loop(bot):
     import asyncio
     while True:
         await asyncio.sleep(10)
+        # Free-form queued notifications (e.g. herdr agent blocked mid-task)
+        for note in db.get_unsent_notifications():
+            try:
+                await bot.send_message(chat_id=note["tg_chat_id"], text=note["message"])
+                db.mark_notification_sent(note["id"])
+            except Exception as e:
+                logger.warning("Failed to send notification %s: %s", note["id"], e)
         for task in db.get_pending_notifications():
             try:
                 if task.status.value == "completed":
@@ -1380,6 +1553,8 @@ def run_bot():
     async def post_init(application):
         import asyncio
         asyncio.create_task(_notify_loop(application.bot))
+        if HERDR_WATCH:
+            asyncio.create_task(_herdr_watch_loop(application.bot))
 
     app = Application.builder().token(token).post_init(post_init).build()
 
@@ -1448,6 +1623,18 @@ def run_bot():
         fallbacks=[CommandHandler("cancel", reply_cancel)],
     )
 
+    herdr_reply_conv = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(cb_herdr_reply_start, pattern=r"^hd_reply:")
+        ],
+        states={
+            ASK_HERDR_REPLY: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, herdr_reply_got_text)
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", herdr_reply_cancel)],
+    )
+
     # Group -1: skills navigation runs before ConversationHandlers (group 0).
     # ConversationHandler eats all callbacks when in an active state, so
     # skills_dir / skills_proj_picker / skills_back must be in a higher-priority group.
@@ -1457,9 +1644,14 @@ def run_bot():
     app.add_handler(CallbackQueryHandler(cb_skills_dir, pattern=r"^skills_dir:"), group=-1)
     app.add_handler(CallbackQueryHandler(cb_skills_back, pattern=r"^skills_back$"), group=-1)
 
+    # herdr bridge buttons must outrank active ConversationHandlers (group 0)
+    app.add_handler(CallbackQueryHandler(cb_herdr_enter, pattern=r"^hd_enter:"), group=-1)
+    app.add_handler(CallbackQueryHandler(cb_herdr_screen, pattern=r"^hd_screen:"), group=-1)
+
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("skills", cmd_skills))
     app.add_handler(MessageHandler(filters.CONTACT, handle_contact))
+    app.add_handler(herdr_reply_conv)
     app.add_handler(reply_conv)
     app.add_handler(add_conv)
     app.add_handler(MessageHandler(filters.Regex("^📋 Задачи$"), show_tasks))
