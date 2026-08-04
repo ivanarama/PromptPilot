@@ -1,21 +1,44 @@
 """FastAPI web API + static file serving."""
 
+import base64
+import secrets
 import sys
 from pathlib import Path
 from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 import os
 
 from . import db
-from .config import get_skills, load_providers, PROJECTS_ROOT
+from .config import API_TOKEN, get_skills, load_providers, provider_available, PROJECTS_ROOT
 from .models import CostStats, Stats, TaskCreate, TaskInDB, TaskStatus, TaskUpdate
 from .version import check_for_update
 
 app = FastAPI(title="PromptPilot", version="0.1.0")
+
+
+@app.middleware("http")
+async def _auth(request, call_next):
+    """Optional auth: enabled by PP_API_TOKEN. Accepts Bearer <token> or
+    HTTP Basic with the token as password (browser shows a native prompt)."""
+    if not API_TOKEN:
+        return await call_next(request)
+    header = request.headers.get("authorization", "")
+    ok = False
+    if header.startswith("Bearer "):
+        ok = secrets.compare_digest(header[7:].strip(), API_TOKEN)
+    elif header.startswith("Basic "):
+        try:
+            _, _, password = base64.b64decode(header[6:]).decode().partition(":")
+            ok = secrets.compare_digest(password, API_TOKEN)
+        except Exception:
+            ok = False
+    if ok:
+        return await call_next(request)
+    return Response(status_code=401, headers={"WWW-Authenticate": 'Basic realm="PromptPilot"'})
 
 # When frozen by PyInstaller, __file__ points into the temp extraction dir
 if getattr(sys, "frozen", False):
@@ -116,6 +139,8 @@ def api_providers():
             "description": info.get("description", name),
             "supports_skills": info.get("supports_skills", False),
             "models": info.get("models", default_models if info.get("supports_skills") else []),
+            "available": provider_available(info),
+            "hidden": bool(info.get("hidden")),
         }
         for name, info in providers.items()
     }

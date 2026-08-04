@@ -207,51 +207,83 @@ def stats():
 @click.argument("action", required=False, default="list")
 @click.argument("name", required=False)
 @click.option("--cmd", "cmd_template", help='Command template, e.g. "myai --run {prompt}"')
+@click.option("--executor", type=click.Choice(["herdr"]), help="Run via an executor instead of a command template")
+@click.option("--kind", default=None, help="Agent kind for --executor herdr (claude, codex, gemini, cursor, opencode, grok, ...)")
+@click.option("--keep-pane", is_flag=True, help="herdr: keep the pane open after a successful task")
 @click.option("--desc", default="", help="Description")
 @click.option("--env", "env_vars", multiple=True, help='Env vars: KEY=VALUE (repeat for multiple)')
-def provider(action, name, cmd_template, desc, env_vars):
-    """Manage CLI providers. Actions: list, add, remove.
+def provider(action, name, cmd_template, executor, kind, keep_pane, desc, env_vars):
+    """Manage CLI providers. Actions: list, add, remove, hide, unhide.
 
     \b
     Examples:
       pp provider                              # list all
       pp provider add myai --cmd "myai {prompt}"
+      pp provider add codex-herdr --executor herdr --kind codex --desc "Codex в herdr"
+      pp provider hide claude-z                # убрать из списков UI/бота
       pp provider remove myai
     """
-    from .config import DEFAULT_CLI, load_providers, save_provider, remove_provider
+    from .config import (DEFAULT_CLI, load_providers, provider_available,
+                         remove_provider, save_provider, set_provider_hidden)
 
     if action == "list" or (action is None and name is None):
         provs = load_providers()
         click.echo("Available providers:\n")
         for pname, info in provs.items():
             default = " (default)" if pname == DEFAULT_CLI else ""
+            flags = []
+            if info.get("hidden"):
+                flags.append("hidden")
+            if not provider_available(info):
+                flags.append("not installed")
+            flag_str = click.style(f"  [{', '.join(flags)}]", fg="yellow") if flags else ""
             pdesc = info.get("description", "")
-            click.echo(f"  {click.style(pname, fg='cyan')}{default}")
+            click.echo(f"  {click.style(pname, fg='cyan')}{default}{flag_str}")
             if pdesc:
                 click.echo(f"    {pdesc}")
-            click.echo(f"    cmd: {info['cmd']}")
+            if info.get("executor"):
+                extra = " (keep pane)" if info.get("keep_pane") else ""
+                click.echo(f"    executor: {info['executor']}, kind: {info.get('kind', 'claude')}{extra}")
+            else:
+                click.echo(f"    cmd: {info.get('cmd', '')}")
             click.echo()
         click.echo("  Add custom: pp provider add <name> --cmd \"<command> {prompt}\"")
+        click.echo("  herdr:      pp provider add <name> --executor herdr --kind <agent>")
         click.echo("  Config:     ~/.promptpilot/providers.json")
 
     elif action == "add":
         if not name:
-            click.echo("Usage: pp provider add <name> --cmd \"<command> {prompt}\"")
+            click.echo("Usage: pp provider add <name> --cmd \"...\" | --executor herdr --kind <agent>")
             return
-        if not cmd_template:
-            # Default: treat name as the command, just append {prompt}
-            cmd_template = f"{name} {{prompt}}"
-        if "{prompt}" not in cmd_template:
-            cmd_template += " {prompt}"
         env = {}
         for kv in env_vars:
             if "=" in kv:
                 k, v = kv.split("=", 1)
                 env[k.strip()] = v.strip()
-        save_provider(name, cmd_template, desc, env=env)
-        click.echo(click.style(f"Provider '{name}' added: {cmd_template}", fg="green"))
+        if executor:
+            save_provider(name, description=desc, env=env, executor=executor,
+                          kind=kind, keep_pane=keep_pane)
+            extra = ", keep pane" if keep_pane else ""
+            click.echo(click.style(f"Provider '{name}' added: executor {executor}, kind {kind or 'claude'}{extra}", fg="green"))
+        else:
+            if not cmd_template:
+                # Default: treat name as the command, just append {prompt}
+                cmd_template = f"{name} {{prompt}}"
+            if "{prompt}" not in cmd_template:
+                cmd_template += " {prompt}"
+            save_provider(name, cmd_template, desc, env=env)
+            click.echo(click.style(f"Provider '{name}' added: {cmd_template}", fg="green"))
         if env:
             click.echo(f"  Env: {', '.join(env.keys())}")
+
+    elif action in ("hide", "unhide"):
+        if not name:
+            click.echo(f"Usage: pp provider {action} <name>")
+            return
+        if set_provider_hidden(name, action == "hide"):
+            click.echo(f"Provider '{name}' {'hidden' if action == 'hide' else 'visible again'}.")
+        else:
+            click.echo(f"Provider '{name}' not found.")
 
     elif action == "remove":
         if not name:
@@ -263,7 +295,7 @@ def provider(action, name, cmd_template, desc, env_vars):
             click.echo(f"Provider '{name}' not found in custom providers.")
 
     else:
-        click.echo(f"Unknown action: {action}. Use: list, add, remove")
+        click.echo(f"Unknown action: {action}. Use: list, add, remove, hide, unhide")
 
 
 @cli.command()

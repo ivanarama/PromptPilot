@@ -786,6 +786,7 @@ async function loadProviders() {
   providersData = await fetchJSON(`${API}/providers`);
   const sel = document.getElementById('providerInput');
   sel.innerHTML = Object.entries(providersData)
+    .filter(([name, info]) => info.available !== false && !info.hidden)
     .map(([name, info]) => `<option value="${esc(name)}">${esc(name)} — ${esc(info.description || info)}</option>`)
     .join('');
   sel.addEventListener('change', () => { skillsCache = {}; updateSkillsToggle(); closeSkillsPanel(); updateModelSelect(); });

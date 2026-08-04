@@ -203,9 +203,8 @@ def _providers_file() -> Path:
 def load_providers() -> dict:
     """Load providers: built-in + user overrides from providers.json.
 
-    When a custom provider overrides a built-in one, it inherits supports_skills
-    from the built-in if not explicitly set (so claude-z stays skill-capable even
-    if the custom entry in providers.json doesn't repeat the flag).
+    A custom entry for a built-in name is MERGED over the built-in one, so
+    partial overrides work (e.g. {"hidden": true} keeps the built-in cmd).
     """
     providers = dict(BUILTIN_PROVIDERS)
     user_file = _providers_file()
@@ -214,10 +213,10 @@ def load_providers() -> dict:
             with open(user_file) as f:
                 custom = json.load(f)
             for name, info in custom.items():
-                if name in providers and "supports_skills" not in info:
-                    info = dict(info)
-                    info["supports_skills"] = providers[name].get("supports_skills", False)
-                providers[name] = info
+                if name in providers:
+                    providers[name] = {**providers[name], **info}
+                else:
+                    providers[name] = info
         except (json.JSONDecodeError, OSError):
             pass
     return providers
@@ -262,23 +261,78 @@ def load_providers_detailed() -> dict:
     return providers
 
 
-def save_provider(name: str, cmd: str, description: str = "", env: dict = None):
-    """Save a custom provider to providers.json."""
-    DB_DIR.mkdir(parents=True, exist_ok=True)
+def _load_custom_providers() -> dict:
     user_file = _providers_file()
-    custom = {}
     if user_file.exists():
         try:
             with open(user_file) as f:
-                custom = json.load(f)
+                return json.load(f)
         except (json.JSONDecodeError, OSError):
             pass
-    entry = {"cmd": cmd, "description": description}
+    return {}
+
+
+def _write_custom_providers(custom: dict):
+    DB_DIR.mkdir(parents=True, exist_ok=True)
+    with open(_providers_file(), "w") as f:
+        json.dump(custom, f, ensure_ascii=False, indent=2)
+
+
+def save_provider(name: str, cmd: str = None, description: str = "", env: dict = None,
+                  executor: str = None, kind: str = None, keep_pane: bool = False):
+    """Save a custom provider (cmd-template or executor-based) to providers.json."""
+    custom = _load_custom_providers()
+    entry = {"description": description}
+    if executor:
+        entry["executor"] = executor
+        entry["kind"] = kind or "claude"
+        if keep_pane:
+            entry["keep_pane"] = True
+        if kind in (None, "claude"):
+            entry["supports_skills"] = True
+    else:
+        entry["cmd"] = cmd
     if env:
         entry["env"] = env
     custom[name] = entry
-    with open(user_file, "w") as f:
-        json.dump(custom, f, indent=2)
+    _write_custom_providers(custom)
+
+
+def set_provider_hidden(name: str, hidden: bool) -> bool:
+    """Hide/unhide a provider in pickers (partial override, keeps built-in cmd)."""
+    if name not in load_providers():
+        return False
+    custom = _load_custom_providers()
+    entry = custom.get(name, {})
+    if hidden:
+        entry["hidden"] = True
+    else:
+        entry.pop("hidden", None)
+    if entry:
+        custom[name] = entry
+    else:
+        custom.pop(name, None)
+    _write_custom_providers(custom)
+    return True
+
+
+def provider_available(info: dict) -> bool:
+    """True when the provider's executable is present on this machine."""
+    import shutil
+    if info.get("executor") == "herdr":
+        return shutil.which(HERDR_BIN) is not None
+    parts = (info.get("cmd") or "").split()
+    if not parts:
+        return False
+    return shutil.which(parts[0]) is not None or Path(parts[0]).exists()
+
+
+def pickable_providers() -> dict:
+    """Providers to offer in UI/bot pickers: installed and not hidden."""
+    return {
+        name: info for name, info in load_providers().items()
+        if not info.get("hidden") and provider_available(info)
+    }
 
 
 def remove_provider(name: str) -> bool:
@@ -451,3 +505,7 @@ TASK_PASSWORD = os.environ.get("PP_TASK_PASSWORD", "")
 # Server
 HOST = os.environ.get("PP_HOST", "127.0.0.1")
 PORT = int(os.environ.get("PP_PORT", "8420"))
+# Optional API/Web UI token. When set, every request must carry it:
+# browser — native Basic-auth prompt (any username, token as password);
+# scripts — "Authorization: Bearer <token>" or curl -u x:<token>.
+API_TOKEN = os.environ.get("PP_API_TOKEN", "")

@@ -32,7 +32,8 @@ from telegram.ext import (
 from . import db
 from .config import (
     DEFAULT_CLI, HERDR_BIN, HERDR_WATCH, HERDR_WATCH_INTERVAL,
-    get_skills, load_providers, load_providers_detailed, PROJECTS_ROOT, TASK_PASSWORD,
+    get_skills, load_providers, load_providers_detailed, pickable_providers,
+    PROJECTS_ROOT, TASK_PASSWORD,
 )
 from .models import TaskCreate, TaskStatus
 from .tg_auth import authorize_user, is_authorized, list_authorized, load_allowed_phones
@@ -536,7 +537,7 @@ async def add_task_got_password(update: Update, context: ContextTypes.DEFAULT_TY
 async def add_task_got_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["new_prompt"] = update.message.text
 
-    providers = load_providers()
+    providers = pickable_providers()
     row, buttons = [], []
     for name in providers:
         row.append(InlineKeyboardButton(name, callback_data=f"pickprov:{name}"))
@@ -1096,7 +1097,7 @@ async def reply_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def _best_claude_provider() -> Optional[str]:
     """Return the best available Claude provider (prefers DEFAULT_CLI if it supports skills)."""
-    providers = load_providers()
+    providers = pickable_providers()
     claude_providers = [name for name, info in providers.items() if info.get("supports_skills", False)]
     if not claude_providers:
         return None
@@ -1307,7 +1308,7 @@ async def skill_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def _skill_provider_keyboard() -> InlineKeyboardMarkup:
     """Inline keyboard with only skill-capable (Claude) providers."""
-    providers = load_providers()
+    providers = pickable_providers()
     skill_providers = {n: i for n, i in providers.items() if i.get("supports_skills", False)}
     row, buttons = [], []
     for name in skill_providers:
