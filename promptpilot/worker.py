@@ -228,24 +228,30 @@ def _maybe_recur(task):
     print(f"  -> Recurring: next run at {next_dt.strftime('%Y-%m-%d %H:%M UTC')}")
 
 
-def _execute_herdr_task(task, provider_cfg):
-    """Run the task in a live herdr session (providers with executor=herdr)."""
-    from .herdr_exec import run_in_herdr
+def _execute_herdr_task(task, provider_cfg, host=None, machine=None):
+    """Run the task in a live herdr session (providers with executor=herdr).
+
+    host is the ssh target of the machine the session lives on (None = local).
+    """
+    from .herdr_exec import attach_hint, run_in_herdr
+
+    attach = attach_hint(host)
+    where = f" на машине {machine}" if machine else ""
 
     def on_blocked(pane_id):
-        print(f"  -> Blocked, waiting for approval in pane {pane_id}")
+        print(f"  -> Blocked, waiting for approval in pane {pane_id}{where}")
         if task.tg_chat_id:
             db.add_notification(
                 task.tg_chat_id,
-                f"⏸ Задача #{task.id} ждёт подтверждения в herdr (панель {pane_id}).\n"
-                f"Подключись командой: herdr — подтверди действие, задача продолжится.",
+                f"⏸ Задача #{task.id} ждёт подтверждения в herdr{where} (панель {pane_id}).\n"
+                f"Подключись командой: {attach} — подтверди действие, задача продолжится.",
                 task_id=task.id,
             )
 
     outcome = run_in_herdr(task, provider_cfg, on_blocked=on_blocked,
                            timeout=_effective_timeout(task),
                            cancel_check=lambda: db.is_cancel_requested(task.id),
-                           keep_pane=task.keep_pane)
+                           keep_pane=task.keep_pane, host=host)
 
     if outcome.get("cancelled"):
         db.clear_cancel_request(task.id)
@@ -292,11 +298,19 @@ def execute_task(task):
     provider_cfg = load_providers().get(provider, {})
     machine = getattr(task, "machine", None)
 
-    if provider_cfg.get("executor") == "herdr":
-        if machine:
-            db.mark_failed(task.id, f"herdr-провайдеры пока выполняются только локально (машина «{machine}»)")
+    host = None
+    if machine:
+        from .config import load_machines
+        m = load_machines().get(machine)
+        if not m or not m.get("host"):
+            db.mark_failed(task.id, f"Машина «{machine}» не найдена в реестре")
             return
-        _execute_herdr_task(task, provider_cfg)
+        host = m["host"]
+
+    if provider_cfg.get("executor") == "herdr":
+        # herdr sessions work the same way on any machine: the CLI calls go
+        # over ssh, the pane lives there (attach with `herdr --remote <host>`).
+        _execute_herdr_task(task, provider_cfg, host=host, machine=machine)
         return
 
     cmd = build_cmd(provider, task.prompt, skip_permissions=task.skip_permissions, session_id=task.session_id, model=task.model)
@@ -304,15 +318,10 @@ def execute_task(task):
     env = get_provider_env(provider)
 
     if machine:
-        from .config import load_machines
-        m = load_machines().get(machine)
-        if not m or not m.get("host"):
-            db.mark_failed(task.id, f"Машина «{machine}» не найдена в реестре")
-            return
         if task.detached:
             db.mark_failed(task.id, "Фоновый запуск (detached) на удалённой машине пока не поддерживается")
             return
-        cmd = _wrap_ssh(m["host"], cmd, provider_cfg.get("env"))
+        cmd = _wrap_ssh(host, cmd, provider_cfg.get("env"))
         env = os.environ.copy()
     else:
         # On Windows, .cmd/.bat wrappers (e.g. npm-installed CLIs like qwen) are

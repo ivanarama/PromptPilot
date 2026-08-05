@@ -31,7 +31,7 @@ from telegram.ext import (
 
 from . import db
 from .config import (
-    DEFAULT_CLI, HERDR_BIN, HERDR_WATCH, HERDR_WATCH_INTERVAL,
+    DEFAULT_CLI, HERDR_WATCH, HERDR_WATCH_INTERVAL,
     get_skills, load_machines, load_providers, load_providers_detailed, pickable_providers,
     PROJECTS_ROOT, TASK_PASSWORD,
 )
@@ -543,10 +543,14 @@ async def add_task_got_password(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 def _provider_buttons(machine: str = None):
-    providers = pickable_providers()
     if machine:
+        # Availability is decided by the machine's own probe — a provider may
+        # be installed there and missing here (and vice versa).
         allowed = set(load_machines().get(machine, {}).get("providers") or [])
-        providers = {n: i for n, i in providers.items() if n in allowed}
+        providers = {n: i for n, i in load_providers().items()
+                     if n in allowed and not i.get("hidden")}
+    else:
+        providers = pickable_providers()
     row, buttons = [], []
     for name in providers:
         row.append(InlineKeyboardButton(name, callback_data=f"pickprov:{name}"))
@@ -623,13 +627,17 @@ async def add_task_got_provider(update: Update, context: ContextTypes.DEFAULT_TY
     context.user_data["new_provider"] = provider
 
     if load_providers().get(provider or DEFAULT_CLI, {}).get("session_target"):
-        data = await _herdr_json("agent", "list")
+        machine = context.user_data.get("new_machine")
+        host = _machine_host(machine)
+        data = await _herdr_json("agent", "list", host=host)
         agents = ((data or {}).get("result") or {}).get("agents") or []
         agents = [a for a in agents if a.get("pane_id")]
         if not agents:
-            await query.edit_message_text("Нет открытых herdr-сессий. Открой панель с агентом и попробуй снова.")
+            where = f" на машине {machine}" if machine else ""
+            await query.edit_message_text(
+                f"Нет открытых herdr-сессий{where}. Открой панель с агентом и попробуй снова.")
             return ConversationHandler.END
-        ws = await _herdr_json("workspace", "list")
+        ws = await _herdr_json("workspace", "list", host=host)
         ws_labels = {w.get("workspace_id"): w.get("label") or w.get("workspace_id")
                      for w in ((ws or {}).get("result") or {}).get("workspaces") or []}
         def _label(a):
@@ -1455,12 +1463,23 @@ async def skill_skip_args(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # The poll interval doubles as a debounce: dialogs the user resolves within
 # seconds while working in herdr never surface here.
 
-async def _herdr_cli(*args, timeout=15):
-    """Run a herdr CLI command. Returns raw stdout text or None on failure."""
+def _machine_host(machine: str) -> str:
+    """ssh target of a registered machine ('' / unknown → local)."""
+    if not machine:
+        return None
+    return (load_machines().get(machine) or {}).get("host")
+
+
+async def _herdr_cli(*args, host=None, timeout=15):
+    """Run a herdr CLI command (locally or on `host`). Raw stdout or None."""
     import asyncio
+    from .herdr_exec import herdr_argv
+    argv = herdr_argv(args, host)
+    if host:
+        timeout = max(timeout, 30)  # ssh round-trip on top of the herdr call
     try:
         proc = await asyncio.create_subprocess_exec(
-            HERDR_BIN, *args,
+            argv[0], *argv[1:],
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             stdin=asyncio.subprocess.DEVNULL,
@@ -1473,8 +1492,8 @@ async def _herdr_cli(*args, timeout=15):
     return (out or err or b"").decode("utf-8", "replace")
 
 
-async def _herdr_json(*args, timeout=15):
-    raw = await _herdr_cli(*args, timeout=timeout)
+async def _herdr_json(*args, host=None, timeout=15):
+    raw = await _herdr_cli(*args, host=host, timeout=timeout)
     if raw is None:
         return None
     try:
@@ -1489,20 +1508,24 @@ def _herdr_agent_label(a: dict) -> str:
     return f"{kind} ({name})" if name else kind
 
 
-async def _herdr_notify(bot, pane_id: str, status: str, agent: dict):
+async def _herdr_notify(bot, pane_id: str, status: str, agent: dict, machine: str = ""):
     label = _herdr_agent_label(agent)
+    # callback_data: hd_<action>:<machine>:<pane> — machine names carry no ':',
+    # pane ids do ("w9:p2"), so the split is bounded to 2.
+    ref = f"{machine}:{pane_id}"
+    where = f" на {machine}" if machine else ""
     if status == "blocked":
-        text = f"⏸ herdr: {label} в панели {pane_id} ждёт подтверждения"
+        text = f"⏸ herdr{where}: {label} в панели {pane_id} ждёт подтверждения"
         buttons = [
-            [InlineKeyboardButton("✅ Подтвердить (Enter)", callback_data=f"hd_enter:{pane_id}"),
-             InlineKeyboardButton("📺 Экран", callback_data=f"hd_screen:{pane_id}")],
-            [InlineKeyboardButton("✍️ Ответить", callback_data=f"hd_reply:{pane_id}")],
+            [InlineKeyboardButton("✅ Подтвердить (Enter)", callback_data=f"hd_enter:{ref}"),
+             InlineKeyboardButton("📺 Экран", callback_data=f"hd_screen:{ref}")],
+            [InlineKeyboardButton("✍️ Ответить", callback_data=f"hd_reply:{ref}")],
         ]
     else:
-        text = f"✅ herdr: {label} в панели {pane_id} завершил работу"
+        text = f"✅ herdr{where}: {label} в панели {pane_id} завершил работу"
         buttons = [
-            [InlineKeyboardButton("📺 Экран", callback_data=f"hd_screen:{pane_id}"),
-             InlineKeyboardButton("✍️ Ответить", callback_data=f"hd_reply:{pane_id}")],
+            [InlineKeyboardButton("📺 Экран", callback_data=f"hd_screen:{ref}"),
+             InlineKeyboardButton("✍️ Ответить", callback_data=f"hd_reply:{ref}")],
         ]
     title = (agent.get("terminal_title_stripped") or "").strip()
     if title:
@@ -1515,33 +1538,60 @@ async def _herdr_notify(bot, pane_id: str, status: str, agent: dict):
             logger.warning("herdr notify to %s failed: %s", chat_id, e)
 
 
+def _herdr_watch_targets():
+    """Machines to poll: this one plus every registered machine with herdr.
+    Returns [(machine_name, host)] — machine_name '' means local."""
+    from .config import machine_has_herdr
+    targets = [("", None)]
+    for name, m in load_machines().items():
+        if m.get("host") and machine_has_herdr(m):
+            targets.append((name, m["host"]))
+    return targets
+
+
 async def _herdr_watch_loop(bot):
     import asyncio
-    notified = {}  # pane_id -> status already notified about
+    notified = {}  # (machine, pane_id) -> status already notified about
     while True:
         await asyncio.sleep(HERDR_WATCH_INTERVAL)
-        data = await _herdr_json("agent", "list")
-        if data is None:
-            continue  # herdr not installed / server down — stay quiet
-        agents = ((data.get("result") or {}).get("agents")) or []
-        current = {}
-        for a in agents:
-            pane = a.get("pane_id")
-            name = a.get("name") or ""
-            if not pane or name.startswith("pp-t"):
-                continue  # PromptPilot's own tasks notify via the worker
-            current[pane] = a
-        for pane, a in current.items():
-            status = a.get("agent_status")
-            if status in ("blocked", "done"):
-                if notified.get(pane) != status:
-                    await _herdr_notify(bot, pane, status, a)
-                    notified[pane] = status
-            else:
-                notified.pop(pane, None)
-        for pane in list(notified):
-            if pane not in current:
-                notified.pop(pane)
+        seen = set()
+        for machine, host in _herdr_watch_targets():
+            data = await _herdr_json("agent", "list", host=host)
+            if data is None:
+                continue  # herdr not installed / server down / ssh — stay quiet
+            agents = ((data.get("result") or {}).get("agents")) or []
+            current = {}
+            for a in agents:
+                pane = a.get("pane_id")
+                name = a.get("name") or ""
+                if not pane or name.startswith("pp-t"):
+                    continue  # PromptPilot's own tasks notify via the worker
+                current[pane] = a
+            seen.update((machine, pane) for pane in current)
+            for pane, a in current.items():
+                key = (machine, pane)
+                status = a.get("agent_status")
+                if status in ("blocked", "done"):
+                    if notified.get(key) != status:
+                        await _herdr_notify(bot, pane, status, a, machine)
+                        notified[key] = status
+                else:
+                    notified.pop(key, None)
+            # A machine that failed to answer keeps its remembered state: only
+            # panes on machines we DID reach may be forgotten.
+            for key in [k for k in notified if k[0] == machine and k not in seen]:
+                notified.pop(key)
+
+
+def _parse_hd_ref(data: str):
+    """'hd_enter:<machine>:<pane>' → (machine, pane, host). Older buttons
+    without the machine part ('hd_enter:w9:p2') are read as local."""
+    parts = data.split(":", 2)
+    if len(parts) == 3 and (parts[1] == "" or parts[1] in load_machines()):
+        machine, pane = parts[1], parts[2]
+    else:
+        machine, pane = "", data.split(":", 1)[1]
+    return machine, pane, _machine_host(machine)
 
 
 async def cb_herdr_enter(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1549,8 +1599,8 @@ async def cb_herdr_enter(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(query.from_user.id):
         await query.answer("Нет доступа.", show_alert=True)
         return
-    pane = query.data.split(":", 1)[1]
-    res = await _herdr_json("agent", "send-keys", pane, "enter")
+    _, pane, host = _parse_hd_ref(query.data)
+    res = await _herdr_json("agent", "send-keys", pane, "enter", host=host)
     if res and res.get("result"):
         await query.answer("Enter отправлен ✓")
     else:
@@ -1562,8 +1612,9 @@ async def cb_herdr_screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(query.from_user.id):
         await query.answer("Нет доступа.", show_alert=True)
         return
-    pane = query.data.split(":", 1)[1]
-    raw = await _herdr_cli("agent", "read", pane, "--source", "visible", "--format", "text")
+    machine, pane, host = _parse_hd_ref(query.data)
+    raw = await _herdr_cli("agent", "read", pane, "--source", "visible", "--format", "text",
+                           host=host)
     if raw is None:
         await query.answer("Не удалось прочитать экран.", show_alert=True)
         return
@@ -1572,7 +1623,7 @@ async def cb_herdr_screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     while lines and not lines[-1]:
         lines.pop()
     tail = "\n".join(lines[-25:])[-3500:] or "(пусто)"
-    await query.message.reply_text(f"📺 {pane}:\n{tail}")
+    await query.message.reply_text(f"📺 {pane}{f' ({machine})' if machine else ''}:\n{tail}")
 
 
 async def cb_herdr_reply_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1580,18 +1631,21 @@ async def cb_herdr_reply_start(update: Update, context: ContextTypes.DEFAULT_TYP
     if not is_authorized(query.from_user.id):
         await query.answer("Нет доступа.", show_alert=True)
         return ConversationHandler.END
-    pane = query.data.split(":", 1)[1]
+    machine, pane, host = _parse_hd_ref(query.data)
     context.user_data["herdr_reply_pane"] = pane
+    context.user_data["herdr_reply_host"] = host
     await query.answer()
-    await query.message.reply_text(f"Текст для агента в панели {pane} (или /cancel):")
+    where = f" на {machine}" if machine else ""
+    await query.message.reply_text(f"Текст для агента в панели {pane}{where} (или /cancel):")
     return ASK_HERDR_REPLY
 
 
 async def herdr_reply_got_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pane = context.user_data.pop("herdr_reply_pane", None)
+    host = context.user_data.pop("herdr_reply_host", None)
     if not pane:
         return ConversationHandler.END
-    res = await _herdr_json("agent", "prompt", pane, update.message.text)
+    res = await _herdr_json("agent", "prompt", pane, update.message.text, host=host)
     if res and res.get("result"):
         await update.message.reply_text("Отправлено ✓")
     else:
@@ -1601,6 +1655,7 @@ async def herdr_reply_got_text(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def herdr_reply_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("herdr_reply_pane", None)
+    context.user_data.pop("herdr_reply_host", None)
     await update.message.reply_text("Отменено.")
     return ConversationHandler.END
 

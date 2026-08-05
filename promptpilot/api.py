@@ -153,15 +153,24 @@ def api_providers():
 
 
 @app.get("/api/herdr/agents")
-def api_herdr_agents():
-    """Live herdr agents for the session-target picker."""
+def api_herdr_agents(machine: str = ""):
+    """Live herdr agents for the session-target picker (locally or on a machine)."""
     import json as _json
     import subprocess as _sp
-    from .config import HERDR_BIN
+    from .config import load_machines
+    from .herdr_exec import herdr_argv
+
+    host = None
+    if machine:
+        m = load_machines().get(machine)
+        if not m or not m.get("host"):
+            raise HTTPException(404, "Машина не найдена")
+        host = m["host"]
+
     def _cli_json(*args):
         try:
-            proc = _sp.run([HERDR_BIN, *args], capture_output=True, text=True,
-                           timeout=10, stdin=_sp.DEVNULL)
+            proc = _sp.run(herdr_argv(args, host), capture_output=True, text=True,
+                           timeout=20, stdin=_sp.DEVNULL)
             return _json.loads(proc.stdout.strip() or "{}")
         except (OSError, ValueError, _sp.TimeoutExpired):
             return {}

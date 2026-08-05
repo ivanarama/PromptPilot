@@ -363,21 +363,35 @@ def remove_machine(name: str) -> bool:
 
 def probe_machine(host: str) -> list:
     """Which providers work on the remote machine (login-shell PATH lookup
-    of each cmd-provider's executable basename). herdr providers are
-    local-only for now and are never probed."""
+    of each provider's executable basename).
+
+    herdr providers need `herdr` on that machine plus the agent CLI of their
+    kind (claude, opencode, ...); the session-target provider needs herdr only.
+    """
     import subprocess
-    bases = {}
+    bases = {}         # cmd provider  -> executable basename
+    herdr_needs = {}   # herdr provider -> agent binary it starts ("" = none)
     for name, info in load_providers().items():
-        if info.get("executor") or info.get("hidden"):
+        if info.get("hidden"):
             continue
+        if info.get("executor") == "herdr":
+            herdr_needs[name] = "" if info.get("session_target") else (info.get("kind") or "claude")
+            continue
+        if info.get("executor"):
+            continue  # unknown executor — nothing to probe
         parts = (info.get("cmd") or "").split()
         if parts:
             bases[name] = os.path.basename(parts[0])
-    if not bases:
+
+    herdr_bin = os.path.basename(HERDR_BIN)
+    probes = set(bases.values()) | {b for b in herdr_needs.values() if b}
+    if herdr_needs:
+        probes.add(herdr_bin)
+    if not probes:
         return []
     import shlex
     script = "for c in %s; do command -v \"$c\" >/dev/null 2>&1 && echo \"$c\"; done" % " ".join(
-        sorted(set(bases.values())))
+        sorted(probes))
     try:
         # ssh flattens argv into one remote command line — quote the script
         proc = subprocess.run(
@@ -388,7 +402,18 @@ def probe_machine(host: str) -> list:
     except (OSError, subprocess.TimeoutExpired):
         return []
     found = set(proc.stdout.split())
-    return sorted(name for name, b in bases.items() if b in found)
+    result = [name for name, b in bases.items() if b in found]
+    if herdr_bin in found:
+        result += [name for name, need in herdr_needs.items() if not need or need in found]
+    return sorted(result)
+
+
+def machine_has_herdr(machine: dict) -> bool:
+    """True when the registry entry lists at least one herdr provider —
+    i.e. the machine's herdr sessions are worth watching/listing."""
+    providers = load_providers()
+    return any(providers.get(p, {}).get("executor") == "herdr"
+               for p in (machine.get("providers") or []))
 
 
 def provider_available(info: dict) -> bool:

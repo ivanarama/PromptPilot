@@ -1026,8 +1026,8 @@ function updateProvidersForMachine() {
   const allowed = machine ? (machinesData[machine]?.providers || []) : null;
   const sel = document.getElementById('providerInput');
   sel.innerHTML = Object.entries(providersData)
-    .filter(([name, info]) => info.available !== false && !info.hidden)
-    .filter(([name]) => !allowed || allowed.includes(name))
+    // для машины наличие CLI определяет её собственная проба, а не эта машина
+    .filter(([name, info]) => !info.hidden && (allowed ? allowed.includes(name) : info.available !== false))
     .map(([name, info]) => `<option value="${esc(name)}">${esc(name)} — ${esc(info.description || info)}</option>`)
     .join('');
   updateSkillsToggle(); updateModelSelect(); updateKeepPane();
@@ -1062,8 +1062,11 @@ function updateKeepPane() {
 
 async function loadHerdrAgents() {
   const sel = document.getElementById('herdrTargetInput');
+  // сессии живут на выбранной машине — спрашиваем именно её
+  const machine = document.getElementById('machineInput').value;
+  const q = machine ? `?machine=${encodeURIComponent(machine)}` : '';
   try {
-    const agents = await fetchJSON(`${API}/herdr/agents`);
+    const agents = await fetchJSON(`${API}/herdr/agents${q}`);
     sel.innerHTML = agents.length
       ? agents.map(a => {
           const what = a.title || a.name || a.pane_id;
