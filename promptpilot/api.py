@@ -158,13 +158,19 @@ def api_herdr_agents():
     import json as _json
     import subprocess as _sp
     from .config import HERDR_BIN
-    try:
-        proc = _sp.run([HERDR_BIN, "agent", "list"], capture_output=True, text=True,
-                       timeout=10, stdin=_sp.DEVNULL)
-        data = _json.loads(proc.stdout.strip() or "{}")
-    except (OSError, ValueError, _sp.TimeoutExpired):
-        return []
+    def _cli_json(*args):
+        try:
+            proc = _sp.run([HERDR_BIN, *args], capture_output=True, text=True,
+                           timeout=10, stdin=_sp.DEVNULL)
+            return _json.loads(proc.stdout.strip() or "{}")
+        except (OSError, ValueError, _sp.TimeoutExpired):
+            return {}
+
+    data = _cli_json("agent", "list")
     agents = ((data.get("result") or {}).get("agents")) or []
+    ws = _cli_json("workspace", "list")
+    ws_labels = {w.get("workspace_id"): w.get("label") or w.get("workspace_id")
+                 for w in ((ws.get("result") or {}).get("workspaces")) or []}
     return [
         {
             "target": a.get("name") or a.get("pane_id"),
@@ -173,6 +179,7 @@ def api_herdr_agents():
             "agent": a.get("display_agent") or a.get("agent") or "",
             "status": a.get("agent_status"),
             "title": (a.get("terminal_title_stripped") or "")[:80],
+            "workspace": ws_labels.get(a.get("workspace_id"), a.get("workspace_id") or ""),
         }
         for a in agents
         if a.get("pane_id")

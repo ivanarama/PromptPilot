@@ -145,7 +145,7 @@ BUILTIN_PROVIDERS = {
     "herdr-session": {
         "executor": "herdr",
         "session_target": True,
-        "description": "Продолжение открытой herdr-сессии (промпт в живую панель)",
+        "description": "Промпт в открытую сессию herdr",
     },
     "claude": {
         "cmd": f"{CLAUDE_EXE} -p --verbose --output-format stream-json {{prompt}}",

@@ -599,9 +599,14 @@ async def add_task_got_provider(update: Update, context: ContextTypes.DEFAULT_TY
         if not agents:
             await query.edit_message_text("Нет открытых herdr-сессий. Открой панель с агентом и попробуй снова.")
             return ConversationHandler.END
-        buttons = [[InlineKeyboardButton(
-            f"{a.get('pane_id')} · {a.get('agent') or '?'} · {a.get('agent_status')}"
-            + (f" · {a['name']}" if a.get('name') else ""),
+        ws = await _herdr_json("workspace", "list")
+        ws_labels = {w.get("workspace_id"): w.get("label") or w.get("workspace_id")
+                     for w in ((ws or {}).get("result") or {}).get("workspaces") or []}
+        def _label(a):
+            what = (a.get("terminal_title_stripped") or a.get("name") or a.get("pane_id") or "")[:35]
+            wsl = ws_labels.get(a.get("workspace_id"), "")
+            return f"{wsl}: {what} · {a.get('agent_status')}"
+        buttons = [[InlineKeyboardButton(_label(a),
             callback_data=f"hstarget:{a.get('name') or a.get('pane_id')}")]
             for a in agents[:20]]
         await query.edit_message_text("В какую сессию отправить промпт?",

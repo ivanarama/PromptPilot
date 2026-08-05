@@ -472,7 +472,7 @@
       <label>Timeout
         <input type="number" id="timeoutInput" placeholder="0 = no limit" min="0" style="width:80px" title="Per-task timeout in seconds (0 = no limit, empty = default)">
       </label>
-      <label style="flex-direction:row;align-items:center;gap:8px;cursor:pointer">
+      <label id="skipPermsLabel" style="flex-direction:row;align-items:center;gap:8px;cursor:pointer">
         <input type="checkbox" id="skipPermissions" style="width:auto;margin:0">
         <span style="font-size:13px;color:var(--yellow)">--dangerously-skip-permissions</span>
       </label>
@@ -974,6 +974,9 @@ function updateKeepPane() {
     (prov.executor === 'herdr' && !prov.session_target) ? 'flex' : 'none';
   const tl = document.getElementById('herdrTargetLabel');
   tl.style.display = prov.session_target ? 'flex' : 'none';
+  // в target-режиме директория и permissions не применимы — прячем
+  document.getElementById('workdirLabel').style.display = prov.session_target ? 'none' : 'flex';
+  document.getElementById('skipPermsLabel').style.display = prov.session_target ? 'none' : 'flex';
   if (prov.session_target) loadHerdrAgents();
 }
 
@@ -982,7 +985,10 @@ async function loadHerdrAgents() {
   try {
     const agents = await fetchJSON(`${API}/herdr/agents`);
     sel.innerHTML = agents.length
-      ? agents.map(a => `<option value="${esc(a.target)}">${esc(a.pane_id)} · ${esc(a.agent)} · ${esc(a.status)}${a.name ? ' · ' + esc(a.name) : ''}</option>`).join('')
+      ? agents.map(a => {
+          const what = a.title || a.name || a.pane_id;
+          return `<option value="${esc(a.target)}" title="${esc(a.pane_id)}">${esc(a.workspace)}: ${esc(what)} — ${esc(a.agent)} · ${esc(a.status)}</option>`;
+        }).join('')
       : '<option value="">— нет открытых сессий —</option>';
   } catch (e) {
     sel.innerHTML = '<option value="">— herdr недоступен —</option>';
