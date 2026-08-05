@@ -332,7 +332,7 @@ def _machines_file() -> Path:
 
 
 def load_machines() -> dict:
-    """Registry of remote machines: {name: {host, providers: [...]}}."""
+    """Registry of remote machines: {name: {host, providers: [...], shell}}."""
     f = _machines_file()
     if f.exists():
         try:
@@ -343,12 +343,20 @@ def load_machines() -> dict:
     return {}
 
 
-def save_machine(name: str, host: str, providers: list = None):
+def save_machine(name: str, host: str, providers: list = None, shell: str = None):
     machines = load_machines()
-    machines[name] = {"host": host, "providers": providers or []}
+    machines[name] = {"host": host, "providers": providers or [],
+                      "shell": shell or "posix"}
     DB_DIR.mkdir(parents=True, exist_ok=True)
     with open(_machines_file(), "w") as f:
         json.dump(machines, f, ensure_ascii=False, indent=2)
+
+
+def machine_remote(machine: dict):
+    """Remote() for a machines.json entry (entries predating the shell field
+    are POSIX — that is what they were probed as)."""
+    from .remote import Remote
+    return Remote(machine["host"], machine.get("shell") or "posix")
 
 
 def remove_machine(name: str) -> bool:
@@ -361,14 +369,21 @@ def remove_machine(name: str) -> bool:
     return True
 
 
-def probe_machine(host: str) -> list:
-    """Which providers work on the remote machine (login-shell PATH lookup
-    of each provider's executable basename).
+def probe_machine(host: str):
+    """(providers, shell) for a remote machine: which of our providers are
+    installed there, and which shell dialect it speaks.
 
     herdr providers need `herdr` on that machine plus the agent CLI of their
     kind (claude, opencode, ...); the session-target provider needs herdr only.
+    An unreachable machine gives ([], "").
     """
     import subprocess
+
+    from .remote import POWERSHELL, Remote, detect_shell, ps_quote, ssh_script
+    shell = detect_shell(host)
+    if not shell:
+        return [], ""
+
     bases = {}         # cmd provider  -> executable basename
     herdr_needs = {}   # herdr provider -> agent binary it starts ("" = none)
     for name, info in load_providers().items():
@@ -388,24 +403,26 @@ def probe_machine(host: str) -> list:
     if herdr_needs:
         probes.add(herdr_bin)
     if not probes:
-        return []
-    import shlex
-    script = "for c in %s; do command -v \"$c\" >/dev/null 2>&1 && echo \"$c\"; done" % " ".join(
-        sorted(probes))
+        return [], shell
+    if shell == POWERSHELL:
+        script = ("foreach ($c in @(%s)) { if (Get-Command $c -ErrorAction "
+                  "SilentlyContinue) { $c } }" % ",".join(ps_quote(c) for c in sorted(probes)))
+    else:
+        script = "for c in %s; do command -v \"$c\" >/dev/null 2>&1 && echo \"$c\"; done" % " ".join(
+            sorted(probes))
     try:
-        # ssh flattens argv into one remote command line — quote the script
         proc = subprocess.run(
-            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host,
-             "bash", "-lc", shlex.quote(script)],
-            capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL,
+            ssh_script(Remote(host, shell), script),
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=30, stdin=subprocess.DEVNULL,
         )
     except (OSError, subprocess.TimeoutExpired):
-        return []
-    found = set(proc.stdout.split())
+        return [], shell
+    found = set((proc.stdout or "").split())
     result = [name for name, b in bases.items() if b in found]
     if herdr_bin in found:
         result += [name for name, need in herdr_needs.items() if not need or need in found]
-    return sorted(result)
+    return sorted(result), shell
 
 
 def machine_has_herdr(machine: dict) -> bool:

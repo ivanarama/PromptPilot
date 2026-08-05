@@ -886,6 +886,7 @@ async function renderMachineList() {
   document.getElementById('machineList').innerHTML = Object.entries(machinesData).map(([n, m]) =>
     `<div class="prov-row"><span class="prov-name">${esc(n)}</span>
      <span class="prov-badge">${esc(m.host)}</span>
+     <span class="prov-badge" title="оболочка машины">${m.shell === 'powershell' ? '🪟 powershell' : '🐧 posix'}</span>
      <div class="prov-cmd">провайдеры: ${esc((m.providers || []).join(', ') || '—')}</div>
      <div class="prov-actions">
        <button class="btn btn-sm btn-ghost" onclick="machineProbe('${esc(n)}')">Перепроверить</button>

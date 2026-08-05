@@ -628,7 +628,7 @@ async def add_task_got_provider(update: Update, context: ContextTypes.DEFAULT_TY
 
     if load_providers().get(provider or DEFAULT_CLI, {}).get("session_target"):
         machine = context.user_data.get("new_machine")
-        host = _machine_host(machine)
+        host = _machine_remote(machine)
         data = await _herdr_json("agent", "list", host=host)
         agents = ((data or {}).get("result") or {}).get("agents") or []
         agents = [a for a in agents if a.get("pane_id")]
@@ -1463,11 +1463,11 @@ async def skill_skip_args(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # The poll interval doubles as a debounce: dialogs the user resolves within
 # seconds while working in herdr never surface here.
 
-def _machine_host(machine: str) -> str:
-    """ssh target of a registered machine ('' / unknown → local)."""
-    if not machine:
-        return None
-    return (load_machines().get(machine) or {}).get("host")
+def _machine_remote(machine: str):
+    """Remote() of a registered machine ('' / unknown → local)."""
+    from .config import machine_remote
+    m = load_machines().get(machine or "")
+    return machine_remote(m) if m and m.get("host") else None
 
 
 async def _herdr_cli(*args, host=None, timeout=15):
@@ -1540,12 +1540,12 @@ async def _herdr_notify(bot, pane_id: str, status: str, agent: dict, machine: st
 
 def _herdr_watch_targets():
     """Machines to poll: this one plus every registered machine with herdr.
-    Returns [(machine_name, host)] — machine_name '' means local."""
-    from .config import machine_has_herdr
+    Returns [(machine_name, remote)] — machine_name '' means local."""
+    from .config import machine_has_herdr, machine_remote
     targets = [("", None)]
     for name, m in load_machines().items():
         if m.get("host") and machine_has_herdr(m):
-            targets.append((name, m["host"]))
+            targets.append((name, machine_remote(m)))
     return targets
 
 
@@ -1591,7 +1591,7 @@ def _parse_hd_ref(data: str):
         machine, pane = parts[1], parts[2]
     else:
         machine, pane = "", data.split(":", 1)[1]
-    return machine, pane, _machine_host(machine)
+    return machine, pane, _machine_remote(machine)
 
 
 async def cb_herdr_enter(update: Update, context: ContextTypes.DEFAULT_TYPE):

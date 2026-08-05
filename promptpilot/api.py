@@ -157,7 +157,7 @@ def api_herdr_agents(machine: str = ""):
     """Live herdr agents for the session-target picker (locally or on a machine)."""
     import json as _json
     import subprocess as _sp
-    from .config import load_machines
+    from .config import load_machines, machine_remote
     from .herdr_exec import herdr_argv
 
     host = None
@@ -165,7 +165,7 @@ def api_herdr_agents(machine: str = ""):
         m = load_machines().get(machine)
         if not m or not m.get("host"):
             raise HTTPException(404, "Машина не найдена")
-        host = m["host"]
+        host = machine_remote(m)
 
     def _cli_json(*args):
         try:
@@ -215,11 +215,13 @@ def api_machine_create(m: MachineCreate):
     import re as __re
     if not __re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,31}", m.name):
         raise HTTPException(400, "Имя: латиница/цифры/-/_/. до 32 символов")
-    providers = probe_machine(m.host)
+    providers, shell = probe_machine(m.host)
+    if not shell:
+        raise HTTPException(400, "Машина недоступна по ssh (проверь ключи и BatchMode)")
     if not providers:
-        raise HTTPException(400, "Машина недоступна по ssh или на ней нет ни одного известного CLI")
-    save_machine(m.name, m.host, providers)
-    return {"ok": True, "providers": providers}
+        raise HTTPException(400, "На машине не найдено ни одного известного CLI")
+    save_machine(m.name, m.host, providers, shell)
+    return {"ok": True, "providers": providers, "shell": shell}
 
 
 @app.post("/api/machines/{name}/probe")
@@ -228,9 +230,11 @@ def api_machine_probe(name: str):
     machine = load_machines().get(name)
     if not machine:
         raise HTTPException(404, "Машина не найдена")
-    providers = probe_machine(machine["host"])
-    save_machine(name, machine["host"], providers)
-    return {"ok": True, "providers": providers}
+    providers, shell = probe_machine(machine["host"])
+    if not shell:
+        raise HTTPException(400, "Машина недоступна по ssh (проверь ключи и BatchMode)")
+    save_machine(name, machine["host"], providers, shell)
+    return {"ok": True, "providers": providers, "shell": shell}
 
 
 @app.delete("/api/machines/{name}")

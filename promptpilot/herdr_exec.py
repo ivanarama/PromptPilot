@@ -14,10 +14,11 @@ the user can attach (``herdr``), watch the agent work and, when the agent
 hits a permission dialog (state ``blocked``), approve it by hand — the task
 keeps running instead of failing.
 
-The same session can live on another machine: pass ``host`` (an ssh target
-from the machine registry) and every herdr CLI call is executed there over
-ssh — the pane, the agent and its working directory belong to that machine,
-and the user attaches with ``herdr --remote <host>``.
+The same session can live on another machine: pass ``host`` (an ssh target, or
+a :class:`~promptpilot.remote.Remote` when the machine speaks PowerShell) and
+every herdr CLI call is executed there over ssh — the pane, the agent and its
+working directory belong to that machine, and the user attaches with
+``herdr --remote <host>``.
 
 Semantics notes:
   - task timeout bounds the *active* prompt turn (herdr-side, clean abort);
@@ -31,18 +32,12 @@ Semantics notes:
 import json
 import os
 import re
-import shlex
 import subprocess
 import time
 
 from .config import HERDR_BIN, HERDR_KEEP_PANE, HERDR_READ_LINES, HERDR_START_TIMEOUT_MS
-
-SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
-            "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3"]
-
-# Safety cap for a remote call: every herdr command we issue is bounded on the
-# herdr side, so anything longer means a hung ssh connection.
-REMOTE_CALL_TIMEOUT = 180
+from .remote import (POWERSHELL, REMOTE_CALL_TIMEOUT, as_remote, ps_quote,
+                     ssh_command, ssh_script)
 
 # Distinctive in-session usage/rate-limit banners (interactive sessions exit 0
 # even when the provider is limited, so detection is textual by necessity).
@@ -59,23 +54,22 @@ class HerdrError(Exception):
     pass
 
 
-def herdr_argv(args, host: str = None) -> list:
-    """Argv for a herdr CLI call — local, or on `host` over ssh.
+def herdr_argv(args, host=None) -> list:
+    """Argv for a herdr CLI call — local, or on `host` (str or Remote) over ssh.
 
-    Remote: the binary is resolved by the remote login-shell PATH (a local
-    absolute PP_HERDR_BIN says nothing about the other machine), and the whole
-    command is quoted twice — ssh flattens argv into one remote command line.
+    Remotely the binary is resolved by the machine's own PATH: a local absolute
+    PP_HERDR_BIN says nothing about the other machine.
     """
-    args = [str(a) for a in args]
-    if not host:
-        return [HERDR_BIN, *args]
-    inner = " ".join(shlex.quote(x) for x in [os.path.basename(HERDR_BIN), *args])
-    return ["ssh", *SSH_OPTS, host, "bash", "-lc", shlex.quote(inner)]
+    remote = as_remote(host)
+    if not remote:
+        return [HERDR_BIN, *[str(a) for a in args]]
+    return ssh_command(remote, [os.path.basename(HERDR_BIN), *args])
 
 
-def attach_hint(host: str = None) -> str:
+def attach_hint(host=None) -> str:
     """How the user opens this herdr session by hand."""
-    return f"herdr --remote {host}" if host else "herdr"
+    remote = as_remote(host)
+    return f"herdr --remote {remote.host}" if remote else "herdr"
 
 
 def _run(args, host=None, timeout=None):
@@ -95,7 +89,7 @@ def _run(args, host=None, timeout=None):
     except FileNotFoundError:
         raise HerdrError("ssh not found" if host else f"herdr CLI not found: {HERDR_BIN}")
     except subprocess.TimeoutExpired:
-        where = f" on {host}" if host else ""
+        where = f" on {as_remote(host).host}" if host else ""
         return -1, None, f"herdr {' '.join(str(a) for a in args[:2])}{where}: local timeout"
     raw = (proc.stdout.strip() or proc.stderr.strip())
     try:
@@ -125,7 +119,8 @@ def _agent_status(data) -> str:
 
 def _start_server(host=None):
     """Launch the herdr server in the background (locally or on `host`)."""
-    if not host:
+    remote = as_remote(host)
+    if not remote:
         subprocess.Popen(
             [HERDR_BIN, "server"],
             stdout=subprocess.DEVNULL,
@@ -134,13 +129,17 @@ def _start_server(host=None):
             start_new_session=True,
         )
         return
-    # Detach on the remote side: without the redirects ssh would hold the
-    # connection open for as long as the server lives.
-    script = (f"nohup {shlex.quote(os.path.basename(HERDR_BIN))} server "
-              f">/dev/null 2>&1 </dev/null &")
+    # Detach on the remote side: a server still attached to the ssh session
+    # would hold the connection open for as long as it lives.
+    binary = os.path.basename(HERDR_BIN)
+    if remote.shell == POWERSHELL:
+        script = (f"Start-Process -FilePath {ps_quote(binary)} "
+                  f"-ArgumentList 'server' -WindowStyle Hidden")
+    else:
+        script = f"nohup {binary} server >/dev/null 2>&1 </dev/null &"
     try:
         subprocess.run(
-            ["ssh", *SSH_OPTS, host, "bash", "-lc", shlex.quote(script)],
+            ssh_script(remote, script),
             capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL,
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -157,7 +156,7 @@ def _ensure_server(host=None):
         rc, data, _ = _run(["status", "server", "--json"], host=host, timeout=30)
         if rc == 0 and _dig(data, "running", default=False):
             return
-    where = f" на машине {host}" if host else ""
+    where = f" на машине {as_remote(host).host}" if host else ""
     raise HerdrError(f"herdr server{where} не запущен и не удалось его поднять "
                      f"(установлен ли herdr, доступен ли ssh?)")
 
@@ -409,7 +408,7 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
             return outcome
 
         # task checkbox decides; provider flag / env force keep-open regardless
-        where = f", машина {host}" if host else ""
+        where = f", машина {as_remote(host).host}" if host else ""
         if target:
             outcome["ok"] = True
             outcome["output"] = (f"{cleaned}\n\n--- Meta ---\n"

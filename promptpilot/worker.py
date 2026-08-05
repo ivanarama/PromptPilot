@@ -279,16 +279,12 @@ def _execute_herdr_task(task, provider_cfg, host=None, machine=None):
     _maybe_recur(task)
 
 
-def _wrap_ssh(host, cmd, env_extra):
-    """Run the command on a remote machine: basename resolved by the remote
-    login-shell PATH, provider env passed via `env K=V`."""
-    import shlex
-    remote = list(cmd)
-    remote[0] = os.path.basename(remote[0])
-    envp = [f"{k}={v}" for k, v in (env_extra or {}).items() if v]
-    inner = " ".join(shlex.quote(x) for x in ((["env", *envp] if envp else []) + remote))
-    # ssh flattens argv into one remote command line — quote the -lc payload
-    return ["ssh", "-o", "BatchMode=yes", host, "bash", "-lc", shlex.quote(inner)]
+def _wrap_ssh(remote, cmd, env_extra):
+    """Run the command on a remote machine: the executable is resolved by that
+    machine's PATH, the provider env is passed along in its shell's dialect."""
+    from .remote import ssh_command
+    argv = [os.path.basename(cmd[0]), *cmd[1:]]
+    return ssh_command(remote, argv, env_extra)
 
 
 def execute_task(task):
@@ -300,12 +296,12 @@ def execute_task(task):
 
     host = None
     if machine:
-        from .config import load_machines
+        from .config import load_machines, machine_remote
         m = load_machines().get(machine)
         if not m or not m.get("host"):
             db.mark_failed(task.id, f"Машина «{machine}» не найдена в реестре")
             return
-        host = m["host"]
+        host = machine_remote(m)
 
     if provider_cfg.get("executor") == "herdr":
         # herdr sessions work the same way on any machine: the CLI calls go
