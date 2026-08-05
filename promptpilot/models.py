@@ -33,6 +33,7 @@ class TaskCreate(BaseModel):
     detached: bool = False  # if True: start process and mark completed immediately (for servers/bots)
     keep_pane: bool = True  # herdr executor: keep the live session open after success
     herdr_target: Optional[str] = None  # herdr: send the prompt into an EXISTING session (agent name or pane id)
+    machine: Optional[str] = None  # run on a registered remote machine (machines.json) over ssh
 
 
 class TaskUpdate(BaseModel):
@@ -69,6 +70,7 @@ class TaskInDB(BaseModel):
     detached: bool = False
     keep_pane: bool = True
     herdr_target: Optional[str] = None
+    machine: Optional[str] = None
 
 
 class Stats(BaseModel):

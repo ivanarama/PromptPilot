@@ -273,12 +273,29 @@ def _execute_herdr_task(task, provider_cfg):
     _maybe_recur(task)
 
 
+def _wrap_ssh(host, cmd, env_extra):
+    """Run the command on a remote machine: basename resolved by the remote
+    login-shell PATH, provider env passed via `env K=V`."""
+    import shlex
+    remote = list(cmd)
+    remote[0] = os.path.basename(remote[0])
+    envp = [f"{k}={v}" for k, v in (env_extra or {}).items() if v]
+    inner = " ".join(shlex.quote(x) for x in ((["env", *envp] if envp else []) + remote))
+    # ssh flattens argv into one remote command line — quote the -lc payload
+    return ["ssh", "-o", "BatchMode=yes", host, "bash", "-lc", shlex.quote(inner)]
+
+
 def execute_task(task):
     """Run CLI with the task's prompt."""
     provider = task.provider or DEFAULT_CLI
 
     provider_cfg = load_providers().get(provider, {})
+    machine = getattr(task, "machine", None)
+
     if provider_cfg.get("executor") == "herdr":
+        if machine:
+            db.mark_failed(task.id, f"herdr-провайдеры пока выполняются только локально (машина «{machine}»)")
+            return
         _execute_herdr_task(task, provider_cfg)
         return
 
@@ -286,12 +303,24 @@ def execute_task(task):
 
     env = get_provider_env(provider)
 
-    # On Windows, .cmd/.bat wrappers (e.g. npm-installed CLIs like qwen) are
-    # invisible to subprocess without shell=True.  shutil.which() resolves the
-    # full path including extension so subprocess can find and run them directly.
-    resolved = shutil.which(cmd[0], path=env.get("PATH"))
-    if resolved:
-        cmd[0] = resolved
+    if machine:
+        from .config import load_machines
+        m = load_machines().get(machine)
+        if not m or not m.get("host"):
+            db.mark_failed(task.id, f"Машина «{machine}» не найдена в реестре")
+            return
+        if task.detached:
+            db.mark_failed(task.id, "Фоновый запуск (detached) на удалённой машине пока не поддерживается")
+            return
+        cmd = _wrap_ssh(m["host"], cmd, provider_cfg.get("env"))
+        env = os.environ.copy()
+    else:
+        # On Windows, .cmd/.bat wrappers (e.g. npm-installed CLIs like qwen) are
+        # invisible to subprocess without shell=True.  shutil.which() resolves the
+        # full path including extension so subprocess can find and run them directly.
+        resolved = shutil.which(cmd[0], path=env.get("PATH"))
+        if resolved:
+            cmd[0] = resolved
 
     # Detached mode: start process and return immediately — for servers/bots that run forever
     if task.detached:

@@ -38,7 +38,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     task_timeout INTEGER,
     detached INTEGER NOT NULL DEFAULT 0,
     keep_pane INTEGER NOT NULL DEFAULT 1,
-    herdr_target TEXT
+    herdr_target TEXT,
+    machine TEXT
 );
 
 CREATE TABLE IF NOT EXISTS settings (
@@ -74,6 +75,7 @@ MIGRATIONS = [
     "ALTER TABLE tasks ADD COLUMN detached INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE tasks ADD COLUMN keep_pane INTEGER NOT NULL DEFAULT 1",
     "ALTER TABLE tasks ADD COLUMN herdr_target TEXT",
+    "ALTER TABLE tasks ADD COLUMN machine TEXT",
     """CREATE TABLE IF NOT EXISTS notifications (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         task_id INTEGER,
@@ -133,8 +135,8 @@ def init_db():
 def create_task(task: TaskCreate) -> TaskInDB:
     with _connect() as conn:
         cur = conn.execute(
-            """INSERT INTO tasks (prompt, working_dir, provider, status, priority, scheduled_at, created_at, max_retries, skip_permissions, model, session_id, parent_task_id, tg_chat_id, recurrence, task_timeout, detached, keep_pane, herdr_target)
-               VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            """INSERT INTO tasks (prompt, working_dir, provider, status, priority, scheduled_at, created_at, max_retries, skip_permissions, model, session_id, parent_task_id, tg_chat_id, recurrence, task_timeout, detached, keep_pane, herdr_target, machine)
+               VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 task.prompt,
                 task.working_dir,
@@ -153,6 +155,7 @@ def create_task(task: TaskCreate) -> TaskInDB:
                 int(task.detached),
                 int(task.keep_pane),
                 task.herdr_target,
+                task.machine,
             ),
         )
         return get_task(cur.lastrowid, conn=conn)

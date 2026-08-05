@@ -327,6 +327,70 @@ def set_provider_hidden(name: str, hidden: bool) -> bool:
     return True
 
 
+def _machines_file() -> Path:
+    return DB_DIR / "machines.json"
+
+
+def load_machines() -> dict:
+    """Registry of remote machines: {name: {host, providers: [...]}}."""
+    f = _machines_file()
+    if f.exists():
+        try:
+            with open(f) as fp:
+                return json.load(fp)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def save_machine(name: str, host: str, providers: list = None):
+    machines = load_machines()
+    machines[name] = {"host": host, "providers": providers or []}
+    DB_DIR.mkdir(parents=True, exist_ok=True)
+    with open(_machines_file(), "w") as f:
+        json.dump(machines, f, ensure_ascii=False, indent=2)
+
+
+def remove_machine(name: str) -> bool:
+    machines = load_machines()
+    if name not in machines:
+        return False
+    del machines[name]
+    with open(_machines_file(), "w") as f:
+        json.dump(machines, f, ensure_ascii=False, indent=2)
+    return True
+
+
+def probe_machine(host: str) -> list:
+    """Which providers work on the remote machine (login-shell PATH lookup
+    of each cmd-provider's executable basename). herdr providers are
+    local-only for now and are never probed."""
+    import subprocess
+    bases = {}
+    for name, info in load_providers().items():
+        if info.get("executor") or info.get("hidden"):
+            continue
+        parts = (info.get("cmd") or "").split()
+        if parts:
+            bases[name] = os.path.basename(parts[0])
+    if not bases:
+        return []
+    import shlex
+    script = "for c in %s; do command -v \"$c\" >/dev/null 2>&1 && echo \"$c\"; done" % " ".join(
+        sorted(set(bases.values())))
+    try:
+        # ssh flattens argv into one remote command line — quote the script
+        proc = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host,
+             "bash", "-lc", shlex.quote(script)],
+            capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    found = set(proc.stdout.split())
+    return sorted(name for name, b in bases.items() if b in found)
+
+
 def provider_available(info: dict) -> bool:
     """True when the provider's executable is present on this machine."""
     import shutil

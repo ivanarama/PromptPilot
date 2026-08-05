@@ -32,7 +32,7 @@ from telegram.ext import (
 from . import db
 from .config import (
     DEFAULT_CLI, HERDR_BIN, HERDR_WATCH, HERDR_WATCH_INTERVAL,
-    get_skills, load_providers, load_providers_detailed, pickable_providers,
+    get_skills, load_machines, load_providers, load_providers_detailed, pickable_providers,
     PROJECTS_ROOT, TASK_PASSWORD,
 )
 from .models import TaskCreate, TaskStatus
@@ -41,7 +41,7 @@ from .tg_auth import authorize_user, is_authorized, list_authorized, load_allowe
 logger = logging.getLogger(__name__)
 
 # Conversation states
-ASK_PASSWORD, ASK_PROMPT, ASK_PROVIDER, ASK_PRIORITY, ASK_SKIP_PERMS, ASK_DIR, ASK_DIR_MANUAL, ASK_SCHEDULE, ASK_REPLY, ASK_SKILL_ARGS, ASK_MODEL, ASK_RECURRENCE, ASK_DETACHED, ASK_HERDR_REPLY, ASK_KEEP_PANE, ASK_HERDR_TARGET = range(16)
+ASK_PASSWORD, ASK_PROMPT, ASK_PROVIDER, ASK_PRIORITY, ASK_SKIP_PERMS, ASK_DIR, ASK_DIR_MANUAL, ASK_SCHEDULE, ASK_REPLY, ASK_SKILL_ARGS, ASK_MODEL, ASK_RECURRENCE, ASK_DETACHED, ASK_HERDR_REPLY, ASK_KEEP_PANE, ASK_HERDR_TARGET, ASK_MACHINE = range(17)
 
 PAGE_SIZE = 5
 
@@ -542,10 +542,11 @@ async def add_task_got_password(update: Update, context: ContextTypes.DEFAULT_TY
     return ASK_PROMPT
 
 
-async def add_task_got_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["new_prompt"] = update.message.text
-
+def _provider_buttons(machine: str = None):
     providers = pickable_providers()
+    if machine:
+        allowed = set(load_machines().get(machine, {}).get("providers") or [])
+        providers = {n: i for n, i in providers.items() if n in allowed}
     row, buttons = [], []
     for name in providers:
         row.append(InlineKeyboardButton(name, callback_data=f"pickprov:{name}"))
@@ -554,6 +555,22 @@ async def add_task_got_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE
             row = []
     if row:
         buttons.append(row)
+    return buttons
+
+
+async def add_task_got_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["new_prompt"] = update.message.text
+
+    machines = load_machines()
+    if machines:
+        buttons = [[InlineKeyboardButton("💻 Локально", callback_data="machine:")]]
+        buttons += [[InlineKeyboardButton(f"🖥 {n} ({m.get('host')})", callback_data=f"machine:{n}")]
+                    for n, m in machines.items()]
+        await update.message.reply_text("Где выполнить задачу?",
+                                        reply_markup=InlineKeyboardMarkup(buttons))
+        return ASK_MACHINE
+
+    buttons = _provider_buttons()
     buttons.append([InlineKeyboardButton("⬛ По умолчанию", callback_data="pickprov:")])
 
     await update.message.reply_text(
@@ -584,6 +601,19 @@ def _model_keyboard(provider: str) -> InlineKeyboardMarkup:
     if row:
         buttons.append(row)
     return InlineKeyboardMarkup(buttons)
+
+
+async def add_task_got_machine(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    machine = query.data.split(":", 1)[1] or None
+    context.user_data["new_machine"] = machine
+    buttons = _provider_buttons(machine)
+    if not buttons:
+        await query.edit_message_text("На этой машине нет известных провайдеров — перепроверь её в ⚙ настройках.")
+        return ConversationHandler.END
+    await query.edit_message_text("Выберите провайдера:", reply_markup=InlineKeyboardMarkup(buttons))
+    return ASK_PROVIDER
 
 
 async def add_task_got_provider(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1025,6 +1055,7 @@ async def _finish_add_task_from_query(query, context):
     detached = context.user_data.pop("new_detached", False)
     keep_pane = context.user_data.pop("new_keep_pane", True)
     herdr_target = context.user_data.pop("new_herdr_target", None)
+    machine = context.user_data.pop("new_machine", None)
 
     task = db.create_task(TaskCreate(
         prompt=prompt,
@@ -1039,6 +1070,7 @@ async def _finish_add_task_from_query(query, context):
         detached=detached,
         keep_pane=keep_pane,
         herdr_target=herdr_target,
+        machine=machine,
     ))
 
     sched_str = scheduled_at.strftime("%d.%m.%Y %H:%M UTC") if scheduled_at else "сейчас"
@@ -1067,6 +1099,7 @@ async def _finish_add_task(update: Update, context: ContextTypes.DEFAULT_TYPE, w
     detached = context.user_data.pop("new_detached", False)
     keep_pane = context.user_data.pop("new_keep_pane", True)
     herdr_target = context.user_data.pop("new_herdr_target", None)
+    machine = context.user_data.pop("new_machine", None)
 
     task = db.create_task(TaskCreate(
         prompt=prompt,
@@ -1081,6 +1114,7 @@ async def _finish_add_task(update: Update, context: ContextTypes.DEFAULT_TYPE, w
         detached=detached,
         keep_pane=keep_pane,
         herdr_target=herdr_target,
+        machine=machine,
     ))
 
     sched_str = scheduled_at.strftime("%d.%m.%Y %H:%M UTC") if scheduled_at else "сейчас"
@@ -1100,7 +1134,7 @@ async def _finish_add_task(update: Update, context: ContextTypes.DEFAULT_TYPE, w
 async def add_task_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for key in ("new_prompt", "new_provider", "new_priority", "new_dir", "new_schedule",
                 "new_recurrence", "new_detached", "new_keep_pane", "new_model",
-                "new_skip_permissions", "new_skill_name", "new_herdr_target"):
+                "new_skip_permissions", "new_skill_name", "new_herdr_target", "new_machine"):
         context.user_data.pop(key, None)
     await update.message.reply_text("Отменено.", reply_markup=_main_menu())
     return ConversationHandler.END
@@ -1665,6 +1699,9 @@ def run_bot():
             ],
             ASK_HERDR_TARGET: [
                 CallbackQueryHandler(add_task_got_herdr_target, pattern=r"^hstarget:"),
+            ],
+            ASK_MACHINE: [
+                CallbackQueryHandler(add_task_got_machine, pattern=r"^machine:"),
             ],
             ASK_DIR: [
                 CallbackQueryHandler(cb_dir_open, pattern=r"^dir_open:"),

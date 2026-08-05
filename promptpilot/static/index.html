@@ -442,6 +442,9 @@
       <label id="modelLabel" style="display:none">Model
         <select id="modelInput"></select>
       </label>
+      <label id="machineLabel" style="display:none">Машина
+        <select id="machineInput" onchange="updateProvidersForMachine()"></select>
+      </label>
       <label id="herdrTargetLabel" style="display:none">Сессия
         <select id="herdrTargetInput" style="max-width:280px"></select>
       </label>
@@ -502,6 +505,16 @@
   <div class="modal">
     <h2>Провайдеры <button class="btn btn-sm btn-ghost" style="margin-left:auto" onclick="closeProviders()">✕ Закрыть</button></h2>
     <div id="provList"></div>
+    <div style="border-top:1px solid var(--border); margin-top:14px; padding-top:14px">
+      <b style="font-size:14px">🖥 Машины (удалённое выполнение по SSH)</b>
+      <div id="machineList" style="margin-top:8px"></div>
+      <form style="display:flex; gap:8px; margin-top:8px" onsubmit="return machineAdd(event)">
+        <input id="mfName" placeholder="имя (vm2)" required style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:inherit;padding:7px 10px;font-size:13px">
+        <input id="mfHost" placeholder="user@host" required style="flex:1;background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:inherit;padding:7px 10px;font-size:13px">
+        <button class="btn btn-primary" type="submit">Добавить и проверить</button>
+      </form>
+      <div id="mfError" style="color:var(--red); font-size:13px; margin-top:4px"></div>
+    </div>
     <form class="prov-form" onsubmit="return provAdd(event)">
       <b style="font-size:14px">Добавить / изменить провайдера</b>
       <input id="pfName" placeholder="имя (латиница, цифры, - _)" required>
@@ -735,6 +748,7 @@ async function addTask() {
       skip_permissions: skipPermissions,
       keep_pane: document.getElementById('keepPane').checked,
       herdr_target: herdrTarget,
+      machine: document.getElementById('machineInput').value || null,
       scheduled_at: schedule ? new Date(schedule).toISOString() : null,
       recurrence,
       task_timeout: taskTimeout,
@@ -799,6 +813,7 @@ document.getElementById('filterBar').addEventListener('click', e => {
 async function openProviders() {
   document.getElementById('provModal').classList.add('open');
   await renderProvList();
+  await renderMachineList();
 }
 function closeProviders() { document.getElementById('provModal').classList.remove('open'); }
 
@@ -855,14 +870,52 @@ function provEdit(name) {
   document.getElementById('pfArgs').value = (p.args || []).join(' ');
   document.getElementById('pfKeep').checked = !!p.keep_pane;
   document.getElementById('pfModels').value = (p.models || []).join(', ');
-  // secrets are masked in the listing — don't round-trip *** back into the config
+  window.pfSourceName = name;
   document.getElementById('pfEnv').value = Object.entries(p.env || {})
-    .filter(([, v]) => v !== '***').map(([k, v]) => `${k}=${v}`).join('\n');
+    .map(([k, v]) => `${k}=${v}`).join('\n');
   const masked = Object.values(p.env || {}).includes('***');
   document.getElementById('pfError').textContent =
-    'Сохранение с этим именем перезапишет провайдера.' + (masked ? ' Скрытые env-секреты нужно ввести заново.' : '');
+    'Сохранение с этим именем перезапишет провайдера; смените имя — создастся копия.'
+    + (masked ? ' Строки со значением *** — сохранённые секреты: оставьте как есть или впишите новое значение.' : '');
   document.getElementById('pfName').scrollIntoView({ behavior: 'smooth', block: 'center' });
   pfTypeChange();
+}
+
+async function renderMachineList() {
+  await loadMachines();
+  document.getElementById('machineList').innerHTML = Object.entries(machinesData).map(([n, m]) =>
+    `<div class="prov-row"><span class="prov-name">${esc(n)}</span>
+     <span class="prov-badge">${esc(m.host)}</span>
+     <div class="prov-cmd">провайдеры: ${esc((m.providers || []).join(', ') || '—')}</div>
+     <div class="prov-actions">
+       <button class="btn btn-sm btn-ghost" onclick="machineProbe('${esc(n)}')">Перепроверить</button>
+       <button class="btn btn-sm btn-danger" onclick="machineDelete('${esc(n)}')">Удалить</button>
+     </div></div>`).join('') || '<div class="prov-cmd">пока нет машин</div>';
+}
+
+async function machineAdd(e) {
+  e.preventDefault();
+  const err = document.getElementById('mfError');
+  err.textContent = '';
+  try {
+    const resp = await fetch(`${API}/machines`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: document.getElementById('mfName').value.trim(), host: document.getElementById('mfHost').value.trim() }) });
+    if (!resp.ok) { const d = await resp.json().catch(() => ({})); throw new Error(d.detail || `HTTP ${resp.status}`); }
+    document.getElementById('mfName').value = ''; document.getElementById('mfHost').value = '';
+    await renderMachineList();
+  } catch (e2) { err.textContent = e2.message; }
+  return false;
+}
+
+async function machineProbe(name) {
+  await fetchJSON(`${API}/machines/${encodeURIComponent(name)}/probe`, { method: 'POST' });
+  await renderMachineList();
+}
+
+async function machineDelete(name) {
+  if (!confirm(`Удалить машину «${name}»?`)) return;
+  await fetchJSON(`${API}/machines/${encodeURIComponent(name)}`, { method: 'DELETE' });
+  await renderMachineList();
 }
 
 function pfTypeChange() {
@@ -883,6 +936,7 @@ async function provAdd(e) {
   });
   const body = {
     name: document.getElementById('pfName').value.trim(),
+    source_name: window.pfSourceName || null,
     description: document.getElementById('pfDesc').value.trim(),
     env,
     models: document.getElementById('pfModels').value.split(',').map(s => s.trim()).filter(Boolean),
@@ -909,6 +963,7 @@ async function provAdd(e) {
     document.getElementById('pfEnv').value = '';
     document.getElementById('pfModels').value = '';
     document.getElementById('pfArgs').value = '';
+    window.pfSourceName = null;
     await renderProvList();
     await loadProviders();
   } catch (err) {
@@ -954,8 +1009,33 @@ document.getElementById('promptInput').addEventListener('keydown', e => {
 });
 
 // --- Load providers into dropdown ---
+let machinesData = {};
+
+async function loadMachines() {
+  try { machinesData = await fetchJSON(`${API}/machines`); } catch (e) { machinesData = {}; }
+  const label = document.getElementById('machineLabel');
+  const sel = document.getElementById('machineInput');
+  const names = Object.keys(machinesData);
+  label.style.display = names.length ? 'flex' : 'none';
+  sel.innerHTML = '<option value="">💻 локально</option>'
+    + names.map(n => `<option value="${esc(n)}">${esc(n)} (${esc(machinesData[n].host)})</option>`).join('');
+}
+
+function updateProvidersForMachine() {
+  const machine = document.getElementById('machineInput').value;
+  const allowed = machine ? (machinesData[machine]?.providers || []) : null;
+  const sel = document.getElementById('providerInput');
+  sel.innerHTML = Object.entries(providersData)
+    .filter(([name, info]) => info.available !== false && !info.hidden)
+    .filter(([name]) => !allowed || allowed.includes(name))
+    .map(([name, info]) => `<option value="${esc(name)}">${esc(name)} — ${esc(info.description || info)}</option>`)
+    .join('');
+  updateSkillsToggle(); updateModelSelect(); updateKeepPane();
+}
+
 async function loadProviders() {
   providersData = await fetchJSON(`${API}/providers`);
+  await loadMachines();
   const sel = document.getElementById('providerInput');
   sel.innerHTML = Object.entries(providersData)
     .filter(([name, info]) => info.available !== false && !info.hidden)

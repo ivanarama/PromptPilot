@@ -186,6 +186,52 @@ def api_herdr_agents():
     ]
 
 
+@app.get("/api/machines")
+def api_machines():
+    from .config import load_machines
+    return load_machines()
+
+
+from pydantic import BaseModel as _PydanticBase
+
+
+class MachineCreate(_PydanticBase):
+    name: str
+    host: str
+
+
+@app.post("/api/machines", status_code=201)
+def api_machine_create(m: MachineCreate):
+    from .config import probe_machine, save_machine
+    import re as __re
+    if not __re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,31}", m.name):
+        raise HTTPException(400, "Имя: латиница/цифры/-/_/. до 32 символов")
+    providers = probe_machine(m.host)
+    if not providers:
+        raise HTTPException(400, "Машина недоступна по ssh или на ней нет ни одного известного CLI")
+    save_machine(m.name, m.host, providers)
+    return {"ok": True, "providers": providers}
+
+
+@app.post("/api/machines/{name}/probe")
+def api_machine_probe(name: str):
+    from .config import load_machines, probe_machine, save_machine
+    machine = load_machines().get(name)
+    if not machine:
+        raise HTTPException(404, "Машина не найдена")
+    providers = probe_machine(machine["host"])
+    save_machine(name, machine["host"], providers)
+    return {"ok": True, "providers": providers}
+
+
+@app.delete("/api/machines/{name}")
+def api_machine_delete(name: str):
+    from .config import remove_machine
+    if not remove_machine(name):
+        raise HTTPException(404, "Машина не найдена")
+    return {"ok": True}
+
+
 import re as _re
 
 from pydantic import BaseModel as _BaseModel
@@ -193,6 +239,7 @@ from pydantic import BaseModel as _BaseModel
 
 class ProviderCreate(_BaseModel):
     name: str
+    source_name: Optional[str] = None  # provider the edit form was opened from
     description: str = ""
     cmd: Optional[str] = None
     executor: Optional[str] = None  # "herdr"
@@ -233,6 +280,19 @@ def api_provider_create(p: ProviderCreate):
     from .config import save_provider
     if not _re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,31}", p.name):
         raise HTTPException(400, "Имя: латиница/цифры/-/_, до 32 символов")
+    # "***" — оставленный без изменений секрет: берём сохранённое значение
+    # (из провайдера-источника при копировании, иначе из одноимённого)
+    if p.env:
+        stored = load_providers().get(p.source_name or p.name, {}).get("env", {})
+        resolved = {}
+        for k, v in p.env.items():
+            if v == "***":
+                if not stored.get(k):
+                    raise HTTPException(400, f"Секрет {k} не найден — введите значение вместо ***")
+                resolved[k] = stored[k]
+            else:
+                resolved[k] = v
+        p.env = resolved
     if p.executor:
         if p.executor != "herdr":
             raise HTTPException(400, "Поддерживаемый executor: herdr")
