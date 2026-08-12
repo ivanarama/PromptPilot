@@ -136,6 +136,31 @@ def list_tasks(status, limit):
         click.echo(f"{t.id:>5}  {status_str}  {t.priority:>1}  {t.retry_count:>3}/{t.max_retries:<3}  {prompt_short}")
 
 
+@cli.command("usage")
+@click.option("--hours", default=5.0, help="Окно в часах (по умолчанию 5 — окно лимита)")
+@click.option("--json", "as_json", is_flag=True, help="Машинно-читаемо")
+def usage_cmd(hours, as_json):
+    """Расход за окно — по всем сессиям Claude Code, не только по задачам pp."""
+    import json as _json
+    from .usage import summary
+
+    data = summary(hours)
+    if as_json:
+        click.echo(_json.dumps(data, ensure_ascii=False, indent=2))
+        return
+
+    click.echo(f"За последние {data['window_hours']:g} ч — оценка по прайсу API:")
+    click.echo(f"  всего:   ${data['cost']:.2f}   {data['tokens'] / 1e6:.1f} млн токенов"
+               f"   сессий: {data['sessions']}")
+    click.echo(f"  задачи:  ${data['cost_tasks']:.2f}")
+    click.echo(f"  прочее:  ${data['cost_other']:.2f}   (живая переписка ест то же окно лимита)")
+    if data["top"]:
+        click.echo("\n  Дороже всего:")
+        for row in data["top"]:
+            mark = "задача" if row["task"] else "  —   "
+            click.echo(f"    ${row['cost']:>8.2f}  {mark}  {row['model']:<18}  {row['dir']}")
+
+
 @cli.command("guard-hook", hidden=True)
 @click.option("--data-dir", default=None, help="Where guard.json and guard.log live")
 def guard_hook(data_dir):

@@ -112,6 +112,21 @@ def api_cost_stats():
     return db.get_cost_stats()
 
 
+@app.get("/api/stats/usage")
+def api_usage(hours: float = 5.0):
+    """Расход за окно лимита по ВСЕМ сессиям Claude Code на машине.
+
+    Отдельно от /stats/costs: тот считает по результатам задач и herdr-задач не
+    видит вовсе. Разбор транскриптов идёт синхронно, но по mtime отсеиваются все
+    файлы вне окна — на сотнях сессий это доли секунды.
+    """
+    from .usage import summary
+    try:
+        return summary(hours)
+    except Exception as e:  # дашборд не должен падать из-за чужого журнала
+        return {"error": f"{type(e).__name__}: {e}", "cost": 0, "sessions": 0}
+
+
 @app.get("/api/worker/status")
 def api_worker_status():
     return {"paused": db.is_paused()}

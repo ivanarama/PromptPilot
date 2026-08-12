@@ -1255,19 +1255,39 @@ async function loadVersion() {
 
 // --- Cost stats ---
 async function loadCosts() {
+  const items = [];
+  // Окно лимита — по всем сессиям Claude Code на машине. Идёт первым: лимит
+  // общий, и живая переписка ест его наравне с задачами.
+  try {
+    const u = await fetchJSON(`${API}/stats/usage`);
+    if (u && !u.error && u.sessions > 0) {
+      items.push(
+        `<div class="cost-item" title="Оценка по прайсу API за последние ${u.window_hours} ч — по всем сессиям Claude Code, не только по задачам">`
+        + `Окно ${u.window_hours}ч: <span>$${u.cost.toFixed(2)}</span></div>`,
+        `<div class="cost-item" title="из них задачи pp (узнаются по session_id и по своему worktree)">`
+        + `задачи: <span>$${u.cost_tasks.toFixed(2)}</span></div>`,
+        `<div class="cost-item" title="живая переписка и прочие сессии — едят то же окно лимита">`
+        + `прочее: <span>$${u.cost_other.toFixed(2)}</span></div>`,
+        `<div class="cost-item">${(u.tokens / 1e6).toFixed(1)} млн ток.</div>`);
+    }
+  } catch (_) {}
+
   try {
     const c = await fetchJSON(`${API}/stats/costs`);
-    if (c.total <= 0) return;
-    const bar = document.getElementById('costBar');
-    bar.innerHTML = [
-      `<div class="cost-item">Today: <span>$${c.today.toFixed(4)}</span></div>`,
-      `<div class="cost-item">Week: <span>$${c.week.toFixed(4)}</span></div>`,
-      `<div class="cost-item">Total: <span>$${c.total.toFixed(4)}</span></div>`,
-      ...Object.entries(c.by_provider).map(([p, v]) =>
-        `<div class="cost-item">${esc(p)}: <span>$${v.toFixed(4)}</span></div>`),
-    ].join('');
-    bar.classList.add('visible');
+    if (c.total > 0) {
+      items.push(
+        `<div class="cost-item">Today: <span>$${c.today.toFixed(4)}</span></div>`,
+        `<div class="cost-item">Week: <span>$${c.week.toFixed(4)}</span></div>`,
+        `<div class="cost-item">Total: <span>$${c.total.toFixed(4)}</span></div>`,
+        ...Object.entries(c.by_provider).map(([p, v]) =>
+          `<div class="cost-item">${esc(p)}: <span>$${v.toFixed(4)}</span></div>`));
+    }
   } catch (_) {}
+
+  if (!items.length) return;
+  const bar = document.getElementById('costBar');
+  bar.innerHTML = items.join('');
+  bar.classList.add('visible');
 }
 
 // --- Init ---
