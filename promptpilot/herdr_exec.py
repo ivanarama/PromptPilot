@@ -260,6 +260,19 @@ def _looks_rate_limited(cleaned: str) -> bool:
     return bool(RATE_LIMIT_RE.search(response_only))
 
 
+def _looks_env_failure(cleaned: str) -> str:
+    """Did the API shut the door, rather than the task failing?
+
+    Same echoed-prompt filtering as the rate-limit scan: a prompt that talks
+    about a 403 must not be read as one.
+    """
+    from .worker import env_failure
+    response_only = "\n".join(
+        l for l in cleaned.splitlines() if not l.lstrip().startswith("❯")
+    )
+    return env_failure(response_only)
+
+
 def _wait_settled(name, until_args, deadline, cancel_check, host=None):
     """Wait for the agent in 10s chunks so cancel/timeout stay responsive.
 
@@ -296,7 +309,7 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
     Raises nothing: all herdr failures are reported via the outcome dict.
     """
     outcome = {"ok": False, "rate_limited": False, "cancelled": False,
-               "output": "", "error": "", "pane_id": "",
+               "output": "", "error": "", "pane_id": "", "env_failure": "",
                "worktree_path": "", "worktree_branch": ""}
     attach = attach_hint(host)
     workspace_id = ""  # set only when the task got its own worktree workspace
@@ -497,6 +510,13 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
         if _looks_rate_limited(cleaned):
             close_tab()  # no-op for target mode (foreign pane)
             outcome["rate_limited"] = True
+            outcome["error"] = cleaned
+            return outcome
+
+        env_marker = _looks_env_failure(cleaned)
+        if env_marker:
+            close_tab()
+            outcome["env_failure"] = env_marker
             outcome["error"] = cleaned
             return outcome
 

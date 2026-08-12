@@ -634,6 +634,10 @@ WORKTREE_COPY = [p.strip() for p in os.environ.get("PP_WORKTREE_COPY", ".env").s
 
 # How many tasks the worker runs at once. 1 = the historical sequential worker.
 CONCURRENCY = max(1, int(os.environ.get("PP_CONCURRENCY", "1")))
+# Don't start another agent with less than this much RAM available (MB).
+# Slots alone say nothing about whether the box can carry one more run: what
+# it actually does is swap, and then the API starts refusing. 0 = no check.
+MIN_FREE_MB = int(os.environ.get("PP_MIN_FREE_MB", "0"))
 
 # Guard — hard limits for unattended runs, enforced by a PreToolUse hook
 # (see promptpilot/guard.py). "auto" wires it into exactly the runs where

@@ -3,6 +3,7 @@
 import json
 import os
 import random
+import re
 import shutil
 import signal
 import subprocess
@@ -11,8 +12,9 @@ import time
 from datetime import datetime, timedelta, timezone
 
 from . import db, worktree
-from .config import (BASE_DELAY, CONCURRENCY, DEFAULT_CLI, MAX_DELAY, POLL_INTERVAL,
-                     TASK_TIMEOUT, build_cmd, get_provider_env, load_providers)
+from .config import (BASE_DELAY, CONCURRENCY, DEFAULT_CLI, MAX_DELAY, MIN_FREE_MB,
+                     POLL_INTERVAL, TASK_TIMEOUT, build_cmd, get_provider_env,
+                     load_providers)
 
 RATE_LIMIT_PATTERNS = [
     "rate limit",
@@ -32,6 +34,30 @@ def is_rate_limited(stderr: str, exit_code: int) -> bool:
         return False
     text = stderr.lower()
     return any(p in text for p in RATE_LIMIT_PATTERNS)
+
+
+# The run died on the environment, not on the task: the door was shut (auth,
+# 403, a 5xx) or the answer was cut off mid-sentence. Blaming the task for
+# these buries work that was usually already done — the last word just never
+# arrived. Such a run goes back into the queue instead, still bounded by
+# max_retries so a permanently broken environment cannot loop forever.
+ENV_FAILURE_RE = re.compile(
+    r"API Error:\s*(?:401|403|5\d\d)"
+    r"|Failed to authenticate"
+    r"|Connection closed mid-response"
+    r"|terminal_reason[\"'\s:=]+api_error"
+    r"|Connection reset by peer"
+    # Socket error codes stay case-SENSITIVE: lowercased, "ENOTFOUND" hides
+    # inside "ModuleNotFoundError" and every missing import becomes an outage.
+    r"|(?-i:\bECONNRESET\b|\bETIMEDOUT\b|\bENOTFOUND\b|\bEAI_AGAIN\b)",
+    re.IGNORECASE,
+)
+
+
+def env_failure(text: str) -> str:
+    """The bit of text proving the environment failed, or "" if it did not."""
+    m = ENV_FAILURE_RE.search(text or "")
+    return m.group(0) if m else ""
 
 
 def compute_next_run(retry_count: int) -> datetime:
@@ -235,6 +261,25 @@ def _maybe_recur(task):
     print(f"  -> Recurring: next run at {next_dt.strftime('%Y-%m-%d %H:%M UTC')}")
 
 
+def _requeue_env_failure(task, marker: str, detail: str):
+    """Hand the task back to the queue: the environment failed, not the task.
+
+    Accounted against max_retries like a rate limit, so an environment that is
+    broken for good ends up failing the task instead of retrying forever.
+    """
+    if task.retry_count >= task.max_retries:
+        db.mark_failed(task.id, f"Срыв по вине среды ({marker}), "
+                                f"попытки исчерпаны ({task.max_retries}).\n{detail}")
+        print(f"  -> Env failure ({marker}), retries exhausted")
+        return
+    next_run = compute_next_run(task.retry_count)
+    db.mark_rate_limited(task.id, next_run,
+                         error=f"Срыв по вине среды ({marker}) — "
+                               f"задача возвращена в очередь.\n{detail}")
+    print(f"  -> Env failure ({marker}). Retry #{task.retry_count + 1} "
+          f"at {next_run.strftime('%H:%M:%S')}")
+
+
 def _execute_herdr_task(task, provider_cfg, host=None, machine=None):
     """Run the task in a live herdr session (providers with executor=herdr).
 
@@ -280,6 +325,10 @@ def _execute_herdr_task(task, provider_cfg, host=None, machine=None):
         next_run = compute_next_run(task.retry_count)
         db.mark_rate_limited(task.id, next_run, error=outcome["error"] or "Rate limited")
         print(f"  -> Rate limited. Retry #{task.retry_count + 1} at {next_run.strftime('%H:%M:%S')}")
+        return
+
+    if outcome.get("env_failure"):
+        _requeue_env_failure(task, outcome["env_failure"], outcome["error"])
         return
 
     if not outcome["ok"]:
@@ -448,6 +497,10 @@ def execute_task(task):
         elif is_stream_json(result.stdout):
             parsed = parse_stream_json(result.stdout)
             error_text = format_result(parsed) or error_text
+        marker = env_failure(result.stderr) or env_failure(result.stdout)
+        if marker:
+            _requeue_env_failure(task, marker, error_text)
+            return
         db.mark_failed(task.id, error_text, exit_code=result.returncode)
         print(f"  -> Failed (exit {result.returncode})")
         return
@@ -497,6 +550,46 @@ def _code_snapshot():
         return {str(f): f.stat().st_mtime for f in base.glob("*.py")}
     except OSError:
         return None
+
+
+def free_mb():
+    """Memory actually available for one more agent, or None if unmeasurable.
+
+    Unmeasurable must not mean "blocked": on a platform where this cannot be
+    read the queue has to keep moving.
+    """
+    try:  # Linux: MemAvailable is the honest number, MemFree is not
+        with open("/proc/meminfo", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) // 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    try:  # Windows, without dragging in psutil
+        import ctypes
+
+        class _Status(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+        st = _Status()
+        st.dwLength = ctypes.sizeof(_Status)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+            return int(st.ullAvailPhys) // (1024 * 1024)
+    except Exception:
+        pass
+    return None
+
+
+def enough_memory() -> bool:
+    """False only when we measured the memory and it is genuinely short."""
+    if MIN_FREE_MB <= 0:
+        return True
+    free = free_mb()
+    return free is None or free >= MIN_FREE_MB
 
 
 def lock_key(task) -> str:
@@ -552,6 +645,7 @@ def run_worker():
 
     pool = None
     in_flight = {}  # Future -> lock key held while it runs
+    short_on_memory = False
     if CONCURRENCY > 1:
         from concurrent.futures import ThreadPoolExecutor
         pool = ThreadPoolExecutor(max_workers=CONCURRENCY, thread_name_prefix="pp-task")
@@ -579,6 +673,16 @@ def run_worker():
         if db.is_paused() or len(in_flight) >= CONCURRENCY:
             time.sleep(POLL_INTERVAL)
             continue
+
+        if not enough_memory():
+            # Say it once per shortage, not every poll — the log is for reading.
+            if not short_on_memory:
+                short_on_memory = True
+                print(f"Мало памяти ({free_mb()} МБ < {MIN_FREE_MB}) — новые задачи не берём",
+                      flush=True)
+            time.sleep(POLL_INTERVAL)
+            continue
+        short_on_memory = False
 
         task = db.get_next_runnable(
             busy_keys=[k for k in in_flight.values() if k], key_fn=lock_key)
