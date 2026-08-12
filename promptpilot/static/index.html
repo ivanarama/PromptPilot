@@ -683,6 +683,8 @@ async function loadTasks() {
         <span class="task-prompt">${esc(t.prompt)}</span>
         ${t.working_dir ? `<span class="task-meta">📁 ${esc(t.working_dir.split(/[/\\]/).filter(Boolean).pop() || t.working_dir)}</span>` : ''}
         ${t.worktree ? `<span class="task-meta" title="отдельный git worktree">🌿 ${esc(t.worktree_branch || 'worktree')}</span>` : ''}
+        ${t.verdict ? `<span class="task-meta" title="итог, которым задача сама себя закрыла">${verdictIcon(t.verdict)} ${esc(t.verdict)}</span>` : ''}
+        ${t.note ? `<span class="task-meta" title="${escAttr(t.note)}">✎ приписка</span>` : ''}
         ${t.provider ? `<span class="task-meta">${esc(t.provider)}</span>` : ''}
         ${scheduleInfo(t)}
         <span class="task-meta">P${t.priority}</span>
@@ -697,6 +699,14 @@ async function loadTasks() {
 
         ${t.working_dir ? `<div class="detail-info"><span class="label">Dir: </span><span>${esc(t.working_dir)}</span></div>` : ''}
         ${t.worktree ? `<div class="detail-info"><span class="label">Worktree: </span><span>${esc(t.worktree_path || 'ещё не создан')}</span>${t.worktree_branch ? ` <span class="label">ветка</span> <span>${esc(t.worktree_branch)}</span>` : ''}</div>` : ''}
+
+        <div class="detail-info" style="align-items:center;gap:6px">
+          <span class="label">Дописать решателю: </span>
+          <input type="text" id="note-${t.id}" value="${escAttr(t.note || '')}"
+                 placeholder="пара фраз — уйдут в следующий прогон этой задачи"
+                 style="flex:1;min-width:220px" onclick="event.stopPropagation()">
+          <button class="btn" onclick="saveNote(event, ${t.id})">Записать</button>
+        </div>
 
         ${resultHTML}
 
@@ -766,6 +776,21 @@ async function addTask() {
   document.getElementById('promptInput').value = '';
   document.getElementById('recurrenceInput').value = '';
   document.getElementById('timeoutInput').value = '';
+  refresh();
+}
+
+function verdictIcon(v) {
+  return { 'ГОТОВО': '✅', 'УЖЕ СДЕЛАНО': '✅', 'НУЖЕН ЧЕЛОВЕК': '🟡', 'НЕ СМОГ': '❌' }[v] || '•';
+}
+
+async function saveNote(e, id) {
+  e.stopPropagation();
+  const text = document.getElementById(`note-${id}`).value;
+  await fetchJSON(`${API}/tasks/${id}/note`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text }),
+  });
   refresh();
 }
 

@@ -13,8 +13,8 @@ from datetime import datetime, timedelta, timezone
 
 from . import db, worktree
 from .config import (BASE_DELAY, CONCURRENCY, DEFAULT_CLI, MAX_DELAY, MIN_FREE_MB,
-                     POLL_INTERVAL, TASK_TIMEOUT, build_cmd, get_provider_env,
-                     load_providers)
+                     POLL_INTERVAL, TASK_TIMEOUT, VERDICT_REQUIRED, build_cmd,
+                     get_provider_env, load_providers)
 
 RATE_LIMIT_PATTERNS = [
     "rate limit",
@@ -52,6 +52,77 @@ ENV_FAILURE_RE = re.compile(
     r"|(?-i:\bECONNRESET\b|\bETIMEDOUT\b|\bENOTFOUND\b|\bEAI_AGAIN\b)",
     re.IGNORECASE,
 )
+
+
+# The agent is asked to end with this line so a finished task says WHAT
+# happened, not just that the process exited 0. Parsed whether or not we asked.
+VERDICTS = ("ГОТОВО", "УЖЕ СДЕЛАНО", "НУЖЕН ЧЕЛОВЕК", "НЕ СМОГ")
+VERDICT_RE = re.compile(r"^[ \t>*#-]*ИТОГ:\s*(" + "|".join(VERDICTS) + r")\b", re.M | re.I)
+
+VERDICT_INSTRUCTION = (
+    "\n\nПоследней строкой ответа напиши ровно одну из:\n"
+    "ИТОГ: ГОТОВО — сделано\n"
+    "ИТОГ: УЖЕ СДЕЛАНО — оказалось, что уже исправлено\n"
+    "ИТОГ: НУЖЕН ЧЕЛОВЕК — нужно решение или доступ человека\n"
+    "ИТОГ: НЕ СМОГ — не получилось\n"
+    "После двоеточия можно коротко пояснить причину."
+)
+
+
+def parse_verdict(text: str) -> str:
+    """The task's own last word, or "" if it never said one.
+
+    Last match wins: the agent may quote the format earlier while explaining
+    itself, and only the closing line is the verdict.
+    """
+    matches = VERDICT_RE.findall(text or "")
+    return matches[-1].upper() if matches else ""
+
+
+def effective_prompt(task) -> str:
+    """The prompt as the agent should see it: task, then the human's late word.
+
+    The note goes last and says so explicitly — it is written after the task was
+    already set, usually because the run was going the wrong way, so it has to
+    outrank everything above it.
+    """
+    prompt = task.prompt
+    note = (getattr(task, "note", None) or "").strip()
+    if note:
+        prompt += ("\n\n<приписка>\n"
+                   "Это дописано человеком ПОСЛЕ постановки задачи выше и главнее её.\n"
+                   f"{note}\n</приписка>")
+    if VERDICT_REQUIRED:
+        prompt += VERDICT_INSTRUCTION
+    return prompt
+
+
+def live_task_ids() -> set:
+    """Tasks whose agent process is demonstrably still alive.
+
+    Found by the marker every run carries in its environment, so a run is
+    recognised by the process itself rather than by our own bookkeeping — that
+    is what makes it survive the worker dying. Linux-only and best effort: where
+    it can't be read, nothing is claimed to be alive and the old behaviour holds.
+    """
+    ids = set()
+    try:
+        pids = [p for p in os.listdir("/proc") if p.isdigit()]
+    except OSError:
+        return ids
+    for pid in pids:
+        try:
+            with open(f"/proc/{pid}/environ", "rb") as f:
+                raw = f.read()
+        except OSError:
+            continue  # not ours, or gone between listdir and open
+        for part in raw.split(b"\0"):
+            if part.startswith(b"PP_TASK_ID="):
+                try:
+                    ids.add(int(part.split(b"=", 1)[1]))
+                except ValueError:
+                    pass
+    return ids
 
 
 def env_failure(text: str) -> str:
@@ -238,8 +309,11 @@ def _maybe_recur(task):
     if not next_dt:
         return
     from .models import TaskCreate
+    # The prompt as stored, never the one this run was handed: a one-off note
+    # must not be baked into every future occurrence.
+    stored = db.get_task(task.id)
     db.create_task(TaskCreate(
-        prompt=task.prompt,
+        prompt=(stored.prompt if stored else task.prompt),
         working_dir=task.working_dir,
         provider=task.provider,
         priority=task.priority,
@@ -336,6 +410,9 @@ def _execute_herdr_task(task, provider_cfg, host=None, machine=None):
         print("  -> Failed (herdr)")
         return
 
+    verdict = parse_verdict(outcome["output"])
+    if verdict:
+        db.set_verdict(task.id, verdict)
     db.mark_completed(task.id, outcome["output"], exit_code=0)
     text_preview = outcome["output"][:80].replace("\n", " ").strip()
     print(f"  -> Completed: {text_preview}")
@@ -394,10 +471,13 @@ def execute_task(task):
         wt_note = "\n\n" + worktree.summary(wt["path"], wt["branch"], wt["copied"])
         print(f"  -> Worktree {wt['path']} ({wt['branch']})")
 
-    cmd = build_cmd(provider, task.prompt, skip_permissions=task.skip_permissions,
+    cmd = build_cmd(provider, effective_prompt(task), skip_permissions=task.skip_permissions,
                     session_id=task.session_id, model=task.model, guard=not machine)
 
     env = get_provider_env(provider)
+    # Marks the run in its own environment, inherited by the agent process. That
+    # is what lets a live run be found by process rather than by our bookkeeping.
+    env["PP_TASK_ID"] = str(task.id)
 
     if machine:
         if task.detached:
@@ -527,6 +607,10 @@ def execute_task(task):
         # Plain text output (non-Claude CLIs)
         output = result.stdout
 
+    verdict = parse_verdict(output)
+    if verdict:
+        db.set_verdict(task.id, verdict)
+
     if wt_note:
         output += wt_note
         changes = worktree.status(wt["root"], wt["path"])
@@ -633,8 +717,12 @@ def run_worker():
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
 
-    # Recover any tasks stuck in 'running' from a previous crash
-    db.recover_running()
+    # Recover tasks stuck in 'running' from a previous crash — but leave alone
+    # any whose agent is still working: the worker dying doesn't kill the agent.
+    alive = live_task_ids()
+    if alive:
+        print(f"Живые прогоны найдены по метке в окружении, не трогаю: {sorted(alive)}")
+    db.recover_running(keep_ids=alive)
 
     code_snapshot = _code_snapshot()
 

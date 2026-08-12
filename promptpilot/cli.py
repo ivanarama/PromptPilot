@@ -136,6 +136,30 @@ def list_tasks(status, limit):
         click.echo(f"{t.id:>5}  {status_str}  {t.priority:>1}  {t.retry_count:>3}/{t.max_retries:<3}  {prompt_short}")
 
 
+@cli.command("note")
+@click.argument("task_id", type=int)
+@click.argument("text", required=False)
+@click.option("--clear", is_flag=True, help="Убрать приписку")
+def note_cmd(task_id, text, clear):
+    """Дописать решателю: пара фраз, которые пойдут в следующий прогон задачи."""
+    task = db.get_task(task_id)
+    if not task:
+        click.echo(f"Задача #{task_id} не найдена.")
+        sys.exit(1)
+    if clear:
+        db.set_note(task_id, "")
+        click.echo("Приписка убрана.")
+        return
+    if not text:
+        click.echo(task.note or "(приписки нет)")
+        return
+    db.set_note(task_id, text)
+    click.echo(click.style(f"Приписка записана к #{task_id}.", fg="green"))
+    if task.status.value == "running":
+        click.echo("Прогон уже идёт — она уйдёт в следующий: "
+                   f"«pp cancel {task_id}» вернёт задачу в очередь прямо сейчас.")
+
+
 @cli.command("usage")
 @click.option("--hours", default=5.0, help="Окно в часах (по умолчанию 5 — окно лимита)")
 @click.option("--json", "as_json", is_flag=True, help="Машинно-читаемо")
@@ -216,6 +240,10 @@ def status(task_id):
     click.echo(f"  Retries:   {task.retry_count}/{task.max_retries}")
     if task.working_dir:
         click.echo(f"  Dir:       {task.working_dir}")
+    if task.verdict:
+        click.echo(f"  Итог:      {task.verdict}")
+    if task.note:
+        click.echo(f"  Приписка:  {task.note}")
     if task.worktree:
         click.echo(f"  Worktree:  {task.worktree_path or '(ещё не создан)'}"
                    f"  [{task.worktree_branch or wt_branch(task.id)}]")

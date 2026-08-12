@@ -312,6 +312,8 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
                "output": "", "error": "", "pane_id": "", "env_failure": "",
                "worktree_path": "", "worktree_branch": ""}
     attach = attach_hint(host)
+    from .worker import effective_prompt
+    prompt = effective_prompt(task)  # task + the human's late word, if any
     workspace_id = ""  # set only when the task got its own worktree workspace
     repo_root = ""
     wt_copied = []
@@ -338,7 +340,9 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
             # Remote: the working dir must exist on THAT machine; without one
             # herdr falls back to its own default (the user's home there).
             cwd = task.working_dir or (None if host else ".")
-            env_args = []
+            # PP_TASK_ID marks the run in the pane's environment and is
+            # inherited by the agent, so a live run can be found by process.
+            env_args = ["--env", f"PP_TASK_ID={task.id}"]
             for k, v in (provider_cfg.get("env") or {}).items():
                 if v:
                     env_args += ["--env", f"{k}={v}"]
@@ -429,7 +433,7 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
 
         # Detached: submit the prompt, confirm it landed, leave the pane open.
         if task.detached:
-            rc, data, raw = _run(["agent", "prompt", name, task.prompt,
+            rc, data, raw = _run(["agent", "prompt", name, prompt,
                                   "--wait", "--until", "working", "--timeout", "15000"],
                                  host=host)
             if rc != 0 and _error_code(data) not in ("timeout", "agent_prompt_stalled"):
@@ -448,7 +452,7 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
         # the agent is already working the prompt DID land (resubmit would
         # double it) — wait instead.
         deadline = time.monotonic() + timeout if timeout else None
-        prompt_cmd = ["agent", "prompt", name, task.prompt, "--wait", "--timeout", "10000"]
+        prompt_cmd = ["agent", "prompt", name, prompt, "--wait", "--timeout", "10000"]
         state = ""
         for attempt in range(1, PROMPT_STALL_RETRIES + 1):
             rc, data, raw = _run(prompt_cmd, host=host)
@@ -505,7 +509,7 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
         if rc != 0:
             return fail(f"herdr agent read failed: {raw}")
 
-        cleaned = _trim_transcript(raw, task.prompt)
+        cleaned = _trim_transcript(raw, prompt)
 
         if _looks_rate_limited(cleaned):
             close_tab()  # no-op for target mode (foreign pane)

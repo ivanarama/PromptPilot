@@ -639,6 +639,10 @@ CONCURRENCY = max(1, int(os.environ.get("PP_CONCURRENCY", "1")))
 # it actually does is swap, and then the API starts refusing. 0 = no check.
 MIN_FREE_MB = int(os.environ.get("PP_MIN_FREE_MB", "0"))
 
+# Ask every task to end with "ИТОГ: ..." so a finished task says WHAT happened,
+# not just that the process exited 0. Off by default — it appends to the prompt.
+VERDICT_REQUIRED = os.environ.get("PP_VERDICT", "0") == "1"
+
 # Guard — hard limits for unattended runs, enforced by a PreToolUse hook
 # (see promptpilot/guard.py). "auto" wires it into exactly the runs where
 # nothing else asks anybody: those with --dangerously-skip-permissions.

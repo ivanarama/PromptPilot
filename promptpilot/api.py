@@ -112,6 +112,19 @@ def api_cost_stats():
     return db.get_cost_stats()
 
 
+@app.post("/api/tasks/{task_id}/note")
+def api_set_note(task_id: int, body: dict = None):
+    """Дописать решателю. Пустой текст убирает приписку.
+
+    Живёт при задаче, а не при прогоне: идущий прогон её уже не увидит, зато
+    увидит следующий — в том числе повтор после rate limit или срыва среды.
+    """
+    text = (body or {}).get("text", "")
+    if not db.set_note(task_id, text):
+        raise HTTPException(404, "Задача не найдена")
+    return {"ok": True, "note": text or None}
+
+
 @app.get("/api/stats/usage")
 def api_usage(hours: float = 5.0):
     """Расход за окно лимита по ВСЕМ сессиям Claude Code на машине.

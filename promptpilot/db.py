@@ -42,7 +42,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     machine TEXT,
     worktree INTEGER NOT NULL DEFAULT 0,
     worktree_path TEXT,
-    worktree_branch TEXT
+    worktree_branch TEXT,
+    note TEXT,
+    verdict TEXT
 );
 
 CREATE TABLE IF NOT EXISTS settings (
@@ -90,6 +92,8 @@ MIGRATIONS = [
     "ALTER TABLE tasks ADD COLUMN worktree INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE tasks ADD COLUMN worktree_path TEXT",
     "ALTER TABLE tasks ADD COLUMN worktree_branch TEXT",
+    "ALTER TABLE tasks ADD COLUMN note TEXT",
+    "ALTER TABLE tasks ADD COLUMN verdict TEXT",
 ]
 
 
@@ -238,6 +242,34 @@ def get_next_runnable(busy_keys=(), key_fn=None) -> Optional[TaskInDB]:
         return None
 
 
+def set_note(task_id: int, text: str) -> bool:
+    """Attach the human's late word to a task — or clear it with an empty text.
+
+    Lives on the task, not on the run: a task that comes back from a rate limit
+    or an environment failure must carry the note into its next attempt, and a
+    note written while a run is in flight has to survive that run being killed.
+    """
+    with _connect() as conn:
+        cur = conn.execute("UPDATE tasks SET note = ? WHERE id = ?",
+                           (text or None, task_id))
+        return cur.rowcount > 0
+
+
+def clear_note(task_id: int):
+    """Drop the note once the task reached a verdict — it was for that attempt.
+
+    Kept on requeue (rate limit, environment failure): there the attempt never
+    got to act on it.
+    """
+    with _connect() as conn:
+        conn.execute("UPDATE tasks SET note = NULL WHERE id = ?", (task_id,))
+
+
+def set_verdict(task_id: int, verdict: str):
+    with _connect() as conn:
+        conn.execute("UPDATE tasks SET verdict = ? WHERE id = ?", (verdict or None, task_id))
+
+
 def set_worktree(task_id: int, path: str, branch: str):
     """Record where a task's checkout landed, so the UI can point at the diff."""
     with _connect() as conn:
@@ -248,6 +280,7 @@ def set_worktree(task_id: int, path: str, branch: str):
 
 
 def mark_completed(task_id: int, result: str, exit_code: int = 0, model_used: str = None, session_id: str = None):
+    clear_note(task_id)
     with _connect() as conn:
         conn.execute(
             "UPDATE tasks SET status = 'completed', result = ?, exit_code = ?, completed_at = ?, model_used = ?, session_id = COALESCE(?, session_id) WHERE id = ?",
@@ -256,6 +289,7 @@ def mark_completed(task_id: int, result: str, exit_code: int = 0, model_used: st
 
 
 def mark_failed(task_id: int, error: str, exit_code: int = 1):
+    clear_note(task_id)
     with _connect() as conn:
         conn.execute(
             "UPDATE tasks SET status = 'failed', error = ?, exit_code = ?, completed_at = ? WHERE id = ?",
@@ -299,6 +333,7 @@ def clear_cancel_request(task_id: int):
 
 
 def mark_cancelled(task_id: int, note: str = None):
+    clear_note(task_id)
     with _connect() as conn:
         conn.execute(
             "UPDATE tasks SET status = 'cancelled', completed_at = ?, error = COALESCE(?, error) WHERE id = ?",
@@ -470,12 +505,19 @@ def mark_notification_sent(notification_id: int):
         )
 
 
-def recover_running():
-    """Reset any 'running' tasks back to 'pending' (crash recovery)."""
+def recover_running(keep_ids=()):
+    """Reset 'running' tasks back to 'pending' (crash recovery).
+
+    keep_ids — tasks whose agent is demonstrably still running. Without it a
+    worker restart yanks the queue out from under live agents, and a second
+    worker process steals the first one's work on startup.
+    """
+    keep = [int(i) for i in keep_ids or ()]
+    sql = "UPDATE tasks SET status = 'pending', started_at = NULL WHERE status = 'running'"
+    if keep:
+        sql += f" AND id NOT IN ({','.join('?' * len(keep))})"
     with _connect() as conn:
-        conn.execute(
-            "UPDATE tasks SET status = 'pending', started_at = NULL WHERE status = 'running'"
-        )
+        conn.execute(sql, keep)
 
 
 def reset_task(task_id: int) -> bool:

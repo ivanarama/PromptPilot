@@ -280,6 +280,12 @@ async def cb_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     if task.working_dir:
         text += f"\nДир: `{_esc(task.working_dir)}`"
+    if task.verdict:
+        icon = {"ГОТОВО": "✅", "УЖЕ СДЕЛАНО": "✅",
+                "НУЖЕН ЧЕЛОВЕК": "🟡", "НЕ СМОГ": "❌"}.get(task.verdict, "•")
+        text += f"\nИтог: {icon} {_esc(task.verdict)}"
+    if task.note:
+        text += f"\n✎ Приписка: {_esc(task.note[:200])}"
     if task.worktree:
         branch = task.worktree_branch or wt_branch(task.id)
         text += f"\n🌿 Worktree: `{_esc(task.worktree_path or 'ещё не создан')}`\nВетка: `{_esc(branch)}`"
