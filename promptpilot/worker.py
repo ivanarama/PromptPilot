@@ -10,8 +10,9 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 
-from . import db
-from .config import BASE_DELAY, DEFAULT_CLI, MAX_DELAY, POLL_INTERVAL, TASK_TIMEOUT, build_cmd, get_provider_env, load_providers
+from . import db, worktree
+from .config import (BASE_DELAY, CONCURRENCY, DEFAULT_CLI, MAX_DELAY, POLL_INTERVAL,
+                     TASK_TIMEOUT, build_cmd, get_provider_env, load_providers)
 
 RATE_LIMIT_PATTERNS = [
     "rate limit",
@@ -224,6 +225,12 @@ def _maybe_recur(task):
         tg_chat_id=task.tg_chat_id,
         task_timeout=task.task_timeout,
         detached=task.detached,
+        # Where and how it ran is part of the schedule, not of one occurrence:
+        # without these a recurring task silently drifts back to this machine,
+        # the shared work tree and a closing pane on its second run.
+        machine=task.machine,
+        keep_pane=task.keep_pane,
+        worktree=task.worktree,
     ))
     print(f"  -> Recurring: next run at {next_dt.strftime('%Y-%m-%d %H:%M UTC')}")
 
@@ -248,10 +255,17 @@ def _execute_herdr_task(task, provider_cfg, host=None, machine=None):
                 task_id=task.id,
             )
 
+    def on_worktree(path, branch):
+        # Recorded the moment the checkout exists, not when the task ends: the
+        # user watching a long run wants the branch name now.
+        db.set_worktree(task.id, path, branch)
+        print(f"  -> Worktree {path} ({branch})")
+
     outcome = run_in_herdr(task, provider_cfg, on_blocked=on_blocked,
                            timeout=_effective_timeout(task),
                            cancel_check=lambda: db.is_cancel_requested(task.id),
-                           keep_pane=task.keep_pane, host=host)
+                           keep_pane=task.keep_pane, host=host,
+                           on_worktree=on_worktree)
 
     if outcome.get("cancelled"):
         db.clear_cancel_request(task.id)
@@ -309,6 +323,28 @@ def execute_task(task):
         _execute_herdr_task(task, provider_cfg, host=host, machine=machine)
         return
 
+    # The task's own checkout, when it asked for one. Done before the CLI starts
+    # so the agent only ever sees the isolated tree.
+    run_dir, wt_note = task.working_dir, ""
+    if getattr(task, "worktree", False):
+        if machine:
+            # A headless remote command runs in the ssh login directory, so a
+            # worktree over there would simply never be entered. herdr-based
+            # providers place the agent in the checkout and do support this.
+            db.mark_failed(task.id, f"worktree на машине «{machine}» поддерживается только "
+                                    f"через herdr-провайдер (executor: herdr)")
+            return
+        try:
+            wt = worktree.prepare(task.working_dir, task.id)
+        except worktree.WorktreeError as e:
+            db.mark_failed(task.id, f"worktree: {e}")
+            print(f"  -> Failed (worktree): {e}")
+            return
+        run_dir = wt["path"]
+        db.set_worktree(task.id, wt["path"], wt["branch"])
+        wt_note = "\n\n" + worktree.summary(wt["path"], wt["branch"], wt["copied"])
+        print(f"  -> Worktree {wt['path']} ({wt['branch']})")
+
     cmd = build_cmd(provider, task.prompt, skip_permissions=task.skip_permissions, session_id=task.session_id, model=task.model)
 
     env = get_provider_env(provider)
@@ -330,14 +366,14 @@ def execute_task(task):
     # Detached mode: start process and return immediately — for servers/bots that run forever
     if task.detached:
         import platform
-        kwargs = {"cwd": task.working_dir, "env": env, "stdin": subprocess.DEVNULL}
+        kwargs = {"cwd": run_dir, "env": env, "stdin": subprocess.DEVNULL}
         if platform.system() == "Windows":
             kwargs["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
         else:
             kwargs["start_new_session"] = True
         try:
             proc = subprocess.Popen(cmd, **kwargs)
-            db.mark_completed(task.id, f"Запущен в фоне (PID {proc.pid})", exit_code=0)
+            db.mark_completed(task.id, f"Запущен в фоне (PID {proc.pid}){wt_note}", exit_code=0)
             print(f"  -> Detached (PID {proc.pid})")
         except FileNotFoundError:
             db.mark_failed(task.id, f"Command not found: {cmd[0]}", exit_code=-1)
@@ -353,7 +389,7 @@ def execute_task(task):
             text=True,
             encoding="utf-8",
             errors="replace",
-            cwd=task.working_dir,
+            cwd=run_dir,
             stdin=subprocess.DEVNULL,
             env=env,
             start_new_session=(os.name == "posix"),
@@ -437,6 +473,12 @@ def execute_task(task):
         # Plain text output (non-Claude CLIs)
         output = result.stdout
 
+    if wt_note:
+        output += wt_note
+        changes = worktree.status(wt["root"], wt["path"])
+        if changes:
+            output += f"\nИзменения: {changes}"
+
     db.mark_completed(task.id, output, exit_code=0, model_used=model_used, session_id=session_id)
     text_preview = output[:80].replace("\n", " ").strip()
     print(f"  -> Completed: {text_preview}")
@@ -456,8 +498,37 @@ def _code_snapshot():
         return None
 
 
+def lock_key(task) -> str:
+    """What a task must not share with another task running at the same time.
+
+    Two agents in one work tree overwrite each other's edits, so a task locks
+    the directory it will edit. A task with its own worktree locks nothing —
+    that is the whole point of it. A task aimed at an existing herdr session
+    locks the session instead: there the directory belongs to the user.
+
+    Empty string means "no conflict possible".
+    """
+    where = getattr(task, "machine", None) or "local"
+    if getattr(task, "herdr_target", None):
+        return f"{where}:session:{task.herdr_target}"
+    if getattr(task, "worktree", False):
+        return ""
+    path = task.working_dir or os.getcwd()
+    if not getattr(task, "machine", None):
+        path = os.path.abspath(path)
+    path = os.path.normcase(path.rstrip("/\\"))
+    return f"{where}:dir:{path}"
+
+
 def run_worker():
-    """Main worker loop."""
+    """Main worker loop.
+
+    With PP_CONCURRENCY=1 (the default) this is the plain sequential worker it
+    has always been. Above that, tasks run in a thread pool and the queue is
+    walked past anything that would collide with a task already in flight —
+    see lock_key(). One worker process is still the assumption: a second one
+    would reset this one's running tasks on startup (recover_running).
+    """
     running = True
 
     def stop(signum, frame):
@@ -474,21 +545,42 @@ def run_worker():
     code_snapshot = _code_snapshot()
 
     print(f"PromptPilot worker started (poll every {POLL_INTERVAL}s)")
-    print(f"Timeout: {'no limit' if TASK_TIMEOUT == 0 else f'{TASK_TIMEOUT}s'} | Backoff: {BASE_DELAY}-{MAX_DELAY}s")
+    print(f"Timeout: {'no limit' if TASK_TIMEOUT == 0 else f'{TASK_TIMEOUT}s'} | Backoff: {BASE_DELAY}-{MAX_DELAY}s"
+          + (f" | Параллельно: {CONCURRENCY}" if CONCURRENCY > 1 else ""))
     print("Waiting for tasks...\n")
 
+    pool = None
+    in_flight = {}  # Future -> lock key held while it runs
+    if CONCURRENCY > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        pool = ThreadPoolExecutor(max_workers=CONCURRENCY, thread_name_prefix="pp-task")
+
+    def reap():
+        for fut in [f for f in in_flight if f.done()]:
+            in_flight.pop(fut, None)
+            exc = fut.exception()
+            if exc:  # execute_task already reports task failures; this is a bug
+                print(f"  !! исполнение задачи упало: {type(exc).__name__}: {exc}", flush=True)
+
     while running:
+        reap()
+
         # Auto-reload: pick up code updates between tasks (dev-friendly —
         # a stale worker silently ignoring new features is worse than a restart)
         if code_snapshot is not None and _code_snapshot() != code_snapshot:
+            if in_flight:
+                # Restarting now would orphan live agents — let them finish.
+                time.sleep(POLL_INTERVAL)
+                continue
             print("Код обновился — перезапускаю worker...", flush=True)
             os.execv(sys.executable, [sys.executable, "-m", "promptpilot", "worker"])
 
-        if db.is_paused():
+        if db.is_paused() or len(in_flight) >= CONCURRENCY:
             time.sleep(POLL_INTERVAL)
             continue
 
-        task = db.get_next_runnable()
+        task = db.get_next_runnable(
+            busy_keys=[k for k in in_flight.values() if k], key_fn=lock_key)
         if task is None:
             time.sleep(POLL_INTERVAL)
             continue
@@ -496,6 +588,13 @@ def run_worker():
         provider = task.provider or DEFAULT_CLI
         prompt_preview = task.prompt[:60].replace("\n", " ")
         print(f"[#{task.id}] [{provider}] Running: {prompt_preview}...")
-        execute_task(task)
+        if pool is None:
+            execute_task(task)
+        else:
+            in_flight[pool.submit(execute_task, task)] = lock_key(task)
 
+    if pool is not None:
+        if in_flight:
+            print(f"Жду завершения задач в работе: {len(in_flight)}...")
+        pool.shutdown(wait=True)
     print("Worker stopped.")

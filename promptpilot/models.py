@@ -34,6 +34,7 @@ class TaskCreate(BaseModel):
     keep_pane: bool = True  # herdr executor: keep the live session open after success
     herdr_target: Optional[str] = None  # herdr: send the prompt into an EXISTING session (agent name or pane id)
     machine: Optional[str] = None  # run on a registered remote machine (machines.json) over ssh
+    worktree: bool = False  # run in a fresh git worktree of working_dir (branch pp/t<id>)
 
 
 class TaskUpdate(BaseModel):
@@ -71,6 +72,9 @@ class TaskInDB(BaseModel):
     keep_pane: bool = True
     herdr_target: Optional[str] = None
     machine: Optional[str] = None
+    worktree: bool = False
+    worktree_path: Optional[str] = None  # filled in once the checkout exists
+    worktree_branch: Optional[str] = None
 
 
 class Stats(BaseModel):

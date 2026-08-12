@@ -39,7 +39,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     detached INTEGER NOT NULL DEFAULT 0,
     keep_pane INTEGER NOT NULL DEFAULT 1,
     herdr_target TEXT,
-    machine TEXT
+    machine TEXT,
+    worktree INTEGER NOT NULL DEFAULT 0,
+    worktree_path TEXT,
+    worktree_branch TEXT
 );
 
 CREATE TABLE IF NOT EXISTS settings (
@@ -84,6 +87,9 @@ MIGRATIONS = [
         created_at TEXT NOT NULL,
         sent_at TEXT
     )""",
+    "ALTER TABLE tasks ADD COLUMN worktree INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE tasks ADD COLUMN worktree_path TEXT",
+    "ALTER TABLE tasks ADD COLUMN worktree_branch TEXT",
 ]
 
 
@@ -105,12 +111,16 @@ def _row_to_task(row: sqlite3.Row) -> TaskInDB:
 
 
 @contextmanager
-def _connect():
+def _connect(immediate: bool = False):
     DB_DIR.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(DB_PATH), timeout=10)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
+    if immediate:
+        # Take the write lock before reading: a claim that decides on a stale
+        # snapshot would hand the same task to two workers.
+        conn.execute("BEGIN IMMEDIATE")
     try:
         yield conn
         conn.commit()
@@ -135,8 +145,8 @@ def init_db():
 def create_task(task: TaskCreate) -> TaskInDB:
     with _connect() as conn:
         cur = conn.execute(
-            """INSERT INTO tasks (prompt, working_dir, provider, status, priority, scheduled_at, created_at, max_retries, skip_permissions, model, session_id, parent_task_id, tg_chat_id, recurrence, task_timeout, detached, keep_pane, herdr_target, machine)
-               VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            """INSERT INTO tasks (prompt, working_dir, provider, status, priority, scheduled_at, created_at, max_retries, skip_permissions, model, session_id, parent_task_id, tg_chat_id, recurrence, task_timeout, detached, keep_pane, herdr_target, machine, worktree)
+               VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 task.prompt,
                 task.working_dir,
@@ -156,6 +166,7 @@ def create_task(task: TaskCreate) -> TaskInDB:
                 int(task.keep_pane),
                 task.herdr_target,
                 task.machine,
+                int(task.worktree),
             ),
         )
         return get_task(cur.lastrowid, conn=conn)
@@ -191,26 +202,49 @@ def list_tasks(
         return [_row_to_task(r) for r in rows]
 
 
-def get_next_runnable() -> Optional[TaskInDB]:
+def get_next_runnable(busy_keys=(), key_fn=None) -> Optional[TaskInDB]:
+    """Claim the highest-priority runnable task and mark it running.
+
+    The whole select-then-claim runs under the write lock, so several workers
+    (threads of one worker, or separate processes) never claim the same row.
+
+    busy_keys/key_fn — when the caller already runs tasks, candidates whose
+    key_fn(task) is in busy_keys are passed over: that is how two agents are
+    kept out of one work tree while the queue keeps moving.
+    """
     now = _now()
-    with _connect() as conn:
-        row = conn.execute(
+    busy = set(busy_keys or ())
+    with _connect(immediate=True) as conn:
+        rows = conn.execute(
             """SELECT * FROM tasks
                WHERE status IN ('pending', 'rate_limited')
                  AND (scheduled_at IS NULL OR scheduled_at <= ?)
                  AND (next_run_at IS NULL OR next_run_at <= ?)
                ORDER BY priority ASC, created_at ASC
-               LIMIT 1""",
-            (now, now),
-        ).fetchone()
-        if row:
+               LIMIT ?""",
+            (now, now, 200 if busy else 1),
+        ).fetchall()
+        for row in rows:
             task = _row_to_task(row)
-            conn.execute(
-                "UPDATE tasks SET status = 'running', started_at = ? WHERE id = ?",
+            if busy and key_fn and key_fn(task) in busy:
+                continue
+            cur = conn.execute(
+                """UPDATE tasks SET status = 'running', started_at = ?
+                   WHERE id = ? AND status IN ('pending', 'rate_limited')""",
                 (_now(), task.id),
             )
-            return task
+            if cur.rowcount:
+                return task
         return None
+
+
+def set_worktree(task_id: int, path: str, branch: str):
+    """Record where a task's checkout landed, so the UI can point at the diff."""
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE tasks SET worktree_path = ?, worktree_branch = ? WHERE id = ?",
+            (path, branch, task_id),
+        )
 
 
 def mark_completed(task_id: int, result: str, exit_code: int = 0, model_used: str = None, session_id: str = None):

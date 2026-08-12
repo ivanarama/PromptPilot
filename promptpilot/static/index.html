@@ -483,6 +483,10 @@
         <input type="checkbox" id="keepPane" checked style="width:auto;margin:0">
         <span style="font-size:13px" title="Панель herdr останется открытой — можно вернуться и продолжить диалог">🖥 оставить сессию открытой</span>
       </label>
+      <label id="worktreeLabel" style="flex-direction:row;align-items:center;gap:8px;cursor:pointer">
+        <input type="checkbox" id="worktree" style="width:auto;margin:0">
+        <span style="font-size:13px" title="Агент работает в отдельном git worktree на ветке pp/t<id> — твоё рабочее дерево не трогается, результат виден как diff">🌿 свой worktree</span>
+      </label>
       <button class="btn btn-primary" onclick="addTask()">Add Task</button>
     </div>
   </div>
@@ -540,6 +544,7 @@ const API = '/api';
 let currentFilter = '';
 let expandedId = null;
 let providersData = {};
+let projectsByPath = {};   // path -> {name, path, git} from /api/projects
 let skillsCache = {};
 let skillsPanelOpen = false;
 
@@ -677,6 +682,7 @@ async function loadTasks() {
         <span class="task-status" data-s="${t.status}">${t.status.replace('_', ' ')}</span>
         <span class="task-prompt">${esc(t.prompt)}</span>
         ${t.working_dir ? `<span class="task-meta">📁 ${esc(t.working_dir.split(/[/\\]/).filter(Boolean).pop() || t.working_dir)}</span>` : ''}
+        ${t.worktree ? `<span class="task-meta" title="отдельный git worktree">🌿 ${esc(t.worktree_branch || 'worktree')}</span>` : ''}
         ${t.provider ? `<span class="task-meta">${esc(t.provider)}</span>` : ''}
         ${scheduleInfo(t)}
         <span class="task-meta">P${t.priority}</span>
@@ -690,6 +696,7 @@ async function loadTasks() {
         </div>
 
         ${t.working_dir ? `<div class="detail-info"><span class="label">Dir: </span><span>${esc(t.working_dir)}</span></div>` : ''}
+        ${t.worktree ? `<div class="detail-info"><span class="label">Worktree: </span><span>${esc(t.worktree_path || 'ещё не создан')}</span>${t.worktree_branch ? ` <span class="label">ветка</span> <span>${esc(t.worktree_branch)}</span>` : ''}</div>` : ''}
 
         ${resultHTML}
 
@@ -747,6 +754,7 @@ async function addTask() {
       working_dir: workdir,
       skip_permissions: skipPermissions,
       keep_pane: document.getElementById('keepPane').checked,
+      worktree: document.getElementById('worktree').checked,
       herdr_target: herdrTarget,
       machine: document.getElementById('machineInput').value || null,
       scheduled_at: schedule ? new Date(schedule).toISOString() : null,
@@ -1058,7 +1066,26 @@ function updateKeepPane() {
   // в target-режиме директория и permissions не применимы — прячем
   document.getElementById('workdirLabel').style.display = prov.session_target ? 'none' : 'flex';
   document.getElementById('skipPermsLabel').style.display = prov.session_target ? 'none' : 'flex';
+  updateWorktree();
   if (prov.session_target) loadHerdrAgents();
+}
+
+// "Own worktree" only makes sense for a task that gets its own directory in a
+// git repo: not for a prompt sent into someone's live session, and not for a
+// project that is not a repository at all.
+function updateWorktree() {
+  const prov = providersData[document.getElementById('providerInput').value] || {};
+  const label = document.getElementById('worktreeLabel');
+  const box = document.getElementById('worktree');
+  const sel = document.getElementById('workdirSelect');
+  const picked = sel.style.display !== 'none' && sel.value && sel.value !== '__custom__'
+    ? projectsByPath[sel.value] : null;
+  const notGit = picked && picked.git === false;
+  label.style.display = prov.session_target ? 'none' : 'flex';
+  box.disabled = !!notGit;
+  if (notGit) box.checked = false;
+  label.title = notGit ? 'Выбранный проект — не git-репозиторий' : '';
+  label.style.opacity = notGit ? '0.45' : '1';
 }
 
 async function loadHerdrAgents() {
@@ -1165,15 +1192,17 @@ async function loadProjects() {
   const inp = document.getElementById('workdirInput');
   if (!projects || !projects.length) return;
 
+  projectsByPath = Object.fromEntries(projects.map(p => [p.path, p]));
   sel.innerHTML = [
     '<option value="">— Select project —</option>',
-    ...projects.map(p => `<option value="${esc(p.path)}">${esc(p.name)}</option>`),
+    ...projects.map(p => `<option value="${esc(p.path)}">${esc(p.name)}${p.git ? '' : ' (не git)'}</option>`),
     '<option value="__custom__">✏️ Custom path...</option>',
   ].join('');
 
   sel.style.display = '';
   inp.style.display = 'none';
   inp.placeholder = '';
+  updateWorktree();
 }
 
 function onProjectSelect() {
@@ -1188,6 +1217,7 @@ function onProjectSelect() {
     inp.style.display = 'none';
     inp.value = '';
   }
+  updateWorktree();
 }
 
 // --- Worker pause ---

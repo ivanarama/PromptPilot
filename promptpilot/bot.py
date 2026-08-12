@@ -37,11 +37,12 @@ from .config import (
 )
 from .models import TaskCreate, TaskStatus
 from .tg_auth import authorize_user, is_authorized, list_authorized, load_allowed_phones
+from .worktree import branch_for as wt_branch
 
 logger = logging.getLogger(__name__)
 
 # Conversation states
-ASK_PASSWORD, ASK_PROMPT, ASK_PROVIDER, ASK_PRIORITY, ASK_SKIP_PERMS, ASK_DIR, ASK_DIR_MANUAL, ASK_SCHEDULE, ASK_REPLY, ASK_SKILL_ARGS, ASK_MODEL, ASK_RECURRENCE, ASK_DETACHED, ASK_HERDR_REPLY, ASK_KEEP_PANE, ASK_HERDR_TARGET, ASK_MACHINE = range(17)
+ASK_PASSWORD, ASK_PROMPT, ASK_PROVIDER, ASK_PRIORITY, ASK_SKIP_PERMS, ASK_DIR, ASK_DIR_MANUAL, ASK_SCHEDULE, ASK_REPLY, ASK_SKILL_ARGS, ASK_MODEL, ASK_RECURRENCE, ASK_DETACHED, ASK_HERDR_REPLY, ASK_KEEP_PANE, ASK_HERDR_TARGET, ASK_MACHINE, ASK_WORKTREE = range(18)
 
 PAGE_SIZE = 5
 
@@ -279,6 +280,9 @@ async def cb_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     if task.working_dir:
         text += f"\nДир: `{_esc(task.working_dir)}`"
+    if task.worktree:
+        branch = task.worktree_branch or wt_branch(task.id)
+        text += f"\n🌿 Worktree: `{_esc(task.worktree_path or 'ещё не создан')}`\nВетка: `{_esc(branch)}`"
     if task.status.value == "rate_limited" and task.next_run_at:
         reset_str = task.next_run_at.strftime("%d.%m.%Y %H:%M UTC")
         text += f"\nСброс: {_esc(reset_str)}"
@@ -783,7 +787,7 @@ async def _ask_dir(query, context):
         pre_dir = context.user_data["new_dir"]
         label = pre_dir if pre_dir else "не указана"
         await query.edit_message_text(f"Директория: `{_esc(label)}`", parse_mode="MarkdownV2")
-        return await _ask_schedule_from_query(query, context)
+        return await _after_dir_from_query(query, context)
 
     projects = _list_projects()
     if projects:
@@ -882,14 +886,14 @@ async def add_task_got_dir_btn(update: Update, context: ContextTypes.DEFAULT_TYP
         full_path = os.path.join(PROJECTS_ROOT, rel.replace("/", os.sep))
         context.user_data["new_dir"] = full_path
         await query.edit_message_text(f"Директория: `{full_path}`", parse_mode="Markdown")
-        return await _ask_schedule_from_query(query, context)
+        return await _after_dir_from_query(query, context)
 
     value = data.split(":", 1)[1]
 
     if value == "__skip__":
         context.user_data["new_dir"] = None
         await query.edit_message_text("Директория: не указана")
-        return await _ask_schedule_from_query(query, context)
+        return await _after_dir_from_query(query, context)
     elif value == "__manual__":
         await query.edit_message_text(
             "Введите путь к директории или /skip чтобы пропустить:"
@@ -899,17 +903,73 @@ async def add_task_got_dir_btn(update: Update, context: ContextTypes.DEFAULT_TYP
         full_path = os.path.join(PROJECTS_ROOT, value)
         context.user_data["new_dir"] = full_path
         await query.edit_message_text(f"Директория: `{full_path}`", parse_mode="Markdown")
-        return await _ask_schedule_from_query(query, context)
+        return await _after_dir_from_query(query, context)
 
 
 async def add_task_got_dir(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["new_dir"] = update.message.text.strip() or None
-    return await _ask_schedule(update, context)
+    return await _after_dir(update, context)
 
 
 async def add_task_skip_dir(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["new_dir"] = None
-    return await _ask_schedule(update, context)
+    return await _after_dir(update, context)
+
+
+async def _ask_worktree(reply, context: ContextTypes.DEFAULT_TYPE):
+    """Offer the task its own checkout — only where that is a real choice.
+
+    A directory that is not a git repository, and a prompt sent into someone's
+    live herdr session, have nothing to branch: those skip straight to timing.
+    `reply` is the coroutine that sends a message (query.message.reply_text or
+    update.message.reply_text), so both wizard branches share this step.
+    """
+    from .worktree import is_git_repo
+
+    working_dir = context.user_data.get("new_dir")
+    if context.user_data.get("new_herdr_target") or not working_dir:
+        return None
+    if context.user_data.get("new_machine"):
+        # Remote worktrees are a herdr-executor feature; the plain runner over
+        # ssh would never enter the checkout. Whether the path over there is a
+        # repository is herdr's answer to give — asking it would mean an ssh
+        # round trip inside a chat handler, and a wrong local guess would hide
+        # the option entirely.
+        provider = context.user_data.get("new_provider") or DEFAULT_CLI
+        if load_providers().get(provider, {}).get("executor") != "herdr":
+            return None
+    elif not is_git_repo(working_dir):
+        return None
+
+    await reply(
+        "Работать в отдельном git worktree?\n"
+        "Агент получит свой чекаут на ветке `pp/t<id>` — твоё рабочее дерево "
+        "останется нетронутым, а результат можно посмотреть как diff.",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🌿 Да, свой worktree", callback_data="worktree:yes"),
+            InlineKeyboardButton("Нет, прямо в репо", callback_data="worktree:no"),
+        ]]),
+        parse_mode="Markdown",
+    )
+    return ASK_WORKTREE
+
+
+async def _after_dir_from_query(query, context: ContextTypes.DEFAULT_TYPE):
+    state = await _ask_worktree(query.message.reply_text, context)
+    return state if state is not None else await _ask_schedule_from_query(query, context)
+
+
+async def _after_dir(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    state = await _ask_worktree(update.message.reply_text, context)
+    return state if state is not None else await _ask_schedule(update, context)
+
+
+async def add_task_got_worktree(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data["new_worktree"] = query.data == "worktree:yes"
+    await query.edit_message_reply_markup(reply_markup=None)
+    return await _ask_schedule_from_query(query, context)
 
 
 async def _ask_schedule_from_query(query, context: ContextTypes.DEFAULT_TYPE):
@@ -1064,6 +1124,7 @@ async def _finish_add_task_from_query(query, context):
     keep_pane = context.user_data.pop("new_keep_pane", True)
     herdr_target = context.user_data.pop("new_herdr_target", None)
     machine = context.user_data.pop("new_machine", None)
+    use_worktree = context.user_data.pop("new_worktree", False)
 
     task = db.create_task(TaskCreate(
         prompt=prompt,
@@ -1079,16 +1140,18 @@ async def _finish_add_task_from_query(query, context):
         keep_pane=keep_pane,
         herdr_target=herdr_target,
         machine=machine,
+        worktree=use_worktree,
     ))
 
     sched_str = scheduled_at.strftime("%d.%m.%Y %H:%M UTC") if scheduled_at else "сейчас"
     skip_str = " ⚠️ --dangerously-skip-permissions" if skip_permissions else ""
     detached_str = " 🔁 фоновый" if detached else ""
+    wt_str = f"\nWorktree: ветка {wt_branch(task.id)}" if use_worktree else ""
     await query.message.reply_text(
         f"✅ Задача #{task.id} добавлена!\n"
         f"Провайдер: {provider or 'claude (по умолчанию)'}\n"
         f"Приоритет: {priority}\n"
-        f"Директория: {working_dir or 'не указана'}\n"
+        f"Директория: {working_dir or 'не указана'}{wt_str}\n"
         f"Запуск: {sched_str}{skip_str}{detached_str}",
         reply_markup=_main_menu(),
     )
@@ -1108,6 +1171,7 @@ async def _finish_add_task(update: Update, context: ContextTypes.DEFAULT_TYPE, w
     keep_pane = context.user_data.pop("new_keep_pane", True)
     herdr_target = context.user_data.pop("new_herdr_target", None)
     machine = context.user_data.pop("new_machine", None)
+    use_worktree = context.user_data.pop("new_worktree", False)
 
     task = db.create_task(TaskCreate(
         prompt=prompt,
@@ -1123,16 +1187,18 @@ async def _finish_add_task(update: Update, context: ContextTypes.DEFAULT_TYPE, w
         keep_pane=keep_pane,
         herdr_target=herdr_target,
         machine=machine,
+        worktree=use_worktree,
     ))
 
     sched_str = scheduled_at.strftime("%d.%m.%Y %H:%M UTC") if scheduled_at else "сейчас"
     skip_str = " ⚠️ --dangerously-skip-permissions" if skip_permissions else ""
     detached_str = " 🔁 фоновый" if detached else ""
+    wt_str = f"\nWorktree: ветка {wt_branch(task.id)}" if use_worktree else ""
     await update.message.reply_text(
         f"✅ Задача #{task.id} добавлена!\n"
         f"Провайдер: {provider or 'claude (по умолчанию)'}\n"
         f"Приоритет: {priority}\n"
-        f"Директория: {working_dir or 'не указана'}\n"
+        f"Директория: {working_dir or 'не указана'}{wt_str}\n"
         f"Запуск: {sched_str}{skip_str}{detached_str}",
         reply_markup=_main_menu(),
     )
@@ -1142,7 +1208,8 @@ async def _finish_add_task(update: Update, context: ContextTypes.DEFAULT_TYPE, w
 async def add_task_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for key in ("new_prompt", "new_provider", "new_priority", "new_dir", "new_schedule",
                 "new_recurrence", "new_detached", "new_keep_pane", "new_model",
-                "new_skip_permissions", "new_skill_name", "new_herdr_target", "new_machine"):
+                "new_skip_permissions", "new_skill_name", "new_herdr_target", "new_machine",
+                "new_worktree"):
         context.user_data.pop(key, None)
     await update.message.reply_text("Отменено.", reply_markup=_main_menu())
     return ConversationHandler.END
@@ -1165,7 +1232,9 @@ async def cb_reply_task_start(update: Update, context: ContextTypes.DEFAULT_TYPE
     context.user_data["reply_task_id"] = task_id
     context.user_data["reply_session_id"] = task.session_id
     context.user_data["reply_provider"] = task.provider
-    context.user_data["reply_dir"] = task.working_dir
+    # Continue where the parent worked: for a worktree task that is its
+    # checkout, not the repository it forked from.
+    context.user_data["reply_dir"] = task.worktree_path or task.working_dir
     context.user_data["reply_skip_permissions"] = task.skip_permissions
 
     await query.message.reply_text(
@@ -1751,6 +1820,9 @@ def run_bot():
             ],
             ASK_KEEP_PANE: [
                 CallbackQueryHandler(add_task_got_keep_pane, pattern=r"^keeppane:"),
+            ],
+            ASK_WORKTREE: [
+                CallbackQueryHandler(add_task_got_worktree, pattern=r"^worktree:"),
             ],
             ASK_HERDR_TARGET: [
                 CallbackQueryHandler(add_task_got_herdr_target, pattern=r"^hstarget:"),

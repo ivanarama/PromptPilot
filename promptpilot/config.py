@@ -613,6 +613,19 @@ HERDR_KEEP_PANE = os.environ.get("PP_HERDR_KEEP_PANE", "0") == "1"
 HERDR_WATCH = os.environ.get("PP_HERDR_WATCH", "1") == "1"
 HERDR_WATCH_INTERVAL = int(os.environ.get("PP_HERDR_WATCH_INTERVAL", "10"))
 
+# Git worktrees — a task edits its own checkout instead of the user's work tree.
+# Branch name is <prefix>t<task id>; the checkout lands next to the repository
+# (same machine, same filesystem) unless PP_WORKTREES_ROOT names a directory.
+WORKTREE_BRANCH_PREFIX = os.environ.get("PP_WORKTREE_PREFIX", "pp/")
+WORKTREES_ROOT = os.environ.get("PP_WORKTREES_ROOT", "")
+WORKTREE_DIRNAME = ".pp-worktrees"
+# Gitignored files a fresh checkout needs to be runnable at all (.env, tokens).
+# Comma-separated names, copied from the source work tree; empty disables it.
+WORKTREE_COPY = [p.strip() for p in os.environ.get("PP_WORKTREE_COPY", ".env").split(",") if p.strip()]
+
+# How many tasks the worker runs at once. 1 = the historical sequential worker.
+CONCURRENCY = max(1, int(os.environ.get("PP_CONCURRENCY", "1")))
+
 # Projects root — optional directory whose subdirectories are offered as project choices
 PROJECTS_ROOT = os.environ.get("PP_PROJECTS_ROOT", "")
 

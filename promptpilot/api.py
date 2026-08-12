@@ -356,7 +356,10 @@ def api_skills(provider: Optional[str] = None, workdir: Optional[str] = None):
 
 @app.get("/api/projects")
 def api_projects():
-    """Return sorted list of {name, path} for subdirs under PP_PROJECTS_ROOT."""
+    """Return sorted list of {name, path, git} for subdirs under PP_PROJECTS_ROOT.
+
+    `git` tells the UI whether "own worktree" is even offerable for that project.
+    """
     if not PROJECTS_ROOT:
         return []
     try:
@@ -364,7 +367,8 @@ def api_projects():
         for d in sorted(os.listdir(PROJECTS_ROOT)):
             full = os.path.join(PROJECTS_ROOT, d)
             if os.path.isdir(full) and not d.startswith("."):
-                entries.append({"name": d, "path": full})
+                entries.append({"name": d, "path": full,
+                                "git": os.path.exists(os.path.join(full, ".git"))})
         return entries
     except OSError:
         return []

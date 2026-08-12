@@ -31,6 +31,7 @@ import click
 
 from . import db
 from .models import TaskCreate, TaskStatus
+from .worktree import branch_for as wt_branch
 
 
 def _fix_mojibake(text: str) -> str:
@@ -79,7 +80,8 @@ def cli(ctx):
 @click.option("-d", "--dir", "working_dir", help="Working directory for claude execution")
 @click.option("-c", "--cli", "provider", default=None, help="CLI provider: claude, claude-z, or custom command")
 @click.option("-r", "--max-retries", default=5, type=int, help="Max retries on rate limit")
-def add(prompt, file_path, priority, scheduled_at, working_dir, provider, max_retries):
+@click.option("-w", "--worktree", is_flag=True, help="Run in a fresh git worktree of --dir (branch pp/t<id>)")
+def add(prompt, file_path, priority, scheduled_at, working_dir, provider, max_retries, worktree):
     """Add a task (or multiple from file)."""
     from datetime import datetime
 
@@ -104,10 +106,12 @@ def add(prompt, file_path, priority, scheduled_at, working_dir, provider, max_re
             priority=priority,
             scheduled_at=dt,
             max_retries=max_retries,
+            worktree=worktree,
         ))
         cli_info = f" [{provider}]" if provider else ""
         time_info = f" at {dt}" if dt else ""
-        click.echo(f"  #{task.id} [P{priority}]{cli_info}{time_info} {p[:70]}")
+        wt_info = f" [{wt_branch(task.id)}]" if worktree else ""
+        click.echo(f"  #{task.id} [P{priority}]{cli_info}{time_info}{wt_info} {p[:70]}")
 
     click.echo(click.style(f"\n{len(prompts)} task(s) added.", fg="green"))
 
@@ -153,6 +157,11 @@ def status(task_id):
     if task.completed_at:
         click.echo(f"  Completed: {task.completed_at}")
     click.echo(f"  Retries:   {task.retry_count}/{task.max_retries}")
+    if task.working_dir:
+        click.echo(f"  Dir:       {task.working_dir}")
+    if task.worktree:
+        click.echo(f"  Worktree:  {task.worktree_path or '(ещё не создан)'}"
+                   f"  [{task.worktree_branch or wt_branch(task.id)}]")
     if task.next_run_at:
         click.echo(f"  Next run:  {task.next_run_at}")
     click.echo(f"\n  Prompt:\n    {task.prompt}")

@@ -35,6 +35,7 @@ import re
 import subprocess
 import time
 
+from . import worktree
 from .config import HERDR_BIN, HERDR_KEEP_PANE, HERDR_READ_LINES, HERDR_START_TIMEOUT_MS
 from .remote import (POWERSHELL, REMOTE_CALL_TIMEOUT, as_remote, ps_quote,
                      ssh_command, ssh_script)
@@ -163,14 +164,60 @@ def _ensure_server(host=None):
 
 def _close_stale_tabs(task_id: int, host=None):
     """Close leftover panes of this task's previous attempts (crash recovery:
-    the worker may have been killed while the agent kept running)."""
-    rc, data, _ = _run(["tab", "list"], host=host)
-    if rc != 0:
-        return
+    the worker may have been killed while the agent kept running).
+
+    A worktree task owns a whole workspace, so those are swept too — closed,
+    never removed: the previous attempt's checkout is where the retry resumes.
+    """
     prefix = f"pp-t{task_id}-"
-    for tab in _dig(data, "result", "tabs", default=[]) or []:
-        if str(tab.get("label", "")).startswith(prefix):
-            _run(["tab", "close", tab.get("tab_id", "")], host=host)
+    rc, data, _ = _run(["tab", "list"], host=host)
+    if rc == 0:
+        for tab in _dig(data, "result", "tabs", default=[]) or []:
+            if str(tab.get("label", "")).startswith(prefix):
+                _run(["tab", "close", tab.get("tab_id", "")], host=host)
+    rc, data, _ = _run(["workspace", "list"], host=host)
+    if rc == 0:
+        for ws in _dig(data, "result", "workspaces", default=[]) or []:
+            if str(ws.get("label", "")).startswith(prefix):
+                _run(["workspace", "close", ws.get("workspace_id", "")], host=host)
+
+
+def _open_worktree(task, cwd, label, host=None) -> dict:
+    """Give the task its own checkout — a worktree-backed herdr workspace.
+
+    herdr owns the checkout: it lands under the worktrees root of the machine
+    that actually runs the task (so this works over ssh unchanged) and shows up
+    as a worktree workspace the user can open, inspect and drop from the UI.
+    pp only fixes the branch — ``pp/t<id>`` — and that is what lets a retry
+    resume its own work instead of starting from a half-changed tree.
+
+    Returns the parsed create/open response plus its interesting bits, or
+    ``{"error": ...}``.
+    """
+    if not cwd:
+        return {"error": "worktree: не задана рабочая директория — "
+                         "не из чего создавать ветку"}
+    branch = worktree.branch_for(task.id)
+    args = ["--cwd", cwd, "--branch", branch, "--label", label, "--no-focus"]
+    rc, data, raw = _run(["worktree", "create", *args], host=host)
+    if rc != 0 and _error_code(data) == "worktree_create_failed":
+        # The checkout of a previous attempt is still on disk — reopen it.
+        rc, data, raw = _run(["worktree", "open", *args], host=host)
+    if rc != 0:
+        if _error_code(data) == "not_git_worktree":
+            return {"error": f"worktree: «{cwd}» — не git-репозиторий; "
+                             f"сними галку «свой worktree» или укажи репозиторий"}
+        return {"error": f"herdr worktree create failed: {raw}"}
+    wt = {
+        "data": data,
+        "workspace_id": _dig(data, "result", "workspace", "workspace_id"),
+        "path": _dig(data, "result", "worktree", "path"),
+        "root": _dig(data, "result", "workspace", "worktree", "repo_root"),
+        "branch": _dig(data, "result", "worktree", "branch") or branch,
+    }
+    # A checkout without .env is a checkout the agent cannot run anything in.
+    wt["copied"] = worktree.copy_extras(wt["root"], wt["path"], host) if wt["root"] else []
+    return wt
 
 
 def _trim_transcript(raw: str, prompt: str) -> str:
@@ -232,10 +279,13 @@ def _wait_settled(name, until_args, deadline, cancel_check, host=None):
 
 
 def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
-                 cancel_check=None, keep_pane: bool = None, host: str = None) -> dict:
+                 cancel_check=None, keep_pane: bool = None, host: str = None,
+                 on_worktree=None) -> dict:
     """Run a task in a herdr-managed agent session.
 
     on_blocked(pane_id) is called once when the agent first enters ``blocked``.
+    on_worktree(path, branch) is called as soon as a ``worktree`` task has its
+    own checkout — long before the run ends, which is when the user wants it.
     timeout (seconds) bounds the ACTIVE prompt turn; time spent in ``blocked``
     is human time and is not counted. cancel_check() → True aborts the run
     (pane is closed) — the worker maps it to the cancelled status.
@@ -245,8 +295,12 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
     Raises nothing: all herdr failures are reported via the outcome dict.
     """
     outcome = {"ok": False, "rate_limited": False, "cancelled": False,
-               "output": "", "error": "", "pane_id": ""}
+               "output": "", "error": "", "pane_id": "",
+               "worktree_path": "", "worktree_branch": ""}
     attach = attach_hint(host)
+    workspace_id = ""  # set only when the task got its own worktree workspace
+    repo_root = ""
+    wt_copied = []
 
     try:
         _ensure_server(host)
@@ -270,13 +324,35 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
             # Remote: the working dir must exist on THAT machine; without one
             # herdr falls back to its own default (the user's home there).
             cwd = task.working_dir or (None if host else ".")
-            tab_cmd = ["tab", "create", "--label", name, "--no-focus"]
-            if cwd:
-                tab_cmd += ["--cwd", cwd]
+            env_args = []
             for k, v in (provider_cfg.get("env") or {}).items():
                 if v:
-                    tab_cmd += ["--env", f"{k}={v}"]
-            rc, data, raw = _run(tab_cmd, host=host)
+                    env_args += ["--env", f"{k}={v}"]
+
+            if getattr(task, "worktree", False):
+                wt = _open_worktree(task, cwd, name, host)
+                if wt.get("error"):
+                    outcome["error"] = wt["error"]
+                    return outcome
+                outcome["worktree_path"] = wt["path"]
+                outcome["worktree_branch"] = wt["branch"]
+                workspace_id, repo_root, wt_copied = wt["workspace_id"], wt["root"], wt["copied"]
+                if on_worktree:
+                    on_worktree(wt["path"], wt["branch"])
+                if env_args:
+                    # `worktree create` takes no --env, so the agent gets its
+                    # own tab inside that workspace to receive the provider's.
+                    rc, data, raw = _run(["tab", "create", "--workspace", workspace_id,
+                                          "--cwd", wt["path"], "--label", name,
+                                          "--no-focus", *env_args], host=host)
+                else:
+                    rc, data, raw = 0, wt["data"], ""
+            else:
+                tab_cmd = ["tab", "create", "--label", name, "--no-focus", *env_args]
+                if cwd:
+                    tab_cmd += ["--cwd", cwd]
+                rc, data, raw = _run(tab_cmd, host=host)
+
             pane_id = _dig(data, "result", "root_pane", "pane_id")
             tab_id = _dig(data, "result", "tab", "tab_id")
             if rc != 0 or not pane_id or not tab_id:
@@ -285,6 +361,14 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
             outcome["pane_id"] = pane_id
 
         def close_tab():
+            if workspace_id:
+                # The checkout IS the result — drop it only when the agent
+                # provably left nothing there, so failures don't litter disks.
+                if repo_root and worktree.is_untouched(repo_root, outcome["worktree_path"], host):
+                    _run(["worktree", "remove", "--workspace", workspace_id], host=host)
+                else:
+                    _run(["workspace", "close", workspace_id], host=host)
+                return
             if tab_id:
                 _run(["tab", "close", tab_id], host=host)
 
@@ -334,6 +418,9 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
             outcome["ok"] = True
             outcome["output"] = (f"Отправлено в сессию {name} (панель {pane_id})" if target
                                  else f"Запущен в herdr (панель {pane_id}) — подключись командой: {attach}")
+            if workspace_id:
+                outcome["output"] += "\n" + worktree.summary(outcome["worktree_path"],
+                                                             outcome["worktree_branch"], wt_copied)
             return outcome
 
         # Submit the prompt. Waits are chunked (10s) so a user cancel or the
@@ -415,6 +502,16 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
                                  f"Executor: herdr (сессия {name}, pane {pane_id}{where})")
             return outcome
 
+        # What the user needs in order to go look at the result: where the
+        # branch is and whether the agent actually put anything on it.
+        wt_meta = ""
+        if workspace_id:
+            changes = worktree.status(repo_root, outcome["worktree_path"], host) if repo_root else ""
+            wt_meta = "\n" + worktree.summary(outcome["worktree_path"],
+                                              outcome["worktree_branch"], wt_copied)
+            if changes:
+                wt_meta += f"\nИзменения: {changes}"
+
         keep = bool(keep_pane) or provider_cfg.get("keep_pane") or HERDR_KEEP_PANE
         if keep:
             # Keep the live session for follow-up work. Rename the agent out of
@@ -423,16 +520,19 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
             # stale. Both renames are best-effort.
             _run(["agent", "rename", name, f"t{task.id}"], host=host)
             _run(["tab", "rename", tab_id, f"pp-kept-{task.id}"], host=host)
+            if workspace_id:
+                _run(["workspace", "rename", workspace_id, f"pp-kept-{task.id}"], host=host)
             outcome["ok"] = True
             outcome["output"] = (
                 f"{cleaned}\n\n--- Meta ---\nExecutor: herdr (pane {pane_id}{where}, "
-                f"сессия оставлена — открой «{attach}» и продолжай в ней)"
+                f"сессия оставлена — открой «{attach}» и продолжай в ней){wt_meta}"
             )
             return outcome
 
         close_tab()
         outcome["ok"] = True
-        outcome["output"] = f"{cleaned}\n\n--- Meta ---\nExecutor: herdr (pane {pane_id}{where})"
+        outcome["output"] = (f"{cleaned}\n\n--- Meta ---\n"
+                             f"Executor: herdr (pane {pane_id}{where}){wt_meta}")
         return outcome
 
     except HerdrError as e:
