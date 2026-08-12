@@ -470,8 +470,13 @@ def remove_provider(name: str) -> bool:
     return True
 
 
-def build_cmd(provider: str, prompt: str, skip_permissions: bool = False, session_id: str = None, model: str = None):
-    """Build the full command list for a provider + prompt."""
+def build_cmd(provider: str, prompt: str, skip_permissions: bool = False, session_id: str = None,
+              model: str = None, guard: bool = True):
+    """Build the full command list for a provider + prompt.
+
+    guard=False for a run that happens on another machine: the settings file
+    with the hook lives here, and that path means nothing over there.
+    """
     providers = load_providers()
     if provider in providers:
         template = providers[provider]["cmd"]
@@ -488,6 +493,10 @@ def build_cmd(provider: str, prompt: str, skip_permissions: bool = False, sessio
         extras += ["--resume", session_id]
     if skip_permissions:
         extras.append("--dangerously-skip-permissions")
+    if guard and guard_enabled(providers.get(provider, {}), skip_permissions):
+        settings = guard_settings_file()
+        if settings:
+            extras += ["--settings", settings]
     if extras:
         prompt_idx = cmd.index(prompt)
         cmd[prompt_idx:prompt_idx] = extras
@@ -625,6 +634,60 @@ WORKTREE_COPY = [p.strip() for p in os.environ.get("PP_WORKTREE_COPY", ".env").s
 
 # How many tasks the worker runs at once. 1 = the historical sequential worker.
 CONCURRENCY = max(1, int(os.environ.get("PP_CONCURRENCY", "1")))
+
+# Guard — hard limits for unattended runs, enforced by a PreToolUse hook
+# (see promptpilot/guard.py). "auto" wires it into exactly the runs where
+# nothing else asks anybody: those with --dangerously-skip-permissions.
+#   auto (default) | 1 (always) | 0 (never)
+GUARD = os.environ.get("PP_GUARD", "auto").strip().lower()
+
+
+def _guard_hook_command() -> str:
+    """How Claude Code should invoke the guard, quoted for the shell it uses."""
+    argv = ([sys.executable, "guard-hook"] if getattr(sys, "frozen", False)
+            else [sys.executable, "-m", "promptpilot", "guard-hook"])
+    if os.name == "nt":
+        import subprocess
+        return subprocess.list2cmdline(argv)
+    import shlex
+    return " ".join(shlex.quote(a) for a in argv)
+
+
+def guard_settings_file() -> str:
+    """Path of the Claude Code settings file that wires the guard in.
+
+    Written on demand rather than shipped: the hook command depends on where
+    Python (or pp.exe) lives, and that is only known at run time. Returns ""
+    if it could not be written — a guard that cannot be installed must not
+    take the task down with it.
+    """
+    path = DB_DIR / "claude-settings.json"
+    hook = {"type": "command", "command": _guard_hook_command()}
+    content = json.dumps(
+        {"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [hook]},
+                                  {"matcher": "mcp__.*", "hooks": [hook]}]}},
+        ensure_ascii=False, indent=2)
+    try:
+        if not path.exists() or path.read_text(encoding="utf-8") != content:
+            DB_DIR.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+    except OSError:
+        return ""
+    return str(path)
+
+
+def guard_enabled(provider_cfg: dict, skip_permissions: bool) -> bool:
+    """Should this run carry the guard?
+
+    Only for Claude Code providers — the hook format is theirs. `supports_skills`
+    is how this codebase already recognises them among plain providers; herdr
+    providers say so with `kind`.
+    """
+    if GUARD == "0":
+        return False
+    if not (provider_cfg.get("supports_skills") or provider_cfg.get("kind") == "claude"):
+        return False
+    return True if GUARD == "1" else bool(skip_permissions)
 
 # Projects root — optional directory whose subdirectories are offered as project choices
 PROJECTS_ROOT = os.environ.get("PP_PROJECTS_ROOT", "")

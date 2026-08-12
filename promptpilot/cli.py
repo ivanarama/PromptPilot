@@ -136,6 +136,35 @@ def list_tasks(status, limit):
         click.echo(f"{t.id:>5}  {status_str}  {t.priority:>1}  {t.retry_count:>3}/{t.max_retries:<3}  {prompt_short}")
 
 
+@cli.command("guard-hook", hidden=True)
+def guard_hook():
+    """PreToolUse hook entry point (Claude Code calls this, not a human)."""
+    from .guard import main
+    sys.exit(main())
+
+
+@cli.command("guard")
+@click.argument("command", required=False)
+@click.option("--rules", is_flag=True, help="List the rules in force")
+def guard_cmd(command, rules):
+    """Check what the guard would do with COMMAND (nothing runs)."""
+    from .config import GUARD, guard_settings_file
+    from .guard import check, load_rules
+
+    if rules or not command:
+        click.echo(f"PP_GUARD={GUARD}  settings: {guard_settings_file() or '(не записан)'}")
+        for pattern, reason in load_rules():
+            click.echo(f"  {pattern}\n      {reason}")
+        if not command:
+            return
+
+    reason = check(command, os.getcwd(), "Bash")
+    if reason:
+        click.echo(click.style(f"ЗАПРЕЩЕНО. {reason}", fg="red"))
+        sys.exit(2)
+    click.echo(click.style("Разрешено.", fg="green"))
+
+
 @cli.command()
 @click.argument("task_id", type=int)
 def status(task_id):

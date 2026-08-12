@@ -345,7 +345,8 @@ def execute_task(task):
         wt_note = "\n\n" + worktree.summary(wt["path"], wt["branch"], wt["copied"])
         print(f"  -> Worktree {wt['path']} ({wt['branch']})")
 
-    cmd = build_cmd(provider, task.prompt, skip_permissions=task.skip_permissions, session_id=task.session_id, model=task.model)
+    cmd = build_cmd(provider, task.prompt, skip_permissions=task.skip_permissions,
+                    session_id=task.session_id, model=task.model, guard=not machine)
 
     env = get_provider_env(provider)
 
