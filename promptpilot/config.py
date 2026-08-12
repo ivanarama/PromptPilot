@@ -647,9 +647,15 @@ GUARD = os.environ.get("PP_GUARD", "auto").strip().lower()
 
 
 def _guard_hook_command() -> str:
-    """How Claude Code should invoke the guard, quoted for the shell it uses."""
+    """How Claude Code should invoke the guard, quoted for the shell it uses.
+
+    The data directory is spelled out rather than inherited: a herdr pane gets
+    only the variables its tab was created with, so PP_DATA_DIR does not reach
+    the hook there and it would read its rules from the wrong place.
+    """
     argv = ([sys.executable, "guard-hook"] if getattr(sys, "frozen", False)
             else [sys.executable, "-m", "promptpilot", "guard-hook"])
+    argv += ["--data-dir", str(DB_DIR)]
     if os.name == "nt":
         import subprocess
         return subprocess.list2cmdline(argv)

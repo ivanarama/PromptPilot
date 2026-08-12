@@ -137,8 +137,11 @@ def list_tasks(status, limit):
 
 
 @cli.command("guard-hook", hidden=True)
-def guard_hook():
+@click.option("--data-dir", default=None, help="Where guard.json and guard.log live")
+def guard_hook(data_dir):
     """PreToolUse hook entry point (Claude Code calls this, not a human)."""
+    if data_dir:
+        os.environ["PP_DATA_DIR"] = data_dir
     from .guard import main
     sys.exit(main())
 
