@@ -56,11 +56,14 @@ def _ps_encode(script: str) -> str:
 def ssh_script(target, script: str) -> list:
     """argv running a snippet written in the target's own shell dialect."""
     r = as_remote(target)
+    # '--' ends ssh option parsing so a host that begins with '-' can't smuggle
+    # an option like -oProxyCommand=... (which would run a local command). The
+    # registry also validates host on the way in; this is defence in depth.
     if r.shell == POWERSHELL:
-        return ["ssh", *SSH_OPTS, r.host, "powershell", "-NoProfile",
+        return ["ssh", *SSH_OPTS, "--", r.host, "powershell", "-NoProfile",
                 "-NonInteractive", "-EncodedCommand", _ps_encode(script)]
     # ssh flattens argv into one remote command line — quote the -lc payload
-    return ["ssh", *SSH_OPTS, r.host, "bash", "-lc", shlex.quote(script)]
+    return ["ssh", *SSH_OPTS, "--", r.host, "bash", "-lc", shlex.quote(script)]
 
 
 def ssh_command(target, argv, env: dict = None) -> list:

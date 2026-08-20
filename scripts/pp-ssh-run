@@ -25,8 +25,21 @@ HOST=$1; shift
 PROMPT=${!#}
 CMD=("${@:1:$#-1}")
 
-# %q-quote every token so the remote shell sees them verbatim (spaces,
-# quotes and unicode in the prompt survive the ssh hop).
-QUOTED=$(printf '%q ' "${CMD[@]}" "$PROMPT")
+# POSIX single-quote (shlex.quote equivalent): works under any remote login
+# shell. printf '%q' emits bash-only $'...' that dash/fish mangle, and it turns
+# a multi-line prompt into a broken command.
+posix_quote() {
+  printf "'%s'" "${1//\'/\'\\\'\'}"
+}
 
-exec ssh -o BatchMode=yes "$HOST" -- "$QUOTED"
+REMOTE=
+for tok in "${CMD[@]}" "$PROMPT"; do
+  REMOTE+="$(posix_quote "$tok") "
+done
+
+# '--' before the host so a host that begins with '-' can't be read as an ssh
+# option. Keepalives so a silent NAT/firewall drop during a long "thinking"
+# turn is detected instead of hanging the task forever.
+exec ssh -o BatchMode=yes -o ConnectTimeout=10 \
+         -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+         -- "$HOST" "$REMOTE"

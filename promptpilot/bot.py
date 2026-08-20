@@ -5,13 +5,16 @@ against PP_TG_ALLOWED_PHONES env var (comma-separated) or ~/.promptpilot/tg_conf
 After authorization all task management features are available.
 """
 
+import functools
 import json
 import logging
 import os
+import time
 from datetime import datetime, timezone
 from typing import Optional
 
 from telegram import (
+    BotCommand,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
@@ -19,6 +22,7 @@ from telegram import (
     ReplyKeyboardRemove,
     Update,
 )
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -32,7 +36,8 @@ from telegram.ext import (
 from . import db
 from .config import (
     DEFAULT_CLI, HERDR_WATCH, HERDR_WATCH_INTERVAL,
-    get_skills, load_machines, load_providers, load_providers_detailed, pickable_providers,
+    get_provider_models, get_proxy_url, get_skills, load_machines, load_providers,
+    load_providers_detailed, mask_proxy_url, pickable_providers,
     PROJECTS_ROOT, TASK_PASSWORD,
 )
 from .models import TaskCreate, TaskStatus
@@ -147,6 +152,75 @@ async def _deny(update: Update):
     )
 
 
+TG_LIMIT = 4096
+
+
+def _clip(text: str, limit: int = TG_LIMIT) -> str:
+    """Keep a message under Telegram's 4096 limit without splitting a trailing
+    MarkdownV2 escape (a lone '\\' at the cut would break parsing)."""
+    if len(text) <= limit:
+        return text
+    cut = text[: limit - 1]
+    # don't end on an unbalanced backslash-escape
+    trailing = len(cut) - len(cut.rstrip("\\"))
+    if trailing % 2:
+        cut = cut[:-1]
+    return cut + "…"
+
+
+def require_auth(func):
+    """Gate a callback/entry handler on authorization AND a private chat.
+
+    callback_data can't be trusted: a user removed from the allow-list still
+    holds old inline buttons, and in a group any member could press them. Several
+    callback handlers used to skip the check that message handlers already do."""
+    @functools.wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *a, **kw):
+        user = update.effective_user
+        chat = update.effective_chat
+        ok = (user is not None and is_authorized(user.id)
+              and (chat is None or chat.type == "private"))
+        if not ok:
+            if update.callback_query:
+                await update.callback_query.answer("Нет доступа.", show_alert=True)
+            elif update.message:
+                await update.message.reply_text("Нет доступа.")
+            return ConversationHandler.END
+        return await func(update, context, *a, **kw)
+    return wrapper
+
+
+# Password gate for task creation (PP_TASK_PASSWORD). Entering it correctly in
+# the add-task flow authorizes the user for a while, so the skill/reply shortcuts
+# can require it too instead of silently bypassing the password.
+_pw_authed: dict = {}
+_PW_TTL = 3600
+
+
+def _pw_ok(user_id: int) -> bool:
+    if not TASK_PASSWORD:
+        return True
+    exp = _pw_authed.get(user_id)
+    return exp is not None and exp > time.monotonic()
+
+
+def _pw_grant(user_id: int):
+    _pw_authed[user_id] = time.monotonic() + _PW_TTL
+
+
+_WIZARD_KEYS = ("new_prompt", "new_provider", "new_priority", "new_dir", "new_schedule",
+                "new_recurrence", "new_detached", "new_keep_pane", "new_model",
+                "new_skip_permissions", "new_skill_name", "new_herdr_target", "new_machine",
+                "new_worktree")
+
+
+def _clear_wizard(context):
+    """Drop leftover add-task state so an aborted wizard can't bleed a stale
+    machine/provider into the next task (e.g. a skill started right after)."""
+    for key in _WIZARD_KEYS:
+        context.user_data.pop(key, None)
+
+
 # ---------------------------------------------------------------------------
 # /start
 # ---------------------------------------------------------------------------
@@ -207,7 +281,10 @@ async def show_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _deny(update)
         return
 
-    page = context.user_data.get("tasks_page", 0)
+    # Opening the list from the menu is always the first page — otherwise a
+    # remembered deep page shows "Задач нет" after tasks were removed.
+    context.user_data["tasks_page"] = 0
+    page = 0
     stats = db.get_stats()
     tasks = db.list_tasks(limit=PAGE_SIZE, offset=page * PAGE_SIZE)
 
@@ -222,6 +299,7 @@ async def show_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+@require_auth
 async def cb_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -247,6 +325,7 @@ async def cb_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Task detail
 # ---------------------------------------------------------------------------
 
+@require_auth
 async def cb_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -271,7 +350,7 @@ async def cb_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if proj:
         text += f"Проект: {_esc(proj)}\n"
     if task.model_used:
-        text += f"Модель: `{_esc(task.model_used)}`\n"
+        text += f"Модель: `{_esc_code(task.model_used)}`\n"
     text += (
         f"Приоритет: {task.priority}\n"
         f"Создана: {_esc(created)}\n"
@@ -279,7 +358,7 @@ async def cb_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Retry: {task.retry_count}/{task.max_retries}"
     )
     if task.working_dir:
-        text += f"\nДир: `{_esc(task.working_dir)}`"
+        text += f"\nДир: `{_esc_code(task.working_dir)}`"
     if task.verdict:
         icon = {"ГОТОВО": "✅", "УЖЕ СДЕЛАНО": "✅",
                 "НУЖЕН ЧЕЛОВЕК": "🟡", "НЕ СМОГ": "❌"}.get(task.verdict, "•")
@@ -288,7 +367,7 @@ async def cb_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += f"\n✎ Приписка: {_esc(task.note[:200])}"
     if task.worktree:
         branch = task.worktree_branch or wt_branch(task.id)
-        text += f"\n🌿 Worktree: `{_esc(task.worktree_path or 'ещё не создан')}`\nВетка: `{_esc(branch)}`"
+        text += f"\n🌿 Worktree: `{_esc_code(task.worktree_path or 'ещё не создан')}`\nВетка: `{_esc_code(branch)}`"
     if task.status.value == "rate_limited" and task.next_run_at:
         reset_str = task.next_run_at.strftime("%d.%m.%Y %H:%M UTC")
         text += f"\nСброс: {_esc(reset_str)}"
@@ -308,11 +387,16 @@ async def cb_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if task.error:
         text += f"\n\n*Ошибка:*\n{_esc(task.error[:300])}"
 
-    await query.edit_message_text(
-        text,
-        reply_markup=_task_detail_keyboard(task),
-        parse_mode="MarkdownV2",
-    )
+    kb = _task_detail_keyboard(task)
+    try:
+        await query.edit_message_text(_clip(text), reply_markup=kb, parse_mode="MarkdownV2")
+    except BadRequest:
+        # Too long after escaping, or a truncation landed inside markdown —
+        # fall back to plain text so the card is never unopenable.
+        plain = (f"Задача #{task.id} [{task.status.value}]\n"
+                 f"Промпт:\n{task.prompt[:500]}\n\n"
+                 f"Результат:\n{(task.result or task.error or '')[:1500]}")
+        await query.edit_message_text(_clip(plain), reply_markup=kb)
 
 
 def _esc(text: str) -> str:
@@ -328,13 +412,12 @@ def _esc_code(text: str) -> str:
 
 
 def _mask_secret(name: str, value: str) -> str:
-    """Mask values that look like API keys/tokens."""
-    secret_hints = ("key", "token", "secret", "password", "auth")
-    if any(h in name.lower() for h in secret_hints) and len(value) > 8:
-        return f"{value[:4]}...{value[-3:]}"
-    return value
+    """Mask provider env values for display (masks by default, no suffix leak)."""
+    from .config import mask_secret_value
+    return mask_secret_value(name, value)
 
 
+@require_auth
 async def cb_cancel_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     task_id = int(query.data.split(":")[1])
@@ -353,6 +436,7 @@ async def cb_cancel_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("Не удалось отменить (уже выполнена или не найдена).", show_alert=True)
 
 
+@require_auth
 async def cb_reset_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     task_id = int(query.data.split(":")[1])
@@ -363,6 +447,7 @@ async def cb_reset_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("Задача не в статусе running.", show_alert=True)
 
 
+@require_auth
 async def cb_delete_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     task_id = int(query.data.split(":")[1])
@@ -459,9 +544,12 @@ async def cb_provider_detail(update: Update, context: ContextTypes.DEFAULT_TYPE)
     elif info.get("executor"):
         lines.append(f"🔧 Исполнитель: {_esc(info['executor'])} \\(kind: {_esc(info.get('kind', 'claude'))}\\)\n")
 
-    models = info.get("models")
+    import asyncio
+    models = await asyncio.to_thread(get_provider_models, name)
     if models:
-        lines.append("🏷 Модели: " + ", ".join(f"`{_esc_code(m)}`" for m in models))
+        shown = models[:20]
+        more = "" if len(models) <= 20 else f" \\(\\+{len(models) - 20}\\)"
+        lines.append("🏷 Модели: " + ", ".join(f"`{_esc_code(m)}`" for m in shown) + more)
     else:
         lines.append("🏷 Модели: по умолчанию \\(sonnet, opus, haiku\\)")
     lines.append("")
@@ -517,6 +605,7 @@ async def add_task_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _deny(update)
         return ConversationHandler.END
 
+    _clear_wizard(context)
     if TASK_PASSWORD:
         await update.message.reply_text(
             "Введите пароль для создания задачи:\n(/cancel — отменить)",
@@ -538,13 +627,15 @@ async def add_task_got_password(update: Update, context: ContextTypes.DEFAULT_TY
     except Exception:
         pass
 
-    if entered != TASK_PASSWORD:
+    import hmac
+    if not hmac.compare_digest(entered, TASK_PASSWORD):
         await update.message.reply_text(
             "Неверный пароль. Создание задачи отменено.",
             reply_markup=_main_menu(),
         )
         return ConversationHandler.END
 
+    _pw_grant(update.effective_user.id)
     await update.message.reply_text(
         "Введите промпт для задачи:\n(/cancel — отменить)",
         reply_markup=ReplyKeyboardRemove(),
@@ -594,20 +685,21 @@ async def add_task_got_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE
     return ASK_PROVIDER
 
 
-_DEFAULT_MODELS = ["sonnet", "opus", "haiku"]
+def _model_keyboard(models) -> InlineKeyboardMarkup:
+    """Model keyboard from a precomputed list (None/empty → no keyboard).
 
-
-def _model_keyboard(provider: str) -> InlineKeyboardMarkup:
-    """Model keyboard: Claude Code providers (supports_skills) or any provider
-    with an explicit models list (e.g. opencode in herdr)."""
-    providers = load_providers()
-    info = providers.get(provider or DEFAULT_CLI, {})
-    models = info.get("models") or (_DEFAULT_MODELS if info.get("supports_skills") else None)
+    The list is fetched by the caller via asyncio.to_thread (get_provider_models
+    may do a blocking network call for dynamic discovery). Capped, and models
+    whose callback_data would exceed Telegram's 64-byte limit are skipped.
+    """
     if not models:
+        return None
+    safe = [m for m in models if len(f"model:{m}".encode("utf-8")) <= 64][:24]
+    if not safe:
         return None
     buttons = [[InlineKeyboardButton("По умолчанию", callback_data="model:")]]
     row = []
-    for m in models:
+    for m in safe:
         row.append(InlineKeyboardButton(m, callback_data=f"model:{m}"))
         if len(row) == 3:
             buttons.append(row)
@@ -661,7 +753,9 @@ async def add_task_got_provider(update: Update, context: ContextTypes.DEFAULT_TY
                                       reply_markup=InlineKeyboardMarkup(buttons))
         return ASK_HERDR_TARGET
 
-    kb = _model_keyboard(provider)
+    import asyncio
+    models = await asyncio.to_thread(get_provider_models, provider or DEFAULT_CLI)
+    kb = _model_keyboard(models)
     if kb:
         await query.edit_message_text("Выберите модель:", reply_markup=kb)
         return ASK_MODEL
@@ -828,6 +922,7 @@ async def _ask_dir(query, context):
         return ASK_DIR_MANUAL
 
 
+@require_auth
 async def cb_dir_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Expand a folder showing its subdirectories."""
     query = update.callback_query
@@ -1212,11 +1307,7 @@ async def _finish_add_task(update: Update, context: ContextTypes.DEFAULT_TYPE, w
 
 
 async def add_task_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    for key in ("new_prompt", "new_provider", "new_priority", "new_dir", "new_schedule",
-                "new_recurrence", "new_detached", "new_keep_pane", "new_model",
-                "new_skip_permissions", "new_skill_name", "new_herdr_target", "new_machine",
-                "new_worktree"):
-        context.user_data.pop(key, None)
+    _clear_wizard(context)
     await update.message.reply_text("Отменено.", reply_markup=_main_menu())
     return ConversationHandler.END
 
@@ -1225,9 +1316,14 @@ async def add_task_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Reply to task (continue session)
 # ---------------------------------------------------------------------------
 
+@require_auth
 async def cb_reply_task_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+
+    if not _pw_ok(query.from_user.id):
+        await query.answer("Сначала введите пароль через ➕ Добавить задачу.", show_alert=True)
+        return ConversationHandler.END
 
     task_id = int(query.data.split(":")[1])
     task = db.get_task(task_id)
@@ -1362,6 +1458,7 @@ async def cmd_skills(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="MarkdownV2", reply_markup=keyboard)
 
 
+@require_auth
 async def cb_skills_proj_picker(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show project selector so user can load project-local skills."""
     query = update.callback_query
@@ -1397,6 +1494,7 @@ async def cb_skills_proj_picker(update: Update, context: ContextTypes.DEFAULT_TY
     )
 
 
+@require_auth
 async def cb_skills_dir_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Expand a folder in skills project picker showing its subdirectories."""
     query = update.callback_query
@@ -1421,6 +1519,7 @@ async def cb_skills_dir_open(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 
+@require_auth
 async def cb_skills_dir(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Load and show global + project-local skills for the selected project."""
     query = update.callback_query
@@ -1454,6 +1553,7 @@ async def cb_skills_dir(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+@require_auth
 async def cb_skills_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Return to global skills list."""
     query = update.callback_query
@@ -1469,11 +1569,17 @@ async def cb_skills_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(text, parse_mode="MarkdownV2", reply_markup=keyboard)
 
 
+@require_auth
 async def skill_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Entry point for skill conversation — triggered when user taps a skill button."""
     query = update.callback_query
     await query.answer()
 
+    if not _pw_ok(query.from_user.id):
+        await query.answer("Сначала введите пароль через ➕ Добавить задачу.", show_alert=True)
+        return ConversationHandler.END
+
+    _clear_wizard(context)
     skill_name = query.data.split(":", 1)[1]
     if not _best_claude_provider():
         await query.edit_message_text("Нет Claude-провайдера для выполнения скилов.")
@@ -1629,6 +1735,13 @@ async def _herdr_watch_loop(bot):
     notified = {}  # (machine, pane_id) -> status already notified about
     while True:
         await asyncio.sleep(HERDR_WATCH_INTERVAL)
+        try:
+            await _herdr_watch_tick(bot, notified)
+        except Exception as e:  # one bad poll must not stop the whole watcher
+            logger.warning("herdr watch tick упал: %s", e)
+
+
+async def _herdr_watch_tick(bot, notified):
         seen = set()
         for machine, host in _herdr_watch_targets():
             data = await _herdr_json("agent", "list", host=host)
@@ -1740,18 +1853,42 @@ async def herdr_reply_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # ---------------------------------------------------------------------------
 
 async def _notify_loop(bot):
-    """Background loop: send notifications for completed/failed tasks every 10s."""
+    """Background loop: send notifications for completed/failed tasks every 10s.
+
+    The DB reads sit inside try/except: this bot shares SQLite with a live
+    worker, and one transient 'database is locked' used to kill this coroutine
+    silently — notifications then just stopped until a bot restart. Permanently
+    undeliverable messages (user blocked the bot, chat gone) are marked done so
+    they don't retry every 10s forever.
+    """
     import asyncio
+    from telegram.error import BadRequest, Forbidden
     while True:
         await asyncio.sleep(10)
         # Free-form queued notifications (e.g. herdr agent blocked mid-task)
-        for note in db.get_unsent_notifications():
+        try:
+            notes = db.get_unsent_notifications()
+        except Exception as e:
+            logger.warning("notify: чтение очереди уведомлений упало: %s", e)
+            continue
+        for note in notes:
             try:
-                await bot.send_message(chat_id=note["tg_chat_id"], text=note["message"])
+                await bot.send_message(chat_id=note["tg_chat_id"], text=_clip(note["message"]))
                 db.mark_notification_sent(note["id"])
+            except (Forbidden, BadRequest) as e:
+                logger.warning("notify %s: постоянная ошибка (%s) — помечаю отправленным", note["id"], e)
+                try:
+                    db.mark_notification_sent(note["id"])
+                except Exception:
+                    pass
             except Exception as e:
                 logger.warning("Failed to send notification %s: %s", note["id"], e)
-        for task in db.get_pending_notifications():
+        try:
+            pending = db.get_pending_notifications()
+        except Exception as e:
+            logger.warning("notify: чтение задач для уведомления упало: %s", e)
+            continue
+        for task in pending:
             try:
                 if task.status.value == "completed":
                     icon, status_word = "✅", "выполнена"
@@ -1774,11 +1911,35 @@ async def _notify_loop(bot):
 
                 proj = _project_name(task.working_dir)
                 proj_str = f" [{proj}]" if proj else ""
-                text = f"{icon} Задача #{task.id}{proj_str} {status_word}{body}"
+                text = _clip(f"{icon} Задача #{task.id}{proj_str} {status_word}{body}")
                 await bot.send_message(chat_id=task.tg_chat_id, text=text)
                 db.mark_notified(task.id)
+            except (Forbidden, BadRequest) as e:
+                logger.warning("notify task %s: постоянная ошибка (%s) — помечаю уведомлённым", task.id, e)
+                try:
+                    db.mark_notified(task.id)
+                except Exception:
+                    pass
             except Exception as e:
                 logger.warning("Failed to notify task %s: %s", task.id, e)
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_user.id):
+        await _deny(update)
+        return
+    await update.message.reply_text(
+        "PromptPilot — очередь задач для AI CLI.\n\n"
+        "Меню:\n"
+        "📋 Задачи — список и детали (отмена / сброс / удаление)\n"
+        "➕ Добавить задачу — пошаговый мастер\n"
+        "📊 Статистика — сводка по статусам\n"
+        "🔌 Провайдеры — список и настройки\n"
+        "⚡ Скилы — запустить /skill Claude Code\n"
+        "⏸ Пауза — приостановить воркер без потери задач\n\n"
+        "Команды: /start, /skills, /help, /cancel",
+        reply_markup=_main_menu(),
+    )
 
 
 def run_bot():
@@ -1793,11 +1954,29 @@ def run_bot():
 
     async def post_init(application):
         import asyncio
+        try:
+            await application.bot.set_my_commands([
+                BotCommand("start", "Меню / авторизация"),
+                BotCommand("skills", "Скилы Claude Code"),
+                BotCommand("help", "Помощь"),
+                BotCommand("cancel", "Отменить текущий диалог"),
+            ])
+        except Exception as e:
+            logger.warning("set_my_commands failed: %s", e)
         asyncio.create_task(_notify_loop(application.bot))
         if HERDR_WATCH:
             asyncio.create_task(_herdr_watch_loop(application.bot))
 
-    app = Application.builder().token(token).post_init(post_init).build()
+    builder = Application.builder().token(token).post_init(post_init)
+    proxy = get_proxy_url()
+    if proxy:
+        # python-telegram-bot 21.x dropped the .proxy_url() builder helper; pass
+        # an HTTPXRequest with a proxy for BOTH the bot channel and long-polling.
+        from telegram.request import HTTPXRequest
+        builder = builder.request(HTTPXRequest(proxy=proxy))
+        builder = builder.get_updates_request(HTTPXRequest(proxy=proxy))
+        logger.info("Telegram через прокси: %s", mask_proxy_url(proxy))
+    app = builder.build()
 
     add_conv = ConversationHandler(
         entry_points=[
@@ -1902,6 +2081,7 @@ def run_bot():
     app.add_handler(CallbackQueryHandler(cb_herdr_screen, pattern=r"^hd_screen:"), group=-1)
 
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("skills", cmd_skills))
     app.add_handler(MessageHandler(filters.CONTACT, handle_contact))
     app.add_handler(herdr_reply_conv)

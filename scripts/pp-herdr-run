@@ -111,14 +111,27 @@ on_term() {
 trap on_term TERM INT HUP
 
 # --- Start the agent in the pane ---------------------------------------------
-if [ ${#AGENT_ARGS[@]} -gt 0 ]; then
-    START_JSON="$(herdr agent start "$AGENT" --kind "$KIND" --pane "$PANE_ID" \
-        --timeout "$START_TIMEOUT_MS" -- "${AGENT_ARGS[@]}" 2>&1)"
-else
-    START_JSON="$(herdr agent start "$AGENT" --kind "$KIND" --pane "$PANE_ID" \
-        --timeout "$START_TIMEOUT_MS" 2>&1)"
-fi
-[ $? -eq 0 ] || { trap - TERM INT HUP; cleanup_tab; die "agent start failed: $START_JSON"; }
+# A freshly created pane's shell may still be coming up, so `agent start` can
+# fail with agent_pane_busy on a loaded/slow machine — retry (mirrors
+# herdr_exec.py, which loops up to 20×0.5s).
+start_agent() {
+    if [ ${#AGENT_ARGS[@]} -gt 0 ]; then
+        herdr agent start "$AGENT" --kind "$KIND" --pane "$PANE_ID" \
+            --timeout "$START_TIMEOUT_MS" -- "${AGENT_ARGS[@]}" 2>&1
+    else
+        herdr agent start "$AGENT" --kind "$KIND" --pane "$PANE_ID" \
+            --timeout "$START_TIMEOUT_MS" 2>&1
+    fi
+}
+START_JSON=""; start_rc=1
+for _ in $(seq 1 20); do
+    START_JSON="$(start_agent)"; start_rc=$?
+    [ $start_rc -eq 0 ] && break
+    ERR_CODE="$(printf '%s' "$START_JSON" | json_get "d.get('error',{}).get('code','')")"
+    [ "$ERR_CODE" = "agent_pane_busy" ] || break
+    sleep 0.5
+done
+[ $start_rc -eq 0 ] || { trap - TERM INT HUP; cleanup_tab; die "agent start failed: $START_JSON"; }
 
 # --- Submit the prompt; retry on agent_prompt_stalled ------------------------
 PROMPT_CMD=(herdr agent prompt "$AGENT" "$PROMPT" --wait)
@@ -209,8 +222,8 @@ CLEANED="$(printf '%s\n' "$RAW" | PP_PROMPT="$PROMPT" python3 -c "$FILTER_PY")" 
 # Interactive sessions exit 0 even when the provider is rate-limited; the
 # worker only retries when exit != 0 and stderr matches its patterns
 # (worker.RATE_LIMIT_PATTERNS — "rate limit" below is what triggers it).
-if printf '%s' "$CLEANED" | grep -qiE \
-    "reached your usage limit|usage limit reached|rate_limit_error|overloaded_error|too many requests|quota exceeded"; then
+if printf '%s' "$CLEANED" | grep -v '❯' | grep -qiE \
+    "reached your usage limit|usage limit reached|hit your (session|usage|weekly) limit|rate_limit_error|overloaded_error|too many requests|quota exceeded"; then
     trap - TERM INT HUP
     cleanup_tab
     echo "pp-herdr-run: rate limit detected in session output" >&2

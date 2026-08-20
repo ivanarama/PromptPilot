@@ -9,21 +9,34 @@ from typing import List, Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 import os
 
 from . import db
-from .config import API_TOKEN, get_skills, load_providers, provider_available, PROJECTS_ROOT
+from .config import API_TOKEN, get_provider_models, get_skills, load_providers, mask_secret_value, provider_available, PROJECTS_ROOT
 from .models import CostStats, Stats, TaskCreate, TaskInDB, TaskStatus, TaskUpdate
 from .version import check_for_update
 
 app = FastAPI(title="PromptPilot", version="0.1.0")
 
 
+_SAFE_METHODS = ("GET", "HEAD", "OPTIONS")
+
+
 @app.middleware("http")
 async def _auth(request, call_next):
     """Optional auth: enabled by PP_API_TOKEN. Accepts Bearer <token> or
-    HTTP Basic with the token as password (browser shows a native prompt)."""
+    HTTP Basic with the token as password (browser shows a native prompt).
+
+    Regardless of the token, a state-changing request that a browser marks as
+    cross-site is refused: without this, a malicious page open in the user's
+    browser could POST to the loopback server (no token by default) and queue a
+    task that runs with --dangerously-skip-permissions. curl/scripts don't send
+    Sec-Fetch-Site, so they're unaffected."""
+    if request.method not in _SAFE_METHODS:
+        if request.headers.get("sec-fetch-site") == "cross-site":
+            return Response(status_code=403, content="cross-site request refused")
     if not API_TOKEN:
         return await call_next(request)
     header = request.headers.get("authorization", "")
@@ -56,6 +69,11 @@ def api_list_tasks(status: Optional[TaskStatus] = None, limit: int = 50, offset:
 
 @app.post("/api/tasks", response_model=TaskInDB, status_code=201)
 def api_create_task(task: TaskCreate):
+    # Allowlist providers: an unknown name would otherwise be turned into a raw
+    # command by build_cmd's fallback (provider='touch x' → run `touch x`). The
+    # UI only ever offers registered providers, so this rejects nothing real.
+    if task.provider and task.provider not in load_providers():
+        raise HTTPException(400, f"Неизвестный провайдер «{task.provider}»")
     return db.create_task(task)
 
 
@@ -74,12 +92,18 @@ def api_update_task(task_id: int, update: TaskUpdate):
         raise HTTPException(404, "Task not found")
 
     if update.status == TaskStatus.CANCELLED:
+        # Cancelling settles the task; a priority change alongside it is moot, so
+        # don't half-apply both (the old code cancelled, then 400'd on priority).
         if task.status == TaskStatus.RUNNING:
             # running: ask the worker to kill the process (it polls every ~2s)
             if not db.request_cancel(task_id):
                 raise HTTPException(400, "Task is no longer running")
         elif not db.cancel_task(task_id):
             raise HTTPException(400, "Can only cancel pending, rate_limited or running tasks")
+        return {"ok": True}
+
+    if update.status is not None:
+        raise HTTPException(400, "Через API поддерживается только отмена (status=cancelled)")
 
     if update.priority is not None:
         if not db.update_priority(task_id, update.priority):
@@ -112,17 +136,20 @@ def api_cost_stats():
     return db.get_cost_stats()
 
 
+class NoteBody(BaseModel):
+    text: str = ""
+
+
 @app.post("/api/tasks/{task_id}/note")
-def api_set_note(task_id: int, body: dict = None):
+def api_set_note(task_id: int, body: NoteBody):
     """Дописать решателю. Пустой текст убирает приписку.
 
     Живёт при задаче, а не при прогоне: идущий прогон её уже не увидит, зато
     увидит следующий — в том числе повтор после rate limit или срыва среды.
     """
-    text = (body or {}).get("text", "")
-    if not db.set_note(task_id, text):
+    if not db.set_note(task_id, body.text):
         raise HTTPException(404, "Задача не найдена")
-    return {"ok": True, "note": text or None}
+    return {"ok": True, "note": body.text or None}
 
 
 @app.get("/api/stats/usage")
@@ -165,12 +192,13 @@ def api_version():
 @app.get("/api/providers")
 def api_providers():
     providers = load_providers()
-    default_models = ["sonnet", "opus", "haiku"]
     return {
         name: {
             "description": info.get("description", name),
             "supports_skills": info.get("supports_skills", False),
-            "models": info.get("models", default_models if info.get("supports_skills") else []),
+            # Dynamic discovery for Claude-type providers (cached); falls back to
+            # the provider's own list or the sonnet/opus/haiku tiers.
+            "models": get_provider_models(name),
             "available": provider_available(info),
             "hidden": bool(info.get("hidden")),
             "executor": info.get("executor", ""),
@@ -243,6 +271,12 @@ def api_machine_create(m: MachineCreate):
     import re as __re
     if not __re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,31}", m.name):
         raise HTTPException(400, "Имя: латиница/цифры/-/_/. до 32 символов")
+    # A host starting with '-' is read by ssh as an option: '-oProxyCommand=...'
+    # would run a local command on the first probe. Enforce [user@]host[:port].
+    host = m.host.strip()
+    if host.startswith("-") or not __re.fullmatch(r"[A-Za-z0-9._@:\-]{1,255}", host):
+        raise HTTPException(400, "Некорректный хост (ожидается [user@]host[:port])")
+    m.host = host
     providers, shell = probe_machine(m.host)
     if not shell:
         raise HTTPException(400, "Машина недоступна по ssh (проверь ключи и BatchMode)")
@@ -306,8 +340,7 @@ def api_providers_manage():
             "models": info.get("models") or [],
             "args": info.get("args") or [],
             "supports_skills": info.get("supports_skills", False),
-            "env": {k: ("***" if any(s in k.upper() for s in ("TOKEN", "KEY", "SECRET")) else v)
-                    for k, v in (info.get("env") or {}).items()},
+            "env": {k: mask_secret_value(k, v) for k, v in (info.get("env") or {}).items()},
             "available": provider_available(info),
             "hidden": bool(info.get("hidden")),
             "source": info.get("_source", "builtin"),

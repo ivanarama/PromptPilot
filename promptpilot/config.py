@@ -7,9 +7,14 @@ from pathlib import Path
 
 
 def _load_dotenv():
-    """Load .env file into os.environ (only for keys not already set).
+    """Load .env files into os.environ (only for keys not already set).
 
-    Search order:
+    All candidates are read, earlier ones winning (a key already set is never
+    overwritten). This matters: running `pp` from a project directory that has
+    its own .env must NOT hide the permanent ~/.promptpilot/.env — otherwise the
+    bot token or data dir silently depends on the current directory.
+
+    Search order (first wins):
       1. Directory of pp.exe  (when running as PyInstaller bundle)
       2. Parent of pp.exe directory (e.g. project root when exe is in dist/)
       3. Current working directory
@@ -42,22 +47,94 @@ def _load_dotenv():
                                 os.environ[key] = value
             except OSError:
                 pass
-            break  # use the first .env found
+            # No break: read every .env, earlier files win via "key not in environ"
 
 
 # Load .env BEFORE reading any os.environ values
 _load_dotenv()
+
+
+def _int_env(name: str, default: int) -> int:
+    """int() an env var, tolerating garbage.
+
+    A typo like PP_PORT='8420 ' or PP_POLL_INTERVAL='5s' must not crash every
+    single pp invocation — including the guard hook, whose failure would leave
+    an unattended run with no guard — with a ValueError on import.
+    """
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return int(raw.strip())
+    except ValueError:
+        print(f"⚠ {name}={raw!r} — не число, использую {default}", file=sys.stderr)
+        return default
+
+
+_warned: set = set()
+
+
+def _warn_once(key: str, msg: str):
+    """Print a warning at most once per process (called from hot load paths)."""
+    if key not in _warned:
+        _warned.add(key)
+        print(msg, file=sys.stderr)
+
+
+def _q(path: str) -> str:
+    """Double-quote a path containing spaces so _split_cmd keeps it one token."""
+    if path and " " in path and not path.startswith(('"', "'")):
+        return f'"{path}"'
+    return path
+
+
+def _split_cmd(template: str) -> list:
+    """Split a command template into argv, honoring quotes.
+
+    A naive str.split() mangles `--system "be nice"` and paths with spaces
+    (C:\\Users\\John Smith\\...). POSIX uses standard shell splitting; on Windows
+    keep backslashes (posix=False) and strip the wrapping quotes ourselves.
+    """
+    import shlex
+    if os.name == "nt":
+        toks = shlex.split(template or "", posix=False)
+        return [t[1:-1] if len(t) >= 2 and t[0] == t[-1] == '"' else t for t in toks]
+    return shlex.split(template or "", posix=True)
+
+
+def _atomic_write_json(path: "Path", data):
+    """Write JSON atomically with owner-only perms.
+
+    Temp file + os.replace so a crash mid-write can't truncate a config full of
+    API keys; chmod 600 so another local user can't read those keys.
+    """
+    DB_DIR.mkdir(parents=True, exist_ok=True)
+    if os.name != "nt":
+        try:
+            os.chmod(DB_DIR, 0o700)
+        except OSError:
+            pass
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    if os.name != "nt":
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+    os.replace(tmp, path)
+
 
 # Database
 DB_DIR = Path(os.environ.get("PP_DATA_DIR", Path.home() / ".promptpilot"))
 DB_PATH = DB_DIR / "promptpilot.db"
 
 # Worker
-POLL_INTERVAL = int(os.environ.get("PP_POLL_INTERVAL", "5"))
-TASK_TIMEOUT = int(os.environ.get("PP_TASK_TIMEOUT", "0"))
-BASE_DELAY = int(os.environ.get("PP_BASE_DELAY", "60"))
-MAX_DELAY = int(os.environ.get("PP_MAX_DELAY", "3600"))
-MAX_RETRIES = int(os.environ.get("PP_MAX_RETRIES", "5"))
+POLL_INTERVAL = _int_env("PP_POLL_INTERVAL", 5)
+TASK_TIMEOUT = _int_env("PP_TASK_TIMEOUT", 0)
+BASE_DELAY = _int_env("PP_BASE_DELAY", 60)
+MAX_DELAY = _int_env("PP_MAX_DELAY", 3600)
+MAX_RETRIES = _int_env("PP_MAX_RETRIES", 5)
 
 # Default CLI command
 DEFAULT_CLI = os.environ.get("PP_DEFAULT_CLI", "claude")
@@ -86,6 +163,8 @@ def _cursor_agent_cmd() -> str:
     shell:true and gets EINVAL.  We bypass it by calling the vendor node.exe +
     index.js directly.  Falls back to 'cursor-agent' if vendor not found.
     """
+    if sys.platform != "win32":
+        return "cursor-agent"  # the .cmd/EINVAL workaround is Windows-only
     try:
         sdk_root = Path.home() / "AppData" / "Roaming" / "npm" / "node_modules" / "@nothumanwork" / "cursor-agents-sdk"
         manifest = json.loads((sdk_root / "vendor" / "manifest.json").read_text())
@@ -93,7 +172,7 @@ def _cursor_agent_cmd() -> str:
         node_exe = vendor_dir / "node.exe"
         index_js = vendor_dir / "index.js"
         if node_exe.exists() and index_js.exists():
-            return f"{node_exe} {index_js}"
+            return f"{_q(str(node_exe))} {_q(str(index_js))}"
     except Exception:
         pass
     return "cursor-agent"
@@ -105,6 +184,8 @@ def _find_rg_dir() -> str:
     import subprocess as _sp
     if shutil.which("rg"):
         return ""
+    if sys.platform != "win32":
+        return ""  # the registry-PATH lookup below is Windows-only
     try:
         result = _sp.run(
             ["powershell", "-Command", '[System.Environment]::GetEnvironmentVariable("PATH","User")'],
@@ -125,17 +206,23 @@ def _find_opencode() -> str:
     resolved = shutil.which("opencode")
     if resolved:
         return resolved
-    # Fallback: common npm global bin locations
-    candidates = [
-        Path.home() / ".opencode" / "bin",                      # official install script
-        Path.home() / "AppData" / "Roaming" / "npm",          # Windows
-        Path("/usr/local/bin"),                                  # macOS / Linux (system npm)
-        Path.home() / ".npm-global" / "bin",                    # Linux (user npm)
-        Path.home() / ".local" / "bin",                         # generic
-    ]
-    for npm_bin in candidates:
-        for ext in (".CMD", ".cmd", ""):
-            candidate = npm_bin / f"opencode{ext}"
+    # Fallback: common install locations, per platform.
+    if sys.platform == "win32":
+        for npm_bin in (Path.home() / "AppData" / "Roaming" / "npm",):
+            for ext in (".CMD", ".cmd", ""):
+                candidate = npm_bin / f"opencode{ext}"
+                if candidate.exists():
+                    return str(candidate)
+    else:
+        candidates = [
+            Path.home() / ".opencode" / "bin",   # official install script
+            Path("/usr/local/bin"),              # system npm
+            Path("/usr/bin"),
+            Path.home() / ".npm-global" / "bin", # user npm
+            Path.home() / ".local" / "bin",      # generic
+        ]
+        for npm_bin in candidates:
+            candidate = npm_bin / "opencode"
             if candidate.exists():
                 return str(candidate)
     return "opencode"
@@ -148,12 +235,12 @@ BUILTIN_PROVIDERS = {
         "description": "Промпт в открытую сессию herdr",
     },
     "claude": {
-        "cmd": f"{CLAUDE_EXE} -p --verbose --output-format stream-json {{prompt}}",
+        "cmd": f"{_q(CLAUDE_EXE)} -p --verbose --output-format stream-json {{prompt}}",
         "description": "Claude Code (Anthropic)",
         "supports_skills": True,
     },
     "claude-z": {
-        "cmd": f"{CLAUDE_EXE} -p --verbose --output-format stream-json {{prompt}}",
+        "cmd": f"{_q(CLAUDE_EXE)} -p --verbose --output-format stream-json {{prompt}}",
         "description": "Claude Code (GLM)",
         "supports_skills": True,
         "env": {
@@ -182,7 +269,7 @@ BUILTIN_PROVIDERS = {
         },
     },
     "opencode": {
-        "cmd": f"{_find_opencode()} run {{prompt}}",
+        "cmd": f"{_q(_find_opencode())} run {{prompt}}",
         "description": "OpenCode AI",
         "supports_skills": False,
         "models": [
@@ -223,7 +310,10 @@ def load_providers() -> dict:
                     providers[name] = {**providers[name], **info}
                 else:
                     providers[name] = info
-        except (json.JSONDecodeError, OSError):
+        except json.JSONDecodeError as e:
+            _warn_once("providers.json",
+                       f"⚠ {user_file} не читается ({e}) — кастомные провайдеры игнорируются")
+        except OSError:
             pass
     return providers
 
@@ -261,7 +351,10 @@ def load_providers_detailed() -> dict:
                     entry["_source"] = "providers.json"
                 entry["_source_path"] = str(user_file)
                 providers[name] = entry
-        except (json.JSONDecodeError, OSError):
+        except json.JSONDecodeError as e:
+            _warn_once("providers.json",
+                       f"⚠ {user_file} не читается ({e}) — кастомные провайдеры игнорируются")
+        except OSError:
             pass
 
     return providers
@@ -273,15 +366,16 @@ def _load_custom_providers() -> dict:
         try:
             with open(user_file) as f:
                 return json.load(f)
-        except (json.JSONDecodeError, OSError):
+        except json.JSONDecodeError as e:
+            _warn_once("providers.json",
+                       f"⚠ {user_file} не читается ({e}) — кастомные провайдеры игнорируются")
+        except OSError:
             pass
     return {}
 
 
 def _write_custom_providers(custom: dict):
-    DB_DIR.mkdir(parents=True, exist_ok=True)
-    with open(_providers_file(), "w") as f:
-        json.dump(custom, f, ensure_ascii=False, indent=2)
+    _atomic_write_json(_providers_file(), custom)
 
 
 def save_provider(name: str, cmd: str = None, description: str = "", env: dict = None,
@@ -347,9 +441,7 @@ def save_machine(name: str, host: str, providers: list = None, shell: str = None
     machines = load_machines()
     machines[name] = {"host": host, "providers": providers or [],
                       "shell": shell or "posix"}
-    DB_DIR.mkdir(parents=True, exist_ok=True)
-    with open(_machines_file(), "w") as f:
-        json.dump(machines, f, ensure_ascii=False, indent=2)
+    _atomic_write_json(_machines_file(), machines)
 
 
 def machine_remote(machine: dict):
@@ -364,8 +456,7 @@ def remove_machine(name: str) -> bool:
     if name not in machines:
         return False
     del machines[name]
-    with open(_machines_file(), "w") as f:
-        json.dump(machines, f, ensure_ascii=False, indent=2)
+    _atomic_write_json(_machines_file(), machines)
     return True
 
 
@@ -394,7 +485,7 @@ def probe_machine(host: str):
             continue
         if info.get("executor"):
             continue  # unknown executor — nothing to probe
-        parts = (info.get("cmd") or "").split()
+        parts = _split_cmd(info.get("cmd") or "")
         if parts:
             bases[name] = os.path.basename(parts[0])
 
@@ -438,7 +529,7 @@ def provider_available(info: dict) -> bool:
     import shutil
     if info.get("executor") == "herdr":
         return shutil.which(HERDR_BIN) is not None
-    parts = (info.get("cmd") or "").split()
+    parts = _split_cmd(info.get("cmd") or "")
     if not parts:
         return False
     return shutil.which(parts[0]) is not None or Path(parts[0]).exists()
@@ -465,8 +556,7 @@ def remove_provider(name: str) -> bool:
     if name not in custom:
         return False
     del custom[name]
-    with open(user_file, "w") as f:
-        json.dump(custom, f, indent=2)
+    _atomic_write_json(user_file, custom)
     return True
 
 
@@ -478,20 +568,25 @@ def build_cmd(provider: str, prompt: str, skip_permissions: bool = False, sessio
     with the hook lives here, and that path means nothing over there.
     """
     providers = load_providers()
+    cfg = providers.get(provider, {})
     if provider in providers:
-        template = providers[provider]["cmd"]
+        template = cfg["cmd"]
     else:
         template = f"{provider} {{prompt}}"
     marker = "\x00PROMPT\x00"
-    parts = template.replace("{prompt}", marker).split()
+    parts = _split_cmd(template.replace("{prompt}", marker))
     cmd = [prompt if p == marker else p for p in parts]
-    # Insert extra flags before the prompt argument
+    # Claude Code owns --resume and --dangerously-skip-permissions; adding them
+    # to codex/qwen/opencode just makes the CLI abort on an unknown argument
+    # (codex spells the skip flag differently, qwen has none). --model is shared
+    # by Claude and opencode, so it stays general.
+    is_claude = bool(cfg.get("supports_skills") or cfg.get("kind") == "claude")
     extras = []
     if model:
         extras += ["--model", model]
-    if session_id:
+    if session_id and is_claude:
         extras += ["--resume", session_id]
-    if skip_permissions:
+    if skip_permissions and is_claude:
         extras.append("--dangerously-skip-permissions")
     if guard and guard_enabled(providers.get(provider, {}), skip_permissions):
         settings = guard_settings_file()
@@ -503,16 +598,135 @@ def build_cmd(provider: str, prompt: str, skip_permissions: bool = False, sessio
     return cmd
 
 
+# PromptPilot's own secrets: the agent process never needs them, and an
+# autonomous run (skip_permissions) can read its own environment — a prompt
+# injection would otherwise exfiltrate the bot token or the Web-UI token.
+_SECRET_ENV = ("PP_TG_TOKEN", "PP_API_TOKEN", "PP_TASK_PASSWORD")
+
+
+# Names that clearly aren't secrets and are useful to see in full.
+_NONSECRET_ENV_HINTS = ("url", "host", "port", "path", "region", "model",
+                        "version", "endpoint", "base", "lang", "locale")
+
+
+def mask_secret_value(name: str, value: str) -> str:
+    """Mask a provider env value for display (bot cards, settings API).
+
+    Default is to mask fully as '***' — no prefix/suffix leak (the old code
+    showed the first 4 and last 3 chars of a key). Only obvious non-secrets
+    (URLs, model names, hosts) are shown in full. '***' also doubles as the
+    "unchanged secret" sentinel the provider-save endpoint already recognises.
+    """
+    if not value:
+        return value
+    if any(h in (name or "").lower() for h in _NONSECRET_ENV_HINTS):
+        return value
+    return "***"
+
+
 def get_provider_env(provider: str) -> dict:
-    """Get extra environment variables for a provider (merged with current env)."""
+    """Environment for a provider's subprocess: current env minus PromptPilot's
+    own secrets, plus the provider's declared env on top."""
     providers = load_providers()
     extra = providers.get(provider, {}).get("env", {})
-    if not extra:
-        return os.environ.copy()
     env = os.environ.copy()
+    for k in _SECRET_ENV:
+        env.pop(k, None)
     # Skip empty values — don't override existing env vars with empty strings
     env.update({k: v for k, v in extra.items() if v})
     return env
+
+
+# ── Dynamic model discovery (LiteLLM / OpenAI-compatible /models) ─────────────
+# Instead of the static sonnet/opus/haiku tiers, ask a provider's OpenAI-style
+# /models endpoint for the real list (e.g. a LiteLLM proxy). The endpoint is
+# resolved from the PROVIDER's OWN ANTHROPIC_BASE_URL, not the global one — so a
+# LiteLLM `claude` and a `claude-z` on api.z.ai don't cross-list each other.
+import time as _time
+import urllib.request as _ureq
+
+MODELS_URL = os.environ.get("PP_MODELS_URL", "").strip()
+MODELS_TOKEN = os.environ.get("PP_MODELS_TOKEN", "").strip()
+_MODELS_TTL = 300      # keep a good answer this long
+_MODELS_NEG_TTL = 60   # keep a failure this long, so a dead host isn't polled every call
+_MODELS_CACHE = {}     # url -> {"ts": float, "data": list|None}
+_CLAUDE_TIERS = ["sonnet", "opus", "haiku"]
+
+
+def _models_url_for(base_url: str) -> str:
+    """OpenAI-style /v1/models URL derived from an Anthropic base URL, or ''.
+
+    PP_MODELS_URL overrides everything. A LiteLLM proxy serves the list at
+    /v1/models on its root while ANTHROPIC_BASE_URL points at /anthropic.
+    """
+    if MODELS_URL:
+        return MODELS_URL
+    base = (base_url or "").strip()
+    if not base:
+        return ""
+    root = base.rstrip("/")
+    for suffix in ("/anthropic", "/v1"):
+        if root.endswith(suffix):
+            root = root[: -len(suffix)]
+            break
+    return root + "/v1/models"
+
+
+def fetch_available_models(base_url: str = None, token: str = None):
+    """Model ids from an OpenAI-compatible /models endpoint, or None.
+
+    Cached PER-URL with a short negative TTL, so a misconfigured/unreachable
+    endpoint isn't re-hit on every call (which would otherwise block for 5s each
+    time). BLOCKING — call via asyncio.to_thread from async code. Returns None →
+    caller falls back to the tiers.
+    """
+    if base_url is None:
+        base_url = os.environ.get("ANTHROPIC_BASE_URL", "")
+    url = _models_url_for(base_url)
+    if not url:
+        return None
+    now = _time.time()
+    cached = _MODELS_CACHE.get(url)
+    if cached is not None:
+        ttl = _MODELS_TTL if cached["data"] else _MODELS_NEG_TTL
+        if now - cached["ts"] < ttl:
+            return cached["data"]
+    if token is None:
+        token = MODELS_TOKEN or os.environ.get("ANTHROPIC_AUTH_TOKEN", "")
+    data = None
+    try:
+        req = _ureq.Request(url)
+        if token:
+            req.add_header("Authorization", f"Bearer {token}")
+        with _ureq.urlopen(req, timeout=5) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        items = payload.get("data", []) if isinstance(payload, dict) else payload
+        data = sorted({m["id"] for m in items
+                       if isinstance(m, dict) and m.get("id")}) or None
+    except (ValueError, OSError, KeyError, TypeError, AttributeError):
+        data = None  # unreachable/garbage → negative-cache below, fall back to tiers
+    _MODELS_CACHE[url] = {"ts": now, "data": data}
+    return data
+
+
+def get_provider_models(provider: str) -> list:
+    """Models to offer for a provider in the UI/bot pickers.
+
+    An explicit `models` list on the provider wins. Otherwise, for a Claude-type
+    provider (supports_skills), try dynamic discovery against THAT provider's
+    endpoint, falling back to the sonnet/opus/haiku tiers. Non-Claude providers
+    without an explicit list get nothing (no model picker).
+    """
+    info = load_providers().get(provider, {})
+    if "models" in info:
+        return list(info["models"])
+    if info.get("supports_skills", False):
+        penv = info.get("env") or {}
+        base = penv.get("ANTHROPIC_BASE_URL") or os.environ.get("ANTHROPIC_BASE_URL", "")
+        token = penv.get("ANTHROPIC_AUTH_TOKEN") or None
+        dynamic = fetch_available_models(base_url=base, token=token)
+        return dynamic if dynamic else list(_CLAUDE_TIERS)
+    return []
 
 
 def _parse_frontmatter(path: Path) -> dict:
@@ -612,15 +826,15 @@ def get_skills(working_dir: str = None) -> list:
 
 # herdr executor (providers with "executor": "herdr" in providers.json)
 HERDR_BIN = os.environ.get("PP_HERDR_BIN", "herdr")
-HERDR_READ_LINES = int(os.environ.get("PP_HERDR_READ_LINES", "300"))
-HERDR_START_TIMEOUT_MS = int(os.environ.get("PP_HERDR_START_TIMEOUT_MS", "60000"))
+HERDR_READ_LINES = _int_env("PP_HERDR_READ_LINES", 300)
+HERDR_START_TIMEOUT_MS = _int_env("PP_HERDR_START_TIMEOUT_MS", 60000)
 # Keep the pane open after a successful task (also per-provider "keep_pane")
 HERDR_KEEP_PANE = os.environ.get("PP_HERDR_KEEP_PANE", "0") == "1"
 
 # herdr → Telegram bridge: the bot watches ALL herdr agents (not only
 # PromptPilot tasks) and notifies when one is blocked or finishes unseen.
 HERDR_WATCH = os.environ.get("PP_HERDR_WATCH", "1") == "1"
-HERDR_WATCH_INTERVAL = int(os.environ.get("PP_HERDR_WATCH_INTERVAL", "10"))
+HERDR_WATCH_INTERVAL = _int_env("PP_HERDR_WATCH_INTERVAL", 10)
 
 # Git worktrees — a task edits its own checkout instead of the user's work tree.
 # Branch name is <prefix>t<task id>; the checkout lands next to the repository
@@ -633,11 +847,11 @@ WORKTREE_DIRNAME = ".pp-worktrees"
 WORKTREE_COPY = [p.strip() for p in os.environ.get("PP_WORKTREE_COPY", ".env").split(",") if p.strip()]
 
 # How many tasks the worker runs at once. 1 = the historical sequential worker.
-CONCURRENCY = max(1, int(os.environ.get("PP_CONCURRENCY", "1")))
+CONCURRENCY = max(1, _int_env("PP_CONCURRENCY", 1))
 # Don't start another agent with less than this much RAM available (MB).
 # Slots alone say nothing about whether the box can carry one more run: what
 # it actually does is swap, and then the API starts refusing. 0 = no check.
-MIN_FREE_MB = int(os.environ.get("PP_MIN_FREE_MB", "0"))
+MIN_FREE_MB = _int_env("PP_MIN_FREE_MB", 0)
 
 # Ask every task to end with "ИТОГ: ..." so a finished task says WHAT happened,
 # not just that the process exited 0. Off by default — it appends to the prompt.
@@ -679,6 +893,7 @@ def guard_settings_file() -> str:
     hook = {"type": "command", "command": _guard_hook_command()}
     content = json.dumps(
         {"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [hook]},
+                                  {"matcher": "Write|Edit|MultiEdit", "hooks": [hook]},
                                   {"matcher": "mcp__.*", "hooks": [hook]}]}},
         ensure_ascii=False, indent=2)
     try:
@@ -711,8 +926,52 @@ TASK_PASSWORD = os.environ.get("PP_TASK_PASSWORD", "")
 
 # Server
 HOST = os.environ.get("PP_HOST", "127.0.0.1")
-PORT = int(os.environ.get("PP_PORT", "8420"))
+PORT = _int_env("PP_PORT", 8420)
+
+
+def is_loopback_host(host: str) -> bool:
+    """Whether the server would bind to loopback only (safe without a token)."""
+    return (host or "").strip() in ("127.0.0.1", "::1", "localhost", "")
 # Optional API/Web UI token. When set, every request must carry it:
 # browser — native Basic-auth prompt (any username, token as password);
 # scripts — "Authorization: Bearer <token>" or curl -u x:<token>.
 API_TOKEN = os.environ.get("PP_API_TOKEN", "")
+
+# Escape hatch for the loopback guard on `pp server`: inside a container binding
+# 0.0.0.0 is normal (the security boundary is the host port publish, not the
+# container's bind), so the image sets this. On bare metal leave it unset.
+ALLOW_INSECURE_BIND = os.environ.get("PP_ALLOW_INSECURE_BIND", "").strip() not in ("", "0", "false", "False")
+
+
+# ── Outbound proxy for the Telegram bot ───────────────────────────────────────
+# Telegram's API is often blocked in corporate networks; route the bot through an
+# HTTP(S) or SOCKS5 proxy. Docker does NOT inherit host env, so pass it in via
+# PP_TG_PROXY (or the standard *_proxy names) — see docker-compose.yml.
+_PROXY_KEYS = (
+    "PP_TG_PROXY",              # explicit override (highest priority)
+    "https_proxy", "HTTPS_PROXY",
+    "all_proxy", "ALL_PROXY",
+    "http_proxy", "HTTP_PROXY",
+)
+
+
+def get_proxy_url() -> str:
+    """Proxy URL for the Telegram bot, or '' when none is configured."""
+    for key in _PROXY_KEYS:
+        val = os.environ.get(key, "").strip()
+        if val:
+            return val
+    return ""
+
+
+def mask_proxy_url(url: str) -> str:
+    """Hide user:pass in a proxy URL before logging it."""
+    if not url or "@" not in url:
+        return url
+    scheme, _, rest = url.partition("://")
+    if not rest or "@" not in rest:
+        return url
+    creds, _, host = rest.rpartition("@")
+    user = creds.split(":", 1)[0] if creds else ""
+    prefix = f"{scheme}://" if scheme else ""
+    return f"{prefix}{(user + ':***@') if user else ''}{host}"

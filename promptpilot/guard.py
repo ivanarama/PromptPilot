@@ -59,6 +59,16 @@ DEFAULT_RULES = [
     (r"\bgit\s+worktree\s+(?:remove|prune)\b",
      "Чужие worktree не трогаем — в них идёт работа других задач."),
 
+    # The guard must not be disarmable by the process it guards. Block shell
+    # writes and tool (Write/Edit) edits to its own config/settings — otherwise
+    # one `printf '{"replace":[]}' > ~/.promptpilot/guard.json` turns it all off.
+    (r"(?:>>?|\btee\b|\btruncate\b|\bdd\b)\s*[^\n|;&]*(?:guard\.json|claude-settings\.json)",
+     "Изменение файлов guard PromptPilot запрещено."),
+    (r"\b(?:rm|mv|cp|ln|install|sed|chmod|chattr)\b[^\n|;&]*(?:guard\.json|claude-settings\.json)",
+     "Изменение файлов guard PromptPilot запрещено."),
+    (r'file_path"\s*:\s*"[^"]*(?:guard\.json|claude-settings\.json)',
+     "Правка файлов guard PromptPilot запрещена."),
+
     (CMD + r"(?:sudo|su)\s",
      "Повышение прав запрещено: задача работает от своего пользователя."),
 
@@ -123,6 +133,27 @@ def _current_branch(cwd: str) -> str:
         return ""
 
 
+def _unquote(s: str) -> str:
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in "'\"":
+        return s[1:-1]
+    return s
+
+
+def _effective_cwd(command: str, cwd: str) -> str:
+    """The directory a `git push` in this command actually runs in.
+
+    `git -C <dir> push` and `cd <dir> && git push` push from <dir>, not from the
+    hook's cwd — checking the wrong directory would let a push from main slip by.
+    """
+    m = re.search(r"\bgit\s+-C\s+('[^']*'|\"[^\"]*\"|\S+)", command)
+    if m:
+        return _unquote(m.group(1))
+    m = re.search(r"(?:^|[;&|]\s*)cd\s+('[^']*'|\"[^\"]*\"|[^\s;&|]+)\s*(?:&&|;)", command)
+    if m:
+        return _unquote(m.group(1))
+    return cwd
+
+
 def check(command: str, cwd: str = "", tool: str = "") -> str:
     """Reason this command must not run, or "" when it may.
 
@@ -135,7 +166,7 @@ def check(command: str, cwd: str = "", tool: str = "") -> str:
         if re.search(pattern, text, re.IGNORECASE):
             return reason
     if re.search(r"\bgit\s+push\b", text, re.IGNORECASE):
-        branch = _current_branch(cwd)
+        branch = _current_branch(_effective_cwd(command, cwd))
         if branch in TRUNK_BRANCHES:
             return (f"Пуш из ветки {branch} запрещён: работай в своей ветке, "
                     f"вливает человек.")

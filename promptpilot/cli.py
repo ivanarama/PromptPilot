@@ -19,8 +19,14 @@ def _ensure_utf8():
     if "utf" in enc.lower():
         return
     os.environ["PYTHONUTF8"] = "1"
+    # When frozen (PyInstaller) sys.executable IS pp itself and knows no "-m";
+    # re-exec it with the original args instead.
+    if getattr(sys, "frozen", False):
+        argv = [sys.executable, *sys.argv[1:]]
+    else:
+        argv = [sys.executable, "-m", "promptpilot", *sys.argv[1:]]
     try:
-        os.execv(sys.executable, [sys.executable, "-m", "promptpilot", *sys.argv[1:]])
+        os.execv(argv[0], argv)
     except OSError:
         pass  # keep going with the current (possibly lossy) encoding
 
@@ -67,9 +73,22 @@ def _status_color(status: str) -> str:
 def cli(ctx):
     """PromptPilot — AI Prompt Scheduler"""
     if ctx.invoked_subcommand is None:
-        # Default: launch tray app when run without arguments
-        from .tray import run_tray
-        run_tray()
+        # Default: launch tray app when run without arguments. On a headless
+        # server (no display, or pystray/Pillow missing) this can't work — show
+        # help instead of dying with a traceback.
+        try:
+            from .tray import run_tray
+        except Exception as e:
+            click.echo(ctx.get_help())
+            click.echo(f"\n(Трей недоступен: {e}. На сервере запускай подкоманды, "
+                       "например `pp worker`, `pp server`.)")
+            return
+        try:
+            run_tray()
+        except Exception as e:
+            click.echo(ctx.get_help())
+            click.echo(f"\n(Трей не запустился: {e}. Нет графической среды? "
+                       "Запусти `pp worker`/`pp server` напрямую.)")
 
 
 @cli.command()
@@ -92,11 +111,23 @@ def add(prompt, file_path, priority, scheduled_at, working_dir, provider, max_re
     elif prompt:
         prompts = [prompt]
     else:
-        click.echo("Provide a prompt or --file")
-        return
+        raise click.UsageError("Provide a prompt or --file")
     prompts = [_fix_mojibake(p) for p in prompts]
 
-    dt = datetime.fromisoformat(scheduled_at) if scheduled_at else None
+    try:
+        dt = datetime.fromisoformat(scheduled_at) if scheduled_at else None
+    except ValueError:
+        raise click.UsageError(
+            f"Не понимаю дату {scheduled_at!r}. Формат ISO, например 2026-03-25T03:00 "
+            "(локальное время машины).")
+
+    if provider:
+        from .config import load_providers
+        import shutil
+        first = provider.split()[0] if provider else ""
+        if provider not in load_providers() and not shutil.which(first):
+            click.secho(f"⚠ Провайдер «{provider}» не найден среди известных и не в PATH — "
+                        "задача, скорее всего, упадёт. Список: pp provider", fg="yellow")
 
     for p in prompts:
         task = db.create_task(TaskCreate(
@@ -156,8 +187,8 @@ def note_cmd(task_id, text, clear):
     db.set_note(task_id, text)
     click.echo(click.style(f"Приписка записана к #{task_id}.", fg="green"))
     if task.status.value == "running":
-        click.echo("Прогон уже идёт — она уйдёт в следующий: "
-                   f"«pp cancel {task_id}» вернёт задачу в очередь прямо сейчас.")
+        click.echo("Прогон уже идёт — эту приписку он не увидит: она уйдёт "
+                   "в следующий прогон (после rate limit / срыва среды).")
 
 
 @cli.command("usage")
@@ -224,7 +255,7 @@ def status(task_id):
     task = db.get_task(task_id)
     if not task:
         click.echo(f"Task #{task_id} not found.")
-        return
+        sys.exit(1)
 
     click.echo(f"Task #{task.id}")
     click.echo(f"  Status:    {click.style(task.status.value, fg=_status_color(task.status.value))}")
@@ -264,6 +295,7 @@ def cancel(task_id):
         click.echo(click.style(f"Task #{task_id} cancelled.", fg="yellow"))
     else:
         click.echo("Cannot cancel (task not found or already running/completed).")
+        sys.exit(1)
 
 
 @cli.command()
@@ -274,6 +306,7 @@ def delete(task_id):
         click.echo(f"Task #{task_id} deleted.")
     else:
         click.echo("Task not found.")
+        sys.exit(1)
 
 
 @cli.command()
@@ -395,6 +428,7 @@ def provider(action, name, cmd_template, executor, kind, keep_pane, models_csv, 
 
     else:
         click.echo(f"Unknown action: {action}. Use: list, add, remove, hide, unhide")
+        sys.exit(1)
 
 
 @cli.command()
@@ -408,14 +442,23 @@ def worker():
 def bot():
     """Start the Telegram bot (requires PP_TG_TOKEN env var)."""
     from .bot import run_bot
-    run_bot()
+    try:
+        run_bot()
+    except RuntimeError as e:
+        raise click.ClickException(
+            f"{e}.\nПолучи токен у @BotFather и задай PP_TG_TOKEN (в .env рядом с pp "
+            "или в окружении).")
 
 
 @cli.command()
 def tray():
     """Start the system tray launcher (default when run without arguments)."""
-    from .tray import run_tray
-    run_tray()
+    try:
+        from .tray import run_tray
+        run_tray()
+    except Exception as e:
+        raise click.ClickException(
+            f"Трей недоступен ({e}). На сервере запускай `pp worker`/`pp server`/`pp bot`.")
 
 
 @cli.command()
@@ -424,10 +467,19 @@ def tray():
 def server(host, port):
     """Start the web UI server."""
     import uvicorn
-    from .config import HOST, PORT
+    from .config import ALLOW_INSECURE_BIND, API_TOKEN, HOST, PORT, is_loopback_host
 
     h = host or HOST
     p = port or PORT
+    # Binding beyond loopback without a token would put an unauthenticated API
+    # that can run commands on the network. Refuse rather than do that silently.
+    # In Docker the bind is always 0.0.0.0 but the real boundary is the host port
+    # publish, so PP_ALLOW_INSECURE_BIND=1 (set by the image) opts out.
+    if not is_loopback_host(h) and not API_TOKEN and not ALLOW_INSECURE_BIND:
+        raise click.ClickException(
+            f"Отказ: сервер на {h} открыт наружу без авторизации. Задай PP_API_TOKEN "
+            "(длинный случайный токен), слушай 127.0.0.1, или PP_ALLOW_INSECURE_BIND=1 "
+            "если публикуешь порт только на loopback (Docker).")
     from .api import app
     click.echo(f"PromptPilot UI: http://{h}:{p}")
     uvicorn.run(app, host=h, port=p, log_level="info")

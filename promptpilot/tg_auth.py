@@ -2,13 +2,22 @@
 
 import json
 import os
+import sys
 from pathlib import Path
 
-from .config import DB_DIR
+from .config import DB_DIR, _atomic_write_json
 
 
 def _users_file() -> Path:
     return DB_DIR / "tg_users.json"
+
+
+def _norm_phone(p) -> str:
+    """Compare phones by digits only: Telegram may or may not send the '+'."""
+    return "".join(ch for ch in str(p or "") if ch.isdigit())
+
+
+_warned_users = False
 
 
 def load_allowed_phones() -> list:
@@ -29,20 +38,27 @@ def load_allowed_phones() -> list:
 
 
 def _load_users() -> dict:
+    global _warned_users
     f = _users_file()
     if f.exists():
         try:
             with open(f) as fp:
                 return json.load(fp)
-        except (json.JSONDecodeError, OSError):
+        except json.JSONDecodeError as e:
+            # A truncated file used to be swallowed as {} — silently logging
+            # everyone out. Surface it and keep no one authorized only for this
+            # read, without overwriting the file.
+            if not _warned_users:
+                _warned_users = True
+                print(f"⚠ {f} повреждён ({e}) — авторизации временно недоступны, файл не тронут",
+                      file=sys.stderr)
+        except OSError:
             pass
     return {}
 
 
 def _save_users(users: dict):
-    DB_DIR.mkdir(parents=True, exist_ok=True)
-    with open(_users_file(), "w") as f:
-        json.dump(users, f, indent=2)
+    _atomic_write_json(_users_file(), users)
 
 
 def authorize_user(chat_id: int, phone: str):
@@ -60,8 +76,20 @@ def deauthorize_user(chat_id: int):
 
 
 def is_authorized(chat_id: int) -> bool:
-    """Check if a user is authorized."""
-    return str(chat_id) in _load_users()
+    """Check if a user is authorized.
+
+    Beyond having authorized once, the stored phone must still be in the allowed
+    list — so removing a number from PP_TG_ALLOWED_PHONES/tg_config.json actually
+    revokes access instead of leaving the old chat authorized forever. When no
+    allow-list is configured, fall back to presence (the original behaviour).
+    """
+    phone = _load_users().get(str(chat_id))
+    if phone is None:
+        return False
+    allowed = load_allowed_phones()
+    if not allowed:
+        return True
+    return _norm_phone(phone) in {_norm_phone(a) for a in allowed}
 
 
 def list_authorized() -> dict:

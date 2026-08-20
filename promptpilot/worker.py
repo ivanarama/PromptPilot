@@ -16,24 +16,30 @@ from .config import (BASE_DELAY, CONCURRENCY, DEFAULT_CLI, MAX_DELAY, MIN_FREE_M
                      POLL_INTERVAL, TASK_TIMEOUT, VERDICT_REQUIRED, build_cmd,
                      get_provider_env, load_providers)
 
-RATE_LIMIT_PATTERNS = [
-    "rate limit",
-    "rate_limit",
-    "ratelimit",
-    "overloaded",
-    "too many requests",
-    "429",
-    "quota exceeded",
-    "capacity",
-    "try again later",
-]
+RATE_LIMIT_RE = re.compile(
+    r"rate[ _-]?limit"
+    r"|overloaded"
+    r"|too many requests"
+    r"|(?:error|status|http|code)[\s:]*429\b"
+    r"|quota exceeded"
+    r"|usage limit"
+    r"|hit your (?:session|usage|weekly) limit"
+    r"|at capacity"
+    r"|try again later",
+    re.IGNORECASE,
+)
 
 
-def is_rate_limited(stderr: str, exit_code: int) -> bool:
+def is_rate_limited(text: str, exit_code: int) -> bool:
+    """Whether the run failed on a rate/usage limit (never for a clean exit).
+
+    Match against readable text — pass stderr, or the text extracted from a
+    stream-json stdout, not raw JSON, so a bare "429" or "capacity" buried in a
+    payload/traceback does not masquerade as a limit.
+    """
     if exit_code == 0:
         return False
-    text = stderr.lower()
-    return any(p in text for p in RATE_LIMIT_PATTERNS)
+    return bool(RATE_LIMIT_RE.search(text or ""))
 
 
 # The run died on the environment, not on the task: the door was shut (auth,
@@ -202,7 +208,7 @@ def parse_stream_json(stdout: str) -> dict:
             if part.get("cost") is not None:
                 meta["cost"] = part["cost"]
             if event.get("sessionID"):
-                meta["session_id"] = event["session_id"]
+                meta["session_id"] = event["sessionID"]
             tokens = part.get("tokens", {})
             if tokens:
                 meta["input_tokens"] = tokens.get("input")
@@ -284,12 +290,40 @@ def _kill_process_tree(proc):
         if os.name == "posix":
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
         else:
-            proc.kill()
+            # proc.kill() ends only the top process. An npm-installed CLI on
+            # Windows is a .cmd wrapper (cmd.exe) that spawns node — killing the
+            # wrapper leaves the real agent editing files. taskkill /T takes the
+            # whole tree.
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                           capture_output=True, check=False)
     except (ProcessLookupError, PermissionError, OSError):
         try:
             proc.kill()
         except OSError:
             pass
+
+
+def _drain(proc, timeout=10):
+    """Collect a killed process's final output without hanging forever.
+
+    A grandchild the agent detached into its own session (setsid) survives the
+    process-group SIGKILL and keeps the inherited stdout/stderr pipe open, so a
+    bare communicate() would block until it too dies. Give up after a timeout
+    and return whatever was read.
+    """
+    try:
+        return proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        for stream in (proc.stdout, proc.stderr):
+            try:
+                if stream is not None:
+                    stream.close()
+            except OSError:
+                pass
+        try:
+            return proc.communicate(timeout=1)
+        except (subprocess.TimeoutExpired, ValueError, OSError):
+            return ("", "")
 
 
 def _effective_timeout(task):
@@ -485,6 +519,10 @@ def execute_task(task):
             return
         cmd = _wrap_ssh(host, cmd, provider_cfg.get("env"))
         env = os.environ.copy()
+        # The marker rides the local ssh process too, so a live remote run is
+        # found by live_task_ids() and recover_running() won't relaunch it into
+        # a second concurrent run in the same remote directory.
+        env["PP_TASK_ID"] = str(task.id)
     else:
         # On Windows, .cmd/.bat wrappers (e.g. npm-installed CLIs like qwen) are
         # invisible to subprocess without shell=True.  shutil.which() resolves the
@@ -538,27 +576,33 @@ def execute_task(task):
         except subprocess.TimeoutExpired:
             if db.is_cancel_requested(task.id):
                 _kill_process_tree(proc)
-                proc.communicate()
+                _drain(proc)
                 db.clear_cancel_request(task.id)
                 db.mark_cancelled(task.id, "Отменена пользователем во время выполнения")
                 print("  -> Cancelled by user")
                 return
             if effective_timeout and time.monotonic() - started > effective_timeout:
                 _kill_process_tree(proc)
-                proc.communicate()
+                _drain(proc)
                 db.mark_failed(task.id, f"Execution timed out after {effective_timeout}s", exit_code=-1)
                 return
 
     result = subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
 
-    if is_rate_limited(result.stderr, result.returncode):
+    # A rate/usage limit can land on stderr, or — for stream-json CLIs like
+    # Claude Code — inside the stdout result event with a non-zero exit. Check
+    # both, matching the readable text extracted from stream-json rather than
+    # raw JSON. Missing the stdout case sent the task to failed forever, which
+    # defeats the whole point of the queue.
+    stdout_text = parse_stream_json(result.stdout).get("text", "") if is_stream_json(result.stdout) else ""
+    if is_rate_limited(result.stderr, result.returncode) or is_rate_limited(stdout_text, result.returncode):
         # Extract readable error from stream-json if possible
         rl_error = result.stderr or result.stdout
-        if is_stream_json(rl_error):
-            parsed = parse_stream_json(rl_error)
-            rl_error = format_result(parsed) or rl_error
-        elif is_stream_json(result.stdout):
+        if is_stream_json(result.stdout):
             parsed = parse_stream_json(result.stdout)
+            rl_error = format_result(parsed) or rl_error
+        elif is_stream_json(result.stderr):
+            parsed = parse_stream_json(result.stderr)
             rl_error = format_result(parsed) or rl_error
         if task.retry_count >= task.max_retries:
             db.mark_failed(task.id, f"Rate limited, max retries ({task.max_retries}) exceeded.\n{rl_error}")
@@ -611,15 +655,23 @@ def execute_task(task):
     if verdict:
         db.set_verdict(task.id, verdict)
 
+    changes = None
     if wt_note:
         output += wt_note
         changes = worktree.status(wt["root"], wt["path"])
-        if changes:
+        if changes and changes != worktree.NO_CHANGES:
             output += f"\nИзменения: {changes}"
 
     db.mark_completed(task.id, output, exit_code=0, model_used=model_used, session_id=session_id)
     text_preview = output[:80].replace("\n", " ").strip()
     print(f"  -> Completed: {text_preview}")
+
+    # An empty checkout (no commits, no dirty files) is just clutter — remove it
+    # so .pp-worktrees doesn't grow without bound. The branch stays regardless;
+    # this mirrors what the herdr executor already does for its own checkouts.
+    if changes == worktree.NO_CHANGES:
+        if worktree.remove(wt["root"], wt["path"]):
+            print(f"  -> Removed empty worktree {wt['path']}")
 
     _maybe_recur(task)
 
@@ -674,6 +726,23 @@ def enough_memory() -> bool:
         return True
     free = free_mb()
     return free is None or free >= MIN_FREE_MB
+
+
+def _fail_stuck(task_id, exc):
+    """An unexpected crash in execute_task left a task stranded in 'running'.
+
+    execute_task reports task-level failures itself, so reaching here is a bug
+    (a KeyError in parsing, a 'database is locked'); mark it failed so the queue
+    keeps moving instead of a task stuck forever and — in the pool — its lock
+    key freed while a second task walks into the same directory. Only touch it
+    if it is still running: the crash may have happened after mark_completed.
+    """
+    try:
+        t = db.get_task(task_id)
+        if t and t.status.value == "running":
+            db.mark_failed(task_id, f"Внутренняя ошибка воркера: {type(exc).__name__}: {exc}")
+    except Exception as e:  # never let recovery itself take down the loop
+        print(f"  !! не удалось пометить #{task_id} failed: {e}", flush=True)
 
 
 def lock_key(task) -> str:
@@ -740,10 +809,11 @@ def run_worker():
 
     def reap():
         for fut in [f for f in in_flight if f.done()]:
-            in_flight.pop(fut, None)
+            _lock, tid = in_flight.pop(fut)
             exc = fut.exception()
             if exc:  # execute_task already reports task failures; this is a bug
-                print(f"  !! исполнение задачи упало: {type(exc).__name__}: {exc}", flush=True)
+                print(f"  !! исполнение задачи #{tid} упало: {type(exc).__name__}: {exc}", flush=True)
+                _fail_stuck(tid, exc)
 
     while running:
         reap()
@@ -773,7 +843,7 @@ def run_worker():
         short_on_memory = False
 
         task = db.get_next_runnable(
-            busy_keys=[k for k in in_flight.values() if k], key_fn=lock_key)
+            busy_keys=[lk for lk, _tid in in_flight.values() if lk], key_fn=lock_key)
         if task is None:
             time.sleep(POLL_INTERVAL)
             continue
@@ -782,9 +852,13 @@ def run_worker():
         prompt_preview = task.prompt[:60].replace("\n", " ")
         print(f"[#{task.id}] [{provider}] Running: {prompt_preview}...")
         if pool is None:
-            execute_task(task)
+            try:
+                execute_task(task)
+            except Exception as exc:  # an unhandled crash must not stop the loop
+                print(f"  !! исполнение задачи #{task.id} упало: {type(exc).__name__}: {exc}", flush=True)
+                _fail_stuck(task.id, exc)
         else:
-            in_flight[pool.submit(execute_task, task)] = lock_key(task)
+            in_flight[pool.submit(execute_task, task)] = (lock_key(task), task.id)
 
     if pool is not None:
         if in_flight:

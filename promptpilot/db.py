@@ -101,6 +101,19 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _to_utc_iso(dt: Optional[datetime]) -> Optional[str]:
+    """Canonical aware-UTC ISO string for the queue's string comparison.
+
+    A naive datetime is read as local time — what a user typing
+    '2026-08-13T15:00' means — then converted to UTC, so scheduled_at and
+    next_run_at compare correctly against _now() ('...+00:00') regardless of
+    who wrote them (CLI naive, bot aware, API with a 'Z' suffix).
+    """
+    if dt is None:
+        return None
+    return dt.astimezone(timezone.utc).isoformat()
+
+
 def _parse_dt(val: Optional[str]) -> Optional[datetime]:
     if val is None:
         return None
@@ -156,7 +169,7 @@ def create_task(task: TaskCreate) -> TaskInDB:
                 task.working_dir,
                 task.provider,
                 task.priority,
-                task.scheduled_at.isoformat() if task.scheduled_at else None,
+                _to_utc_iso(task.scheduled_at),
                 _now(),
                 task.max_retries,
                 int(task.skip_permissions),
@@ -219,14 +232,19 @@ def get_next_runnable(busy_keys=(), key_fn=None) -> Optional[TaskInDB]:
     now = _now()
     busy = set(busy_keys or ())
     with _connect(immediate=True) as conn:
+        # Sequential worker takes just the top task. When some keys are busy we
+        # walk the whole runnable queue in priority order until a non-colliding
+        # task is found — a hard LIMIT could hide a free task behind a wall of
+        # conflicting ones. Rows are materialised before any UPDATE so claiming
+        # one doesn't disturb the iteration.
+        limit_clause = "" if busy else " LIMIT 1"
         rows = conn.execute(
-            """SELECT * FROM tasks
+            f"""SELECT * FROM tasks
                WHERE status IN ('pending', 'rate_limited')
                  AND (scheduled_at IS NULL OR scheduled_at <= ?)
                  AND (next_run_at IS NULL OR next_run_at <= ?)
-               ORDER BY priority ASC, created_at ASC
-               LIMIT ?""",
-            (now, now, 200 if busy else 1),
+               ORDER BY priority ASC, created_at ASC{limit_clause}""",
+            (now, now),
         ).fetchall()
         for row in rows:
             task = _row_to_task(row)
@@ -279,6 +297,15 @@ def set_worktree(task_id: int, path: str, branch: str):
         )
 
 
+def _drop_cancel_flag(conn, task_id: int):
+    """Clear a stale cancel request as a task leaves 'running'.
+
+    Otherwise a cancel that lands just before the run finishes on its own (rate
+    limit, env failure) leaves the flag set, and the task's next attempt — or a
+    manual reset — is killed on sight by ghost of the old request."""
+    conn.execute("DELETE FROM settings WHERE key = ?", (f"cancel_task:{task_id}",))
+
+
 def mark_completed(task_id: int, result: str, exit_code: int = 0, model_used: str = None, session_id: str = None):
     clear_note(task_id)
     with _connect() as conn:
@@ -286,6 +313,7 @@ def mark_completed(task_id: int, result: str, exit_code: int = 0, model_used: st
             "UPDATE tasks SET status = 'completed', result = ?, exit_code = ?, completed_at = ?, model_used = ?, session_id = COALESCE(?, session_id) WHERE id = ?",
             (result, exit_code, _now(), model_used, session_id, task_id),
         )
+        _drop_cancel_flag(conn, task_id)
 
 
 def mark_failed(task_id: int, error: str, exit_code: int = 1):
@@ -295,6 +323,7 @@ def mark_failed(task_id: int, error: str, exit_code: int = 1):
             "UPDATE tasks SET status = 'failed', error = ?, exit_code = ?, completed_at = ? WHERE id = ?",
             (error, exit_code, _now(), task_id),
         )
+        _drop_cancel_flag(conn, task_id)
 
 
 def mark_rate_limited(task_id: int, next_run_at: datetime, error: str = None):
@@ -306,13 +335,16 @@ def mark_rate_limited(task_id: int, next_run_at: datetime, error: str = None):
                    retry_count = retry_count + 1,
                    error = COALESCE(?, error)
                WHERE id = ?""",
-            (next_run_at.isoformat(), error, task_id),
+            (_to_utc_iso(next_run_at), error, task_id),
         )
+        _drop_cancel_flag(conn, task_id)
 
 
 def request_cancel(task_id: int) -> bool:
     """Ask the worker to kill a RUNNING task's process (worker polls this)."""
-    with _connect() as conn:
+    # immediate: the read-then-write must not race a concurrent writer, or WAL
+    # returns SQLITE_BUSY on the upgrade instead of waiting out the busy timeout.
+    with _connect(immediate=True) as conn:
         row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
         if not row or row["status"] != "running":
             return False
@@ -339,6 +371,7 @@ def mark_cancelled(task_id: int, note: str = None):
             "UPDATE tasks SET status = 'cancelled', completed_at = ?, error = COALESCE(?, error) WHERE id = ?",
             (_now(), note, task_id),
         )
+        _drop_cancel_flag(conn, task_id)
 
 
 def cancel_task(task_id: int) -> bool:

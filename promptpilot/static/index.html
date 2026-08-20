@@ -549,9 +549,34 @@ let skillsCache = {};
 let skillsPanelOpen = false;
 
 // --- API calls ---
+function toast(msg, isErr = true) {
+  let el = document.getElementById('pp-toast');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'pp-toast';
+    el.style.cssText = 'position:fixed;bottom:20px;left:50%;transform:translateX(-50%);' +
+      'z-index:9999;padding:10px 16px;border-radius:8px;font-size:14px;max-width:90%;' +
+      'box-shadow:0 2px 12px rgba(0,0,0,.4);color:#fff';
+    document.body.appendChild(el);
+  }
+  el.style.background = isErr ? '#b71c1c' : '#2e7d32';
+  el.textContent = msg;
+  el.style.display = 'block';
+  clearTimeout(el._t);
+  el._t = setTimeout(() => { el.style.display = 'none'; }, isErr ? 6000 : 2500);
+}
+
 async function fetchJSON(url, opts) {
   const res = await fetch(url, opts);
-  return res.json();
+  if (!res.ok) {
+    let detail = res.statusText;
+    try { const j = await res.json(); if (j && j.detail) detail = j.detail; } catch (e) { /* no body */ }
+    const err = new Error(typeof detail === 'string' ? detail : JSON.stringify(detail));
+    err.status = res.status;
+    throw err;
+  }
+  if (res.status === 204) return null;
+  try { return await res.json(); } catch (e) { return null; }
 }
 
 async function loadStats() {
@@ -753,29 +778,36 @@ async function addTask() {
   const timeoutVal = document.getElementById('timeoutInput').value.trim();
   const taskTimeout = timeoutVal !== '' ? parseInt(timeoutVal) : null;
 
-  await fetchJSON(`${API}/tasks`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      prompt,
-      provider,
-      model,
-      priority,
-      working_dir: workdir,
-      skip_permissions: skipPermissions,
-      keep_pane: document.getElementById('keepPane').checked,
-      worktree: document.getElementById('worktree').checked,
-      herdr_target: herdrTarget,
-      machine: document.getElementById('machineInput').value || null,
-      scheduled_at: schedule ? new Date(schedule).toISOString() : null,
-      recurrence,
-      task_timeout: taskTimeout,
-    }),
-  });
+  try {
+    await fetchJSON(`${API}/tasks`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        prompt,
+        provider,
+        model,
+        priority,
+        working_dir: workdir,
+        skip_permissions: skipPermissions,
+        keep_pane: document.getElementById('keepPane').checked,
+        worktree: document.getElementById('worktree').checked,
+        herdr_target: herdrTarget,
+        machine: document.getElementById('machineInput').value || null,
+        scheduled_at: schedule ? new Date(schedule).toISOString() : null,
+        recurrence,
+        task_timeout: taskTimeout,
+      }),
+    });
+  } catch (e) {
+    // Keep the typed prompt so it isn't lost on a validation/server error.
+    toast('Не удалось создать задачу: ' + e.message);
+    return;
+  }
 
   document.getElementById('promptInput').value = '';
   document.getElementById('recurrenceInput').value = '';
   document.getElementById('timeoutInput').value = '';
+  toast('Задача создана', false);
   refresh();
 }
 
@@ -786,33 +818,41 @@ function verdictIcon(v) {
 async function saveNote(e, id) {
   e.stopPropagation();
   const text = document.getElementById(`note-${id}`).value;
-  await fetchJSON(`${API}/tasks/${id}/note`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ text }),
-  });
+  try {
+    await fetchJSON(`${API}/tasks/${id}/note`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text }),
+    });
+    toast('Приписка сохранена', false);
+  } catch (err) { toast('Не удалось сохранить приписку: ' + err.message); return; }
   refresh();
 }
 
 async function resetTask(e, id) {
   e.stopPropagation();
-  await fetchJSON(`${API}/tasks/${id}/reset`, { method: 'POST' });
+  try { await fetchJSON(`${API}/tasks/${id}/reset`, { method: 'POST' }); }
+  catch (err) { toast('Не удалось сбросить: ' + err.message); return; }
   refresh();
 }
 
 async function cancelTask(e, id) {
   e.stopPropagation();
-  await fetchJSON(`${API}/tasks/${id}`, {
-    method: 'PATCH',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ status: 'cancelled' }),
-  });
+  try {
+    await fetchJSON(`${API}/tasks/${id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: 'cancelled' }),
+    });
+  } catch (err) { toast('Не удалось отменить: ' + err.message); return; }
   refresh();
 }
 
 async function deleteTask(e, id) {
   e.stopPropagation();
-  await fetchJSON(`${API}/tasks/${id}`, { method: 'DELETE' });
+  if (!confirm(`Удалить задачу #${id}? Результат будет потерян безвозвратно.`)) return;
+  try { await fetchJSON(`${API}/tasks/${id}`, { method: 'DELETE' }); }
+  catch (err) { toast('Не удалось удалить: ' + err.message); return; }
   if (expandedId === id) expandedId = null;
   refresh();
 }
@@ -1024,7 +1064,14 @@ function timeAgo(iso) {
   return Math.floor(diff / 86400) + 'd';
 }
 
-function refresh() { loadStats(); if (!expandedId) loadTasks(); }
+function refresh() {
+  loadStats();
+  // Keep the list live even with a card expanded (a running task used to freeze
+  // once opened) — but don't re-render out from under a note being typed.
+  const ae = document.activeElement;
+  if (ae && ae.id && ae.id.startsWith('note-')) return;
+  loadTasks();
+}
 
 // --- Set default schedule to current datetime ---
 function setDefaultSchedule() {
@@ -1052,7 +1099,7 @@ async function loadMachines() {
   const names = Object.keys(machinesData);
   label.style.display = names.length ? 'flex' : 'none';
   sel.innerHTML = '<option value="">💻 локально</option>'
-    + names.map(n => `<option value="${esc(n)}">${esc(n)} (${esc(machinesData[n].host)})</option>`).join('');
+    + names.map(n => `<option value="${escAttr(n)}">${esc(n)} (${esc(machinesData[n].host)})</option>`).join('');
 }
 
 function updateProvidersForMachine() {
@@ -1062,7 +1109,7 @@ function updateProvidersForMachine() {
   sel.innerHTML = Object.entries(providersData)
     // для машины наличие CLI определяет её собственная проба, а не эта машина
     .filter(([name, info]) => !info.hidden && (allowed ? allowed.includes(name) : info.available !== false))
-    .map(([name, info]) => `<option value="${esc(name)}">${esc(name)} — ${esc(info.description || info)}</option>`)
+    .map(([name, info]) => `<option value="${escAttr(name)}">${esc(name)} — ${esc(info.description || info)}</option>`)
     .join('');
   updateSkillsToggle(); updateModelSelect(); updateKeepPane();
 }
@@ -1073,7 +1120,7 @@ async function loadProviders() {
   const sel = document.getElementById('providerInput');
   sel.innerHTML = Object.entries(providersData)
     .filter(([name, info]) => info.available !== false && !info.hidden)
-    .map(([name, info]) => `<option value="${esc(name)}">${esc(name)} — ${esc(info.description || info)}</option>`)
+    .map(([name, info]) => `<option value="${escAttr(name)}">${esc(name)} — ${esc(info.description || info)}</option>`)
     .join('');
   sel.addEventListener('change', () => { skillsCache = {}; updateSkillsToggle(); closeSkillsPanel(); updateModelSelect(); updateKeepPane(); });
   updateSkillsToggle();
@@ -1123,7 +1170,7 @@ async function loadHerdrAgents() {
     sel.innerHTML = agents.length
       ? agents.map(a => {
           const what = a.title || a.name || a.pane_id;
-          return `<option value="${esc(a.target)}" title="${esc(a.pane_id)}">${esc(a.workspace)}: ${esc(what)} — ${esc(a.agent)} · ${esc(a.status)}</option>`;
+          return `<option value="${escAttr(a.target)}" title="${escAttr(a.pane_id)}">${esc(a.workspace)}: ${esc(what)} — ${esc(a.agent)} · ${esc(a.status)}</option>`;
         }).join('')
       : '<option value="">— нет открытых сессий —</option>';
   } catch (e) {
@@ -1139,7 +1186,7 @@ function updateModelSelect() {
   const modelSel = document.getElementById('modelInput');
   if (models.length > 0) {
     modelSel.innerHTML = '<option value="">Default</option>' +
-      models.map(m => `<option value="${esc(m)}">${esc(m)}</option>`).join('');
+      models.map(m => `<option value="${escAttr(m)}">${esc(m)}</option>`).join('');
     label.style.display = '';
   } else {
     label.style.display = 'none';
@@ -1220,7 +1267,7 @@ async function loadProjects() {
   projectsByPath = Object.fromEntries(projects.map(p => [p.path, p]));
   sel.innerHTML = [
     '<option value="">— Select project —</option>',
-    ...projects.map(p => `<option value="${esc(p.path)}">${esc(p.name)}${p.git ? '' : ' (не git)'}</option>`),
+    ...projects.map(p => `<option value="${escAttr(p.path)}">${esc(p.name)}${p.git ? '' : ' (не git)'}</option>`),
     '<option value="__custom__">✏️ Custom path...</option>',
   ].join('');
 

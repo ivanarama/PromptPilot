@@ -33,8 +33,10 @@ PRICES = {
     "claude-fable-5":   (10.0, 50.0),
     "claude-mythos-5":  (10.0, 50.0),
     "claude-opus-5":    (5.0, 25.0),
-    "claude-opus-4":    (5.0, 25.0),
-    "claude-opus":      (5.0, 25.0),
+    "claude-opus-4-5":  (5.0, 25.0),   # Opus 4.5
+    "claude-opus-4-1":  (15.0, 75.0),  # Opus 4.1 — прайс старой линейки
+    "claude-opus-4":    (15.0, 75.0),  # Opus 4 (и датированные -4-2025…)
+    "claude-opus":      (15.0, 75.0),
     "claude-sonnet-5":  (3.0, 15.0),
     "claude-sonnet-4":  (3.0, 15.0),
     "claude-sonnet":    (3.0, 15.0),
@@ -91,6 +93,11 @@ def _scan_file(path: Path, since: float) -> dict:
     """
     total = {"cost": 0.0, "input": 0, "output": 0, "cache_read": 0, "cache_write": 0,
              "messages": 0, "first": 0.0, "last": 0.0, "model": "", "cwd": "", "session": ""}
+    # Claude Code writes one assistant line PER content block, and every one of
+    # them carries the FULL usage of the message. Counting each line double- (or
+    # quadruple-) bills a single message; dedupe by message id. Lines without an
+    # id are counted as before.
+    seen_ids = set()
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
             for line in f:
@@ -106,6 +113,11 @@ def _scan_file(path: Path, since: float) -> dict:
                 usage = msg.get("usage") or {}
                 if not usage:
                     continue
+                mid = msg.get("id")
+                if mid is not None:
+                    if mid in seen_ids:
+                        continue
+                    seen_ids.add(mid)
                 ts = _parse_ts(ev.get("timestamp"))
                 if ts < since:
                     continue

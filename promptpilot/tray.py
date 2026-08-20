@@ -72,6 +72,19 @@ def _bot_log_path() -> Path:
     return _LOG_DIR / "bot.log"
 
 
+def _open_path(path):
+    """Open a file with the OS default handler (Windows/macOS/Linux)."""
+    try:
+        if sys.platform == "win32":
+            os.startfile(str(path))  # noqa: only exists on Windows
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(path)])
+        else:
+            subprocess.Popen(["xdg-open", str(path)])
+    except OSError:
+        pass
+
+
 def _start(service: str):
     with _lock:
         if _is_running(service):
@@ -169,7 +182,7 @@ def _build_menu(icon: pystray.Icon) -> pystray.Menu:
     def open_bot_log(i, it):
         log_path = _bot_log_path()
         if log_path.exists():
-            os.startfile(str(log_path))
+            _open_path(log_path)
         else:
             i.title = "PromptPilot: лог бота пока пуст"
 

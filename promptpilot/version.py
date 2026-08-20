@@ -30,13 +30,21 @@ def check_for_update() -> dict:
     """Return update info dict. Uses 24h file cache."""
     base = {"current": __version__, "latest": None, "update_available": False}
 
-    # Try cache first
+    # Try cache first. Recompute update_available against the CURRENT version
+    # rather than trusting the cached fields: after an upgrade the cache still
+    # holds the old `current`/`update_available` and would nag for 24h.
     try:
         if _CACHE_FILE.exists():
             cached = json.loads(_CACHE_FILE.read_text(encoding="utf-8"))
             checked_at = datetime.fromisoformat(cached.get("checked_at", "2000-01-01T00:00:00+00:00"))
             if datetime.now(timezone.utc) - checked_at < timedelta(hours=_CACHE_HOURS):
-                return {**base, **cached}
+                latest = cached.get("latest")
+                return {
+                    **base,
+                    "latest": latest,
+                    "update_available": bool(latest) and _compare(__version__, latest) < 0,
+                    "checked_at": cached.get("checked_at"),
+                }
     except Exception:
         pass
 
