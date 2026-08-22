@@ -384,8 +384,25 @@ def _requeue_env_failure(task, marker: str, detail: str):
     db.mark_rate_limited(task.id, next_run,
                          error=f"Срыв по вине среды ({marker}) — "
                                f"задача возвращена в очередь.\n{detail}")
+    _notify_requeued(task, next_run, f"срыв среды ({marker})")
     print(f"  -> Env failure ({marker}). Retry #{task.retry_count + 1} "
           f"at {next_run.strftime('%H:%M:%S')}")
+
+
+def _notify_requeued(task, next_run, reason: str):
+    """Queue a Telegram note when a task silently leaves the fast path —
+    without it a rate-limited task just looks 'running' for hours."""
+    if not task.tg_chat_id:
+        return
+    try:
+        when = next_run.astimezone().strftime("%d.%m %H:%M") if next_run else "позже"
+        db.add_notification(
+            task.tg_chat_id,
+            f"⏸ Задача #{task.id}: {reason} — продолжу в {when}.",
+            task_id=task.id,
+        )
+    except Exception as e:
+        print(f"  -> notify requeue failed: {e}")
 
 
 def _execute_herdr_task(task, provider_cfg, host=None, machine=None):
@@ -401,12 +418,20 @@ def _execute_herdr_task(task, provider_cfg, host=None, machine=None):
     def on_blocked(pane_id):
         print(f"  -> Blocked, waiting for approval in pane {pane_id}{where}")
         if task.tg_chat_id:
+            # pane_id/machine ride along so the bot can attach confirm/screen/
+            # reply buttons — approving one's OWN task from the phone used to
+            # be impossible (the message only suggested ssh).
             db.add_notification(
                 task.tg_chat_id,
                 f"⏸ Задача #{task.id} ждёт подтверждения в herdr{where} (панель {pane_id}).\n"
-                f"Подключись командой: {attach} — подтверди действие, задача продолжится.",
+                f"Подтверди кнопкой ниже, или подключись: {attach}",
                 task_id=task.id,
+                pane_id=pane_id,
+                machine=machine,
             )
+
+    def on_pane(pane_id):
+        db.set_task_pane(task.id, pane_id)
 
     def on_worktree(path, branch):
         # Recorded the moment the checkout exists, not when the task ends: the
@@ -418,7 +443,7 @@ def _execute_herdr_task(task, provider_cfg, host=None, machine=None):
                            timeout=_effective_timeout(task),
                            cancel_check=lambda: db.is_cancel_requested(task.id),
                            keep_pane=task.keep_pane, host=host,
-                           on_worktree=on_worktree)
+                           on_worktree=on_worktree, on_pane=on_pane)
 
     if outcome.get("cancelled"):
         db.clear_cancel_request(task.id)
@@ -432,6 +457,7 @@ def _execute_herdr_task(task, provider_cfg, host=None, machine=None):
             return
         next_run = compute_next_run(task.retry_count)
         db.mark_rate_limited(task.id, next_run, error=outcome["error"] or "Rate limited")
+        _notify_requeued(task, next_run, "упёрлась в лимит (rate limit)")
         print(f"  -> Rate limited. Retry #{task.retry_count + 1} at {next_run.strftime('%H:%M:%S')}")
         return
 
@@ -609,6 +635,7 @@ def execute_task(task):
             return
         next_run = compute_next_run(task.retry_count)
         db.mark_rate_limited(task.id, next_run, error=rl_error or "Rate limited")
+        _notify_requeued(task, next_run, "упёрлась в лимит (rate limit)")
         print(f"  -> Rate limited. Retry #{task.retry_count + 1} at {next_run.strftime('%H:%M:%S')}")
         return
 
@@ -645,6 +672,7 @@ def execute_task(task):
                 return
             next_run = compute_next_run(task.retry_count)
             db.mark_rate_limited(task.id, next_run, error=output or "Rate limited")
+            _notify_requeued(task, next_run, "упёрлась в лимит (rate limit)")
             print(f"  -> Rate limited (stream event). Retry at {next_run.strftime('%H:%M:%S')}")
             return
     else:

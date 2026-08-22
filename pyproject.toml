@@ -17,7 +17,7 @@ dependencies = [
     "uvicorn[standard]>=0.34",
     "click>=8.1",
     "pydantic>=2.0",
-    "python-telegram-bot>=21.0",
+    "python-telegram-bot[job-queue]>=21.0",
     "socksio>=1.0",  # SOCKS5 proxy support for the Telegram bot (via httpx)
     # Tray is Windows-first and needs a GUI; not required for server/worker/bot
     # on a Linux host, so keep it off headless installs.

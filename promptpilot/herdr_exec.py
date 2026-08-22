@@ -294,10 +294,12 @@ def _wait_settled(name, until_args, deadline, cancel_check, host=None):
 
 def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
                  cancel_check=None, keep_pane: bool = None, host: str = None,
-                 on_worktree=None) -> dict:
+                 on_worktree=None, on_pane=None) -> dict:
     """Run a task in a herdr-managed agent session.
 
     on_blocked(pane_id) is called once when the agent first enters ``blocked``.
+    on_pane(pane_id) is called as soon as the pane is known — the bot's task
+    card wants a «📺 Экран» button while the run is still going.
     on_worktree(path, branch) is called as soon as a ``worktree`` task has its
     own checkout — long before the run ends, which is when the user wants it.
     timeout (seconds) bounds the ACTIVE prompt turn; time spent in ``blocked``
@@ -334,6 +336,8 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
             pane_id = _dig(data, "result", "agent", "pane_id") or target
             tab_id = None
             outcome["pane_id"] = pane_id
+            if on_pane:
+                on_pane(pane_id)
         else:
             _close_stale_tabs(task.id, host)
             name = f"pp-t{task.id}-{int(time.time()) % 100000}"
@@ -377,6 +381,8 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
                 outcome["error"] = f"herdr tab create failed: {raw}"
                 return outcome
             outcome["pane_id"] = pane_id
+            if on_pane:
+                on_pane(pane_id)
 
         def close_tab():
             if workspace_id:

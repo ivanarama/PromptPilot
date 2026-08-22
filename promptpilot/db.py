@@ -58,7 +58,9 @@ CREATE TABLE IF NOT EXISTS notifications (
     tg_chat_id INTEGER NOT NULL,
     message TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    sent_at TEXT
+    sent_at TEXT,
+    pane_id TEXT,
+    machine TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
@@ -94,6 +96,9 @@ MIGRATIONS = [
     "ALTER TABLE tasks ADD COLUMN worktree_branch TEXT",
     "ALTER TABLE tasks ADD COLUMN note TEXT",
     "ALTER TABLE tasks ADD COLUMN verdict TEXT",
+    "ALTER TABLE tasks ADD COLUMN herdr_pane TEXT",
+    "ALTER TABLE notifications ADD COLUMN pane_id TEXT",
+    "ALTER TABLE notifications ADD COLUMN machine TEXT",
 ]
 
 
@@ -204,9 +209,20 @@ def list_tasks(
     status: Optional[TaskStatus] = None,
     limit: int = 50,
     offset: int = 0,
+    statuses: Optional[list] = None,
 ):
+    """statuses — a list of TaskStatus/str values for multi-status filters
+    (e.g. the bot's «Активные» view = pending+running+rate_limited)."""
     with _connect() as conn:
-        if status:
+        if statuses:
+            vals = [s.value if hasattr(s, "value") else s for s in statuses]
+            marks = ",".join("?" * len(vals))
+            rows = conn.execute(
+                f"SELECT * FROM tasks WHERE status IN ({marks})"
+                " ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                (*vals, limit, offset),
+            ).fetchall()
+        elif status:
             rows = conn.execute(
                 "SELECT * FROM tasks WHERE status = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
                 (status.value, limit, offset),
@@ -217,6 +233,20 @@ def list_tasks(
                 (limit, offset),
             ).fetchall()
         return [_row_to_task(r) for r in rows]
+
+
+def recent_working_dirs(limit: int = 8, machine: Optional[str] = None) -> list:
+    """Distinct working_dirs of past tasks, most recent first — candidates for
+    the bot's directory picker. Scoped to one machine (None = local): a path
+    used on another host is no suggestion here."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT working_dir, MAX(id) AS mid FROM tasks"
+            " WHERE working_dir IS NOT NULL AND working_dir != '' AND machine IS ?"
+            " GROUP BY working_dir ORDER BY mid DESC LIMIT ?",
+            (machine, limit),
+        ).fetchall()
+        return [r["working_dir"] for r in rows]
 
 
 def get_next_runnable(busy_keys=(), key_fn=None) -> Optional[TaskInDB]:
@@ -512,13 +542,25 @@ def mark_notified(task_id: int):
         )
 
 
-def add_notification(tg_chat_id: int, message: str, task_id: int = None):
-    """Queue a free-form message for the bot's notify loop (e.g. blocked agent)."""
+def add_notification(tg_chat_id: int, message: str, task_id: int = None,
+                     pane_id: str = None, machine: str = None):
+    """Queue a free-form message for the bot's notify loop (e.g. blocked agent).
+
+    pane_id/machine let the bot attach herdr action buttons (confirm/screen/
+    reply) to the delivered message instead of sending bare text."""
     with _connect() as conn:
         conn.execute(
-            "INSERT INTO notifications (task_id, tg_chat_id, message, created_at) VALUES (?, ?, ?, ?)",
-            (task_id, tg_chat_id, message, _now()),
+            "INSERT INTO notifications (task_id, tg_chat_id, message, created_at, pane_id, machine)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (task_id, tg_chat_id, message, _now(), pane_id, machine),
         )
+
+
+def set_task_pane(task_id: int, pane_id: str):
+    """Remember the herdr pane a running task lives in — the bot's task card
+    uses it for the «📺 Экран» button."""
+    with _connect() as conn:
+        conn.execute("UPDATE tasks SET herdr_pane = ? WHERE id = ?", (pane_id, task_id))
 
 
 def get_unsent_notifications() -> list:

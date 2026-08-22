@@ -75,6 +75,7 @@ class TaskInDB(BaseModel):
     worktree: bool = False
     worktree_path: Optional[str] = None  # filled in once the checkout exists
     worktree_branch: Optional[str] = None
+    herdr_pane: Optional[str] = None  # pane of a herdr-executor run (📺 in the bot)
     note: Optional[str] = None  # the human's late word, injected into the next attempt
     verdict: Optional[str] = None  # ГОТОВО | УЖЕ СДЕЛАНО | НУЖЕН ЧЕЛОВЕК | НЕ СМОГ
 
