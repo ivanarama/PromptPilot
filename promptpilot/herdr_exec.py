@@ -45,7 +45,14 @@ from .remote import (POWERSHELL, REMOTE_CALL_TIMEOUT, as_remote, ps_quote,
 # even when the provider is limited, so detection is textual by necessity).
 RATE_LIMIT_RE = re.compile(
     r"reached your usage limit|usage limit reached|rate_limit_error"
-    r"|overloaded_error|too many requests|quota exceeded|hit your session limit",
+    r"|too many requests|quota exceeded|hit your session limit",
+    re.IGNORECASE,
+)
+
+# Provider-side congestion, not our quota — requeued the same way, but reported
+# as an overload so nobody goes hunting through their subscription.
+OVERLOADED_RE = re.compile(
+    r"overloaded_error|529 overloaded|\boverloaded\b|at capacity",
     re.IGNORECASE,
 )
 
@@ -251,13 +258,23 @@ def _trim_transcript(raw: str, prompt: str) -> str:
     return out if out else raw.strip()
 
 
-def _looks_rate_limited(cleaned: str) -> bool:
-    """Scan the response for limit banners, skipping echoed prompt lines
-    (a prompt that merely mentions 'too many requests' must not trigger)."""
+def _retry_reason(cleaned: str):
+    """'rate_limit' | 'overload' | None — scan the response for limit banners,
+    skipping echoed prompt lines (a prompt that merely mentions 'too many
+    requests' must not trigger). A real limit wins over an overload."""
     response_only = "\n".join(
         l for l in cleaned.splitlines() if not l.lstrip().startswith("❯")
     )
-    return bool(RATE_LIMIT_RE.search(response_only))
+    if RATE_LIMIT_RE.search(response_only):
+        return "rate_limit"
+    if OVERLOADED_RE.search(response_only):
+        return "overload"
+    return None
+
+
+def _looks_rate_limited(cleaned: str) -> bool:
+    """Either kind of provider stall — both mean 'requeue and try again'."""
+    return _retry_reason(cleaned) is not None
 
 
 def _looks_env_failure(cleaned: str) -> str:
@@ -307,10 +324,13 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
     (pane is closed) — the worker maps it to the cancelled status.
     host: ssh target of the machine to run on; None = this machine.
 
-    Returns {"ok", "rate_limited", "cancelled", "output", "error", "pane_id"}.
+    Returns {"ok", "rate_limited", "retry_reason", "cancelled", "output",
+    "error", "pane_id"}; retry_reason tells a real limit ('rate_limit') from
+    provider congestion ('overload').
     Raises nothing: all herdr failures are reported via the outcome dict.
     """
-    outcome = {"ok": False, "rate_limited": False, "cancelled": False,
+    outcome = {"ok": False, "rate_limited": False, "retry_reason": "",
+               "cancelled": False,
                "output": "", "error": "", "pane_id": "", "env_failure": "",
                "worktree_path": "", "worktree_branch": ""}
     attach = attach_hint(host)
@@ -517,9 +537,11 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
 
         cleaned = _trim_transcript(raw, prompt)
 
-        if _looks_rate_limited(cleaned):
+        reason = _retry_reason(cleaned)
+        if reason:
             close_tab()  # no-op for target mode (foreign pane)
             outcome["rate_limited"] = True
+            outcome["retry_reason"] = reason
             outcome["error"] = cleaned
             return outcome
 

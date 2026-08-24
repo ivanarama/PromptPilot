@@ -10,36 +10,72 @@ import subprocess
 import sys
 import time
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 from . import db, worktree
 from .config import (BASE_DELAY, CONCURRENCY, DEFAULT_CLI, MAX_DELAY, MIN_FREE_MB,
                      POLL_INTERVAL, TASK_TIMEOUT, VERDICT_REQUIRED, build_cmd,
                      get_provider_env, load_providers)
 
+# Our quota is spent — the wait is measured in hours and nothing else will get
+# through either.
 RATE_LIMIT_RE = re.compile(
     r"rate[ _-]?limit"
-    r"|overloaded"
     r"|too many requests"
     r"|(?:error|status|http|code)[\s:]*429\b"
     r"|quota exceeded"
     r"|usage limit"
-    r"|hit your (?:session|usage|weekly) limit"
+    r"|hit your (?:session|usage|weekly) limit",
+    re.IGNORECASE,
+)
+
+# The provider is swamped (HTTP 529/503) — nothing to do with our quota, and it
+# usually clears in minutes. Same requeue, very different thing to tell a human.
+OVERLOADED_RE = re.compile(
+    r"overloaded"
+    r"|(?:error|status|http|code)[\s:]*(?:529|503)\b"
     r"|at capacity"
     r"|try again later",
     re.IGNORECASE,
 )
 
+RETRY_RATE_LIMIT = "rate_limit"
+RETRY_OVERLOAD = "overload"
 
-def is_rate_limited(text: str, exit_code: int) -> bool:
-    """Whether the run failed on a rate/usage limit (never for a clean exit).
+# Human-facing wording per reason — a 529 reported as "упёрлась в лимит" sends
+# people looking at their subscription instead of status.claude.com.
+RETRY_REASON_RU = {
+    RETRY_RATE_LIMIT: "упёрлась в лимит (rate limit)",
+    RETRY_OVERLOAD: "API перегружен (529 overloaded)",
+}
+RETRY_REASON_ERR = {
+    RETRY_RATE_LIMIT: "Rate limited",
+    RETRY_OVERLOAD: "API overloaded",
+}
+
+
+def retry_reason(text: str, exit_code: int) -> Optional[str]:
+    """Why the run must be requeued: RETRY_RATE_LIMIT, RETRY_OVERLOAD or None.
 
     Match against readable text — pass stderr, or the text extracted from a
     stream-json stdout, not raw JSON, so a bare "429" or "capacity" buried in a
-    payload/traceback does not masquerade as a limit.
+    payload/traceback does not masquerade as a limit. A real limit wins over
+    overload: limit banners often end with "try again later" too.
     """
     if exit_code == 0:
-        return False
-    return bool(RATE_LIMIT_RE.search(text or ""))
+        return None
+    text = text or ""
+    if RATE_LIMIT_RE.search(text):
+        return RETRY_RATE_LIMIT
+    if OVERLOADED_RE.search(text):
+        return RETRY_OVERLOAD
+    return None
+
+
+def is_rate_limited(text: str, exit_code: int) -> bool:
+    """Whether the run failed on a limit OR a provider overload — both mean
+    'requeue and try again', which is all most callers care about."""
+    return retry_reason(text, exit_code) is not None
 
 
 # The run died on the environment, not on the task: the door was shut (auth,
@@ -452,13 +488,16 @@ def _execute_herdr_task(task, provider_cfg, host=None, machine=None):
         return
 
     if outcome["rate_limited"]:
+        reason = outcome.get("retry_reason") or RETRY_RATE_LIMIT
+        label = RETRY_REASON_ERR.get(reason, RETRY_REASON_ERR[RETRY_RATE_LIMIT])
         if task.retry_count >= task.max_retries:
-            db.mark_failed(task.id, f"Rate limited, max retries ({task.max_retries}) exceeded.\n{outcome['error']}")
+            db.mark_failed(task.id, f"{label}, max retries ({task.max_retries}) exceeded.\n{outcome['error']}")
             return
         next_run = compute_next_run(task.retry_count)
-        db.mark_rate_limited(task.id, next_run, error=outcome["error"] or "Rate limited")
-        _notify_requeued(task, next_run, "упёрлась в лимит (rate limit)")
-        print(f"  -> Rate limited. Retry #{task.retry_count + 1} at {next_run.strftime('%H:%M:%S')}")
+        db.mark_rate_limited(task.id, next_run, error=outcome["error"] or label)
+        _notify_requeued(task, next_run,
+                         RETRY_REASON_RU.get(reason, RETRY_REASON_RU[RETRY_RATE_LIMIT]))
+        print(f"  -> {label}. Retry #{task.retry_count + 1} at {next_run.strftime('%H:%M:%S')}")
         return
 
     if outcome.get("env_failure"):
@@ -621,7 +660,9 @@ def execute_task(task):
     # raw JSON. Missing the stdout case sent the task to failed forever, which
     # defeats the whole point of the queue.
     stdout_text = parse_stream_json(result.stdout).get("text", "") if is_stream_json(result.stdout) else ""
-    if is_rate_limited(result.stderr, result.returncode) or is_rate_limited(stdout_text, result.returncode):
+    reason = (retry_reason(result.stderr, result.returncode)
+              or retry_reason(stdout_text, result.returncode))
+    if reason:
         # Extract readable error from stream-json if possible
         rl_error = result.stderr or result.stdout
         if is_stream_json(result.stdout):
@@ -630,13 +671,14 @@ def execute_task(task):
         elif is_stream_json(result.stderr):
             parsed = parse_stream_json(result.stderr)
             rl_error = format_result(parsed) or rl_error
+        label = RETRY_REASON_ERR[reason]
         if task.retry_count >= task.max_retries:
-            db.mark_failed(task.id, f"Rate limited, max retries ({task.max_retries}) exceeded.\n{rl_error}")
+            db.mark_failed(task.id, f"{label}, max retries ({task.max_retries}) exceeded.\n{rl_error}")
             return
         next_run = compute_next_run(task.retry_count)
-        db.mark_rate_limited(task.id, next_run, error=rl_error or "Rate limited")
-        _notify_requeued(task, next_run, "упёрлась в лимит (rate limit)")
-        print(f"  -> Rate limited. Retry #{task.retry_count + 1} at {next_run.strftime('%H:%M:%S')}")
+        db.mark_rate_limited(task.id, next_run, error=rl_error or label)
+        _notify_requeued(task, next_run, RETRY_REASON_RU[reason])
+        print(f"  -> {label}. Retry #{task.retry_count + 1} at {next_run.strftime('%H:%M:%S')}")
         return
 
     if result.returncode != 0:
@@ -668,11 +710,12 @@ def execute_task(task):
         rl = parsed.get("rate_limit_info")
         if rl and not parsed["text"]:
             if task.retry_count >= task.max_retries:
-                db.mark_failed(task.id, f"Rate limited.\n{output}")
+                db.mark_failed(task.id, f"{RETRY_REASON_ERR[RETRY_RATE_LIMIT]}.\n{output}")
                 return
             next_run = compute_next_run(task.retry_count)
-            db.mark_rate_limited(task.id, next_run, error=output or "Rate limited")
-            _notify_requeued(task, next_run, "упёрлась в лимит (rate limit)")
+            db.mark_rate_limited(task.id, next_run,
+                                 error=output or RETRY_REASON_ERR[RETRY_RATE_LIMIT])
+            _notify_requeued(task, next_run, RETRY_REASON_RU[RETRY_RATE_LIMIT])
             print(f"  -> Rate limited (stream event). Retry at {next_run.strftime('%H:%M:%S')}")
             return
     else:
