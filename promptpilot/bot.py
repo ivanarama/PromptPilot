@@ -9,6 +9,7 @@ import functools
 import json
 import logging
 import os
+import re
 import time
 from datetime import timezone
 from typing import Optional
@@ -35,7 +36,7 @@ from telegram.ext import (
 
 from . import db
 from .config import (
-    DEFAULT_CLI, HERDR_WATCH, HERDR_WATCH_INTERVAL,
+    DEFAULT_CLI, HERDR_WATCH, HERDR_WATCH_INTERVAL, LOG_PROMPTS,
     get_provider_models, get_proxy_url, get_skills, load_machines, load_providers,
     load_providers_detailed, mask_proxy_url, pickable_providers,
     PROJECTS_ROOT, TASK_PASSWORD,
@@ -95,7 +96,7 @@ def _main_menu() -> ReplyKeyboardMarkup:
     pause_label = "▶ Продолжить" if db.is_paused() else "⏸ Пауза"
     return ReplyKeyboardMarkup(
         [
-            ["📋 Задачи", "➕ Добавить задачу"],
+            ["📋 Задачи", "🖥 Окна", "➕ Добавить задачу"],
             ["📊 Статистика", "🔌 Провайдеры", "⚡ Скилы"],
             [pause_label],
         ],
@@ -2325,6 +2326,15 @@ def _herdr_blocked_keyboard(ref: str) -> list:
     ]
 
 
+def _screen_chrome(line: str) -> bool:
+    """Terminal-UI furniture worth dropping on a phone: the full-width rules
+    Claude Code draws around its input box eat a third of the message and wrap
+    into unreadable rubbish on a narrow screen."""
+    s = line.strip()
+    return (s.count("─") >= 8 or s == "❯"
+            or "? for shortcuts" in s or "· /effort" in s)
+
+
 async def _herdr_screen_tail(pane_id: str, machine: str = "", lines_n: int = 10) -> str:
     """Last lines of the pane — so a blocked notification SHOWS the question
     instead of making the user tap 📺 first."""
@@ -2332,10 +2342,18 @@ async def _herdr_screen_tail(pane_id: str, machine: str = "", lines_n: int = 10)
                            "--format", "text", host=_machine_remote(machine))
     if not raw:
         return ""
-    lines = [l.rstrip() for l in raw.splitlines()]
+    lines = [l.rstrip() for l in raw.splitlines() if not _screen_chrome(l)]
     while lines and not lines[-1]:
         lines.pop()
-    return "\n".join(lines[-lines_n:])[-1000:]
+    tail = lines[-lines_n:]
+    # An agent that cleared its screen leaves the tail as blank padding; drop
+    # the leading gap and collapse runs so the card isn't mostly whitespace.
+    out = []
+    for line in tail:
+        if not line and (not out or not out[-1]):
+            continue
+        out.append(line)
+    return "\n".join(out)[-1000:]
 
 
 async def _herdr_notify(bot, pane_id: str, status: str, agent: dict, machine: str = ""):
@@ -2367,13 +2385,25 @@ async def _herdr_notify(bot, pane_id: str, status: str, agent: dict, machine: st
             logger.warning("herdr notify to %s failed: %s", chat_id, e)
 
 
+_LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0", "localhost.localdomain"}
+
+
+def _is_local_host(host: str) -> bool:
+    """A machine whose ssh host is this very box talks to the SAME herdr
+    server, so polling it duplicates every local pane — twice in the windows
+    list, and two identical notifications per blocked dialog."""
+    h = (host or "").split("@")[-1].strip().lower()
+    return h in _LOCAL_HOSTS or h == os.uname().nodename.lower()
+
+
 def _herdr_watch_targets():
     """Machines to poll: this one plus every registered machine with herdr.
     Returns [(machine_name, remote)] — machine_name '' means local."""
     from .config import machine_has_herdr, machine_remote
     targets = [("", None)]
     for name, m in load_machines().items():
-        if m.get("host") and machine_has_herdr(m):
+        host = m.get("host")
+        if host and machine_has_herdr(m) and not _is_local_host(host):
             targets.append((name, machine_remote(m)))
     return targets
 
@@ -2419,23 +2449,41 @@ async def _herdr_watch_tick(bot, notified):
                 notified.pop(key)
 
 
-def _parse_hd_ref(data: str):
-    """'hd_enter:<machine>:<pane>' → (machine, pane, host). Older buttons
-    without the machine part ('hd_enter:w9:p2') are read as local."""
-    parts = data.split(":", 2)
-    if len(parts) == 3 and (parts[1] == "" or parts[1] in load_machines()):
-        machine, pane = parts[1], parts[2]
-    else:
-        machine, pane = "", data.split(":", 1)[1]
+def _parse_hd_ref(ref: str):
+    """'<machine>:<pane>' → (machine, pane, host). machine '' means local;
+    legacy refs without the machine part ('w9:p2') are read as local too.
+    A machine name that is NOT in the registry raises ValueError — silently
+    falling back to local used to send keys into the wrong herdr."""
+    parts = ref.split(":", 1)
+    machine, pane = (parts[0], parts[1]) if len(parts) == 2 else ("", ref)
+    if machine and machine not in load_machines():
+        # Workspace ids are short 'w<hex-ish>' tokens; a registered machine
+        # named like one would be misread here — don't call a machine "w1".
+        if re.fullmatch(r"w[0-9A-Za-z]{1,3}", machine):
+            machine, pane = "", ref
+        else:
+            raise ValueError(f"unknown machine {machine!r}")
     return machine, pane, _machine_remote(machine)
 
 
+async def _hd_ref_or_alert(query, ref: str):
+    """Parse a button ref, alerting (and returning None) on a machine that
+    has been removed from the registry since the button was sent."""
+    try:
+        return _parse_hd_ref(ref)
+    except ValueError:
+        await query.answer("Машина не найдена в реестре — кнопка устарела.",
+                           show_alert=True)
+        return None
+
+
+@require_auth
 async def cb_herdr_enter(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if not is_authorized(query.from_user.id):
-        await query.answer("Нет доступа.", show_alert=True)
+    ref = await _hd_ref_or_alert(query, query.data.split(":", 1)[1])
+    if ref is None:
         return
-    _, pane, host = _parse_hd_ref(query.data)
+    _, pane, host = ref
     res = await _herdr_json("agent", "send-keys", pane, "enter", host=host)
     if res and res.get("result"):
         await query.answer("Enter отправлен ✓")
@@ -2443,15 +2491,16 @@ async def cb_herdr_enter(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("Не удалось — агент ещё существует?", show_alert=True)
 
 
+@require_auth
 async def cb_herdr_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """hd_key:<key>:<machine>:<pane> — send a named key (2/3/esc/…) into the
     blocked dialog; Enter has its own button/handler."""
     query = update.callback_query
-    if not is_authorized(query.from_user.id):
-        await query.answer("Нет доступа.", show_alert=True)
+    _, key, rest = query.data.split(":", 2)
+    ref = await _hd_ref_or_alert(query, rest)
+    if ref is None:
         return
-    _, key, machine, pane = query.data.split(":", 3)
-    host = _machine_remote(machine)
+    _, pane, host = ref
     res = await _herdr_json("agent", "send-keys", pane, key, host=host)
     if res and res.get("result"):
         await query.answer(f"Отправлено: {key} ✓")
@@ -2459,12 +2508,13 @@ async def cb_herdr_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("Не удалось — агент ещё существует?", show_alert=True)
 
 
+@require_auth
 async def cb_herdr_screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if not is_authorized(query.from_user.id):
-        await query.answer("Нет доступа.", show_alert=True)
+    ref = await _hd_ref_or_alert(query, query.data.split(":", 1)[1])
+    if ref is None:
         return
-    machine, pane, host = _parse_hd_ref(query.data)
+    machine, pane, host = ref
     raw = await _herdr_cli("agent", "read", pane, "--source", "visible", "--format", "text",
                            host=host)
     if raw is None:
@@ -2478,28 +2528,53 @@ async def cb_herdr_screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.message.reply_text(f"📺 {pane}{f' ({machine})' if machine else ''}:\n{tail}")
 
 
+@require_auth
 async def cb_herdr_reply_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if not is_authorized(query.from_user.id):
-        await query.answer("Нет доступа.", show_alert=True)
+    ref = await _hd_ref_or_alert(query, query.data.split(":", 1)[1])
+    if ref is None:
         return ConversationHandler.END
-    machine, pane, host = _parse_hd_ref(query.data)
+    machine, pane, host = ref
     context.user_data["herdr_reply_pane"] = pane
     context.user_data["herdr_reply_host"] = host
+    context.user_data["herdr_reply_machine"] = machine
     await query.answer()
     where = f" на {machine}" if machine else ""
     await query.message.reply_text(f"Текст для агента в панели {pane}{where} (или /cancel):")
     return ASK_HERDR_REPLY
 
 
+async def _log_pane_prompt(pane: str, machine: str, host, text: str):
+    """prompt_log row for a direct-to-pane prompt: project (pane cwd) plus the
+    agent's session id — full transcripts stay with the agent, we keep the
+    pointer. Best-effort: a logging hiccup must not fail the send."""
+    data = await _herdr_json("agent", "get", pane, host=host)
+    agent = ((data or {}).get("result") or {}).get("agent") or {}
+    try:
+        db.add_prompt_log(
+            prompt=text,
+            pane_id=pane,
+            machine=machine or None,
+            agent=agent.get("agent"),
+            agent_session=agent.get("agent_session"),
+            project=agent.get("cwd") or agent.get("foreground_cwd"),
+            source="reply",
+        )
+    except Exception as e:
+        logger.warning("prompt_log: запись не удалась: %s", e)
+
+
 async def herdr_reply_got_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pane = context.user_data.pop("herdr_reply_pane", None)
     host = context.user_data.pop("herdr_reply_host", None)
+    machine = context.user_data.pop("herdr_reply_machine", "")
     if not pane:
         return ConversationHandler.END
     res = await _herdr_json("agent", "prompt", pane, update.message.text, host=host)
     if res and res.get("result"):
         await update.message.reply_text("Отправлено ✓")
+        if LOG_PROMPTS:
+            await _log_pane_prompt(pane, machine, host, update.message.text)
     else:
         await update.message.reply_text("Не удалось отправить — агент ещё существует?")
     return ConversationHandler.END
@@ -2508,8 +2583,198 @@ async def herdr_reply_got_text(update: Update, context: ContextTypes.DEFAULT_TYP
 async def herdr_reply_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("herdr_reply_pane", None)
     context.user_data.pop("herdr_reply_host", None)
+    context.user_data.pop("herdr_reply_machine", None)
     await update.message.reply_text("Отменено.")
     return ConversationHandler.END
+
+
+# ---------------------------------------------------------------------------
+# herdr windows screen («🖥 Окна» / /windows)
+# ---------------------------------------------------------------------------
+# Pull-side of the herdr bridge: the watch loop pushes blocked/done
+# notifications, this screen lets the user come to the panes — list every
+# live agent across machines, open one and continue in it (prompt / dialog
+# keys / screen) without waiting for a notification.
+
+_WINDOWS_PER_PAGE = 8
+_WIN_STATUS_ICON = {"blocked": "⏸", "done": "✅", "working": "🔄", "idle": "💤"}
+
+
+def _win_task_id(name: str):
+    """PromptPilot task id from an agent name: running tasks are 'pp-t<id>-…',
+    kept panes are renamed to 't<id>' (herdr_exec keep_pane)."""
+    m = re.match(r"^(?:pp-)?t(\d+)(?:\b|-)", name or "")
+    return int(m.group(1)) if m else None
+
+
+async def _win_fetch(context) -> list:
+    """agent list + workspace list on every herdr machine, concurrently.
+    Unreachable machines are silently skipped, same as the watch loop."""
+    import asyncio
+
+    async def one(machine, host):
+        data = await _herdr_json("agent", "list", host=host)
+        agents = ((data or {}).get("result") or {}).get("agents") or []
+        agents = [a for a in agents if a.get("pane_id")]
+        if not agents:
+            return []
+        ws = await _herdr_json("workspace", "list", host=host)
+        ws_labels = {w.get("workspace_id"): w.get("label") or ""
+                     for w in ((ws or {}).get("result") or {}).get("workspaces") or []}
+        return [{
+            "machine": machine,
+            "pane_id": a.get("pane_id"),
+            "name": a.get("name") or "",
+            "agent": a.get("display_agent") or a.get("agent") or "",
+            "status": a.get("agent_status") or "unknown",
+            "title": (a.get("terminal_title_stripped") or "").strip(),
+            "cwd": a.get("cwd") or a.get("foreground_cwd") or "",
+            "session": a.get("agent_session") or "",
+            "ws": ws_labels.get(a.get("workspace_id")) or "",
+        } for a in agents]
+
+    chunks = await asyncio.gather(*(one(m, h) for m, h in _herdr_watch_targets()))
+    wins = [w for chunk in chunks for w in chunk]
+    context.user_data["win_cache"] = wins
+    return wins
+
+
+def _windows_keyboard(wins, page: int) -> InlineKeyboardMarkup:
+    keyboard = []
+    start = page * _WINDOWS_PER_PAGE
+    for i, w in enumerate(wins[start:start + _WINDOWS_PER_PAGE], start):
+        icon = _WIN_STATUS_ICON.get(w["status"], "•")
+        tags = "/".join(t for t in (w["machine"], w["ws"]) if t)
+        tid = _win_task_id(w["name"])
+        what = w["title"] or w["name"] or w["pane_id"]
+        label = " ".join(p for p in (
+            icon, f"[{tags}]" if tags else "", f"#{tid}" if tid else "", what) if p)
+        keyboard.append([InlineKeyboardButton(label[:60], callback_data=f"win_i:{i}")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀ Пред", callback_data=f"win_pg:{page - 1}"))
+    if start + _WINDOWS_PER_PAGE < len(wins):
+        nav.append(InlineKeyboardButton("▶ След", callback_data=f"win_pg:{page + 1}"))
+    if nav:
+        keyboard.append(nav)
+    keyboard.append([InlineKeyboardButton("🔄 Обновить", callback_data="win_rf")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+async def _render_windows(send, context, page: int = 0, refresh: bool = True):
+    """send — query.edit_message_text or message.reply_text."""
+    wins = context.user_data.get("win_cache")
+    if refresh or wins is None:
+        wins = await _win_fetch(context)
+    context.user_data["win_page"] = page
+    if not wins:
+        await send("Нет открытых herdr-окон с агентами.")
+        return
+    counts = {}
+    for w in wins:
+        counts[w["status"]] = counts.get(w["status"], 0) + 1
+    detail = ", ".join(f"{_WIN_STATUS_ICON.get(s, '•')} {n}"
+                       for s, n in sorted(counts.items()))
+    await send(f"🖥 Окна herdr: {len(wins)} ({detail})",
+               reply_markup=_windows_keyboard(wins, page))
+
+
+@require_auth
+async def show_windows(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _render_windows(update.message.reply_text, context)
+
+
+async def _render_window_card(query, context, idx: int) -> str:
+    """Render one pane's card; returns toast text (answering is the caller's
+    job — a second query.answer() on the same press is silently lost)."""
+    wins = context.user_data.get("win_cache") or []
+    if idx >= len(wins):
+        await _render_windows(query.edit_message_text, context, 0)
+        return "Список устарел — обновил."
+    w = wins[idx]
+    host = _machine_remote(w["machine"])
+    # Fresh state on open: the cached list may be minutes old, and the card's
+    # keyboard depends on whether the agent is blocked right now.
+    data = await _herdr_json("agent", "get", w["pane_id"], host=host)
+    agent = ((data or {}).get("result") or {}).get("agent") or {}
+    if not agent:
+        await _render_windows(query.edit_message_text, context, 0)
+        return "Окно закрыто — обновил список."
+    w.update(
+        status=agent.get("agent_status") or w["status"],
+        title=(agent.get("terminal_title_stripped") or "").strip() or w["title"],
+        cwd=agent.get("cwd") or agent.get("foreground_cwd") or w["cwd"],
+        session=agent.get("agent_session") or w["session"],
+    )
+
+    icon = _WIN_STATUS_ICON.get(w["status"], "•")
+    lines = [f"{icon} {_herdr_agent_label(agent)} — {w['status']}"]
+    if w["machine"]:
+        lines.append(f"Машина: {w['machine']}")
+    if w["ws"]:
+        lines.append(f"Workspace: {w['ws']}")
+    if w["cwd"]:
+        lines.append(f"Папка: {w['cwd']}")
+    tid = _win_task_id(w["name"])
+    if tid:
+        lines.append(f"Задача PromptPilot: #{tid}")
+    lines.append(f"Панель: {w['pane_id']}")
+    tail = await _herdr_screen_tail(w["pane_id"], w["machine"], lines_n=12)
+    if tail:
+        lines.append(f"\n{tail}")
+
+    ref = f"{w['machine']}:{w['pane_id']}"
+    rows = [[InlineKeyboardButton(REPLY_LABEL, callback_data=f"hd_reply:{ref}")]]
+    if w["status"] == "blocked":
+        rows.append([InlineKeyboardButton("✅ Enter", callback_data=f"hd_enter:{ref}"),
+                     InlineKeyboardButton("2", callback_data=f"hd_key:2:{ref}"),
+                     InlineKeyboardButton("3", callback_data=f"hd_key:3:{ref}"),
+                     InlineKeyboardButton("✖ Esc", callback_data=f"hd_key:esc:{ref}")])
+    rows.append([InlineKeyboardButton("🔄 Обновить", callback_data=f"win_i:{idx}"),
+                 InlineKeyboardButton("← К списку", callback_data="win_ls")])
+    await query.edit_message_text(_clip("\n".join(lines)),
+                                  reply_markup=InlineKeyboardMarkup(rows))
+    return ""
+
+
+@require_auth
+async def cb_window(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    idx = int(query.data.split(":")[1])
+    try:
+        toast = await _render_window_card(query, context, idx)
+    except BadRequest:
+        await query.answer("Без изменений.")
+        return
+    await query.answer(toast or None)
+
+
+@require_auth
+async def cb_windows_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await _render_windows(query.edit_message_text, context,
+                          int(query.data.split(":")[1]), refresh=False)
+
+
+@require_auth
+async def cb_windows_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    try:
+        await _render_windows(query.edit_message_text, context, 0)
+    except BadRequest:
+        await query.answer("Без изменений.")
+        return
+    await query.answer("Обновлено ✓")
+
+
+@require_auth
+async def cb_windows_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """«← К списку» from a window card — back to the remembered page."""
+    query = update.callback_query
+    await query.answer()
+    await _render_windows(query.edit_message_text, context,
+                          context.user_data.get("win_page", 0), refresh=False)
 
 
 # ---------------------------------------------------------------------------
@@ -2621,13 +2886,14 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "завершении приходит уведомление с кнопками (открыть / ответить / повторить).\n\n"
         "Меню:\n"
         "📋 Задачи — список с фильтрами; в карточке: отмена, сброс, повтор, полный вывод\n"
+        "🖥 Окна — живые herdr-сессии: открыть экран, ответить агенту, нажать кнопку диалога\n"
         "➕ Добавить задачу — мастер: промпт → где выполнить → папка → 🚀 Запустить\n"
         "   (приоритет, права, worktree, повтор, отложенный запуск — «⚙ Дополнительно»)\n"
         "📊 Статистика — сводка по статусам и расходы\n"
         "🔌 Провайдеры — список и настройки\n"
         "⚡ Скилы — запустить /skill Claude Code\n"
         "⏸ Пауза — приостановить воркер без потери задач\n\n"
-        "Команды: /tasks, /add, /stats, /providers, /pause, /skills, /help\n"
+        "Команды: /tasks, /windows, /add, /stats, /providers, /pause, /skills, /help\n"
         "/cancel — прервать текущий мастер или диалог\n\n"
         "Совет: задайте PP_PROJECTS_ROOT в .env — рабочую папку можно будет "
         "выбирать кнопками, а не печатать путь.",
@@ -2650,6 +2916,7 @@ def run_bot():
         try:
             await application.bot.set_my_commands([
                 BotCommand("tasks", "Список задач"),
+                BotCommand("windows", "Окна herdr"),
                 BotCommand("add", "Новая задача"),
                 BotCommand("stats", "Статистика"),
                 BotCommand("providers", "Провайдеры"),
@@ -2768,8 +3035,8 @@ def run_bot():
         fallbacks=[
             CommandHandler("cancel", add_task_cancel),
             CallbackQueryHandler(cb_wiz_cancel, pattern=r"^wiz_cancel$"),
-            # skills_* / hd_* are handled in group -1 — don't toast over them
-            CallbackQueryHandler(wizard_unexpected_cb, pattern=r"^(?!skills_|hd_)"),
+            # skills_* / hd_* / win_* are handled in group -1 — don't toast over them
+            CallbackQueryHandler(wizard_unexpected_cb, pattern=r"^(?!skills_|hd_|win_)"),
             MessageHandler(filters.ALL, wizard_unexpected),
         ],
         allow_reentry=True,
@@ -2827,12 +3094,19 @@ def run_bot():
     app.add_handler(CallbackQueryHandler(cb_herdr_screen, pattern=r"^hd_screen:"), group=-1)
     app.add_handler(CallbackQueryHandler(cb_herdr_key, pattern=r"^hd_key:"), group=-1)
 
+    # windows screen buttons live in cards that outlive any active wizard
+    app.add_handler(CallbackQueryHandler(cb_window, pattern=r"^win_i:\d+$"), group=-1)
+    app.add_handler(CallbackQueryHandler(cb_windows_page, pattern=r"^win_pg:\d+$"), group=-1)
+    app.add_handler(CallbackQueryHandler(cb_windows_refresh, pattern=r"^win_rf$"), group=-1)
+    app.add_handler(CallbackQueryHandler(cb_windows_list, pattern=r"^win_ls$"), group=-1)
+
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("skills", cmd_skills))
     # Command aliases for every menu button: on desktop the reply keyboard is
     # often collapsed, and the Telegram command menu is all the user sees.
     app.add_handler(CommandHandler("tasks", show_tasks))
+    app.add_handler(CommandHandler("windows", show_windows))
     app.add_handler(CommandHandler("stats", show_stats))
     app.add_handler(CommandHandler("providers", show_providers))
     app.add_handler(CommandHandler("pause", toggle_pause))
@@ -2841,6 +3115,7 @@ def run_bot():
     app.add_handler(reply_conv)
     app.add_handler(add_conv)
     app.add_handler(MessageHandler(filters.Regex("^📋 Задачи$"), show_tasks))
+    app.add_handler(MessageHandler(filters.Regex("^🖥 Окна$"), show_windows))
     app.add_handler(MessageHandler(filters.Regex("^📊 Статистика$"), show_stats))
     app.add_handler(MessageHandler(filters.Regex("^🔌 Провайдеры$"), show_providers))
     app.add_handler(MessageHandler(filters.Regex("^⚡ Скилы$"), cmd_skills))

@@ -836,6 +836,10 @@ HERDR_KEEP_PANE = os.environ.get("PP_HERDR_KEEP_PANE", "0") == "1"
 HERDR_WATCH = os.environ.get("PP_HERDR_WATCH", "1") == "1"
 HERDR_WATCH_INTERVAL = _int_env("PP_HERDR_WATCH_INTERVAL", 10)
 
+# Journal prompts sent straight into herdr panes from the bot (💬 in «🖥 Окна»
+# and notifications) into the prompt_log table, keyed by the pane's cwd.
+LOG_PROMPTS = os.environ.get("PP_LOG_PROMPTS", "1") == "1"
+
 # Git worktrees — a task edits its own checkout instead of the user's work tree.
 # Branch name is <prefix>t<task id>; the checkout lands next to the repository
 # (same machine, same filesystem) unless PP_WORKTREES_ROOT names a directory.

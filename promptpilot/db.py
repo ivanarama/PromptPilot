@@ -63,8 +63,21 @@ CREATE TABLE IF NOT EXISTS notifications (
     machine TEXT
 );
 
+CREATE TABLE IF NOT EXISTS prompt_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    machine TEXT,
+    pane_id TEXT,
+    agent TEXT,
+    agent_session TEXT,
+    project TEXT,
+    prompt TEXT NOT NULL,
+    source TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_runnable ON tasks(status, priority, next_run_at);
+CREATE INDEX IF NOT EXISTS idx_prompt_log_project ON prompt_log(project);
 """
 
 MIGRATIONS = [
@@ -554,6 +567,37 @@ def add_notification(tg_chat_id: int, message: str, task_id: int = None,
             " VALUES (?, ?, ?, ?, ?, ?)",
             (task_id, tg_chat_id, message, _now(), pane_id, machine),
         )
+
+
+def add_prompt_log(prompt: str, pane_id: str = None, machine: str = None,
+                   agent: str = None, agent_session: str = None,
+                   project: str = None, source: str = None):
+    """Journal a prompt sent straight into a herdr pane (outside the task
+    queue). Stores the project (pane cwd) and agent_session — a pointer into
+    the agent's own transcript store (~/.claude/projects for Claude Code) —
+    never the reply text: duplicating transcripts here would only be a worse
+    copy of what the agent already keeps."""
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO prompt_log (created_at, machine, pane_id, agent,"
+            " agent_session, project, prompt, source)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (_now(), machine, pane_id, agent, agent_session, project, prompt, source),
+        )
+
+
+def list_prompt_log(project: str = None, limit: int = 50) -> list:
+    """Direct-to-pane prompts, newest first; project filters by pane cwd."""
+    sql = "SELECT * FROM prompt_log"
+    args = []
+    if project:
+        sql += " WHERE project = ?"
+        args.append(project)
+    sql += " ORDER BY id DESC LIMIT ?"
+    args.append(limit)
+    with _connect() as conn:
+        rows = conn.execute(sql, args).fetchall()
+        return [dict(r) for r in rows]
 
 
 def set_task_pane(task_id: int, pane_id: str):
