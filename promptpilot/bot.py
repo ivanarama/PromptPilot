@@ -36,7 +36,7 @@ from telegram.ext import (
 
 from . import db
 from .config import (
-    DEFAULT_CLI, HERDR_WATCH, HERDR_WATCH_INTERVAL, LOG_PROMPTS,
+    DEFAULT_CLI, HERDR_RENOTIFY_COOLDOWN, HERDR_WATCH, HERDR_WATCH_INTERVAL, LOG_PROMPTS,
     get_provider_models, get_proxy_url, get_skills, load_machines, load_providers,
     load_providers_detailed, mask_proxy_url, pickable_providers,
     PROJECTS_ROOT, TASK_PASSWORD,
@@ -473,7 +473,7 @@ async def cb_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += f"\nДир: `{_esc_code(task.working_dir)}`"
     if task.verdict:
         icon = {"ГОТОВО": "✅", "УЖЕ СДЕЛАНО": "✅",
-                "НУЖЕН ЧЕЛОВЕК": "🟡", "НЕ СМОГ": "❌"}.get(task.verdict, "•")
+                "НУЖЕН ЧЕЛОВЕК": "🟡", "НЕ СМОГ": "❌", "ПУСТО": "⚪"}.get(task.verdict, "•")
         text += f"\nИтог: {icon} {_esc(task.verdict)}"
     if task.note:
         text += f"\n✎ Приписка: {_esc(task.note[:200])}"
@@ -2332,7 +2332,8 @@ def _screen_chrome(line: str) -> bool:
     into unreadable rubbish on a narrow screen."""
     s = line.strip()
     return (s.count("─") >= 8 or s == "❯"
-            or "? for shortcuts" in s or "· /effort" in s)
+            or "? for shortcuts" in s or "· /effort" in s
+            or "Enter to select" in s or "Esc to cancel" in s)
 
 
 async def _herdr_screen_tail(pane_id: str, machine: str = "", lines_n: int = 10) -> str:
@@ -2356,7 +2357,8 @@ async def _herdr_screen_tail(pane_id: str, machine: str = "", lines_n: int = 10)
     return "\n".join(out)[-1000:]
 
 
-async def _herdr_notify(bot, pane_id: str, status: str, agent: dict, machine: str = ""):
+async def _herdr_notify(bot, pane_id: str, status: str, agent: dict, machine: str = "",
+                        tail: str = ""):
     label = _herdr_agent_label(agent)
     # callback_data: hd_<action>:<machine>:<pane> — machine names carry no ':',
     # pane ids do ("w9:p2"), so the split is bounded to 2.
@@ -2365,7 +2367,6 @@ async def _herdr_notify(bot, pane_id: str, status: str, agent: dict, machine: st
     if status == "blocked":
         text = f"⏸ herdr{where}: {label} в панели {pane_id} ждёт подтверждения"
         buttons = _herdr_blocked_keyboard(ref)
-        tail = await _herdr_screen_tail(pane_id, machine)
         if tail:
             text += f"\n\n{tail}"
     else:
@@ -2434,15 +2435,29 @@ async def _herdr_watch_tick(bot, notified):
                     continue  # PromptPilot's own tasks notify via the worker
                 current[pane] = a
             seen.update((machine, pane) for pane in current)
+            now = time.monotonic()
             for pane, a in current.items():
                 key = (machine, pane)
                 status = a.get("agent_status")
                 if status in ("blocked", "done"):
-                    if notified.get(key) != status:
-                        await _herdr_notify(bot, pane, status, a, machine)
-                        notified[key] = status
-                else:
-                    notified.pop(key, None)
+                    prev = notified.get(key)  # (status, screen tail, когда видели)
+                    if prev and prev[0] == status and now - prev[2] < HERDR_WATCH_INTERVAL * 3:
+                        # Висит непрерывно (или статус мигнул working на
+                        # один-два опроса — датчик herdr не идеален): уже
+                        # сказано, только освежаем время наблюдения. Экран
+                        # ради этого не перечитываем.
+                        notified[key] = (prev[0], prev[1], now)
+                        continue
+                    tail = await _herdr_screen_tail(pane, machine) if status == "blocked" else ""
+                    dup = (prev and prev[0] == status and prev[1] == tail
+                           and now - prev[2] < HERDR_RENOTIFY_COOLDOWN)
+                    if not dup:
+                        await _herdr_notify(bot, pane, status, a, machine, tail=tail)
+                    notified[key] = (status, tail, now)
+                # Состояние ушло из blocked/done — запись НЕ удаляем: раньше
+                # мигание статуса стирало её, и следующий же blocked давал
+                # дубль уведомления. Тот же диалог в течение cooldown молчит,
+                # новый (другой текст на экране) — уведомит сразу.
             # A machine that failed to answer keeps its remembered state: only
             # panes on machines we DID reach may be forgotten.
             for key in [k for k in notified if k[0] == machine and k not in seen]:
@@ -2826,6 +2841,12 @@ async def _notify_loop(bot):
             continue
         for task in pending:
             try:
+                # ПУСТО — «проснулся по расписанию, делать нечего»: рутина
+                # повторяющихся задач, ради которой будить человека не за чем.
+                # Итог остаётся в базе и виден в списке задач.
+                if task.status.value == "completed" and (task.verdict or "").upper() == "ПУСТО":
+                    db.mark_notified(task.id)
+                    continue
                 if task.status.value == "completed":
                     icon, status_word = "✅", "выполнена"
                     body = ""

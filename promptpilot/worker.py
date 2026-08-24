@@ -98,7 +98,7 @@ ENV_FAILURE_RE = re.compile(
 
 # The agent is asked to end with this line so a finished task says WHAT
 # happened, not just that the process exited 0. Parsed whether or not we asked.
-VERDICTS = ("ГОТОВО", "УЖЕ СДЕЛАНО", "НУЖЕН ЧЕЛОВЕК", "НЕ СМОГ")
+VERDICTS = ("ГОТОВО", "УЖЕ СДЕЛАНО", "НУЖЕН ЧЕЛОВЕК", "НЕ СМОГ", "ПУСТО")
 VERDICT_RE = re.compile(r"^[ \t>*#-]*ИТОГ:\s*(" + "|".join(VERDICTS) + r")\b", re.M | re.I)
 
 VERDICT_INSTRUCTION = (
@@ -107,6 +107,7 @@ VERDICT_INSTRUCTION = (
     "ИТОГ: УЖЕ СДЕЛАНО — оказалось, что уже исправлено\n"
     "ИТОГ: НУЖЕН ЧЕЛОВЕК — нужно решение или доступ человека\n"
     "ИТОГ: НЕ СМОГ — не получилось\n"
+    "ИТОГ: ПУСТО — проснулся по расписанию, а делать нечего\n"
     "После двоеточия можно коротко пояснить причину."
 )
 

@@ -835,6 +835,9 @@ HERDR_KEEP_PANE = os.environ.get("PP_HERDR_KEEP_PANE", "0") == "1"
 # PromptPilot tasks) and notifies when one is blocked or finishes unseen.
 HERDR_WATCH = os.environ.get("PP_HERDR_WATCH", "1") == "1"
 HERDR_WATCH_INTERVAL = _int_env("PP_HERDR_WATCH_INTERVAL", 10)
+# Повторное blocked с ТЕМ ЖЕ экраном в течение этого срока — не событие,
+# а дребезг датчика статуса; молчим. Новый текст на экране уведомляет сразу.
+HERDR_RENOTIFY_COOLDOWN = _int_env("PP_HERDR_RENOTIFY_COOLDOWN", 600)
 
 # Journal prompts sent straight into herdr panes from the bot (💬 in «🖥 Окна»
 # and notifications) into the prompt_log table, keyed by the pane's cwd.
