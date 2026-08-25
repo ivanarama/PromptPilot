@@ -88,6 +88,54 @@
     margin-bottom: 12px;
   }
   .add-form textarea:focus { outline: none; border-color: var(--accent); }
+  .add-form textarea.dragover { border-color: var(--accent2); background: var(--surface2); }
+
+  /* Attachments */
+  .attach-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-bottom: 12px;
+  }
+  .file-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 3px 10px;
+    font-size: 12px;
+    font-family: var(--mono);
+    color: var(--text);
+  }
+  .file-chip .chip-size { color: var(--text2); }
+  .file-chip button {
+    background: none;
+    border: none;
+    color: var(--text2);
+    cursor: pointer;
+    font-size: 12px;
+    padding: 0;
+  }
+  .file-chip button:hover { color: var(--red); }
+
+  /* Agent screen (herdr) */
+  .screen-status {
+    font-size: 11px;
+    font-weight: 500;
+    text-transform: none;
+    letter-spacing: 0;
+    padding: 1px 8px;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    color: var(--text2);
+    margin-left: 6px;
+  }
+  .screen-status[data-st="working"] { color: var(--cyan); border-color: var(--cyan); }
+  .screen-status[data-st="blocked"] { color: var(--yellow); border-color: var(--yellow); }
+  .screen-status[data-st="idle"], .screen-status[data-st="done"] { color: var(--green); border-color: var(--green); }
 
   .form-row {
     display: flex;
@@ -430,6 +478,12 @@
 
   <div class="add-form">
     <textarea id="promptInput" placeholder="Enter your prompt here..."></textarea>
+    <div class="attach-row">
+      <button type="button" class="btn-skills" onclick="document.getElementById('fileInput').click()" title="Файлы сохранятся на этой машине, пути допишутся к промпту">📎 Файлы</button>
+      <input type="file" id="fileInput" multiple hidden onchange="addFiles(this.files); this.value=''">
+      <span class="skills-hint">скриншот можно вставить из буфера (Ctrl+V) или перетащить файл на поле промпта</span>
+      <span id="fileChips" style="display:contents"></span>
+    </div>
     <div class="skills-toggle-row" id="skillsToggleRow">
       <button type="button" class="btn-skills" id="skillsToggleBtn" onclick="toggleSkills()">⚡ Skills</button>
       <span class="skills-hint">Claude Code only · /skill-name [args]</span>
@@ -543,6 +597,7 @@
 const API = '/api';
 let currentFilter = '';
 let expandedId = null;
+let screenCache = {};  // task id -> {text, status}: экран герд-панели раскрытой карточки
 let providersData = {};
 let projectsByPath = {};   // path -> {name, path, git} from /api/projects
 let skillsCache = {};
@@ -733,6 +788,20 @@ async function loadTasks() {
           <button class="btn" onclick="saveNote(event, ${t.id})">Записать</button>
         </div>
 
+        ${t.status === 'running' && t.herdr_pane ? `
+          <div class="detail-label">Экран агента<span class="screen-status" id="screen-status-${t.id}" data-st="${escAttr(screenCache[t.id]?.status || '')}">${esc(screenCache[t.id]?.status || '…')}</span></div>
+          <div class="result-block">
+            <pre class="agent-screen" id="screen-${t.id}">${esc(screenCache[t.id]?.text || 'Загрузка экрана…')}</pre>
+          </div>
+          <div class="detail-actions">
+            <button class="btn btn-sm btn-ghost" onclick="sendKey(event, ${t.id}, 'enter')" title="подтвердить диалог агента">⏎ Enter</button>
+            <button class="btn btn-sm btn-ghost" onclick="sendKey(event, ${t.id}, '2')">2</button>
+            <button class="btn btn-sm btn-ghost" onclick="sendKey(event, ${t.id}, '3')">3</button>
+            <button class="btn btn-sm btn-ghost" onclick="sendKey(event, ${t.id}, 'esc')">Esc</button>
+            <button class="btn btn-sm btn-copy" onclick="refreshScreen(event, ${t.id})">↻ Обновить</button>
+          </div>
+        ` : ''}
+
         ${resultHTML}
 
         ${t.error ? `
@@ -758,11 +827,21 @@ async function loadTasks() {
       </div>
     </div>`;
   }).join('');
+
+  // экран агента дорисован из кэша — держим прокрутку у свежих строк
+  const sc = document.getElementById('screen-' + expandedId);
+  if (sc && screenCache[expandedId]) sc.scrollTop = sc.scrollHeight;
 }
 
 async function addTask() {
-  const prompt = document.getElementById('promptInput').value.trim();
-  if (!prompt) return;
+  let prompt = document.getElementById('promptInput').value.trim();
+  if (!prompt) {
+    // Вставил скриншот, нажал Add и ничего не произошло — молчание тут выглядит
+    // как сломанная кнопка, а файлы даже не успевают загрузиться.
+    if (pendingFiles.length) toast('Опишите задачу — что сделать с приложенными файлами?');
+    document.getElementById('promptInput').focus();
+    return;
+  }
   const priority = parseInt(document.getElementById('priorityInput').value);
   const schedule = document.getElementById('scheduleInput').value || null;
   const provider = document.getElementById('providerInput').value || null;
@@ -777,6 +856,20 @@ async function addTask() {
   const recurrence = document.getElementById('recurrenceInput').value.trim() || null;
   const timeoutVal = document.getElementById('timeoutInput').value.trim();
   const taskTimeout = timeoutVal !== '' ? parseInt(timeoutVal) : null;
+  const machine = document.getElementById('machineInput').value || null;
+
+  // Вложения сохраняются на ЭТОЙ машине — удалённый агент их не прочитает.
+  if (pendingFiles.length && machine) {
+    toast('Вложения пока работают только локально: файлы лежат на этом хосте, задача на другой машине их не увидит. Убери файлы или выбери «💻 локально».');
+    return;
+  }
+  if (pendingFiles.length) {
+    let uploaded;
+    try { uploaded = await uploadPendingFiles(); }
+    catch (e) { toast('Не удалось загрузить файлы: ' + e.message); return; }
+    prompt += '\n\nПриложенные файлы (читай по этим путям):\n'
+      + uploaded.map(u => `- ${u.path}`).join('\n');
+  }
 
   try {
     await fetchJSON(`${API}/tasks`, {
@@ -792,7 +885,7 @@ async function addTask() {
         keep_pane: document.getElementById('keepPane').checked,
         worktree: document.getElementById('worktree').checked,
         herdr_target: herdrTarget,
-        machine: document.getElementById('machineInput').value || null,
+        machine,
         scheduled_at: schedule ? new Date(schedule).toISOString() : null,
         recurrence,
         task_timeout: taskTimeout,
@@ -807,8 +900,45 @@ async function addTask() {
   document.getElementById('promptInput').value = '';
   document.getElementById('recurrenceInput').value = '';
   document.getElementById('timeoutInput').value = '';
+  pendingFiles = [];
+  renderFileChips();
   toast('Задача создана', false);
   refresh();
+}
+
+// --- Вложения: выбранные файлы живут во вкладке до создания задачи ---
+let pendingFiles = [];
+
+function addFiles(list) {
+  for (const f of list) {
+    if (f.size > 20 * 1024 * 1024) { toast(`«${f.name}» больше 20 МБ — не приложен`); continue; }
+    pendingFiles.push(f);
+  }
+  renderFileChips();
+}
+
+function removeFile(i) {
+  pendingFiles.splice(i, 1);
+  renderFileChips();
+}
+
+function renderFileChips() {
+  document.getElementById('fileChips').innerHTML = pendingFiles.map((f, i) =>
+    `<span class="file-chip">${esc(f.name)} <span class="chip-size">${fmtSize(f.size)}</span>
+      <button type="button" title="убрать" onclick="removeFile(${i})">✕</button></span>`).join('');
+}
+
+function fmtSize(n) {
+  if (n >= 1048576) return (n / 1048576).toFixed(1) + ' МБ';
+  if (n >= 1024) return Math.round(n / 1024) + ' КБ';
+  return n + ' Б';
+}
+
+async function uploadPendingFiles() {
+  const fd = new FormData();
+  pendingFiles.forEach(f => fd.append('files', f, f.name));
+  // Content-Type не ставим: браузер сам выставит multipart с boundary
+  return await fetchJSON(`${API}/upload`, { method: 'POST', body: fd });
 }
 
 function verdictIcon(v) {
@@ -859,7 +989,60 @@ async function deleteTask(e, id) {
 
 function toggleTask(id) {
   expandedId = expandedId === id ? null : id;
-  loadTasks();
+  loadTasks().then(() => pollScreen());
+}
+
+// --- Экран агента (herdr) в раскрытой карточке ---
+let screenBusy = false;
+let screenPending = false;
+
+async function pollScreen(force) {
+  const id = expandedId;
+  if (!id) return;
+  if (screenBusy) {
+    // Один опрос удалённой машины — два ssh-вызова, они легко перекрывают
+    // интервал: без этой ветки «↻ Обновить» выглядит сломанной кнопкой.
+    if (force) { screenPending = true; toast('Экран уже обновляется…'); }
+    return;
+  }
+  if (!document.getElementById('screen-' + id)) return;  // карточка без живой панели
+  screenBusy = true;
+  try {
+    const s = await fetchJSON(`${API}/tasks/${id}/screen`);
+    screenCache = { [id]: { text: s.text || '', status: s.agent_status || '' } };
+    const el = document.getElementById('screen-' + id);  // список мог перерисоваться
+    if (el) {
+      el.textContent = s.text || '(экран пуст)';
+      el.scrollTop = el.scrollHeight;
+    }
+    const st = document.getElementById('screen-status-' + id);
+    if (st) { st.textContent = s.agent_status || '?'; st.dataset.st = s.agent_status || ''; }
+  } catch (e) {
+    const st = document.getElementById('screen-status-' + id);
+    if (st) { st.textContent = 'недоступен'; st.dataset.st = ''; }
+    if (force) toast('Экран недоступен: ' + e.message);
+  } finally {
+    screenBusy = false;
+    if (screenPending) { screenPending = false; pollScreen(true); }
+  }
+}
+
+function refreshScreen(e, id) {
+  e.stopPropagation();
+  pollScreen(true);
+}
+
+async function sendKey(e, id, key) {
+  e.stopPropagation();
+  try {
+    await fetchJSON(`${API}/tasks/${id}/keys`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key }),
+    });
+    toast(`Отправлено: ${key}`, false);
+    setTimeout(() => pollScreen(), 700);  // экран успевает отреагировать
+  } catch (err) { toast('Не удалось отправить: ' + err.message); }
 }
 
 function copyText(e, text) {
@@ -1088,6 +1271,31 @@ document.getElementById('promptInput').addEventListener('keydown', e => {
     addTask();
   }
 });
+
+// --- Скриншот из буфера обмена / drag-n-drop на поле промпта ---
+document.getElementById('promptInput').addEventListener('paste', e => {
+  const imgs = [...(e.clipboardData?.items || [])]
+    .filter(it => it.kind === 'file' && it.type.startsWith('image/'))
+    .map(it => it.getAsFile()).filter(Boolean);
+  if (!imgs.length) return;
+  e.preventDefault();
+  // из буфера картинка приходит безликим image.png — даём внятное имя
+  addFiles(imgs.map((f, i) => new File(
+    [f],
+    `screenshot-${Date.now()}${i ? '-' + i : ''}.${(f.type.split('/')[1] || 'png').replace(/[^a-z0-9]/gi, '')}`,
+    { type: f.type })));
+});
+
+{
+  const ta = document.getElementById('promptInput');
+  ta.addEventListener('dragover', e => { e.preventDefault(); ta.classList.add('dragover'); });
+  ta.addEventListener('dragleave', () => ta.classList.remove('dragover'));
+  ta.addEventListener('drop', e => {
+    e.preventDefault();
+    ta.classList.remove('dragover');
+    if (e.dataTransfer?.files?.length) addFiles(e.dataTransfer.files);
+  });
+}
 
 // --- Load providers into dropdown ---
 let machinesData = {};
@@ -1371,6 +1579,7 @@ loadVersion();
 loadCosts();
 refresh();
 setInterval(refresh, 5000);
+setInterval(() => pollScreen(), 4000);  // только для раскрытой карточки с herdr-панелью
 setInterval(loadWorkerStatus, 10000);
 setInterval(loadCosts, 30000);
 </script>

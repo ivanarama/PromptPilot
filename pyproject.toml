@@ -14,6 +14,7 @@ classifiers = [
 ]
 dependencies = [
     "fastapi>=0.115",
+    "python-multipart>=0.0.9",  # multipart-формы: /api/upload (вложения к задачам)
     "uvicorn[standard]>=0.34",
     "click>=8.1",
     "pydantic>=2.0",

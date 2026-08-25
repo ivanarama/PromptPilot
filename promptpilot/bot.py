@@ -10,7 +10,10 @@ import json
 import logging
 import os
 import re
+import shutil
 import time
+import unicodedata
+import uuid
 from datetime import timezone
 from typing import Optional
 
@@ -283,7 +286,14 @@ _WIZARD_KEYS = ("new_prompt", "new_provider", "new_priority", "new_dir", "new_sc
                 "new_recurrence", "new_detached", "new_keep_pane", "new_model",
                 "new_skip_permissions", "new_skill_name", "new_herdr_target", "new_machine",
                 "new_worktree", "pw_attempts", "model_list", "herdr_targets",
-                "last_settings", "dir_base", "dir_subs", "dir_page", "dir_hist")
+                "last_settings", "dir_base", "dir_subs", "dir_page", "dir_hist",
+                "att_media_group")
+
+
+def _drop_attachment_files(paths):
+    """Файлы недосозданной задачи никому не нужны — удалить их uuid-каталоги."""
+    for p in paths or []:
+        shutil.rmtree(os.path.dirname(p), ignore_errors=True)
 
 
 def _clear_wizard(context):
@@ -291,6 +301,84 @@ def _clear_wizard(context):
     machine/provider into the next task (e.g. a skill started right after)."""
     for key in _WIZARD_KEYS:
         context.user_data.pop(key, None)
+    _drop_attachment_files(context.user_data.pop("new_attachments", None))
+
+
+_MAX_ATTACHMENT_MB = 20  # Bot API не отдаёт боту файлы крупнее
+
+
+def _safe_attachment_name(name: str) -> str:
+    """Имя попадает в путь на диске и в промпт задачи. Режем разделители путей,
+    управляющие символы и запрещённое в Windows, но буквы оставляем любые:
+    «договор.pdf» и «приложение.pdf» должны остаться различимыми, иначе агент
+    получит два одинаковых имени и не поймёт, где какой файл."""
+    base = os.path.basename((name or "").strip().replace("\\", "/"))
+    base = unicodedata.normalize("NFC", base)
+    base = re.sub(r'[\x00-\x1f\x7f/:*?"<>|]+', "_", base).strip().lstrip(".")
+    stem, ext = os.path.splitext(base)
+    ext = ext[:16]
+    # длину считаем в байтах — в кириллическом имени их вдвое больше символов
+    while stem and len((stem + ext).encode("utf-8")) > 80:
+        stem = stem[:-1]
+    return (stem + ext) if stem else "file.bin"
+
+
+def _attachments_prompt_block(paths) -> str:
+    return ("\n\nПриложенные файлы (читай по этим путям):\n"
+            + "\n".join(f"- {p}" for p in paths))
+
+
+def _repeat_media_group(context, message) -> bool:
+    """Альбом из нескольких скриншотов Telegram шлёт отдельными сообщениями —
+    подтверждать стоит только первое, иначе на 5 файлов прилетит 5 ответов."""
+    group = message.media_group_id
+    prev = context.user_data.get("att_media_group")
+    context.user_data["att_media_group"] = group
+    return bool(group) and group == prev
+
+
+def _attachments_summary_line(paths) -> str:
+    names = [os.path.basename(p) for p in paths]
+    shown = ", ".join(names[:3])
+    more = f" и ещё {len(names) - 3}" if len(names) > 3 else ""
+    return f"📎 Вложения ({len(names)}): {shown}{more}"
+
+
+async def _ingest_attachment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[str]:
+    """Скачивает фото/документ в DB_DIR/attachments/<uuid4>/<имя> и добавляет
+    путь в user_data["new_attachments"]. Возвращает текст ошибки для
+    пользователя или None при успехе."""
+    from .config import DB_DIR
+
+    msg = update.message
+    already = len(context.user_data.get("new_attachments") or [])
+    if msg.photo:
+        tg_obj = msg.photo[-1]  # последний элемент — максимальное разрешение
+        # нумеруем: у скриншотов нет имён, а одинаковые photo.jpg в промпте
+        # агент не различит
+        name = f"photo-{already + 1}.jpg"
+    elif msg.document:
+        tg_obj = msg.document
+        name = _safe_attachment_name(msg.document.file_name or "")
+    else:
+        return "Такой тип вложения не поддерживается — пришлите фото или файл-документ."
+
+    if (tg_obj.file_size or 0) > _MAX_ATTACHMENT_MB * 1024 * 1024:
+        return (f"Файл больше {_MAX_ATTACHMENT_MB} МБ — Telegram не отдаёт такие боту. "
+                "Сожмите его или положите в рабочую директорию задачи.")
+
+    dest = DB_DIR / "attachments" / str(uuid.uuid4()) / name
+    try:
+        tg_file = await context.bot.get_file(tg_obj.file_id)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        await tg_file.download_to_drive(custom_path=str(dest))
+    except Exception as e:
+        logger.warning("не смог скачать вложение %s: %s", name, e)
+        shutil.rmtree(dest.parent, ignore_errors=True)
+        return "Не удалось скачать вложение из Telegram. Попробуйте ещё раз."
+
+    context.user_data.setdefault("new_attachments", []).append(str(dest))
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -926,15 +1014,13 @@ async def _ask_machine_or_provider(send, context):
     return ASK_PROVIDER
 
 
-async def add_task_got_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["new_prompt"] = update.message.text
-
+async def _after_prompt(message, context: ContextTypes.DEFAULT_TYPE):
     # The user almost always runs the next task with the same provider and
     # folder — offer last time's settings before walking every step again.
-    last = _load_last_settings(update.effective_chat.id)
+    last = _load_last_settings(message.chat_id)
     if last and not load_providers().get(last.get("new_provider") or DEFAULT_CLI, {}).get("session_target"):
         context.user_data["last_settings"] = last
-        await update.message.reply_text(
+        await message.reply_text(
             "Как в прошлый раз?\n" + _last_settings_line(last),
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("↩ Да, с этими настройками", callback_data="last_use")],
@@ -944,7 +1030,73 @@ async def add_task_got_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return ASK_LAST
 
-    return await _ask_machine_or_provider(update.message.reply_text, context)
+    return await _ask_machine_or_provider(message.reply_text, context)
+
+
+async def add_task_got_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["new_prompt"] = update.message.text
+    return await _after_prompt(update.message, context)
+
+
+def _append_caption_to_prompt(context, caption: str):
+    if not caption:
+        return
+    prev = context.user_data.get("new_prompt")
+    context.user_data["new_prompt"] = f"{prev}\n\n{caption}" if prev else caption
+
+
+async def add_task_got_attachment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Фото/документ на шаге промпта: подпись к вложению становится промптом,
+    без подписи — копим файлы и ждём текст."""
+    error = await _ingest_attachment(update, context)
+    if error:
+        await update.message.reply_text(f"{error}\n(/cancel — отменить)")
+        return ASK_PROMPT
+    _append_caption_to_prompt(context, (update.message.caption or "").strip())
+    repeat = _repeat_media_group(context, update.message)
+    if context.user_data.get("new_prompt"):
+        return await _after_prompt(update.message, context)
+    if repeat:
+        return ASK_PROMPT
+    count = len(context.user_data.get("new_attachments") or [])
+    await update.message.reply_text(
+        f"📎 Вложение сохранено (всего: {count}). Теперь введите промпт "
+        "или пришлите ещё файлы:\n(/cancel — отменить)")
+    return ASK_PROMPT
+
+
+async def add_task_attachment_midway(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Вложение, пришедшее на любом шаге после промпта: остальные файлы альбома
+    прилетают, когда мастер уже шагнул дальше, а без этого хендлера их съедал
+    fallback. Возврат None оставляет мастер на текущем шаге."""
+    error = await _ingest_attachment(update, context)
+    if error:
+        await update.message.reply_text(error)
+        return None
+    _append_caption_to_prompt(context, (update.message.caption or "").strip())
+    if _repeat_media_group(context, update.message):
+        return None
+    count = len(context.user_data.get("new_attachments") or [])
+    await update.message.reply_text(
+        f"📎 Вложение добавлено (всего: {count}). Продолжайте с шагом выше.")
+    return None
+
+
+async def add_task_got_attachment_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Фото/документ на карточке подтверждения: подпись дополняет промпт,
+    карточка перерисовывается со свежим списком вложений."""
+    error = await _ingest_attachment(update, context)
+    if error:
+        await update.message.reply_text(error)
+        return ASK_CONFIRM
+    _append_caption_to_prompt(context, (update.message.caption or "").strip())
+    if _repeat_media_group(context, update.message):
+        # остальные файлы альбома: ещё одна карточка на каждый файл оставила бы
+        # несколько живых клавиатур «🚀 Запустить», и все, кроме первой, мёртвые
+        count = len(context.user_data.get("new_attachments") or [])
+        await update.message.reply_text(f"📎 Вложение добавлено (всего: {count}).")
+        return ASK_CONFIRM
+    return await _show_confirm(update.message.reply_text, context)
 
 
 async def cb_last_use(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1508,6 +1660,11 @@ def _wizard_summary(context) -> str:
         "Проверьте задачу:",
         "",
         f"📝 {prompt}",
+    ]
+    attachments = ud.get("new_attachments") or []
+    if attachments:
+        lines.append(_attachments_summary_line(attachments))
+    lines += [
         "",
         f"🔌 {prov}{model} · 💻 {ud.get('new_machine') or 'локально'}",
     ]
@@ -1532,6 +1689,9 @@ def _wizard_summary(context) -> str:
         flags.append("закрыть панель после")
     if flags:
         lines.append("⚙ " + ", ".join(flags))
+    if attachments and ud.get("new_machine"):
+        lines.append("⚠️ Вложения пока работают только на локальной машине — "
+                     "уберите машину или вложения")
     return "\n".join(lines)
 
 
@@ -1561,11 +1721,49 @@ async def _show_confirm(send, context):
 async def cb_wiz_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    if context.user_data.get("new_attachments") and context.user_data.get("new_machine"):
+        # Файлы скачаны на этот хост — удалённый агент их не увидит; запускать
+        # молча значило бы потерять вложения.
+        await query.message.reply_text(
+            "📎 Вложения пока работают только на локальной машине — "
+            "уберите машину или вложения.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("💻 Выполнить локально", callback_data="wiz_drop_machine")],
+                [InlineKeyboardButton("🗑 Убрать вложения", callback_data="wiz_drop_att")],
+            ]),
+        )
+        return ASK_CONFIRM
     try:
         await query.edit_message_reply_markup(reply_markup=None)
     except BadRequest:
         pass
     return await _finish_add_task_from_query(query, context)
+
+
+async def cb_wiz_drop_attachments(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    _drop_attachment_files(context.user_data.pop("new_attachments", None))
+    return await _show_confirm(query.edit_message_text, context)
+
+
+async def cb_wiz_drop_machine(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    ud = context.user_data
+    ud.pop("new_machine", None)
+    ud.pop("new_herdr_target", None)
+    # Провайдер выбирался из списка той машины — локально его может не быть
+    if ud.get("new_provider") and ud["new_provider"] not in pickable_providers():
+        ud.pop("new_provider", None)
+        ud.pop("new_model", None)
+    # Директорию тоже выбирали на удалённой машине: локально этого пути может
+    # не быть вовсе, а может быть чужой каталог с тем же именем
+    if ud.get("new_dir") and not os.path.isdir(ud["new_dir"]):
+        ud.pop("new_dir", None)
+    if ud.get("new_worktree") and not _worktree_available(context):
+        ud["new_worktree"] = False
+    return await _show_confirm(query.edit_message_text, context)
 
 
 async def cb_wiz_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1699,13 +1897,21 @@ def _schedule_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+def _server_now_example() -> str:
+    """Пример времени — всегда «сейчас» на сервере. Захардкоженная дата за
+    несколько месяцев уезжает в прошлое, а скопировав её, пользователь получает
+    мгновенный запуск вместо отложенного."""
+    from datetime import datetime
+    return datetime.now().strftime("%Y-%m-%dT%H:%M")
+
+
 async def cb_wiz_sched(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     await query.edit_message_text(
         "Когда запустить?\n"
-        "Выберите или введите время вручную "
-        "(формат: `2026-03-27T03:00`, время сервера)",
+        "Выберите кнопку или введите время вручную в том же формате — "
+        f"сейчас на сервере `{_server_now_example()}`",
         reply_markup=_schedule_keyboard(),
         parse_mode="Markdown",
     )
@@ -1734,13 +1940,14 @@ async def add_task_got_schedule_btn(update: Update, context: ContextTypes.DEFAUL
 
 
 async def add_task_got_schedule_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    from datetime import datetime
+    from datetime import datetime, timedelta
     text = update.message.text.strip()
     try:
         scheduled_at = datetime.fromisoformat(text)
     except ValueError:
         await update.message.reply_text(
-            "Не удалось распознать время. Используй формат `2026-03-27T03:00` или выбери кнопку.",
+            "Не удалось распознать время. Введите его как "
+            f"`{_server_now_example()}` или выберите кнопку.",
             parse_mode="Markdown",
         )
         return ASK_SCHEDULE
@@ -1749,6 +1956,16 @@ async def add_task_got_schedule_text(update: Update, context: ContextTypes.DEFAU
         # Typed times are read as server-local (matching the DB convention) —
         # pin the zone now so the confirm card shows the same instant.
         scheduled_at = scheduled_at.astimezone()
+    # Прошедшее время воркер подхватит сразу — «отложил», а оно стартовало.
+    # Минута допуска: пока набирал, время могло уйти вперёд.
+    if scheduled_at < datetime.now().astimezone() - timedelta(minutes=1):
+        await update.message.reply_text(
+            f"Это время уже прошло — сейчас на сервере `{_server_now_example()}`, "
+            "а задача с прошедшим временем стартует сразу.\n"
+            "Введите будущее время или нажмите «▶ Сейчас», если запустить нужно немедленно.",
+            parse_mode="Markdown",
+        )
+        return ASK_SCHEDULE
     context.user_data["new_schedule"] = scheduled_at
     return await _show_confirm(update.message.reply_text, context)
 
@@ -1801,6 +2018,9 @@ async def _finish_add_task_from_query(query, context):
     from .models import TaskCreate
     _save_last_settings(query.message.chat_id, context)
     prompt = context.user_data.pop("new_prompt", "")
+    attachments = context.user_data.pop("new_attachments", None) or []
+    if attachments:
+        prompt += _attachments_prompt_block(attachments)
     provider = context.user_data.pop("new_provider", None)
     priority = context.user_data.pop("new_priority", 5)
     working_dir = context.user_data.pop("new_dir", None)
@@ -1835,10 +2055,11 @@ async def _finish_add_task_from_query(query, context):
     skip_str = " ⚠️ без подтверждений" if skip_permissions else ""
     detached_str = " 🔁 фоновый" if detached else ""
     wt_str = f"\nWorktree: ветка {wt_branch(task.id)}" if use_worktree else ""
+    att_str = f"\nВложения: {len(attachments)}" if attachments else ""
     await query.message.reply_text(
         f"✅ Задача #{task.id} добавлена!\n"
         f"Провайдер: {provider or f'{DEFAULT_CLI} (по умолчанию)'}\n"
-        f"Директория: {working_dir or 'не указана'}{wt_str}\n"
+        f"Директория: {working_dir or 'не указана'}{wt_str}{att_str}\n"
         f"Запуск: {sched_str}{skip_str}{detached_str}",
         reply_markup=_main_menu(),
     )
@@ -2970,6 +3191,11 @@ def run_bot():
         logger.info("Telegram через прокси: %s", mask_proxy_url(proxy))
     app = builder.build()
 
+    # Тот же обработчик стоит на каждом шаге после промпта: остальные файлы
+    # альбома приходят отдельными сообщениями, когда мастер уже шагнул дальше.
+    att_midway = MessageHandler(filters.PHOTO | filters.Document.ALL,
+                                add_task_attachment_midway)
+
     add_conv = ConversationHandler(
         entry_points=[
             MessageHandler(filters.Regex("^➕ Добавить задачу$"), add_task_start),
@@ -2980,26 +3206,32 @@ def run_bot():
             ASK_SKILL_ARGS: [
                 CommandHandler("skip", skill_skip_args),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, skill_got_args),
+                att_midway,
             ],
             ASK_PASSWORD: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, add_task_got_password)
             ],
             ASK_PROMPT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, add_task_got_prompt)
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_task_got_prompt),
+                MessageHandler(filters.PHOTO | filters.Document.ALL, add_task_got_attachment),
             ],
             ASK_LAST: [
                 CallbackQueryHandler(cb_last_use, pattern=r"^last_use$"),
                 CallbackQueryHandler(cb_last_edit, pattern=r"^last_edit$"),
+                att_midway,
             ],
             ASK_PROVIDER: [
-                CallbackQueryHandler(add_task_got_provider, pattern=r"^pickprov:")
+                CallbackQueryHandler(add_task_got_provider, pattern=r"^pickprov:"),
+                att_midway,
             ],
             ASK_MACHINE: [
                 CallbackQueryHandler(add_task_got_machine, pattern=r"^machine:"),
+                att_midway,
             ],
             ASK_HERDR_TARGET: [
                 CallbackQueryHandler(add_task_got_herdr_target,
                                      pattern=r"^(hst_i:\d+|hst_more)$"),
+                att_midway,
             ],
             ASK_MODEL: [
                 CallbackQueryHandler(add_task_got_model_idx, pattern=r"^model_i:\d+$"),
@@ -3008,6 +3240,7 @@ def run_bot():
                 CallbackQueryHandler(add_task_got_model, pattern=r"^model:"),
                 CommandHandler("skip", add_task_skip_model),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, add_task_got_model_text),
+                att_midway,
             ],
             ASK_DIR: [
                 CallbackQueryHandler(cb_dir_nav, pattern=r"^dirn:\d+$"),
@@ -3017,36 +3250,46 @@ def run_bot():
                 CallbackQueryHandler(cb_dir_page, pattern=r"^dir_pg:\d+$"),
                 CallbackQueryHandler(cb_dir_hist, pattern=r"^dirh:\d+$"),
                 CallbackQueryHandler(add_task_got_dir_btn, pattern=r"^dir:"),
+                att_midway,
             ],
             ASK_DIR_MANUAL: [
                 CommandHandler("skip", add_task_skip_dir),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, add_task_got_dir),
+                att_midway,
             ],
             ASK_CONFIRM: [
                 CallbackQueryHandler(cb_wiz_run, pattern=r"^wiz_run$"),
                 CallbackQueryHandler(cb_wiz_sched, pattern=r"^wiz_sched$"),
                 CallbackQueryHandler(cb_extras_open, pattern=r"^wiz_extras$"),
                 CallbackQueryHandler(cb_wiz_back, pattern=r"^wiz_back$"),
+                CallbackQueryHandler(cb_wiz_drop_attachments, pattern=r"^wiz_drop_att$"),
+                CallbackQueryHandler(cb_wiz_drop_machine, pattern=r"^wiz_drop_machine$"),
+                MessageHandler(filters.PHOTO | filters.Document.ALL,
+                               add_task_got_attachment_confirm),
             ],
             ASK_EXTRAS: [
                 CallbackQueryHandler(cb_extras_priority, pattern=r"^ex_pri$"),
                 CallbackQueryHandler(cb_extras_toggle, pattern=r"^ex_(perms|wt|det|keep)$"),
                 CallbackQueryHandler(cb_extras_recurrence, pattern=r"^ex_rec$"),
                 CallbackQueryHandler(cb_extras_done, pattern=r"^ex_done$"),
+                att_midway,
             ],
             ASK_PRIORITY: [
                 CallbackQueryHandler(add_task_got_priority, pattern=r"^pri:"),
                 CallbackQueryHandler(cb_priority_back, pattern=r"^pri_back$"),
+                att_midway,
             ],
             ASK_SCHEDULE: [
                 CallbackQueryHandler(add_task_got_schedule_btn, pattern=r"^sched:"),
                 CallbackQueryHandler(cb_sched_back, pattern=r"^sched_back$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, add_task_got_schedule_text),
+                att_midway,
             ],
             ASK_RECURRENCE: [
                 CallbackQueryHandler(cb_recurrence_preset, pattern=r"^rec:"),
                 CallbackQueryHandler(cb_recurrence_manual, pattern=r"^rec_manual$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, add_task_got_recurrence),
+                att_midway,
             ],
             ConversationHandler.TIMEOUT: [
                 MessageHandler(filters.ALL, wizard_timeout),
@@ -3172,6 +3415,18 @@ def run_bot():
             reply_markup=_main_menu(),
         )
 
+    async def unknown_attachment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Файл вне мастера: молчание тут читается как «бот сломался»."""
+        if not is_authorized(update.effective_user.id):
+            await _deny(update)
+            return
+        await update.message.reply_text(
+            "📎 Файлы принимаются внутри мастера: нажмите «➕ Добавить задачу» "
+            "и пришлите файл вместе с текстом задачи (подпись к файлу тоже "
+            "считается текстом).",
+            reply_markup=_main_menu(),
+        )
+
     async def unknown_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # A button whose handler no longer exists (very old message) — answer
         # it so the user doesn't stare at an endless spinner.
@@ -3183,6 +3438,9 @@ def run_bot():
 
     app.add_handler(CommandHandler("cancel", cancel_global))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, unknown_text))
+    app.add_handler(MessageHandler(
+        filters.PHOTO | filters.Document.ALL | filters.VIDEO | filters.VOICE
+        | filters.AUDIO, unknown_attachment))
     app.add_handler(CallbackQueryHandler(unknown_callback))
 
     async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:

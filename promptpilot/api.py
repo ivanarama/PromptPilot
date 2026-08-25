@@ -3,18 +3,20 @@
 import base64
 import secrets
 import sys
+import uuid
 from pathlib import Path
 from typing import List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import os
+import re as _re
 
 from . import db
-from .config import API_TOKEN, get_provider_models, get_skills, load_providers, mask_secret_value, provider_available, PROJECTS_ROOT
+from .config import API_TOKEN, DB_DIR, get_provider_models, get_skills, load_providers, mask_secret_value, provider_available, PROJECTS_ROOT
 from .models import CostStats, Stats, TaskCreate, TaskInDB, TaskStatus, TaskUpdate
 from .version import check_for_update
 
@@ -150,6 +152,119 @@ def api_set_note(task_id: int, body: NoteBody):
     if not db.set_note(task_id, body.text):
         raise HTTPException(404, "Задача не найдена")
     return {"ok": True, "note": body.text or None}
+
+
+# --- Вложения к задачам ---
+
+UPLOADS_DIR = DB_DIR / "uploads"
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+
+
+@app.post("/api/upload")
+async def api_upload(files: List[UploadFile] = File(...)):
+    """Принять вложения (файлы/скриншоты) для будущей задачи.
+
+    Файлы ложатся в ~/.promptpilot/uploads под случайными именами — имя клиента
+    в путь не попадает, а наружу каталог не раздаётся: агент читает вложения по
+    абсолютному пути, который фронт дописывает в промпт. Отказ по любому файлу
+    убирает и уже сохранённые — либо весь набор, либо ничего.
+    """
+    UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+    saved = []
+    try:
+        for up in files:
+            ext = Path(up.filename or "").suffix
+            if not _re.fullmatch(r"[A-Za-z0-9.]{1,10}", ext):
+                ext = ""
+            dest = UPLOADS_DIR / f"{uuid.uuid4().hex}{ext}"
+            size = 0
+            try:
+                with open(dest, "wb") as out:
+                    # потоково: сам FastAPI размер тела не ограничивает
+                    while chunk := await up.read(1024 * 1024):
+                        size += len(chunk)
+                        if size > MAX_UPLOAD_BYTES:
+                            raise HTTPException(413, f"«{up.filename}» больше 20 МБ")
+                        out.write(chunk)
+            except HTTPException:
+                dest.unlink(missing_ok=True)
+                raise
+            saved.append({"path": str(dest), "name": up.filename or dest.name, "size": size})
+    except HTTPException:
+        for s in saved:
+            Path(s["path"]).unlink(missing_ok=True)
+        raise
+    return saved
+
+
+# --- Экран агента herdr-задачи ---
+
+# РОВНО эти клавиши: подтвердить/выбрать вариант в диалоге агента. Произвольный
+# ввод и обращение по сырому pane_id — сознательно не в V1: только через id
+# задачи, чтобы не открывать все панели машины наружу.
+HERDR_UI_KEYS = ("enter", "2", "3", "esc")
+SCREEN_TAIL_LINES = 30
+
+
+class KeyBody(BaseModel):
+    key: str
+
+
+def _herdr_task_pane(task_id: int):
+    """(pane, host) herdr-задачи; 404, если у задачи нет панели."""
+    from .config import load_machines, machine_remote
+    task = db.get_task(task_id)
+    if not task or not task.herdr_pane:
+        raise HTTPException(404, "У задачи нет herdr-панели")
+    host = None
+    if task.machine:
+        m = load_machines().get(task.machine)
+        if not m or not m.get("host"):
+            raise HTTPException(404, "Машина задачи не найдена в реестре")
+        host = machine_remote(m)
+    return task.herdr_pane, host
+
+
+def screen_tail(pane: str, host=None, lines_n: int = SCREEN_TAIL_LINES) -> str:
+    """Хвост видимого экрана панели (как 📺 в боте, но для веб-карточки)."""
+    from .herdr_exec import _run
+    rc, _, raw = _run(["agent", "read", pane, "--source", "visible",
+                       "--format", "text"], host=host, timeout=20)
+    if rc != 0:
+        raise HTTPException(502, f"herdr agent read failed — панель закрыта? ({raw[:200]})")
+    lines = [l.rstrip() for l in raw.splitlines()]
+    while lines and not lines[-1]:
+        lines.pop()
+    return "\n".join(lines[-lines_n:])
+
+
+@app.get("/api/tasks/{task_id}/screen")
+def api_task_screen(task_id: int):
+    from .herdr_exec import HerdrError, _agent_status, _run
+    pane, host = _herdr_task_pane(task_id)
+    try:
+        text = screen_tail(pane, host)
+        rc, data, _ = _run(["agent", "get", pane], host=host, timeout=20)
+        status = _agent_status(data) if rc == 0 else ""
+    except HerdrError as e:
+        raise HTTPException(502, str(e))
+    return {"text": text, "agent_status": status}
+
+
+@app.post("/api/tasks/{task_id}/keys")
+def api_task_keys(task_id: int, body: KeyBody):
+    from .herdr_exec import HerdrError, _run
+    key = body.key.strip().lower()
+    if key not in HERDR_UI_KEYS:
+        raise HTTPException(400, f"Клавиша не поддерживается (можно: {', '.join(HERDR_UI_KEYS)})")
+    pane, host = _herdr_task_pane(task_id)
+    try:
+        rc, data, raw = _run(["agent", "send-keys", pane, key], host=host, timeout=20)
+    except HerdrError as e:
+        raise HTTPException(502, str(e))
+    if rc != 0 or not (data or {}).get("result"):
+        raise HTTPException(502, f"Не удалось отправить — агент ещё существует? ({raw[:200]})")
+    return {"ok": True, "key": key}
 
 
 @app.get("/api/stats/usage")
@@ -306,8 +421,6 @@ def api_machine_delete(name: str):
         raise HTTPException(404, "Машина не найдена")
     return {"ok": True}
 
-
-import re as _re
 
 from pydantic import BaseModel as _BaseModel
 
