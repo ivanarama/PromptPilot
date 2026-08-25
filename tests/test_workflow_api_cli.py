@@ -5,7 +5,7 @@ from pathlib import Path
 import httpx
 from click.testing import CliRunner
 
-from promptpilot.api import app
+from promptpilot.api import HERDR_UI_KEYS, app
 from promptpilot.cli import cli
 from promptpilot.models import WorkflowCreate
 
@@ -89,6 +89,7 @@ def test_web_ui_exposes_workflow_and_live_agent_controls():
     assert "function wfSendKey" in html
     assert 'id="wfAgentScreen"' in html
     assert "a.agent || 'agent'" in html
+    assert HERDR_UI_KEYS == ("enter", "1", "2", "3", "4", "esc")
 
 
 def test_workflow_api_validates_slug_and_duplicate(isolated_db):
