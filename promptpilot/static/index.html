@@ -1321,6 +1321,19 @@ function workflowRoundRow(round, current = false) {
   </div>`;
 }
 
+function workflowStopReason(events) {
+  const latest = [...events]
+    .sort((a, b) => (b.seq || 0) - (a.seq || 0))
+    .find(e => ['executor.invalid_output','gate.failed','run.failed'].includes(e.event_type));
+  if (!latest) return '';
+  const reason = latest.payload?.reason || latest.payload?.summary || latest.event_type;
+  const task = latest.payload?.task_id ? `Task #${latest.payload.task_id}: ` : '';
+  if (reason === 'missing successful workflow verdict') {
+    return `${task}PromptPilot не получил финальную строку «ИТОГ: …» от агента.`;
+  }
+  return `${task}${reason}`;
+}
+
 function renderWorkflowDetail(wf, rounds, runs, events, findings, orphanPane = null) {
   const terminal = ['completed','failed','cancelled'].includes(wf.status);
   const activeRun = [...runs].reverse().find(r => ['pending','running'].includes(r.status));
@@ -1333,6 +1346,7 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, orphanPane = n
   const importedCount = rounds.filter(r => r.summary?.historical).length;
   const stage = wf.config?.stage || {};
   const statusInfo = workflowStatusInfo(wf.status, !!reviewerDone);
+  const stopReason = workflowStopReason(events);
   const previousAudit = [...pastRounds].reverse().find(r => r.summary?.summary);
   const stageTitle = stage.title || `Раунд ${wf.current_round}: доработка после последнего аудита`;
   const stageGoal = stage.goal || previousAudit?.summary?.summary || wf.objective;
@@ -1375,6 +1389,9 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, orphanPane = n
       <div class="wf-stage-title">${esc(stage.code ? `${stage.code}: ${stageTitle}` : stageTitle)}</div>
       <div class="wf-round-summary">${esc(stageGoal)}</div>
       <div class="wf-next">${esc(statusInfo[1])}</div>
+      ${stopReason && ['awaiting_human','revision_required','failed'].includes(wf.status)
+        ? `<div class="wf-round-summary" style="color:var(--red)"><b>Причина остановки:</b> ${esc(stopReason)}</div>`
+        : ''}
     </div>
     <div class="wf-meta">Текущий раунд: ${wf.current_round}; ранее импортировано: ${importedCount}; открытых замечаний: ${openFindings.length}</div>
     <div class="wf-meta">${esc(wf.repository_path)} · ${esc(wf.candidate_branch)}</div>
