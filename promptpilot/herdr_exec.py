@@ -57,6 +57,12 @@ OVERLOADED_RE = re.compile(
 )
 
 PROMPT_STALL_RETRIES = 3
+WORKFLOW_IDLE_GRACE_SECONDS = 30
+WORKFLOW_CONTRACT_MARKER = '<promptpilot-workflow-contract version="w1-verdict-v1">'
+WORKFLOW_CLOSING_VERDICT_RE = re.compile(
+    r"^ИТОГ:\s*(ГОТОВО|УЖЕ СДЕЛАНО|НУЖЕН ЧЕЛОВЕК|НЕ СМОГ)(?:\s*[—-].*)?$",
+    re.IGNORECASE,
+)
 
 
 class HerdrError(Exception):
@@ -288,6 +294,75 @@ def _looks_env_failure(cleaned: str) -> str:
         l for l in cleaned.splitlines() if not l.lstrip().startswith("❯")
     )
     return env_failure(response_only)
+
+
+def _closing_workflow_verdict(cleaned: str) -> str:
+    """Return a workflow verdict only when it is the final response line.
+
+    The prompt itself contains all four allowed verdict examples. Searching the
+    whole transcript would therefore accept the echoed contract before the
+    agent had done any work. The workflow contract requires the verdict on the
+    last line, which is both safer and easier to observe across agent UIs.
+    """
+    lines = [line.strip() for line in (cleaned or "").splitlines() if line.strip()]
+    if not lines:
+        return ""
+    match = WORKFLOW_CLOSING_VERDICT_RE.fullmatch(lines[-1])
+    return match.group(1).upper() if match else ""
+
+
+def _stabilize_workflow_completion(name, prompt, state, raw, deadline,
+                                   cancel_check, on_blocked=None, host=None):
+    """Do not treat a transient idle between agy background tasks as done.
+
+    Antigravity can briefly return to an idle prompt while a managed background
+    task or a self-relaunched process continues. For W1 prompts we have a much
+    stronger completion contract: the final response must end in ``ИТОГ:``.
+    Keep observing the existing pane until that marker appears, or until the
+    pane stays idle for a full grace period (then normal invalid-output handling
+    is allowed to take over).
+    """
+    if WORKFLOW_CONTRACT_MARKER not in prompt:
+        return state, raw
+
+    idle_since = time.monotonic() if state in {"idle", "done"} else None
+    blocked_reported = False
+    while True:
+        if cancel_check and cancel_check():
+            return "__cancel__", raw
+        if deadline and time.monotonic() > deadline:
+            return "__timeout__", raw
+
+        rc, _, recent = _run(
+            ["agent", "read", name, "--source", "recent-unwrapped",
+             "--lines", str(HERDR_READ_LINES), "--format", "text"],
+            host=host,
+        )
+        if rc == 0:
+            raw = recent
+            if _closing_workflow_verdict(_trim_transcript(recent, prompt)):
+                return state, raw
+
+        rc, data, status_raw = _run(["agent", "get", name], host=host)
+        if rc != 0:
+            return "__error__", status_raw
+        state = _agent_status(data)
+        if state == "blocked":
+            idle_since = None
+            if on_blocked and not blocked_reported:
+                on_blocked(_dig(data, "result", "agent", "pane_id") or name)
+                blocked_reported = True
+        elif state == "working":
+            idle_since = None
+            blocked_reported = False
+        elif state in {"idle", "done"}:
+            if idle_since is None:
+                idle_since = time.monotonic()
+            elif time.monotonic() - idle_since >= WORKFLOW_IDLE_GRACE_SECONDS:
+                return state, raw
+        else:
+            return "__error__", status_raw
+        time.sleep(2)
 
 
 def _wait_settled(name, until_args, deadline, cancel_check, host=None):
@@ -524,6 +599,12 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
         while state == "blocked":
             state, raw = _wait_settled(name, ["--until", "idle", "--until", "done"],
                                        None, cancel_check, host)
+
+        if state not in {"__cancel__", "__timeout__", "__error__"}:
+            state, raw = _stabilize_workflow_completion(
+                name, prompt, state, raw, deadline, cancel_check,
+                on_blocked=on_blocked, host=host,
+            )
 
         if state == "__cancel__":
             close_tab()
