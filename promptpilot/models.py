@@ -337,8 +337,12 @@ class WorkflowTaskDispatch(BaseModel):
     max_retries: int = Field(default=5, ge=0, le=50)
     skip_permissions: bool = False
     model: Optional[str] = None
+    effort: Optional[str] = None
     working_dir: Optional[str] = None
     worktree: bool = False
+    keep_pane: bool = True
+    herdr_target: Optional[str] = None
+    machine: Optional[str] = None
     task_timeout: Optional[int] = Field(default=None, ge=0)
 
 

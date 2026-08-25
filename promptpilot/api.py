@@ -619,6 +619,7 @@ def api_herdr_agents(machine: str = ""):
             "name": a.get("name"),
             "agent": a.get("display_agent") or a.get("agent") or "",
             "status": a.get("agent_status"),
+            "cwd": a.get("cwd") or "",
             "title": (a.get("terminal_title_stripped") or "")[:80],
             "workspace": ws_labels.get(a.get("workspace_id"), a.get("workspace_id") or ""),
         }

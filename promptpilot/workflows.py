@@ -346,8 +346,12 @@ def dispatch_task(workflow_id: str,
             max_retries=dispatch.max_retries,
             skip_permissions=dispatch.skip_permissions,
             model=dispatch.model,
+            effort=dispatch.effort,
             task_timeout=dispatch.task_timeout,
             worktree=dispatch.worktree,
+            keep_pane=dispatch.keep_pane,
+            herdr_target=dispatch.herdr_target,
+            machine=dispatch.machine,
         ))
         attempt_no = conn.execute(
             """SELECT COALESCE(MAX(attempt_no), 0) + 1
@@ -375,6 +379,9 @@ def dispatch_task(workflow_id: str,
                 "attempt_no": attempt_no,
                 "task_id": task.id,
                 "input_sha256": input_sha,
+                "provider": dispatch.provider,
+                "herdr_target": dispatch.herdr_target,
+                "machine": dispatch.machine,
             },
         ))
         if dispatch.role is WorkflowRole.EXECUTOR:

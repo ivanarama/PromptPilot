@@ -386,6 +386,27 @@
   .prov-form input, .prov-form textarea { background: var(--surface2); border: 1px solid var(--border); border-radius: 6px; color: inherit; padding: 7px 10px; font-size: 13px; }
   .prov-form label { font-size: 13px; color: var(--text2); }
 
+  /* Workflow orchestrator */
+  .wf-grid { display: grid; grid-template-columns: minmax(220px, 34%) 1fr; gap: 12px; }
+  .wf-list { display: flex; flex-direction: column; gap: 6px; }
+  .wf-row { border: 1px solid var(--border); border-radius: 7px; padding: 9px 10px; cursor: pointer; }
+  .wf-row:hover, .wf-row.active { border-color: var(--accent); background: var(--surface2); }
+  .wf-title { font-weight: 600; font-size: 13px; }
+  .wf-meta { color: var(--text2); font-size: 11px; margin-top: 3px; }
+  .wf-panel { border: 1px solid var(--border); border-radius: 8px; padding: 12px; min-height: 220px; }
+  .wf-actions { display: flex; flex-wrap: wrap; gap: 7px; margin: 10px 0; }
+  .wf-form { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 10px; }
+  .wf-form .wide { grid-column: 1 / -1; }
+  .wf-form input, .wf-form select, .wf-form textarea {
+    width: 100%; background: var(--bg); border: 1px solid var(--border);
+    border-radius: 6px; color: var(--text); padding: 7px 9px; font-size: 12px;
+  }
+  .wf-form textarea { min-height: 110px; resize: vertical; font-family: var(--mono); }
+  .wf-history { margin-top: 12px; max-height: 260px; overflow-y: auto; }
+  .wf-event { border-top: 1px solid var(--border); padding: 6px 0; font-size: 11px; }
+  .wf-event code { color: var(--accent2); }
+  @media (max-width: 720px) { .wf-grid { grid-template-columns: 1fr; } }
+
   /* Update banner */
   .update-banner {
     display: none;
@@ -557,10 +578,35 @@
     <button class="filter-btn" data-filter="rate_limited">Rate Limited</button>
     <button id="pauseBtn" class="btn-pause" onclick="toggleWorkerPause()" style="margin-left:auto">⏸ Pause</button>
     <button class="btn-pause" onclick="openSchedule()" style="margin-left:8px">🗓 Расписание</button>
+    <button class="btn-pause" onclick="openWorkflows()" style="margin-left:8px">Workflows</button>
     <button class="btn-pause" onclick="openProviders()" style="margin-left:8px">⚙ Providers</button>
   </div>
 
   <div class="task-list" id="taskList"></div>
+</div>
+
+<div class="modal-overlay" id="workflowModal" onclick="if(event.target===this)closeWorkflows()">
+  <div class="modal" style="max-width:1040px">
+    <h2>Workflow-оркестратор <button class="btn btn-sm btn-ghost" style="margin-left:auto" onclick="closeWorkflows()">Закрыть</button></h2>
+    <div class="wf-grid">
+      <div>
+        <div class="wf-actions">
+          <button class="btn btn-sm btn-primary" onclick="toggleWorkflowCreate()">Новый workflow</button>
+          <button class="btn btn-sm btn-ghost" onclick="loadWorkflows()">Обновить</button>
+        </div>
+        <form id="wfCreateForm" class="wf-form" style="display:none" onsubmit="return createWorkflow(event)">
+          <input id="wfNewSlug" placeholder="slug: ut10-bp3" required>
+          <input id="wfNewBranch" placeholder="ветка" required>
+          <input class="wide" id="wfNewObjective" placeholder="цель" required>
+          <input class="wide" id="wfNewRepo" placeholder="D:\Projects\exchange" required>
+          <input id="wfNewRounds" type="number" min="1" value="6" title="максимум новых раундов">
+          <button class="btn btn-sm btn-primary" type="submit">Создать</button>
+        </form>
+        <div id="wfList" class="wf-list"></div>
+      </div>
+      <div id="wfDetail" class="wf-panel"><span class="wf-meta">Выберите workflow слева.</span></div>
+    </div>
+  </div>
 </div>
 
 <div class="modal-overlay" id="schedModal" onclick="if(event.target===this)closeSchedule()">
@@ -627,6 +673,9 @@ let providersData = {};
 let projectsByPath = {};   // path -> {name, path, git} from /api/projects
 let skillsCache = {};
 let skillsPanelOpen = false;
+let workflowCache = [];
+let selectedWorkflowId = null;
+let selectedWorkflowData = null;
 
 // --- API calls ---
 function toast(msg, isErr = true) {
@@ -1146,6 +1195,180 @@ document.getElementById('filterBar').addEventListener('click', e => {
 // --- Providers settings modal ---
 const STATUS_RU = { completed: 'успех', failed: 'падение', cancelled: 'отменена',
                     pending: 'в очереди', running: 'идёт', rate_limited: 'ждёт лимита' };
+
+// --- Workflow orchestrator ---
+function openWorkflows() {
+  document.getElementById('workflowModal').classList.add('open');
+  loadWorkflows();
+}
+
+function closeWorkflows() { document.getElementById('workflowModal').classList.remove('open'); }
+
+function toggleWorkflowCreate() {
+  const form = document.getElementById('wfCreateForm');
+  form.style.display = form.style.display === 'none' ? 'grid' : 'none';
+}
+
+async function createWorkflow(event) {
+  event.preventDefault();
+  const body = {
+    slug: document.getElementById('wfNewSlug').value.trim(),
+    objective: document.getElementById('wfNewObjective').value.trim(),
+    repository_path: document.getElementById('wfNewRepo').value.trim(),
+    candidate_branch: document.getElementById('wfNewBranch').value.trim(),
+    config: { limits: { max_rounds: parseInt(document.getElementById('wfNewRounds').value) || 6 } },
+  };
+  try {
+    const created = await fetchJSON(`${API}/workflows`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
+    });
+    selectedWorkflowId = created.id;
+    document.getElementById('wfCreateForm').style.display = 'none';
+    await loadWorkflows();
+    toast('Workflow создан', false);
+  } catch (e) { toast('Не удалось создать workflow: ' + e.message); }
+  return false;
+}
+
+async function loadWorkflows() {
+  try {
+    workflowCache = await fetchJSON(`${API}/workflows?limit=200`);
+  } catch (e) {
+    toast('Не удалось загрузить workflows: ' + e.message);
+    return;
+  }
+  const list = document.getElementById('wfList');
+  list.innerHTML = workflowCache.length ? workflowCache.map(w => `
+    <div class="wf-row${w.id === selectedWorkflowId ? ' active' : ''}" onclick="selectWorkflow('${escAttr(w.id)}')">
+      <div class="wf-title">${esc(w.slug)}</div>
+      <div class="wf-meta">${esc(w.status)} · раунд ${w.current_round} · v${w.state_version}</div>
+    </div>`).join('') : '<div class="wf-meta">Workflow пока нет.</div>';
+  if (!selectedWorkflowId && workflowCache.length) selectedWorkflowId = workflowCache[0].id;
+  if (selectedWorkflowId) await selectWorkflow(selectedWorkflowId);
+}
+
+async function selectWorkflow(id) {
+  selectedWorkflowId = id;
+  document.querySelectorAll('.wf-row').forEach(row => row.classList.remove('active'));
+  const wf = workflowCache.find(item => item.id === id) || await fetchJSON(`${API}/workflows/${id}`);
+  selectedWorkflowData = wf;
+  const [rounds, events, findings] = await Promise.all([
+    fetchJSON(`${API}/workflows/${id}/rounds`),
+    fetchJSON(`${API}/workflows/${id}/events?limit=200`),
+    fetchJSON(`${API}/workflows/${id}/findings`),
+  ]);
+  const current = rounds.find(r => r.round_no === wf.current_round);
+  const runs = current ? await fetchJSON(`${API}/workflows/${id}/rounds/${current.id}/runs`) : [];
+  renderWorkflowDetail(wf, rounds, runs, events, findings);
+  const idx = workflowCache.findIndex(item => item.id === id);
+  if (idx >= 0) workflowCache[idx] = wf;
+  const list = document.getElementById('wfList');
+  [...list.children].forEach((row, n) => row.classList.toggle('active', workflowCache[n]?.id === id));
+}
+
+function workflowProviderOptions() {
+  const names = Object.entries(providersData).filter(([, p]) => !p.hidden);
+  return names.map(([name, p]) => `<option value="${escAttr(name)}"${name === 'herdr-session' ? ' selected' : ''}>${esc(name)}${p.session_target ? ' · живая сессия' : ''}</option>`).join('');
+}
+
+function renderWorkflowDetail(wf, rounds, runs, events, findings) {
+  const terminal = ['completed','failed','cancelled'].includes(wf.status);
+  const activeRun = [...runs].reverse().find(r => ['pending','running'].includes(r.status));
+  const reviewerDone = [...runs].reverse().find(r => r.role === 'reviewer' && r.status === 'completed');
+  const openFindings = findings.filter(f => ['open','reopened'].includes(f.status));
+  let action = '';
+  if (wf.status === 'draft') {
+    action = `<button class="btn btn-sm btn-primary" onclick="wfStart()">Начать первый раунд</button>`;
+  } else if (['queued','reviewing'].includes(wf.status)) {
+    const role = wf.status === 'queued' ? 'executor' : 'reviewer';
+    action = `<div class="wf-form wide">
+      <textarea class="wide" id="wfPrompt" placeholder="Промпт для ${role}"></textarea>
+      <select id="wfProvider" onchange="wfProviderChanged()">${workflowProviderOptions()}</select>
+      <select id="wfTarget"><option value="">загрузка herdr-сессий…</option></select>
+      <button class="btn btn-sm btn-primary" onclick="wfDispatch('${role}')">Запустить ${role}</button>
+    </div>`;
+  } else if (wf.status === 'gating') {
+    action = `<div class="wf-form"><input class="wide" id="wfDecisionSummary" placeholder="Итог gate">
+      <button class="btn btn-sm btn-primary" onclick="wfGate('PASS')">Gate PASS</button>
+      <button class="btn btn-sm btn-danger" onclick="wfGate('FAIL')">Gate FAIL</button>
+      <button class="btn btn-sm btn-ghost wide" onclick="wfGate('HUMAN_REQUIRED')">Нужен человек</button></div>`;
+  } else if (wf.status === 'revision_required' || (wf.status === 'awaiting_human' && !reviewerDone)) {
+    action = `<div class="wf-form"><input class="wide" id="wfHumanText" value="Продолжить работу с учётом сохранённого состояния" required>
+      <button class="btn btn-sm btn-primary" onclick="wfResume()">Продолжить ${wf.status === 'revision_required' ? 'новым раундом' : 'текущий раунд'}</button></div>`;
+  } else if (wf.status === 'awaiting_human' && reviewerDone) {
+    action = `<div class="wf-form"><input class="wide" id="wfDecisionSummary" placeholder="Итог независимого ревью">
+      <button class="btn btn-sm btn-primary" onclick="wfReview('PASS')">Review PASS</button>
+      <button class="btn btn-sm btn-danger" onclick="wfReview('REVISION_REQUIRED')">Нужны исправления</button>
+      <button class="btn btn-sm btn-ghost wide" onclick="wfReview('HUMAN_REQUIRED')">Нужен человек</button></div>`;
+  }
+  const runRows = runs.map(r => `<div class="wf-event"><code>${esc(r.role)} #${r.attempt_no}</code> · ${esc(r.status)}${r.task_id ? ` · task #${r.task_id}` : ''}</div>`).join('');
+  const eventRows = [...events].reverse().slice(0, 30).map(e => `<div class="wf-event"><code>${esc(e.event_type)}</code> · ${formatTime(e.created_at)}</div>`).join('');
+  document.getElementById('wfDetail').innerHTML = `
+    <div class="wf-title">${esc(wf.slug)} <span class="task-status" data-s="${escAttr(wf.status)}">${esc(wf.status)}</span></div>
+    <div class="wf-meta">${esc(wf.objective)}</div>
+    <div class="wf-meta">${esc(wf.repository_path)} · ${esc(wf.candidate_branch)} · раунд ${wf.current_round} · version ${wf.state_version}</div>
+    <div class="wf-actions">
+      <button class="btn btn-sm btn-ghost" onclick="wfSync()">Sync</button>
+      ${activeRun?.task_id ? `<button class="btn btn-sm btn-danger" onclick="wfStopTask(${activeRun.task_id})">Остановить task #${activeRun.task_id}</button>` : ''}
+      ${!terminal ? `<button class="btn btn-sm btn-danger" onclick="wfCancel()">Отменить весь workflow</button>` : ''}
+    </div>
+    ${action}
+    <div class="wf-meta" style="margin-top:10px">Раундов: ${rounds.length}; открытых замечаний: ${openFindings.length}</div>
+    <div class="wf-history">${runRows}${eventRows || '<div class="wf-meta">Событий пока нет.</div>'}</div>`;
+  if (['queued','reviewing'].includes(wf.status)) setTimeout(wfProviderChanged, 0);
+}
+
+async function wfProviderChanged() {
+  const provider = document.getElementById('wfProvider')?.value;
+  const target = document.getElementById('wfTarget');
+  if (!target) return;
+  const info = providersData[provider] || {};
+  target.style.display = info.session_target ? '' : 'none';
+  if (!info.session_target) { target.innerHTML = '<option value=""></option>'; return; }
+  try {
+    const agents = await fetchJSON(`${API}/herdr/agents`);
+    target.innerHTML = agents.map(a => `<option value="${escAttr(a.target)}">${esc(a.agent || 'agent')} · ${esc(a.status || '?')} · ${esc(a.cwd || a.title || a.pane_id)}</option>`).join('');
+    const agy = agents.find(a => (a.agent || '').toLowerCase() === 'agy' && a.cwd === selectedWorkflowData?.repository_path);
+    if (agy) target.value = agy.target;
+  } catch (e) { target.innerHTML = '<option value="">herdr недоступен</option>'; }
+}
+
+async function wfPost(suffix, body) {
+  try {
+    await fetchJSON(`${API}/workflows/${selectedWorkflowId}/${suffix}`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body || {}),
+    });
+    await loadWorkflows();
+  } catch (e) { toast('Workflow: ' + e.message); }
+}
+
+function wfStart() { return wfPost('start', {expected_version: selectedWorkflowData.state_version}); }
+function wfSync() { return wfPost('sync', {}); }
+function wfResume() { return wfPost('human-input', {expected_version: selectedWorkflowData.state_version, text: document.getElementById('wfHumanText').value, resume: true}); }
+function wfGate(verdict) { return wfPost('gate', {expected_version: selectedWorkflowData.state_version, verdict, gate_id: 'ui-manual-gate', summary: document.getElementById('wfDecisionSummary').value}); }
+function wfReview(verdict) { return wfPost('review', {expected_version: selectedWorkflowData.state_version, verdict, summary: document.getElementById('wfDecisionSummary').value, findings: []}); }
+function wfCancel() { if (confirm('Отменить workflow и все его активные задачи?')) return wfPost('cancel', {expected_version: selectedWorkflowData.state_version}); }
+
+async function wfDispatch(role) {
+  const provider = document.getElementById('wfProvider').value;
+  const info = providersData[provider] || {};
+  const target = info.session_target ? document.getElementById('wfTarget').value : null;
+  if (info.session_target && !target) { toast('Выберите живую herdr-сессию.'); return; }
+  return wfPost('dispatch', {
+    expected_version: selectedWorkflowData.state_version, role,
+    prompt: document.getElementById('wfPrompt').value, provider,
+    herdr_target: target, keep_pane: true,
+    working_dir: selectedWorkflowData.repository_path,
+  });
+}
+
+async function wfStopTask(taskId) {
+  try {
+    await fetchJSON(`${API}/tasks/${taskId}`, {method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify({status:'cancelled'})});
+    toast(`Остановка task #${taskId} запрошена`, false);
+    setTimeout(() => wfPost('sync', {}), 2500);
+  } catch (e) { toast('Не удалось остановить задачу: ' + e.message); }
+}
 
 async function openSchedule() {
   document.getElementById('schedModal').classList.add('open');

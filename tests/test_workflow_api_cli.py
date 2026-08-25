@@ -1,5 +1,6 @@
 import asyncio
 import io
+from pathlib import Path
 
 import httpx
 from click.testing import CliRunner
@@ -75,6 +76,18 @@ def test_openapi_contains_read_models_and_workflow_routes(isolated_db):
     assert "WorkflowEventInDB" in schema["components"]["schemas"]
 
 
+def test_web_ui_exposes_workflow_and_live_agent_controls():
+    html = (Path(__file__).parents[1] / "promptpilot" / "static" / "index.html").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'id="workflowModal"' in html
+    assert 'onclick="openWorkflows()"' in html
+    assert "function wfDispatch(role)" in html
+    assert "function wfStopTask(taskId)" in html
+    assert "a.agent || 'agent'" in html
+
+
 def test_workflow_api_validates_slug_and_duplicate(isolated_db):
     assert request("POST", "/api/workflows", json=payload("bad slug")).status_code == 422
     assert request("POST", "/api/workflows", json=payload()).status_code == 201
@@ -124,6 +137,40 @@ def test_w1_api_manual_start_dispatch_sync_and_gate(isolated_db):
     )
     assert gate.status_code == 200
     assert gate.json()["status"] == "reviewing"
+
+
+def test_w1_dispatch_preserves_herdr_target_and_effort(isolated_db):
+    created = request("POST", "/api/workflows", json=payload("api-herdr")).json()
+    started = request(
+        "POST",
+        f"/api/workflows/{created['id']}/start",
+        json={"expected_version": 0},
+    ).json()
+
+    dispatched = request(
+        "POST",
+        f"/api/workflows/{created['id']}/dispatch",
+        json={
+            "expected_version": started["state_version"],
+            "role": "executor",
+            "prompt": "Continue in the existing agy session",
+            "provider": "herdr-session",
+            "herdr_target": "wB:p1",
+            "effort": "high",
+            "keep_pane": True,
+        },
+    )
+
+    assert dispatched.status_code == 200
+    task = dispatched.json()["task"]
+    assert task["provider"] == "herdr-session"
+    assert task["herdr_target"] == "wB:p1"
+    assert task["effort"] == "high"
+    assert task["keep_pane"] is True
+    events = request(
+        "GET", f"/api/workflows/{created['id']}/events"
+    ).json()
+    assert events[-2]["payload"]["herdr_target"] == "wB:p1"
 
 
 def test_w1_api_history_import_is_idempotent(isolated_db):
