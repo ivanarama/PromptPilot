@@ -41,6 +41,12 @@ class ScheduleTestBase(unittest.TestCase):
         db.init_db()
 
     def setUp(self):
+        # «Дефолтного чата нет» — предпосылка проверок про серию без адресата.
+        # Говорим это вслух, а не полагаемся на окружение: у настоящей установки
+        # PP_TG_CHAT_ID задан, и через ~/.promptpilot/.env он доезжает и сюда.
+        patcher = mock.patch.object(db, "TG_CHAT_ID", 0)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         with db._connect() as conn:
             conn.execute("DELETE FROM tasks")
             conn.execute("DELETE FROM settings")
