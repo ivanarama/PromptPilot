@@ -39,7 +39,8 @@ from telegram.ext import (
 
 from . import db
 from .config import (
-    DEFAULT_CLI, HERDR_RENOTIFY_COOLDOWN, HERDR_WATCH, HERDR_WATCH_INTERVAL, LOG_PROMPTS,
+    DEFAULT_CLI, HERDR_PLACE_TTL, HERDR_RENOTIFY_COOLDOWN, HERDR_WATCH,
+    HERDR_WATCH_INTERVAL, LOG_PROMPTS,
     get_provider_models, get_proxy_url, get_skills, load_machines, load_providers,
     load_providers_detailed, mask_proxy_url, pickable_providers,
     PROJECTS_ROOT, SCHEDULE_WATCH_INTERVAL, TASK_PASSWORD, TG_CHAT_ID,
@@ -90,6 +91,7 @@ STATUS_RU = {
 # made the UI look assembled from different bots
 BACK_LABEL = "← Назад"
 REPLY_LABEL = "💬 Ответить"
+FOCUS_LABEL = "🎯 Открыть"
 
 
 # ---------------------------------------------------------------------------
@@ -2705,6 +2707,59 @@ def _herdr_agent_label(a: dict) -> str:
     return f"{kind} ({name})" if name else kind
 
 
+# Кэш карты «id → метка» по машинам: machine -> (когда, воркспейсы, вкладки).
+_HERDR_PLACES: dict = {}
+
+
+async def _herdr_place_maps(machine: str = "", host=None):
+    """({workspace_id: метка}, {tab_id: метка}) — то, чего нет в `agent list`.
+    Два лишних вызова CLI на уведомление ни к чему: метки меняются редко,
+    поэтому карта живёт в кэше HERDR_PLACE_TTL секунд. Молчащий herdr
+    (None) не кэшируем — иначе один сбой ослепил бы бота на весь TTL."""
+    now = time.monotonic()
+    cached = _HERDR_PLACES.get(machine)
+    if cached and now - cached[0] < HERDR_PLACE_TTL:
+        return cached[1], cached[2]
+    ws = await _herdr_json("workspace", "list", host=host)
+    tabs = await _herdr_json("tab", "list", host=host)
+    if ws is None and tabs is None:
+        return {}, {}
+    ws_labels = {w.get("workspace_id"): w.get("label") or ""
+                 for w in ((ws or {}).get("result") or {}).get("workspaces") or []}
+    tab_labels = {t.get("tab_id"): t.get("label") or ""
+                  for t in ((tabs or {}).get("result") or {}).get("tabs") or []}
+    _HERDR_PLACES[machine] = (now, ws_labels, tab_labels)
+    return ws_labels, tab_labels
+
+
+def _herdr_tab_label(label: str) -> str:
+    """Безымянная вкладка нумеруется («2»), и голая цифра в тексте читается как
+    что угодно; названная вкладка («pp-kept-9999») говорит сама за себя."""
+    label = (label or "").strip()
+    return f"вкл. {label}" if label.isdigit() else label
+
+
+def _herdr_place(agent: dict, ws_labels: dict, tab_labels: dict) -> str:
+    """«PromptPilot / pp-kept-9999 · ~/test-herdr» — место панели так, как его
+    видно глазами в herdr. Сам pane_id («w9:pC») в интерфейсе не написан
+    нигде: он годится для CLI и кнопок, но искать по нему панель человеку
+    нечем, поэтому в уведомлении он идёт после адреса, а не вместо него."""
+    parts = [ws_labels.get(agent.get("workspace_id") or "") or "",
+             _herdr_tab_label(tab_labels.get(agent.get("tab_id") or ""))]
+    place = " / ".join(p for p in parts if p)
+    cwd = _tilde_path(agent.get("cwd") or agent.get("foreground_cwd") or "")
+    return f"{place} · {cwd}" if place and cwd else (place or cwd)
+
+
+def _tilde_path(path: str) -> str:
+    """~/onebase вместо /home/vibecoder5/onebase — путь тут для узнавания,
+    а не для копирования в консоль."""
+    home = os.path.expanduser("~")
+    if path == home:
+        return "~"
+    return "~/" + path[len(home) + 1:] if path.startswith(home + os.sep) else path
+
+
 def _herdr_blocked_keyboard(ref: str) -> list:
     """Buttons for a blocked herdr dialog. Claude Code permission dialogs are
     multi-choice — Enter alone only accepts the default, so 2/3/Esc are a tap
@@ -2716,7 +2771,8 @@ def _herdr_blocked_keyboard(ref: str) -> list:
          InlineKeyboardButton("3", callback_data=f"hd_key:3:{ref}"),
          InlineKeyboardButton("✖ Esc", callback_data=f"hd_key:esc:{ref}"),
          InlineKeyboardButton("📺", callback_data=f"hd_screen:{ref}")],
-        [InlineKeyboardButton(REPLY_LABEL, callback_data=f"hd_reply:{ref}")],
+        [InlineKeyboardButton(REPLY_LABEL, callback_data=f"hd_reply:{ref}"),
+         InlineKeyboardButton(FOCUS_LABEL, callback_data=f"hd_focus:{ref}")],
     ]
 
 
@@ -2758,15 +2814,22 @@ async def _herdr_notify(bot, pane_id: str, status: str, agent: dict, machine: st
     # pane ids do ("w9:p2"), so the split is bounded to 2.
     ref = f"{machine}:{pane_id}"
     where = f" на {machine}" if machine else ""
+    ws_labels, tab_labels = await _herdr_place_maps(machine, _machine_remote(machine))
+    place = _herdr_place(agent, ws_labels, tab_labels)
+    # Адрес отдельной строкой: панель ищут глазами по нему, а не по pane_id —
+    # тот остаётся в хвосте для CLI (`herdr agent focus w9:pC`) и как
+    # единственный ориентир, если herdr не отдал карту воркспейсов.
+    loc = f"\n📍 {place} · {pane_id}" if place else f"\n📍 панель {pane_id}"
     if status == "blocked":
-        text = f"⏸ herdr{where}: {label} в панели {pane_id} ждёт подтверждения"
+        text = f"⏸ herdr{where}: {label} ждёт подтверждения{loc}"
         buttons = _herdr_blocked_keyboard(ref)
         if tail:
             text += f"\n\n{tail}"
     else:
-        text = f"✅ herdr{where}: {label} в панели {pane_id} завершил работу"
+        text = f"✅ herdr{where}: {label} завершил работу{loc}"
         buttons = [
             [InlineKeyboardButton("📺 Экран", callback_data=f"hd_screen:{ref}"),
+             InlineKeyboardButton(FOCUS_LABEL, callback_data=f"hd_focus:{ref}"),
              InlineKeyboardButton(REPLY_LABEL, callback_data=f"hd_reply:{ref}")],
         ]
     title = (agent.get("terminal_title_stripped") or "").strip()
@@ -2938,6 +3001,25 @@ async def cb_herdr_screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @require_auth
+async def cb_herdr_focus(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """🎯 — довести терминал до панели. Уведомление говорит, ГДЕ агент, но
+    руками добираться до воркспейса и вкладки всё равно нужно; кнопка делает
+    это за один тап — к терминалу человек приходит уже на нужный экран."""
+    query = update.callback_query
+    ref = await _hd_ref_or_alert(query, query.data.split(":", 1)[1])
+    if ref is None:
+        return
+    machine, pane, host = ref
+    # `agent focus` на несуществующей панели выходит с кодом 0 и телом
+    # {"error": …} — успех определяется наличием result, не кодом возврата.
+    res = await _herdr_json("agent", "focus", pane, host=host)
+    if res and res.get("result"):
+        await query.answer(f"Фокус на {pane}{f' ({machine})' if machine else ''} ✓")
+    else:
+        await query.answer("Не удалось — панель ещё открыта?", show_alert=True)
+
+
+@require_auth
 async def cb_herdr_reply_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     ref = await _hd_ref_or_alert(query, query.data.split(":", 1)[1])
@@ -3027,9 +3109,7 @@ async def _win_fetch(context) -> list:
         agents = [a for a in agents if a.get("pane_id")]
         if not agents:
             return []
-        ws = await _herdr_json("workspace", "list", host=host)
-        ws_labels = {w.get("workspace_id"): w.get("label") or ""
-                     for w in ((ws or {}).get("result") or {}).get("workspaces") or []}
+        ws_labels, tab_labels = await _herdr_place_maps(machine, host)
         return [{
             "machine": machine,
             "pane_id": a.get("pane_id"),
@@ -3040,6 +3120,7 @@ async def _win_fetch(context) -> list:
             "cwd": a.get("cwd") or a.get("foreground_cwd") or "",
             "session": a.get("agent_session") or "",
             "ws": ws_labels.get(a.get("workspace_id")) or "",
+            "tab": _herdr_tab_label(tab_labels.get(a.get("tab_id") or "")),
         } for a in agents]
 
     chunks = await asyncio.gather(*(one(m, h) for m, h in _herdr_watch_targets()))
@@ -3389,6 +3470,8 @@ async def _render_window_card(query, context, idx: int) -> str:
         lines.append(f"Машина: {w['machine']}")
     if w["ws"]:
         lines.append(f"Workspace: {w['ws']}")
+    if w.get("tab"):
+        lines.append(f"Вкладка: {w['tab']}")
     if w["cwd"]:
         lines.append(f"Папка: {w['cwd']}")
     tid = _win_task_id(w["name"])
@@ -3400,7 +3483,8 @@ async def _render_window_card(query, context, idx: int) -> str:
         lines.append(f"\n{tail}")
 
     ref = f"{w['machine']}:{w['pane_id']}"
-    rows = [[InlineKeyboardButton(REPLY_LABEL, callback_data=f"hd_reply:{ref}")]]
+    rows = [[InlineKeyboardButton(REPLY_LABEL, callback_data=f"hd_reply:{ref}"),
+             InlineKeyboardButton(FOCUS_LABEL, callback_data=f"hd_focus:{ref}")]]
     if w["status"] == "blocked":
         rows.append([InlineKeyboardButton("✅ Enter", callback_data=f"hd_enter:{ref}"),
                      InlineKeyboardButton("2", callback_data=f"hd_key:2:{ref}"),
@@ -3844,6 +3928,7 @@ def run_bot():
     # herdr bridge buttons must outrank active ConversationHandlers (group 0)
     app.add_handler(CallbackQueryHandler(cb_herdr_enter, pattern=r"^hd_enter:"), group=-1)
     app.add_handler(CallbackQueryHandler(cb_herdr_screen, pattern=r"^hd_screen:"), group=-1)
+    app.add_handler(CallbackQueryHandler(cb_herdr_focus, pattern=r"^hd_focus:"), group=-1)
     app.add_handler(CallbackQueryHandler(cb_herdr_key, pattern=r"^hd_key:"), group=-1)
 
     # windows screen buttons live in cards that outlive any active wizard
