@@ -42,7 +42,7 @@ from .config import (
     DEFAULT_CLI, HERDR_RENOTIFY_COOLDOWN, HERDR_WATCH, HERDR_WATCH_INTERVAL, LOG_PROMPTS,
     get_provider_models, get_proxy_url, get_skills, load_machines, load_providers,
     load_providers_detailed, mask_proxy_url, pickable_providers,
-    PROJECTS_ROOT, TASK_PASSWORD, EFFORT_LEVELS, provider_is_claude,
+    PROJECTS_ROOT, TASK_PASSWORD, TG_CHAT_ID, EFFORT_LEVELS, provider_is_claude,
 )
 from .models import TaskCreate
 from .tg_auth import authorize_user, is_authorized, list_authorized, load_allowed_phones
@@ -3181,9 +3181,38 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "⚡ Скилы — запустить /skill Claude Code\n"
         "⏸ Пауза — приостановить воркер без потери задач\n\n"
         "Команды: /tasks, /windows, /add, /stats, /providers, /pause, /skills, /help\n"
+        "/chatid — id этого чата для PP_TG_CHAT_ID\n"
         "/cancel — прервать текущий мастер или диалог\n\n"
         "Совет: задайте PP_PROJECTS_ROOT в .env — рабочую папку можно будет "
         "выбирать кнопками, а не печатать путь.",
+        reply_markup=_main_menu(),
+    )
+
+
+async def cmd_chatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать chat id — без него нечего написать в PP_TG_CHAT_ID.
+
+    Задача, заведённая в вебе, chat id не знает: браузеру его взять неоткуда.
+    Дефолт закрывает это, но узнать своё значение раньше было негде — команда
+    и есть недостающее звено между «уведомления не приходят» и настройкой.
+    """
+    if not is_authorized(update.effective_user.id):
+        await _deny(update)
+        return
+    chat_id = update.effective_chat.id
+    configured = TG_CHAT_ID
+    if configured == chat_id:
+        state = "✅ Уже задан: задачи из веб\\-UI пишут сюда\\."
+    elif configured:
+        state = (f"⚠ Сейчас в PP\\_TG\\_CHAT\\_ID другой чат: `{_esc_code(str(configured))}`\\.")
+    else:
+        state = "⚠ PP\\_TG\\_CHAT\\_ID не задан — задачи из веб\\-UI молчат\\."
+    await update.message.reply_text(
+        f"Chat id: `{_esc_code(str(chat_id))}`\n\n{state}\n\n"
+        f"Строка для `~/\\.promptpilot/\\.env`:\n"
+        f"`PP_TG_CHAT_ID={_esc_code(str(chat_id))}`\n\n"
+        f"После правки перезапустите `pp worker` и `pp server`\\.",
+        parse_mode="MarkdownV2",
         reply_markup=_main_menu(),
     )
 
@@ -3209,6 +3238,7 @@ def run_bot():
                 BotCommand("providers", "Провайдеры"),
                 BotCommand("pause", "Пауза / продолжить воркер"),
                 BotCommand("skills", "Скилы Claude Code"),
+                BotCommand("chatid", "Id чата для PP_TG_CHAT_ID"),
                 BotCommand("help", "Помощь"),
                 BotCommand("cancel", "Отменить текущий диалог"),
                 BotCommand("start", "Меню / авторизация"),
@@ -3416,6 +3446,7 @@ def run_bot():
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("chatid", cmd_chatid))
     app.add_handler(CommandHandler("skills", cmd_skills))
     # Command aliases for every menu button: on desktop the reply keyboard is
     # often collapsed, and the Telegram command menu is all the user sees.

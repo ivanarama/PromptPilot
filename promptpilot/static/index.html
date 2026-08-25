@@ -544,6 +544,10 @@
         <input type="checkbox" id="worktree" style="width:auto;margin:0">
         <span style="font-size:13px" title="Агент работает в отдельном git worktree на ветке pp/t<id> — твоё рабочее дерево не трогается, результат виден как diff">🌿 свой worktree</span>
       </label>
+      <label id="tgNotifyLabel" style="flex-direction:row;align-items:center;gap:8px;cursor:pointer;display:none">
+        <input type="checkbox" id="tgNotify" checked style="width:auto;margin:0">
+        <span id="tgNotifyText" style="font-size:13px">🔔 уведомлять в Telegram</span>
+      </label>
       <button class="btn btn-primary" onclick="addTask()">Add Task</button>
     </div>
   </div>
@@ -625,6 +629,7 @@ let expandedId = null;
 let screenCache = {};  // task id -> {text, status}: экран герд-панели раскрытой карточки
 let providersData = {};
 let projectsByPath = {};   // path -> {name, path, git} from /api/projects
+let serverConfig = {};     // {tg_chat_id, tg_bot} from /api/config
 let skillsCache = {};
 let skillsPanelOpen = false;
 
@@ -845,6 +850,15 @@ async function loadTasks() {
         ${t.next_run_at ? `<div class="detail-info"><span class="label">Next retry: </span><span>${new Date(t.next_run_at).toLocaleString()}</span></div>` : ''}
         <div class="detail-info"><span class="label">Retries: </span><span>${t.retry_count}/${t.max_retries}</span>${t.exit_code !== null ? ` <span class="label">| Exit: </span><span>${t.exit_code}</span>` : ''}</div>
 
+        <div class="detail-info" style="align-items:center;gap:8px">
+          <span class="label">Уведомления: </span>
+          <span>${t.tg_chat_id ? `🔔 чат ${t.tg_chat_id}` : '🔕 никому'}</span>
+          ${['pending','rate_limited','running'].includes(t.status) && (t.tg_chat_id || serverConfig.tg_chat_id) ? `
+            <button class="btn btn-sm btn-ghost" onclick="toggleTaskNotify(event,${t.id},${t.tg_chat_id || 0})"
+                    title="${t.tg_chat_id ? 'Задача перестанет писать в Telegram' : `Уведомления пойдут в чат ${serverConfig.tg_chat_id}`}">${t.tg_chat_id ? 'Выключить' : 'Включить'}</button>` : ''}
+          ${!t.tg_chat_id && !serverConfig.tg_chat_id ? '<span class="label">(задай PP_TG_CHAT_ID в ~/.promptpilot/.env)</span>' : ''}
+        </div>
+
         ${['pending','rate_limited'].includes(t.status) ? `
           <div class="detail-label" style="margin-top:10px">Изменить (пока задача в очереди)</div>
           <div class="detail-actions" style="flex-wrap:wrap; gap:6px" onclick="event.stopPropagation()">
@@ -909,6 +923,26 @@ async function saveTaskEdit(event, id) {
   refresh();
 }
 
+// Уведомления у уже созданной задачи: серию не надо пересоздавать, чтобы
+// назначить ей адресата — история прогонов и время следующего запуска целы.
+async function toggleTaskNotify(event, id, current) {
+  event.stopPropagation();
+  const next = current ? 0 : serverConfig.tg_chat_id;
+  if (!next && !current) { toast('Не задан PP_TG_CHAT_ID — некуда слать'); return; }
+  try {
+    await fetchJSON(`${API}/tasks/${id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tg_chat_id: next }),
+    });
+  } catch (e) {
+    toast('Не удалось изменить: ' + e.message);
+    return;
+  }
+  toast(next ? `Уведомления пойдут в чат ${next}` : 'Уведомления выключены', false);
+  refresh();
+}
+
 async function addTask() {
   let prompt = document.getElementById('promptInput').value.trim();
   if (!prompt) {
@@ -934,6 +968,10 @@ async function addTask() {
   const timeoutVal = document.getElementById('timeoutInput').value.trim();
   const taskTimeout = timeoutVal !== '' ? parseInt(timeoutVal) : null;
   const machine = document.getElementById('machineInput').value || null;
+  // Пусто = «как настроено на сервере» (PP_TG_CHAT_ID), 0 = «эту не уведомлять».
+  // Браузер chat id не знает и знать не может, поэтому здесь только да/нет.
+  const tgBox = document.getElementById('tgNotify');
+  const tgChatId = (serverConfig.tg_chat_id && !tgBox.checked) ? 0 : null;
 
   // Вложения сохраняются на ЭТОЙ машине — удалённый агент их не прочитает.
   if (pendingFiles.length && machine) {
@@ -967,6 +1005,7 @@ async function addTask() {
         scheduled_at: schedule ? new Date(schedule).toISOString() : null,
         recurrence,
         task_timeout: taskTimeout,
+        tg_chat_id: tgChatId,
       }),
     });
   } catch (e) {
@@ -1606,6 +1645,32 @@ function selectSkill(name) {
   closeSkillsPanel();
 }
 
+// --- Server-side defaults the browser can't know (PP_TG_CHAT_ID, бот жив ли) ---
+async function loadConfig() {
+  serverConfig = (await fetchJSON(`${API}/config`)) || {};
+  const label = document.getElementById('tgNotifyLabel');
+  const box = document.getElementById('tgNotify');
+  const text = document.getElementById('tgNotifyText');
+  label.style.display = 'flex';
+  if (!serverConfig.tg_chat_id) {
+    // Не молчим о том, что функции нет: иначе задача из веба просто никогда
+    // ничего не пришлёт, и по интерфейсу это неотличимо от «всё в порядке».
+    box.checked = false;
+    box.disabled = true;
+    label.style.cursor = 'default';
+    text.textContent = '🔕 уведомлений не будет';
+    text.title = 'Задай PP_TG_CHAT_ID в ~/.promptpilot/.env — свой chat id узнаешь у бота командой /start';
+    text.style.color = 'var(--text2)';
+    return;
+  }
+  box.checked = true;
+  box.disabled = false;
+  text.textContent = '🔔 уведомлять в Telegram';
+  text.title = `Вердикт прогона, rate limit и «ждёт подтверждения» уйдут в чат ${serverConfig.tg_chat_id}`
+    + (serverConfig.tg_bot ? '' : '\n⚠ PP_TG_TOKEN не задан — доставлять их некому, пока не запущен pp bot');
+  text.style.color = serverConfig.tg_bot ? '' : 'var(--yellow)';
+}
+
 // --- Load projects into dir select ---
 async function loadProjects() {
   const projects = await fetchJSON(`${API}/projects`);
@@ -1713,6 +1778,7 @@ async function loadCosts() {
 
 // --- Init ---
 setDefaultSchedule();
+loadConfig();
 loadProviders();
 loadProjects();
 loadWorkerStatus();

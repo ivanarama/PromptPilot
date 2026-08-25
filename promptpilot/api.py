@@ -16,7 +16,7 @@ import os
 import re as _re
 
 from . import db
-from .config import API_TOKEN, DB_DIR, EFFORT_LEVELS, get_provider_models, get_skills, load_providers, mask_secret_value, provider_available, PROJECTS_ROOT
+from .config import API_TOKEN, DB_DIR, EFFORT_LEVELS, get_provider_models, get_skills, load_providers, mask_secret_value, provider_available, PROJECTS_ROOT, TG_CHAT_ID
 from .models import CostStats, Stats, TaskCreate, TaskInDB, TaskStatus, TaskUpdate
 from .version import check_for_update
 
@@ -134,6 +134,9 @@ def api_update_task(task_id: int, update: TaskUpdate):
         fields["scheduled_at"] = update.scheduled_at
     if update.working_dir is not None:
         fields["working_dir"] = update.working_dir.strip() or None
+    if update.tg_chat_id is not None:
+        # 0 = «не уведомлять»; отрицательные — обычные id групп и супергрупп.
+        fields["tg_chat_id"] = update.tg_chat_id
     if fields and not db.update_task_fields(task_id, fields):
         raise HTTPException(400, "Править можно только задачу в очереди (pending/rate_limited)")
 
@@ -334,6 +337,20 @@ def api_worker_resume():
 @app.get("/api/version")
 def api_version():
     return check_for_update()
+
+
+@app.get("/api/config")
+def api_config():
+    """Server-side defaults the browser cannot know on its own.
+
+    tg_chat_id — куда уйдут уведомления задачи, созданной здесь (PP_TG_CHAT_ID);
+    tg_bot — запущен ли вообще бот, который их доставит: без токена галочка
+    «уведомлять» обещала бы то, чего не будет.
+    """
+    return {
+        "tg_chat_id": TG_CHAT_ID or None,
+        "tg_bot": bool(os.environ.get("PP_TG_TOKEN", "").strip()),
+    }
 
 
 @app.get("/api/providers")

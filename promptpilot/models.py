@@ -49,6 +49,9 @@ class TaskUpdate(BaseModel):
     recurrence: Optional[str] = None
     scheduled_at: Optional[datetime] = None
     working_dir: Optional[str] = None
+    # Кому уходят уведомления. 0 — «никому»; серию так можно дозаправить
+    # адресатом, не пересоздавая её и не теряя историю прогонов.
+    tg_chat_id: Optional[int] = None
 
 
 class TaskInDB(BaseModel):
