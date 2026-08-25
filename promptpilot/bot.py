@@ -898,7 +898,8 @@ async def add_task_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ASK_PASSWORD
 
     await update.message.reply_text(
-        "Введите промпт для задачи:\n(/cancel — отменить)",
+        "Введите промпт для задачи — или имя скила, например /triage-issues:\n"
+        "(/cancel — отменить)",
         reply_markup=ReplyKeyboardRemove(),
     )
     return ASK_PROMPT
@@ -939,7 +940,8 @@ async def add_task_got_password(update: Update, context: ContextTypes.DEFAULT_TY
     if context.user_data.get("new_skill_name"):
         return await _ask_skill_args(update.message.reply_text, context)
     await update.message.reply_text(
-        "Введите промпт для задачи:\n(/cancel — отменить)",
+        "Введите промпт для задачи — или имя скила, например /triage-issues:\n"
+        "(/cancel — отменить)",
         reply_markup=ReplyKeyboardRemove(),
     )
     return ASK_PROMPT
@@ -1039,6 +1041,15 @@ async def _after_prompt(message, context: ContextTypes.DEFAULT_TYPE):
 async def add_task_got_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["new_prompt"] = update.message.text
     return await _after_prompt(update.message, context)
+
+
+# Команды бота, которые на шаге промпта остаются командами. Всё остальное со
+# слэшем — это скил Claude Code (`/triage-issues`): Telegram размечает такое
+# сообщение как bot_command, фильтр `~filters.COMMAND` его отбрасывал, и самый
+# очевидный способ запустить скил — напечатать его имя — проваливался молча.
+_RESERVED_COMMANDS = ("start", "help", "tasks", "windows", "add", "stats",
+                      "providers", "pause", "skills", "cancel", "skip")
+_RESERVED_CMD_RE = r"^/(?:%s)(?:@\w+)?(?:\s|$)" % "|".join(_RESERVED_COMMANDS)
 
 
 def _append_caption_to_prompt(context, caption: str):
@@ -1354,30 +1365,81 @@ def _list_subdirs(parent_path):
         return []
 
 
-def _list_projects_with_skills():
-    """Return projects that have local skill files in .claude/commands/ or .claude/skills/.
+def _has_local_skills(path) -> bool:
+    """Есть ли у этой директории свои скилы в .claude/commands|skills.
 
-    Supports both layouts:
+    Обе раскладки:
     - Flat:   .claude/skills/*.md
     - Subdir: .claude/skills/<skill-name>/*.md
     """
     from pathlib import Path
-    result = []
-    for proj in _list_projects():
-        full = Path(PROJECTS_ROOT) / proj
-        for sub in ("commands", "skills"):
-            skill_dir = full / ".claude" / sub
-            if not skill_dir.is_dir():
-                continue
-            # Flat .md files
+    full = Path(path)
+    for sub in ("commands", "skills"):
+        skill_dir = full / ".claude" / sub
+        if not skill_dir.is_dir():
+            continue
+        try:
             if any(f for f in skill_dir.glob("*.md") if f.name.lower() != "readme.md"):
-                result.append(proj)
-                break
-            # Subdir-style: subdirectory containing at least one .md file
+                return True
             if any(d for d in skill_dir.iterdir() if d.is_dir() and any(d.glob("*.md"))):
-                result.append(proj)
-                break
-    return result
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _list_projects_with_skills():
+    """Return projects under PROJECTS_ROOT that have local skill files."""
+    return [proj for proj in _list_projects()
+            if _has_local_skills(os.path.join(PROJECTS_ROOT, proj))]
+
+
+def _skill_history_dirs(limit: int = 8) -> list:
+    """Рабочие папки прошлых задач, у которых есть свои скилы.
+
+    PP_PROJECTS_ROOT задан не у всех, и без него кнопка «Скилы проекта» вела в
+    пустоту — хотя папки, где задачи реально запускались, лежат в базе. В вебе
+    проектные скилы видны без всякой настройки, бот теперь не хуже.
+    """
+    try:
+        hist = db.recent_working_dirs(limit=30)
+    except Exception:
+        hist = []
+    under_root = set()
+    if PROJECTS_ROOT:
+        under_root = {os.path.abspath(os.path.join(PROJECTS_ROOT, p))
+                      for p in _list_projects_with_skills()}
+    out = []
+    for d in hist:
+        if not d or os.path.abspath(d) in under_root:
+            continue
+        if _has_local_skills(d):
+            out.append(d)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _default_skills_workdir(chat_id: int, context) -> Optional[str]:
+    """К какой папке отнести проектные скилы, когда её не выбирали явно.
+
+    `/skills` звался без working_dir, поэтому проектных скилов в списке не было
+    и быть не могло — а по интерфейсу это неотличимо от «у проекта их нет».
+    Порядок: выбранный в этой сессии проект → папка текущего мастера → папка
+    прошлой задачи этого чата → самая свежая рабочая папка из базы.
+    """
+    for key in ("skills_workdir", "new_dir"):
+        value = context.user_data.get(key)
+        if value:
+            return value
+    last = _load_last_settings(chat_id) or {}
+    if last.get("new_dir"):
+        return last["new_dir"]
+    try:
+        recent = db.recent_working_dirs(limit=1)
+    except Exception:
+        recent = []
+    return recent[0] if recent else None
 
 
 async def add_task_got_priority(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2298,10 +2360,35 @@ def _build_skills_message(skills: list, title: str, show_proj_btn: bool = False)
             row = []
     if row:
         buttons.append(row)
-    if show_proj_btn and _list_projects_with_skills():
+    if show_proj_btn:
+        # Кнопка показывается всегда: раньше при пустом PROJECTS_ROOT её просто
+        # не было, и отсутствие настройки выглядело как отсутствие функции.
         buttons.append([InlineKeyboardButton("📁 Скилы проекта...", callback_data="skills_proj_picker")])
 
     return "\n".join(lines), InlineKeyboardMarkup(buttons)
+
+
+async def _send_skills_list(send, context, chat_id: int, workdir: str = None):
+    """Показать список скилов: глобальные + проектные для workdir.
+
+    workdir=None — определить самим (`_default_skills_workdir`), потому что
+    молчаливо неполный список хуже пустого: по нему не видно, что чего-то нет.
+    """
+    if workdir is None:
+        workdir = _default_skills_workdir(chat_id, context)
+    skills = get_skills(working_dir=workdir) if workdir else get_skills()
+    if not skills:
+        await send(
+            "Скилы не найдены\\. Добавьте команды в `~/.claude/commands/` "
+            "или в `.claude/skills/` проекта\\.",
+            parse_mode="MarkdownV2",
+        )
+        return
+    title = f"Скилы ({_short_dir(workdir)}):" if workdir else "Доступные скилы:"
+    text, keyboard = _build_skills_message(skills, title, show_proj_btn=True)
+    if workdir and not any(s.get("source") == "local" for s in skills):
+        text += f"\n\n_У `{_esc_code(_short_dir(workdir))}` своих скилов нет_"
+    await send(text, parse_mode="MarkdownV2", reply_markup=keyboard)
 
 
 async def cmd_skills(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2316,18 +2403,7 @@ async def cmd_skills(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    skills = get_skills()
-    if not skills:
-        await update.message.reply_text(
-            "Скилы не найдены\\. Добавьте команды в `~/\\.claude/commands/` "
-            "или установите плагины через Claude Code\\.",
-            parse_mode="MarkdownV2",
-            reply_markup=_main_menu(),
-        )
-        return
-
-    text, keyboard = _build_skills_message(skills, "Доступные скилы:", show_proj_btn=True)
-    await update.message.reply_text(text, parse_mode="MarkdownV2", reply_markup=keyboard)
+    await _send_skills_list(update.message.reply_text, context, update.effective_chat.id)
 
 
 @require_auth
@@ -2337,11 +2413,21 @@ async def cb_skills_proj_picker(update: Update, context: ContextTypes.DEFAULT_TY
     await query.answer()
 
     projects = _list_projects_with_skills()
-    if not projects:
+    history = _skill_history_dirs()
+    if not projects and not history:
+        # Раньше в этом месте кнопки просто не было. Пустой экран с объяснением
+        # честнее: видно, что функция есть и чего ей не хватает.
+        hint = ("Проектов со своими скилами не видно\\.\n\n"
+                "Скилы проекта — это `.md` в `<проект>/.claude/skills/` или "
+                "`.claude/commands/`\\. Они появятся здесь сами, как только в такой "
+                "папке выполнится задача\\.\n\n"
+                "Чтобы выбирать проекты кнопками сразу, задайте `PP_PROJECTS_ROOT` "
+                "в `~/.promptpilot/.env`:\n"
+                "`PP_PROJECTS_ROOT=/home/user/projects`")
         await query.edit_message_text(
-            "Нет проектов с локальными скилами\\.\n"
-            "Добавьте `.md` файлы в `<project>/.claude/commands/` или `<project>/.claude/skills/`",
-            parse_mode="MarkdownV2",
+            hint, parse_mode="MarkdownV2",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton(BACK_LABEL, callback_data="skills_back")]]),
         )
         return
 
@@ -2358,12 +2444,44 @@ async def cb_skills_proj_picker(update: Update, context: ContextTypes.DEFAULT_TY
             row = []
     if row:
         buttons.append(row)
+    # Недавние рабочие папки — по индексу: абсолютный путь в callback_data не
+    # влезает в 64 байта Telegram.
+    context.user_data["skills_hist"] = history
+    for i, path in enumerate(history):
+        buttons.append([InlineKeyboardButton(f"🕘 {_short_dir(path)}",
+                                             callback_data=f"skills_hist:{i}")])
     buttons.append([InlineKeyboardButton(BACK_LABEL, callback_data="skills_back")])
 
-    await query.edit_message_text(
-        "Выберите проект для загрузки его скилов:",
-        reply_markup=InlineKeyboardMarkup(buttons),
-    )
+    text = "Выберите проект для загрузки его скилов:"
+    if history and not projects:
+        text = "Проекты из истории задач (со своими скилами):"
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+
+
+@require_auth
+async def cb_skills_hist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Load skills for a directory picked from task history."""
+    query = update.callback_query
+    hist = context.user_data.get("skills_hist") or []
+    idx = int(query.data.split(":", 1)[1])
+    if idx >= len(hist):
+        await query.answer("Список устарел — откройте заново.", show_alert=True)
+        return
+    await query.answer()
+    workdir = hist[idx]
+    context.user_data["skills_workdir"] = workdir
+    await _send_skills_list(_edit_with_back(query), context,
+                            query.message.chat_id, workdir=workdir)
+
+
+def _edit_with_back(query):
+    """edit_message_text с кнопкой «назад» к общему списку скилов."""
+    async def send(text, **kwargs):
+        markup = kwargs.pop("reply_markup", None)
+        rows = list(markup.inline_keyboard) if markup else []
+        rows.append([InlineKeyboardButton(BACK_LABEL, callback_data="skills_proj_picker")])
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(rows), **kwargs)
+    return send
 
 
 @require_auth
@@ -2430,18 +2548,11 @@ async def cb_skills_dir(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @require_auth
 async def cb_skills_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Return to global skills list."""
+    """Return to the default skills list (global + skills of the default dir)."""
     query = update.callback_query
     await query.answer()
     context.user_data.pop("skills_workdir", None)
-
-    skills = get_skills()
-    if not skills:
-        await query.edit_message_text("Скилы не найдены.")
-        return
-
-    text, keyboard = _build_skills_message(skills, "Доступные скилы:", show_proj_btn=True)
-    await query.edit_message_text(text, parse_mode="MarkdownV2", reply_markup=keyboard)
+    await _send_skills_list(query.edit_message_text, context, query.message.chat_id)
 
 
 async def _ask_skill_args(send, context: ContextTypes.DEFAULT_TYPE):
@@ -3175,10 +3286,13 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📋 Задачи — список с фильтрами; в карточке: отмена, сброс, повтор, полный вывод\n"
         "🖥 Окна — живые herdr-сессии: открыть экран, ответить агенту, нажать кнопку диалога\n"
         "➕ Добавить задачу — мастер: промпт → где выполнить → папка → 🚀 Запустить\n"
+        "   (на шаге промпта можно просто напечатать имя скила: /triage-issues)\n"
         "   (приоритет, права, worktree, повтор, отложенный запуск — «⚙ Дополнительно»)\n"
         "📊 Статистика — сводка по статусам и расходы\n"
         "🔌 Провайдеры — список и настройки\n"
-        "⚡ Скилы — запустить /skill Claude Code\n"
+        "⚡ Скилы — запустить /skill Claude Code; список включает скилы проекта "
+        "(рабочая папка берётся из прошлых задач, кнопка «📁 Скилы проекта…» "
+        "позволяет выбрать другую)\n"
         "⏸ Пауза — приостановить воркер без потери задач\n\n"
         "Команды: /tasks, /windows, /add, /stats, /providers, /pause, /skills, /help\n"
         "/cancel — прервать текущий мастер или диалог\n\n"
@@ -3258,6 +3372,10 @@ def run_bot():
             ],
             ASK_PROMPT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, add_task_got_prompt),
+                # `/имя-скила` как промпт: команды самого бота (см.
+                # _RESERVED_COMMANDS) по-прежнему уходят своим обработчикам.
+                MessageHandler(filters.COMMAND & ~filters.Regex(_RESERVED_CMD_RE),
+                               add_task_got_prompt),
                 MessageHandler(filters.PHOTO | filters.Document.ALL, add_task_got_attachment),
             ],
             ASK_LAST: [
@@ -3401,6 +3519,7 @@ def run_bot():
     app.add_handler(CallbackQueryHandler(cb_skills_dir_open, pattern=r"^skills_dir_open:"), group=-1)
     app.add_handler(CallbackQueryHandler(cb_skills_dir, pattern=r"^skills_dir_sub:"), group=-1)
     app.add_handler(CallbackQueryHandler(cb_skills_dir, pattern=r"^skills_dir:"), group=-1)
+    app.add_handler(CallbackQueryHandler(cb_skills_hist, pattern=r"^skills_hist:\d+$"), group=-1)
     app.add_handler(CallbackQueryHandler(cb_skills_back, pattern=r"^skills_back$"), group=-1)
 
     # herdr bridge buttons must outrank active ConversationHandlers (group 0)
