@@ -246,7 +246,8 @@ def api_get_workflow(workflow_id: str):
 @app.patch("/api/workflows/{workflow_id}", response_model=WorkflowInDB)
 def api_update_workflow(workflow_id: str, update: WorkflowUpdate):
     try:
-        return db.update_workflow(workflow_id, update)
+        updated = db.update_workflow(workflow_id, update)
+        return workflows.advance_workflow(workflow_id)
     except db.WorkflowNotFoundError as exc:
         raise HTTPException(404, "Workflow not found") from exc
     except db.WorkflowConflictError as exc:
@@ -336,7 +337,8 @@ def _workflow_action(call, *args):
     response_model=WorkflowInDB,
 )
 def api_start_workflow(workflow_id: str, request: WorkflowStartRequest):
-    return _workflow_action(workflows.start_workflow, workflow_id, request)
+    started = _workflow_action(workflows.start_workflow, workflow_id, request)
+    return workflows.advance_workflow(started.id)
 
 
 @app.post(
@@ -400,6 +402,34 @@ def api_sync_workflow(workflow_id: str):
         "runs_synced": workflows.sync_all_tasks(workflow_id),
         "workflow": db.get_workflow(workflow_id),
     }
+
+
+@app.post(
+    "/api/workflows/{workflow_id}/advance",
+    response_model=WorkflowInDB,
+)
+def api_advance_workflow(workflow_id: str):
+    return _workflow_action(workflows.advance_workflow, workflow_id)
+
+
+@app.get("/api/workflows/{workflow_id}/report")
+def api_workflow_report(
+    workflow_id: str,
+    format: str = Query(default="json", pattern="^(json|markdown)$"),
+):
+    try:
+        if format == "markdown":
+            return Response(
+                content=workflows.workflow_report_markdown(workflow_id),
+                media_type="text/markdown; charset=utf-8",
+                headers={
+                    "Content-Disposition":
+                    f'attachment; filename="workflow-{workflow_id}.md"'
+                },
+            )
+        return workflows.workflow_report(workflow_id)
+    except db.WorkflowNotFoundError as exc:
+        raise HTTPException(404, "Workflow not found") from exc
 
 
 @app.post(

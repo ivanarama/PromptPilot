@@ -4,7 +4,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class TaskStatus(str, Enum):
@@ -166,6 +166,96 @@ class FindingStatus(str, Enum):
     ACCEPTED_RISK = "accepted_risk"
 
 
+class WorkflowRoleConfig(BaseModel):
+    """Durable defaults for one AI role in an autonomous workflow."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    provider: Optional[str] = None
+    model: Optional[str] = None
+    effort: Optional[str] = None
+    priority: int = Field(default=5, ge=1, le=10)
+    max_retries: int = Field(default=5, ge=0, le=50)
+    task_timeout: Optional[int] = Field(default=None, ge=0)
+    skip_permissions: bool = False
+    worktree: bool = False
+    keep_pane: bool = True
+    herdr_target: Optional[str] = None
+    machine: Optional[str] = None
+    prompt_template: str = ""
+
+
+class WorkflowRolesConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    executor: WorkflowRoleConfig = Field(default_factory=WorkflowRoleConfig)
+    reviewer: WorkflowRoleConfig = Field(default_factory=WorkflowRoleConfig)
+
+    @model_validator(mode="after")
+    def reviewer_is_not_unrestricted(self):
+        if self.reviewer.skip_permissions:
+            raise ValueError("reviewer cannot use skip_permissions")
+        return self
+
+
+class WorkflowGateConfig(BaseModel):
+    """Deterministic checks executed after a successful executor run."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    commands: list[str] = Field(default_factory=list, max_length=20)
+    timeout_seconds: int = Field(default=1800, ge=1, le=86400)
+    stop_on_failure: bool = True
+
+    @field_validator("commands")
+    @classmethod
+    def commands_are_not_blank(cls, value: list[str]) -> list[str]:
+        cleaned = [item.strip() for item in value]
+        if any(not item for item in cleaned):
+            raise ValueError("gate commands cannot be blank")
+        return cleaned
+
+
+class WorkflowAutomationConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    auto_dispatch_executor: bool = True
+    auto_gate: bool = True
+    auto_dispatch_reviewer: bool = True
+    auto_apply_review: bool = True
+    auto_resume_revision: bool = True
+    stop_on_human_required: bool = True
+
+
+class WorkflowLimitsConfig(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    max_rounds: int = Field(default=6, ge=1, le=100)
+
+
+class WorkflowConfig(BaseModel):
+    """Versioned workflow configuration with legacy-friendly defaults."""
+
+    model_config = ConfigDict(extra="allow")
+
+    schema_version: int = Field(default=1, ge=1, le=1)
+    automation: WorkflowAutomationConfig = Field(
+        default_factory=WorkflowAutomationConfig
+    )
+    roles: WorkflowRolesConfig = Field(default_factory=WorkflowRolesConfig)
+    gate: WorkflowGateConfig = Field(default_factory=WorkflowGateConfig)
+    limits: WorkflowLimitsConfig = Field(default_factory=WorkflowLimitsConfig)
+    stage: dict[str, Any] = Field(default_factory=dict)
+
+
+def normalize_workflow_config(value: Any = None) -> dict[str, Any]:
+    """Validate raw/legacy JSON and return the canonical versioned shape."""
+
+    return WorkflowConfig.model_validate(value or {}).model_dump(mode="json")
+
+
 class WorkflowCreate(BaseModel):
     slug: str = Field(
         min_length=1,
@@ -175,7 +265,12 @@ class WorkflowCreate(BaseModel):
     objective: str = Field(min_length=1)
     repository_path: str = Field(min_length=1)
     candidate_branch: str = Field(min_length=1)
-    config: dict[str, Any] = Field(default_factory=dict)
+    config: dict[str, Any] = Field(default_factory=normalize_workflow_config)
+
+    @field_validator("config", mode="before")
+    @classmethod
+    def validate_config(cls, value):
+        return normalize_workflow_config(value)
 
 
 class WorkflowUpdate(BaseModel):
@@ -192,6 +287,11 @@ class WorkflowUpdate(BaseModel):
     config: Optional[dict[str, Any]] = None
     expected_version: int = Field(ge=0)
 
+    @field_validator("config", mode="before")
+    @classmethod
+    def validate_config(cls, value):
+        return None if value is None else normalize_workflow_config(value)
+
 
 class WorkflowInDB(BaseModel):
     id: str
@@ -202,10 +302,15 @@ class WorkflowInDB(BaseModel):
     status: WorkflowStatus
     current_round: int = 0
     state_version: int = 0
-    config: dict[str, Any] = Field(default_factory=dict)
+    config: dict[str, Any] = Field(default_factory=normalize_workflow_config)
     created_at: datetime
     updated_at: datetime
     completed_at: Optional[datetime] = None
+
+    @field_validator("config", mode="before")
+    @classmethod
+    def validate_config(cls, value):
+        return normalize_workflow_config(value)
 
 
 class WorkflowRoundCreate(BaseModel):

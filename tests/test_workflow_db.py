@@ -91,7 +91,9 @@ def test_create_get_list_workflow_and_creation_event(isolated_db):
     assert created.id == "wf_test"
     assert created.status.value == "draft"
     assert created.state_version == 0
-    assert created.config == {"limits": {"max_rounds": 6}}
+    assert created.config["schema_version"] == 1
+    assert created.config["automation"]["enabled"] is False
+    assert created.config["limits"]["max_rounds"] == 6
     assert isolated_db.get_workflow_by_ref("ut10-bp3-u3").id == "wf_test"
     assert [item.id for item in isolated_db.list_workflows()] == ["wf_test"]
 

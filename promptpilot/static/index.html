@@ -402,6 +402,15 @@
     border-radius: 6px; color: var(--text); padding: 7px 9px; font-size: 12px;
   }
   .wf-form textarea { min-height: 110px; resize: vertical; font-family: var(--mono); }
+  .wf-settings-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:10px; }
+  .wf-settings-card { background:var(--bg); border:1px solid var(--border); border-radius:8px; padding:10px; }
+  .wf-settings-card h4 { margin:0 0 8px; font-size:13px; }
+  .wf-settings-card label { display:flex; flex-direction:column; gap:4px; margin:7px 0; color:var(--text2); font-size:12px; }
+  .wf-settings-card label.check { flex-direction:row; align-items:center; }
+  .wf-settings-card input, .wf-settings-card select, .wf-settings-card textarea {
+    background:var(--surface2); border:1px solid var(--border); border-radius:6px; color:var(--text); padding:7px 8px;
+  }
+  .wf-settings-card textarea { min-height:90px; resize:vertical; font-family:var(--mono); }
   .wf-history { margin-top: 12px; max-height: 260px; overflow-y: auto; }
   .wf-event { border-top: 1px solid var(--border); padding: 6px 0; font-size: 11px; }
   .wf-event code { color: var(--accent2); }
@@ -413,7 +422,7 @@
   .wf-round.current { border-left-color: var(--accent2); }
   .wf-round-summary { font-size: 12px; margin-top: 2px; }
   .wf-technical summary { cursor: pointer; color: var(--text2); font-size: 11px; margin-top: 12px; }
-  @media (max-width: 720px) { .wf-grid { grid-template-columns: 1fr; } }
+  @media (max-width: 720px) { .wf-grid, .wf-settings-grid { grid-template-columns: 1fr; } }
 
   /* Update banner */
   .update-banner {
@@ -608,6 +617,9 @@
           <input class="wide" id="wfNewObjective" placeholder="цель" required>
           <input class="wide" id="wfNewRepo" placeholder="D:\Projects\exchange" required>
           <input id="wfNewRounds" type="number" min="1" value="6" title="максимум новых раундов">
+          <label style="display:flex;flex-direction:row;align-items:center;gap:6px"><input id="wfNewAuto" type="checkbox" style="width:auto"> автономный цикл</label>
+          <select id="wfNewExecutorProvider" title="провайдер исполнителя"></select>
+          <select id="wfNewReviewerProvider" title="провайдер аудитора"></select>
           <button class="btn btn-sm btn-primary" type="submit">Создать</button>
         </form>
         <div id="wfList" class="wf-list"></div>
@@ -1228,6 +1240,12 @@ async function autoRefreshWorkflowState() {
 function toggleWorkflowCreate() {
   const form = document.getElementById('wfCreateForm');
   form.style.display = form.style.display === 'none' ? 'grid' : 'none';
+  if (form.style.display !== 'none') {
+    const preferredExecutor = providersData.agy ? 'agy' : '';
+    const preferredReviewer = providersData.codex ? 'codex' : preferredExecutor;
+    document.getElementById('wfNewExecutorProvider').innerHTML = workflowProviderOptions(preferredExecutor, false);
+    document.getElementById('wfNewReviewerProvider').innerHTML = workflowProviderOptions(preferredReviewer, false);
+  }
 }
 
 async function createWorkflow(event) {
@@ -1237,7 +1255,15 @@ async function createWorkflow(event) {
     objective: document.getElementById('wfNewObjective').value.trim(),
     repository_path: document.getElementById('wfNewRepo').value.trim(),
     candidate_branch: document.getElementById('wfNewBranch').value.trim(),
-    config: { limits: { max_rounds: parseInt(document.getElementById('wfNewRounds').value) || 6 } },
+    config: {
+      schema_version: 1,
+      limits: { max_rounds: parseInt(document.getElementById('wfNewRounds').value) || 6 },
+      automation: { enabled: document.getElementById('wfNewAuto').checked },
+      roles: {
+        executor: { provider: document.getElementById('wfNewExecutorProvider').value || null },
+        reviewer: { provider: document.getElementById('wfNewReviewerProvider').value || null },
+      },
+    },
   };
   try {
     const created = await fetchJSON(`${API}/workflows`, {
@@ -1298,9 +1324,67 @@ async function selectWorkflow(id) {
   [...list.children].forEach((row, n) => row.classList.toggle('active', workflowCache[n]?.id === id));
 }
 
-function workflowProviderOptions() {
+function workflowProviderOptions(selected = 'herdr-session', includeSession = true) {
   const names = Object.entries(providersData).filter(([, p]) => !p.hidden);
-  return names.map(([name, p]) => `<option value="${escAttr(name)}"${name === 'herdr-session' ? ' selected' : ''}>${esc(name)}${p.session_target ? ' · живая сессия' : ''}</option>`).join('');
+  const filtered = names.filter(([, p]) => includeSession || !p.session_target);
+  const defaultOption = selected ? '' : '<option value="" selected>провайдер PromptPilot по умолчанию</option>';
+  const missingOption = selected && !filtered.some(([name]) => name === selected)
+    ? `<option value="${escAttr(selected)}" selected>${esc(selected)} · недоступен</option>` : '';
+  return defaultOption + missingOption + filtered
+    .map(([name, p]) => `<option value="${escAttr(name)}"${name === selected ? ' selected' : ''}>${esc(name)}${p.session_target ? ' · живая сессия' : ''}</option>`).join('');
+}
+
+function wfChecked(value) { return value ? ' checked' : ''; }
+
+function workflowSettingsHtml(wf) {
+  const cfg = wf.config || {};
+  const automation = cfg.automation || {};
+  const roles = cfg.roles || {};
+  const executor = roles.executor || {};
+  const reviewer = roles.reviewer || {};
+  const gate = cfg.gate || {};
+  const effortOptions = value => ['', 'low', 'medium', 'high', 'xhigh', 'max']
+    .map(x => `<option value="${x}"${x === (value || '') ? ' selected' : ''}>${x || 'по умолчанию'}</option>`).join('');
+  const roleCard = (prefix, title, role, allowWrite) => `<div class="wf-settings-card">
+    <h4>${title}</h4>
+    <label>Провайдер<select id="wfCfg${prefix}Provider">${workflowProviderOptions(role.provider || '', true)}</select></label>
+    <label>Модель<input id="wfCfg${prefix}Model" value="${escAttr(role.model || '')}" placeholder="по умолчанию провайдера"></label>
+    <label>Effort<select id="wfCfg${prefix}Effort">${effortOptions(role.effort)}</select></label>
+    <label>Timeout, сек<input id="wfCfg${prefix}Timeout" type="number" min="0" value="${role.task_timeout ?? ''}" placeholder="0 = без лимита"></label>
+    <label>Herdr target<input id="wfCfg${prefix}Target" value="${escAttr(role.herdr_target || '')}" placeholder="например w1:p6; нужен только herdr-session"></label>
+    <label class="check"><input id="wfCfg${prefix}Worktree" type="checkbox"${wfChecked(role.worktree)}> отдельный worktree</label>
+    ${allowWrite ? `<label class="check"><input id="wfCfg${prefix}Skip" type="checkbox"${wfChecked(role.skip_permissions)}> skip permissions (с guard)</label>` : ''}
+    <label>Шаблон промпта<textarea id="wfCfg${prefix}Prompt" placeholder="Пусто = встроенный шаблон">${esc(role.prompt_template || '')}</textarea></label>
+  </div>`;
+  return `<details class="wf-technical" id="wfSettings"><summary>⚙ Настройки автономного workflow</summary>
+    <div class="wf-settings-grid">
+      <div class="wf-settings-card">
+        <h4>Автоматизация</h4>
+        <label class="check"><input id="wfCfgEnabled" type="checkbox"${wfChecked(automation.enabled)}> автономный ping-pong включён</label>
+        <label>Максимум новых раундов<input id="wfCfgMaxRounds" type="number" min="1" max="100" value="${cfg.limits?.max_rounds || 6}"></label>
+        <label>Код текущего этапа<input id="wfCfgStageCode" value="${escAttr(cfg.stage?.code || '')}" placeholder="U3-2"></label>
+        <label>Название этапа<input id="wfCfgStageTitle" value="${escAttr(cfg.stage?.title || '')}" placeholder="Документы реализации"></label>
+        <label>Цель текущего этапа<textarea id="wfCfgStageGoal" placeholder="Проверяемый результат этапа">${esc(cfg.stage?.goal || '')}</textarea></label>
+        <label class="check"><input id="wfCfgAutoExecutor" type="checkbox"${wfChecked(automation.auto_dispatch_executor !== false)}> автоматически запускать исполнителя</label>
+        <label class="check"><input id="wfCfgAutoGate" type="checkbox"${wfChecked(automation.auto_gate !== false)}> автоматически выполнять gate</label>
+        <label class="check"><input id="wfCfgAutoReviewer" type="checkbox"${wfChecked(automation.auto_dispatch_reviewer !== false)}> автоматически запускать аудитора</label>
+        <label class="check"><input id="wfCfgAutoReview" type="checkbox"${wfChecked(automation.auto_apply_review !== false)}> применять машинный вердикт аудитора</label>
+        <label class="check"><input id="wfCfgAutoResume" type="checkbox"${wfChecked(automation.auto_resume_revision !== false)}> создавать новый раунд при REVISION_REQUIRED</label>
+      </div>
+      <div class="wf-settings-card">
+        <h4>Deterministic Gate</h4>
+        <label class="check"><input id="wfCfgGateEnabled" type="checkbox"${wfChecked(gate.enabled !== false)}> gate включён</label>
+        <label>Timeout одной команды, сек<input id="wfCfgGateTimeout" type="number" min="1" value="${gate.timeout_seconds || 1800}"></label>
+        <label>Команды — по одной на строке<textarea id="wfCfgGateCommands" placeholder="pytest -q&#10;git status --porcelain">${esc((gate.commands || []).join('\n'))}</textarea></label>
+        <div class="wf-meta">Команды выполняются кодом PromptPilot в каталоге репозитория. Ненулевой exit code возвращает работу исполнителю.</div>
+      </div>
+      ${roleCard('Executor', 'Исполнитель', executor, true)}
+      ${roleCard('Reviewer', 'Независимый аудитор', reviewer, false)}
+    </div>
+    <div class="wf-actions"><button class="btn btn-sm btn-primary" onclick="wfSaveSettings()">Сохранить настройки</button>
+      <button class="btn btn-sm btn-ghost" onclick="wfAdvance()">Запустить следующий автоматический переход</button></div>
+    <div class="wf-meta">Переменные шаблонов: {{objective}}, {{stage_code}}, {{stage_title}}, {{stage_goal}}, {{repository_path}}, {{candidate_branch}}, {{round_no}}, {{previous_review}}, {{executor_report}}, {{gate_evidence}}.</div>
+  </details>`;
 }
 
 function workflowStatusInfo(status, reviewerDone = false) {
@@ -1368,9 +1452,12 @@ function workflowRoundRow(round, current = false) {
 }
 
 function workflowStopReason(events) {
-  const stopping = ['executor.invalid_output','gate.failed','run.failed'];
+  const stopping = [
+    'executor.invalid_output','reviewer.invalid_output','gate.failed',
+    'gate.human_required','run.failed','automation.paused','limit.max_rounds',
+  ];
   const superseding = [
-    'executor.completed','gate.passed','reviewer.dispatched',
+    'human.resumed','executor.dispatched','executor.completed','gate.passed','reviewer.dispatched',
     'review.awaiting_decision','review.passed','review.revision_required',
     'workflow.completed',
   ];
@@ -1449,7 +1536,8 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, orphanPane = n
   const eventRows = [...events].reverse().slice(0, 30).map(e => `<div class="wf-event"><code>${esc(e.event_type)}</code> · ${formatTime(e.created_at)}</div>`).join('');
   const historyRows = pastRounds.map(r => workflowRoundRow(r)).join('');
   document.getElementById('wfDetail').innerHTML = `
-    <div class="wf-title">${esc(wf.slug)} <span class="task-status" data-s="${escAttr(wf.status)}">${esc(statusInfo[0])}</span></div>
+    <div class="wf-title">${esc(wf.slug)} <span class="task-status" data-s="${escAttr(wf.status)}">${esc(statusInfo[0])}</span>
+      ${wf.config?.automation?.enabled ? '<span class="task-status" data-s="running">АВТО</span>' : '<span class="wf-meta">ручной режим</span>'}</div>
     <div class="wf-stage" style="border-color:${ownerInfo.color}">
       <div class="wf-stage-title">🏓 Мяч сейчас: <span style="color:${ownerInfo.color}">${esc(ownerInfo.who)}</span></div>
       <div class="wf-round-summary">${esc(ownerInfo.detail)}</div>
@@ -1467,9 +1555,12 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, orphanPane = n
     <div class="wf-meta">${esc(wf.repository_path)} · ${esc(wf.candidate_branch)}</div>
     <div class="wf-actions">
       <button class="btn btn-sm btn-ghost" onclick="wfSync()">Sync</button>
+      <button class="btn btn-sm btn-ghost" onclick="wfDownloadReport('json')">Экспорт JSON</button>
+      <button class="btn btn-sm btn-ghost" onclick="wfDownloadReport('markdown')">Экспорт Markdown</button>
       ${activeRun?.task_id ? `<button class="btn btn-sm btn-danger" onclick="wfStopTask(${activeRun.task_id})">Остановить task #${activeRun.task_id}</button>` : ''}
       ${!terminal ? `<button class="btn btn-sm btn-danger" onclick="wfCancel()">Отменить весь workflow</button>` : ''}
     </div>
+    ${workflowSettingsHtml(wf)}
     ${action}
     <div class="wf-section-title">Текущий раунд</div>
     ${currentRound ? workflowRoundRow(currentRound, true) : '<div class="wf-meta">Текущий раунд ещё не создан.</div>'}
@@ -1518,6 +1609,77 @@ async function wfPost(suffix, body) {
     });
     await loadWorkflows();
   } catch (e) { toast('Workflow: ' + e.message); }
+}
+
+function wfOptionalNumber(id) {
+  const raw = document.getElementById(id)?.value?.trim();
+  return raw === '' ? null : Math.max(0, parseInt(raw, 10) || 0);
+}
+
+function wfRoleSettings(prefix, current, allowWrite) {
+  return {
+    ...(current || {}),
+    provider: document.getElementById(`wfCfg${prefix}Provider`).value || null,
+    model: document.getElementById(`wfCfg${prefix}Model`).value.trim() || null,
+    effort: document.getElementById(`wfCfg${prefix}Effort`).value || null,
+    task_timeout: wfOptionalNumber(`wfCfg${prefix}Timeout`),
+    herdr_target: document.getElementById(`wfCfg${prefix}Target`).value.trim() || null,
+    worktree: document.getElementById(`wfCfg${prefix}Worktree`).checked,
+    skip_permissions: allowWrite ? document.getElementById(`wfCfg${prefix}Skip`).checked : false,
+    prompt_template: document.getElementById(`wfCfg${prefix}Prompt`).value,
+  };
+}
+
+async function wfSaveSettings() {
+  const old = selectedWorkflowData.config || {};
+  const wasEnabled = !!old.automation?.enabled;
+  const enabled = document.getElementById('wfCfgEnabled').checked;
+  if (!wasEnabled && enabled && !confirm('Включить автономный ping-pong? После сохранения PromptPilot сразу выполнит допустимый следующий переход.')) return;
+  const commands = document.getElementById('wfCfgGateCommands').value
+    .split(/\r?\n/).map(x => x.trim()).filter(Boolean);
+  const config = {
+    ...old,
+    schema_version: 1,
+    limits: {...(old.limits || {}), max_rounds: Math.max(1, parseInt(document.getElementById('wfCfgMaxRounds').value, 10) || 6)},
+    stage: {
+      ...(old.stage || {}),
+      code: document.getElementById('wfCfgStageCode').value.trim(),
+      title: document.getElementById('wfCfgStageTitle').value.trim(),
+      goal: document.getElementById('wfCfgStageGoal').value.trim(),
+    },
+    automation: {
+      ...(old.automation || {}), enabled,
+      auto_dispatch_executor: document.getElementById('wfCfgAutoExecutor').checked,
+      auto_gate: document.getElementById('wfCfgAutoGate').checked,
+      auto_dispatch_reviewer: document.getElementById('wfCfgAutoReviewer').checked,
+      auto_apply_review: document.getElementById('wfCfgAutoReview').checked,
+      auto_resume_revision: document.getElementById('wfCfgAutoResume').checked,
+    },
+    gate: {
+      ...(old.gate || {}), enabled: document.getElementById('wfCfgGateEnabled').checked,
+      commands, timeout_seconds: Math.max(1, parseInt(document.getElementById('wfCfgGateTimeout').value, 10) || 1800),
+    },
+    roles: {
+      executor: wfRoleSettings('Executor', old.roles?.executor, true),
+      reviewer: wfRoleSettings('Reviewer', old.roles?.reviewer, false),
+    },
+  };
+  try {
+    await fetchJSON(`${API}/workflows/${selectedWorkflowId}`, {
+      method:'PATCH', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({expected_version:selectedWorkflowData.state_version, config}),
+    });
+    toast('Настройки workflow сохранены', false);
+    await loadWorkflows();
+  } catch (e) { toast('Настройки workflow: ' + e.message); }
+}
+
+function wfAdvance() { return wfPost('advance', {}); }
+function wfDownloadReport(format) {
+  const link = document.createElement('a');
+  link.href = `${API}/workflows/${selectedWorkflowId}/report?format=${format}`;
+  link.download = `${selectedWorkflowData.slug}-workflow-report.${format === 'markdown' ? 'md' : 'json'}`;
+  document.body.appendChild(link); link.click(); link.remove();
 }
 
 function wfStart() { return wfPost('start', {expected_version: selectedWorkflowData.state_version}); }

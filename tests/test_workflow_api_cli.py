@@ -73,7 +73,37 @@ def test_openapi_contains_read_models_and_workflow_routes(isolated_db):
     assert "/api/workflows" in paths
     assert "/api/workflows/{workflow_id}/events" in paths
     assert "/api/workflows/{workflow_id}/rounds/{round_id}/runs" in paths
+    assert "/api/workflows/{workflow_id}/advance" in paths
+    assert "/api/workflows/{workflow_id}/report" in paths
     assert "WorkflowEventInDB" in schema["components"]["schemas"]
+
+
+def test_active_workflow_allows_config_but_not_metadata_edits(isolated_db):
+    created = request("POST", "/api/workflows", json=payload("active-config")).json()
+    started = request(
+        "POST", f"/api/workflows/{created['id']}/start",
+        json={"expected_version": created["state_version"]},
+    ).json()
+    assert started["status"] == "queued"
+
+    updated = request(
+        "PATCH", f"/api/workflows/{created['id']}",
+        json={
+            "expected_version": started["state_version"],
+            "config": {"limits": {"max_rounds": 9}},
+        },
+    )
+    assert updated.status_code == 200
+    assert updated.json()["config"]["limits"]["max_rounds"] == 9
+
+    rejected = request(
+        "PATCH", f"/api/workflows/{created['id']}",
+        json={
+            "expected_version": updated.json()["state_version"],
+            "objective": "scope mutation while active",
+        },
+    )
+    assert rejected.status_code == 409
 
 
 def test_web_ui_exposes_workflow_and_live_agent_controls():
@@ -98,6 +128,9 @@ def test_web_ui_exposes_workflow_and_live_agent_controls():
     assert "review.awaiting_decision" in html
     assert "История завершённых раундов" in html
     assert "Технический журнал" in html
+    assert "Настройки автономного workflow" in html
+    assert "function wfSaveSettings" in html
+    assert "function wfDownloadReport" in html
     assert "агент ещё работает" in html
     assert "orphanPane" in html
     assert 'id="wfAgentScreen"' in html

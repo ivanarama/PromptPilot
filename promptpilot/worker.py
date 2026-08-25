@@ -818,6 +818,7 @@ def execute_task(task):
             print(f"  !! не смог продлить расписание #{task.id}: {exc}", flush=True)
         try:
             workflows.sync_task(task.id)
+            workflows.advance_linked_task(task.id)
         except Exception as exc:
             print(f"  !! workflow final sync #{task.id}: {exc}", flush=True)
 
@@ -889,6 +890,7 @@ def _fail_stuck(task_id, exc):
             db.mark_failed(task_id, f"Внутренняя ошибка воркера: {type(exc).__name__}: {exc}")
             from . import workflows
             workflows.sync_task(task_id)
+            workflows.advance_linked_task(task_id)
     except Exception as e:  # never let recovery itself take down the loop
         print(f"  !! не удалось пометить #{task_id} failed: {e}", flush=True)
 

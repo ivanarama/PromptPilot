@@ -1111,9 +1111,14 @@ def update_workflow(workflow_id: str, update: WorkflowUpdate) -> WorkflowInDB:
         ).fetchone()
         if not current:
             raise WorkflowNotFoundError(workflow_id)
-        if current["status"] != "draft":
+        metadata_changes = set(changes) - {"config_json"}
+        if current["status"] != "draft" and metadata_changes:
             raise WorkflowConflictError(
-                "workflow metadata can only be edited while status is draft"
+                "workflow metadata except config can only be edited while status is draft"
+            )
+        if current["status"] in {"completed", "failed", "cancelled"}:
+            raise WorkflowConflictError(
+                "terminal workflow configuration cannot be edited"
             )
         if current["state_version"] != update.expected_version:
             raise WorkflowConflictError(
