@@ -405,6 +405,14 @@
   .wf-history { margin-top: 12px; max-height: 260px; overflow-y: auto; }
   .wf-event { border-top: 1px solid var(--border); padding: 6px 0; font-size: 11px; }
   .wf-event code { color: var(--accent2); }
+  .wf-stage { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 11px 12px; margin: 9px 0; }
+  .wf-stage-title { font-size: 15px; font-weight: 650; }
+  .wf-next { color: var(--cyan); font-size: 12px; margin-top: 5px; }
+  .wf-section-title { margin-top: 14px; margin-bottom: 5px; font-size: 12px; font-weight: 650; color: var(--text); }
+  .wf-round { border-left: 3px solid var(--border); padding: 6px 9px; margin: 5px 0; background: var(--bg); border-radius: 0 6px 6px 0; }
+  .wf-round.current { border-left-color: var(--accent2); }
+  .wf-round-summary { font-size: 12px; margin-top: 2px; }
+  .wf-technical summary { cursor: pointer; color: var(--text2); font-size: 11px; margin-top: 12px; }
   @media (max-width: 720px) { .wf-grid { grid-template-columns: 1fr; } }
 
   /* Update banner */
@@ -1272,12 +1280,49 @@ function workflowProviderOptions() {
   return names.map(([name, p]) => `<option value="${escAttr(name)}"${name === 'herdr-session' ? ' selected' : ''}>${esc(name)}${p.session_target ? ' · живая сессия' : ''}</option>`).join('');
 }
 
+function workflowStatusInfo(status, reviewerDone = false) {
+  const info = {
+    draft: ['Черновик', 'Следующее действие: запустить первый раунд.'],
+    queued: ['Готов к запуску', 'Следующее действие: выбрать исполнителя и отправить промпт.'],
+    executing: ['Исполнитель работает', 'Следующее действие: наблюдать за агентом; после успешного ответа начнутся проверки.'],
+    gating: ['Автоматические проверки', 'Следующее действие: зафиксировать результат gate.'],
+    reviewing: ['Независимое ревью', 'Следующее действие: запустить проверяющего.'],
+    revision_required: ['Нужны исправления', 'Следующее действие: открыть новый раунд доработок.'],
+    awaiting_human: reviewerDone
+      ? ['Ожидается вердикт ревью', 'Следующее действие: принять, вернуть на доработку или запросить решение человека.']
+      : ['Ожидается ваше решение', 'Предыдущая попытка не завершила этап. Следующее действие: продолжить текущий раунд.'],
+    completed: ['Завершён', 'Цель workflow принята независимым ревью.'],
+    failed: ['Завершён с ошибкой', 'Требуется анализ причины и новый workflow либо ручное решение.'],
+    cancelled: ['Отменён', 'Workflow остановлен пользователем.'],
+  };
+  return info[status] || [status, ''];
+}
+
+function workflowRoundRow(round, current = false) {
+  const historical = !!round.summary?.historical;
+  const summary = round.summary?.summary || (current ? 'Текущий автоматизированный раунд' : 'Описание не зафиксировано');
+  const hashes = [round.candidate_sha && `candidate ${round.candidate_sha.slice(0, 8)}`,
+                  round.audit_sha && `audit ${round.audit_sha.slice(0, 8)}`].filter(Boolean).join(' · ');
+  return `<div class="wf-round${current ? ' current' : ''}">
+    <div><b>Раунд ${round.round_no}</b> · ${historical ? 'импортированная история' : 'PromptPilot'} · ${esc(round.status)}</div>
+    <div class="wf-round-summary">${esc(summary)}</div>
+    ${hashes ? `<div class="wf-meta">${esc(hashes)}</div>` : ''}
+  </div>`;
+}
+
 function renderWorkflowDetail(wf, rounds, runs, events, findings) {
   const terminal = ['completed','failed','cancelled'].includes(wf.status);
   const activeRun = [...runs].reverse().find(r => ['pending','running'].includes(r.status));
   const reviewerDone = [...runs].reverse().find(r => r.role === 'reviewer' && r.status === 'completed');
   const openFindings = findings.filter(f => ['open','reopened'].includes(f.status));
   activeWorkflowTaskId = activeRun?.task_id || null;
+  const currentRound = rounds.find(r => r.round_no === wf.current_round);
+  const pastRounds = rounds.filter(r => r.round_no !== wf.current_round);
+  const importedCount = rounds.filter(r => r.summary?.historical).length;
+  const stage = wf.config?.stage || {};
+  const statusInfo = workflowStatusInfo(wf.status, !!reviewerDone);
+  const stageTitle = stage.title || `Рабочий раунд ${wf.current_round}`;
+  const stageGoal = stage.goal || wf.objective;
   let action = '';
   if (wf.status === 'draft') {
     action = `<button class="btn btn-sm btn-primary" onclick="wfStart()">Начать первый раунд</button>`;
@@ -1303,18 +1348,28 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings) {
       <button class="btn btn-sm btn-danger" onclick="wfReview('REVISION_REQUIRED')">Нужны исправления</button>
       <button class="btn btn-sm btn-ghost wide" onclick="wfReview('HUMAN_REQUIRED')">Нужен человек</button></div>`;
   }
-  const runRows = runs.map(r => `<div class="wf-event"><code>${esc(r.role)} #${r.attempt_no}</code> · ${esc(r.status)}${r.task_id ? ` · task #${r.task_id}` : ''}</div>`).join('');
+  const runRows = runs.map(r => `<div class="wf-round${r === activeRun ? ' current' : ''}"><b>${esc(r.role)} · попытка ${r.attempt_no}</b> · ${esc(r.status)}${r.task_id ? ` · task #${r.task_id}` : ''}</div>`).join('');
   const eventRows = [...events].reverse().slice(0, 30).map(e => `<div class="wf-event"><code>${esc(e.event_type)}</code> · ${formatTime(e.created_at)}</div>`).join('');
+  const historyRows = pastRounds.map(r => workflowRoundRow(r)).join('');
   document.getElementById('wfDetail').innerHTML = `
-    <div class="wf-title">${esc(wf.slug)} <span class="task-status" data-s="${escAttr(wf.status)}">${esc(wf.status)}</span></div>
-    <div class="wf-meta">${esc(wf.objective)}</div>
-    <div class="wf-meta">${esc(wf.repository_path)} · ${esc(wf.candidate_branch)} · раунд ${wf.current_round} · version ${wf.state_version}</div>
+    <div class="wf-title">${esc(wf.slug)} <span class="task-status" data-s="${escAttr(wf.status)}">${esc(statusInfo[0])}</span></div>
+    <div class="wf-stage">
+      <div class="wf-stage-title">${esc(stage.code ? `${stage.code}: ${stageTitle}` : stageTitle)}</div>
+      <div class="wf-round-summary">${esc(stageGoal)}</div>
+      <div class="wf-next">${esc(statusInfo[1])}</div>
+    </div>
+    <div class="wf-meta">Текущий раунд: ${wf.current_round}; ранее импортировано: ${importedCount}; открытых замечаний: ${openFindings.length}</div>
+    <div class="wf-meta">${esc(wf.repository_path)} · ${esc(wf.candidate_branch)}</div>
     <div class="wf-actions">
       <button class="btn btn-sm btn-ghost" onclick="wfSync()">Sync</button>
       ${activeRun?.task_id ? `<button class="btn btn-sm btn-danger" onclick="wfStopTask(${activeRun.task_id})">Остановить task #${activeRun.task_id}</button>` : ''}
       ${!terminal ? `<button class="btn btn-sm btn-danger" onclick="wfCancel()">Отменить весь workflow</button>` : ''}
     </div>
     ${action}
+    <div class="wf-section-title">Текущий раунд</div>
+    ${currentRound ? workflowRoundRow(currentRound, true) : '<div class="wf-meta">Текущий раунд ещё не создан.</div>'}
+    <div class="wf-section-title">Попытки исполнителей и проверяющих в текущем раунде</div>
+    ${runRows || '<div class="wf-meta">Попыток пока нет.</div>'}
     ${activeRun?.task_id ? `<div class="detail-label">Экран агента task #${activeRun.task_id}
       <span class="screen-status" id="wfAgentStatus">загрузка…</span></div>
       <div class="result-block"><pre class="agent-screen" id="wfAgentScreen">Загрузка экрана…</pre></div>
@@ -1327,8 +1382,11 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings) {
         <button class="btn btn-sm btn-ghost" onclick="wfSendKey('esc')">Esc</button>
         <button class="btn btn-sm btn-copy" onclick="wfRefreshScreen(${activeRun.task_id}, true)">Обновить экран</button>
       </div>` : ''}
-    <div class="wf-meta" style="margin-top:10px">Раундов: ${rounds.length}; открытых замечаний: ${openFindings.length}</div>
-    <div class="wf-history">${runRows}${eventRows || '<div class="wf-meta">Событий пока нет.</div>'}</div>`;
+    <div class="wf-section-title">История завершённых раундов</div>
+    <div class="wf-history">${historyRows || '<div class="wf-meta">Истории пока нет.</div>'}</div>
+    <details class="wf-technical"><summary>Технический журнал · ${events.length} событий · state version ${wf.state_version}</summary>
+      <div class="wf-history">${eventRows || '<div class="wf-meta">Событий пока нет.</div>'}</div>
+    </details>`;
   if (['queued','reviewing'].includes(wf.status)) setTimeout(wfProviderChanged, 0);
   if (activeWorkflowTaskId) setTimeout(() => wfRefreshScreen(activeWorkflowTaskId), 0);
 }

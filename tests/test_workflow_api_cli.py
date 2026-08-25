@@ -87,6 +87,9 @@ def test_web_ui_exposes_workflow_and_live_agent_controls():
     assert "function wfStopTask(taskId)" in html
     assert "function wfRefreshScreen" in html
     assert "function wfSendKey" in html
+    assert "function workflowStatusInfo" in html
+    assert "История завершённых раундов" in html
+    assert "Технический журнал" in html
     assert 'id="wfAgentScreen"' in html
     assert "a.agent || 'agent'" in html
     assert HERDR_UI_KEYS == ("enter", "1", "2", "3", "4", "esc")
