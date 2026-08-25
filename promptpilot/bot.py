@@ -87,6 +87,10 @@ STATUS_RU = {
     "cancelled": "отменена",
 }
 
+VERDICT_ICON = {"ГОТОВО": "✅", "УЖЕ СДЕЛАНО": "✅",
+                "НУЖЕН ЧЕЛОВЕК": "🟡", "НЕ СМОГ": "❌", "ПУСТО": "⚪"}
+
+
 # One spelling for recurring buttons — «← Назад» vs «◀ Назад» and 💬 vs ✍️
 # made the UI look assembled from different bots
 BACK_LABEL = "← Назад"
@@ -563,9 +567,7 @@ async def cb_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if task.working_dir:
         text += f"\nДир: `{_esc_code(task.working_dir)}`"
     if task.verdict:
-        icon = {"ГОТОВО": "✅", "УЖЕ СДЕЛАНО": "✅",
-                "НУЖЕН ЧЕЛОВЕК": "🟡", "НЕ СМОГ": "❌", "ПУСТО": "⚪"}.get(task.verdict, "•")
-        text += f"\nИтог: {icon} {_esc(task.verdict)}"
+        text += f"\nИтог: {VERDICT_ICON.get(task.verdict, '•')} {_esc(task.verdict)}"
     if task.note:
         text += f"\n✎ Приписка: {_esc(task.note[:200])}"
     if task.worktree:
@@ -3544,6 +3546,28 @@ async def cb_windows_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _task_headline(task, limit: int = 40) -> str:
+    """Первая строка промпта — то, чем задача была, в одну строку.
+
+    Для этапа конвейера это имя скила («/review-queue»), для обычной задачи —
+    начало формулировки; и то и другое отвечает на вопрос «это что было?»
+    быстрее, чем номер.
+    """
+    head = (task.prompt or "").strip().splitlines()[0].strip() if (task.prompt or "").strip() else ""
+    return head if len(head) <= limit else head[:limit - 1].rstrip() + "…"
+
+
+def _verdict_suffix(task) -> str:
+    """« — 🟡 НУЖЕН ЧЕЛОВЕК»: итог прогона там же, где статус процесса.
+
+    «Выполнена» говорит лишь то, что агент дошёл до конца; нужен ли после этого
+    человек — говорит вердикт, и раньше его в уведомлении не было вовсе.
+    """
+    if not task.verdict:
+        return ""
+    return f" — {VERDICT_ICON.get(task.verdict, '•')} {task.verdict}"
+
+
 async def _notify_loop(bot):
     """Background loop: send notifications for completed/failed tasks every 10s.
 
@@ -3601,7 +3625,13 @@ async def _notify_loop(bot):
                     if task.result:
                         preview = task.result.split("\n--- Meta ---")[0].strip()
                         if preview:
-                            body = f"\n\n{preview[:600]}"
+                            # ХВОСТ, а не начало: агент отвечает потоком, и первые
+                            # строки — это «I'll start by checking…», тогда как
+                            # вывод и строка ИТОГ приходят последними. Уведомление
+                            # читают вместо результата, а не как анонс к нему.
+                            if len(preview) > 600:
+                                preview = "…" + preview[-600:].lstrip()
+                            body = f"\n\n{preview}"
                         meta_lines = []
                         if "--- Meta ---" in task.result:
                             for line in task.result[task.result.find("--- Meta ---"):].splitlines():
@@ -3616,7 +3646,13 @@ async def _notify_loop(bot):
 
                 proj = _project_name(task.working_dir)
                 proj_str = f" [{proj}]" if proj else ""
-                text = _clip(f"{icon} Задача #{task.id}{proj_str} {status_word}{body}")
+                # Чем была задача — в заголовке. У конвейера все прогоны на одну
+                # директорию, и «Задача #95 [onebase-pipeline] выполнена» не
+                # отвечает на первый же вопрос: какой это этап.
+                head = _task_headline(task)
+                head_str = f" «{head}»" if head else ""
+                text = _clip(f"{icon} Задача #{task.id}{head_str}{proj_str} "
+                             f"{status_word}{_verdict_suffix(task)}{body}")
                 # The completion notification is the entry point to the most
                 # common flow (read result → reply) — give it buttons instead
                 # of sending the user back through the menu and the task list.
