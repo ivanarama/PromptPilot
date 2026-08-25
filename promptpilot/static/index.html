@@ -886,6 +886,7 @@ async function loadTasks() {
 
         <div class="detail-actions">
           ${['pending','rate_limited','running'].includes(t.status) ? `<button class="btn btn-sm btn-ghost" onclick="cancelTask(event,${t.id})">Cancel</button>` : ''}
+          ${['completed','failed','cancelled'].includes(t.status) ? `<button class="btn btn-sm btn-ghost" onclick="rerunTask(event,${t.id})" title="та же задача заново: провайдер, каталог, модель и усилие переносятся">🔁 Повторить</button>` : ''}
           ${t.status === 'running' ? `<button class="btn btn-sm btn-ghost" onclick="resetTask(event,${t.id})">Reset to pending</button>` : ''}
           <button class="btn btn-sm btn-danger" onclick="deleteTask(event,${t.id})">Delete</button>
         </div>
@@ -1091,6 +1092,15 @@ async function resetTask(e, id) {
   e.stopPropagation();
   try { await fetchJSON(`${API}/tasks/${id}/reset`, { method: 'POST' }); }
   catch (err) { toast('Не удалось сбросить: ' + err.message); return; }
+  refresh();
+}
+
+async function rerunTask(e, id) {
+  e.stopPropagation();
+  let clone;
+  try { clone = await fetchJSON(`${API}/tasks/${id}/rerun`, { method: 'POST' }); }
+  catch (err) { toast('Не удалось повторить: ' + err.message); return; }
+  toast(`Задача #${clone.id} добавлена (повтор #${id}).`, false);
   refresh();
 }
 

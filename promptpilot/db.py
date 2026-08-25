@@ -253,6 +253,46 @@ def create_task(task: TaskCreate) -> TaskInDB:
         return get_task(cur.lastrowid, conn=conn)
 
 
+#: Что НЕ переносится в повтор (и почему):
+#: recurrence/scheduled_at — повтор одноразовый, иначе кнопка «ещё раз» молча
+#: заводила бы вторую серию рядом с исходной;
+#: session_id/parent_task_id — новая задача идёт с чистого листа, а не
+#: продолжает чужую сессию;
+#: herdr_target — панель, в которую задача писала, к этому моменту обычно
+#: закрыта; повтор должен подняться сам, а не упасть на мёртвой цели.
+def clone_task(task_id: int, *, tg_chat_id: Optional[int] = None) -> Optional[TaskInDB]:
+    """«Повторить»: та же работа заново, без прохода по мастеру.
+
+    Один источник правды для бота и веба: раньше клон собирался руками в
+    обработчике бота и незаметно терял поля — `effort`, например, задавался в
+    мастере, а в повторе оказывался провайдерским по умолчанию.
+
+    `tg_chat_id` — кому уведомлять о повторе. None = «куда и оригинал»;
+    бот передаёт сюда чат, в котором нажали кнопку.
+    """
+    src = get_task(task_id)
+    if not src:
+        return None
+    return create_task(TaskCreate(
+        prompt=src.prompt,
+        working_dir=src.working_dir,
+        provider=src.provider,
+        priority=src.priority,
+        max_retries=src.max_retries,
+        skip_permissions=src.skip_permissions,
+        model=src.model,
+        effort=src.effort,
+        # Ноль здесь значим: «уведомления выключены» переносится вперёд, а не
+        # подменяется дефолтным чатом (см. resolve_tg_chat_id).
+        tg_chat_id=src.tg_chat_id if tg_chat_id is None else tg_chat_id,
+        task_timeout=src.task_timeout,
+        detached=src.detached,
+        keep_pane=src.keep_pane,
+        machine=src.machine,
+        worktree=src.worktree,
+    ))
+
+
 def get_task(task_id: int, *, conn=None) -> Optional[TaskInDB]:
     def _query(c):
         row = c.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()

@@ -704,19 +704,13 @@ async def cb_rerun_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _pw_ok(query.from_user.id):
         await query.answer("Сначала введите пароль через ➕ Добавить задачу.", show_alert=True)
         return
-    new = db.create_task(TaskCreate(
-        prompt=task.prompt,
-        working_dir=task.working_dir,
-        provider=task.provider,
-        priority=task.priority,
-        skip_permissions=task.skip_permissions,
-        model=task.model,
-        tg_chat_id=query.message.chat_id,
-        detached=task.detached,
-        keep_pane=task.keep_pane,
-        machine=task.machine,
-        worktree=task.worktree,
-    ))
+    # Клон собирает db.clone_task — тот же код, что и у веб-кнопки. Пока
+    # список полей лежал здесь, он отставал от TaskCreate: effort спрашивался
+    # в мастере, а в повтор не попадал.
+    new = db.clone_task(task_id, tg_chat_id=query.message.chat_id)
+    if not new:
+        await query.answer("Задача не найдена.", show_alert=True)
+        return
     await query.answer(f"Задача #{new.id} добавлена.")
     await query.message.reply_text(
         f"🔁 Задача #{new.id} добавлена (повтор #{task_id}).",

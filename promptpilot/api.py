@@ -156,6 +156,27 @@ def api_delete_task(task_id: int):
     return {"ok": True}
 
 
+@app.post("/api/tasks/{task_id}/rerun", response_model=TaskInDB, status_code=201)
+def api_rerun_task(task_id: int):
+    """«Повторить» — клон завершённой задачи новой pending-задачей.
+
+    В боте эта кнопка есть с самого начала, в вебе её не было: повтор
+    приходилось собирать руками в форме, а она не помнит ни провайдера, ни
+    каталога — то есть самый частый жест стоил дороже всего.
+    """
+    task = db.get_task(task_id)
+    if not task:
+        raise HTTPException(404, "Task not found")
+    # Незавершённую задачу повторять нечего: она сама доедет. Клон дал бы двух
+    # агентов на одной рабочей копии — с worktree это ещё и гонка за веткой.
+    if task.status not in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
+        raise HTTPException(409, "Повторить можно только завершённую задачу")
+    clone = db.clone_task(task_id)
+    if not clone:
+        raise HTTPException(404, "Task not found")
+    return clone
+
+
 @app.post("/api/tasks/{task_id}/reset", response_model=dict)
 def api_reset_task(task_id: int):
     if not db.reset_task(task_id):
