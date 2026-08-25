@@ -7,7 +7,7 @@ import uuid
 from pathlib import Path
 from typing import List, Optional
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -17,7 +17,24 @@ import re as _re
 
 from . import db
 from .config import API_TOKEN, DB_DIR, get_provider_models, get_skills, load_providers, mask_secret_value, provider_available, PROJECTS_ROOT
-from .models import CostStats, Stats, TaskCreate, TaskInDB, TaskStatus, TaskUpdate
+from .models import (
+    CostStats,
+    FindingStatus,
+    Stats,
+    TaskCreate,
+    TaskInDB,
+    TaskStatus,
+    TaskUpdate,
+    WorkflowArtifactInDB,
+    WorkflowCreate,
+    WorkflowEventInDB,
+    WorkflowFindingInDB,
+    WorkflowInDB,
+    WorkflowRoundInDB,
+    WorkflowRunInDB,
+    WorkflowStatus,
+    WorkflowUpdate,
+)
 from .version import check_for_update
 
 app = FastAPI(title="PromptPilot", version="0.1.0")
@@ -152,6 +169,117 @@ def api_set_note(task_id: int, body: NoteBody):
     if not db.set_note(task_id, body.text):
         raise HTTPException(404, "Задача не найдена")
     return {"ok": True, "note": body.text or None}
+
+
+# --- Workflow orchestrator W0 ---------------------------------------------
+
+
+@app.post("/api/workflows", response_model=WorkflowInDB, status_code=201)
+def api_create_workflow(workflow: WorkflowCreate):
+    try:
+        return db.create_workflow(workflow)
+    except db.WorkflowConflictError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.get("/api/workflows", response_model=List[WorkflowInDB])
+def api_list_workflows(
+    status: Optional[WorkflowStatus] = None,
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+):
+    return db.list_workflows(
+        status=status.value if status else None,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@app.get("/api/workflows/{workflow_id}", response_model=WorkflowInDB)
+def api_get_workflow(workflow_id: str):
+    workflow = db.get_workflow(workflow_id)
+    if not workflow:
+        raise HTTPException(404, "Workflow not found")
+    return workflow
+
+
+@app.patch("/api/workflows/{workflow_id}", response_model=WorkflowInDB)
+def api_update_workflow(workflow_id: str, update: WorkflowUpdate):
+    try:
+        return db.update_workflow(workflow_id, update)
+    except db.WorkflowNotFoundError as exc:
+        raise HTTPException(404, "Workflow not found") from exc
+    except db.WorkflowConflictError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get(
+    "/api/workflows/{workflow_id}/rounds",
+    response_model=List[WorkflowRoundInDB],
+)
+def api_list_workflow_rounds(workflow_id: str):
+    if not db.get_workflow(workflow_id):
+        raise HTTPException(404, "Workflow not found")
+    return db.list_workflow_rounds(workflow_id)
+
+
+@app.get(
+    "/api/workflows/{workflow_id}/rounds/{round_id}/runs",
+    response_model=List[WorkflowRunInDB],
+)
+def api_list_workflow_runs(workflow_id: str, round_id: str):
+    round_data = db.get_workflow_round(round_id)
+    if not round_data or round_data.workflow_id != workflow_id:
+        raise HTTPException(404, "Workflow round not found")
+    return db.list_workflow_runs(round_id)
+
+
+@app.get(
+    "/api/workflows/{workflow_id}/events",
+    response_model=List[WorkflowEventInDB],
+)
+def api_list_workflow_events(
+    workflow_id: str,
+    after_seq: int = Query(default=0, ge=0),
+    limit: int = Query(default=200, ge=1, le=1000),
+):
+    if not db.get_workflow(workflow_id):
+        raise HTTPException(404, "Workflow not found")
+    return db.list_workflow_events(workflow_id, after_seq=after_seq, limit=limit)
+
+
+@app.get(
+    "/api/workflows/{workflow_id}/findings",
+    response_model=List[WorkflowFindingInDB],
+)
+def api_list_workflow_findings(
+    workflow_id: str,
+    status: Optional[FindingStatus] = None,
+):
+    if not db.get_workflow(workflow_id):
+        raise HTTPException(404, "Workflow not found")
+    return db.list_workflow_findings(
+        workflow_id, status=status.value if status else None
+    )
+
+
+@app.get(
+    "/api/workflows/{workflow_id}/artifacts",
+    response_model=List[WorkflowArtifactInDB],
+)
+def api_list_workflow_artifacts(
+    workflow_id: str,
+    round_id: Optional[str] = None,
+):
+    if not db.get_workflow(workflow_id):
+        raise HTTPException(404, "Workflow not found")
+    if round_id:
+        round_data = db.get_workflow_round(round_id)
+        if not round_data or round_data.workflow_id != workflow_id:
+            raise HTTPException(404, "Workflow round not found")
+    return db.list_workflow_artifacts(workflow_id, round_id=round_id)
 
 
 # --- Вложения к задачам ---

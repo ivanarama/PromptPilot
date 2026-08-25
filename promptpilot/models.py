@@ -2,7 +2,7 @@
 
 from datetime import datetime
 from enum import Enum
-from typing import Optional
+from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 
@@ -95,3 +95,215 @@ class CostStats(BaseModel):
     week: float = 0.0
     total: float = 0.0
     by_provider: dict = {}
+
+
+# --- Workflow orchestrator -------------------------------------------------
+
+
+class WorkflowStatus(str, Enum):
+    """Durable lifecycle states for an orchestrated engineering workflow."""
+
+    DRAFT = "draft"
+    QUEUED = "queued"
+    EXECUTING = "executing"
+    GATING = "gating"
+    REVIEWING = "reviewing"
+    REVISION_REQUIRED = "revision_required"
+    AWAITING_HUMAN = "awaiting_human"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class WorkflowRoundStatus(str, Enum):
+    PENDING = "pending"
+    EXECUTING = "executing"
+    GATING = "gating"
+    REVIEWING = "reviewing"
+    REVISION_REQUIRED = "revision_required"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class WorkflowRunStatus(str, Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class WorkflowRole(str, Enum):
+    EXECUTOR = "executor"
+    GATE = "gate"
+    REVIEWER = "reviewer"
+    ARCHIVER = "archiver"
+
+
+class FindingSeverity(str, Enum):
+    BLOCKER = "blocker"
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+    INFO = "info"
+
+
+class FindingStatus(str, Enum):
+    OPEN = "open"
+    RESOLVED = "resolved"
+    REOPENED = "reopened"
+    ACCEPTED_RISK = "accepted_risk"
+
+
+class WorkflowCreate(BaseModel):
+    slug: str = Field(
+        min_length=1,
+        max_length=64,
+        pattern=r"^[a-z0-9][a-z0-9._-]*$",
+    )
+    objective: str = Field(min_length=1)
+    repository_path: str = Field(min_length=1)
+    candidate_branch: str = Field(min_length=1)
+    config: dict[str, Any] = Field(default_factory=dict)
+
+
+class WorkflowUpdate(BaseModel):
+    """Editable W0 metadata with optimistic concurrency control.
+
+    Lifecycle transitions are deliberately not exposed here; W1 owns the state
+    machine. ``expected_version`` prevents two API clients from silently
+    overwriting each other's draft configuration.
+    """
+
+    objective: Optional[str] = Field(default=None, min_length=1)
+    repository_path: Optional[str] = Field(default=None, min_length=1)
+    candidate_branch: Optional[str] = Field(default=None, min_length=1)
+    config: Optional[dict[str, Any]] = None
+    expected_version: int = Field(ge=0)
+
+
+class WorkflowInDB(BaseModel):
+    id: str
+    slug: str
+    objective: str
+    repository_path: str
+    candidate_branch: str
+    status: WorkflowStatus
+    current_round: int = 0
+    state_version: int = 0
+    config: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
+    updated_at: datetime
+    completed_at: Optional[datetime] = None
+
+
+class WorkflowRoundCreate(BaseModel):
+    workflow_id: str
+    round_no: int = Field(ge=1)
+    base_sha: Optional[str] = None
+
+
+class WorkflowRoundInDB(BaseModel):
+    id: str
+    workflow_id: str
+    round_no: int
+    status: WorkflowRoundStatus
+    base_sha: Optional[str] = None
+    candidate_sha: Optional[str] = None
+    audit_sha: Optional[str] = None
+    started_at: datetime
+    completed_at: Optional[datetime] = None
+    summary: Optional[dict[str, Any]] = None
+
+
+class WorkflowRunCreate(BaseModel):
+    workflow_id: str
+    round_id: str
+    role: WorkflowRole
+    attempt_no: int = Field(default=1, ge=1)
+    input_sha256: str = Field(min_length=1)
+    task_id: Optional[int] = None
+
+
+class WorkflowRunInDB(BaseModel):
+    id: str
+    workflow_id: str
+    round_id: str
+    role: WorkflowRole
+    attempt_no: int
+    task_id: Optional[int] = None
+    status: WorkflowRunStatus
+    input_sha256: str
+    output_sha256: Optional[str] = None
+    output: Optional[dict[str, Any]] = None
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+
+
+class WorkflowFindingUpsert(BaseModel):
+    workflow_id: str
+    fingerprint: str = Field(min_length=1)
+    severity: FindingSeverity
+    category: str = Field(min_length=1)
+    title: str = Field(min_length=1)
+    status: FindingStatus = FindingStatus.OPEN
+    round_no: int = Field(ge=1)
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class WorkflowFindingInDB(BaseModel):
+    id: str
+    workflow_id: str
+    fingerprint: str
+    severity: FindingSeverity
+    category: str
+    title: str
+    status: FindingStatus
+    first_seen_round: int
+    last_seen_round: int
+    reopen_count: int = 0
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class WorkflowArtifactCreate(BaseModel):
+    workflow_id: str
+    round_id: str
+    kind: str = Field(min_length=1)
+    path: str = Field(min_length=1)
+    sha256: str = Field(min_length=1)
+    size_bytes: int = Field(ge=0)
+    run_id: Optional[str] = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class WorkflowArtifactInDB(BaseModel):
+    id: str
+    workflow_id: str
+    round_id: str
+    run_id: Optional[str] = None
+    kind: str
+    path: str
+    sha256: str
+    size_bytes: int
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class WorkflowEventCreate(BaseModel):
+    workflow_id: str
+    event_type: str = Field(min_length=1)
+    idempotency_key: str = Field(min_length=1)
+    payload: dict[str, Any] = Field(default_factory=dict)
+    round_id: Optional[str] = None
+    run_id: Optional[str] = None
+
+
+class WorkflowEventInDB(BaseModel):
+    seq: int
+    workflow_id: str
+    event_type: str
+    idempotency_key: str
+    payload: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
+    round_id: Optional[str] = None
+    run_id: Optional[str] = None

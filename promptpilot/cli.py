@@ -330,6 +330,167 @@ def stats():
     click.echo(f"  Total:        {s.total}")
 
 
+@cli.group("workflow")
+def workflow_group():
+    """Read workflow-orchestrator state and append-only history (W0)."""
+
+
+@workflow_group.command("list")
+@click.option("-s", "--status", type=click.Choice([
+    "draft", "queued", "executing", "gating", "reviewing",
+    "revision_required", "awaiting_human", "completed", "failed",
+    "cancelled",
+]))
+@click.option("-n", "--limit", default=20, type=click.IntRange(1, 500))
+@click.option("--json", "as_json", is_flag=True, help="Машинно-читаемый вывод")
+def workflow_list(status, limit, as_json):
+    """List workflows, newest activity first."""
+    import json as _json
+
+    workflows = db.list_workflows(status=status, limit=limit)
+    if as_json:
+        click.echo(_json.dumps(
+            [item.model_dump(mode="json") for item in workflows],
+            ensure_ascii=False,
+            indent=2,
+        ))
+        return
+    if not workflows:
+        click.echo("Workflows not found.")
+        return
+    click.echo(f"{'Slug':<28} {'Status':<19} {'Round':>5} {'Ver':>4}  Objective")
+    click.echo("-" * 100)
+    for item in workflows:
+        objective = item.objective.replace("\n", " ")[:40]
+        click.echo(
+            f"{item.slug:<28} {item.status.value:<19} "
+            f"{item.current_round:>5} {item.state_version:>4}  {objective}"
+        )
+
+
+def _workflow_or_exit(reference):
+    workflow = db.get_workflow_by_ref(reference)
+    if not workflow:
+        raise click.ClickException(f"Workflow {reference!r} not found")
+    return workflow
+
+
+@workflow_group.command("show")
+@click.argument("reference")
+@click.option("--json", "as_json", is_flag=True, help="Машинно-читаемый вывод")
+def workflow_show(reference, as_json):
+    """Show a workflow by id or slug."""
+    import json as _json
+
+    item = _workflow_or_exit(reference)
+    if as_json:
+        click.echo(_json.dumps(item.model_dump(mode="json"), ensure_ascii=False, indent=2))
+        return
+    click.echo(f"Workflow {item.slug}")
+    click.echo(f"  ID:         {item.id}")
+    click.echo(f"  Status:     {item.status.value}")
+    click.echo(f"  Round:      {item.current_round}")
+    click.echo(f"  Version:    {item.state_version}")
+    click.echo(f"  Repository: {item.repository_path}")
+    click.echo(f"  Branch:     {item.candidate_branch}")
+    click.echo(f"  Created:    {item.created_at}")
+    click.echo(f"  Updated:    {item.updated_at}")
+    click.echo(f"\n  Objective:\n    {item.objective}")
+    if item.config:
+        rendered = _json.dumps(item.config, ensure_ascii=False, indent=2)
+        click.echo(f"\n  Config:\n{rendered}")
+
+
+@workflow_group.command("rounds")
+@click.argument("reference")
+@click.option("--json", "as_json", is_flag=True, help="Машинно-читаемый вывод")
+def workflow_rounds(reference, as_json):
+    """List rounds of a workflow."""
+    import json as _json
+
+    workflow = _workflow_or_exit(reference)
+    rounds = db.list_workflow_rounds(workflow.id)
+    if as_json:
+        click.echo(_json.dumps(
+            [item.model_dump(mode="json") for item in rounds],
+            ensure_ascii=False,
+            indent=2,
+        ))
+        return
+    if not rounds:
+        click.echo("Rounds not found.")
+        return
+    click.echo(f"{'Round':>5} {'Status':<19} {'Base':<12} {'Candidate':<12} Started")
+    for item in rounds:
+        click.echo(
+            f"{item.round_no:>5} {item.status.value:<19} "
+            f"{(item.base_sha or '-')[:12]:<12} "
+            f"{(item.candidate_sha or '-')[:12]:<12} {item.started_at}"
+        )
+
+
+@workflow_group.command("events")
+@click.argument("reference")
+@click.option("--after", "after_seq", default=0, type=click.IntRange(0))
+@click.option("-n", "--limit", default=200, type=click.IntRange(1, 1000))
+@click.option("--json", "as_json", is_flag=True, help="Машинно-читаемый вывод")
+def workflow_events(reference, after_seq, limit, as_json):
+    """Show append-only workflow events."""
+    import json as _json
+
+    workflow = _workflow_or_exit(reference)
+    events = db.list_workflow_events(workflow.id, after_seq=after_seq, limit=limit)
+    if as_json:
+        click.echo(_json.dumps(
+            [item.model_dump(mode="json") for item in events],
+            ensure_ascii=False,
+            indent=2,
+        ))
+        return
+    if not events:
+        click.echo("Events not found.")
+        return
+    for item in events:
+        scope = item.round_id or item.run_id or "-"
+        payload = _json.dumps(item.payload, ensure_ascii=False, sort_keys=True)
+        click.echo(
+            f"{item.seq:>6} {item.created_at.isoformat()} "
+            f"{item.event_type:<24} {scope:<18} {payload}"
+        )
+
+
+@workflow_group.command("findings")
+@click.argument("reference")
+@click.option("-s", "--status", type=click.Choice([
+    "open", "resolved", "reopened", "accepted_risk",
+]))
+@click.option("--json", "as_json", is_flag=True, help="Машинно-читаемый вывод")
+def workflow_findings(reference, status, as_json):
+    """Show current materialized findings and their fingerprints."""
+    import json as _json
+
+    workflow = _workflow_or_exit(reference)
+    findings = db.list_workflow_findings(workflow.id, status=status)
+    if as_json:
+        click.echo(_json.dumps(
+            [item.model_dump(mode="json") for item in findings],
+            ensure_ascii=False,
+            indent=2,
+        ))
+        return
+    if not findings:
+        click.echo("Findings not found.")
+        return
+    click.echo(f"{'Severity':<9} {'Status':<14} {'Rounds':<9} Fingerprint / title")
+    click.echo("-" * 100)
+    for item in findings:
+        rounds = f"{item.first_seen_round}-{item.last_seen_round}"
+        click.echo(
+            f"{item.severity.value:<9} {item.status.value:<14} {rounds:<9} "
+            f"{item.fingerprint} / {item.title}"
+        )
+
+
 @cli.command()
 @click.argument("action", required=False, default="list")
 @click.argument("name", required=False)

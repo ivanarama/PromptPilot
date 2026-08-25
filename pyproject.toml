@@ -26,6 +26,12 @@ dependencies = [
     "Pillow>=10.0; sys_platform == 'win32'",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "httpx>=0.27",
+    "pytest>=8.0",
+]
+
 [project.scripts]
 pp = "promptpilot.cli:cli"
 promptpilot = "promptpilot.cli:cli"

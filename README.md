@@ -47,6 +47,26 @@
 - **Tray-приложение** — двойной клик на `pp.exe`, иконка в трее, всё управление мышью
 - **Standalone .exe** — сборка без зависимостей через PyInstaller
 - **SQLite** — данные хранятся локально в `~/.promptpilot/`
+- **Workflow foundation (W0)** — versioned SQLite-схема, append-only события,
+  rounds/runs/findings/artifacts, REST API и read-only CLI для будущего цикла
+  «исполнитель → гейты → аудитор»
+
+### Workflow Orchestrator
+
+Архитектура автономного цикла описана в
+[`docs/WORKFLOW_ORCHESTRATOR_SPEC.md`](docs/WORKFLOW_ORCHESTRATOR_SPEC.md).
+Текущий этап W0 реализует хранилище, API и наблюдаемость, но ещё не запускает
+агентов автоматически: state machine и dispatch относятся к W1/W2.
+
+Доступные read-only команды:
+
+```bash
+pp workflow list
+pp workflow show <id-or-slug>
+pp workflow rounds <id-or-slug>
+pp workflow events <id-or-slug> --json
+pp workflow findings <id-or-slug>
+```
 
 ## Установка
 
@@ -1113,6 +1133,15 @@ DELETE /api/providers/{name}       — удалить кастомного пр�
 POST   /api/providers/{name}/hide|unhide — скрыть/показать в списках
 GET    /api/skills                 — скилы (?provider=claude&workdir=/path)
 GET    /api/projects               — проекты из PP_PROJECTS_ROOT ({name, path, git})
+POST   /api/workflows              — создать draft workflow
+GET    /api/workflows              — список workflow (?status=draft&limit=50)
+GET    /api/workflows/{id}         — детали workflow
+PATCH  /api/workflows/{id}         — обновить draft-метаданные с expected_version
+GET    /api/workflows/{id}/rounds  — раунды
+GET    /api/workflows/{id}/rounds/{round_id}/runs — запуски ролей
+GET    /api/workflows/{id}/events  — append-only история (?after_seq=0)
+GET    /api/workflows/{id}/findings — текущие findings
+GET    /api/workflows/{id}/artifacts — зарегистрированные артефакты
 ```
 
 ## Конфигурация
