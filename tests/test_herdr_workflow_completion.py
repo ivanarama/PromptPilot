@@ -1,6 +1,7 @@
 from promptpilot.herdr_exec import (
     _closing_workflow_verdict,
     _has_running_background_task,
+    _trim_transcript,
 )
 
 
@@ -32,3 +33,25 @@ def test_agy_background_task_indicator_blocks_idle_completion():
     assert not _has_running_background_task(
         "● [16:02:06] python -m pytest -q completed"
     )
+
+
+def test_trim_transcript_uses_agy_greater_than_prompt_marker():
+    prompt = "Recovery/finalization only. Inspect the completed work."
+    transcript = """Old answer that must not be returned
+─────────────────────────────────────────────────────
+> Recovery/finalization only. Inspect the completed work.
+
+● Bash(git status --short)
+
+Проверка завершена, дерево чистое.
+ИТОГ: ГОТОВО — задача выполнена
+─────────────────────────────────────────────────────
+>
+? for shortcuts               Gemini 3.7 Flash · high
+"""
+
+    cleaned = _trim_transcript(transcript, prompt)
+
+    assert "Old answer" not in cleaned
+    assert "Проверка завершена" in cleaned
+    assert cleaned.endswith("ИТОГ: ГОТОВО — задача выполнена")

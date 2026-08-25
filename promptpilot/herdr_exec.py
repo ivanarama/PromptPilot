@@ -244,7 +244,12 @@ def _trim_transcript(raw: str, prompt: str) -> str:
     start = 0
     probe = prompt.strip().splitlines()[0][:60] if prompt.strip() else ""
     for i, line in enumerate(lines):
-        if probe and line.lstrip().startswith("❯") and probe in line:
+        # Different agents/themes render the submitted prompt with either ❯
+        # or >.  Requiring only ❯ made an attached agy session start trimming
+        # at the previous turn; the first separator then cut the real answer
+        # down to its heading even though the closing verdict was visible.
+        prompt_line = line.lstrip().lstrip("❯>").lstrip()
+        if probe and probe in prompt_line:
             start = i
 
     # The bottom input box begins at the first full-width ─ separator after start.
