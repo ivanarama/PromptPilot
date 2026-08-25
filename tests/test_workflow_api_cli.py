@@ -107,6 +107,7 @@ def test_w1_api_manual_start_dispatch_sync_and_gate(isolated_db):
     task = isolated_db.get_next_runnable()
     assert task.id == task_id
     isolated_db.mark_completed(task.id, "executor complete", exit_code=0)
+    isolated_db.set_verdict(task.id, "ГОТОВО")
     synced = request("POST", f"/api/workflows/{created['id']}/sync")
     assert synced.status_code == 200
     assert synced.json()["workflow"]["status"] == "gating"

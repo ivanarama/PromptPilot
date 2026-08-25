@@ -87,6 +87,21 @@ TERMINAL_STATES = {
 }
 
 
+WORKFLOW_VERDICT_INSTRUCTION = """
+
+<promptpilot-workflow-contract version="w1-verdict-v1">
+Не завершай ответ уточняющим вопросом, если можешь продолжить самостоятельно.
+Последней строкой ответа обязательно напиши ровно один вариант:
+ИТОГ: ГОТОВО — задача выполнена, изменения и проверки перечислены выше
+ИТОГ: УЖЕ СДЕЛАНО — изменений не потребовалось, причина доказана выше
+ИТОГ: НУЖЕН ЧЕЛОВЕК — требуется конкретное решение или доступ
+ИТОГ: НЕ СМОГ — задача не выполнена, блокер доказан выше
+</promptpilot-workflow-contract>
+"""
+
+SUCCESS_VERDICTS = {"ГОТОВО", "УЖЕ СДЕЛАНО"}
+
+
 def _workflow_row(conn: sqlite3.Connection, workflow_id: str) -> sqlite3.Row:
     row = conn.execute(
         "SELECT * FROM workflows WHERE id = ?", (workflow_id,)
@@ -295,6 +310,7 @@ def start_workflow(workflow_id: str,
 def _input_sha(dispatch: WorkflowTaskDispatch, working_dir: str) -> str:
     payload = dispatch.model_dump(mode="json")
     payload["working_dir"] = working_dir
+    payload["output_contract"] = "w1-verdict-v1"
     return hashlib.sha256(db._json_dump(payload).encode("utf-8")).hexdigest()
 
 
@@ -323,7 +339,7 @@ def dispatch_task(workflow_id: str,
         round_row = _current_round_row(conn, workflow)
         working_dir = dispatch.working_dir or workflow["repository_path"]
         task = db._insert_task(conn, TaskCreate(
-            prompt=dispatch.prompt,
+            prompt=dispatch.prompt.rstrip() + WORKFLOW_VERDICT_INSTRUCTION,
             working_dir=working_dir,
             provider=dispatch.provider,
             priority=dispatch.priority,
@@ -858,6 +874,36 @@ def sync_task(task_id: int) -> Optional[WorkflowRunInDB]:
 
             state = WorkflowStatus(workflow["status"])
             role = WorkflowRole(run["role"])
+            if (
+                final_status == "completed"
+                and task_row["verdict"] not in SUCCESS_VERDICTS
+            ):
+                if (
+                    state not in TERMINAL_STATES
+                    and state is not WorkflowStatus.AWAITING_HUMAN
+                ):
+                    conn.execute(
+                        """UPDATE workflow_rounds SET status = 'failed',
+                           completed_at = ? WHERE id = ?""",
+                        (db._now(), run["round_id"]),
+                    )
+                    workflow = _transition(
+                        conn,
+                        workflow,
+                        WorkflowStatus.AWAITING_HUMAN,
+                        f"{role.value}.invalid_output",
+                        {
+                            "task_id": task_id,
+                            "run_id": run["id"],
+                            "verdict": task_row["verdict"],
+                            "reason": "missing successful workflow verdict",
+                        },
+                        round_id=run["round_id"],
+                    )
+                refreshed = conn.execute(
+                    "SELECT * FROM workflow_runs WHERE id = ?", (run["id"],)
+                ).fetchone()
+                return db._row_to_workflow_run(refreshed)
             if final_status == "completed" and role is WorkflowRole.EXECUTOR:
                 if state is WorkflowStatus.EXECUTING:
                     conn.execute(

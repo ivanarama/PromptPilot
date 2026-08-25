@@ -36,6 +36,7 @@ def settle_next_task(db, result="ok"):
     assert task is not None
     workflows.sync_task(task.id)
     db.mark_completed(task.id, result, exit_code=0)
+    db.set_verdict(task.id, "ГОТОВО")
     workflows.sync_task(task.id)
     return task
 
@@ -267,6 +268,7 @@ def test_sync_repairs_crash_gap_and_is_idempotent(isolated_db):
     # Simulate a process that updated the durable task row and died before the
     # workflow callback ran.
     isolated_db.mark_completed(task.id, "finished before crash", exit_code=0)
+    isolated_db.set_verdict(task.id, "ГОТОВО")
     assert isolated_db.get_workflow(workflow.id).status.value == "executing"
 
     assert workflows.sync_all_tasks(workflow.id) == 1
@@ -328,8 +330,29 @@ def test_worker_wrapper_reconciles_linked_task(monkeypatch, isolated_db):
 
     def fake_execute(current_task):
         isolated_db.mark_completed(current_task.id, "wrapped completion")
+        isolated_db.set_verdict(current_task.id, "ГОТОВО")
 
     monkeypatch.setattr(worker, "_execute_task_inner", fake_execute)
     worker.execute_task(task)
 
     assert isolated_db.get_workflow(workflow.id).status.value == "gating"
+
+
+def test_missing_workflow_verdict_never_reaches_gating(isolated_db):
+    workflow = create_workflow(isolated_db, slug="missing-verdict")
+    workflows.start_workflow(workflow.id, WorkflowStartRequest(expected_version=0))
+    result = dispatch(isolated_db, workflow.id, WorkflowRole.EXECUTOR, "execute")
+    assert "promptpilot-workflow-contract" in result.task.prompt
+    assert "ИТОГ: ГОТОВО" in result.task.prompt
+
+    task = isolated_db.get_next_runnable()
+    isolated_db.mark_completed(
+        task.id, "Какую роль мне принять и что нужно сделать?", exit_code=0
+    )
+    workflows.sync_task(task.id)
+
+    current = isolated_db.get_workflow(workflow.id)
+    assert current.status.value == "awaiting_human"
+    assert isolated_db.list_workflow_events(workflow.id)[-1].event_type == (
+        "executor.invalid_output"
+    )
