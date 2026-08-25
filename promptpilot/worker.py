@@ -929,7 +929,10 @@ def run_worker():
                 time.sleep(POLL_INTERVAL)
                 continue
             print("Код обновился — перезапускаю worker...", flush=True)
-            os.execv(sys.executable, [sys.executable, "-m", "promptpilot", "worker"])
+            # -u обязателен: без него stdout в файл буферизуется, и лог
+            # перезапущенного воркера выглядит замершим — ровно в тот момент,
+            # когда в него смотрят, чтобы понять, пережил ли он обновление.
+            os.execv(sys.executable, [sys.executable, "-u", "-m", "promptpilot", "worker"])
 
         if db.is_paused() or len(in_flight) >= CONCURRENCY:
             time.sleep(POLL_INTERVAL)

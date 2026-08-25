@@ -88,6 +88,16 @@ class HerdrPlaceTest(unittest.TestCase):
             self.assertEqual(asyncio.run(bot._herdr_place_maps("", None)), ({}, {}))
         self.assertEqual(bot._HERDR_PLACES, {})
 
+    def test_half_answer_is_used_but_not_cached(self):
+        """Полкарты в кэше на весь TTL молча отрезали бы вкладку от адреса —
+        и это выглядело бы как «у панели нет имени», а не как сбой herdr."""
+        with mock.patch.object(bot, "_herdr_json",
+                               _herdr_stub({("workspace", "list"): WORKSPACES})):
+            ws_labels, tab_labels = asyncio.run(bot._herdr_place_maps("", None))
+        self.assertEqual(ws_labels["w9"], "PromptPilot")   # что знаем — отдаём
+        self.assertEqual(tab_labels, {})
+        self.assertEqual(bot._HERDR_PLACES, {})            # но не запоминаем
+
 
 class HerdrNotifyTest(unittest.TestCase):
     def setUp(self):
@@ -173,7 +183,14 @@ class HerdrFocusButtonTest(unittest.TestCase):
         self.assertNotIn("show_alert", answer.await_args.kwargs)
 
     def test_closed_pane_is_reported(self):
-        """herdr отвечает {"error": …} с кодом 0 — успех виден по result."""
+        """Настоящий herdr на закрытой панели выходит с КОДОМ 1, поэтому
+        `_herdr_json` отдаёт None — это и есть основной путь отказа."""
+        _, answer = self._press(None)
+        self.assertTrue(answer.await_args.kwargs.get("show_alert"))
+
+    def test_error_body_with_a_zero_exit_is_reported_too(self):
+        """Успех определяется наличием result, а не кодом возврата: если herdr
+        когда-нибудь ответит телом ошибки и нулём, «Фокус ✓» соврало бы."""
         _, answer = self._press({"error": {"code": "agent_not_found"}})
         self.assertTrue(answer.await_args.kwargs.get("show_alert"))
 

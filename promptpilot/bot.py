@@ -2722,12 +2722,15 @@ async def _herdr_place_maps(machine: str = "", host=None):
         return cached[1], cached[2]
     ws = await _herdr_json("workspace", "list", host=host)
     tabs = await _herdr_json("tab", "list", host=host)
-    if ws is None and tabs is None:
-        return {}, {}
     ws_labels = {w.get("workspace_id"): w.get("label") or ""
                  for w in ((ws or {}).get("result") or {}).get("workspaces") or []}
     tab_labels = {t.get("tab_id"): t.get("label") or ""
                   for t in ((tabs or {}).get("result") or {}).get("tabs") or []}
+    if ws is None or tabs is None:
+        # Отдаём то, что успели узнать, но НЕ кэшируем: половина карты, залёгшая
+        # на весь TTL, молча отрезала бы от адреса воркспейс или вкладку — и это
+        # выглядело бы как «у панели просто нет имени», а не как сбой herdr.
+        return ws_labels, tab_labels
     _HERDR_PLACES[machine] = (now, ws_labels, tab_labels)
     return ws_labels, tab_labels
 
