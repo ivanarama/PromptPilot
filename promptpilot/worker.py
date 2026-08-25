@@ -372,8 +372,28 @@ def _effective_timeout(task):
     return None if TASK_TIMEOUT == 0 else TASK_TIMEOUT
 
 
-def _maybe_recur(task):
-    """After a successful run, enqueue the next occurrence of a recurring task."""
+def _recur_after_run(task):
+    """Продлить расписание после завершившегося прогона — успешного или нет.
+
+    Раньше следующее вхождение создавалось только на успешном пути, и первое же
+    падение убивало серию навсегда и молча: 2026-08-25 merge-shepherd исчез из
+    очереди на 13 часов из-за одного rate limit. Расписание — это намерение
+    «делай каждые 2 часа», а не награда за удачный прогон.
+
+    Статус перечитываем из базы: в памяти он остался тем, с которым задачу
+    забрали. rate_limited/running сюда не попадают (прогон ещё продолжится), а
+    отменённая серия не продлевается — отмена это воля человека.
+    """
+    if not task.recurrence:
+        return
+    fresh = db.get_task(task.id)
+    if not fresh or fresh.status.value not in ("completed", "failed"):
+        return
+    _maybe_recur(fresh, failed=fresh.status.value == "failed")
+
+
+def _maybe_recur(task, failed: bool = False):
+    """Enqueue the next occurrence of a recurring task."""
     if not task.recurrence:
         return
     next_dt = db.parse_recurrence(task.recurrence)
@@ -392,6 +412,7 @@ def _maybe_recur(task):
         max_retries=task.max_retries,
         skip_permissions=task.skip_permissions,
         model=task.model,
+        effort=task.effort,
         recurrence=task.recurrence,
         tg_chat_id=task.tg_chat_id,
         task_timeout=task.task_timeout,
@@ -403,7 +424,22 @@ def _maybe_recur(task):
         keep_pane=task.keep_pane,
         worktree=task.worktree,
     ))
-    print(f"  -> Recurring: next run at {next_dt.strftime('%Y-%m-%d %H:%M UTC')}")
+    print(f"  -> Recurring: next run at {next_dt.strftime('%Y-%m-%d %H:%M UTC')}"
+          f"{' (после падения)' if failed else ''}")
+    # Продлили — но человек должен узнать, что серия работает вхолостую: молча
+    # повторять падение каждые два часа ничем не лучше молчаливой смерти.
+    if failed and task.tg_chat_id:
+        try:
+            when = next_dt.astimezone().strftime("%d.%m %H:%M")
+            db.add_notification(
+                task.tg_chat_id,
+                f"🔁 Задача #{task.id} упала, но расписание продолжено — "
+                f"следующий запуск в {when}.\n"
+                f"Если падает подряд, серию стоит починить или отменить.",
+                task_id=task.id,
+            )
+        except Exception as e:
+            print(f"  -> notify recur-after-fail failed: {e}")
 
 
 def _requeue_env_failure(task, marker: str, detail: str):
@@ -516,7 +552,6 @@ def _execute_herdr_task(task, provider_cfg, host=None, machine=None):
     db.mark_completed(task.id, outcome["output"], exit_code=0)
     text_preview = outcome["output"][:80].replace("\n", " ").strip()
     print(f"  -> Completed: {text_preview}")
-    _maybe_recur(task)
 
 
 def _wrap_ssh(remote, cmd, env_extra):
@@ -573,7 +608,8 @@ def _execute_task_inner(task):
 
     agent_prompt = effective_prompt(task)
     cmd = build_cmd(provider, agent_prompt, skip_permissions=task.skip_permissions,
-                    session_id=task.session_id, model=task.model, guard=not machine)
+                    session_id=task.session_id, model=task.model, guard=not machine,
+                    effort=task.effort)
     prompt_stdin = agent_prompt if provider_cfg.get("prompt_stdin") else None
 
     env = get_provider_env(provider)
@@ -759,8 +795,6 @@ def _execute_task_inner(task):
         if worktree.remove(wt["root"], wt["path"]):
             print(f"  -> Removed empty worktree {wt['path']}")
 
-    _maybe_recur(task)
-
 
 def execute_task(task):
     """Execute a queue task and reconcile an optional W1 workflow link.
@@ -778,6 +812,10 @@ def execute_task(task):
     try:
         return _execute_task_inner(task)
     finally:
+        try:
+            _recur_after_run(task)
+        except Exception as exc:
+            print(f"  !! не смог продлить расписание #{task.id}: {exc}", flush=True)
         try:
             workflows.sync_task(task.id)
         except Exception as exc:

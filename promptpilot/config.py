@@ -384,7 +384,7 @@ def _write_custom_providers(custom: dict):
 
 def save_provider(name: str, cmd: str = None, description: str = "", env: dict = None,
                   executor: str = None, kind: str = None, keep_pane: bool = False,
-                  models: list = None, args: list = None):
+                  models: list = None, args: list = None, effort: str = None):
     """Save a custom provider (cmd-template or executor-based) to providers.json."""
     custom = _load_custom_providers()
     entry = {"description": description}
@@ -392,6 +392,10 @@ def save_provider(name: str, cmd: str = None, description: str = "", env: dict =
         entry["models"] = models
     if args:
         entry["args"] = args
+    # Эффорт хранится полем, а не флагом в cmd/args: так его видно в форме и в
+    # списке провайдеров, и он одинаково работает для обоих типов провайдеров.
+    if (effort or "").strip().lower() in EFFORT_LEVELS:
+        entry["effort"] = effort.strip().lower()
     if executor:
         entry["executor"] = executor
         entry["kind"] = kind or "claude"
@@ -401,6 +405,12 @@ def save_provider(name: str, cmd: str = None, description: str = "", env: dict =
             entry["supports_skills"] = True
     else:
         entry["cmd"] = cmd
+        # Клон встроенного claude, собранный руками в форме, — это тот же Claude
+        # Code, и вести себя он должен так же: скилы, выбор модели, --effort,
+        # --resume. Без этой отметки провайдер выглядел «неизвестным CLI» и молча
+        # ронял всё перечисленное на пол.
+        if cmd_runs_claude(cmd):
+            entry["supports_skills"] = True
     if env:
         entry["env"] = env
     custom[name] = entry
@@ -564,8 +574,37 @@ def remove_provider(name: str) -> bool:
     return True
 
 
+# Уровни усилия рассуждений Claude Code (--effort), от дешёвого к дорогому —
+# в этом же порядке они стоят в селектах UI и в клавиатуре бота.
+EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+
+
+def provider_is_claude(cfg: dict) -> bool:
+    """Провайдер запускает Claude Code — у него свои флаги (--resume, --effort)."""
+    return bool(cfg.get("supports_skills") or cfg.get("kind") == "claude")
+
+
+def cmd_runs_claude(cmd: str) -> bool:
+    """Шаблон команды запускает сам Claude Code (с путём, .exe и кавычками)."""
+    parts = _split_cmd(cmd or "")
+    return bool(parts) and os.path.basename(parts[0]).lower().startswith("claude")
+
+
+def resolve_effort(provider_cfg: dict, task_effort: str = None) -> str:
+    """Эффорт запуска: задача → провайдер → дефолт CLI (пустая строка).
+
+    Уровня два, потому что и запросы разные: этап конвейера живёт на своём
+    эффорте постоянно (это свойство провайдера), а разовому прогону иногда
+    нужен max здесь и сейчас — не заводя ради этого клон провайдера.
+    Незнакомое значение молча игнорируется: подсунуть агенту чужой флаг
+    хуже, чем отработать на дефолте.
+    """
+    value = (task_effort or provider_cfg.get("effort") or "").strip().lower()
+    return value if value in EFFORT_LEVELS else ""
+
+
 def build_cmd(provider: str, prompt: str, skip_permissions: bool = False, session_id: str = None,
-              model: str = None, guard: bool = True):
+              model: str = None, guard: bool = True, effort: str = None):
     """Build the full command list for a provider + prompt.
 
     guard=False for a run that happens on another machine: the settings file
@@ -584,10 +623,16 @@ def build_cmd(provider: str, prompt: str, skip_permissions: bool = False, sessio
     # to codex/qwen/opencode just makes the CLI abort on an unknown argument
     # (codex spells the skip flag differently, qwen has none). --model is shared
     # by Claude and opencode, so it stays general.
-    is_claude = bool(cfg.get("supports_skills") or cfg.get("kind") == "claude")
+    is_claude = provider_is_claude(cfg)
     extras = []
     if model:
         extras += ["--model", model]
+    # --effort понимает только Claude Code (у opencode это --variant), а если
+    # флаг уже вписан в шаблон руками — второй не добавляем, чтобы не спорить
+    # с тем, что человек написал явно.
+    eff = resolve_effort(cfg, effort)
+    if eff and is_claude and "--effort" not in cmd:
+        extras += ["--effort", eff]
     if session_id and is_claude:
         extras += ["--resume", session_id]
     if skip_permissions and is_claude:

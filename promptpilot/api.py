@@ -16,7 +16,7 @@ import os
 import re as _re
 
 from . import db, workflows
-from .config import API_TOKEN, DB_DIR, get_provider_models, get_skills, load_providers, mask_secret_value, provider_available, PROJECTS_ROOT
+from .config import API_TOKEN, DB_DIR, EFFORT_LEVELS, get_provider_models, get_skills, load_providers, mask_secret_value, provider_available, PROJECTS_ROOT
 from .models import (
     CostStats,
     FindingStatus,
@@ -132,11 +132,43 @@ def api_update_task(task_id: int, update: TaskUpdate):
     if update.status is not None:
         raise HTTPException(400, "Через API поддерживается только отмена (status=cancelled)")
 
+    # Сначала проверяем ВСЁ, пишем одним запросом: иначе правка «провайдер +
+    # приоритет» с опечаткой в провайдере успевала применить приоритет и
+    # вернуть 400 — половина применена, а человеку сказано «не вышло».
+    fields = {}
     if update.priority is not None:
-        if not db.update_priority(task_id, update.priority):
-            raise HTTPException(400, "Can only reprioritize pending or rate_limited tasks")
+        fields["priority"] = update.priority
+    if update.provider is not None:
+        provider = update.provider.strip()
+        if provider and provider not in load_providers():
+            raise HTTPException(400, f"Провайдер «{provider}» не найден")
+        fields["provider"] = provider or None
+    if update.model is not None:
+        fields["model"] = update.model.strip() or None
+    if update.effort is not None:
+        effort = update.effort.strip().lower()
+        if effort and effort not in EFFORT_LEVELS:
+            raise HTTPException(400, f"Эффорт: {', '.join(EFFORT_LEVELS)} или пусто")
+        fields["effort"] = effort or None
+    if update.recurrence is not None:
+        recurrence = update.recurrence.strip()
+        if recurrence and db.parse_recurrence(recurrence) is None:
+            raise HTTPException(400, "Повтор не разобран: «6h», «90m», «daily@09:00»")
+        fields["recurrence"] = recurrence or None
+    if update.scheduled_at is not None:
+        fields["scheduled_at"] = update.scheduled_at
+    if update.working_dir is not None:
+        fields["working_dir"] = update.working_dir.strip() or None
+    if fields and not db.update_task_fields(task_id, fields):
+        raise HTTPException(400, "Править можно только задачу в очереди (pending/rate_limited)")
 
     return {"ok": True}
+
+
+@app.get("/api/schedule")
+def api_schedule():
+    """Повторяющиеся задачи как серии: период, следующий запуск, исход прошлого."""
+    return db.list_series()
 
 
 @app.delete("/api/tasks/{task_id}", response_model=dict)
@@ -540,6 +572,9 @@ def api_providers():
             # Dynamic discovery for Claude-type providers (cached); falls back to
             # the provider's own list or the sonnet/opus/haiku tiers.
             "models": get_provider_models(name),
+            # Эффорт провайдера — дефолт, который мастер показывает как
+            # «по умолчанию» и который задача может перекрыть.
+            "effort": info.get("effort", ""),
             "available": provider_available(info),
             "hidden": bool(info.get("hidden")),
             "executor": info.get("executor", ""),
@@ -662,6 +697,7 @@ class ProviderCreate(_BaseModel):
     env: dict = {}
     models: list = []
     args: list = []
+    effort: Optional[str] = None
 
 
 @app.get("/api/providers/manage")
@@ -678,6 +714,7 @@ def api_providers_manage():
             "keep_pane": bool(info.get("keep_pane")),
             "models": info.get("models") or [],
             "args": info.get("args") or [],
+            "effort": info.get("effort", ""),
             "supports_skills": info.get("supports_skills", False),
             "env": {k: mask_secret_value(k, v) for k, v in (info.get("env") or {}).items()},
             "available": provider_available(info),
@@ -711,12 +748,14 @@ def api_provider_create(p: ProviderCreate):
             raise HTTPException(400, "Поддерживаемый executor: herdr")
         save_provider(p.name, description=p.description, env=p.env or None,
                       executor=p.executor, kind=p.kind, keep_pane=p.keep_pane,
-                      models=p.models or None, args=p.args or None)
+                      models=p.models or None, args=p.args or None, effort=p.effort)
     else:
         if not p.cmd or "{prompt}" not in p.cmd:
             raise HTTPException(400, "cmd обязателен и должен содержать {prompt}")
+        # Остальные флаги cmd-провайдера живут в шаблоне, а эффорт — поле:
+        # он единственный, который приходится менять от этапа к этапу.
         save_provider(p.name, p.cmd, p.description, env=p.env or None,
-                      models=p.models or None)  # for cmd providers flags live in cmd
+                      models=p.models or None, effort=p.effort)
     return {"ok": True}
 
 

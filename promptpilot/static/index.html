@@ -496,6 +496,9 @@
       <label id="modelLabel" style="display:none">Model
         <select id="modelInput"></select>
       </label>
+      <label id="effortLabel" style="display:none">Effort
+        <select id="effortInput"></select>
+      </label>
       <label id="machineLabel" style="display:none">Машина
         <select id="machineInput" onchange="updateProvidersForMachine()"></select>
       </label>
@@ -553,10 +556,22 @@
     <button class="filter-btn" data-filter="failed">Failed</button>
     <button class="filter-btn" data-filter="rate_limited">Rate Limited</button>
     <button id="pauseBtn" class="btn-pause" onclick="toggleWorkerPause()" style="margin-left:auto">⏸ Pause</button>
+    <button class="btn-pause" onclick="openSchedule()" style="margin-left:8px">🗓 Расписание</button>
     <button class="btn-pause" onclick="openProviders()" style="margin-left:8px">⚙ Providers</button>
   </div>
 
   <div class="task-list" id="taskList"></div>
+</div>
+
+<div class="modal-overlay" id="schedModal" onclick="if(event.target===this)closeSchedule()">
+  <div class="modal">
+    <h2>Расписание <button class="btn btn-sm btn-ghost" style="margin-left:auto" onclick="closeSchedule()">✕ Закрыть</button></h2>
+    <div style="font-size:12px; color:var(--muted); margin-bottom:10px">
+      Повторяющиеся задачи, собранные в серии. Серия без запланированного вхождения
+      («оборвана») сама не продолжится — её надо запустить заново.
+    </div>
+    <div id="schedList"></div>
+  </div>
 </div>
 
 <div class="modal-overlay" id="provModal" onclick="if(event.target===this)closeProviders()">
@@ -582,10 +597,20 @@
       <input id="pfCmd" placeholder='например: myai run {prompt}'>
       <div id="pfHerdr" style="display:none; flex-direction:column; gap:8px">
         <input id="pfKind" placeholder="агент: claude, codex, gemini, cursor, opencode, grok...">
-        <input id="pfArgs" placeholder='доп. аргументы CLI агента, например: --effort max'>
+        <input id="pfArgs" placeholder='доп. аргументы CLI агента, например: --model opus'>
         <label><input type="checkbox" id="pfKeep"> Оставлять сессию открытой после задачи (keep pane)</label>
       </div>
       <input id="pfModels" placeholder="модели для выбора (через запятую), например: opencode/big-pickle, opencode/mimo-v2.5-free">
+      <label style="display:flex; align-items:center; gap:8px">Эффорт (Claude Code)
+        <select id="pfEffort">
+          <option value="">по умолчанию CLI</option>
+          <option value="low">low</option>
+          <option value="medium">medium</option>
+          <option value="high">high</option>
+          <option value="xhigh">xhigh</option>
+          <option value="max">max</option>
+        </select>
+      </label>
       <textarea id="pfEnv" rows="2" placeholder="переменные окружения, по одной на строку: KEY=VALUE"></textarea>
       <button class="btn btn-primary" type="submit" style="align-self:flex-start">Сохранить</button>
       <div id="pfError" style="color:var(--red); font-size:13px"></div>
@@ -812,12 +837,27 @@ async function loadTasks() {
           </div>
         ` : ''}
 
+        ${t.effort ? `<div class="detail-info"><span class="label">Effort: </span><span>${esc(t.effort)}</span></div>` : ''}
         ${t.recurrence ? `<div class="detail-info"><span class="label">Recurrence: </span><span>${esc(t.recurrence)}</span></div>` : ''}
         ${t.scheduled_at ? `<div class="detail-info"><span class="label">Scheduled: </span><span>${new Date(t.scheduled_at).toLocaleString()}</span></div>` : ''}
         ${t.started_at ? `<div class="detail-info"><span class="label">Started: </span><span>${new Date(t.started_at).toLocaleString()}</span></div>` : ''}
         ${t.completed_at ? `<div class="detail-info"><span class="label">Completed: </span><span>${new Date(t.completed_at).toLocaleString()}</span></div>` : ''}
         ${t.next_run_at ? `<div class="detail-info"><span class="label">Next retry: </span><span>${new Date(t.next_run_at).toLocaleString()}</span></div>` : ''}
         <div class="detail-info"><span class="label">Retries: </span><span>${t.retry_count}/${t.max_retries}</span>${t.exit_code !== null ? ` <span class="label">| Exit: </span><span>${t.exit_code}</span>` : ''}</div>
+
+        ${['pending','rate_limited'].includes(t.status) ? `
+          <div class="detail-label" style="margin-top:10px">Изменить (пока задача в очереди)</div>
+          <div class="detail-actions" style="flex-wrap:wrap; gap:6px" onclick="event.stopPropagation()">
+            <select id="ed-prov-${t.id}" title="провайдер">${providerOptions(t.provider)}</select>
+            <select id="ed-eff-${t.id}" title="эффорт">${effortOptions(t.effort)}</select>
+            <input id="ed-model-${t.id}" value="${escAttr(t.model || '')}" placeholder="модель"
+                   style="width:110px; background:var(--surface2); border:1px solid var(--border); border-radius:6px; color:inherit; padding:5px 8px; font-size:12px">
+            <input id="ed-rec-${t.id}" value="${escAttr(t.recurrence || '')}" placeholder="повтор: 6h"
+                   style="width:100px; background:var(--surface2); border:1px solid var(--border); border-radius:6px; color:inherit; padding:5px 8px; font-size:12px">
+            <input id="ed-pri-${t.id}" type="number" min="1" max="10" value="${t.priority}" title="приоритет"
+                   style="width:60px; background:var(--surface2); border:1px solid var(--border); border-radius:6px; color:inherit; padding:5px 8px; font-size:12px">
+            <button class="btn btn-sm btn-primary" onclick="saveTaskEdit(event,${t.id})">Сохранить</button>
+          </div>` : ''}
 
         <div class="detail-actions">
           ${['pending','rate_limited','running'].includes(t.status) ? `<button class="btn btn-sm btn-ghost" onclick="cancelTask(event,${t.id})">Cancel</button>` : ''}
@@ -833,6 +873,42 @@ async function loadTasks() {
   if (sc && screenCache[expandedId]) sc.scrollTop = sc.scrollHeight;
 }
 
+function providerOptions(current) {
+  return Object.entries(providersData)
+    .filter(([name, p]) => !p.hidden || name === current)
+    .map(([name]) => `<option value="${escAttr(name)}"${name === current ? ' selected' : ''}>${esc(name)}</option>`)
+    .join('');
+}
+
+function effortOptions(current) {
+  return [['', 'эффорт: по умолчанию'], ...EFFORT_LEVELS.map(l => [l, l])]
+    .map(([v, label]) => `<option value="${v}"${v === (current || '') ? ' selected' : ''}>${esc(label)}</option>`)
+    .join('');
+}
+
+// Правка задачи, ещё стоящей в очереди: раньше сменить провайдера или эффорт у
+// повторяющейся задачи можно было только пересозданием, теряя tg_chat_id и время
+// следующего запуска.
+async function saveTaskEdit(event, id) {
+  event.stopPropagation();
+  const val = pfx => document.getElementById(`ed-${pfx}-${id}`).value.trim();
+  try {
+    await fetchJSON(`${API}/tasks/${id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        provider: val('prov'), effort: val('eff'), model: val('model'),
+        recurrence: val('rec'), priority: parseInt(val('pri')) || 5,
+      }),
+    });
+  } catch (e) {
+    toast('Не удалось сохранить: ' + e.message);
+    return;
+  }
+  toast('Задача изменена', false);
+  refresh();
+}
+
 async function addTask() {
   let prompt = document.getElementById('promptInput').value.trim();
   if (!prompt) {
@@ -846,6 +922,7 @@ async function addTask() {
   const schedule = document.getElementById('scheduleInput').value || null;
   const provider = document.getElementById('providerInput').value || null;
   const model = document.getElementById('modelInput').value || null;
+  const effort = document.getElementById('effortInput').value || null;
   const sel = document.getElementById('workdirSelect');
   const selVal = sel.style.display !== 'none' && sel.value && sel.value !== '__custom__' ? sel.value : null;
   const workdir = selVal || document.getElementById('workdirInput').value.trim() || null;
@@ -879,6 +956,7 @@ async function addTask() {
         prompt,
         provider,
         model,
+        effort,
         priority,
         working_dir: workdir,
         skip_permissions: skipPermissions,
@@ -1066,6 +1144,43 @@ document.getElementById('filterBar').addEventListener('click', e => {
 
 // --- Helpers ---
 // --- Providers settings modal ---
+const STATUS_RU = { completed: 'успех', failed: 'падение', cancelled: 'отменена',
+                    pending: 'в очереди', running: 'идёт', rate_limited: 'ждёт лимита' };
+
+async function openSchedule() {
+  document.getElementById('schedModal').classList.add('open');
+  const box = document.getElementById('schedList');
+  box.innerHTML = 'Загрузка…';
+  let series;
+  try { series = await fetchJSON(`${API}/schedule`); }
+  catch (e) { box.innerHTML = `<div style="color:var(--red)">Не удалось загрузить: ${esc(e.message)}</div>`; return; }
+  if (!series.length) { box.innerHTML = '<div style="color:var(--muted)">Повторяющихся задач нет.</div>'; return; }
+  const when = s => s ? new Date(s).toLocaleString() : '—';
+  box.innerHTML = series.map(s => {
+    const params = [s.provider || 'по умолчанию', s.model, s.effort && `эффорт ${s.effort}`,
+                    s.machine, `приоритет ${s.priority}`].filter(Boolean).join(' · ');
+    const last = s.last_task_id
+      ? esc(`#${s.last_task_id} — ${STATUS_RU[s.last_status] || s.last_status}`
+            + (s.last_verdict ? ` (${s.last_verdict})` : '') + `, ${when(s.last_at)}`)
+      : 'ещё не запускалась';
+    const next = s.broken
+      ? '<span style="color:var(--red)">серия оборвана — следующего запуска нет</span>'
+      : `#${s.next_task_id} — ${STATUS_RU[s.next_status] || s.next_status}, ${when(s.next_run_at)}`;
+    return `<div class="prov-row${s.broken ? '' : ''}">
+      <span class="prov-name">${esc(s.prompt.slice(0, 60))}</span>
+      <span class="prov-badge">каждые ${esc(s.recurrence)}</span>
+      <span class="prov-badge">прогонов: ${s.runs}</span>
+      ${s.broken ? '<span class="prov-badge" style="color:var(--red)">оборвана</span>' : ''}
+      <div class="prov-cmd">${esc(s.working_dir || 'без директории')}</div>
+      <div class="prov-cmd">${esc(params)}</div>
+      <div class="prov-cmd">След.: ${next}</div>
+      <div class="prov-cmd">Прошлый: ${last}</div>
+    </div>`;
+  }).join('');
+}
+
+function closeSchedule() { document.getElementById('schedModal').classList.remove('open'); }
+
 async function openProviders() {
   document.getElementById('provModal').classList.add('open');
   await renderProvList();
@@ -1086,7 +1201,8 @@ async function renderProvList() {
     const what = (p.executor
       ? `executor: ${esc(p.executor)}, агент: ${esc(p.kind || 'claude')}${p.keep_pane ? ', keep pane' : ''}`
       : esc(p.cmd))
-      + (p.models && p.models.length ? `<br>модели: ${esc(p.models.join(', '))}` : '');
+      + (p.models && p.models.length ? `<br>модели: ${esc(p.models.join(', '))}` : '')
+      + (p.effort ? `<br>эффорт: ${esc(p.effort)}` : '');
     const canDelete = p.source !== 'builtin';
     return `<div class="prov-row${(!p.available || p.hidden) ? ' dim' : ''}">
       <span class="prov-name">${esc(name)}</span>${badges.join('')}
@@ -1126,6 +1242,7 @@ function provEdit(name) {
   document.getElementById('pfArgs').value = (p.args || []).join(' ');
   document.getElementById('pfKeep').checked = !!p.keep_pane;
   document.getElementById('pfModels').value = (p.models || []).join(', ');
+  document.getElementById('pfEffort').value = p.effort || '';
   window.pfSourceName = name;
   document.getElementById('pfEnv').value = Object.entries(p.env || {})
     .map(([k, v]) => `${k}=${v}`).join('\n');
@@ -1197,6 +1314,7 @@ async function provAdd(e) {
     description: document.getElementById('pfDesc').value.trim(),
     env,
     models: document.getElementById('pfModels').value.split(',').map(s => s.trim()).filter(Boolean),
+    effort: document.getElementById('pfEffort').value || null,
   };
   if (herdr) {
     body.executor = 'herdr';
@@ -1220,6 +1338,7 @@ async function provAdd(e) {
     document.getElementById('pfEnv').value = '';
     document.getElementById('pfModels').value = '';
     document.getElementById('pfArgs').value = '';
+    document.getElementById('pfEffort').value = '';
     window.pfSourceName = null;
     await renderProvList();
     await loadProviders();
@@ -1319,7 +1438,7 @@ function updateProvidersForMachine() {
     .filter(([name, info]) => !info.hidden && (allowed ? allowed.includes(name) : info.available !== false))
     .map(([name, info]) => `<option value="${escAttr(name)}">${esc(name)} — ${esc(info.description || info)}</option>`)
     .join('');
-  updateSkillsToggle(); updateModelSelect(); updateKeepPane();
+  updateSkillsToggle(); updateModelSelect(); updateEffortSelect(); updateKeepPane();
 }
 
 async function loadProviders() {
@@ -1330,9 +1449,10 @@ async function loadProviders() {
     .filter(([name, info]) => info.available !== false && !info.hidden)
     .map(([name, info]) => `<option value="${escAttr(name)}">${esc(name)} — ${esc(info.description || info)}</option>`)
     .join('');
-  sel.addEventListener('change', () => { skillsCache = {}; updateSkillsToggle(); closeSkillsPanel(); updateModelSelect(); updateKeepPane(); });
+  sel.addEventListener('change', () => { skillsCache = {}; updateSkillsToggle(); closeSkillsPanel(); updateModelSelect(); updateEffortSelect(); updateKeepPane(); });
   updateSkillsToggle();
   updateModelSelect();
+  updateEffortSelect();
   updateKeepPane();
 }
 
@@ -1400,6 +1520,27 @@ function updateModelSelect() {
     label.style.display = 'none';
     modelSel.value = '';
   }
+}
+
+// Эффорт показываем только у Claude-провайдеров: у остальных агентов флага
+// --effort нет. В «по умолчанию» подписан уровень провайдера, чтобы было видно,
+// что унаследует задача, если ничего не выбирать.
+const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'];
+
+function updateEffortSelect() {
+  const sel = document.getElementById('providerInput');
+  const prov = providersData[sel ? sel.value : ''] || {};
+  const label = document.getElementById('effortLabel');
+  const effSel = document.getElementById('effortInput');
+  if (!prov.supports_skills) {
+    label.style.display = 'none';
+    effSel.value = '';
+    return;
+  }
+  const inherited = prov.effort ? `по умолчанию (${prov.effort})` : 'по умолчанию';
+  effSel.innerHTML = `<option value="">${esc(inherited)}</option>` +
+    EFFORT_LEVELS.map(l => `<option value="${l}">${l}</option>`).join('');
+  label.style.display = '';
 }
 
 function updateSkillsToggle() {
