@@ -1213,6 +1213,18 @@ function openWorkflows() {
 
 function closeWorkflows() { document.getElementById('workflowModal').classList.remove('open'); }
 
+let workflowAutoRefreshBusy = false;
+async function autoRefreshWorkflowState() {
+  const modal = document.getElementById('workflowModal');
+  if (!modal?.classList.contains('open') || !selectedWorkflowId || workflowAutoRefreshBusy) return;
+  const active = document.activeElement;
+  // Never erase a prompt/decision while the user is typing or selecting it.
+  if (active && document.getElementById('wfDetail')?.contains(active)
+      && ['INPUT','TEXTAREA','SELECT'].includes(active.tagName)) return;
+  workflowAutoRefreshBusy = true;
+  try { await loadWorkflows(); } finally { workflowAutoRefreshBusy = false; }
+}
+
 function toggleWorkflowCreate() {
   const form = document.getElementById('wfCreateForm');
   form.style.display = form.style.display === 'none' ? 'grid' : 'none';
@@ -2086,6 +2098,7 @@ refresh();
 setInterval(refresh, 5000);
 setInterval(() => pollScreen(), 4000);  // только для раскрытой карточки с herdr-панелью
 setInterval(() => wfRefreshScreen(), 4000);  // экран активного task прямо в workflow
+setInterval(() => autoRefreshWorkflowState(), 5000);  // стадия, раунды и runs без ручного «Обновить»
 setInterval(loadWorkerStatus, 10000);
 setInterval(loadCosts, 30000);
 </script>
