@@ -178,6 +178,36 @@ def init_db():
                 pass  # Column already exists
 
 
+def next_occurrence(task: TaskInDB, scheduled_at: datetime, prompt: str = None,
+                    tg_chat_id: int = None) -> TaskCreate:
+    """Следующее вхождение серии — что переносится из прошлого прогона.
+
+    Где и как задача выполнялась — часть расписания, а не одного прогона: без
+    machine/keep_pane/worktree серия на втором запуске тихо съезжает на эту
+    машину, в общее рабочее дерево и в закрывающуюся панель. Живёт здесь, а не
+    в воркере, потому что продлевать серию умеет и бот (кнопка «Возобновить»),
+    и два списка полей неизбежно разъехались бы.
+    """
+    return TaskCreate(
+        prompt=task.prompt if prompt is None else prompt,
+        working_dir=task.working_dir,
+        provider=task.provider,
+        priority=task.priority,
+        scheduled_at=scheduled_at,
+        max_retries=task.max_retries,
+        skip_permissions=task.skip_permissions,
+        model=task.model,
+        effort=task.effort,
+        recurrence=task.recurrence,
+        tg_chat_id=task.tg_chat_id if tg_chat_id is None else tg_chat_id,
+        task_timeout=task.task_timeout,
+        detached=task.detached,
+        machine=task.machine,
+        keep_pane=task.keep_pane,
+        worktree=task.worktree,
+    )
+
+
 def create_task(task: TaskCreate) -> TaskInDB:
     with _connect() as conn:
         cur = conn.execute(

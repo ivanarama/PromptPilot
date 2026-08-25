@@ -14,7 +14,7 @@ import shutil
 import time
 import unicodedata
 import uuid
-from datetime import timezone
+from datetime import datetime, timezone
 from typing import Optional
 
 from telegram import (
@@ -42,7 +42,8 @@ from .config import (
     DEFAULT_CLI, HERDR_RENOTIFY_COOLDOWN, HERDR_WATCH, HERDR_WATCH_INTERVAL, LOG_PROMPTS,
     get_provider_models, get_proxy_url, get_skills, load_machines, load_providers,
     load_providers_detailed, mask_proxy_url, pickable_providers,
-    PROJECTS_ROOT, TASK_PASSWORD, EFFORT_LEVELS, provider_is_claude,
+    PROJECTS_ROOT, SCHEDULE_WATCH_INTERVAL, TASK_PASSWORD, EFFORT_LEVELS,
+    provider_is_claude,
 )
 from .models import TaskCreate
 from .tg_auth import authorize_user, is_authorized, list_authorized, load_allowed_phones
@@ -101,7 +102,7 @@ def _main_menu() -> ReplyKeyboardMarkup:
         [
             ["📋 Задачи", "🖥 Окна", "➕ Добавить задачу"],
             ["📊 Статистика", "🔌 Провайдеры", "⚡ Скилы"],
-            [pause_label],
+            ["🗓 Расписание", pause_label],
         ],
         resize_keyboard=True,
     )
@@ -2965,6 +2966,273 @@ async def show_windows(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _render_windows(update.message.reply_text, context)
 
 
+# ---------------------------------------------------------------------------
+# Расписание: серии повторяющихся задач
+# ---------------------------------------------------------------------------
+
+def _series_handle(s: dict) -> int:
+    """Id вхождения, по которому серия находится снова.
+
+    Серии как объекта в базе нет, поэтому кнопка носит id её ближайшего (или
+    последнего) вхождения: индекс в списке протух бы при первом же продлении.
+    """
+    return s.get("next_task_id") or s.get("last_task_id")
+
+
+def _find_series(handle: int) -> Optional[dict]:
+    for s in db.list_series():
+        if _series_handle(s) == handle:
+            return s
+    return None
+
+
+def _series_when(value) -> str:
+    """Время из строки серии: list_series отдаёт сырые ISO-строки из базы."""
+    if not value:
+        return "—"
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value)
+        except ValueError:
+            return value
+    return _local_str(value)
+
+
+def _schedule_screen():
+    """(text, keyboard) для списка серий."""
+    try:
+        series = db.list_series()
+    except Exception as e:
+        logger.warning("расписание: чтение серий упало: %s", e)
+        return "Не удалось прочитать расписание.", None
+    if not series:
+        return ("🗓 Повторяющихся задач нет.\n"
+                "Повтор задаётся при создании задачи («⚙ Дополнительно» → Повтор).", None)
+
+    lines = ["*🗓 Расписание*\n"]
+    buttons = []
+    for s in series:
+        head = s["prompt"].strip().splitlines()[0][:40]
+        mark = "🔴" if s["broken"] else "🔁"
+        when = ("оборвана" if s["broken"]
+                else f"след. {_series_when(s['next_run_at'])}")
+        lines.append(f"{mark} `{_esc_code(head)}` — каждые {_esc(s['recurrence'])}, {_esc(when)}")
+        buttons.append([InlineKeyboardButton(f"{mark} {head[:28]} · {s['recurrence']}",
+                                             callback_data=f"ser:{_series_handle(s)}")])
+    broken = sum(1 for s in series if s["broken"])
+    if broken:
+        lines.append(f"\n🔴 оборвано серий: {broken} — сами не продолжатся\\.")
+    buttons.append([InlineKeyboardButton("↻ Обновить", callback_data="ser_list")])
+    return "\n".join(lines), InlineKeyboardMarkup(buttons)
+
+
+def _series_card(s: dict):
+    """(text, keyboard) карточки одной серии."""
+    params = " · ".join(filter(None, [
+        s["provider"] or "провайдер по умолчанию", s["model"],
+        f"эффорт {s['effort']}" if s["effort"] else None,
+        s["machine"], f"приоритет {s['priority']}",
+    ]))
+    last = "ещё не запускалась"
+    if s["last_task_id"]:
+        verdict = f" ({s['last_verdict']})" if s["last_verdict"] else ""
+        last = (f"#{s['last_task_id']} — {STATUS_RU.get(s['last_status'], s['last_status'])}"
+                f"{verdict}, {_series_when(s['last_at'])}")
+    if s["broken"]:
+        nxt = "🔴 серия оборвана — следующего запуска нет"
+    else:
+        nxt = (f"#{s['next_task_id']} — {STATUS_RU.get(s['next_status'], s['next_status'])}, "
+               f"{_series_when(s['next_run_at'])}")
+
+    text = (f"*🗓 Серия*\n\n`{_esc_code(s['prompt'][:300])}`\n\n"
+            f"Каждые {_esc(s['recurrence'])} · прогонов: {s['runs']}\n"
+            f"📁 {_esc(s['working_dir'] or 'без директории')}\n"
+            f"⚙ {_esc(params)}\n\n"
+            f"След\\.: {_esc(nxt)}\n"
+            f"Прошлый: {_esc(last)}")
+
+    handle = _series_handle(s)
+    rows = []
+    if s["broken"]:
+        rows.append([InlineKeyboardButton("🔁 Возобновить серию",
+                                          callback_data=f"ser_resume:{handle}")])
+    else:
+        rows.append([
+            InlineKeyboardButton("▶️ Запустить сейчас", callback_data=f"ser_now:{handle}"),
+            InlineKeyboardButton("✖️ Остановить", callback_data=f"ser_stop:{handle}"),
+        ])
+    if s["last_task_id"]:
+        rows.append([InlineKeyboardButton(f"📋 Прошлый прогон #{s['last_task_id']}",
+                                          callback_data=f"task:{s['last_task_id']}")])
+    rows.append([InlineKeyboardButton(BACK_LABEL, callback_data="ser_list")])
+    return text, InlineKeyboardMarkup(rows)
+
+
+@require_auth
+async def show_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Экран «🗓 Расписание» — то же, что видно в вебе, но с телефона.
+
+    Признак «оборвана» раньше был виден только из браузера: ровно тот случай,
+    когда конвейер молча стоит, а бот выглядит так же, как при «делать нечего».
+    """
+    text, kb = _schedule_screen()
+    await update.message.reply_text(text, parse_mode="MarkdownV2" if kb else None,
+                                    reply_markup=kb or _main_menu())
+
+
+@require_auth
+async def cb_sched_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    text, kb = _schedule_screen()
+    await query.edit_message_text(text, parse_mode="MarkdownV2" if kb else None,
+                                  reply_markup=kb)
+
+
+@require_auth
+async def cb_sched_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    handle = int(query.data.split(":", 1)[1])
+    series = _find_series(handle)
+    if not series:
+        await query.answer("Серия изменилась — обновляю список.", show_alert=True)
+        return await cb_sched_list(update, context)
+    await query.answer()
+    text, kb = _series_card(series)
+    await query.edit_message_text(text, parse_mode="MarkdownV2", reply_markup=kb)
+
+
+@require_auth
+async def cb_sched_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Сдвинуть ближайшее вхождение на сейчас — воркер возьмёт его на ближайшем опросе."""
+    query = update.callback_query
+    handle = int(query.data.split(":", 1)[1])
+    series = _find_series(handle)
+    if not series or not series["next_task_id"]:
+        await query.answer("Нечего запускать — у серии нет следующего вхождения.", show_alert=True)
+        return await cb_sched_list(update, context)
+    ok = db.update_task_fields(series["next_task_id"],
+                               {"scheduled_at": datetime.now(timezone.utc)})
+    await query.answer("Запускаю" if ok else "Уже выполняется — трогать нечего", show_alert=not ok)
+    refreshed = _find_series(handle)
+    if refreshed:
+        text, kb = _series_card(refreshed)
+        await query.edit_message_text(text, parse_mode="MarkdownV2", reply_markup=kb)
+
+
+@require_auth
+async def cb_sched_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отменить ближайшее вхождение: серия без него не продолжится."""
+    query = update.callback_query
+    handle = int(query.data.split(":", 1)[1])
+    series = _find_series(handle)
+    if not series or not series["next_task_id"]:
+        await query.answer("У серии нет следующего вхождения.", show_alert=True)
+        return await cb_sched_list(update, context)
+    task_id = series["next_task_id"]
+    if series["next_status"] == "running":
+        ok = db.request_cancel(task_id)
+    else:
+        ok = db.cancel_task(task_id)
+    # Отменённая серия — решение человека, а не обрыв: сторож о ней молчит.
+    if ok:
+        _mark_break_seen(series, reason="cancelled")
+    await query.answer("Серия остановлена" if ok else "Не вышло отменить", show_alert=not ok)
+    text, kb = _schedule_screen()
+    await query.edit_message_text(text, parse_mode="MarkdownV2" if kb else None, reply_markup=kb)
+
+
+@require_auth
+async def cb_sched_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Завести новое вхождение оборванной серии — теми же параметрами."""
+    query = update.callback_query
+    handle = int(query.data.split(":", 1)[1])
+    series = _find_series(handle)
+    source_id = series["last_task_id"] if series else None
+    task = db.get_task(source_id) if source_id else None
+    if not task:
+        await query.answer("Не нашёл прошлый прогон серии.", show_alert=True)
+        return await cb_sched_list(update, context)
+    new = db.create_task(db.next_occurrence(
+        task, datetime.now(timezone.utc), tg_chat_id=query.message.chat_id))
+    _mark_break_seen(series, reason="resumed")
+    await query.answer(f"Серия продолжена задачей #{new.id}")
+    refreshed = _find_series(_series_handle(series)) or _find_series(new.id)
+    if refreshed:
+        text, kb = _series_card(refreshed)
+        await query.edit_message_text(text, parse_mode="MarkdownV2", reply_markup=kb)
+
+
+# --- сторож обрыва серии -----------------------------------------------------
+
+def _break_key(series: dict) -> str:
+    import hashlib
+    raw = f"{series['prompt']}\x00{series['working_dir'] or ''}"
+    return "sched_break:" + hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _mark_break_seen(series: Optional[dict], reason: str):
+    """Запомнить, что об этом обрыве говорить не нужно (или уже сказано)."""
+    if not series:
+        return
+    try:
+        db.set_setting(_break_key(series), f"{reason}:{series.get('last_task_id') or 0}")
+    except Exception as e:
+        logger.warning("расписание: не смог отметить обрыв: %s", e)
+
+
+async def _schedule_watch_loop(bot):
+    """Раз в SCHEDULE_WATCH_INTERVAL проверяет, не оборвалась ли серия.
+
+    Молчание бота сейчас неотличимо от «всё в порядке, делать нечего» — а
+    серия без запланированного вхождения не продолжится сама. Отменённые
+    руками сериями не считаются: их обрыв — решение человека.
+    """
+    import asyncio
+    while True:
+        await asyncio.sleep(SCHEDULE_WATCH_INTERVAL)
+        try:
+            await _schedule_watch_tick(bot)
+        except Exception as e:  # один плохой тик не должен убивать сторожа
+            logger.warning("schedule watch tick упал: %s", e)
+
+
+async def _schedule_watch_tick(bot):
+    for s in db.list_series():
+        if not s["broken"] or s["last_status"] not in ("completed", "failed"):
+            continue
+        chat_id = None
+        last = db.get_task(s["last_task_id"]) if s["last_task_id"] else None
+        if last:
+            chat_id = last.tg_chat_id
+        if not chat_id:
+            continue  # некому писать: у серии нет адресата
+        key = _break_key(s)
+        stamp = f"broken:{s['last_task_id'] or 0}"
+        try:
+            if db.get_setting(key) in (stamp, f"cancelled:{s['last_task_id'] or 0}"):
+                continue
+        except Exception as e:
+            logger.warning("расписание: чтение отметки обрыва упало: %s", e)
+            continue
+        head = s["prompt"].strip().splitlines()[0][:60]
+        text = (f"🔴 Серия «{head}» оборвана: следующего запуска нет.\n"
+                f"Прошлый прогон #{s['last_task_id']} — "
+                f"{STATUS_RU.get(s['last_status'], s['last_status'])}, "
+                f"{_series_when(s['last_at'])}.\n"
+                f"Каждые {s['recurrence']} · прогонов: {s['runs']}\n\n"
+                f"Сама она не продолжится.")
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔁 Возобновить", callback_data=f"ser_resume:{_series_handle(s)}"),
+            InlineKeyboardButton("🗓 Расписание", callback_data="ser_list"),
+        ]])
+        try:
+            await bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
+            db.set_setting(key, stamp)
+        except Exception as e:
+            logger.warning("расписание: уведомление об обрыве не ушло: %s", e)
+
+
 async def _render_window_card(query, context, idx: int) -> str:
     """Render one pane's card; returns toast text (answering is the caller's
     job — a second query.answer() on the same press is silently lost)."""
@@ -3177,10 +3445,12 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "➕ Добавить задачу — мастер: промпт → где выполнить → папка → 🚀 Запустить\n"
         "   (приоритет, права, worktree, повтор, отложенный запуск — «⚙ Дополнительно»)\n"
         "📊 Статистика — сводка по статусам и расходы\n"
+        "🗓 Расписание — серии повторяющихся задач: следующий запуск, исход "
+        "прошлого, «оборвана»; запустить сейчас, остановить, возобновить\n"
         "🔌 Провайдеры — список и настройки\n"
         "⚡ Скилы — запустить /skill Claude Code\n"
         "⏸ Пауза — приостановить воркер без потери задач\n\n"
-        "Команды: /tasks, /windows, /add, /stats, /providers, /pause, /skills, /help\n"
+        "Команды: /tasks, /windows, /add, /stats, /schedule, /providers, /pause, /skills, /help\n"
         "/cancel — прервать текущий мастер или диалог\n\n"
         "Совет: задайте PP_PROJECTS_ROOT в .env — рабочую папку можно будет "
         "выбирать кнопками, а не печатать путь.",
@@ -3208,6 +3478,7 @@ def run_bot():
                 BotCommand("stats", "Статистика"),
                 BotCommand("providers", "Провайдеры"),
                 BotCommand("pause", "Пауза / продолжить воркер"),
+                BotCommand("schedule", "Расписание: серии повторяющихся задач"),
                 BotCommand("skills", "Скилы Claude Code"),
                 BotCommand("help", "Помощь"),
                 BotCommand("cancel", "Отменить текущий диалог"),
@@ -3218,6 +3489,8 @@ def run_bot():
         asyncio.create_task(_notify_loop(application.bot))
         if HERDR_WATCH:
             asyncio.create_task(_herdr_watch_loop(application.bot))
+        if SCHEDULE_WATCH_INTERVAL > 0:
+            asyncio.create_task(_schedule_watch_loop(application.bot))
 
     # The wizard survives a bot restart: without persistence every inline
     # button of a half-finished wizard died silently after redeploy.
@@ -3424,6 +3697,7 @@ def run_bot():
     app.add_handler(CommandHandler("stats", show_stats))
     app.add_handler(CommandHandler("providers", show_providers))
     app.add_handler(CommandHandler("pause", toggle_pause))
+    app.add_handler(CommandHandler("schedule", show_schedule))
     app.add_handler(MessageHandler(filters.CONTACT, handle_contact))
     app.add_handler(herdr_reply_conv)
     app.add_handler(reply_conv)
@@ -3433,7 +3707,13 @@ def run_bot():
     app.add_handler(MessageHandler(filters.Regex("^📊 Статистика$"), show_stats))
     app.add_handler(MessageHandler(filters.Regex("^🔌 Провайдеры$"), show_providers))
     app.add_handler(MessageHandler(filters.Regex("^⚡ Скилы$"), cmd_skills))
+    app.add_handler(MessageHandler(filters.Regex("^🗓 Расписание$"), show_schedule))
     app.add_handler(MessageHandler(filters.Regex(r"^(⏸ Пауза|▶ Продолжить)$"), toggle_pause))
+    app.add_handler(CallbackQueryHandler(cb_sched_list, pattern=r"^ser_list$"))
+    app.add_handler(CallbackQueryHandler(cb_sched_open, pattern=r"^ser:\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_sched_now, pattern=r"^ser_now:\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_sched_stop, pattern=r"^ser_stop:\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_sched_resume, pattern=r"^ser_resume:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_task, pattern=r"^task:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_page, pattern=r"^page:\d+(:\w+)?$"))
     app.add_handler(CallbackQueryHandler(cb_filter, pattern=r"^flt:\w+$"))
