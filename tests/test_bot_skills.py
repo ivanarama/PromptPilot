@@ -3,7 +3,6 @@
 Run: python3 -m unittest discover -s tests
 """
 
-import os
 import re
 import sys
 import tempfile
@@ -12,11 +11,14 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))          # tests/_env.py
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))   # promptpilot
 
-os.environ.setdefault("PP_DATA_DIR", tempfile.mkdtemp())
+import _env  # noqa: E402  — своя база; импорт до promptpilot
 
 from promptpilot import bot  # noqa: E402
+
+_env.assert_isolated()
 
 
 def _make_skill(project: Path, name: str = "triage-issues", flat: bool = False):

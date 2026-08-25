@@ -3,23 +3,24 @@
 Run: python3 -m unittest discover -s tests
 """
 
-import os
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))          # tests/_env.py
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))   # promptpilot
 
-# Конфиг читает окружение на импорте — данные и дефолт задаём до него.
-_TMP = tempfile.TemporaryDirectory()
-os.environ["PP_DATA_DIR"] = _TMP.name
-os.environ["PP_TG_CHAT_ID"] = "555001"
+import _env  # noqa: E402  — своя база; импорт до promptpilot
 
-from promptpilot import db  # noqa: E402
+from promptpilot import api, db  # noqa: E402
 from promptpilot.models import TaskCreate  # noqa: E402
 
+_env.assert_isolated()
+
+# Дефолт подставляется из модульной переменной, а не из окружения на импорте:
+# модули тестов делят процесс, и кто импортировал конфиг первым — тот и задал
+# всем PP_TG_CHAT_ID. Патчим там, куда значение уже попало.
 DEFAULT_CHAT = 555001
 
 
@@ -27,9 +28,11 @@ class TgChatIdTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         db.init_db()
-        cls.addClassCleanup(_TMP.cleanup)
 
     def setUp(self):
+        patcher = mock.patch.object(db, "TG_CHAT_ID", DEFAULT_CHAT)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         with db._connect() as conn:
             conn.execute("DELETE FROM tasks")
 
@@ -106,9 +109,14 @@ class ApiPatchTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         from fastapi.testclient import TestClient
-        from promptpilot.api import app
         db.init_db()
-        cls.client = TestClient(app)
+        cls.client = TestClient(api.app)
+
+    def setUp(self):
+        for module, attr in ((db, "TG_CHAT_ID"), (api, "TG_CHAT_ID")):
+            patcher = mock.patch.object(module, attr, DEFAULT_CHAT)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def test_patch_sets_and_clears_the_chat(self):
         task = db.create_task(TaskCreate(prompt="из веба"))

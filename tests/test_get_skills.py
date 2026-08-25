@@ -10,9 +10,14 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))          # tests/_env.py
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))   # promptpilot
+
+import _env  # noqa: E402  — своя база; импорт до promptpilot
 
 from promptpilot import config  # noqa: E402
+
+_env.assert_isolated()
 
 
 def _skill(dir_path: Path, name: str, description: str):

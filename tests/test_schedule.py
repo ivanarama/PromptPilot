@@ -4,7 +4,6 @@ Run: python3 -m unittest discover -s tests
 """
 
 import asyncio
-import os
 import sys
 import tempfile
 import unittest
@@ -12,13 +11,15 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))          # tests/_env.py
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))   # promptpilot
 
-_TMP = tempfile.TemporaryDirectory()
-os.environ.setdefault("PP_DATA_DIR", _TMP.name)
+import _env  # noqa: E402  — своя база; импорт до promptpilot
 
 from promptpilot import bot, db  # noqa: E402
 from promptpilot.models import TaskCreate  # noqa: E402
+
+_env.assert_isolated()
 
 
 class FakeBot:
@@ -38,7 +39,6 @@ class ScheduleTestBase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         db.init_db()
-        cls.addClassCleanup(_TMP.cleanup)
 
     def setUp(self):
         with db._connect() as conn:
