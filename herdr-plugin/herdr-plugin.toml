@@ -1,0 +1,28 @@
+id = "promptpilot"
+name = "PromptPilot"
+version = "0.1.0"
+min_herdr_version = "0.7.5"
+description = "Очередь задач PromptPilot внутри herdr: автозапуск worker'а при старте сервера и постановка задачи из текущей панели"
+platforms = ["linux", "macos"]
+
+[[startup]]
+command = ["bash", "scripts/ensure-worker.sh"]
+
+[[actions]]
+id = "enqueue"
+title = "PromptPilot: поставить задачу"
+contexts = ["pane"]
+command = ["bash", "scripts/open-enqueue.sh"]
+
+[[panes]]
+id = "enqueue"
+title = "PromptPilot — новая задача"
+placement = "popup"
+width = 80
+height = 20
+command = ["bash", "scripts/enqueue-pane.sh"]
+
+[[keys.command]]
+key = "ctrl+alt+e"
+type = "plugin_action"
+command = "promptpilot.enqueue"

@@ -89,12 +89,25 @@ herdr-задач (интерактивный режим не отдаёт stream
 Это уникальная ниша: в экосистеме herdr Telegram-уведомлений нет, а его аудитория
 (24k звёзд) — люди, которые «detach and walk away».
 
-### Фаза 3 — herdr-плагин + marketplace
+### Фаза 3 — herdr-плагин + marketplace (частично ✅ 2026-08-25)
 
-- Манифест `herdr-plugin.toml`: `[[startup]]` — запуск worker'а,
-  `[[actions]]` — enqueue из herdr, `[[events]]` — реакции на статусы агентов.
-- Публикация: публичный GitHub-репозиторий с топиком `herdr-plugin`
-  (индекс marketplace обновляется каждые 30 минут).
+Сделано — минимальный плагин в `herdr-plugin/` (установка:
+`herdr plugin link .../herdr-plugin`):
+
+- [x] Манифест `herdr-plugin.toml` (id `promptpilot`, herdr 0.7.5+,
+  linux/macos).
+- [x] `[[startup]]` — `scripts/ensure-worker.sh` идемпотентно поднимает
+  `pp worker` при старте herdr-сервера (уже работающий не трогается).
+- [x] `[[actions]]`/`[[panes]]` — action «enqueue» открывает popup-панель:
+  текст задачи → `pp add --dir <cwd панели>`; cwd берётся из
+  `HERDR_PLUGIN_CONTEXT_JSON`. Клавиша `ctrl+alt+e` (`[[keys.command]]`).
+
+Не сделано:
+
+- [ ] `[[events]]`-мост — реакции на статусы агентов (пока эту нишу закрывает
+  поллинг из Фазы 2).
+- [ ] Публикация в marketplace: публичный GitHub-репозиторий с топиком
+  `herdr-plugin` (индекс обновляется каждые 30 минут).
 
 ## Задачи в открытую herdr-сессию ✅ (2026-08-05)
 
