@@ -90,6 +90,7 @@ def test_web_ui_exposes_workflow_and_live_agent_controls():
     assert "function workflowStatusInfo" in html
     assert "function workflowStopReason" in html
     assert "Причина остановки:" in html
+    assert "review.awaiting_decision" in html
     assert "История завершённых раундов" in html
     assert "Технический журнал" in html
     assert "агент ещё работает" in html

@@ -1322,10 +1322,19 @@ function workflowRoundRow(round, current = false) {
 }
 
 function workflowStopReason(events) {
+  const stopping = ['executor.invalid_output','gate.failed','run.failed'];
+  const superseding = [
+    'executor.completed','gate.passed','reviewer.dispatched',
+    'review.awaiting_decision','review.passed','review.revision_required',
+    'workflow.completed',
+  ];
   const latest = [...events]
     .sort((a, b) => (b.seq || 0) - (a.seq || 0))
-    .find(e => ['executor.invalid_output','gate.failed','run.failed'].includes(e.event_type));
-  if (!latest) return '';
+    .find(e => stopping.includes(e.event_type) || superseding.includes(e.event_type));
+  // A later successful transition supersedes an older transport/gate failure.
+  // Showing the old task #8 reason while task #9 and the reviewer had already
+  // completed made the current decision screen actively misleading.
+  if (!latest || !stopping.includes(latest.event_type)) return '';
   const reason = latest.payload?.reason || latest.payload?.summary || latest.event_type;
   const task = latest.payload?.task_id ? `Task #${latest.payload.task_id}: ` : '';
   if (reason === 'missing successful workflow verdict') {
