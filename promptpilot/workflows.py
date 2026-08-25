@@ -863,6 +863,15 @@ def sync_task(task_id: int) -> Optional[WorkflowRunInDB]:
             }
             output_json = db._json_dump(output)
             output_sha = hashlib.sha256(output_json.encode("utf-8")).hexdigest()
+            # A terminal run whose durable output is already projected is a
+            # complete no-op. Without this guard, worker startup replayed an
+            # old ``invalid_output`` transition after a human had resumed the
+            # same round, racing ``queued`` back to ``awaiting_human``.
+            if (
+                run["status"] == final_status
+                and run["output_sha256"] == output_sha
+            ):
+                return db._row_to_workflow_run(run)
             conn.execute(
                 """UPDATE workflow_runs SET status = ?, output_json = ?,
                    output_sha256 = ?, completed_at = ? WHERE id = ?""",

@@ -356,3 +356,28 @@ def test_missing_workflow_verdict_never_reaches_gating(isolated_db):
     assert isolated_db.list_workflow_events(workflow.id)[-1].event_type == (
         "executor.invalid_output"
     )
+
+
+def test_terminal_run_replay_cannot_undo_human_resume(isolated_db):
+    workflow = create_workflow(isolated_db, slug="terminal-replay")
+    workflows.start_workflow(workflow.id, WorkflowStartRequest(expected_version=0))
+    dispatch(isolated_db, workflow.id, WorkflowRole.EXECUTOR, "execute")
+    task = isolated_db.get_next_runnable()
+    isolated_db.mark_completed(task.id, "incomplete response", exit_code=0)
+    workflows.sync_task(task.id)
+
+    waiting = isolated_db.get_workflow(workflow.id)
+    assert waiting.status.value == "awaiting_human"
+    resumed = workflows.human_input(workflow.id, WorkflowHumanInput(
+        expected_version=waiting.state_version,
+        text="retry with the correct executor",
+        resume=True,
+    ))
+    event_count = len(isolated_db.list_workflow_events(workflow.id, limit=1000))
+
+    workflows.sync_all_tasks(workflow.id)
+
+    after_replay = isolated_db.get_workflow(workflow.id)
+    assert after_replay.status.value == "queued"
+    assert after_replay.state_version == resumed.state_version
+    assert len(isolated_db.list_workflow_events(workflow.id, limit=1000)) == event_count

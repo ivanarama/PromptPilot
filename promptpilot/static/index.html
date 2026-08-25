@@ -1321,8 +1321,9 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings) {
   const importedCount = rounds.filter(r => r.summary?.historical).length;
   const stage = wf.config?.stage || {};
   const statusInfo = workflowStatusInfo(wf.status, !!reviewerDone);
-  const stageTitle = stage.title || `Рабочий раунд ${wf.current_round}`;
-  const stageGoal = stage.goal || wf.objective;
+  const previousAudit = [...pastRounds].reverse().find(r => r.summary?.summary);
+  const stageTitle = stage.title || `Раунд ${wf.current_round}: доработка после последнего аудита`;
+  const stageGoal = stage.goal || previousAudit?.summary?.summary || wf.objective;
   let action = '';
   if (wf.status === 'draft') {
     action = `<button class="btn btn-sm btn-primary" onclick="wfStart()">Начать первый раунд</button>`;
