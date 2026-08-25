@@ -30,6 +30,10 @@ from .models import (
     WorkflowEventInDB,
     WorkflowFindingInDB,
     WorkflowInDB,
+    WorkflowPlanApproval,
+    WorkflowPlanDispatch,
+    WorkflowPlanInDB,
+    WorkflowPlanReplace,
     WorkflowDispatchResult,
     WorkflowGateDecision,
     WorkflowHistoryImport,
@@ -37,6 +41,7 @@ from .models import (
     WorkflowReviewDecision,
     WorkflowRoundInDB,
     WorkflowRunInDB,
+    WorkflowStageInDB,
     WorkflowStartRequest,
     WorkflowStatus,
     WorkflowTaskDispatch,
@@ -323,6 +328,26 @@ def api_list_workflow_artifacts(
     return db.list_workflow_artifacts(workflow_id, round_id=round_id)
 
 
+@app.get(
+    "/api/workflows/{workflow_id}/plan",
+    response_model=Optional[WorkflowPlanInDB],
+)
+def api_get_workflow_plan(workflow_id: str):
+    if not db.get_workflow(workflow_id):
+        raise HTTPException(404, "Workflow not found")
+    return db.get_workflow_plan(workflow_id)
+
+
+@app.get(
+    "/api/workflows/{workflow_id}/stages",
+    response_model=List[WorkflowStageInDB],
+)
+def api_list_workflow_stages(workflow_id: str):
+    if not db.get_workflow(workflow_id):
+        raise HTTPException(404, "Workflow not found")
+    return db.list_workflow_stages(workflow_id)
+
+
 def _workflow_action(call, *args):
     try:
         return call(*args)
@@ -339,6 +364,39 @@ def _workflow_action(call, *args):
 def api_start_workflow(workflow_id: str, request: WorkflowStartRequest):
     started = _workflow_action(workflows.start_workflow, workflow_id, request)
     return workflows.advance_workflow(started.id)
+
+
+@app.post(
+    "/api/workflows/{workflow_id}/plan/dispatch",
+    response_model=WorkflowPlanInDB,
+)
+def api_dispatch_workflow_planner(
+    workflow_id: str, dispatch: WorkflowPlanDispatch
+):
+    if dispatch.provider and dispatch.provider not in load_providers():
+        raise HTTPException(400, f"Неизвестный провайдер «{dispatch.provider}»")
+    return _workflow_action(workflows.dispatch_planner, workflow_id, dispatch)
+
+
+@app.put(
+    "/api/workflows/{workflow_id}/plan",
+    response_model=List[WorkflowStageInDB],
+)
+def api_replace_workflow_plan(
+    workflow_id: str, replacement: WorkflowPlanReplace
+):
+    return _workflow_action(workflows.replace_plan, workflow_id, replacement)
+
+
+@app.post(
+    "/api/workflows/{workflow_id}/plan/approve",
+    response_model=WorkflowInDB,
+)
+def api_approve_workflow_plan(
+    workflow_id: str, approval: WorkflowPlanApproval
+):
+    approved = _workflow_action(workflows.approve_plan, workflow_id, approval)
+    return workflows.advance_workflow(approved.id)
 
 
 @app.post(

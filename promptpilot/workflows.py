@@ -28,11 +28,18 @@ from .models import (
     WorkflowHistoryImport,
     WorkflowHumanInput,
     WorkflowInDB,
+    WorkflowPlanApproval,
+    WorkflowPlanDispatch,
+    WorkflowPlanInDB,
+    WorkflowPlanReplace,
     WorkflowReviewDecision,
     WorkflowRole,
     WorkflowRoundInDB,
     WorkflowRoundStatus,
     WorkflowRunInDB,
+    WorkflowStageInDB,
+    WorkflowStageSpec,
+    WorkflowStageStatus,
     WorkflowStartRequest,
     WorkflowStatus,
     WorkflowTaskDispatch,
@@ -42,7 +49,21 @@ from .models import (
 
 
 ALLOWED_TRANSITIONS = {
-    WorkflowStatus.DRAFT: {WorkflowStatus.QUEUED, WorkflowStatus.CANCELLED},
+    WorkflowStatus.DRAFT: {
+        WorkflowStatus.PLANNING,
+        WorkflowStatus.QUEUED,
+        WorkflowStatus.CANCELLED,
+    },
+    WorkflowStatus.PLANNING: {
+        WorkflowStatus.AWAITING_PLAN_APPROVAL,
+        WorkflowStatus.AWAITING_HUMAN,
+        WorkflowStatus.CANCELLED,
+    },
+    WorkflowStatus.AWAITING_PLAN_APPROVAL: {
+        WorkflowStatus.PLANNING,
+        WorkflowStatus.QUEUED,
+        WorkflowStatus.CANCELLED,
+    },
     WorkflowStatus.QUEUED: {
         WorkflowStatus.EXECUTING,
         WorkflowStatus.AWAITING_HUMAN,
@@ -75,6 +96,7 @@ ALLOWED_TRANSITIONS = {
         WorkflowStatus.CANCELLED,
     },
     WorkflowStatus.AWAITING_HUMAN: {
+        WorkflowStatus.PLANNING,
         WorkflowStatus.QUEUED,
         WorkflowStatus.REVIEWING,
         WorkflowStatus.REVISION_REQUIRED,
@@ -108,11 +130,43 @@ WORKFLOW_VERDICT_INSTRUCTION = """
 
 SUCCESS_VERDICTS = {"ГОТОВО", "УЖЕ СДЕЛАНО"}
 
+DEFAULT_PLANNER_PROMPT = """Ты — ведущий инженер-планировщик PromptPilot.
+Изучи репозиторий и разложи общую задачу на короткие последовательные этапы,
+которые сможет надёжно выполнить более слабый исполнитель.
+
+Цель: {{objective}}
+Репозиторий: {{repository_path}}
+Ветка кандидата: {{candidate_branch}}
+
+Требования к плану:
+- каждый этап даёт один проверяемый инженерный результат;
+- зависимости могут ссылаться только на предыдущие этапы;
+- укажи разрешённые пути, deliverables и deterministic acceptance gates;
+- ограничивай scope этапа, не объединяй независимые функциональные области;
+- последним добавь integration-этап, проверяющий результат целиком;
+- не изменяй файлы репозитория: твой результат — только план.
+
+Верни план между маркерами строго как JSON-объект {"stages": [...]}.
+Для каждого этапа обязательны code, title, objective; доступны stage_type
+(implementation/integration), dependencies, allowed_paths, deliverables,
+acceptance_gates, executor_prompt, reviewer_prompt, max_revision_rounds.
+"""
+
+PLAN_OUTPUT_CONTRACT = """
+<promptpilot-plan-contract version="stage-plan-v1">
+WORKFLOW_PLAN_JSON_BEGIN
+{"stages":[{"code":"S1","title":"...","objective":"...","stage_type":"implementation","dependencies":[],"allowed_paths":[],"deliverables":[],"acceptance_gates":[]},{"code":"FINAL","title":"Интеграционный аудит","objective":"Проверить результат целиком","stage_type":"integration","dependencies":["S1"],"allowed_paths":[],"deliverables":[],"acceptance_gates":[]}]}
+WORKFLOW_PLAN_JSON_END
+</promptpilot-plan-contract>
+"""
+
 DEFAULT_EXECUTOR_PROMPT = """Ты — исполнитель в автономном инженерном workflow PromptPilot.
 
 Цель: {{objective}}
 Текущий этап: {{stage_code}} {{stage_title}}
 Цель этапа: {{stage_goal}}
+Разрешённые пути: {{allowed_paths}}
+Ожидаемые результаты: {{deliverables}}
 Репозиторий: {{repository_path}}
 Ветка кандидата: {{candidate_branch}}
 Раунд: {{round_no}}
@@ -254,7 +308,7 @@ def _insert_round(conn: sqlite3.Connection, workflow_id: str, round_no: int,
                   base_sha: str = None, status: WorkflowRoundStatus =
                   WorkflowRoundStatus.PENDING, candidate_sha: str = None,
                   audit_sha: str = None, summary: dict = None,
-                  historical: bool = False) -> sqlite3.Row:
+                  historical: bool = False, stage_id: str = None) -> sqlite3.Row:
     round_id = db._new_id("round")
     now = db._now()
     completed_at = now if status in {
@@ -266,10 +320,10 @@ def _insert_round(conn: sqlite3.Connection, workflow_id: str, round_no: int,
     try:
         conn.execute(
             """INSERT INTO workflow_rounds
-               (id, workflow_id, round_no, status, base_sha, candidate_sha,
+               (id, workflow_id, round_no, stage_id, status, base_sha, candidate_sha,
                 audit_sha, started_at, completed_at, summary_json)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (round_id, workflow_id, round_no, status.value, base_sha,
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (round_id, workflow_id, round_no, stage_id, status.value, base_sha,
              candidate_sha, audit_sha, now, completed_at,
              db._json_dump(summary) if summary is not None else None),
         )
@@ -296,6 +350,7 @@ def _insert_round(conn: sqlite3.Connection, workflow_id: str, round_no: int,
             "candidate_sha": candidate_sha,
             "audit_sha": audit_sha,
             "status": status.value,
+            "stage_id": stage_id,
             "historical": historical,
         },
     ))
@@ -318,13 +373,14 @@ def _first_automated_round(conn: sqlite3.Connection,
                            workflow_id: str) -> Optional[int]:
     row = conn.execute(
         """SELECT payload_json FROM workflow_events
-           WHERE workflow_id = ? AND event_type = 'workflow.started'
+           WHERE workflow_id = ? AND event_type IN ('workflow.started', 'plan.approved')
            ORDER BY seq LIMIT 1""",
         (workflow_id,),
     ).fetchone()
     if not row:
         return None
-    return db._json_load(row["payload_json"]).get("first_automated_round")
+    payload = db._json_load(row["payload_json"])
+    return payload.get("first_automated_round") or payload.get("first_round")
 
 
 def _check_round_budget(conn: sqlite3.Connection, workflow: sqlite3.Row,
@@ -334,6 +390,255 @@ def _check_round_budget(conn: sqlite3.Connection, workflow: sqlite3.Row,
         return True
     used_after_create = next_round - first + 1
     return used_after_create <= _max_automated_rounds(workflow)
+
+
+def _render_planner_prompt(workflow: WorkflowInDB, custom_prompt: str = "") -> str:
+    rendered = _config_for(workflow).planning.prompt_template or DEFAULT_PLANNER_PROMPT
+    values = {
+        "objective": workflow.objective,
+        "repository_path": workflow.repository_path,
+        "candidate_branch": workflow.candidate_branch,
+    }
+    for name, value in values.items():
+        rendered = rendered.replace("{{" + name + "}}", value)
+    if custom_prompt.strip():
+        rendered += "\n\nДополнительные указания пользователя:\n" + custom_prompt.strip()
+    return rendered.strip() + "\n\n" + PLAN_OUTPUT_CONTRACT.strip()
+
+
+def parse_workflow_plan(report: str, max_stages: int = 20) -> list[WorkflowStageSpec] | None:
+    match = re.search(
+        r"WORKFLOW_PLAN_JSON_BEGIN\s*(\{.*?\})\s*WORKFLOW_PLAN_JSON_END",
+        report or "",
+        flags=re.DOTALL,
+    )
+    if not match:
+        return None
+    try:
+        payload = json.loads(match.group(1))
+        replacement = WorkflowPlanReplace(
+            expected_version=0, stages=payload.get("stages") or []
+        )
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+    if len(replacement.stages) > max_stages:
+        return None
+    return replacement.stages
+
+
+def dispatch_planner(workflow_id: str,
+                     dispatch: WorkflowPlanDispatch) -> WorkflowPlanInDB:
+    with db._connect(immediate=True) as conn:
+        workflow_row = _workflow_row(conn, workflow_id)
+        _require_version(workflow_row, dispatch.expected_version)
+        state = WorkflowStatus(workflow_row["status"])
+        if state not in {
+            WorkflowStatus.DRAFT,
+            WorkflowStatus.AWAITING_PLAN_APPROVAL,
+            WorkflowStatus.AWAITING_HUMAN,
+        }:
+            raise db.WorkflowConflictError(
+                f"cannot dispatch planner while workflow is {state.value}"
+            )
+        if state is WorkflowStatus.AWAITING_HUMAN and workflow_row["current_round"]:
+            raise db.WorkflowConflictError(
+                "planner can only be retried before stage execution starts"
+            )
+        workflow = db._row_to_workflow(workflow_row)
+        config = _config_for(workflow)
+        role = config.roles.planner
+        provider = dispatch.provider if dispatch.provider is not None else role.provider
+        herdr_target = dispatch.herdr_target or role.herdr_target
+        if provider == "herdr-session" and not herdr_target:
+            raise db.WorkflowConflictError("planner using herdr-session needs herdr_target")
+        prompt = _render_planner_prompt(workflow, dispatch.prompt)
+        task = db._insert_task(conn, TaskCreate(
+            prompt=prompt.rstrip() + WORKFLOW_VERDICT_INSTRUCTION,
+            working_dir=workflow.repository_path,
+            provider=provider,
+            priority=dispatch.priority if dispatch.priority != 5 else role.priority,
+            max_retries=(
+                dispatch.max_retries if dispatch.max_retries != 5 else role.max_retries
+            ),
+            skip_permissions=False,
+            model=dispatch.model or role.model,
+            effort=dispatch.effort or role.effort,
+            task_timeout=(
+                dispatch.task_timeout
+                if dispatch.task_timeout is not None else role.task_timeout
+            ),
+            keep_pane=dispatch.keep_pane,
+            herdr_target=herdr_target,
+            machine=dispatch.machine or role.machine,
+        ))
+        input_sha = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        now = db._now()
+        conn.execute(
+            """INSERT INTO workflow_plans
+               (workflow_id, status, planner_task_id, input_sha256,
+                created_at, updated_at)
+               VALUES (?, 'planning', ?, ?, ?, ?)
+               ON CONFLICT(workflow_id) DO UPDATE SET status='planning',
+                 planner_task_id=excluded.planner_task_id,
+                 input_sha256=excluded.input_sha256,
+                 output_sha256=NULL, output_json=NULL,
+                 updated_at=excluded.updated_at, approved_at=NULL""",
+            (workflow_id, task.id, input_sha, now, now),
+        )
+        workflow_row = _transition(
+            conn, workflow_row, WorkflowStatus.PLANNING,
+            "planner.dispatched",
+            {"task_id": task.id, "provider": provider, "input_sha256": input_sha},
+        )
+        row = conn.execute(
+            "SELECT * FROM workflow_plans WHERE workflow_id = ?", (workflow_id,)
+        ).fetchone()
+        return db._row_to_workflow_plan(row)
+
+
+def sync_planner_task(task_id: int) -> Optional[WorkflowPlanInDB]:
+    auto_approve: tuple[str, int] | None = None
+    with db._connect(immediate=True) as conn:
+        plan = conn.execute(
+            "SELECT * FROM workflow_plans WHERE planner_task_id = ?", (task_id,)
+        ).fetchone()
+        if not plan:
+            return None
+        task = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if not task:
+            raise db.WorkflowConflictError(f"planner task {task_id} is missing")
+        workflow = _workflow_row(conn, plan["workflow_id"])
+        if task["status"] in {"pending", "rate_limited", "running"}:
+            return db._row_to_workflow_plan(plan)
+        output = {
+            "task_status": task["status"], "result": task["result"],
+            "error": task["error"], "exit_code": task["exit_code"],
+            "verdict": task["verdict"], "model_used": task["model_used"],
+        }
+        output_json = db._json_dump(output)
+        output_sha = hashlib.sha256(output_json.encode("utf-8")).hexdigest()
+        if plan["output_sha256"] == output_sha:
+            return db._row_to_workflow_plan(plan)
+        config = _config_for(db._row_to_workflow(workflow))
+        stages = (
+            parse_workflow_plan(task["result"] or "", config.planning.max_stages)
+            if task["status"] == "completed" and task["verdict"] in SUCCESS_VERDICTS
+            else None
+        )
+        if stages:
+            db._replace_workflow_stages(conn, workflow["id"], stages)
+            conn.execute(
+                """UPDATE workflow_plans SET status='awaiting_approval',
+                   output_sha256=?, output_json=?, updated_at=?
+                   WHERE workflow_id=?""",
+                (output_sha, output_json, db._now(), workflow["id"]),
+            )
+            workflow = _transition(
+                conn, workflow, WorkflowStatus.AWAITING_PLAN_APPROVAL,
+                "planner.completed",
+                {"task_id": task_id, "stage_count": len(stages),
+                 "stage_codes": [stage.code for stage in stages],
+                 "output_sha256": output_sha},
+            )
+            # LLM-authored shell commands are never executed without a human
+            # seeing the plan, even when command-free plans may auto-approve.
+            has_generated_commands = any(stage.acceptance_gates for stage in stages)
+            if not config.planning.require_approval and not has_generated_commands:
+                auto_approve = (workflow["id"], workflow["state_version"])
+        else:
+            conn.execute(
+                """UPDATE workflow_plans SET status='failed', output_sha256=?,
+                   output_json=?, updated_at=? WHERE workflow_id=?""",
+                (output_sha, output_json, db._now(), workflow["id"]),
+            )
+            _transition(
+                conn, workflow, WorkflowStatus.AWAITING_HUMAN,
+                "planner.invalid_output",
+                {"task_id": task_id, "output_sha256": output_sha,
+                 "reason": "planner did not return a valid stage-plan-v1 contract"},
+            )
+        row = conn.execute(
+            "SELECT * FROM workflow_plans WHERE workflow_id = ?",
+            (plan["workflow_id"],),
+        ).fetchone()
+        result = db._row_to_workflow_plan(row)
+    if auto_approve:
+        approve_plan(
+            auto_approve[0],
+            WorkflowPlanApproval(expected_version=auto_approve[1]),
+        )
+        return db.get_workflow_plan(auto_approve[0])
+    return result
+
+
+def replace_plan(workflow_id: str,
+                 replacement: WorkflowPlanReplace) -> list[WorkflowStageInDB]:
+    with db._connect(immediate=True) as conn:
+        workflow = _workflow_row(conn, workflow_id)
+        _require_version(workflow, replacement.expected_version)
+        if WorkflowStatus(workflow["status"]) is not WorkflowStatus.AWAITING_PLAN_APPROVAL:
+            raise db.WorkflowConflictError("plan can only be edited before approval")
+        limit = _config_for(db._row_to_workflow(workflow)).planning.max_stages
+        if len(replacement.stages) > limit:
+            raise db.WorkflowConflictError(f"plan exceeds max_stages={limit}")
+        stages = db._replace_workflow_stages(conn, workflow_id, replacement.stages)
+        conn.execute(
+            "UPDATE workflow_plans SET updated_at=? WHERE workflow_id=?",
+            (db._now(), workflow_id),
+        )
+        _touch(
+            conn, workflow, "plan.edited",
+            {"stage_count": len(stages), "stage_codes": [stage.code for stage in stages]},
+        )
+        return stages
+
+
+def approve_plan(workflow_id: str,
+                 approval: WorkflowPlanApproval) -> WorkflowInDB:
+    with db._connect(immediate=True) as conn:
+        workflow = _workflow_row(conn, workflow_id)
+        _require_version(workflow, approval.expected_version)
+        if WorkflowStatus(workflow["status"]) is not WorkflowStatus.AWAITING_PLAN_APPROVAL:
+            raise db.WorkflowConflictError("workflow plan is not awaiting approval")
+        stages = conn.execute(
+            "SELECT * FROM workflow_stages WHERE workflow_id=? ORDER BY position",
+            (workflow_id,),
+        ).fetchall()
+        if not stages:
+            raise db.WorkflowConflictError("workflow plan has no stages")
+        now = db._now()
+        conn.execute(
+            "UPDATE workflow_stages SET status='pending' WHERE workflow_id=?",
+            (workflow_id,),
+        )
+        first = stages[0]
+        conn.execute(
+            """UPDATE workflow_stages SET status='executing', started_at=?
+               WHERE id=?""",
+            (now, first["id"]),
+        )
+        conn.execute(
+            """UPDATE workflow_plans SET status='approved', approved_at=?,
+               updated_at=? WHERE workflow_id=?""",
+            (now, now, workflow_id),
+        )
+        conn.execute(
+            "UPDATE workflows SET current_stage_id=? WHERE id=?",
+            (first["id"], workflow_id),
+        )
+        round_no = workflow["current_round"] + 1
+        round_row = _insert_round(
+            conn, workflow_id, round_no, base_sha=approval.base_sha,
+            stage_id=first["id"],
+        )
+        workflow = _workflow_row(conn, workflow_id)
+        workflow = _transition(
+            conn, workflow, WorkflowStatus.QUEUED, "plan.approved",
+            {"stage_count": len(stages), "stage_id": first["id"],
+             "stage_code": first["code"], "first_round": round_no},
+            round_id=round_row["id"],
+        )
+        return db._row_to_workflow(workflow)
 
 
 def start_workflow(workflow_id: str,
@@ -622,10 +927,71 @@ def record_review(workflow_id: str,
                    completed_at = ?, summary_json = ? WHERE id = ?""",
                 (db._now(), db._json_dump(common), round_row["id"]),
             )
-            workflow = _transition(
-                conn, workflow, WorkflowStatus.COMPLETED, "review.passed",
-                common, round_id=round_row["id"],
-            )
+            current_stage = None
+            if workflow["current_stage_id"]:
+                current_stage = conn.execute(
+                    "SELECT * FROM workflow_stages WHERE id=?",
+                    (workflow["current_stage_id"],),
+                ).fetchone()
+            if current_stage:
+                now = db._now()
+                conn.execute(
+                    """UPDATE workflow_stages SET status='completed',
+                       completed_at=?, summary_json=? WHERE id=?""",
+                    (now, db._json_dump(common), current_stage["id"]),
+                )
+                db._append_workflow_event(conn, WorkflowEventCreate(
+                    workflow_id=workflow_id,
+                    round_id=round_row["id"],
+                    event_type="stage.completed",
+                    idempotency_key=f"stage.completed:{current_stage['id']}",
+                    payload={"stage_id": current_stage["id"],
+                             "stage_code": current_stage["code"], **common},
+                ))
+                next_stage = conn.execute(
+                    """SELECT * FROM workflow_stages
+                       WHERE workflow_id=? AND position>? AND status='pending'
+                       ORDER BY position LIMIT 1""",
+                    (workflow_id, current_stage["position"]),
+                ).fetchone()
+                if next_stage:
+                    conn.execute(
+                        """UPDATE workflow_stages SET status='executing',
+                           started_at=? WHERE id=?""",
+                        (now, next_stage["id"]),
+                    )
+                    conn.execute(
+                        "UPDATE workflows SET current_stage_id=? WHERE id=?",
+                        (next_stage["id"], workflow_id),
+                    )
+                    new_round = _insert_round(
+                        conn, workflow_id, workflow["current_round"] + 1,
+                        base_sha=round_row["candidate_sha"],
+                        stage_id=next_stage["id"],
+                    )
+                    workflow = _workflow_row(conn, workflow_id)
+                    workflow = _transition(
+                        conn, workflow, WorkflowStatus.QUEUED,
+                        "stage.advanced",
+                        {"completed_stage_id": current_stage["id"],
+                         "completed_stage_code": current_stage["code"],
+                         "next_stage_id": next_stage["id"],
+                         "next_stage_code": next_stage["code"]},
+                        round_id=new_round["id"],
+                    )
+                else:
+                    workflow = _transition(
+                        conn, workflow, WorkflowStatus.COMPLETED,
+                        "review.passed",
+                        {**common, "final_stage_id": current_stage["id"],
+                         "final_stage_code": current_stage["code"]},
+                        round_id=round_row["id"],
+                    )
+            else:
+                workflow = _transition(
+                    conn, workflow, WorkflowStatus.COMPLETED, "review.passed",
+                    common, round_id=round_row["id"],
+                )
         elif decision.verdict is ReviewVerdict.REVISION_REQUIRED:
             conn.execute(
                 """UPDATE workflow_rounds SET status = 'revision_required',
@@ -658,17 +1024,51 @@ def human_input(workflow_id: str,
             raise db.WorkflowConflictError(
                 f"workflow is not waiting for human input: {state.value}"
             )
-        round_row = _current_round_row(conn, workflow)
+        round_row = (
+            _current_round_row(conn, workflow)
+            if workflow["current_round"] else None
+        )
         if not action.resume:
             workflow = _touch(
                 conn, workflow, "human.input",
                 {"text": action.text, "resume": False},
-                round_id=round_row["id"],
+                round_id=round_row["id"] if round_row else None,
             )
             return db._row_to_workflow(workflow)
+        if round_row is None:
+            raise db.WorkflowConflictError(
+                "planning failure must be retried with planner dispatch"
+            )
 
         if state is WorkflowStatus.REVISION_REQUIRED:
             next_round = workflow["current_round"] + 1
+            current_stage = None
+            if workflow["current_stage_id"]:
+                current_stage = conn.execute(
+                    "SELECT * FROM workflow_stages WHERE id=?",
+                    (workflow["current_stage_id"],),
+                ).fetchone()
+            if current_stage:
+                spec = db._json_load(current_stage["spec_json"])
+                configured_limit = (
+                    spec.get("max_revision_rounds")
+                    or _config_for(db._row_to_workflow(workflow)).planning.max_revisions_per_stage
+                )
+                revision_count = conn.execute(
+                    """SELECT COUNT(*) FROM workflow_rounds
+                       WHERE stage_id=? AND status='revision_required'""",
+                    (current_stage["id"],),
+                ).fetchone()[0]
+                if revision_count >= int(configured_limit):
+                    workflow = _transition(
+                        conn, workflow, WorkflowStatus.AWAITING_HUMAN,
+                        "limit.stage_revisions",
+                        {"text": action.text, "stage_id": current_stage["id"],
+                         "stage_code": current_stage["code"],
+                         "max_revision_rounds": int(configured_limit)},
+                        round_id=round_row["id"],
+                    )
+                    return db._row_to_workflow(workflow)
             if not _check_round_budget(conn, workflow, next_round):
                 workflow = _transition(
                     conn, workflow, WorkflowStatus.AWAITING_HUMAN,
@@ -684,6 +1084,7 @@ def human_input(workflow_id: str,
             new_round = _insert_round(
                 conn, workflow_id, next_round,
                 base_sha=round_row["candidate_sha"],
+                stage_id=workflow["current_stage_id"],
             )
             workflow = _workflow_row(conn, workflow_id)
             workflow = _transition(
@@ -743,6 +1144,29 @@ def cancel_workflow(workflow_id: str,
                 "UPDATE workflow_runs SET status = 'cancelled' WHERE id = ?",
                 (item["run_id"],),
             )
+        planner_task = conn.execute(
+            """SELECT t.id, t.status FROM workflow_plans p
+               JOIN tasks t ON t.id=p.planner_task_id
+               WHERE p.workflow_id=? AND t.status IN
+               ('pending','rate_limited','running')""",
+            (workflow_id,),
+        ).fetchone()
+        if planner_task:
+            if planner_task["status"] == "running":
+                conn.execute(
+                    "INSERT OR REPLACE INTO settings (key, value) VALUES (?, '1')",
+                    (f"cancel_task:{planner_task['id']}",),
+                )
+            else:
+                conn.execute(
+                    """UPDATE tasks SET status='cancelled', completed_at=?
+                       WHERE id=?""",
+                    (db._now(), planner_task["id"]),
+                )
+            conn.execute(
+                "UPDATE workflow_plans SET status='cancelled', updated_at=? WHERE workflow_id=?",
+                (db._now(), workflow_id),
+            )
         round_row = None
         if workflow["current_round"]:
             round_row = _current_round_row(conn, workflow)
@@ -753,7 +1177,8 @@ def cancel_workflow(workflow_id: str,
             )
         workflow = _transition(
             conn, workflow, WorkflowStatus.CANCELLED, "workflow.cancelled",
-            {"linked_tasks": [item["id"] for item in linked]},
+            {"linked_tasks": [item["id"] for item in linked]
+             + ([planner_task["id"]] if planner_task else [])},
             round_id=round_row["id"] if round_row else None,
         )
         return db._row_to_workflow(workflow)
@@ -905,7 +1330,14 @@ def _latest_gate_evidence(workflow_id: str, *, before_round: int = None) -> str:
 def _render_role_prompt(workflow: WorkflowInDB, role: WorkflowRole,
                         template: str) -> str:
     round_no = workflow.current_round
-    stage = workflow.config.get("stage") or {}
+    stage_row = (
+        db.get_workflow_stage(workflow.current_stage_id)
+        if workflow.current_stage_id else None
+    )
+    stage = (
+        stage_row.model_dump(mode="json")
+        if stage_row else (workflow.config.get("stage") or {})
+    )
     values = {
         "objective": workflow.objective,
         "repository_path": workflow.repository_path,
@@ -913,7 +1345,9 @@ def _render_role_prompt(workflow: WorkflowInDB, role: WorkflowRole,
         "round_no": str(round_no),
         "stage_code": str(stage.get("code") or ""),
         "stage_title": str(stage.get("title") or ""),
-        "stage_goal": str(stage.get("goal") or workflow.objective),
+        "stage_goal": str(stage.get("objective") or stage.get("goal") or workflow.objective),
+        "allowed_paths": "\n".join(stage.get("allowed_paths") or []) or "(не ограничены планом)",
+        "deliverables": "\n".join(stage.get("deliverables") or []) or "(см. цель этапа)",
         "previous_review": _latest_run_output(
             workflow.id, WorkflowRole.REVIEWER, before_round=round_no
         ),
@@ -928,6 +1362,13 @@ def _render_role_prompt(workflow: WorkflowInDB, role: WorkflowRole,
         DEFAULT_EXECUTOR_PROMPT
         if role is WorkflowRole.EXECUTOR else DEFAULT_REVIEWER_PROMPT
     )
+    if stage_row:
+        override = (
+            stage_row.executor_prompt
+            if role is WorkflowRole.EXECUTOR else stage_row.reviewer_prompt
+        )
+        if override:
+            rendered = override
     for name, value in values.items():
         rendered = rendered.replace("{{" + name + "}}", value)
     return rendered.strip()
@@ -967,8 +1408,18 @@ def _dispatch_configured_role(workflow: WorkflowInDB,
 
 def _run_gate_commands(workflow: WorkflowInDB) -> WorkflowGateDecision:
     gate = _config_for(workflow).gate
+    stage = (
+        db.get_workflow_stage(workflow.current_stage_id)
+        if workflow.current_stage_id else None
+    )
+    commands = list(gate.commands)
+    if stage:
+        commands.extend(
+            command for command in stage.acceptance_gates
+            if command not in commands
+        )
     evidence: list[str] = []
-    if not gate.enabled or not gate.commands:
+    if not gate.enabled or not commands:
         return WorkflowGateDecision(
             expected_version=workflow.state_version,
             verdict=GateVerdict.PASS,
@@ -979,7 +1430,7 @@ def _run_gate_commands(workflow: WorkflowInDB) -> WorkflowGateDecision:
             ),
             evidence=[],
         )
-    for index, command in enumerate(gate.commands, start=1):
+    for index, command in enumerate(commands, start=1):
         argv = (
             ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command]
             if os.name == "nt" else ["/bin/sh", "-lc", command]
@@ -1029,7 +1480,7 @@ def _run_gate_commands(workflow: WorkflowInDB) -> WorkflowGateDecision:
         expected_version=workflow.state_version,
         verdict=GateVerdict.PASS,
         gate_id="automatic-gate",
-        summary=f"Пройдено команд gate: {len(gate.commands)}",
+        summary=f"Пройдено команд gate: {len(commands)}",
         evidence=evidence,
     )
 
@@ -1113,6 +1564,18 @@ def advance_workflow(workflow_id: str, max_actions: int = 12) -> WorkflowInDB:
         if not config.automation.enabled or workflow.status in TERMINAL_STATES:
             return workflow
         try:
+            if workflow.status is WorkflowStatus.AWAITING_PLAN_APPROVAL:
+                if config.planning.require_approval:
+                    return workflow
+                stages = db.list_workflow_stages(workflow.id)
+                if any(stage.acceptance_gates for stage in stages):
+                    return workflow
+                workflow = approve_plan(
+                    workflow.id,
+                    WorkflowPlanApproval(expected_version=workflow.state_version),
+                )
+                continue
+
             if workflow.status is WorkflowStatus.QUEUED:
                 if not config.automation.auto_dispatch_executor:
                     return workflow
@@ -1198,6 +1661,13 @@ def advance_linked_task(task_id: int) -> Optional[WorkflowInDB]:
         row = conn.execute(
             "SELECT workflow_id FROM workflow_runs WHERE task_id = ?", (task_id,)
         ).fetchone()
+        planner = conn.execute(
+            "SELECT workflow_id FROM workflow_plans WHERE planner_task_id = ?",
+            (task_id,),
+        ).fetchone()
+    if planner:
+        sync_planner_task(task_id)
+        return advance_workflow(planner["workflow_id"])
     return advance_workflow(row["workflow_id"]) if row else None
 
 
@@ -1387,10 +1857,27 @@ def sync_all_tasks(workflow_id: str = None) -> int:
             """SELECT id FROM workflows WHERE status NOT IN
                ('completed', 'failed', 'cancelled')"""
         ).fetchall() if workflow_id is None else []
+        if workflow_id:
+            planner_rows = conn.execute(
+                """SELECT planner_task_id AS task_id, workflow_id
+                   FROM workflow_plans WHERE workflow_id=? AND status='planning'
+                   AND planner_task_id IS NOT NULL""",
+                (workflow_id,),
+            ).fetchall()
+        else:
+            planner_rows = conn.execute(
+                """SELECT planner_task_id AS task_id, workflow_id
+                   FROM workflow_plans WHERE status='planning'
+                   AND planner_task_id IS NOT NULL"""
+            ).fetchall()
     count = 0
     workflow_ids: set[str] = {row["id"] for row in recoverable}
     for row in rows:
         if sync_task(row["task_id"]):
+            count += 1
+            workflow_ids.add(row["workflow_id"])
+    for row in planner_rows:
+        if sync_planner_task(row["task_id"]):
             count += 1
             workflow_ids.add(row["workflow_id"])
     for linked_workflow_id in workflow_ids:
@@ -1410,7 +1897,14 @@ def workflow_report(workflow_id: str) -> dict:
     findings = db.list_workflow_findings(workflow_id)
     artifacts = db.list_workflow_artifacts(workflow_id)
     events = db.list_workflow_events(workflow_id, limit=100000)
-    tasks = [db.get_task(run.task_id) for run in runs if run.task_id]
+    plan = db.get_workflow_plan(workflow_id)
+    stages = db.list_workflow_stages(workflow_id)
+    task_ids = [run.task_id for run in runs if run.task_id]
+    task_ids.extend(
+        event.payload.get("task_id") for event in events
+        if event.event_type == "planner.dispatched" and event.payload.get("task_id")
+    )
+    tasks = [db.get_task(task_id) for task_id in dict.fromkeys(task_ids)]
     tasks = [task for task in tasks if task]
 
     provider_counts = Counter(task.provider or "default" for task in tasks)
@@ -1420,9 +1914,10 @@ def workflow_report(workflow_id: str) -> dict:
     finding_statuses = Counter(item.status.value for item in findings)
     finding_severities = Counter(item.severity.value for item in findings)
     event_counts = Counter(item.event_type for item in events)
+    stage_statuses = Counter(item.status.value for item in stages)
     runtime_seconds = sum(
-        max(0.0, (run.completed_at - run.started_at).total_seconds())
-        for run in runs if run.started_at and run.completed_at
+        max(0.0, (task.completed_at - task.started_at).total_seconds())
+        for task in tasks if task.started_at and task.completed_at
     )
     metrics = {
         "rounds_total": len(rounds),
@@ -1430,10 +1925,15 @@ def workflow_report(workflow_id: str) -> dict:
         "rounds_promptpilot": sum(not bool(item.summary and item.summary.get("historical")) for item in rounds),
         "executor_attempts": sum(run.role is WorkflowRole.EXECUTOR for run in runs),
         "reviewer_attempts": sum(run.role is WorkflowRole.REVIEWER for run in runs),
+        "planner_attempts": event_counts["planner.dispatched"],
+        "stages_total": len(stages),
+        "stages_by_status": dict(stage_statuses),
         "gate_passes": event_counts["gate.passed"],
         "gate_failures": event_counts["gate.failed"],
         "review_revisions": event_counts["review.revision_required"],
-        "review_passes": event_counts["review.passed"],
+        "review_passes": (
+            event_counts["stage.completed"] if stages else event_counts["review.passed"]
+        ),
         "human_pauses": event_counts["automation.paused"] + event_counts["review.human_required"],
         "agent_runtime_seconds": round(runtime_seconds, 3),
         "elapsed_seconds": round((workflow.updated_at - workflow.created_at).total_seconds(), 3),
@@ -1445,10 +1945,12 @@ def workflow_report(workflow_id: str) -> dict:
         "events": len(events),
     }
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "generated_at": db._now(),
         "workflow": workflow.model_dump(mode="json"),
         "metrics": metrics,
+        "plan": plan.model_dump(mode="json") if plan else None,
+        "stages": [item.model_dump(mode="json") for item in stages],
         "rounds": [item.model_dump(mode="json") for item in rounds],
         "runs": [item.model_dump(mode="json") for item in runs],
         "findings": [item.model_dump(mode="json") for item in findings],
@@ -1477,6 +1979,15 @@ def workflow_report_markdown(workflow_id: str) -> str:
     for name, value in metrics.items():
         rendered = json.dumps(value, ensure_ascii=False) if isinstance(value, dict) else value
         lines.append(f"- {name}: {rendered}")
+    lines.extend(["", "## Stage plan", ""])
+    if report["stages"]:
+        for stage in report["stages"]:
+            lines.append(
+                f"- {stage['position']}. `{stage['code']}` — {stage['title']} "
+                f"[{stage['stage_type']}/{stage['status']}]: {stage['objective']}"
+            )
+    else:
+        lines.append("- No stage plan recorded.")
     lines.extend(["", "## Rounds", ""])
     for round_item in report["rounds"]:
         lines.append(

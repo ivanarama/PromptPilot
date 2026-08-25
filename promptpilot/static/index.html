@@ -411,6 +411,15 @@
     background:var(--surface2); border:1px solid var(--border); border-radius:6px; color:var(--text); padding:7px 8px;
   }
   .wf-settings-card textarea { min-height:90px; resize:vertical; font-family:var(--mono); }
+  .wf-stage-list { display:flex; flex-direction:column; gap:8px; margin:10px 0; }
+  .wf-stage-card { background:var(--bg); border:1px solid var(--border); border-left:4px solid var(--border); border-radius:8px; padding:10px; }
+  .wf-stage-card[data-status="executing"] { border-left-color:var(--accent); }
+  .wf-stage-card[data-status="completed"] { border-left-color:var(--green); }
+  .wf-stage-card[data-status="failed"] { border-left-color:var(--red); }
+  .wf-stage-editor { display:grid; grid-template-columns:120px 1fr 150px; gap:7px; }
+  .wf-stage-editor .wide { grid-column:1/-1; }
+  .wf-stage-editor input, .wf-stage-editor select, .wf-stage-editor textarea { background:var(--surface2); border:1px solid var(--border); border-radius:6px; color:var(--text); padding:7px 8px; }
+  .wf-stage-editor textarea { min-height:58px; resize:vertical; font-family:var(--mono); }
   .wf-history { margin-top: 12px; max-height: 260px; overflow-y: auto; }
   .wf-event { border-top: 1px solid var(--border); padding: 6px 0; font-size: 11px; }
   .wf-event code { color: var(--accent2); }
@@ -422,7 +431,7 @@
   .wf-round.current { border-left-color: var(--accent2); }
   .wf-round-summary { font-size: 12px; margin-top: 2px; }
   .wf-technical summary { cursor: pointer; color: var(--text2); font-size: 11px; margin-top: 12px; }
-  @media (max-width: 720px) { .wf-grid, .wf-settings-grid { grid-template-columns: 1fr; } }
+  @media (max-width: 720px) { .wf-grid, .wf-settings-grid, .wf-stage-editor { grid-template-columns: 1fr; } .wf-stage-editor .wide { grid-column:auto; } }
 
   /* Update banner */
   .update-banner {
@@ -618,6 +627,8 @@
           <input class="wide" id="wfNewRepo" placeholder="D:\Projects\exchange" required>
           <input id="wfNewRounds" type="number" min="1" value="6" title="максимум новых раундов">
           <label style="display:flex;flex-direction:row;align-items:center;gap:6px"><input id="wfNewAuto" type="checkbox" style="width:auto"> автономный цикл</label>
+          <label style="display:flex;flex-direction:row;align-items:center;gap:6px"><input id="wfNewPlanning" type="checkbox" checked style="width:auto"> сначала составить план этапов</label>
+          <select id="wfNewPlannerProvider" title="провайдер планировщика"></select>
           <select id="wfNewExecutorProvider" title="провайдер исполнителя"></select>
           <select id="wfNewReviewerProvider" title="провайдер аудитора"></select>
           <button class="btn btn-sm btn-primary" type="submit">Создать</button>
@@ -1243,6 +1254,7 @@ function toggleWorkflowCreate() {
   if (form.style.display !== 'none') {
     const preferredExecutor = providersData.agy ? 'agy' : '';
     const preferredReviewer = providersData.codex ? 'codex' : preferredExecutor;
+    document.getElementById('wfNewPlannerProvider').innerHTML = workflowProviderOptions(preferredReviewer, false);
     document.getElementById('wfNewExecutorProvider').innerHTML = workflowProviderOptions(preferredExecutor, false);
     document.getElementById('wfNewReviewerProvider').innerHTML = workflowProviderOptions(preferredReviewer, false);
   }
@@ -1259,7 +1271,9 @@ async function createWorkflow(event) {
       schema_version: 1,
       limits: { max_rounds: parseInt(document.getElementById('wfNewRounds').value) || 6 },
       automation: { enabled: document.getElementById('wfNewAuto').checked },
+      planning: { enabled: document.getElementById('wfNewPlanning').checked, require_approval: true },
       roles: {
+        planner: { provider: document.getElementById('wfNewPlannerProvider').value || null },
         executor: { provider: document.getElementById('wfNewExecutorProvider').value || null },
         reviewer: { provider: document.getElementById('wfNewReviewerProvider').value || null },
       },
@@ -1299,13 +1313,19 @@ async function selectWorkflow(id) {
   document.querySelectorAll('.wf-row').forEach(row => row.classList.remove('active'));
   const wf = workflowCache.find(item => item.id === id) || await fetchJSON(`${API}/workflows/${id}`);
   selectedWorkflowData = wf;
-  const [rounds, events, findings] = await Promise.all([
+  const [rounds, events, findings, plan, stages] = await Promise.all([
     fetchJSON(`${API}/workflows/${id}/rounds`),
     fetchJSON(`${API}/workflows/${id}/events?limit=200`),
     fetchJSON(`${API}/workflows/${id}/findings`),
+    fetchJSON(`${API}/workflows/${id}/plan`),
+    fetchJSON(`${API}/workflows/${id}/stages`),
   ]);
   const current = rounds.find(r => r.round_no === wf.current_round);
   const runs = current ? await fetchJSON(`${API}/workflows/${id}/rounds/${current.id}/runs`) : [];
+  let plannerTask = null;
+  if (plan?.planner_task_id) {
+    try { plannerTask = await fetchJSON(`${API}/tasks/${plan.planner_task_id}`); } catch (_) {}
+  }
   let orphanPane = null;
   const latestTaskRun = [...runs].reverse().find(r => r.task_id);
   if (latestTaskRun && !['pending','running'].includes(latestTaskRun.status)) {
@@ -1317,7 +1337,7 @@ async function selectWorkflow(id) {
       }
     } catch (_) {}
   }
-  renderWorkflowDetail(wf, rounds, runs, events, findings, orphanPane);
+  renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, plannerTask, orphanPane);
   const idx = workflowCache.findIndex(item => item.id === id);
   if (idx >= 0) workflowCache[idx] = wf;
   const list = document.getElementById('wfList');
@@ -1339,7 +1359,9 @@ function wfChecked(value) { return value ? ' checked' : ''; }
 function workflowSettingsHtml(wf) {
   const cfg = wf.config || {};
   const automation = cfg.automation || {};
+  const planning = cfg.planning || {};
   const roles = cfg.roles || {};
+  const planner = roles.planner || {};
   const executor = roles.executor || {};
   const reviewer = roles.reviewer || {};
   const gate = cfg.gate || {};
@@ -1378,6 +1400,15 @@ function workflowSettingsHtml(wf) {
         <label>Команды — по одной на строке<textarea id="wfCfgGateCommands" placeholder="pytest -q&#10;git status --porcelain">${esc((gate.commands || []).join('\n'))}</textarea></label>
         <div class="wf-meta">Команды выполняются кодом PromptPilot в каталоге репозитория. Ненулевой exit code возвращает работу исполнителю.</div>
       </div>
+      <div class="wf-settings-card">
+        <h4>План этапов</h4>
+        <label class="check"><input id="wfCfgPlanningEnabled" type="checkbox"${wfChecked(planning.enabled)}> использовать planner и последовательные этапы</label>
+        <label class="check"><input id="wfCfgPlanApproval" type="checkbox"${wfChecked(planning.require_approval !== false)}> требовать утверждение плана человеком</label>
+        <label>Максимум этапов<input id="wfCfgMaxStages" type="number" min="1" max="50" value="${planning.max_stages || 20}"></label>
+        <label>Возвратов на один этап<input id="wfCfgStageRevisions" type="number" min="1" max="20" value="${planning.max_revisions_per_stage || 3}"></label>
+        <label>Шаблон prompt планировщика<textarea id="wfCfgPlanningPrompt" placeholder="Пусто = встроенный шаблон">${esc(planning.prompt_template || '')}</textarea></label>
+      </div>
+      ${roleCard('Planner', 'Планировщик', planner, false)}
       ${roleCard('Executor', 'Исполнитель', executor, true)}
       ${roleCard('Reviewer', 'Независимый аудитор', reviewer, false)}
     </div>
@@ -1389,7 +1420,9 @@ function workflowSettingsHtml(wf) {
 
 function workflowStatusInfo(status, reviewerDone = false) {
   const info = {
-    draft: ['Черновик', 'Следующее действие: запустить первый раунд.'],
+    draft: ['Черновик', 'Следующее действие: сформировать план этапов либо запустить быструю задачу.'],
+    planning: ['Планирование', 'Сильный планировщик исследует задачу и формирует этапы.'],
+    awaiting_plan_approval: ['План ожидает утверждения', 'Проверьте порядок, scope и gate каждого этапа, затем утвердите план.'],
     queued: ['Готов к запуску', 'Следующее действие: выбрать исполнителя и отправить промпт.'],
     executing: ['Исполнитель работает', 'Следующее действие: наблюдать за агентом; после успешного ответа начнутся проверки.'],
     gating: ['Автоматические проверки', 'Следующее действие: зафиксировать результат gate.'],
@@ -1406,6 +1439,14 @@ function workflowStatusInfo(status, reviewerDone = false) {
 }
 
 function workflowOwnerInfo(wf, activeRun, reviewerDone) {
+  if (wf.status === 'planning') return {
+    who: 'Планировщик', detail: activeRun?.task_id ? `task #${activeRun.task_id} · разбивает задачу на этапы` : 'запускается',
+    next: 'Дальше: ваше однократное утверждение плана', color: 'var(--accent)',
+  };
+  if (wf.status === 'awaiting_plan_approval') return {
+    who: 'Вы', detail: 'нужно проверить и утвердить предложенные этапы',
+    next: 'После утверждения начнётся автономное выполнение этапа 1', color: 'var(--yellow)',
+  };
   if (wf.status === 'executing') return {
     who: 'Исполнитель', detail: activeRun?.task_id ? `task #${activeRun.task_id} · работает` : 'запускается',
     next: 'Дальше: автоматические проверки (Gate)', color: 'var(--accent)',
@@ -1453,10 +1494,12 @@ function workflowRoundRow(round, current = false) {
 
 function workflowStopReason(events) {
   const stopping = [
-    'executor.invalid_output','reviewer.invalid_output','gate.failed',
+    'planner.invalid_output','executor.invalid_output','reviewer.invalid_output','gate.failed',
     'gate.human_required','run.failed','automation.paused','limit.max_rounds',
+    'limit.stage_revisions',
   ];
   const superseding = [
+    'planner.dispatched','planner.completed','plan.edited','plan.approved','stage.advanced',
     'human.resumed','executor.dispatched','executor.completed','gate.passed','reviewer.dispatched',
     'review.awaiting_decision','review.passed','review.revision_required',
     'workflow.completed',
@@ -1476,9 +1519,49 @@ function workflowStopReason(events) {
   return `${task}${reason}`;
 }
 
-function renderWorkflowDetail(wf, rounds, runs, events, findings, orphanPane = null) {
+function workflowStageEditorCard(stage = {}, index = 0) {
+  return `<div class="wf-stage-card wf-stage-edit-card" data-index="${index}" data-status="${escAttr(stage.status || 'draft')}">
+    <div class="wf-stage-editor">
+      <input data-field="code" value="${escAttr(stage.code || '')}" placeholder="Код">
+      <input data-field="title" value="${escAttr(stage.title || '')}" placeholder="Название">
+      <select data-field="stage_type"><option value="implementation"${stage.stage_type !== 'integration' ? ' selected' : ''}>implementation</option><option value="integration"${stage.stage_type === 'integration' ? ' selected' : ''}>integration</option></select>
+      <textarea class="wide" data-field="objective" placeholder="Проверяемая цель">${esc(stage.objective || '')}</textarea>
+      <input class="wide" data-field="dependencies" value="${escAttr((stage.dependencies || []).join(', '))}" placeholder="Зависимости: S1, S2">
+      <textarea class="wide" data-field="allowed_paths" placeholder="Разрешённые пути — по одному на строке">${esc((stage.allowed_paths || []).join('\n'))}</textarea>
+      <textarea class="wide" data-field="deliverables" placeholder="Deliverables — по одному на строке">${esc((stage.deliverables || []).join('\n'))}</textarea>
+      <textarea class="wide" data-field="acceptance_gates" placeholder="Gate-команды — по одной на строке">${esc((stage.acceptance_gates || []).join('\n'))}</textarea>
+      <input data-field="max_revision_rounds" type="number" min="1" value="${stage.max_revision_rounds || ''}" placeholder="Лимит возвратов">
+      <input data-field="executor_prompt" value="${escAttr(stage.executor_prompt || '')}" placeholder="Особый prompt executor">
+      <input data-field="reviewer_prompt" value="${escAttr(stage.reviewer_prompt || '')}" placeholder="Особый prompt reviewer">
+    </div>
+    <div class="wf-actions"><button class="btn btn-sm btn-ghost" data-stage-action="up" onclick="wfMoveStage(${index},-1)">↑</button><button class="btn btn-sm btn-ghost" data-stage-action="down" onclick="wfMoveStage(${index},1)">↓</button><button class="btn btn-sm btn-danger" data-stage-action="delete" onclick="wfDeleteStage(${index})">Удалить</button></div>
+  </div>`;
+}
+
+function workflowPlanHtml(wf, plan, stages) {
+  if (!wf.config?.planning?.enabled && !stages.length) return '';
+  const editable = wf.status === 'awaiting_plan_approval';
+  const cards = stages.map((stage, index) => editable ? workflowStageEditorCard(stage, index) : `
+    <div class="wf-stage-card" data-status="${escAttr(stage.status)}">
+      <div class="wf-stage-title">${index + 1}. ${esc(stage.code)} · ${esc(stage.title)} <span class="task-status" data-s="${escAttr(stage.status)}">${esc(stage.status)}</span></div>
+      <div class="wf-round-summary">${esc(stage.objective)}</div>
+      <div class="wf-meta">${esc(stage.stage_type)} · gate: ${(stage.acceptance_gates || []).length} · возвратов: ${stage.max_revision_rounds || wf.config?.planning?.max_revisions_per_stage || 3}</div>
+    </div>`).join('');
+  const controls = editable ? `<div class="wf-actions">
+    <button class="btn btn-sm btn-ghost" onclick="wfAddStage()">Добавить этап</button>
+    <button class="btn btn-sm btn-ghost" onclick="wfSavePlan()">Сохранить план</button>
+    <button class="btn btn-sm btn-primary" onclick="wfApprovePlan()">Сохранить и утвердить</button>
+    <button class="btn btn-sm btn-ghost" onclick="wfPlannerDispatch(true)">Сформировать заново</button>
+  </div>` : '';
+  return `<div class="wf-section-title">План этапов · ${stages.length}</div>
+    ${editable ? '<div class="wf-meta">Последний этап должен иметь тип integration. Gate-команды выполняются только после ручного утверждения плана.</div>' : ''}
+    <div class="wf-stage-list" id="wfStageList">${cards || '<div class="wf-meta">Планировщик ещё не сформировал этапы.</div>'}</div>${controls}`;
+}
+
+function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, plannerTask, orphanPane = null) {
   const terminal = ['completed','failed','cancelled'].includes(wf.status);
-  const activeRun = [...runs].reverse().find(r => ['pending','running'].includes(r.status));
+  const plannerRun = wf.status === 'planning' && plannerTask ? {role:'planner', task_id:plannerTask.id, status:plannerTask.status} : null;
+  const activeRun = plannerRun || [...runs].reverse().find(r => ['pending','running'].includes(r.status));
   const activeTaskId = activeRun?.task_id || orphanPane?.task_id || null;
   const reviewerDone = [...runs].reverse().find(r => r.role === 'reviewer' && r.status === 'completed');
   const reviewerResult = reviewerDone?.output?.result || '';
@@ -1488,16 +1571,25 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, orphanPane = n
   const currentRound = rounds.find(r => r.round_no === wf.current_round);
   const pastRounds = rounds.filter(r => r.round_no !== wf.current_round);
   const importedCount = rounds.filter(r => r.summary?.historical).length;
-  const stage = wf.config?.stage || {};
+  const stage = stages.find(item => item.id === wf.current_stage_id) || wf.config?.stage || {};
   const statusInfo = workflowStatusInfo(wf.status, !!reviewerDone);
   const ownerInfo = workflowOwnerInfo(wf, activeRun, reviewerDone);
   const stopReason = workflowStopReason(events);
   const previousAudit = [...pastRounds].reverse().find(r => r.summary?.summary);
   const stageTitle = stage.title || `Раунд ${wf.current_round}: доработка после последнего аудита`;
-  const stageGoal = stage.goal || previousAudit?.summary?.summary || wf.objective;
+  const stageGoal = stage.objective || stage.goal || previousAudit?.summary?.summary || wf.objective;
+  const plannerForm = `<div class="wf-form wide">
+    <textarea class="wide" id="wfPlannerPrompt" placeholder="Дополнительные указания планировщику (необязательно)"></textarea>
+    <select id="wfPlannerProvider">${workflowProviderOptions(wf.config?.roles?.planner?.provider || '', false)}</select>
+    <button class="btn btn-sm btn-primary" onclick="wfPlannerDispatch(false)">Сформировать план этапов</button>
+  </div>`;
   let action = '';
   if (wf.status === 'draft') {
-    action = `<button class="btn btn-sm btn-primary" onclick="wfStart()">Начать первый раунд</button>`;
+    action = wf.config?.planning?.enabled
+      ? `${plannerForm}<button class="btn btn-sm btn-ghost" onclick="wfStart()">Запустить без плана как один этап</button>`
+      : `<button class="btn btn-sm btn-primary" onclick="wfStart()">Начать первый раунд</button>`;
+  } else if (wf.status === 'awaiting_human' && plan?.status === 'failed' && !wf.current_round) {
+    action = plannerForm;
   } else if (['queued','reviewing'].includes(wf.status)) {
     const role = wf.status === 'queued' ? 'executor' : 'reviewer';
     action = `<div class="wf-form wide">
@@ -1532,7 +1624,8 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, orphanPane = n
       <button class="btn btn-sm btn-danger" onclick="wfReview('REVISION_REQUIRED')">Нужны исправления</button>
       <button class="btn btn-sm btn-ghost wide" onclick="wfReview('HUMAN_REQUIRED')">Нужен человек</button></div>`;
   }
-  const runRows = runs.map(r => `<div class="wf-round${r === activeRun ? ' current' : ''}"><b>${esc(r.role)} · попытка ${r.attempt_no}</b> · ${esc(r.status)}${r.task_id ? ` · task #${r.task_id}` : ''}</div>`).join('');
+  const runRows = (plannerTask ? [`<div class="wf-round${plannerRun ? ' current' : ''}"><b>planner</b> · ${esc(plannerTask.status)} · task #${plannerTask.id}</div>`] : [])
+    .concat(runs.map(r => `<div class="wf-round${r === activeRun ? ' current' : ''}"><b>${esc(r.role)} · попытка ${r.attempt_no}</b> · ${esc(r.status)}${r.task_id ? ` · task #${r.task_id}` : ''}</div>`)).join('');
   const eventRows = [...events].reverse().slice(0, 30).map(e => `<div class="wf-event"><code>${esc(e.event_type)}</code> · ${formatTime(e.created_at)}</div>`).join('');
   const historyRows = pastRounds.map(r => workflowRoundRow(r)).join('');
   document.getElementById('wfDetail').innerHTML = `
@@ -1561,6 +1654,7 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, orphanPane = n
       ${!terminal ? `<button class="btn btn-sm btn-danger" onclick="wfCancel()">Отменить весь workflow</button>` : ''}
     </div>
     ${workflowSettingsHtml(wf)}
+    ${workflowPlanHtml(wf, plan, stages)}
     ${action}
     <div class="wf-section-title">Текущий раунд</div>
     ${currentRound ? workflowRoundRow(currentRound, true) : '<div class="wf-meta">Текущий раунд ещё не создан.</div>'}
@@ -1584,6 +1678,7 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, orphanPane = n
       <div class="wf-history">${eventRows || '<div class="wf-meta">Событий пока нет.</div>'}</div>
     </details>`;
   if (['queued','reviewing'].includes(wf.status)) setTimeout(wfProviderChanged, 0);
+  if (wf.status === 'awaiting_plan_approval') setTimeout(wfReindexStageCards, 0);
   if (activeWorkflowTaskId) setTimeout(() => wfRefreshScreen(activeWorkflowTaskId), 0);
 }
 
@@ -1647,6 +1742,14 @@ async function wfSaveSettings() {
       title: document.getElementById('wfCfgStageTitle').value.trim(),
       goal: document.getElementById('wfCfgStageGoal').value.trim(),
     },
+    planning: {
+      ...(old.planning || {}),
+      enabled: document.getElementById('wfCfgPlanningEnabled').checked,
+      require_approval: document.getElementById('wfCfgPlanApproval').checked,
+      max_stages: Math.max(1, parseInt(document.getElementById('wfCfgMaxStages').value, 10) || 20),
+      max_revisions_per_stage: Math.max(1, parseInt(document.getElementById('wfCfgStageRevisions').value, 10) || 3),
+      prompt_template: document.getElementById('wfCfgPlanningPrompt').value,
+    },
     automation: {
       ...(old.automation || {}), enabled,
       auto_dispatch_executor: document.getElementById('wfCfgAutoExecutor').checked,
@@ -1660,6 +1763,7 @@ async function wfSaveSettings() {
       commands, timeout_seconds: Math.max(1, parseInt(document.getElementById('wfCfgGateTimeout').value, 10) || 1800),
     },
     roles: {
+      planner: wfRoleSettings('Planner', old.roles?.planner, false),
       executor: wfRoleSettings('Executor', old.roles?.executor, true),
       reviewer: wfRoleSettings('Reviewer', old.roles?.reviewer, false),
     },
@@ -1672,6 +1776,112 @@ async function wfSaveSettings() {
     toast('Настройки workflow сохранены', false);
     await loadWorkflows();
   } catch (e) { toast('Настройки workflow: ' + e.message); }
+}
+
+function wfReindexStageCards() {
+  [...document.querySelectorAll('#wfStageList .wf-stage-edit-card')].forEach((card, index) => {
+    card.dataset.index = index;
+    const up = card.querySelector('[data-stage-action="up"]');
+    const down = card.querySelector('[data-stage-action="down"]');
+    const remove = card.querySelector('[data-stage-action="delete"]');
+    if (up) { up.setAttribute('onclick', `wfMoveStage(${index},-1)`); up.disabled = index === 0; }
+    if (down) { down.setAttribute('onclick', `wfMoveStage(${index},1)`); down.disabled = index === document.querySelectorAll('#wfStageList .wf-stage-edit-card').length - 1; }
+    if (remove) remove.setAttribute('onclick', `wfDeleteStage(${index})`);
+  });
+}
+
+function wfMoveStage(index, delta) {
+  const list = document.getElementById('wfStageList');
+  const cards = [...list.querySelectorAll('.wf-stage-edit-card')];
+  const target = index + delta;
+  if (!cards[index] || target < 0 || target >= cards.length) return;
+  if (delta < 0) list.insertBefore(cards[index], cards[target]);
+  else list.insertBefore(cards[target], cards[index]);
+  wfReindexStageCards();
+}
+
+function wfDeleteStage(index) {
+  const cards = [...document.querySelectorAll('#wfStageList .wf-stage-edit-card')];
+  if (cards.length <= 1) { toast('В плане должен остаться хотя бы один этап.'); return; }
+  cards[index]?.remove();
+  wfReindexStageCards();
+}
+
+function wfAddStage() {
+  const list = document.getElementById('wfStageList');
+  const index = list.querySelectorAll('.wf-stage-edit-card').length;
+  list.insertAdjacentHTML('beforeend', workflowStageEditorCard({
+    code: `S${index + 1}`, title: '', objective: '', stage_type: 'implementation',
+    dependencies: index ? [`S${index}`] : [], allowed_paths: [], deliverables: [], acceptance_gates: [],
+  }, index));
+  wfReindexStageCards();
+  list.lastElementChild?.querySelector('[data-field="title"]')?.focus();
+}
+
+function wfStageListValue(card, field, comma = false) {
+  const value = card.querySelector(`[data-field="${field}"]`)?.value || '';
+  return value.split(comma ? ',' : /\r?\n/).map(item => item.trim()).filter(Boolean);
+}
+
+function wfCollectPlanStages() {
+  return [...document.querySelectorAll('#wfStageList .wf-stage-edit-card')].map(card => {
+    const value = field => card.querySelector(`[data-field="${field}"]`)?.value?.trim() || '';
+    const revisionRaw = value('max_revision_rounds');
+    return {
+      code: value('code'), title: value('title'), objective: value('objective'),
+      stage_type: value('stage_type') || 'implementation',
+      dependencies: wfStageListValue(card, 'dependencies', true),
+      allowed_paths: wfStageListValue(card, 'allowed_paths'),
+      deliverables: wfStageListValue(card, 'deliverables'),
+      acceptance_gates: wfStageListValue(card, 'acceptance_gates'),
+      executor_prompt: value('executor_prompt'), reviewer_prompt: value('reviewer_prompt'),
+      max_revision_rounds: revisionRaw ? parseInt(revisionRaw, 10) : null,
+    };
+  });
+}
+
+async function wfSavePlan(reload = true) {
+  const stages = wfCollectPlanStages();
+  if (!stages.length || stages.some(stage => !stage.code || !stage.title || !stage.objective)) {
+    toast('У каждого этапа обязательны код, название и проверяемая цель.');
+    return false;
+  }
+  try {
+    await fetchJSON(`${API}/workflows/${selectedWorkflowId}/plan`, {
+      method:'PUT', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({expected_version:selectedWorkflowData.state_version, stages}),
+    });
+    toast('План этапов сохранён', false);
+    if (reload) await loadWorkflows();
+    return true;
+  } catch (e) { toast('План этапов: ' + e.message); return false; }
+}
+
+async function wfApprovePlan() {
+  if (!await wfSavePlan(false)) return;
+  try {
+    const fresh = await fetchJSON(`${API}/workflows/${selectedWorkflowId}`);
+    await fetchJSON(`${API}/workflows/${selectedWorkflowId}/plan/approve`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({expected_version:fresh.state_version}),
+    });
+    toast('План утверждён, первый этап запущен', false);
+    await loadWorkflows();
+  } catch (e) { toast('Утверждение плана: ' + e.message); }
+}
+
+async function wfPlannerDispatch(regenerate = false) {
+  if (regenerate && !confirm('Заменить текущий черновик плана новым результатом планировщика?')) return;
+  const provider = document.getElementById('wfPlannerProvider')?.value || selectedWorkflowData.config?.roles?.planner?.provider || null;
+  const prompt = document.getElementById('wfPlannerPrompt')?.value || '';
+  try {
+    await fetchJSON(`${API}/workflows/${selectedWorkflowId}/plan/dispatch`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({expected_version:selectedWorkflowData.state_version, provider, prompt, keep_pane:true}),
+    });
+    toast('Планировщик запущен', false);
+    await loadWorkflows();
+  } catch (e) { toast('Планировщик: ' + e.message); }
 }
 
 function wfAdvance() { return wfPost('advance', {}); }

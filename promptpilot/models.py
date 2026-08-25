@@ -114,6 +114,8 @@ class WorkflowStatus(str, Enum):
     """Durable lifecycle states for an orchestrated engineering workflow."""
 
     DRAFT = "draft"
+    PLANNING = "planning"
+    AWAITING_PLAN_APPROVAL = "awaiting_plan_approval"
     QUEUED = "queued"
     EXECUTING = "executing"
     GATING = "gating"
@@ -145,6 +147,7 @@ class WorkflowRunStatus(str, Enum):
 
 
 class WorkflowRole(str, Enum):
+    PLANNER = "planner"
     EXECUTOR = "executor"
     GATE = "gate"
     REVIEWER = "reviewer"
@@ -164,6 +167,20 @@ class FindingStatus(str, Enum):
     RESOLVED = "resolved"
     REOPENED = "reopened"
     ACCEPTED_RISK = "accepted_risk"
+
+
+class WorkflowStageStatus(str, Enum):
+    DRAFT = "draft"
+    PENDING = "pending"
+    EXECUTING = "executing"
+    COMPLETED = "completed"
+    SKIPPED = "skipped"
+    FAILED = "failed"
+
+
+class WorkflowStageType(str, Enum):
+    IMPLEMENTATION = "implementation"
+    INTEGRATION = "integration"
 
 
 class WorkflowRoleConfig(BaseModel):
@@ -188,6 +205,7 @@ class WorkflowRoleConfig(BaseModel):
 class WorkflowRolesConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    planner: WorkflowRoleConfig = Field(default_factory=WorkflowRoleConfig)
     executor: WorkflowRoleConfig = Field(default_factory=WorkflowRoleConfig)
     reviewer: WorkflowRoleConfig = Field(default_factory=WorkflowRoleConfig)
 
@@ -235,6 +253,16 @@ class WorkflowLimitsConfig(BaseModel):
     max_rounds: int = Field(default=6, ge=1, le=100)
 
 
+class WorkflowPlanningConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    require_approval: bool = True
+    max_stages: int = Field(default=20, ge=1, le=50)
+    max_revisions_per_stage: int = Field(default=3, ge=1, le=20)
+    prompt_template: str = ""
+
+
 class WorkflowConfig(BaseModel):
     """Versioned workflow configuration with legacy-friendly defaults."""
 
@@ -246,6 +274,7 @@ class WorkflowConfig(BaseModel):
     )
     roles: WorkflowRolesConfig = Field(default_factory=WorkflowRolesConfig)
     gate: WorkflowGateConfig = Field(default_factory=WorkflowGateConfig)
+    planning: WorkflowPlanningConfig = Field(default_factory=WorkflowPlanningConfig)
     limits: WorkflowLimitsConfig = Field(default_factory=WorkflowLimitsConfig)
     stage: dict[str, Any] = Field(default_factory=dict)
 
@@ -301,6 +330,7 @@ class WorkflowInDB(BaseModel):
     candidate_branch: str
     status: WorkflowStatus
     current_round: int = 0
+    current_stage_id: Optional[str] = None
     state_version: int = 0
     config: dict[str, Any] = Field(default_factory=normalize_workflow_config)
     created_at: datetime
@@ -323,6 +353,7 @@ class WorkflowRoundInDB(BaseModel):
     id: str
     workflow_id: str
     round_no: int
+    stage_id: Optional[str] = None
     status: WorkflowRoundStatus
     base_sha: Optional[str] = None
     candidate_sha: Optional[str] = None
@@ -354,6 +385,87 @@ class WorkflowRunInDB(BaseModel):
     output: Optional[dict[str, Any]] = None
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
+
+
+class WorkflowStageSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    code: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+    title: str = Field(min_length=1, max_length=200)
+    objective: str = Field(min_length=1)
+    stage_type: WorkflowStageType = WorkflowStageType.IMPLEMENTATION
+    dependencies: list[str] = Field(default_factory=list, max_length=20)
+    allowed_paths: list[str] = Field(default_factory=list, max_length=100)
+    deliverables: list[str] = Field(default_factory=list, max_length=100)
+    acceptance_gates: list[str] = Field(default_factory=list, max_length=20)
+    executor_prompt: str = ""
+    reviewer_prompt: str = ""
+    max_revision_rounds: Optional[int] = Field(default=None, ge=1, le=20)
+
+
+class WorkflowPlanReplace(BaseModel):
+    expected_version: int = Field(ge=0)
+    stages: list[WorkflowStageSpec] = Field(min_length=1, max_length=50)
+
+    @model_validator(mode="after")
+    def validate_sequential_dependencies(self):
+        codes = [stage.code for stage in self.stages]
+        if len(codes) != len(set(codes)):
+            raise ValueError("workflow stage codes must be unique")
+        seen: set[str] = set()
+        for stage in self.stages:
+            unknown = set(stage.dependencies) - seen
+            if unknown:
+                raise ValueError(
+                    f"stage {stage.code} dependencies must reference earlier stages: "
+                    + ", ".join(sorted(unknown))
+                )
+            seen.add(stage.code)
+        if self.stages[-1].stage_type is not WorkflowStageType.INTEGRATION:
+            raise ValueError("the final workflow stage must have stage_type=integration")
+        return self
+
+
+class WorkflowStageInDB(WorkflowStageSpec):
+    id: str
+    workflow_id: str
+    position: int = Field(ge=1)
+    status: WorkflowStageStatus
+    created_at: datetime
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    summary: Optional[dict[str, Any]] = None
+
+
+class WorkflowPlanDispatch(BaseModel):
+    expected_version: int = Field(ge=0)
+    prompt: str = ""
+    provider: Optional[str] = None
+    priority: int = Field(default=5, ge=1, le=10)
+    max_retries: int = Field(default=5, ge=0, le=50)
+    model: Optional[str] = None
+    effort: Optional[str] = None
+    task_timeout: Optional[int] = Field(default=None, ge=0)
+    herdr_target: Optional[str] = None
+    machine: Optional[str] = None
+    keep_pane: bool = True
+
+
+class WorkflowPlanInDB(BaseModel):
+    workflow_id: str
+    status: str
+    planner_task_id: Optional[int] = None
+    input_sha256: Optional[str] = None
+    output_sha256: Optional[str] = None
+    output: Optional[dict[str, Any]] = None
+    created_at: datetime
+    updated_at: datetime
+    approved_at: Optional[datetime] = None
+
+
+class WorkflowPlanApproval(BaseModel):
+    expected_version: int = Field(ge=0)
+    base_sha: Optional[str] = None
 
 
 class WorkflowFindingUpsert(BaseModel):

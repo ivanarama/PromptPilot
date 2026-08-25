@@ -75,6 +75,10 @@ def test_openapi_contains_read_models_and_workflow_routes(isolated_db):
     assert "/api/workflows/{workflow_id}/rounds/{round_id}/runs" in paths
     assert "/api/workflows/{workflow_id}/advance" in paths
     assert "/api/workflows/{workflow_id}/report" in paths
+    assert "/api/workflows/{workflow_id}/plan" in paths
+    assert "/api/workflows/{workflow_id}/stages" in paths
+    assert "/api/workflows/{workflow_id}/plan/dispatch" in paths
+    assert "/api/workflows/{workflow_id}/plan/approve" in paths
     assert "WorkflowEventInDB" in schema["components"]["schemas"]
 
 
@@ -130,6 +134,10 @@ def test_web_ui_exposes_workflow_and_live_agent_controls():
     assert "Технический журнал" in html
     assert "Настройки автономного workflow" in html
     assert "function wfSaveSettings" in html
+    assert "function wfPlannerDispatch" in html
+    assert "function wfSavePlan" in html
+    assert "function wfApprovePlan" in html
+    assert "План этапов" in html
     assert "function wfDownloadReport" in html
     assert "агент ещё работает" in html
     assert "orphanPane" in html
@@ -143,6 +151,59 @@ def test_workflow_api_validates_slug_and_duplicate(isolated_db):
     assert request("POST", "/api/workflows", json=payload()).status_code == 201
     assert request("POST", "/api/workflows", json=payload()).status_code == 409
     assert request("GET", "/api/workflows/does-not-exist").status_code == 404
+
+
+def test_w3_plan_api_dispatch_edit_and_approve(isolated_db):
+    body = payload("api-stage-plan")
+    body["config"] = {
+        "planning": {"enabled": True, "require_approval": True},
+        "automation": {"enabled": False},
+    }
+    created = request("POST", "/api/workflows", json=body).json()
+    dispatched = request(
+        "POST", f"/api/workflows/{created['id']}/plan/dispatch",
+        json={"expected_version": created["state_version"]},
+    )
+    assert dispatched.status_code == 200
+    task = isolated_db.get_next_runnable()
+    isolated_db.mark_completed(
+        task.id,
+        "WORKFLOW_PLAN_JSON_BEGIN\n"
+        '{"stages":[{"code":"FINAL","title":"Контракт","objective":"Сделать контракт","stage_type":"integration"}]}'
+        "\nWORKFLOW_PLAN_JSON_END\nИТОГ: ГОТОВО — план",
+        exit_code=0,
+    )
+    isolated_db.set_verdict(task.id, "ГОТОВО")
+    synced = request("POST", f"/api/workflows/{created['id']}/sync")
+    assert synced.status_code == 200
+    assert synced.json()["workflow"]["status"] == "awaiting_plan_approval"
+    plan = request("GET", f"/api/workflows/{created['id']}/plan").json()
+    stages = request("GET", f"/api/workflows/{created['id']}/stages").json()
+    assert plan["status"] == "awaiting_approval"
+    assert [stage["code"] for stage in stages] == ["FINAL"]
+
+    current = request("GET", f"/api/workflows/{created['id']}").json()
+    edited = request(
+        "PUT", f"/api/workflows/{created['id']}/plan",
+        json={
+            "expected_version": current["state_version"],
+            "stages": [{
+                "code": "FINAL", "title": "Контракт API", "stage_type": "integration",
+                "objective": "Проверить редактирование", "acceptance_gates": ["pytest -q"],
+            }],
+        },
+    )
+    assert edited.status_code == 200
+    assert edited.json()[0]["title"] == "Контракт API"
+
+    current = request("GET", f"/api/workflows/{created['id']}").json()
+    approved = request(
+        "POST", f"/api/workflows/{created['id']}/plan/approve",
+        json={"expected_version": current["state_version"]},
+    )
+    assert approved.status_code == 200
+    assert approved.json()["status"] == "queued"
+    assert approved.json()["current_stage_id"]
 
 
 def test_w1_api_manual_start_dispatch_sync_and_gate(isolated_db):

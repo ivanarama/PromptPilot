@@ -24,6 +24,9 @@ from .models import (
     WorkflowFindingInDB,
     WorkflowFindingUpsert,
     WorkflowInDB,
+    WorkflowPlanInDB,
+    WorkflowStageInDB,
+    WorkflowStageSpec,
     WorkflowRoundCreate,
     WorkflowRoundInDB,
     WorkflowRunCreate,
@@ -114,6 +117,7 @@ CREATE TABLE IF NOT EXISTS workflows (
     candidate_branch TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'draft',
     current_round INTEGER NOT NULL DEFAULT 0,
+    current_stage_id TEXT,
     state_version INTEGER NOT NULL DEFAULT 0,
     config_json TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL,
@@ -121,10 +125,41 @@ CREATE TABLE IF NOT EXISTS workflows (
     completed_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS workflow_plans (
+    workflow_id TEXT PRIMARY KEY REFERENCES workflows(id) ON DELETE RESTRICT,
+    status TEXT NOT NULL DEFAULT 'draft',
+    planner_task_id INTEGER,
+    input_sha256 TEXT,
+    output_sha256 TEXT,
+    output_json TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    approved_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS workflow_stages (
+    id TEXT PRIMARY KEY,
+    workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE RESTRICT,
+    position INTEGER NOT NULL,
+    code TEXT NOT NULL,
+    title TEXT NOT NULL,
+    objective TEXT NOT NULL,
+    stage_type TEXT NOT NULL DEFAULT 'implementation',
+    status TEXT NOT NULL DEFAULT 'draft',
+    spec_json TEXT NOT NULL DEFAULT '{}',
+    summary_json TEXT,
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    completed_at TEXT,
+    UNIQUE(workflow_id, position),
+    UNIQUE(workflow_id, code)
+);
+
 CREATE TABLE IF NOT EXISTS workflow_rounds (
     id TEXT PRIMARY KEY,
     workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE RESTRICT,
     round_no INTEGER NOT NULL,
+    stage_id TEXT REFERENCES workflow_stages(id) ON DELETE RESTRICT,
     status TEXT NOT NULL DEFAULT 'pending',
     base_sha TEXT,
     candidate_sha TEXT,
@@ -203,6 +238,7 @@ BEGIN
 END;
 
 CREATE INDEX IF NOT EXISTS idx_workflows_status ON workflows(status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_workflow_stages_workflow ON workflow_stages(workflow_id, position);
 CREATE INDEX IF NOT EXISTS idx_workflow_rounds_workflow ON workflow_rounds(workflow_id, round_no);
 CREATE INDEX IF NOT EXISTS idx_workflow_runs_round ON workflow_runs(round_id, role, attempt_no);
 CREATE INDEX IF NOT EXISTS idx_workflow_findings_workflow ON workflow_findings(workflow_id, status, severity);
@@ -243,9 +279,28 @@ MIGRATIONS = [
     "ALTER TABLE tasks ADD COLUMN effort TEXT",
     "ALTER TABLE notifications ADD COLUMN pane_id TEXT",
     "ALTER TABLE notifications ADD COLUMN machine TEXT",
+    "ALTER TABLE workflows ADD COLUMN current_stage_id TEXT",
+    """CREATE TABLE IF NOT EXISTS workflow_plans (
+        workflow_id TEXT PRIMARY KEY REFERENCES workflows(id) ON DELETE RESTRICT,
+        status TEXT NOT NULL DEFAULT 'draft', planner_task_id INTEGER,
+        input_sha256 TEXT, output_sha256 TEXT, output_json TEXT,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL, approved_at TEXT
+    )""",
+    """CREATE TABLE IF NOT EXISTS workflow_stages (
+        id TEXT PRIMARY KEY,
+        workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE RESTRICT,
+        position INTEGER NOT NULL, code TEXT NOT NULL, title TEXT NOT NULL,
+        objective TEXT NOT NULL, stage_type TEXT NOT NULL DEFAULT 'implementation',
+        status TEXT NOT NULL DEFAULT 'draft', spec_json TEXT NOT NULL DEFAULT '{}',
+        summary_json TEXT, created_at TEXT NOT NULL, started_at TEXT, completed_at TEXT,
+        UNIQUE(workflow_id, position), UNIQUE(workflow_id, code)
+    )""",
+    "ALTER TABLE workflow_rounds ADD COLUMN stage_id TEXT REFERENCES workflow_stages(id) ON DELETE RESTRICT",
+    "CREATE INDEX IF NOT EXISTS idx_workflow_stages_workflow ON workflow_stages(workflow_id, position)",
 ]
 
 WORKFLOW_SCHEMA_VERSION = "workflow_orchestrator_w0_v1"
+WORKFLOW_STAGE_SCHEMA_VERSION = "workflow_stage_planner_w3_v1"
 
 
 def _now() -> str:
@@ -316,6 +371,11 @@ def init_db():
             """INSERT OR IGNORE INTO schema_migrations (version, applied_at)
                VALUES (?, ?)""",
             (WORKFLOW_SCHEMA_VERSION, _now()),
+        )
+        conn.execute(
+            """INSERT OR IGNORE INTO schema_migrations (version, applied_at)
+               VALUES (?, ?)""",
+            (WORKFLOW_STAGE_SCHEMA_VERSION, _now()),
         )
 
 
@@ -967,6 +1027,35 @@ def _row_to_workflow_event(row: sqlite3.Row) -> WorkflowEventInDB:
     return WorkflowEventInDB(**data)
 
 
+def _row_to_workflow_plan(row: sqlite3.Row) -> WorkflowPlanInDB:
+    data = dict(row)
+    data["output"] = _json_load(data.pop("output_json"), None)
+    for field in ("created_at", "updated_at", "approved_at"):
+        data[field] = _parse_dt(data[field])
+    return WorkflowPlanInDB(**data)
+
+
+def _row_to_workflow_stage(row: sqlite3.Row) -> WorkflowStageInDB:
+    raw = dict(row)
+    spec = _json_load(raw.pop("spec_json"))
+    summary = _json_load(raw.pop("summary_json"), None)
+    spec.update({
+        "id": raw["id"],
+        "workflow_id": raw["workflow_id"],
+        "position": raw["position"],
+        "code": raw["code"],
+        "title": raw["title"],
+        "objective": raw["objective"],
+        "stage_type": raw["stage_type"],
+        "status": raw["status"],
+        "created_at": _parse_dt(raw["created_at"]),
+        "started_at": _parse_dt(raw["started_at"]),
+        "completed_at": _parse_dt(raw["completed_at"]),
+        "summary": summary,
+    })
+    return WorkflowStageInDB(**spec)
+
+
 def _append_workflow_event(conn: sqlite3.Connection,
                            event: WorkflowEventCreate) -> WorkflowEventInDB:
     """Insert exactly once, rejecting reuse of a key for different content."""
@@ -1092,6 +1181,71 @@ def list_workflows(status: str = None, limit: int = 50,
                 (limit, offset),
             ).fetchall()
         return [_row_to_workflow(row) for row in rows]
+
+
+def get_workflow_plan(workflow_id: str, *, conn=None) -> Optional[WorkflowPlanInDB]:
+    def _query(c):
+        row = c.execute(
+            "SELECT * FROM workflow_plans WHERE workflow_id = ?", (workflow_id,)
+        ).fetchone()
+        return _row_to_workflow_plan(row) if row else None
+
+    if conn is not None:
+        return _query(conn)
+    with _connect() as c:
+        return _query(c)
+
+
+def list_workflow_stages(workflow_id: str, *, conn=None) -> list[WorkflowStageInDB]:
+    def _query(c):
+        rows = c.execute(
+            """SELECT * FROM workflow_stages WHERE workflow_id = ?
+               ORDER BY position""",
+            (workflow_id,),
+        ).fetchall()
+        return [_row_to_workflow_stage(row) for row in rows]
+
+    if conn is not None:
+        return _query(conn)
+    with _connect() as c:
+        return _query(c)
+
+
+def get_workflow_stage(stage_id: str, *, conn=None) -> Optional[WorkflowStageInDB]:
+    def _query(c):
+        row = c.execute(
+            "SELECT * FROM workflow_stages WHERE id = ?", (stage_id,)
+        ).fetchone()
+        return _row_to_workflow_stage(row) if row else None
+
+    if conn is not None:
+        return _query(conn)
+    with _connect() as c:
+        return _query(c)
+
+
+def _replace_workflow_stages(conn: sqlite3.Connection, workflow_id: str,
+                             stages: list[WorkflowStageSpec]) -> list[WorkflowStageInDB]:
+    conn.execute("DELETE FROM workflow_stages WHERE workflow_id = ?", (workflow_id,))
+    now = _now()
+    for position, stage in enumerate(stages, start=1):
+        stage_id = _new_id("stage")
+        spec = stage.model_dump(
+            mode="json", exclude={"code", "title", "objective", "stage_type"}
+        )
+        conn.execute(
+            """INSERT INTO workflow_stages
+               (id, workflow_id, position, code, title, objective, stage_type,
+                status, spec_json, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?)""",
+            (stage_id, workflow_id, position, stage.code, stage.title,
+             stage.objective, stage.stage_type.value, _json_dump(spec), now),
+        )
+    rows = conn.execute(
+        "SELECT * FROM workflow_stages WHERE workflow_id = ? ORDER BY position",
+        (workflow_id,),
+    ).fetchall()
+    return [_row_to_workflow_stage(row) for row in rows]
 
 
 def update_workflow(workflow_id: str, update: WorkflowUpdate) -> WorkflowInDB:

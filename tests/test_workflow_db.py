@@ -54,6 +54,61 @@ def test_legacy_database_gets_w0_tables_without_losing_task(tmp_path, monkeypatc
         assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
 
 
+def test_w2_database_gets_stage_planner_columns_and_tables(tmp_path, monkeypatch):
+    from promptpilot import db
+
+    legacy_path = tmp_path / "w2.db"
+    with sqlite3.connect(legacy_path) as conn:
+        conn.executescript("""
+            CREATE TABLE workflows (
+                id TEXT PRIMARY KEY, slug TEXT NOT NULL UNIQUE,
+                objective TEXT NOT NULL, repository_path TEXT NOT NULL,
+                candidate_branch TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'draft',
+                current_round INTEGER NOT NULL DEFAULT 0,
+                state_version INTEGER NOT NULL DEFAULT 0,
+                config_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL, completed_at TEXT
+            );
+            CREATE TABLE workflow_rounds (
+                id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL REFERENCES workflows(id),
+                round_no INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+                base_sha TEXT, candidate_sha TEXT, audit_sha TEXT,
+                started_at TEXT NOT NULL, completed_at TEXT, summary_json TEXT,
+                UNIQUE(workflow_id, round_no)
+            );
+        """)
+        conn.execute(
+            """INSERT INTO workflows
+               (id, slug, objective, repository_path, candidate_branch,
+                config_json, created_at, updated_at)
+               VALUES ('wf_old', 'w2-old', 'keep me', 'D:/repo', 'main',
+                       '{}', '2026-08-25T00:00:00+00:00',
+                       '2026-08-25T00:00:00+00:00')"""
+        )
+
+    monkeypatch.setattr(db, "DB_DIR", tmp_path)
+    monkeypatch.setattr(db, "DB_PATH", legacy_path)
+    db.init_db()
+
+    assert db.get_workflow("wf_old").objective == "keep me"
+    with db._connect() as conn:
+        workflow_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(workflows)")
+        }
+        round_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(workflow_rounds)")
+        }
+        tables = {
+            row["name"] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    assert "current_stage_id" in workflow_columns
+    assert "stage_id" in round_columns
+    assert {"workflow_plans", "workflow_stages"}.issubset(tables)
+
+
 def test_init_db_is_idempotent_and_preserves_existing_tasks(isolated_db):
     task = isolated_db.create_task(TaskCreate(prompt="legacy task"))
 
@@ -72,6 +127,10 @@ def test_init_db_is_idempotent_and_preserves_existing_tasks(isolated_db):
             "SELECT version FROM schema_migrations WHERE version = ?",
             (isolated_db.WORKFLOW_SCHEMA_VERSION,),
         ).fetchone()
+        stage_migration = conn.execute(
+            "SELECT version FROM schema_migrations WHERE version = ?",
+            (isolated_db.WORKFLOW_STAGE_SCHEMA_VERSION,),
+        ).fetchone()
     assert {
         "workflows",
         "workflow_rounds",
@@ -79,8 +138,11 @@ def test_init_db_is_idempotent_and_preserves_existing_tasks(isolated_db):
         "workflow_findings",
         "workflow_artifacts",
         "workflow_events",
+        "workflow_plans",
+        "workflow_stages",
     }.issubset(tables)
     assert migration["version"] == isolated_db.WORKFLOW_SCHEMA_VERSION
+    assert stage_migration["version"] == isolated_db.WORKFLOW_STAGE_SCHEMA_VERSION
 
 
 def test_create_get_list_workflow_and_creation_event(isolated_db):

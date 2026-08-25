@@ -382,7 +382,7 @@ def workflow_create(file_path):
 
 @workflow_group.command("list")
 @click.option("-s", "--status", type=click.Choice([
-    "draft", "queued", "executing", "gating", "reviewing",
+    "draft", "planning", "awaiting_plan_approval", "queued", "executing", "gating", "reviewing",
     "revision_required", "awaiting_human", "completed", "failed",
     "cancelled",
 ]))
