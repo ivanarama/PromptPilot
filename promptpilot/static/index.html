@@ -1360,6 +1360,8 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, orphanPane = n
   const activeRun = [...runs].reverse().find(r => ['pending','running'].includes(r.status));
   const activeTaskId = activeRun?.task_id || orphanPane?.task_id || null;
   const reviewerDone = [...runs].reverse().find(r => r.role === 'reviewer' && r.status === 'completed');
+  const reviewerResult = reviewerDone?.output?.result || '';
+  const auditVerdict = (reviewerResult.match(/AUDIT_VERDICT:\s*(PASS|REVISION_REQUIRED|HUMAN_REQUIRED)/i) || [])[1]?.toUpperCase() || '';
   const openFindings = findings.filter(f => ['open','reopened'].includes(f.status));
   activeWorkflowTaskId = activeTaskId;
   const currentRound = rounds.find(r => r.round_no === wf.current_round);
@@ -1396,7 +1398,14 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, orphanPane = n
     action = `<div class="wf-form"><input class="wide" id="wfHumanText" value="Продолжить работу с учётом сохранённого состояния" required>
       <button class="btn btn-sm btn-primary" onclick="wfResume()">Продолжить ${wf.status === 'revision_required' ? 'новым раундом' : 'текущий раунд'}</button></div>`;
   } else if (wf.status === 'awaiting_human' && reviewerDone) {
-    action = `<div class="wf-form"><input class="wide" id="wfDecisionSummary" placeholder="Итог независимого ревью">
+    const auditColor = auditVerdict === 'PASS' ? 'var(--green)' : 'var(--red)';
+    action = `<div class="wf-stage" style="border-color:${auditColor}">
+      <b style="color:${auditColor}">Аудитор task #${reviewerDone.task_id}: ${esc(auditVerdict || 'отчёт готов')}</b>
+      <details><summary>Показать отчёт независимого аудитора</summary>
+        <div class="result-block"><pre>${esc(reviewerResult)}</pre></div>
+      </details>
+    </div>
+    <div class="wf-form"><input class="wide" id="wfDecisionSummary" placeholder="Итог независимого ревью">
       <button class="btn btn-sm btn-primary" onclick="wfReview('PASS')">Review PASS</button>
       <button class="btn btn-sm btn-danger" onclick="wfReview('REVISION_REQUIRED')">Нужны исправления</button>
       <button class="btn btn-sm btn-ghost wide" onclick="wfReview('HUMAN_REQUIRED')">Нужен человек</button></div>`;
