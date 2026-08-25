@@ -969,6 +969,11 @@ HERDR_WATCH_INTERVAL = _int_env("PP_HERDR_WATCH_INTERVAL", 10)
 # а дребезг датчика статуса; молчим. Новый текст на экране уведомляет сразу.
 HERDR_RENOTIFY_COOLDOWN = _int_env("PP_HERDR_RENOTIFY_COOLDOWN", 600)
 
+# Сторож расписания: серия без запланированного вхождения не продолжится сама,
+# и заметить это раньше можно было только в вебе. Бот проверяет серии с этим
+# интервалом (сек) и пишет об обрыве; 0 — выключить.
+SCHEDULE_WATCH_INTERVAL = _int_env("PP_SCHEDULE_WATCH_INTERVAL", 900)
+
 # Journal prompts sent straight into herdr panes from the bot (💬 in «🖥 Окна»
 # and notifications) into the prompt_log table, keyed by the pane's cwd.
 LOG_PROMPTS = os.environ.get("PP_LOG_PROMPTS", "1") == "1"

@@ -399,31 +399,11 @@ def _maybe_recur(task, failed: bool = False):
     next_dt = db.parse_recurrence(task.recurrence)
     if not next_dt:
         return
-    from .models import TaskCreate
     # The prompt as stored, never the one this run was handed: a one-off note
     # must not be baked into every future occurrence.
     stored = db.get_task(task.id)
-    db.create_task(TaskCreate(
-        prompt=(stored.prompt if stored else task.prompt),
-        working_dir=task.working_dir,
-        provider=task.provider,
-        priority=task.priority,
-        scheduled_at=next_dt,
-        max_retries=task.max_retries,
-        skip_permissions=task.skip_permissions,
-        model=task.model,
-        effort=task.effort,
-        recurrence=task.recurrence,
-        tg_chat_id=task.tg_chat_id,
-        task_timeout=task.task_timeout,
-        detached=task.detached,
-        # Where and how it ran is part of the schedule, not of one occurrence:
-        # without these a recurring task silently drifts back to this machine,
-        # the shared work tree and a closing pane on its second run.
-        machine=task.machine,
-        keep_pane=task.keep_pane,
-        worktree=task.worktree,
-    ))
+    db.create_task(db.next_occurrence(
+        task, next_dt, prompt=(stored.prompt if stored else task.prompt)))
     print(f"  -> Recurring: next run at {next_dt.strftime('%Y-%m-%d %H:%M UTC')}"
           f"{' (после падения)' if failed else ''}")
     # Продлили — но человек должен узнать, что серия работает вхолостую: молча
