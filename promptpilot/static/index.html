@@ -1268,7 +1268,18 @@ async function selectWorkflow(id) {
   ]);
   const current = rounds.find(r => r.round_no === wf.current_round);
   const runs = current ? await fetchJSON(`${API}/workflows/${id}/rounds/${current.id}/runs`) : [];
-  renderWorkflowDetail(wf, rounds, runs, events, findings);
+  let orphanPane = null;
+  const latestTaskRun = [...runs].reverse().find(r => r.task_id);
+  if (latestTaskRun && !['pending','running'].includes(latestTaskRun.status)) {
+    try {
+      const screen = await fetchJSON(`${API}/tasks/${latestTaskRun.task_id}/screen`);
+      const backgroundRunning = /^\s*[●•]\s*\[[^\]]+\].*\brunning\s*$/mi.test(screen.text || '');
+      if (['working','blocked'].includes(screen.agent_status) || backgroundRunning) {
+        orphanPane = {task_id: latestTaskRun.task_id, screen};
+      }
+    } catch (_) {}
+  }
+  renderWorkflowDetail(wf, rounds, runs, events, findings, orphanPane);
   const idx = workflowCache.findIndex(item => item.id === id);
   if (idx >= 0) workflowCache[idx] = wf;
   const list = document.getElementById('wfList');
@@ -1310,12 +1321,13 @@ function workflowRoundRow(round, current = false) {
   </div>`;
 }
 
-function renderWorkflowDetail(wf, rounds, runs, events, findings) {
+function renderWorkflowDetail(wf, rounds, runs, events, findings, orphanPane = null) {
   const terminal = ['completed','failed','cancelled'].includes(wf.status);
   const activeRun = [...runs].reverse().find(r => ['pending','running'].includes(r.status));
+  const activeTaskId = activeRun?.task_id || orphanPane?.task_id || null;
   const reviewerDone = [...runs].reverse().find(r => r.role === 'reviewer' && r.status === 'completed');
   const openFindings = findings.filter(f => ['open','reopened'].includes(f.status));
-  activeWorkflowTaskId = activeRun?.task_id || null;
+  activeWorkflowTaskId = activeTaskId;
   const currentRound = rounds.find(r => r.round_no === wf.current_round);
   const pastRounds = rounds.filter(r => r.round_no !== wf.current_round);
   const importedCount = rounds.filter(r => r.summary?.historical).length;
@@ -1340,6 +1352,11 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings) {
       <button class="btn btn-sm btn-primary" onclick="wfGate('PASS')">Gate PASS</button>
       <button class="btn btn-sm btn-danger" onclick="wfGate('FAIL')">Gate FAIL</button>
       <button class="btn btn-sm btn-ghost wide" onclick="wfGate('HUMAN_REQUIRED')">Нужен человек</button></div>`;
+  } else if (orphanPane) {
+    action = `<div class="wf-stage" style="border-color:var(--red)">
+      <b style="color:var(--red)">Task #${orphanPane.task_id} отмечен завершённым, но его агент ещё работает.</b>
+      <div class="wf-round-summary">Не запускайте новый раунд. Дождитесь завершения фоновых build/pytest; экран агента показан ниже.</div>
+    </div>`;
   } else if (wf.status === 'revision_required' || (wf.status === 'awaiting_human' && !reviewerDone)) {
     action = `<div class="wf-form"><input class="wide" id="wfHumanText" value="Продолжить работу с учётом сохранённого состояния" required>
       <button class="btn btn-sm btn-primary" onclick="wfResume()">Продолжить ${wf.status === 'revision_required' ? 'новым раундом' : 'текущий раунд'}</button></div>`;
@@ -1371,9 +1388,9 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings) {
     ${currentRound ? workflowRoundRow(currentRound, true) : '<div class="wf-meta">Текущий раунд ещё не создан.</div>'}
     <div class="wf-section-title">Попытки исполнителей и проверяющих в текущем раунде</div>
     ${runRows || '<div class="wf-meta">Попыток пока нет.</div>'}
-    ${activeRun?.task_id ? `<div class="detail-label">Экран агента task #${activeRun.task_id}
-      <span class="screen-status" id="wfAgentStatus">загрузка…</span></div>
-      <div class="result-block"><pre class="agent-screen" id="wfAgentScreen">Загрузка экрана…</pre></div>
+    ${activeTaskId ? `<div class="detail-label">Экран агента task #${activeTaskId}
+      <span class="screen-status" id="wfAgentStatus">${esc(orphanPane?.screen?.agent_status || 'загрузка…')}</span></div>
+      <div class="result-block"><pre class="agent-screen" id="wfAgentScreen">${esc(orphanPane?.screen?.text || 'Загрузка экрана…')}</pre></div>
       <div class="detail-actions" style="flex-wrap:wrap">
         <button class="btn btn-sm btn-ghost" onclick="wfSendKey(1)">1</button>
         <button class="btn btn-sm btn-ghost" onclick="wfSendKey(2)">2</button>
@@ -1381,7 +1398,7 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings) {
         <button class="btn btn-sm btn-ghost" onclick="wfSendKey(4)">4</button>
         <button class="btn btn-sm btn-primary" onclick="wfSendKey('enter')">Enter</button>
         <button class="btn btn-sm btn-ghost" onclick="wfSendKey('esc')">Esc</button>
-        <button class="btn btn-sm btn-copy" onclick="wfRefreshScreen(${activeRun.task_id}, true)">Обновить экран</button>
+        <button class="btn btn-sm btn-copy" onclick="wfRefreshScreen(${activeTaskId}, true)">Обновить экран</button>
       </div>` : ''}
     <div class="wf-section-title">История завершённых раундов</div>
     <div class="wf-history">${historyRows || '<div class="wf-meta">Истории пока нет.</div>'}</div>
