@@ -1321,6 +1321,40 @@ function workflowStatusInfo(status, reviewerDone = false) {
   return info[status] || [status, ''];
 }
 
+function workflowOwnerInfo(wf, activeRun, reviewerDone) {
+  if (wf.status === 'executing') return {
+    who: 'Исполнитель', detail: activeRun?.task_id ? `task #${activeRun.task_id} · работает` : 'запускается',
+    next: 'Дальше: автоматические проверки (Gate)', color: 'var(--accent)',
+  };
+  if (wf.status === 'gating') return {
+    who: 'PromptPilot / Gate', detail: 'проверяется результат исполнителя',
+    next: 'Дальше: независимый аудитор', color: 'var(--yellow)',
+  };
+  if (wf.status === 'reviewing') return {
+    who: 'Независимый аудитор', detail: activeRun?.task_id ? `task #${activeRun.task_id} · проверяет` : 'запускается',
+    next: 'Дальше: PASS либо новый раунд исправлений', color: 'var(--accent)',
+  };
+  if (wf.status === 'awaiting_human') return {
+    who: 'Вы', detail: reviewerDone ? 'нужно зафиксировать решение по аудиту' : 'автоматический этап остановлен',
+    next: reviewerDone ? 'Выбрать: принять / вернуть на доработку / нужен человек' : 'Проверить причину остановки', color: 'var(--red)',
+  };
+  if (wf.status === 'revision_required') return {
+    who: 'Вы', detail: 'аудитор вернул результат на доработку',
+    next: 'Открыть следующий раунд исполнителя', color: 'var(--red)',
+  };
+  if (wf.status === 'queued') return {
+    who: 'Вы / оркестратор', detail: 'нужно запустить исполнителя',
+    next: 'Дальше: работа исполнителя', color: 'var(--yellow)',
+  };
+  if (wf.status === 'draft') return {
+    who: 'Вы', detail: 'workflow ещё не запущен', next: 'Начать первый раунд', color: 'var(--muted)',
+  };
+  return {
+    who: wf.status === 'completed' ? 'Готово' : 'Workflow завершён',
+    detail: workflowStatusInfo(wf.status, !!reviewerDone)[0], next: '', color: 'var(--green)',
+  };
+}
+
 function workflowRoundRow(round, current = false) {
   const historical = !!round.summary?.historical;
   const summary = round.summary?.summary || (current ? 'Текущий автоматизированный раунд' : 'Описание не зафиксировано');
@@ -1369,6 +1403,7 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, orphanPane = n
   const importedCount = rounds.filter(r => r.summary?.historical).length;
   const stage = wf.config?.stage || {};
   const statusInfo = workflowStatusInfo(wf.status, !!reviewerDone);
+  const ownerInfo = workflowOwnerInfo(wf, activeRun, reviewerDone);
   const stopReason = workflowStopReason(events);
   const previousAudit = [...pastRounds].reverse().find(r => r.summary?.summary);
   const stageTitle = stage.title || `Раунд ${wf.current_round}: доработка после последнего аудита`;
@@ -1415,6 +1450,11 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, orphanPane = n
   const historyRows = pastRounds.map(r => workflowRoundRow(r)).join('');
   document.getElementById('wfDetail').innerHTML = `
     <div class="wf-title">${esc(wf.slug)} <span class="task-status" data-s="${escAttr(wf.status)}">${esc(statusInfo[0])}</span></div>
+    <div class="wf-stage" style="border-color:${ownerInfo.color}">
+      <div class="wf-stage-title">🏓 Мяч сейчас: <span style="color:${ownerInfo.color}">${esc(ownerInfo.who)}</span></div>
+      <div class="wf-round-summary">${esc(ownerInfo.detail)}</div>
+      ${ownerInfo.next ? `<div class="wf-next">${esc(ownerInfo.next)}</div>` : ''}
+    </div>
     <div class="wf-stage">
       <div class="wf-stage-title">${esc(stage.code ? `${stage.code}: ${stageTitle}` : stageTitle)}</div>
       <div class="wf-round-summary">${esc(stageGoal)}</div>

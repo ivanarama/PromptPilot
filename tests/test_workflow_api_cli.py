@@ -88,6 +88,8 @@ def test_web_ui_exposes_workflow_and_live_agent_controls():
     assert "function wfRefreshScreen" in html
     assert "function wfSendKey" in html
     assert "function workflowStatusInfo" in html
+    assert "function workflowOwnerInfo" in html
+    assert "Мяч сейчас:" in html
     assert "function workflowStopReason" in html
     assert "function autoRefreshWorkflowState" in html
     assert "AUDIT_VERDICT:" in html
