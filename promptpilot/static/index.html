@@ -556,10 +556,22 @@
     <button class="filter-btn" data-filter="failed">Failed</button>
     <button class="filter-btn" data-filter="rate_limited">Rate Limited</button>
     <button id="pauseBtn" class="btn-pause" onclick="toggleWorkerPause()" style="margin-left:auto">⏸ Pause</button>
+    <button class="btn-pause" onclick="openSchedule()" style="margin-left:8px">🗓 Расписание</button>
     <button class="btn-pause" onclick="openProviders()" style="margin-left:8px">⚙ Providers</button>
   </div>
 
   <div class="task-list" id="taskList"></div>
+</div>
+
+<div class="modal-overlay" id="schedModal" onclick="if(event.target===this)closeSchedule()">
+  <div class="modal">
+    <h2>Расписание <button class="btn btn-sm btn-ghost" style="margin-left:auto" onclick="closeSchedule()">✕ Закрыть</button></h2>
+    <div style="font-size:12px; color:var(--muted); margin-bottom:10px">
+      Повторяющиеся задачи, собранные в серии. Серия без запланированного вхождения
+      («оборвана») сама не продолжится — её надо запустить заново.
+    </div>
+    <div id="schedList"></div>
+  </div>
 </div>
 
 <div class="modal-overlay" id="provModal" onclick="if(event.target===this)closeProviders()">
@@ -833,6 +845,20 @@ async function loadTasks() {
         ${t.next_run_at ? `<div class="detail-info"><span class="label">Next retry: </span><span>${new Date(t.next_run_at).toLocaleString()}</span></div>` : ''}
         <div class="detail-info"><span class="label">Retries: </span><span>${t.retry_count}/${t.max_retries}</span>${t.exit_code !== null ? ` <span class="label">| Exit: </span><span>${t.exit_code}</span>` : ''}</div>
 
+        ${['pending','rate_limited'].includes(t.status) ? `
+          <div class="detail-label" style="margin-top:10px">Изменить (пока задача в очереди)</div>
+          <div class="detail-actions" style="flex-wrap:wrap; gap:6px" onclick="event.stopPropagation()">
+            <select id="ed-prov-${t.id}" title="провайдер">${providerOptions(t.provider)}</select>
+            <select id="ed-eff-${t.id}" title="эффорт">${effortOptions(t.effort)}</select>
+            <input id="ed-model-${t.id}" value="${escAttr(t.model || '')}" placeholder="модель"
+                   style="width:110px; background:var(--surface2); border:1px solid var(--border); border-radius:6px; color:inherit; padding:5px 8px; font-size:12px">
+            <input id="ed-rec-${t.id}" value="${escAttr(t.recurrence || '')}" placeholder="повтор: 6h"
+                   style="width:100px; background:var(--surface2); border:1px solid var(--border); border-radius:6px; color:inherit; padding:5px 8px; font-size:12px">
+            <input id="ed-pri-${t.id}" type="number" min="1" max="10" value="${t.priority}" title="приоритет"
+                   style="width:60px; background:var(--surface2); border:1px solid var(--border); border-radius:6px; color:inherit; padding:5px 8px; font-size:12px">
+            <button class="btn btn-sm btn-primary" onclick="saveTaskEdit(event,${t.id})">Сохранить</button>
+          </div>` : ''}
+
         <div class="detail-actions">
           ${['pending','rate_limited','running'].includes(t.status) ? `<button class="btn btn-sm btn-ghost" onclick="cancelTask(event,${t.id})">Cancel</button>` : ''}
           ${t.status === 'running' ? `<button class="btn btn-sm btn-ghost" onclick="resetTask(event,${t.id})">Reset to pending</button>` : ''}
@@ -845,6 +871,42 @@ async function loadTasks() {
   // экран агента дорисован из кэша — держим прокрутку у свежих строк
   const sc = document.getElementById('screen-' + expandedId);
   if (sc && screenCache[expandedId]) sc.scrollTop = sc.scrollHeight;
+}
+
+function providerOptions(current) {
+  return Object.entries(providersData)
+    .filter(([name, p]) => !p.hidden || name === current)
+    .map(([name]) => `<option value="${escAttr(name)}"${name === current ? ' selected' : ''}>${esc(name)}</option>`)
+    .join('');
+}
+
+function effortOptions(current) {
+  return [['', 'эффорт: по умолчанию'], ...EFFORT_LEVELS.map(l => [l, l])]
+    .map(([v, label]) => `<option value="${v}"${v === (current || '') ? ' selected' : ''}>${esc(label)}</option>`)
+    .join('');
+}
+
+// Правка задачи, ещё стоящей в очереди: раньше сменить провайдера или эффорт у
+// повторяющейся задачи можно было только пересозданием, теряя tg_chat_id и время
+// следующего запуска.
+async function saveTaskEdit(event, id) {
+  event.stopPropagation();
+  const val = pfx => document.getElementById(`ed-${pfx}-${id}`).value.trim();
+  try {
+    await fetchJSON(`${API}/tasks/${id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        provider: val('prov'), effort: val('eff'), model: val('model'),
+        recurrence: val('rec'), priority: parseInt(val('pri')) || 5,
+      }),
+    });
+  } catch (e) {
+    toast('Не удалось сохранить: ' + e.message);
+    return;
+  }
+  toast('Задача изменена', false);
+  refresh();
 }
 
 async function addTask() {
@@ -1082,6 +1144,43 @@ document.getElementById('filterBar').addEventListener('click', e => {
 
 // --- Helpers ---
 // --- Providers settings modal ---
+const STATUS_RU = { completed: 'успех', failed: 'падение', cancelled: 'отменена',
+                    pending: 'в очереди', running: 'идёт', rate_limited: 'ждёт лимита' };
+
+async function openSchedule() {
+  document.getElementById('schedModal').classList.add('open');
+  const box = document.getElementById('schedList');
+  box.innerHTML = 'Загрузка…';
+  let series;
+  try { series = await fetchJSON(`${API}/schedule`); }
+  catch (e) { box.innerHTML = `<div style="color:var(--red)">Не удалось загрузить: ${esc(e.message)}</div>`; return; }
+  if (!series.length) { box.innerHTML = '<div style="color:var(--muted)">Повторяющихся задач нет.</div>'; return; }
+  const when = s => s ? new Date(s).toLocaleString() : '—';
+  box.innerHTML = series.map(s => {
+    const params = [s.provider || 'по умолчанию', s.model, s.effort && `эффорт ${s.effort}`,
+                    s.machine, `приоритет ${s.priority}`].filter(Boolean).join(' · ');
+    const last = s.last_task_id
+      ? esc(`#${s.last_task_id} — ${STATUS_RU[s.last_status] || s.last_status}`
+            + (s.last_verdict ? ` (${s.last_verdict})` : '') + `, ${when(s.last_at)}`)
+      : 'ещё не запускалась';
+    const next = s.broken
+      ? '<span style="color:var(--red)">серия оборвана — следующего запуска нет</span>'
+      : `#${s.next_task_id} — ${STATUS_RU[s.next_status] || s.next_status}, ${when(s.next_run_at)}`;
+    return `<div class="prov-row${s.broken ? '' : ''}">
+      <span class="prov-name">${esc(s.prompt.slice(0, 60))}</span>
+      <span class="prov-badge">каждые ${esc(s.recurrence)}</span>
+      <span class="prov-badge">прогонов: ${s.runs}</span>
+      ${s.broken ? '<span class="prov-badge" style="color:var(--red)">оборвана</span>' : ''}
+      <div class="prov-cmd">${esc(s.working_dir || 'без директории')}</div>
+      <div class="prov-cmd">${esc(params)}</div>
+      <div class="prov-cmd">След.: ${next}</div>
+      <div class="prov-cmd">Прошлый: ${last}</div>
+    </div>`;
+  }).join('');
+}
+
+function closeSchedule() { document.getElementById('schedModal').classList.remove('open'); }
+
 async function openProviders() {
   document.getElementById('provModal').classList.add('open');
   await renderProvList();

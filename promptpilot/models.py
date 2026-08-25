@@ -41,6 +41,14 @@ class TaskCreate(BaseModel):
 class TaskUpdate(BaseModel):
     status: Optional[TaskStatus] = None
     priority: Optional[int] = Field(default=None, ge=1, le=10)
+    # Правка ещё не начавшейся задачи. Пустая строка — «снять значение»
+    # (например, убрать повтор), None — «не трогать это поле».
+    provider: Optional[str] = None
+    model: Optional[str] = None
+    effort: Optional[str] = None
+    recurrence: Optional[str] = None
+    scheduled_at: Optional[datetime] = None
+    working_dir: Optional[str] = None
 
 
 class TaskInDB(BaseModel):

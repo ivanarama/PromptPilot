@@ -437,6 +437,84 @@ def update_priority(task_id: int, priority: int) -> bool:
         return cur.rowcount > 0
 
 
+def list_series() -> list:
+    """Повторяющиеся задачи, собранные в серии — то, что человек называет «расписанием».
+
+    Серии как объекта в базе нет: каждое вхождение — отдельная строка, которую
+    создаёт предыдущая. Поэтому серию восстанавливаем по тому, что от вхождения
+    к вхождению не меняется — промпт и рабочая директория. Отдаём ближайшее
+    запланированное вхождение и последнее завершённое: без второго не видно, что
+    серия давно падает или что её вовсе некому продолжить.
+    """
+    with _connect() as conn:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM tasks WHERE recurrence IS NOT NULL AND recurrence != ''"
+            " ORDER BY id DESC")]
+    series = {}
+    for r in rows:
+        key = (r["prompt"], r["working_dir"] or "")
+        s = series.setdefault(key, {"prompt": r["prompt"], "working_dir": r["working_dir"],
+                                    "runs": 0, "next": None, "last": None})
+        s["runs"] += 1
+        if r["status"] in ("pending", "rate_limited", "running") and s["next"] is None:
+            s["next"] = r
+        elif r["status"] in ("completed", "failed", "cancelled") and s["last"] is None:
+            s["last"] = r
+    out = []
+    for s in series.values():
+        head = s["next"] or s["last"]
+        last = s["last"]
+        out.append({
+            "prompt": s["prompt"],
+            "working_dir": s["working_dir"],
+            "runs": s["runs"],
+            "recurrence": head["recurrence"],
+            "provider": head["provider"],
+            "model": head["model"],
+            "effort": head["effort"],
+            "priority": head["priority"],
+            "machine": head["machine"],
+            "next_task_id": s["next"]["id"] if s["next"] else None,
+            "next_status": s["next"]["status"] if s["next"] else None,
+            "next_run_at": s["next"]["scheduled_at"] if s["next"] else None,
+            "last_task_id": last["id"] if last else None,
+            "last_status": last["status"] if last else None,
+            "last_at": (last["completed_at"] or last["started_at"]) if last else None,
+            "last_verdict": last["verdict"] if last else None,
+            # Серия без запланированного вхождения продолжаться не будет: либо
+            # её отменили руками, либо она оборвалась до того, как продление
+            # стало переживать падения.
+            "broken": s["next"] is None,
+        })
+    out.sort(key=lambda s: (not s["broken"], s["next_run_at"] or ""))
+    return out
+
+
+EDITABLE_FIELDS = ("provider", "model", "effort", "priority", "recurrence",
+                   "scheduled_at", "working_dir")
+
+
+def update_task_fields(task_id: int, fields: dict) -> bool:
+    """Правка ещё не начавшейся задачи: провайдер, модель, эффорт, расписание.
+
+    Только pending/rate_limited: у running менять провайдера поздно (процесс уже
+    идёт), а у завершённой бессмысленно — следующее вхождение серии это
+    отдельная строка, её и надо править.
+    """
+    fields = {k: v for k, v in fields.items() if k in EDITABLE_FIELDS}
+    if not fields:
+        return False
+    if "scheduled_at" in fields:
+        fields["scheduled_at"] = _to_utc_iso(fields["scheduled_at"])
+    sets = ", ".join(f"{k} = ?" for k in fields)
+    with _connect() as conn:
+        cur = conn.execute(
+            f"UPDATE tasks SET {sets} WHERE id = ? AND status IN ('pending', 'rate_limited')",
+            (*fields.values(), task_id),
+        )
+        return cur.rowcount > 0
+
+
 def delete_task(task_id: int) -> bool:
     with _connect() as conn:
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))

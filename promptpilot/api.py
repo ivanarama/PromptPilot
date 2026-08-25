@@ -16,7 +16,7 @@ import os
 import re as _re
 
 from . import db
-from .config import API_TOKEN, DB_DIR, get_provider_models, get_skills, load_providers, mask_secret_value, provider_available, PROJECTS_ROOT
+from .config import API_TOKEN, DB_DIR, EFFORT_LEVELS, get_provider_models, get_skills, load_providers, mask_secret_value, provider_available, PROJECTS_ROOT
 from .models import CostStats, Stats, TaskCreate, TaskInDB, TaskStatus, TaskUpdate
 from .version import check_for_update
 
@@ -107,11 +107,43 @@ def api_update_task(task_id: int, update: TaskUpdate):
     if update.status is not None:
         raise HTTPException(400, "Через API поддерживается только отмена (status=cancelled)")
 
+    # Сначала проверяем ВСЁ, пишем одним запросом: иначе правка «провайдер +
+    # приоритет» с опечаткой в провайдере успевала применить приоритет и
+    # вернуть 400 — половина применена, а человеку сказано «не вышло».
+    fields = {}
     if update.priority is not None:
-        if not db.update_priority(task_id, update.priority):
-            raise HTTPException(400, "Can only reprioritize pending or rate_limited tasks")
+        fields["priority"] = update.priority
+    if update.provider is not None:
+        provider = update.provider.strip()
+        if provider and provider not in load_providers():
+            raise HTTPException(400, f"Провайдер «{provider}» не найден")
+        fields["provider"] = provider or None
+    if update.model is not None:
+        fields["model"] = update.model.strip() or None
+    if update.effort is not None:
+        effort = update.effort.strip().lower()
+        if effort and effort not in EFFORT_LEVELS:
+            raise HTTPException(400, f"Эффорт: {', '.join(EFFORT_LEVELS)} или пусто")
+        fields["effort"] = effort or None
+    if update.recurrence is not None:
+        recurrence = update.recurrence.strip()
+        if recurrence and db.parse_recurrence(recurrence) is None:
+            raise HTTPException(400, "Повтор не разобран: «6h», «90m», «daily@09:00»")
+        fields["recurrence"] = recurrence or None
+    if update.scheduled_at is not None:
+        fields["scheduled_at"] = update.scheduled_at
+    if update.working_dir is not None:
+        fields["working_dir"] = update.working_dir.strip() or None
+    if fields and not db.update_task_fields(task_id, fields):
+        raise HTTPException(400, "Править можно только задачу в очереди (pending/rate_limited)")
 
     return {"ok": True}
+
+
+@app.get("/api/schedule")
+def api_schedule():
+    """Повторяющиеся задачи как серии: период, следующий запуск, исход прошлого."""
+    return db.list_series()
 
 
 @app.delete("/api/tasks/{task_id}", response_model=dict)
