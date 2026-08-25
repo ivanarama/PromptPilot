@@ -264,11 +264,14 @@ def _trim_transcript(raw: str, prompt: str) -> str:
                 start = i + 1
                 break
 
-    # The bottom input box begins at the first full-width ─ separator after start.
+    # The bottom input box begins at the first *full-width* ─ separator after
+    # start.  Markdown horizontal rules rendered inside an agy report are only
+    # a few characters wide; treating those as terminal chrome truncated a
+    # successful multi-section report before its final workflow verdict.
     end = len(lines)
     for i in range(start + 1, len(lines)):
         s = lines[i].strip()
-        if s and set(s) <= {"─"}:
+        if len(s) >= 30 and set(s) <= {"─"}:
             end = i
             break
 

@@ -48,6 +48,8 @@ def test_trim_transcript_uses_agy_greater_than_prompt_marker():
 ● Bash(git status --short)
 
 Проверка завершена, дерево чистое.
+────────
+Вторая секция отчёта также завершена.
 ИТОГ: ГОТОВО — задача выполнена
 ─────────────────────────────────────────────────────
 >
@@ -58,6 +60,7 @@ def test_trim_transcript_uses_agy_greater_than_prompt_marker():
 
     assert "Old answer" not in cleaned
     assert "Проверка завершена" in cleaned
+    assert "Вторая секция отчёта" in cleaned
     assert cleaned.endswith("ИТОГ: ГОТОВО — задача выполнена")
 
 
