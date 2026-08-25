@@ -63,6 +63,9 @@ WORKFLOW_CLOSING_VERDICT_RE = re.compile(
     r"^ИТОГ:\s*(ГОТОВО|УЖЕ СДЕЛАНО|НУЖЕН ЧЕЛОВЕК|НЕ СМОГ)(?:\s*[—-].*)?$",
     re.IGNORECASE,
 )
+AGY_BACKGROUND_RUNNING_RE = re.compile(
+    r"(?mi)^\s*[●•]\s*\[[^\]]+\].*\brunning\s*$"
+)
 
 
 class HerdrError(Exception):
@@ -311,6 +314,11 @@ def _closing_workflow_verdict(cleaned: str) -> str:
     return match.group(1).upper() if match else ""
 
 
+def _has_running_background_task(text: str) -> bool:
+    """Recognize Antigravity's bottom-bar background task indicator."""
+    return bool(AGY_BACKGROUND_RUNNING_RE.search(text or ""))
+
+
 def _stabilize_workflow_completion(name, prompt, state, raw, deadline,
                                    cancel_check, on_blocked=None, host=None):
     """Do not treat a transient idle between agy background tasks as done.
@@ -338,8 +346,10 @@ def _stabilize_workflow_completion(name, prompt, state, raw, deadline,
              "--lines", str(HERDR_READ_LINES), "--format", "text"],
             host=host,
         )
+        background_running = False
         if rc == 0:
             raw = recent
+            background_running = _has_running_background_task(recent)
             if _closing_workflow_verdict(_trim_transcript(recent, prompt)):
                 return state, raw
 
@@ -355,6 +365,10 @@ def _stabilize_workflow_completion(name, prompt, state, raw, deadline,
         elif state == "working":
             idle_since = None
             blocked_reported = False
+        elif state in {"idle", "done"} and background_running:
+            # agy can mark the main turn done while pytest/build continues in
+            # its managed background-task bar. That is still active work.
+            idle_since = None
         elif state in {"idle", "done"}:
             if idle_since is None:
                 idle_since = time.monotonic()
