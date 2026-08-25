@@ -242,7 +242,10 @@ def _trim_transcript(raw: str, prompt: str) -> str:
     lines = raw.splitlines()
 
     start = 0
-    probe = prompt.strip().splitlines()[0][:60] if prompt.strip() else ""
+    # Keep the probe shorter than the narrowest supported terminal.  agy wraps
+    # an echoed prompt at roughly 50 columns; a 60-character probe can never
+    # occur on one physical transcript line.
+    probe = prompt.strip().splitlines()[0][:24] if prompt.strip() else ""
     for i, line in enumerate(lines):
         # Different agents/themes render the submitted prompt with either ❯
         # or >.  Requiring only ❯ made an attached agy session start trimming
@@ -251,6 +254,15 @@ def _trim_transcript(raw: str, prompt: str) -> str:
         prompt_line = line.lstrip().lstrip("❯>").lstrip()
         if probe and probe in prompt_line:
             start = i
+
+    # Workflow prompts contain verdict examples.  Do not return those examples
+    # as task output (the generic verdict parser would otherwise accept the
+    # echoed ГОТОВО).  The actual assistant turn begins after the closing tag.
+    if WORKFLOW_CONTRACT_MARKER in prompt:
+        for i in range(start, len(lines)):
+            if "</promptpilot-workflow-contract>" in lines[i]:
+                start = i + 1
+                break
 
     # The bottom input box begins at the first full-width ─ separator after start.
     end = len(lines)
@@ -312,10 +324,15 @@ def _closing_workflow_verdict(cleaned: str) -> str:
     agent had done any work. The workflow contract requires the verdict on the
     last line, which is both safer and easier to observe across agent UIs.
     """
-    lines = [line.strip() for line in (cleaned or "").splitlines() if line.strip()]
+    lines = [line for line in (cleaned or "").splitlines() if line.strip()]
     if not lines:
         return ""
-    match = WORKFLOW_CLOSING_VERDICT_RE.fullmatch(lines[-1])
+    match = WORKFLOW_CLOSING_VERDICT_RE.fullmatch(lines[-1].strip())
+    if not match and len(lines) >= 2 and lines[-1][:1].isspace():
+        # Narrow agy terminals wrap the final verdict.  The first physical line
+        # still contains the verdict and its dash text; the indented last line
+        # is only a visual continuation, not a later assistant paragraph.
+        match = WORKFLOW_CLOSING_VERDICT_RE.fullmatch(lines[-2].strip())
     return match.group(1).upper() if match else ""
 
 

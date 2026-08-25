@@ -24,6 +24,10 @@ def test_closing_workflow_verdict_accepts_only_final_line():
     assert _closing_workflow_verdict(
         "ИТОГ: ГОТОВО — промежуточно\nНо работа продолжается"
     ) == ""
+    assert _closing_workflow_verdict(
+        "  ИТОГ: ГОТОВО — задача выполнена, изменения и\n"
+        "  проверки перечислены выше"
+    ) == "ГОТОВО"
 
 
 def test_agy_background_task_indicator_blocks_idle_completion():
@@ -55,3 +59,32 @@ def test_trim_transcript_uses_agy_greater_than_prompt_marker():
     assert "Old answer" not in cleaned
     assert "Проверка завершена" in cleaned
     assert cleaned.endswith("ИТОГ: ГОТОВО — задача выполнена")
+
+
+def test_trim_transcript_drops_wrapped_workflow_contract_examples():
+    prompt = """Final workflow registration only. Do not modify files.
+
+<promptpilot-workflow-contract version="w1-verdict-v1">
+ИТОГ: ГОТОВО — example
+ИТОГ: НЕ СМОГ — example
+</promptpilot-workflow-contract>"""
+    transcript = """> Final workflow registration only. Do not modify
+  files.
+  <promptpilot-workflow-contract
+  version="w1-verdict-v1">
+  ИТОГ: ГОТОВО — example
+  ИТОГ: НЕ СМОГ — example
+  </promptpilot-workflow-contract>
+
+● Bash(git status --short)
+  Дерево чистое.
+  ИТОГ: УЖЕ СДЕЛАНО — проверка завершена
+─────────────────────────────────────────────────────
+>
+"""
+
+    cleaned = _trim_transcript(transcript, prompt)
+
+    assert "example" not in cleaned
+    assert cleaned.startswith("● Bash")
+    assert cleaned.endswith("ИТОГ: УЖЕ СДЕЛАНО — проверка завершена")
