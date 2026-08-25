@@ -2279,11 +2279,25 @@ def _priority_keyboard():
     ])
 
 
+def _skill_source_mark(source: str) -> str:
+    """Where a skill comes from, in one MarkdownV2 chunk.
+
+    Two skills can share a name across a project, ~/.claude and a plugin; the
+    list must say which one a tap would actually run, or a collision looks like
+    the skill having quietly changed its description.
+    """
+    if source == "local":
+        return " 📁"
+    if source.startswith("plugin:"):
+        return f" _{_esc(source)}_"
+    return ""
+
+
 def _build_skills_message(skills: list, title: str, show_proj_btn: bool = False):
     """Return (text, InlineKeyboardMarkup) for a skills list."""
     lines = [f"*{_esc(title)}*\n"]
     for s in skills:
-        local_mark = " 📁" if s.get("source") == "local" else ""
+        local_mark = _skill_source_mark(s.get("source") or "")
         hint = f" `[{_esc_code(s['argument_hint'])}]`" if s.get("argument_hint") else ""
         desc = f" — {_esc(s['description'])}" if s.get("description") else ""
         lines.append(f"`/{_esc_code(s['name'])}`{local_mark}{hint}{desc}")
@@ -2320,7 +2334,8 @@ async def cmd_skills(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not skills:
         await update.message.reply_text(
             "Скилы не найдены\\. Добавьте команды в `~/\\.claude/commands/` "
-            "или установите плагины через Claude Code\\.",
+            "или включите плагин через Claude Code \\(`/plugin`\\)\\.\n"
+            "Команды невключённых плагинов в списке не показываются\\.",
             parse_mode="MarkdownV2",
             reply_markup=_main_menu(),
         )

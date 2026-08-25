@@ -1072,7 +1072,11 @@ CURSOR_API_KEY=crsr_your_key_here
 
 ## Скилы Claude Code
 
-Скилы — команды (`/skill-name`) из `~/.claude/commands/`, `~/.claude/skills/` и плагинов Claude Code. Доступны для всех провайдеров с `supports_skills=True`.
+Скилы — команды (`/skill-name`) из `~/.claude/commands/`, `~/.claude/skills/`, из `.claude/` самого проекта и из плагинов Claude Code. Доступны для всех провайдеров с `supports_skills=True`.
+
+**Что попадает в список.** Плагин показывается, только если он включён в Claude Code (`enabledPlugins` в `~/.claude/settings.json`, `~/.claude.json` или в `.claude/settings.json` проекта). Одного добавленного маркетплейса мало: его клон приезжает на диск целиком, но ни одну из этих команд Claude Code не выполнит, значит и предлагать их нечестно.
+
+**Кто выигрывает имя.** Порядок разрешения — `local` (`.claude/` рабочей директории) → `user` (`~/.claude/`) → `plugin`: специфичное побеждает общее. Источник виден в списке (📁 в боте, метка справа в Web UI), так что совпадение имён заметно человеку, а не только в коде.
 
 ### Web UI
 

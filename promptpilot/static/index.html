@@ -460,6 +460,17 @@
   .skill-name { font-family: var(--mono); font-size: 12px; color: var(--accent2); min-width: 120px; }
   .skill-arghint { font-size: 11px; color: var(--yellow); }
   .skill-desc { font-size: 11px; color: var(--text2); }
+  .skill-src {
+    font-size: 10px;
+    color: var(--text2);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 1px 5px;
+    margin-left: auto;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+  .skill-src.local { color: var(--accent2); border-color: var(--accent2); }
 </style>
 </head>
 <body>
@@ -1585,7 +1596,7 @@ async function toggleSkills() {
 
   const skills = skillsCache[cacheKey] || [];
   if (!skills.length) {
-    panel.innerHTML = '<div style="padding:8px 12px;color:var(--text2)">No skills found in ~/.claude/commands/ or plugins.</div>';
+    panel.innerHTML = '<div style="padding:8px 12px;color:var(--text2)">No skills found in ~/.claude/commands/, in this project\'s .claude/, or in enabled plugins. Commands of plugins not enabled in Claude Code are not listed.</div>';
     return;
   }
 
@@ -1594,8 +1605,15 @@ async function toggleSkills() {
       <span class="skill-name">/${esc(s.name)}</span>
       ${s.argument_hint ? `<span class="skill-arghint">[${esc(s.argument_hint)}]</span>` : ''}
       ${s.description ? `<span class="skill-desc">${esc(s.description)}</span>` : ''}
+      ${s.source ? `<span class="skill-src${s.source === 'local' ? ' local' : ''}" title="${escAttr(skillSourceHint(s.source))}">${esc(s.source === 'local' ? '📁 проект' : s.source)}</span>` : ''}
     </div>`
   ).join('');
+}
+
+function skillSourceHint(source) {
+  if (source === 'local') return 'Из .claude этого проекта — побеждает одноимённые user/plugin';
+  if (source === 'user') return 'Из ~/.claude — доступен в любой директории';
+  return 'Из включённого плагина Claude Code';
 }
 
 function selectSkill(name) {

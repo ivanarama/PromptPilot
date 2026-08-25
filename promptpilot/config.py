@@ -796,12 +796,91 @@ def _parse_frontmatter(path: Path) -> dict:
     return result
 
 
+def _read_json_file(path: Path) -> dict:
+    """Parse a JSON config file; anything unreadable reads as {}.
+
+    These are Claude Code's own files, hand-edited and not ours to validate:
+    a stray comma in settings.json must not take the whole skills list down.
+    """
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _enabled_plugins(working_dir: str = None) -> dict:
+    """Claude Code's plugin on/off state: {"<plugin>@<marketplace>": bool}.
+
+    What lies on disk under ~/.claude/plugins/marketplaces is the marketplace
+    CATALOGUE — adding a marketplace clones every plugin it offers, enabled or
+    not. What the user actually turned on is `enabledPlugins` in the settings
+    files, keyed `<plugin>@<marketplace>` (bare `<plugin>` in older versions).
+    No key anywhere means nothing is enabled, which is exactly the state after
+    merely adding a marketplace.
+
+    Read in Claude Code's own precedence order, the more specific file last.
+    """
+    files = [
+        Path.home() / ".claude" / "settings.json",
+        Path.home() / ".claude" / "settings.local.json",
+        Path.home() / ".claude.json",
+    ]
+    if working_dir:
+        files.append(Path(working_dir) / ".claude" / "settings.json")
+        files.append(Path(working_dir) / ".claude" / "settings.local.json")
+
+    state = {}
+    for path in files:
+        data = _read_json_file(path)
+        sections = [data.get("enabledPlugins")]
+        # ~/.claude.json keeps per-project settings in a "projects" map
+        projects = data.get("projects")
+        if working_dir and isinstance(projects, dict):
+            entry = projects.get(str(working_dir))
+            if isinstance(entry, dict):
+                sections.append(entry.get("enabledPlugins"))
+        for section in sections:
+            if isinstance(section, dict):
+                for key, value in section.items():
+                    state[str(key)] = bool(value)
+    return state
+
+
+def _plugin_enabled(state: dict, name: str, marketplace: str) -> bool:
+    """Is this plugin enabled, given the `enabledPlugins` state?"""
+    if marketplace and f"{name}@{marketplace}" in state:
+        return state[f"{name}@{marketplace}"]
+    if name in state:
+        return state[name]
+    # Marketplace not derivable from the path (a layout we don't know): accept
+    # the plugin if any spelling of it is on, rather than hide a working skill.
+    return any(on for key, on in state.items() if key.split("@", 1)[0] == name)
+
+
+def _plugin_id(cmd_dir: Path) -> tuple:
+    """(plugin, marketplace) for a .../commands dir under ~/.claude/plugins."""
+    marketplace = ""
+    parts = cmd_dir.parts
+    if "marketplaces" in parts:
+        idx = parts.index("marketplaces")
+        if idx + 1 < len(parts):
+            marketplace = parts[idx + 1]
+    return cmd_dir.parent.name, marketplace
+
+
 def get_skills(working_dir: str = None) -> list:
     """Return list of available Claude Code skills from ~/.claude/commands/ and plugins.
 
     Each item: {name, description, argument_hint, source}
     Skills are invoked as /skill-name [args] when passed as a task prompt to Claude Code.
     Only relevant for providers with supports_skills=True (claude, claude-z).
+
+    Resolution order is specific-first — local (the task's own repository), then
+    user, then plugin — because a name collision must be won by the skill the
+    task would actually run, not by whichever directory got scanned first.
+    Commands of plugins that are not enabled in Claude Code are left out: they
+    cannot be invoked the way this list says they can.
     """
     skills = []
     seen = set()
@@ -849,22 +928,28 @@ def get_skills(working_dir: str = None) -> list:
                 "source": source,
             })
 
+    # Project-local commands/skills — scanned first, so a project skill wins
+    # its own name over a user or plugin command spelled the same way.
+    if working_dir:
+        _add_from_dir(Path(working_dir) / ".claude" / "commands", "local")
+        _add_from_dir(Path(working_dir) / ".claude" / "skills", "local")
+
     # Global user commands/skills (~/.claude/commands/ and ~/.claude/skills/)
     _add_from_dir(Path.home() / ".claude" / "commands", "user")
     _add_from_dir(Path.home() / ".claude" / "skills", "user")
 
-    # Plugin commands — scan all directories named "commands" under ~/.claude/plugins/
+    # Plugin commands — scan all directories named "commands" under
+    # ~/.claude/plugins/, skipping plugins the user has not enabled.
     plugins_dir = Path.home() / ".claude" / "plugins"
     if plugins_dir.is_dir():
+        enabled = _enabled_plugins(working_dir)
         for cmd_dir in sorted(plugins_dir.rglob("commands")):
-            if cmd_dir.is_dir():
-                plugin_name = cmd_dir.parent.name
-                _add_from_dir(cmd_dir, f"plugin:{plugin_name}")
-
-    # Project-local commands/skills
-    if working_dir:
-        _add_from_dir(Path(working_dir) / ".claude" / "commands", "local")
-        _add_from_dir(Path(working_dir) / ".claude" / "skills", "local")
+            if not cmd_dir.is_dir():
+                continue
+            plugin_name, marketplace = _plugin_id(cmd_dir)
+            if not _plugin_enabled(enabled, plugin_name, marketplace):
+                continue
+            _add_from_dir(cmd_dir, f"plugin:{plugin_name}")
 
     return skills
 
