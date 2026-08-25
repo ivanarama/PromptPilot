@@ -392,6 +392,7 @@ def _maybe_recur(task):
         max_retries=task.max_retries,
         skip_permissions=task.skip_permissions,
         model=task.model,
+        effort=task.effort,
         recurrence=task.recurrence,
         tg_chat_id=task.tg_chat_id,
         task_timeout=task.task_timeout,
@@ -572,7 +573,8 @@ def execute_task(task):
         print(f"  -> Worktree {wt['path']} ({wt['branch']})")
 
     cmd = build_cmd(provider, effective_prompt(task), skip_permissions=task.skip_permissions,
-                    session_id=task.session_id, model=task.model, guard=not machine)
+                    session_id=task.session_id, model=task.model, guard=not machine,
+                    effort=task.effort)
 
     env = get_provider_env(provider)
     # Marks the run in its own environment, inherited by the agent process. That

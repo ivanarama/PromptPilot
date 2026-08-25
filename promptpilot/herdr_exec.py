@@ -37,7 +37,7 @@ import time
 
 from . import worktree
 from .config import (HERDR_BIN, HERDR_KEEP_PANE, HERDR_READ_LINES, HERDR_START_TIMEOUT_MS,
-                     guard_enabled, guard_settings_file)
+                     guard_enabled, guard_settings_file, resolve_effort)
 from .remote import (POWERSHELL, REMOTE_CALL_TIMEOUT, as_remote, ps_quote,
                      ssh_command, ssh_script)
 
@@ -431,6 +431,11 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
         agent_args = list(provider_cfg.get("args") or [])
         if task.model:
             agent_args += ["--model", task.model]
+        # Эффорт полем провайдера/задачи — но если он уже вписан в «доп.
+        # аргументы CLI» руками, выигрывает написанное руками.
+        eff = resolve_effort(provider_cfg, task.effort)
+        if eff and kind == "claude" and "--effort" not in agent_args:
+            agent_args += ["--effort", eff]
         if task.session_id:
             agent_args += ["--resume", task.session_id]
         if task.skip_permissions:

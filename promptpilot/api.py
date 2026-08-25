@@ -314,6 +314,9 @@ def api_providers():
             # Dynamic discovery for Claude-type providers (cached); falls back to
             # the provider's own list or the sonnet/opus/haiku tiers.
             "models": get_provider_models(name),
+            # Эффорт провайдера — дефолт, который мастер показывает как
+            # «по умолчанию» и который задача может перекрыть.
+            "effort": info.get("effort", ""),
             "available": provider_available(info),
             "hidden": bool(info.get("hidden")),
             "executor": info.get("executor", ""),
@@ -436,6 +439,7 @@ class ProviderCreate(_BaseModel):
     env: dict = {}
     models: list = []
     args: list = []
+    effort: Optional[str] = None
 
 
 @app.get("/api/providers/manage")
@@ -452,6 +456,7 @@ def api_providers_manage():
             "keep_pane": bool(info.get("keep_pane")),
             "models": info.get("models") or [],
             "args": info.get("args") or [],
+            "effort": info.get("effort", ""),
             "supports_skills": info.get("supports_skills", False),
             "env": {k: mask_secret_value(k, v) for k, v in (info.get("env") or {}).items()},
             "available": provider_available(info),
@@ -485,12 +490,14 @@ def api_provider_create(p: ProviderCreate):
             raise HTTPException(400, "Поддерживаемый executor: herdr")
         save_provider(p.name, description=p.description, env=p.env or None,
                       executor=p.executor, kind=p.kind, keep_pane=p.keep_pane,
-                      models=p.models or None, args=p.args or None)
+                      models=p.models or None, args=p.args or None, effort=p.effort)
     else:
         if not p.cmd or "{prompt}" not in p.cmd:
             raise HTTPException(400, "cmd обязателен и должен содержать {prompt}")
+        # Остальные флаги cmd-провайдера живут в шаблоне, а эффорт — поле:
+        # он единственный, который приходится менять от этапа к этапу.
         save_provider(p.name, p.cmd, p.description, env=p.env or None,
-                      models=p.models or None)  # for cmd providers flags live in cmd
+                      models=p.models or None, effort=p.effort)
     return {"ok": True}
 
 

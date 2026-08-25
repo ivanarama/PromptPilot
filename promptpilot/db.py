@@ -110,6 +110,7 @@ MIGRATIONS = [
     "ALTER TABLE tasks ADD COLUMN note TEXT",
     "ALTER TABLE tasks ADD COLUMN verdict TEXT",
     "ALTER TABLE tasks ADD COLUMN herdr_pane TEXT",
+    "ALTER TABLE tasks ADD COLUMN effort TEXT",
     "ALTER TABLE notifications ADD COLUMN pane_id TEXT",
     "ALTER TABLE notifications ADD COLUMN machine TEXT",
 ]
@@ -180,8 +181,8 @@ def init_db():
 def create_task(task: TaskCreate) -> TaskInDB:
     with _connect() as conn:
         cur = conn.execute(
-            """INSERT INTO tasks (prompt, working_dir, provider, status, priority, scheduled_at, created_at, max_retries, skip_permissions, model, session_id, parent_task_id, tg_chat_id, recurrence, task_timeout, detached, keep_pane, herdr_target, machine, worktree)
-               VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            """INSERT INTO tasks (prompt, working_dir, provider, status, priority, scheduled_at, created_at, max_retries, skip_permissions, model, session_id, parent_task_id, tg_chat_id, recurrence, task_timeout, detached, keep_pane, herdr_target, machine, worktree, effort)
+               VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 task.prompt,
                 task.working_dir,
@@ -202,6 +203,7 @@ def create_task(task: TaskCreate) -> TaskInDB:
                 task.herdr_target,
                 task.machine,
                 int(task.worktree),
+                task.effort,
             ),
         )
         return get_task(cur.lastrowid, conn=conn)

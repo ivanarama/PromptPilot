@@ -42,7 +42,7 @@ from .config import (
     DEFAULT_CLI, HERDR_RENOTIFY_COOLDOWN, HERDR_WATCH, HERDR_WATCH_INTERVAL, LOG_PROMPTS,
     get_provider_models, get_proxy_url, get_skills, load_machines, load_providers,
     load_providers_detailed, mask_proxy_url, pickable_providers,
-    PROJECTS_ROOT, TASK_PASSWORD,
+    PROJECTS_ROOT, TASK_PASSWORD, EFFORT_LEVELS, provider_is_claude,
 )
 from .models import TaskCreate
 from .tg_auth import authorize_user, is_authorized, list_authorized, load_allowed_phones
@@ -54,7 +54,7 @@ logger = logging.getLogger(__name__)
 (ASK_PASSWORD, ASK_PROMPT, ASK_PROVIDER, ASK_PRIORITY, ASK_DIR, ASK_DIR_MANUAL,
  ASK_SCHEDULE, ASK_REPLY, ASK_SKILL_ARGS, ASK_MODEL, ASK_RECURRENCE,
  ASK_HERDR_REPLY, ASK_HERDR_TARGET, ASK_MACHINE, ASK_CONFIRM, ASK_EXTRAS,
- ASK_LAST) = range(17)
+ ASK_EFFORT, ASK_LAST) = range(18)
 
 
 class _MsgSend:
@@ -283,7 +283,7 @@ def _pw_grant(user_id: int):
 
 
 _WIZARD_KEYS = ("new_prompt", "new_provider", "new_priority", "new_dir", "new_schedule",
-                "new_recurrence", "new_detached", "new_keep_pane", "new_model",
+                "new_recurrence", "new_detached", "new_keep_pane", "new_model", "new_effort",
                 "new_skip_permissions", "new_skill_name", "new_herdr_target", "new_machine",
                 "new_worktree", "pw_attempts", "model_list", "herdr_targets",
                 "last_settings", "dir_base", "dir_subs", "dir_page", "dir_hist",
@@ -967,8 +967,9 @@ def _provider_buttons(machine: str = None):
 
 # Which wizard choices are worth remembering between tasks. Schedule and
 # recurrence are task-specific; a herdr target names a live session.
-_LAST_FIELDS = ("new_machine", "new_provider", "new_model", "new_dir", "new_priority",
-                "new_skip_permissions", "new_keep_pane", "new_worktree", "new_detached")
+_LAST_FIELDS = ("new_machine", "new_provider", "new_model", "new_effort", "new_dir",
+                "new_priority", "new_skip_permissions", "new_keep_pane", "new_worktree",
+                "new_detached")
 
 
 def _save_last_settings(chat_id: int, context):
@@ -994,6 +995,8 @@ def _last_settings_line(last: dict) -> str:
     parts = [last.get("new_provider") or f"{DEFAULT_CLI} (по умолчанию)"]
     if last.get("new_model"):
         parts.append(last["new_model"])
+    if last.get("new_effort"):
+        parts.append(f"эффорт {last['new_effort']}")
     parts.append(last.get("new_machine") or "локально")
     parts.append(_short_dir(last["new_dir"]) if last.get("new_dir") else "без директории")
     return " · ".join(parts)
@@ -1656,6 +1659,8 @@ def _wizard_summary(context) -> str:
         prompt = prompt[:200] + "…"
     prov = ud.get("new_provider") or f"{DEFAULT_CLI} (по умолчанию)"
     model = f" · {ud['new_model']}" if ud.get("new_model") else ""
+    if ud.get("new_effort"):
+        model += f" · эффорт {ud['new_effort']}"
     lines = [
         "Проверьте задачу:",
         "",
@@ -1757,6 +1762,7 @@ async def cb_wiz_drop_machine(update: Update, context: ContextTypes.DEFAULT_TYPE
     if ud.get("new_provider") and ud["new_provider"] not in pickable_providers():
         ud.pop("new_provider", None)
         ud.pop("new_model", None)
+        ud.pop("new_effort", None)
     # Директорию тоже выбирали на удалённой машине: локально этого пути может
     # не быть вовсе, а может быть чужой каталог с тем же именем
     if ud.get("new_dir") and not os.path.isdir(ud["new_dir"]):
@@ -1809,6 +1815,19 @@ _EXTRAS_TEXT = (
 )
 
 
+def _provider_claude(name: str) -> bool:
+    return provider_is_claude(load_providers().get(name, {}))
+
+
+def _effort_keyboard(provider: str) -> InlineKeyboardMarkup:
+    """Уровни эффорта; «по умолчанию» подписан уровнем провайдера, если он есть."""
+    inherited = load_providers().get(provider, {}).get("effort")
+    default_label = f"По умолчанию ({inherited})" if inherited else "По умолчанию"
+    rows = [[InlineKeyboardButton(l, callback_data=f"eff:{l}")] for l in EFFORT_LEVELS]
+    rows.append([InlineKeyboardButton(default_label, callback_data="eff:")])
+    return InlineKeyboardMarkup(rows)
+
+
 def _extras_keyboard(context) -> InlineKeyboardMarkup:
     ud = context.user_data
     provider = ud.get("new_provider") or DEFAULT_CLI
@@ -1818,6 +1837,13 @@ def _extras_keyboard(context) -> InlineKeyboardMarkup:
             "⚠️ Права: не спрашивать" if ud.get("new_skip_permissions") else "Права: спрашивать",
             callback_data="ex_perms")],
         [InlineKeyboardButton(f"Повтор: {ud.get('new_recurrence') or 'нет'}", callback_data="ex_rec")],
+    ]
+    # Эффорт есть только у Claude Code: у остальных агентов такого флага нет, и
+    # кнопка-обманка хуже отсутствующей.
+    if _provider_claude(provider):
+        rows.append([InlineKeyboardButton(
+            f"Эффорт: {ud.get('new_effort') or 'по умолчанию'}", callback_data="ex_eff")])
+    rows += [
         [InlineKeyboardButton(
             "Запуск: фоновый (не ждать)" if ud.get("new_detached") else "Запуск: ждать результата",
             callback_data="ex_det")],
@@ -1870,6 +1896,23 @@ async def cb_extras_recurrence(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.answer()
     await query.edit_message_text("Повторять задачу?", reply_markup=_recurrence_keyboard())
     return ASK_RECURRENCE
+
+
+async def cb_extras_effort(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    provider = context.user_data.get("new_provider") or DEFAULT_CLI
+    await query.edit_message_text(
+        "Усилие рассуждений (--effort). Дороже — дольше и качественнее:",
+        reply_markup=_effort_keyboard(provider))
+    return ASK_EFFORT
+
+
+async def cb_effort_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data["new_effort"] = query.data.split(":", 1)[1] or None
+    return await _show_extras(query.edit_message_text, context)
 
 
 async def cb_extras_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2027,6 +2070,7 @@ async def _finish_add_task_from_query(query, context):
     scheduled_at = context.user_data.pop("new_schedule", None)
     skip_permissions = context.user_data.pop("new_skip_permissions", False)
     model = context.user_data.pop("new_model", None)
+    effort = context.user_data.pop("new_effort", None)
     recurrence = context.user_data.pop("new_recurrence", None)
     detached = context.user_data.pop("new_detached", False)
     keep_pane = context.user_data.pop("new_keep_pane", True)
@@ -2042,6 +2086,7 @@ async def _finish_add_task_from_query(query, context):
         scheduled_at=scheduled_at,
         skip_permissions=skip_permissions,
         model=model,
+        effort=effort,
         tg_chat_id=query.message.chat_id,
         recurrence=recurrence,
         detached=detached,
@@ -3271,7 +3316,12 @@ def run_bot():
                 CallbackQueryHandler(cb_extras_priority, pattern=r"^ex_pri$"),
                 CallbackQueryHandler(cb_extras_toggle, pattern=r"^ex_(perms|wt|det|keep)$"),
                 CallbackQueryHandler(cb_extras_recurrence, pattern=r"^ex_rec$"),
+                CallbackQueryHandler(cb_extras_effort, pattern=r"^ex_eff$"),
                 CallbackQueryHandler(cb_extras_done, pattern=r"^ex_done$"),
+                att_midway,
+            ],
+            ASK_EFFORT: [
+                CallbackQueryHandler(cb_effort_pick, pattern=r"^eff:"),
                 att_midway,
             ],
             ASK_PRIORITY: [

@@ -25,6 +25,7 @@ class TaskCreate(BaseModel):
     max_retries: int = Field(default=5, ge=0, le=50)
     skip_permissions: bool = False
     model: Optional[str] = None  # e.g. "sonnet", "opus", "haiku"
+    effort: Optional[str] = None  # Claude --effort: low|medium|high|xhigh|max; None = provider default
     session_id: Optional[str] = None  # Claude session to resume (--resume)
     parent_task_id: Optional[int] = None  # Task this is a reply to
     tg_chat_id: Optional[int] = None  # Telegram chat to notify on completion
@@ -62,6 +63,7 @@ class TaskInDB(BaseModel):
     model_used: Optional[str] = None
     skip_permissions: bool = False
     model: Optional[str] = None
+    effort: Optional[str] = None
     session_id: Optional[str] = None
     parent_task_id: Optional[int] = None
     tg_chat_id: Optional[int] = None
