@@ -676,6 +676,7 @@ let skillsPanelOpen = false;
 let workflowCache = [];
 let selectedWorkflowId = null;
 let selectedWorkflowData = null;
+let activeWorkflowTaskId = null;
 
 // --- API calls ---
 function toast(msg, isErr = true) {
@@ -1276,6 +1277,7 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings) {
   const activeRun = [...runs].reverse().find(r => ['pending','running'].includes(r.status));
   const reviewerDone = [...runs].reverse().find(r => r.role === 'reviewer' && r.status === 'completed');
   const openFindings = findings.filter(f => ['open','reopened'].includes(f.status));
+  activeWorkflowTaskId = activeRun?.task_id || null;
   let action = '';
   if (wf.status === 'draft') {
     action = `<button class="btn btn-sm btn-primary" onclick="wfStart()">Начать первый раунд</button>`;
@@ -1313,9 +1315,22 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings) {
       ${!terminal ? `<button class="btn btn-sm btn-danger" onclick="wfCancel()">Отменить весь workflow</button>` : ''}
     </div>
     ${action}
+    ${activeRun?.task_id ? `<div class="detail-label">Экран агента task #${activeRun.task_id}
+      <span class="screen-status" id="wfAgentStatus">загрузка…</span></div>
+      <div class="result-block"><pre class="agent-screen" id="wfAgentScreen">Загрузка экрана…</pre></div>
+      <div class="detail-actions" style="flex-wrap:wrap">
+        <button class="btn btn-sm btn-ghost" onclick="wfSendKey(1)">1</button>
+        <button class="btn btn-sm btn-ghost" onclick="wfSendKey(2)">2</button>
+        <button class="btn btn-sm btn-ghost" onclick="wfSendKey(3)">3</button>
+        <button class="btn btn-sm btn-ghost" onclick="wfSendKey(4)">4</button>
+        <button class="btn btn-sm btn-primary" onclick="wfSendKey('enter')">Enter</button>
+        <button class="btn btn-sm btn-ghost" onclick="wfSendKey('esc')">Esc</button>
+        <button class="btn btn-sm btn-copy" onclick="wfRefreshScreen(${activeRun.task_id}, true)">Обновить экран</button>
+      </div>` : ''}
     <div class="wf-meta" style="margin-top:10px">Раундов: ${rounds.length}; открытых замечаний: ${openFindings.length}</div>
     <div class="wf-history">${runRows}${eventRows || '<div class="wf-meta">Событий пока нет.</div>'}</div>`;
   if (['queued','reviewing'].includes(wf.status)) setTimeout(wfProviderChanged, 0);
+  if (activeWorkflowTaskId) setTimeout(() => wfRefreshScreen(activeWorkflowTaskId), 0);
 }
 
 async function wfProviderChanged() {
@@ -1368,6 +1383,30 @@ async function wfStopTask(taskId) {
     toast(`Остановка task #${taskId} запрошена`, false);
     setTimeout(() => wfPost('sync', {}), 2500);
   } catch (e) { toast('Не удалось остановить задачу: ' + e.message); }
+}
+
+async function wfRefreshScreen(taskId = activeWorkflowTaskId, notifyError = false) {
+  if (!taskId || !document.getElementById('workflowModal').classList.contains('open')) return;
+  try {
+    const screen = await fetchJSON(`${API}/tasks/${taskId}/screen`);
+    const body = document.getElementById('wfAgentScreen');
+    const status = document.getElementById('wfAgentStatus');
+    if (body) { body.textContent = screen.text || '(экран пуст)'; body.scrollTop = body.scrollHeight; }
+    if (status) { status.textContent = screen.agent_status || '?'; status.dataset.st = screen.agent_status || ''; }
+  } catch (e) {
+    if (notifyError) toast('Экран агента недоступен: ' + e.message);
+  }
+}
+
+async function wfSendKey(key) {
+  if (!activeWorkflowTaskId) return;
+  try {
+    await fetchJSON(`${API}/tasks/${activeWorkflowTaskId}/keys`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({key: String(key)}),
+    });
+    toast(`Отправлено: ${key}`, false);
+    setTimeout(() => wfRefreshScreen(activeWorkflowTaskId), 700);
+  } catch (e) { toast('Не удалось отправить клавишу: ' + e.message); }
 }
 
 async function openSchedule() {
@@ -1944,6 +1983,7 @@ loadCosts();
 refresh();
 setInterval(refresh, 5000);
 setInterval(() => pollScreen(), 4000);  // только для раскрытой карточки с herdr-панелью
+setInterval(() => wfRefreshScreen(), 4000);  // экран активного task прямо в workflow
 setInterval(loadWorkerStatus, 10000);
 setInterval(loadCosts, 30000);
 </script>
