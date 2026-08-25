@@ -318,34 +318,42 @@ def init_db():
         )
 
 
+def _insert_task(conn: sqlite3.Connection, task: TaskCreate) -> TaskInDB:
+    """Insert a queue task inside the caller's transaction."""
+    cur = conn.execute(
+        """INSERT INTO tasks (prompt, working_dir, provider, status, priority,
+           scheduled_at, created_at, max_retries, skip_permissions, model,
+           session_id, parent_task_id, tg_chat_id, recurrence, task_timeout,
+           detached, keep_pane, herdr_target, machine, worktree)
+           VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            task.prompt,
+            task.working_dir,
+            task.provider,
+            task.priority,
+            _to_utc_iso(task.scheduled_at),
+            _now(),
+            task.max_retries,
+            int(task.skip_permissions),
+            task.model,
+            task.session_id,
+            task.parent_task_id,
+            task.tg_chat_id,
+            task.recurrence,
+            task.task_timeout,
+            int(task.detached),
+            int(task.keep_pane),
+            task.herdr_target,
+            task.machine,
+            int(task.worktree),
+        ),
+    )
+    return get_task(cur.lastrowid, conn=conn)
+
+
 def create_task(task: TaskCreate) -> TaskInDB:
     with _connect() as conn:
-        cur = conn.execute(
-            """INSERT INTO tasks (prompt, working_dir, provider, status, priority, scheduled_at, created_at, max_retries, skip_permissions, model, session_id, parent_task_id, tg_chat_id, recurrence, task_timeout, detached, keep_pane, herdr_target, machine, worktree)
-               VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                task.prompt,
-                task.working_dir,
-                task.provider,
-                task.priority,
-                _to_utc_iso(task.scheduled_at),
-                _now(),
-                task.max_retries,
-                int(task.skip_permissions),
-                task.model,
-                task.session_id,
-                task.parent_task_id,
-                task.tg_chat_id,
-                task.recurrence,
-                task.task_timeout,
-                int(task.detached),
-                int(task.keep_pane),
-                task.herdr_target,
-                task.machine,
-                int(task.worktree),
-            ),
-        )
-        return get_task(cur.lastrowid, conn=conn)
+        return _insert_task(conn, task)
 
 
 def get_task(task_id: int, *, conn=None) -> Optional[TaskInDB]:

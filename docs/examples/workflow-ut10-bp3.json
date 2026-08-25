@@ -1,0 +1,11 @@
+{
+  "slug": "ut10-bp3-u3",
+  "objective": "Закрыть этап УТ10 → БП3 через независимые раунды реализации и аудита",
+  "repository_path": "D:\\Projects\\exchange",
+  "candidate_branch": "checkpoint/u2-wip-20260824",
+  "config": {
+    "limits": {
+      "max_rounds": 6
+    }
+  }
+}

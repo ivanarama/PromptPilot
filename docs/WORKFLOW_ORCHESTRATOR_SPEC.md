@@ -1,15 +1,19 @@
 # Workflow Orchestrator: автономный цикл «исполнитель → проверка → аудитор»
 
-- Статус: **Proposed / Draft 0.1**
+- Статус: **W1 implemented / Draft 0.2**
 - Дата: 2026-08-25
 - Целевой пилот: **УТ10 → БП3, этап U3-FIX-2**
 
 Состояние реализации:
 
 - **W0 реализован:** модели, versioned SQLite schema, append-only event log,
-  repository API, REST API, read-only CLI и тесты миграции/идемпотентности;
-- **W1–W5 не реализованы:** наличие W0 не означает, что автономный цикл уже
-  запускает агентов или меняет состояния workflow.
+  repository API, REST API и CLI наблюдаемости;
+- **W1 реализован:** атомарная state machine, ручной dispatch executor/reviewer,
+  связь run с task, восстановление после crash-gap, max-rounds stop и импорт
+  исторических раундов с provenance-статусами;
+- **W2–W5 не реализованы:** W1 является управляемым ручным пилотом. Он ещё не
+  выполняет автоматические handoff, не создаёт постоянный workflow-worktree и
+  не обеспечивает физически read-only checkout аудитора.
 
 ## 1. Назначение
 
@@ -584,34 +588,46 @@ handoff между разными специалистами. Критическ
 POST   /api/workflows
 GET    /api/workflows
 GET    /api/workflows/{id}
+PATCH  /api/workflows/{id}
 POST   /api/workflows/{id}/start
-POST   /api/workflows/{id}/pause
-POST   /api/workflows/{id}/resume
+POST   /api/workflows/{id}/dispatch
+POST   /api/workflows/{id}/gate
+POST   /api/workflows/{id}/review
 POST   /api/workflows/{id}/cancel
 POST   /api/workflows/{id}/human-input
+POST   /api/workflows/{id}/sync
+POST   /api/workflows/{id}/history/import
 GET    /api/workflows/{id}/rounds
+GET    /api/workflows/{id}/rounds/{round_id}/runs
 GET    /api/workflows/{id}/events
 GET    /api/workflows/{id}/findings
 GET    /api/workflows/{id}/artifacts
-GET    /api/workflows/{id}/metrics
-POST   /api/workflows/{id}/export
 ```
 
-State-changing endpoints требуют существующую API-аутентификацию и
-idempotency key.
+State-changing endpoints защищены существующей API-аутентификацией и
+optimistic concurrency через `expected_version`. Импорт истории имеет отдельный
+стабильный idempotency key; `sync` по определению повторяем. Универсальные
+idempotency keys для остальных команд относятся к W2.
+
+Планируемые после W1 endpoints: `pause`, `resume`, `metrics`, `export`.
 
 ### 13.2. CLI
 
 ```text
-pp workflow create --file workflow.yaml
-pp workflow start <id>
-pp workflow show <id>
-pp workflow events <id> --follow
-pp workflow findings <id>
-pp workflow pause|resume|cancel <id>
-pp workflow input <id> --file decision.md
-pp workflow export <id> --format json|csv|markdown|article
+pp workflow create workflow.json
+pp workflow import-history <id> history.json
+pp workflow start <id> [--base-sha SHA]
+pp workflow dispatch <id> executor|reviewer --file prompt.md
+pp workflow sync <id>
+pp workflow gate <id> PASS|FAIL|HUMAN_REQUIRED
+pp workflow review <id> PASS|REVISION_REQUIRED|HUMAN_REQUIRED
+pp workflow input <id> "решение" [--resume]
+pp workflow cancel <id>
+pp workflow show|rounds|events|findings <id>
 ```
+
+`pause`, длительное `--follow` и article export остаются командами следующих
+фаз.
 
 ### 13.3. UI и Telegram
 
@@ -801,11 +817,18 @@ acceptance:
 
 ### Фаза W1 — state machine и ручной pilot
 
+- **Реализовано 2026-08-25.**
 - переходы состояний;
 - связь workflow run с существующей task;
 - ручной запуск executor/reviewer через API;
 - limits и `awaiting_human`;
 - crash recovery tests.
+
+Дополнительно реализован импорт дооркестраторной истории. Он принимает только
+терминальные раунды, требует стабильный idempotency key и сохраняет каждый факт
+с явным статусом `CLAIMED`, `VERIFIED`, `DISPROVED`, `PARTIAL`, `INFERRED` или
+`UNKNOWN`. Исторические раунды не расходуют бюджет новых автоматизированных
+раундов. Формат описан в `docs/HISTORY_IMPORT_GUIDE.md`.
 
 ### Фаза W2 — автоматический executor/gate/reviewer loop
 

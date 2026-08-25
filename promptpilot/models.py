@@ -307,3 +307,111 @@ class WorkflowEventInDB(BaseModel):
     created_at: datetime
     round_id: Optional[str] = None
     run_id: Optional[str] = None
+
+
+class WorkflowStartRequest(BaseModel):
+    expected_version: int = Field(ge=0)
+    base_sha: Optional[str] = None
+
+
+class WorkflowVersionRequest(BaseModel):
+    expected_version: int = Field(ge=0)
+
+
+class WorkflowTaskDispatch(BaseModel):
+    expected_version: int = Field(ge=0)
+    role: WorkflowRole
+    prompt: str = Field(min_length=1)
+    provider: Optional[str] = None
+    priority: int = Field(default=5, ge=1, le=10)
+    max_retries: int = Field(default=5, ge=0, le=50)
+    skip_permissions: bool = False
+    model: Optional[str] = None
+    working_dir: Optional[str] = None
+    worktree: bool = False
+    task_timeout: Optional[int] = Field(default=None, ge=0)
+
+
+class WorkflowDispatchResult(BaseModel):
+    workflow: WorkflowInDB
+    round: WorkflowRoundInDB
+    run: WorkflowRunInDB
+    task: TaskInDB
+
+
+class GateVerdict(str, Enum):
+    PASS = "PASS"
+    FAIL = "FAIL"
+    HUMAN_REQUIRED = "HUMAN_REQUIRED"
+
+
+class WorkflowGateDecision(BaseModel):
+    verdict: GateVerdict
+    expected_version: int = Field(ge=0)
+    gate_id: str = Field(default="manual-gate", min_length=1)
+    summary: str = ""
+    evidence: list[str] = Field(default_factory=list)
+
+
+class ReviewVerdict(str, Enum):
+    PASS = "PASS"
+    REVISION_REQUIRED = "REVISION_REQUIRED"
+    HUMAN_REQUIRED = "HUMAN_REQUIRED"
+
+
+class ReviewFindingInput(BaseModel):
+    fingerprint: str = Field(min_length=1)
+    severity: FindingSeverity
+    category: str = Field(min_length=1)
+    title: str = Field(min_length=1)
+    status: FindingStatus = FindingStatus.OPEN
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class WorkflowReviewDecision(BaseModel):
+    verdict: ReviewVerdict
+    expected_version: int = Field(ge=0)
+    summary: str = ""
+    findings: list[ReviewFindingInput] = Field(default_factory=list)
+
+
+class WorkflowHumanInput(BaseModel):
+    text: str = Field(min_length=1)
+    expected_version: int = Field(ge=0)
+    resume: bool = False
+
+
+class HistoricalFactStatus(str, Enum):
+    CLAIMED = "CLAIMED"
+    VERIFIED = "VERIFIED"
+    DISPROVED = "DISPROVED"
+    PARTIAL = "PARTIAL"
+    INFERRED = "INFERRED"
+    UNKNOWN = "UNKNOWN"
+
+
+class HistoricalFactImport(BaseModel):
+    claim: str = Field(min_length=1)
+    status: HistoricalFactStatus
+    source: str = Field(min_length=1)
+    evidence: list[str] = Field(default_factory=list)
+    notes: str = ""
+
+
+class HistoricalRoundImport(BaseModel):
+    round_no: int = Field(ge=1)
+    status: WorkflowRoundStatus = WorkflowRoundStatus.COMPLETED
+    base_sha: Optional[str] = None
+    candidate_sha: Optional[str] = None
+    audit_sha: Optional[str] = None
+    summary: str = ""
+    facts: list[HistoricalFactImport] = Field(default_factory=list)
+    metrics: dict[str, Any] = Field(default_factory=dict)
+
+
+class WorkflowHistoryImport(BaseModel):
+    expected_version: int = Field(ge=0)
+    idempotency_key: str = Field(min_length=1)
+    source: str = Field(min_length=1)
+    rounds: list[HistoricalRoundImport] = Field(min_length=1)
+    notes: str = ""

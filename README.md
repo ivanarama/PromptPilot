@@ -47,26 +47,42 @@
 - **Tray-приложение** — двойной клик на `pp.exe`, иконка в трее, всё управление мышью
 - **Standalone .exe** — сборка без зависимостей через PyInstaller
 - **SQLite** — данные хранятся локально в `~/.promptpilot/`
-- **Workflow foundation (W0)** — versioned SQLite-схема, append-only события,
-  rounds/runs/findings/artifacts, REST API и read-only CLI для будущего цикла
-  «исполнитель → гейты → аудитор»
+- **Workflow pilot (W1)** — атомарная state machine, связь workflow с очередью
+  задач, ручной цикл «исполнитель → гейт → аудитор», crash recovery и импорт
+  истории с provenance-метками для последующего анализа
 
 ### Workflow Orchestrator
 
 Архитектура автономного цикла описана в
 [`docs/WORKFLOW_ORCHESTRATOR_SPEC.md`](docs/WORKFLOW_ORCHESTRATOR_SPEC.md).
-Текущий этап W0 реализует хранилище, API и наблюдаемость, но ещё не запускает
-агентов автоматически: state machine и dispatch относятся к W1/W2.
+W0 и W1 реализованы. Уже можно создать workflow, импортировать прежние раунды,
+вручную ставить в очередь исполнителя и аудитора и получать непрерывный журнал.
+Полностью автоматическая передача хода, физически read-only checkout аудитора,
+автоматические гейты и статистический/article export относятся к W2–W4.
 
-Доступные read-only команды:
+Минимальный ручной пилот:
 
 ```bash
+pp workflow create workflow.json
+pp workflow import-history <id-or-slug> history.json
+pp workflow start <id-or-slug> --base-sha <sha>
+pp workflow dispatch <id-or-slug> executor --file executor-prompt.md
+pp workflow sync <id-or-slug>
+pp workflow gate <id-or-slug> PASS --gate-id tests
+pp workflow dispatch <id-or-slug> reviewer --file reviewer-prompt.md
+pp workflow sync <id-or-slug>
+pp workflow review <id-or-slug> PASS --summary "Принято"
+
 pp workflow list
 pp workflow show <id-or-slug>
 pp workflow rounds <id-or-slug>
 pp workflow events <id-or-slug> --json
 pp workflow findings <id-or-slug>
 ```
+
+Формат переноса старых итераций и правила отделения проверенных фактов от
+ручных воспоминаний описаны в
+[`docs/HISTORY_IMPORT_GUIDE.md`](docs/HISTORY_IMPORT_GUIDE.md).
 
 ## Установка
 
@@ -1137,6 +1153,14 @@ POST   /api/workflows              — создать draft workflow
 GET    /api/workflows              — список workflow (?status=draft&limit=50)
 GET    /api/workflows/{id}         — детали workflow
 PATCH  /api/workflows/{id}         — обновить draft-метаданные с expected_version
+POST   /api/workflows/{id}/start   — создать первый новый раунд
+POST   /api/workflows/{id}/dispatch — поставить executor/reviewer task в очередь
+POST   /api/workflows/{id}/gate    — записать результат ручного W1-гейта
+POST   /api/workflows/{id}/review  — записать структурированный verdict аудитора
+POST   /api/workflows/{id}/human-input — решение человека/возобновление
+POST   /api/workflows/{id}/cancel  — отменить workflow и связанные задачи
+POST   /api/workflows/{id}/sync    — восстановить проекцию из состояния tasks
+POST   /api/workflows/{id}/history/import — импортировать старые раунды и факты
 GET    /api/workflows/{id}/rounds  — раунды
 GET    /api/workflows/{id}/rounds/{round_id}/runs — запуски ролей
 GET    /api/workflows/{id}/events  — append-only история (?after_seq=0)

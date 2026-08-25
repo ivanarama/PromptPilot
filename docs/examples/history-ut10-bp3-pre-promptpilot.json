@@ -1,0 +1,135 @@
+{
+  "idempotency_key": "ut10-bp3-audit-history-through-8744181-v1",
+  "source": "D:\\Projects\\exchange\\docs\\audit + git log",
+  "notes": "Консервативная реконструкция: фиксируются решения независимого аудита, а не все технические заявления исполнителя.",
+  "rounds": [
+    {
+      "round_no": 1,
+      "status": "revision_required",
+      "audit_sha": "3b85979",
+      "summary": "U2-FIX-2 возвращён на доработку",
+      "metrics": {"documented_blockers": 9},
+      "facts": [
+        {
+          "claim": "Аудитор зафиксировал девять блокирующих замечаний U2-FIX-2",
+          "status": "VERIFIED",
+          "source": "docs/audit/UT10-BP3_U2_FIX2_REVIEW.md",
+          "evidence": ["9 headings under Блокирующие замечания"]
+        }
+      ]
+    },
+    {
+      "round_no": 2,
+      "status": "revision_required",
+      "audit_sha": "3b85979",
+      "summary": "Повторная сдача с COM runtime не принята",
+      "metrics": {"documented_blockers": 5},
+      "facts": [
+        {
+          "claim": "Аудитор оставил readiness R0 и потребовал пять исправлений COM runtime candidate",
+          "status": "VERIFIED",
+          "source": "docs/audit/UT10-BP3_U2_COM_RUNTIME_REVIEW.md",
+          "evidence": ["Вердикт: U2 не принят; readiness оставить R0"]
+        }
+      ]
+    },
+    {
+      "round_no": 3,
+      "status": "revision_required",
+      "audit_sha": "3b85979",
+      "summary": "U2-FIX-3 возвращён на доработку",
+      "metrics": {"documented_blockers": 5},
+      "facts": [
+        {
+          "claim": "Независимое ревью U2-FIX-3 завершилось отказом в приёмке",
+          "status": "VERIFIED",
+          "source": "docs/audit/UT10-BP3_U2_FIX3_REVIEW.md",
+          "evidence": ["Вердикт: U2 не принят; readiness оставить R0"]
+        }
+      ]
+    },
+    {
+      "round_no": 4,
+      "status": "revision_required",
+      "audit_sha": "610b4bd",
+      "summary": "U2-FIX-4 возвращён на доработку",
+      "metrics": {"documented_blockers": 5},
+      "facts": [
+        {
+          "claim": "Commit 610b4bd содержит независимое ревью U2-FIX-4 с пятью блокерами",
+          "status": "VERIFIED",
+          "source": "git commit 610b4bd + docs/audit/UT10-BP3_U2_FIX4_REVIEW.md",
+          "evidence": ["610b4bd", "Вердикт: U2 не принят; readiness оставить R0"]
+        }
+      ]
+    },
+    {
+      "round_no": 5,
+      "status": "revision_required",
+      "audit_sha": "cdcff48",
+      "summary": "U2-FIX-5 возвращён из-за runtime-блокера",
+      "facts": [
+        {
+          "claim": "Commit cdcff48 фиксирует непринятый U2-FIX-5 и критический runtime-блокер",
+          "status": "VERIFIED",
+          "source": "git commit cdcff48 + docs/audit/UT10-BP3_U2_FIX5_REVIEW.md",
+          "evidence": ["cdcff48", "Вердикт: U2 не принят; readiness оставить R0"]
+        }
+      ]
+    },
+    {
+      "round_no": 6,
+      "status": "revision_required",
+      "audit_sha": "1610c21",
+      "summary": "Transport/runtime subset принят, полный U2 ещё не принят",
+      "metrics": {"documented_runtime_blockers": 1},
+      "facts": [
+        {
+          "claim": "В U2-FIX-6 аудитор принял transport/runtime subset, сохранив R0 до закрытия оставшегося runtime-блокера",
+          "status": "VERIFIED",
+          "source": "git commit 1610c21 + docs/audit/UT10-BP3_U2_FIX6_REVIEW.md",
+          "evidence": ["1610c21", "Единственный оставшийся runtime-блокер"]
+        }
+      ]
+    },
+    {
+      "round_no": 7,
+      "status": "revision_required",
+      "candidate_sha": "93d64b7",
+      "audit_sha": "f7919b3",
+      "summary": "U2 принят в уточнённом объёме; U3-0/U3-1 возвращены на доработку",
+      "metrics": {"documented_blockers": 5},
+      "facts": [
+        {
+          "claim": "Commit f7919b3 принял U2 transport/runtime foundation и перечислил пять блокеров U3",
+          "status": "VERIFIED",
+          "source": "git commit f7919b3 + docs/audit/UT10-BP3_U3_REVIEW.md",
+          "evidence": ["candidate 93d64b7", "audit f7919b3"]
+        }
+      ]
+    },
+    {
+      "round_no": 8,
+      "status": "revision_required",
+      "candidate_sha": "b13cfa7",
+      "audit_sha": "8744181",
+      "summary": "Canonical dump parsing и ObjectModule runtime subset приняты; U3 не принят",
+      "metrics": {"documented_blockers": 3},
+      "facts": [
+        {
+          "claim": "Commit 8744181 подтвердил часть runtime-ядра и вернул U3-FIX-1 с тремя блокерами",
+          "status": "VERIFIED",
+          "source": "git commit 8744181 + docs/audit/UT10-BP3_U3_FIX1_REVIEW.md",
+          "evidence": ["candidate b13cfa7", "audit 8744181"]
+        },
+        {
+          "claim": "После этого аудита исполнитель продолжил работу коммитами d56bfa2..e67e13c",
+          "status": "VERIFIED",
+          "source": "git log checkpoint/u2-wip-20260824",
+          "evidence": ["d56bfa2", "ee64b9a", "f1754be", "eeca2ca", "e67e13c"],
+          "notes": "Эти коммиты ещё не объявлены принятыми независимым аудитором в импортируемой истории."
+        }
+      ]
+    }
+  ]
+}

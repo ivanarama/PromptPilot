@@ -332,7 +332,31 @@ def stats():
 
 @cli.group("workflow")
 def workflow_group():
-    """Read workflow-orchestrator state and append-only history (W0)."""
+    """Manage the W1 workflow pilot and its append-only history."""
+
+
+@workflow_group.command("create")
+@click.argument("file_path", type=click.Path(exists=True, dir_okay=False))
+def workflow_create(file_path):
+    """Create a draft from a UTF-8 JSON WorkflowCreate document."""
+    import json as _json
+    from pydantic import ValidationError
+
+    from .models import WorkflowCreate
+
+    try:
+        with open(file_path, encoding="utf-8") as handle:
+            payload = WorkflowCreate.model_validate(_json.load(handle))
+    except (OSError, ValueError, ValidationError) as exc:
+        raise click.ClickException(f"Invalid workflow file: {exc}") from exc
+    created = _workflow_call_cli(db.create_workflow, payload)
+    click.echo(
+        click.style(
+            f"Created {created.slug} ({created.id}), version "
+            f"{created.state_version}",
+            fg="green",
+        )
+    )
 
 
 @workflow_group.command("list")
@@ -373,6 +397,13 @@ def _workflow_or_exit(reference):
     if not workflow:
         raise click.ClickException(f"Workflow {reference!r} not found")
     return workflow
+
+
+def _workflow_call_cli(call, *args):
+    try:
+        return call(*args)
+    except (db.WorkflowConflictError, db.WorkflowNotFoundError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
 
 
 @workflow_group.command("show")
@@ -489,6 +520,235 @@ def workflow_findings(reference, status, as_json):
             f"{item.severity.value:<9} {item.status.value:<14} {rounds:<9} "
             f"{item.fingerprint} / {item.title}"
         )
+
+
+@workflow_group.command("start")
+@click.argument("reference")
+@click.option("--base-sha", default=None, help="Commit/base identity первого нового раунда")
+def workflow_start(reference, base_sha):
+    """Start a draft and create its first non-historical round."""
+    from . import workflows
+    from .models import WorkflowStartRequest
+
+    item = _workflow_or_exit(reference)
+    updated = _workflow_call_cli(
+        workflows.start_workflow,
+        item.id,
+        WorkflowStartRequest(
+            expected_version=item.state_version,
+            base_sha=base_sha,
+        ),
+    )
+    click.echo(
+        click.style(
+            f"Workflow {updated.slug}: {updated.status.value}, "
+            f"round {updated.current_round}, version {updated.state_version}",
+            fg="green",
+        )
+    )
+
+
+@workflow_group.command("dispatch")
+@click.argument("reference")
+@click.argument("role", type=click.Choice(["executor", "reviewer"]))
+@click.argument("prompt", required=False)
+@click.option("-f", "--file", "file_path", type=click.Path(exists=True, dir_okay=False))
+@click.option("-c", "--cli", "provider", default=None)
+@click.option("-m", "--model", default=None)
+@click.option("-p", "--priority", default=5, type=click.IntRange(1, 10))
+@click.option("-d", "--dir", "working_dir", default=None)
+@click.option("-w", "--worktree", is_flag=True)
+@click.option("--skip-permissions", is_flag=True)
+@click.option("--timeout", "task_timeout", type=click.IntRange(0), default=None)
+def workflow_dispatch(reference, role, prompt, file_path, provider, model,
+                      priority, working_dir, worktree, skip_permissions,
+                      task_timeout):
+    """Queue an executor or reviewer task for the current round."""
+    from . import workflows
+    from .models import WorkflowRole, WorkflowTaskDispatch
+
+    if file_path:
+        with open(file_path, encoding="utf-8") as handle:
+            prompt = handle.read().strip()
+    if not prompt:
+        raise click.UsageError("Provide PROMPT or --file")
+    item = _workflow_or_exit(reference)
+    result = _workflow_call_cli(
+        workflows.dispatch_task,
+        item.id,
+        WorkflowTaskDispatch(
+            expected_version=item.state_version,
+            role=WorkflowRole(role),
+            prompt=prompt,
+            provider=provider,
+            model=model,
+            priority=priority,
+            working_dir=working_dir,
+            worktree=worktree,
+            skip_permissions=skip_permissions,
+            task_timeout=task_timeout,
+        ),
+    )
+    click.echo(
+        click.style(
+            f"Task #{result.task.id}, run {result.run.id}, "
+            f"workflow {result.workflow.status.value} v{result.workflow.state_version}",
+            fg="green",
+        )
+    )
+
+
+@workflow_group.command("gate")
+@click.argument("reference")
+@click.argument("verdict", type=click.Choice(["PASS", "FAIL", "HUMAN_REQUIRED"]))
+@click.option("--gate-id", default="manual-gate")
+@click.option("--summary", default="")
+@click.option("--evidence", multiple=True)
+def workflow_gate(reference, verdict, gate_id, summary, evidence):
+    """Record the deterministic/manual gate verdict for the current round."""
+    from . import workflows
+    from .models import GateVerdict, WorkflowGateDecision
+
+    item = _workflow_or_exit(reference)
+    updated = _workflow_call_cli(
+        workflows.record_gate,
+        item.id,
+        WorkflowGateDecision(
+            expected_version=item.state_version,
+            verdict=GateVerdict(verdict),
+            gate_id=gate_id,
+            summary=summary,
+            evidence=list(evidence),
+        ),
+    )
+    click.echo(f"Workflow {updated.slug}: {updated.status.value}")
+
+
+@workflow_group.command("review")
+@click.argument("reference")
+@click.argument(
+    "verdict",
+    type=click.Choice(["PASS", "REVISION_REQUIRED", "HUMAN_REQUIRED"]),
+)
+@click.option("--summary", default="")
+@click.option(
+    "--findings-file",
+    type=click.Path(exists=True, dir_okay=False),
+    help="JSON array of ReviewFindingInput objects",
+)
+def workflow_review(reference, verdict, summary, findings_file):
+    """Submit the manual W1 decision after a completed reviewer task."""
+    import json as _json
+    from pydantic import ValidationError
+
+    from . import workflows
+    from .models import ReviewFindingInput, ReviewVerdict, WorkflowReviewDecision
+
+    findings = []
+    if findings_file:
+        try:
+            with open(findings_file, encoding="utf-8") as handle:
+                findings = [
+                    ReviewFindingInput.model_validate(item)
+                    for item in _json.load(handle)
+                ]
+        except (OSError, ValueError, TypeError, ValidationError) as exc:
+            raise click.ClickException(f"Invalid findings file: {exc}") from exc
+    item = _workflow_or_exit(reference)
+    updated = _workflow_call_cli(
+        workflows.record_review,
+        item.id,
+        WorkflowReviewDecision(
+            expected_version=item.state_version,
+            verdict=ReviewVerdict(verdict),
+            summary=summary,
+            findings=findings,
+        ),
+    )
+    click.echo(f"Workflow {updated.slug}: {updated.status.value}")
+
+
+@workflow_group.command("input")
+@click.argument("reference")
+@click.argument("text")
+@click.option("--resume", is_flag=True)
+def workflow_input(reference, text, resume):
+    """Append a human decision and optionally resume the workflow."""
+    from . import workflows
+    from .models import WorkflowHumanInput
+
+    item = _workflow_or_exit(reference)
+    updated = _workflow_call_cli(
+        workflows.human_input,
+        item.id,
+        WorkflowHumanInput(
+            expected_version=item.state_version,
+            text=text,
+            resume=resume,
+        ),
+    )
+    click.echo(f"Workflow {updated.slug}: {updated.status.value}")
+
+
+@workflow_group.command("cancel")
+@click.argument("reference")
+def workflow_cancel(reference):
+    """Cancel a non-terminal workflow and its queued/running linked tasks."""
+    from . import workflows
+
+    item = _workflow_or_exit(reference)
+    updated = _workflow_call_cli(
+        workflows.cancel_workflow, item.id, item.state_version
+    )
+    click.echo(click.style(f"Workflow {updated.slug}: cancelled", fg="yellow"))
+
+
+@workflow_group.command("sync")
+@click.argument("reference")
+def workflow_sync(reference):
+    """Reconcile linked queue tasks after a crash or manual task update."""
+    from . import workflows
+
+    item = _workflow_or_exit(reference)
+    count = _workflow_call_cli(workflows.sync_all_tasks, item.id)
+    updated = _workflow_or_exit(item.id)
+    click.echo(
+        f"Synced {count} run(s); workflow {updated.status.value} "
+        f"v{updated.state_version}"
+    )
+
+
+@workflow_group.command("import-history")
+@click.argument("reference")
+@click.argument("file_path", type=click.Path(exists=True, dir_okay=False))
+def workflow_import_history(reference, file_path):
+    """Import historical rounds/facts from a provenance-labelled JSON file."""
+    import json as _json
+    from pydantic import ValidationError
+
+    from . import workflows
+    from .models import WorkflowHistoryImport
+
+    item = _workflow_or_exit(reference)
+    try:
+        with open(file_path, encoding="utf-8") as handle:
+            raw = _json.load(handle)
+        raw["expected_version"] = item.state_version
+        payload = WorkflowHistoryImport.model_validate(raw)
+    except (OSError, ValueError, ValidationError) as exc:
+        raise click.ClickException(f"Invalid history file: {exc}") from exc
+    # The file can be prepared before the workflow exists; the current version
+    # is authoritative at import time and cannot be forged by stale JSON.
+    updated = _workflow_call_cli(
+        workflows.import_history, item.id, payload
+    )
+    click.echo(
+        click.style(
+            f"Imported history through round {updated.current_round}; "
+            f"workflow version {updated.state_version}",
+            fg="green",
+        )
+    )
 
 
 @cli.command()

@@ -527,7 +527,7 @@ def _wrap_ssh(remote, cmd, env_extra):
     return ssh_command(remote, argv, env_extra)
 
 
-def execute_task(task):
+def _execute_task_inner(task):
     """Run CLI with the task's prompt."""
     provider = task.provider or DEFAULT_CLI
 
@@ -748,6 +748,28 @@ def execute_task(task):
     _maybe_recur(task)
 
 
+def execute_task(task):
+    """Execute a queue task and reconcile an optional W1 workflow link.
+
+    Reconciliation is deliberately repeatable. If the process dies between the
+    queue update and this callback, ``sync_all_tasks`` at worker startup repairs
+    the projection from the durable task row.
+    """
+    from . import workflows
+
+    try:
+        workflows.sync_task(task.id)
+    except Exception as exc:
+        print(f"  !! workflow start sync #{task.id}: {exc}", flush=True)
+    try:
+        return _execute_task_inner(task)
+    finally:
+        try:
+            workflows.sync_task(task.id)
+        except Exception as exc:
+            print(f"  !! workflow final sync #{task.id}: {exc}", flush=True)
+
+
 def _code_snapshot():
     """Mtimes of the package's .py files; None when frozen (code can't change)."""
     if getattr(sys, "frozen", False):
@@ -813,6 +835,8 @@ def _fail_stuck(task_id, exc):
         t = db.get_task(task_id)
         if t and t.status.value == "running":
             db.mark_failed(task_id, f"Внутренняя ошибка воркера: {type(exc).__name__}: {exc}")
+            from . import workflows
+            workflows.sync_task(task_id)
     except Exception as e:  # never let recovery itself take down the loop
         print(f"  !! не удалось пометить #{task_id} failed: {e}", flush=True)
 
@@ -864,6 +888,14 @@ def run_worker():
     if alive:
         print(f"Живые прогоны найдены по метке в окружении, не трогаю: {sorted(alive)}")
     db.recover_running(keep_ids=alive)
+    # A crash may happen after a queue task commits its final status but before
+    # the W1 workflow projection observes it. Reconciliation is idempotent and
+    # also maps reset running tasks back to pending runs.
+    try:
+        from . import workflows
+        workflows.sync_all_tasks()
+    except Exception as exc:
+        print(f"Не удалось синхронизировать workflow после восстановления: {exc}")
 
     code_snapshot = _code_snapshot()
 

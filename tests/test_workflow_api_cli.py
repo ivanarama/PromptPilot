@@ -81,6 +81,79 @@ def test_workflow_api_validates_slug_and_duplicate(isolated_db):
     assert request("GET", "/api/workflows/does-not-exist").status_code == 404
 
 
+def test_w1_api_manual_start_dispatch_sync_and_gate(isolated_db):
+    created = request("POST", "/api/workflows", json=payload("api-w1")).json()
+    started = request(
+        "POST",
+        f"/api/workflows/{created['id']}/start",
+        json={"expected_version": 0, "base_sha": "abc123"},
+    )
+    assert started.status_code == 200
+    assert started.json()["status"] == "queued"
+
+    dispatched = request(
+        "POST",
+        f"/api/workflows/{created['id']}/dispatch",
+        json={
+            "expected_version": started.json()["state_version"],
+            "role": "executor",
+            "prompt": "Implement the next round",
+        },
+    )
+    assert dispatched.status_code == 200
+    task_id = dispatched.json()["task"]["id"]
+
+    task = isolated_db.get_next_runnable()
+    assert task.id == task_id
+    isolated_db.mark_completed(task.id, "executor complete", exit_code=0)
+    synced = request("POST", f"/api/workflows/{created['id']}/sync")
+    assert synced.status_code == 200
+    assert synced.json()["workflow"]["status"] == "gating"
+
+    current = synced.json()["workflow"]
+    gate = request(
+        "POST",
+        f"/api/workflows/{created['id']}/gate",
+        json={
+            "expected_version": current["state_version"],
+            "verdict": "PASS",
+            "gate_id": "test-gate",
+        },
+    )
+    assert gate.status_code == 200
+    assert gate.json()["status"] == "reviewing"
+
+
+def test_w1_api_history_import_is_idempotent(isolated_db):
+    created = request("POST", "/api/workflows", json=payload("api-history")).json()
+    history = {
+        "expected_version": 0,
+        "idempotency_key": "legacy-v1",
+        "source": "git+audit",
+        "rounds": [{
+            "round_no": 3,
+            "status": "revision_required",
+            "facts": [{
+                "claim": "Runtime gate passed",
+                "status": "VERIFIED",
+                "source": "audit-log",
+            }],
+        }],
+    }
+    first = request(
+        "POST", f"/api/workflows/{created['id']}/history/import", json=history
+    )
+    second = request(
+        "POST", f"/api/workflows/{created['id']}/history/import", json=history
+    )
+    assert first.status_code == second.status_code == 200
+    assert first.json()["state_version"] == second.json()["state_version"] == 1
+    events = request(
+        "GET", f"/api/workflows/{created['id']}/events"
+    ).json()
+    assert [event["event_type"] for event in events].count("history.fact_imported") == 1
+
+
 def test_workflow_cli_read_only_commands(isolated_db):
     workflow = isolated_db.create_workflow(
         WorkflowCreate(**payload("cli-workflow")),
@@ -105,11 +178,49 @@ def test_workflow_cli_read_only_commands(isolated_db):
     assert "Findings not found" in findings.output
 
 
-def test_cli_has_no_w0_mutation_subcommands(isolated_db):
+def test_cli_exposes_w1_manual_pilot_commands(isolated_db):
     runner = CliRunner()
     help_result = runner.invoke(cli, ["workflow", "--help"])
 
     assert help_result.exit_code == 0
-    assert " start" not in help_result.output
-    assert " cancel" not in help_result.output
-    assert " delete" not in help_result.output
+    for command in (
+        "create", "start", "dispatch", "gate", "review", "input", "cancel",
+        "sync", "import-history",
+    ):
+        assert command in help_result.output
+
+
+def test_cli_create_and_import_history(isolated_db, tmp_path):
+    workflow_file = tmp_path / "workflow.json"
+    workflow_file.write_text(
+        __import__("json").dumps(payload("cli-import"), ensure_ascii=False),
+        encoding="utf-8",
+    )
+    history_file = tmp_path / "history.json"
+    history_file.write_text(
+        __import__("json").dumps({
+            "idempotency_key": "pre-pilot-v1",
+            "source": "manual+git",
+            "rounds": [{
+                "round_no": 1,
+                "status": "completed",
+                "facts": [{
+                    "claim": "Baseline hash was recorded",
+                    "status": "VERIFIED",
+                    "source": "manifest.json",
+                }],
+            }],
+        }),
+        encoding="utf-8",
+    )
+    runner = CliRunner()
+
+    created = runner.invoke(cli, ["workflow", "create", str(workflow_file)])
+    imported = runner.invoke(
+        cli, ["workflow", "import-history", "cli-import", str(history_file)]
+    )
+
+    assert created.exit_code == 0
+    assert "Created cli-import" in created.output
+    assert imported.exit_code == 0
+    assert "Imported history through round 1" in imported.output

@@ -15,7 +15,7 @@ from pydantic import BaseModel
 import os
 import re as _re
 
-from . import db
+from . import db, workflows
 from .config import API_TOKEN, DB_DIR, get_provider_models, get_skills, load_providers, mask_secret_value, provider_available, PROJECTS_ROOT
 from .models import (
     CostStats,
@@ -30,10 +30,18 @@ from .models import (
     WorkflowEventInDB,
     WorkflowFindingInDB,
     WorkflowInDB,
+    WorkflowDispatchResult,
+    WorkflowGateDecision,
+    WorkflowHistoryImport,
+    WorkflowHumanInput,
+    WorkflowReviewDecision,
     WorkflowRoundInDB,
     WorkflowRunInDB,
+    WorkflowStartRequest,
     WorkflowStatus,
+    WorkflowTaskDispatch,
     WorkflowUpdate,
+    WorkflowVersionRequest,
 )
 from .version import check_for_update
 
@@ -171,7 +179,7 @@ def api_set_note(task_id: int, body: NoteBody):
     return {"ok": True, "note": body.text or None}
 
 
-# --- Workflow orchestrator W0 ---------------------------------------------
+# --- Workflow orchestrator W0/W1 ------------------------------------------
 
 
 @app.post("/api/workflows", response_model=WorkflowInDB, status_code=201)
@@ -280,6 +288,96 @@ def api_list_workflow_artifacts(
         if not round_data or round_data.workflow_id != workflow_id:
             raise HTTPException(404, "Workflow round not found")
     return db.list_workflow_artifacts(workflow_id, round_id=round_id)
+
+
+def _workflow_action(call, *args):
+    try:
+        return call(*args)
+    except db.WorkflowNotFoundError as exc:
+        raise HTTPException(404, "Workflow not found") from exc
+    except db.WorkflowConflictError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.post(
+    "/api/workflows/{workflow_id}/start",
+    response_model=WorkflowInDB,
+)
+def api_start_workflow(workflow_id: str, request: WorkflowStartRequest):
+    return _workflow_action(workflows.start_workflow, workflow_id, request)
+
+
+@app.post(
+    "/api/workflows/{workflow_id}/dispatch",
+    response_model=WorkflowDispatchResult,
+)
+def api_dispatch_workflow_task(
+    workflow_id: str, dispatch: WorkflowTaskDispatch
+):
+    if dispatch.provider and dispatch.provider not in load_providers():
+        raise HTTPException(400, f"Неизвестный провайдер «{dispatch.provider}»")
+    return _workflow_action(workflows.dispatch_task, workflow_id, dispatch)
+
+
+@app.post(
+    "/api/workflows/{workflow_id}/gate",
+    response_model=WorkflowInDB,
+)
+def api_record_workflow_gate(
+    workflow_id: str, decision: WorkflowGateDecision
+):
+    return _workflow_action(workflows.record_gate, workflow_id, decision)
+
+
+@app.post(
+    "/api/workflows/{workflow_id}/review",
+    response_model=WorkflowInDB,
+)
+def api_record_workflow_review(
+    workflow_id: str, decision: WorkflowReviewDecision
+):
+    return _workflow_action(workflows.record_review, workflow_id, decision)
+
+
+@app.post(
+    "/api/workflows/{workflow_id}/human-input",
+    response_model=WorkflowInDB,
+)
+def api_workflow_human_input(
+    workflow_id: str, action: WorkflowHumanInput
+):
+    return _workflow_action(workflows.human_input, workflow_id, action)
+
+
+@app.post(
+    "/api/workflows/{workflow_id}/cancel",
+    response_model=WorkflowInDB,
+)
+def api_cancel_workflow(workflow_id: str, request: WorkflowVersionRequest):
+    return _workflow_action(
+        workflows.cancel_workflow, workflow_id, request.expected_version
+    )
+
+
+@app.post("/api/workflows/{workflow_id}/sync")
+def api_sync_workflow(workflow_id: str):
+    if not db.get_workflow(workflow_id):
+        raise HTTPException(404, "Workflow not found")
+    return {
+        "ok": True,
+        "runs_synced": workflows.sync_all_tasks(workflow_id),
+        "workflow": db.get_workflow(workflow_id),
+    }
+
+
+@app.post(
+    "/api/workflows/{workflow_id}/history/import",
+    response_model=WorkflowInDB,
+)
+def api_import_workflow_history(
+    workflow_id: str, history: WorkflowHistoryImport
+):
+    return _workflow_action(workflows.import_history, workflow_id, history)
 
 
 # --- Вложения к задачам ---
