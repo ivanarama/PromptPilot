@@ -1,4 +1,5 @@
 import asyncio
+import io
 
 import httpx
 from click.testing import CliRunner
@@ -224,3 +225,20 @@ def test_cli_create_and_import_history(isolated_db, tmp_path):
     assert "Created cli-import" in created.output
     assert imported.exit_code == 0
     assert "Imported history through round 1" in imported.output
+
+
+def test_windows_utf8_stream_setup_handles_non_cp1251_text(monkeypatch):
+    from promptpilot import cli as cli_module
+
+    raw = io.BytesIO()
+    stream = io.TextIOWrapper(raw, encoding="cp1251")
+    monkeypatch.setattr(cli_module.os, "name", "nt")
+    monkeypatch.setattr(cli_module.sys, "stdout", stream)
+    monkeypatch.setattr(cli_module.sys, "stderr", stream)
+
+    cli_module._ensure_windows_utf8_streams()
+    stream.write("УТ10 → БП3")
+    stream.flush()
+
+    assert stream.encoding.lower().replace("-", "") == "utf8"
+    assert raw.getvalue().decode("utf-8") == "УТ10 → БП3"

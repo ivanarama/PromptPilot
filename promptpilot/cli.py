@@ -33,6 +33,27 @@ def _ensure_utf8():
 
 _ensure_utf8()
 
+
+def _ensure_windows_utf8_streams():
+    """Keep Unicode workflow/article text writable through Windows pipes.
+
+    Interactive Windows consoles normally use Python's Unicode console path,
+    but redirected stdout can still inherit CP1251. Workflow objectives and
+    evidence legitimately contain arrows and other characters outside CP1251.
+    """
+    if os.name != "nt":
+        return
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure:
+            try:
+                reconfigure(encoding="utf-8")
+            except (OSError, ValueError):
+                pass
+
+
+_ensure_windows_utf8_streams()
+
 import click
 
 from . import db
