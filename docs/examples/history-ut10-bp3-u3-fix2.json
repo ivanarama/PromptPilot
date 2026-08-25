@@ -1,0 +1,76 @@
+{
+  "idempotency_key": "ut10-bp3-u3-fix2-audit-1e13c01-v1",
+  "source": "D:\\Projects\\exchange\\docs\\audit\\UT10-BP3_U3_FIX2_REVIEW.md + git commit 1e13c01",
+  "notes": "Последний раунд до фактического включения dispatch PromptPilot. Функциональность принята; следующий раунд ограничен clean-build/evidence.",
+  "rounds": [
+    {
+      "round_no": 9,
+      "status": "revision_required",
+      "base_sha": "8744181",
+      "candidate_sha": "70344248387452933d56743bd05f16eb24cddf9a",
+      "audit_sha": "1e13c01",
+      "summary": "U3-0/U3-1 функционально приняты; требуется evidence-only clean rebuild",
+      "metrics": {
+        "targeted_strict_passed": 110,
+        "full_default_passed": 1050,
+        "full_default_skipped": 23,
+        "full_strict_failed": 146,
+        "runtime_created": 129,
+        "runtime_updated": 8,
+        "runtime_errors": 0,
+        "exact_dump_rows": 137,
+        "dual_generation_identical": 38
+      },
+      "facts": [
+        {
+          "claim": "Production-функциональность U3-0/U3-1 прошла независимый COM runtime на новой disposable БП3",
+          "status": "VERIFIED",
+          "source": "docs/audit/UT10-BP3_U3_FIX2_REVIEW.md",
+          "evidence": [
+            "docs/audit/evidence/ut10_u3_fix2_runtime_audit_20260825.json",
+            "129 created + 8 updated + 0 errors",
+            "4 exact bank/cash documents verified"
+          ]
+        },
+        {
+          "claim": "Полный обычный pytest проходит",
+          "status": "VERIFIED",
+          "source": "independent command: python -m pytest -q",
+          "evidence": ["1050 passed, 23 skipped, 73 deselected"]
+        },
+        {
+          "claim": "Целевой строгий U3/U2/fleet набор проходит с -W error",
+          "status": "VERIFIED",
+          "source": "independent targeted pytest",
+          "evidence": ["110 passed"]
+        },
+        {
+          "claim": "Кандидат получен чистым циклом сборки",
+          "status": "DISPROVED",
+          "source": "evidence/ut10-bp3/20260825_111804_605_e31295d1/manifest.json",
+          "evidence": [
+            "source_commit=e67e13c0b801c09868d09ad41aa5c2e1bab4c08f",
+            "dirty_worktree=true"
+          ]
+        },
+        {
+          "claim": "Manifest согласован с заявленными functional/transport/dual checks",
+          "status": "DISPROVED",
+          "source": "manifest.json vs UT10-BP3_U3_IMPLEMENTATION_REPORT.md",
+          "evidence": [
+            "functional_tests=false",
+            "transport_contracts=false",
+            "dual_generation=false"
+          ]
+        },
+        {
+          "claim": "Полный pytest проходит с -W error",
+          "status": "DISPROVED",
+          "source": "independent command: python -m pytest -q -W error",
+          "evidence": ["146 failed, 903 passed, 1 error", "ResourceWarning promoted to errors"],
+          "notes": "Неблокирующий общий технический долг; обычный полный pytest и целевой строгий U3-набор зелёные."
+        }
+      ]
+    }
+  ]
+}
