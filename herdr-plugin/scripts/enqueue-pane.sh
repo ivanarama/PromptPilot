@@ -3,6 +3,10 @@
 # PromptPilot с рабочей директорией панели-источника.
 set -u
 
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=scripts/lib.sh
+. "$script_dir/lib.sh"
+
 ctx=${HERDR_PLUGIN_CONTEXT_JSON:-}
 cwd=""
 if [ -n "$ctx" ]; then
@@ -19,12 +23,12 @@ except Exception:
 fi
 [ -n "$cwd" ] || cwd=$PWD
 
-if command -v pp > /dev/null 2>&1; then
-    pp_cmd=(pp)
-elif [ -x "$HOME/.local/bin/pp" ]; then
-    pp_cmd=("$HOME/.local/bin/pp")
-else
-    pp_cmd=(python3 -m promptpilot)
+# Проверяем до вопроса о тексте: обидно набрать задачу и только потом узнать,
+# что класть её некуда.
+if ! pp_resolve; then
+    pp_notify_missing
+    read -r -p "Enter — закрыть" _ || true
+    exit 1
 fi
 
 echo "PromptPilot — новая задача"
@@ -38,7 +42,7 @@ if [ -z "$prompt" ]; then
     exit 0
 fi
 
-out=$("${pp_cmd[@]}" add --dir "$cwd" -- "$prompt" 2>&1)
+out=$("${PP_CMD[@]}" add --dir "$cwd" -- "$prompt" 2>&1)
 rc=$?
 printf '%s\n' "$out"
 

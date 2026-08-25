@@ -597,8 +597,15 @@ Web UI: **⚙ Providers** → «Изменить» у нужного прова�
 Минимальный плагин для herdr 0.7.5+ лежит в `herdr-plugin/`. Установка:
 
 ```bash
-herdr plugin link /path/to/PromptPilot/herdr-plugin
+herdr plugin install ivanarama/PromptPilot/herdr-plugin   # из GitHub
+herdr plugin link /path/to/PromptPilot/herdr-plugin       # локальная копия
 ```
+
+Плагин — тонкая обёртка над `pp`: сам PromptPilot он не ставит и без него не
+работает. Если `pp` на машине нет (не в PATH, не в `~/.local/bin`, модуль
+`promptpilot` не импортируется), плагин не пытается запустить что-то наугад —
+он показывает уведомление herdr со ссылкой на установку и пишет то же самое в
+`~/.promptpilot/startup.log`.
 
 Что даёт:
 

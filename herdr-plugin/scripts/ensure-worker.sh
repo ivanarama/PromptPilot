@@ -3,6 +3,10 @@
 # Идемпотентен — уже работающий worker не трогается.
 set -u
 
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=scripts/lib.sh
+. "$script_dir/lib.sh"
+
 state_dir=${HERDR_PLUGIN_STATE_DIR:-$HOME/.promptpilot}
 mkdir -p "$state_dir"
 log_file=$state_dir/startup.log
@@ -26,13 +30,16 @@ if worker_running; then
     exit 0
 fi
 
-# Тот же порядок поиска, что в enqueue-pane.sh, иначе половинки плагина
-# запускают разные инсталляции.
-if command -v pp > /dev/null 2>&1; then
-    worker_cmd=(pp worker)
-elif [ -x "$HOME/.local/bin/pp" ]; then
-    worker_cmd=("$HOME/.local/bin/pp" worker)
-else
+if ! pp_resolve; then
+    pp_notify_missing | tee -a "$log_file"
+    # Это не отказ плагина: его штатно ставят раньше самого PromptPilot, и
+    # красной записи в `herdr plugin log` такая ситуация не заслуживает —
+    # человеку уже сказали, что делать, уведомлением.
+    exit 0
+fi
+
+worker_cmd=("${PP_CMD[@]}" worker)
+if [ "${PP_CMD[0]}" = "python3" ]; then
     # -u обязателен: без него лог worker'а буферизуется и отстаёт от реальности.
     worker_cmd=(python3 -u -m promptpilot worker)
 fi
