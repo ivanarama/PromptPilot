@@ -1058,6 +1058,14 @@ def guard_enabled(provider_cfg: dict, skip_permissions: bool) -> bool:
 # Projects root — optional directory whose subdirectories are offered as project choices
 PROJECTS_ROOT = os.environ.get("PP_PROJECTS_ROOT", "")
 
+# Telegram chat that gets a task's notifications when the task itself names none.
+# A browser has no chat id, so without this every task created in the Web UI runs
+# silently: no verdict, no «упала, но расписание продолжено», no «ждёт
+# подтверждения» — and for a recurring task that silence lasts months.
+# 0 = unset. A task may also carry 0 itself, meaning «this one notifies nobody»;
+# that is a decision, so it is never overwritten by this default.
+TG_CHAT_ID = _int_env("PP_TG_CHAT_ID", 0)
+
 # Optional password required to create tasks via Telegram bot
 TASK_PASSWORD = os.environ.get("PP_TASK_PASSWORD", "")
 

@@ -6,7 +6,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from .config import DB_DIR, DB_PATH
+from .config import DB_DIR, DB_PATH, TG_CHAT_ID
 from .models import Stats, TaskCreate, TaskInDB, TaskStatus
 
 SCHEMA = """
@@ -178,6 +178,20 @@ def init_db():
                 pass  # Column already exists
 
 
+def resolve_tg_chat_id(value: Optional[int]) -> Optional[int]:
+    """Which chat this task notifies: its own, the configured default, or nobody.
+
+    None = «не сказано» → PP_TG_CHAT_ID, because the most common way to say
+    nothing is to create the task from the Web UI, where a chat id is unknowable.
+    0 = «сказано: молчать» and stays 0: a recurring task carries this value into
+    every next occurrence, so the default must not resurrect notifications the
+    human turned off.
+    """
+    if value is None:
+        return TG_CHAT_ID or None
+    return value
+
+
 def create_task(task: TaskCreate) -> TaskInDB:
     with _connect() as conn:
         cur = conn.execute(
@@ -195,7 +209,7 @@ def create_task(task: TaskCreate) -> TaskInDB:
                 task.model,
                 task.session_id,
                 task.parent_task_id,
-                task.tg_chat_id,
+                resolve_tg_chat_id(task.tg_chat_id),
                 task.recurrence,
                 task.task_timeout,
                 int(task.detached),
@@ -491,7 +505,12 @@ def list_series() -> list:
 
 
 EDITABLE_FIELDS = ("provider", "model", "effort", "priority", "recurrence",
-                   "scheduled_at", "working_dir")
+                   "scheduled_at", "working_dir", "tg_chat_id")
+
+# Адресат уведомлений — единственное, что осмысленно менять и у идущей задачи:
+# он читается из строки в момент доставки, а не при старте процесса, поэтому
+# назначенный на ходу чат получит и вердикт этого прогона.
+RUNNING_EDITABLE_FIELDS = ("tg_chat_id",)
 
 
 def update_task_fields(task_id: int, fields: dict) -> bool:
@@ -499,18 +518,23 @@ def update_task_fields(task_id: int, fields: dict) -> bool:
 
     Только pending/rate_limited: у running менять провайдера поздно (процесс уже
     идёт), а у завершённой бессмысленно — следующее вхождение серии это
-    отдельная строка, её и надо править.
+    отдельная строка, её и надо править. Исключение — поля из
+    RUNNING_EDITABLE_FIELDS, см. комментарий у константы.
     """
     fields = {k: v for k, v in fields.items() if k in EDITABLE_FIELDS}
     if not fields:
         return False
     if "scheduled_at" in fields:
         fields["scheduled_at"] = _to_utc_iso(fields["scheduled_at"])
+    statuses = ["pending", "rate_limited"]
+    if all(k in RUNNING_EDITABLE_FIELDS for k in fields):
+        statuses.append("running")
     sets = ", ".join(f"{k} = ?" for k in fields)
+    marks = ", ".join("?" for _ in statuses)
     with _connect() as conn:
         cur = conn.execute(
-            f"UPDATE tasks SET {sets} WHERE id = ? AND status IN ('pending', 'rate_limited')",
-            (*fields.values(), task_id),
+            f"UPDATE tasks SET {sets} WHERE id = ? AND status IN ({marks})",
+            (*fields.values(), task_id, *statuses),
         )
         return cur.rowcount > 0
 
@@ -616,11 +640,16 @@ def get_cost_stats() -> dict:
 
 
 def get_pending_notifications() -> list:
-    """Return completed/failed tasks with a tg_chat_id that haven't been notified yet."""
+    """Return completed/failed tasks with a tg_chat_id that haven't been notified yet.
+
+    tg_chat_id = 0 is the muted task: a value, not an absence, so it has to be
+    excluded explicitly — chat 0 exists nowhere and sending there just errors.
+    """
     with _connect() as conn:
         rows = conn.execute(
             """SELECT * FROM tasks
                WHERE tg_chat_id IS NOT NULL
+                 AND tg_chat_id != 0
                  AND notified_at IS NULL
                  AND status IN ('completed', 'failed')""",
         ).fetchall()
