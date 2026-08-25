@@ -250,7 +250,11 @@ BUILTIN_PROVIDERS = {
         },
     },
     "codex": {
-        "cmd": "codex exec {prompt}",
+        # Windows resolves the npm shim as codex.CMD. A multiline argv value is
+        # then truncated at its first newline by cmd.exe. Codex natively reads
+        # the full prompt from stdin when its prompt argument is '-'.
+        "cmd": "codex exec -",
+        "prompt_stdin": True,
         "description": "OpenAI Codex",
         "supports_skills": False,
     },
@@ -593,7 +597,12 @@ def build_cmd(provider: str, prompt: str, skip_permissions: bool = False, sessio
         if settings:
             extras += ["--settings", settings]
     if extras:
-        prompt_idx = cmd.index(prompt)
+        if prompt in cmd:
+            prompt_idx = cmd.index(prompt)
+        elif cfg.get("prompt_stdin") and cmd and cmd[-1] == "-":
+            prompt_idx = len(cmd) - 1
+        else:
+            prompt_idx = len(cmd)
         cmd[prompt_idx:prompt_idx] = extras
     return cmd
 

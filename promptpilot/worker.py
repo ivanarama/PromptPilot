@@ -571,8 +571,10 @@ def _execute_task_inner(task):
         wt_note = "\n\n" + worktree.summary(wt["path"], wt["branch"], wt["copied"])
         print(f"  -> Worktree {wt['path']} ({wt['branch']})")
 
-    cmd = build_cmd(provider, effective_prompt(task), skip_permissions=task.skip_permissions,
+    agent_prompt = effective_prompt(task)
+    cmd = build_cmd(provider, agent_prompt, skip_permissions=task.skip_permissions,
                     session_id=task.session_id, model=task.model, guard=not machine)
+    prompt_stdin = agent_prompt if provider_cfg.get("prompt_stdin") else None
 
     env = get_provider_env(provider)
     # Marks the run in its own environment, inherited by the agent process. That
@@ -624,13 +626,25 @@ def _execute_task_inner(task):
             encoding="utf-8",
             errors="replace",
             cwd=run_dir,
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.PIPE if prompt_stdin is not None else subprocess.DEVNULL,
             env=env,
             start_new_session=(os.name == "posix"),
         )
     except FileNotFoundError:
         db.mark_failed(task.id, f"CLI '{provider}' not found. Is it installed and in PATH?", exit_code=-1)
         return
+
+    if prompt_stdin is not None:
+        # Write once and detach the handle before polling communicate(). This
+        # avoids resending after TimeoutExpired and preserves newlines through
+        # Windows .CMD provider shims.
+        try:
+            proc.stdin.write(prompt_stdin)
+            proc.stdin.close()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+        finally:
+            proc.stdin = None
 
     # Poll instead of blocking: allows user-requested cancellation of a
     # RUNNING task (Web UI/bot) and the per-task timeout.
