@@ -8,6 +8,7 @@ from promptpilot.models import (
     TaskStatus,
     WorkflowCreate,
     WorkflowStartRequest,
+    WorkflowUpdate,
 )
 
 
@@ -62,7 +63,9 @@ def test_autonomous_revision_round_then_pass(isolated_db):
 
     complete_next(
         isolated_db,
-        "AUDIT_FINDINGS_JSON: []\n"
+        'AUDIT_FINDINGS_JSON: [{"fingerprint":"f1","severity":"high",'
+        '"category":"runtime","title":"Broken","status":"open",'
+        '"payload":{"path":"x"}}]\n'
         "AUDIT_VERDICT: REVISION_REQUIRED\n"
         "ИТОГ: ГОТОВО — аудит завершён",
     )
@@ -73,9 +76,14 @@ def test_autonomous_revision_round_then_pass(isolated_db):
     assert "AUDIT_VERDICT: REVISION_REQUIRED" in executor_retry.prompt
 
     complete_next(isolated_db, "executor report round 2")
+    reviewer_retry = isolated_db.list_tasks(status=TaskStatus.PENDING)[0]
+    assert '"fingerprint": "f1"' in reviewer_retry.prompt
+    assert "со status=resolved" in reviewer_retry.prompt
     complete_next(
         isolated_db,
-        "AUDIT_FINDINGS_JSON: []\n"
+        'AUDIT_FINDINGS_JSON: [{"fingerprint":"f1","severity":"high",'
+        '"category":"runtime","title":"Broken","status":"resolved",'
+        '"payload":{"verified":true}}]\n'
         "AUDIT_VERDICT: PASS\n"
         "ИТОГ: ГОТОВО — аудит завершён",
     )
@@ -126,6 +134,20 @@ def test_failed_automatic_gate_stops_at_round_budget(monkeypatch, isolated_db):
     ]
     assert "gate.failed" in event_types
     assert event_types[-1] == "limit.max_rounds"
+
+    resumed_config = dict(stopped.config)
+    resumed_config["limits"] = {"max_rounds": 2}
+    updated = isolated_db.update_workflow(
+        workflow.id,
+        WorkflowUpdate(
+            expected_version=stopped.state_version,
+            config=resumed_config,
+        ),
+    )
+    resumed = workflows.advance_workflow(updated.id)
+    assert resumed.status.value == "executing"
+    assert resumed.current_round == 2
+    assert isolated_db.list_tasks(status=TaskStatus.PENDING)
 
 
 def test_invalid_reviewer_contract_pauses_for_human(isolated_db):

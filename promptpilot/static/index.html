@@ -1237,6 +1237,22 @@ function openWorkflows() {
 function closeWorkflows() { document.getElementById('workflowModal').classList.remove('open'); }
 
 let workflowAutoRefreshBusy = false;
+
+function captureWorkflowOpenDetails() {
+  return new Set([...document.querySelectorAll('#wfDetail details')]
+    .filter(detail => detail.open)
+    .map(detail => detail.dataset.wfDetail || detail.id)
+    .filter(Boolean));
+}
+
+function restoreWorkflowOpenDetails(openKeys) {
+  if (!openKeys?.size) return;
+  document.querySelectorAll('#wfDetail details').forEach(detail => {
+    const key = detail.dataset.wfDetail || detail.id;
+    if (key && openKeys.has(key)) detail.open = true;
+  });
+}
+
 async function autoRefreshWorkflowState() {
   const modal = document.getElementById('workflowModal');
   if (!modal?.classList.contains('open') || !selectedWorkflowId || workflowAutoRefreshBusy) return;
@@ -1337,7 +1353,9 @@ async function selectWorkflow(id) {
       }
     } catch (_) {}
   }
+  const openDetailKeys = captureWorkflowOpenDetails();
   renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, plannerTask, orphanPane);
+  restoreWorkflowOpenDetails(openDetailKeys);
   const idx = workflowCache.findIndex(item => item.id === id);
   if (idx >= 0) workflowCache[idx] = wf;
   const list = document.getElementById('wfList');
@@ -1414,7 +1432,7 @@ function workflowSettingsHtml(wf) {
     </div>
     <div class="wf-actions"><button class="btn btn-sm btn-primary" onclick="wfSaveSettings()">Сохранить настройки</button>
       <button class="btn btn-sm btn-ghost" onclick="wfAdvance()">Запустить следующий автоматический переход</button></div>
-    <div class="wf-meta">Переменные шаблонов: {{objective}}, {{stage_code}}, {{stage_title}}, {{stage_goal}}, {{repository_path}}, {{candidate_branch}}, {{round_no}}, {{previous_review}}, {{executor_report}}, {{gate_evidence}}.</div>
+    <div class="wf-meta">Переменные шаблонов: {{objective}}, {{stage_code}}, {{stage_title}}, {{stage_goal}}, {{repository_path}}, {{candidate_branch}}, {{round_no}}, {{previous_review}}, {{executor_report}}, {{gate_evidence}}, {{open_findings}}.</div>
   </details>`;
 }
 
@@ -1615,7 +1633,7 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, 
     const auditColor = auditVerdict === 'PASS' ? 'var(--green)' : 'var(--red)';
     action = `<div class="wf-stage" style="border-color:${auditColor}">
       <b style="color:${auditColor}">Аудитор task #${reviewerDone.task_id}: ${esc(auditVerdict || 'отчёт готов')}</b>
-      <details><summary>Показать отчёт независимого аудитора</summary>
+      <details data-wf-detail="audit-report"><summary>Показать отчёт независимого аудитора</summary>
         <div class="result-block"><pre>${esc(reviewerResult)}</pre></div>
       </details>
     </div>
@@ -1674,7 +1692,7 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, 
       </div>` : ''}
     <div class="wf-section-title">История завершённых раундов</div>
     <div class="wf-history">${historyRows || '<div class="wf-meta">Истории пока нет.</div>'}</div>
-    <details class="wf-technical"><summary>Технический журнал · ${events.length} событий · state version ${wf.state_version}</summary>
+    <details class="wf-technical" data-wf-detail="technical-log"><summary>Технический журнал · ${events.length} событий · state version ${wf.state_version}</summary>
       <div class="wf-history">${eventRows || '<div class="wf-meta">Событий пока нет.</div>'}</div>
     </details>`;
   if (['queued','reviewing'].includes(wf.status)) setTimeout(wfProviderChanged, 0);

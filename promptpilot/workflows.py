@@ -199,6 +199,9 @@ DEFAULT_REVIEWER_PROMPT = """Ты — независимый аудитор в �
 Deterministic gate:
 {{gate_evidence}}
 
+Незакрытые замечания предыдущих аудитов:
+{{open_findings}}
+
 Проверь diff, историю Git, тесты и evidence. В конце отчёта обязательно выведи
 две машинно-читаемые строки (каждая целиком на одной строке):
 AUDIT_FINDINGS_JSON: []
@@ -208,6 +211,11 @@ AUDIT_VERDICT: PASS
 (blocker/high/medium/low/info), category, title, status (open/resolved/reopened/
 accepted_risk), payload. AUDIT_VERDICT допускает только PASS,
 REVISION_REQUIRED или HUMAN_REQUIRED.
+
+Если список незакрытых замечаний выше не пуст, верни в AUDIT_FINDINGS_JSON
+каждый прежний fingerprint: со status=resolved, когда исправление проверено, либо
+со status=open/reopened и вердиктом REVISION_REQUIRED. Не возвращай PASS с
+пустым массивом, пока в реестре есть незакрытые замечания.
 """
 
 
@@ -1040,7 +1048,11 @@ def human_input(workflow_id: str,
                 "planning failure must be retried with planner dispatch"
             )
 
-        if state is WorkflowStatus.REVISION_REQUIRED:
+        revision_context = (
+            state is WorkflowStatus.REVISION_REQUIRED
+            or round_row["status"] == WorkflowRoundStatus.REVISION_REQUIRED.value
+        )
+        if revision_context:
             next_round = workflow["current_round"] + 1
             current_stage = None
             if workflow["current_stage_id"]:
@@ -1060,6 +1072,8 @@ def human_input(workflow_id: str,
                     (current_stage["id"],),
                 ).fetchone()[0]
                 if revision_count >= int(configured_limit):
+                    if state is WorkflowStatus.AWAITING_HUMAN:
+                        return db._row_to_workflow(workflow)
                     workflow = _transition(
                         conn, workflow, WorkflowStatus.AWAITING_HUMAN,
                         "limit.stage_revisions",
@@ -1070,6 +1084,8 @@ def human_input(workflow_id: str,
                     )
                     return db._row_to_workflow(workflow)
             if not _check_round_budget(conn, workflow, next_round):
+                if state is WorkflowStatus.AWAITING_HUMAN:
+                    return db._row_to_workflow(workflow)
                 workflow = _transition(
                     conn, workflow, WorkflowStatus.AWAITING_HUMAN,
                     "limit.max_rounds",
@@ -1357,6 +1373,18 @@ def _render_role_prompt(workflow: WorkflowInDB, role: WorkflowRole,
         "gate_evidence": _latest_gate_evidence(
             workflow.id, before_round=round_no
         ),
+        "open_findings": json.dumps([
+            {
+                "fingerprint": finding.fingerprint,
+                "severity": finding.severity.value,
+                "category": finding.category,
+                "title": finding.title,
+                "status": finding.status.value,
+                "payload": finding.payload,
+            }
+            for finding in db.list_workflow_findings(workflow.id)
+            if finding.status in {FindingStatus.OPEN, FindingStatus.REOPENED}
+        ], ensure_ascii=False, indent=2),
     }
     rendered = template or (
         DEFAULT_EXECUTOR_PROMPT
@@ -1597,15 +1625,42 @@ def advance_workflow(workflow_id: str, max_actions: int = 12) -> WorkflowInDB:
                     item for item in db.list_workflow_rounds(workflow.id)
                     if item.round_no == workflow.current_round
                 )
-                reviewer_runs = [
-                    item for item in db.list_workflow_runs(current_round.id)
-                    if item.role is WorkflowRole.REVIEWER
-                ]
-                if reviewer_runs:
+                events = db.list_workflow_events(workflow.id, limit=1000)
+                latest_gate_seq = max(
+                    (event.seq for event in events
+                     if event.round_id == current_round.id
+                     and event.event_type == "gate.passed"),
+                    default=0,
+                )
+                latest_reviewer_dispatch_seq = max(
+                    (event.seq for event in events
+                     if event.round_id == current_round.id
+                     and event.event_type == "reviewer.dispatched"),
+                    default=0,
+                )
+                if latest_reviewer_dispatch_seq > latest_gate_seq:
                     return workflow
                 return _dispatch_configured_role(workflow, WorkflowRole.REVIEWER).workflow
 
             if workflow.status is WorkflowStatus.AWAITING_HUMAN:
+                if not workflow.current_round:
+                    return workflow
+                current_round = next(
+                    item for item in db.list_workflow_rounds(workflow.id)
+                    if item.round_no == workflow.current_round
+                )
+                if (
+                    current_round.status is WorkflowRoundStatus.REVISION_REQUIRED
+                    and config.automation.auto_resume_revision
+                ):
+                    workflow = human_input(workflow.id, WorkflowHumanInput(
+                        expected_version=workflow.state_version,
+                        text="Автоматическое продолжение после увеличения лимита раундов",
+                        resume=True,
+                    ))
+                    if workflow.status is WorkflowStatus.AWAITING_HUMAN:
+                        return workflow
+                    continue
                 if not config.automation.auto_apply_review:
                     return workflow
                 reviewer = _latest_completed_reviewer(workflow)

@@ -126,6 +126,10 @@ def test_web_ui_exposes_workflow_and_live_agent_controls():
     assert "Мяч сейчас:" in html
     assert "function workflowStopReason" in html
     assert "function autoRefreshWorkflowState" in html
+    assert "function captureWorkflowOpenDetails" in html
+    assert "function restoreWorkflowOpenDetails" in html
+    assert 'data-wf-detail="audit-report"' in html
+    assert 'data-wf-detail="technical-log"' in html
     assert "AUDIT_VERDICT:" in html
     assert "Показать отчёт независимого аудитора" in html
     assert "Причина остановки:" in html
