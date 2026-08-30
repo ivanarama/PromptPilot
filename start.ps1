@@ -38,10 +38,13 @@ if (Test-Path $pidFile) {
     Remove-Item $pidFile
 }
 
-# Pick executable: prefer built dist\pp.exe, fall back to pp from PATH
+# Pick executable: prefer built dist, then the repository venv, then PATH.
 if (Test-Path "$PSScriptRoot\dist\pp.exe") {
     $exe = "$PSScriptRoot\dist\pp.exe"
     Write-Host "Using: dist\pp.exe" -ForegroundColor DarkGray
+} elseif (Test-Path "$PSScriptRoot\.venv\Scripts\pp.exe") {
+    $exe = "$PSScriptRoot\.venv\Scripts\pp.exe"
+    Write-Host "Using: .venv\Scripts\pp.exe" -ForegroundColor DarkGray
 } else {
     $exe = "pp"
     Write-Host "Using: pp (from PATH)" -ForegroundColor DarkGray
@@ -54,12 +57,12 @@ Write-Host "Starting PromptPilot..." -ForegroundColor Cyan
 $w = Start-Process $exe -ArgumentList "worker" `
     -RedirectStandardOutput "$logDir\worker.log" `
     -RedirectStandardError  "$logDir\worker.err" `
-    -NoNewWindow -PassThru
+    -WindowStyle Hidden -PassThru
 
 $s = Start-Process $exe -ArgumentList "server" `
     -RedirectStandardOutput "$logDir\server.log" `
     -RedirectStandardError  "$logDir\server.err" `
-    -NoNewWindow -PassThru
+    -WindowStyle Hidden -PassThru
 
 $pids = [ordered]@{ worker = $w.Id; server = $s.Id }
 
@@ -71,9 +74,9 @@ if ($Bot -or $env:PP_TG_TOKEN) {
         Write-Host "PP_TG_TOKEN is not set, skipping bot." -ForegroundColor Yellow
     } else {
         $b = Start-Process $exe -ArgumentList "bot" `
-            -RedirectStandardOutput "$logDir\bot.log" `
-            -RedirectStandardError  "$logDir\bot.err" `
-            -NoNewWindow -PassThru
+        -RedirectStandardOutput "$logDir\bot.log" `
+        -RedirectStandardError  "$logDir\bot.err" `
+        -WindowStyle Hidden -PassThru
         $pids.bot = $b.Id
         Write-Host "  Bot     PID $($b.Id)   logs\bot.log" -ForegroundColor Green
     }
