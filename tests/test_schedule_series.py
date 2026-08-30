@@ -71,7 +71,7 @@ def test_temporary_boost_expiry_uses_base_interval(isolated_db):
 
 
 def test_pipeline_insights_finds_capacity_bottleneck(isolated_db, monkeypatch):
-    counts = iter([15, 5, 17, 9])
+    counts = iter([15, 5, 0, 17, 9])
     monkeypatch.setattr(pipeline_insights, "_github_count", lambda repo, query: next(counts))
     pipeline_insights._cache.clear()
 
@@ -84,3 +84,12 @@ def test_pipeline_insights_finds_capacity_bottleneck(isolated_db, monkeypatch):
     assert review["recommended_interval"] == "1h"
     assert "оставить 1h" not in review["recommendation"]  # no matching series in this unit test
     assert "решения человека" in triage["recommendation"]
+
+
+def test_onebase_profile_excludes_parked_prs_from_machine_queues():
+    profile = pipeline_insights.DEFAULT_PROFILES["onebase"]
+    queues = {item["id"]: item for item in profile["queues"]}
+
+    assert "-label:needs-decision" in queues["review"]["query"]
+    assert "-label:needs-decision" in queues["merge"]["query"]
+    assert all("-label:needs-decision" in query for query in queues["fix"]["queries"])

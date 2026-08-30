@@ -25,17 +25,20 @@ DEFAULT_PROFILES = {
             },
             {
                 "id": "fix", "title": "Исправления", "capacity": 1,
-                "query": "is:issue is:open label:ready-fix -label:in-work -label:hold -label:manual",
+                "queries": [
+                    "is:issue is:open label:ready-fix,approved -label:in-work -label:hold -label:manual -label:needs-decision",
+                    "is:pr is:open label:changes-requested -label:hold -label:needs-decision",
+                ],
                 "series_contains": "FIX",
             },
             {
                 "id": "review", "title": "Ревью PR", "capacity": 2,
-                "query": "is:pr is:open -label:reviewed -label:changes-requested",
+                "query": "is:pr is:open draft:false -label:ship -label:reviewed -label:changes-requested -label:needs-decision -label:hold",
                 "series_contains": "REVIEW",
             },
             {
                 "id": "merge", "title": "Слияние", "capacity": 3,
-                "query": "is:pr is:open label:ship",
+                "query": "is:pr is:open label:ship -label:hold -label:needs-decision",
                 "series_contains": "MERGE",
             },
         ],
@@ -131,7 +134,8 @@ def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True) -> d
     target_hours = float(profile.get("target_clear_hours", 8))
     queues = []
     for item in profile["queues"]:
-        backlog = _github_count(profile["repository"], item["query"])
+        queries = item.get("queries") or [item["query"]]
+        backlog = sum(_github_count(profile["repository"], query) for query in queries)
         capacity = max(1, int(item.get("capacity", 1)))
         matching = next((s for s in series
                          if item.get("series_contains", "").lower() in s["title"].lower()), None)
