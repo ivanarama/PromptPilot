@@ -78,4 +78,9 @@ def test_pipeline_insights_finds_capacity_bottleneck(isolated_db, monkeypatch):
     result = pipeline_insights.analyze("onebase", [], use_cache=False)
 
     assert result["bottleneck"] == "review"
-    assert next(q for q in result["queues"] if q["id"] == "review")["runs_needed"] == 8.5
+    review = next(q for q in result["queues"] if q["id"] == "review")
+    triage = next(q for q in result["queues"] if q["id"] == "triage")
+    assert review["runs_needed"] == 8.5
+    assert review["recommended_interval"] == "1h"
+    assert "оставить 1h" not in review["recommendation"]  # no matching series in this unit test
+    assert "решения человека" in triage["recommendation"]

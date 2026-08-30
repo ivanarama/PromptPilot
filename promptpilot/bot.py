@@ -866,21 +866,45 @@ async def show_pipeline_insights(update: Update, context: ContextTypes.DEFAULT_T
     if not is_authorized(update.effective_user.id):
         await _deny(update)
         return
+    profiles = pipeline_insights.list_profiles()
+    if len(profiles) > 1:
+        buttons = [[InlineKeyboardButton(p["title"][:55], callback_data=f"pipeline:{p['id']}")]
+                   for p in profiles]
+        await update.message.reply_text("📈 Выберите проект/цепочку:",
+                                        reply_markup=InlineKeyboardMarkup(buttons))
+        return
+    await _send_pipeline_insights(update.message, profiles[0]["id"] if profiles else "onebase")
+
+
+def _pipeline_text(data: dict) -> str:
+    lines = [f"📈 {data['title']}",
+             f"Цель оценки: текущая очередь примерно за {data['target_clear_hours']:g} ч.", ""]
+    for queue in data["queues"]:
+        marker = "⚠" if queue["id"] == data["bottleneck"] else "•"
+        lines.append(f"{marker} {queue['title']}: {queue['backlog']} / "
+                     f"{queue['capacity']} за прогон = {queue['runs_needed']} прогонов; "
+                     f"сейчас {queue['interval'] or 'не настроено'}\n"
+                     f"   Рекомендация: {queue['recommendation']}")
+    lines.extend(["", "⚠ — текущее узкое место по backlog / ёмкость запуска."])
+    return "\n".join(lines)
+
+
+async def _send_pipeline_insights(message, profile_id: str):
     import asyncio
-    status = await update.message.reply_text("📈 Считаю очереди GitHub…")
+    status = await message.reply_text("📈 Считаю очереди GitHub…")
     try:
         data = await asyncio.to_thread(
-            pipeline_insights.analyze, "onebase", db.list_series(), use_cache=False)
-        lines = [f"📈 {data['title']}", ""]
-        for queue in data["queues"]:
-            marker = "⚠" if queue["id"] == data["bottleneck"] else "•"
-            lines.append(f"{marker} {queue['title']}: {queue['backlog']} в очереди / "
-                         f"{queue['capacity']} за прогон = {queue['runs_needed']} прогонов; "
-                         f"интервал {queue['interval'] or 'не настроен'}")
-        lines.extend(["", "⚠ — текущее узкое место по backlog / ёмкость запуска."])
-        await status.edit_text("\n".join(lines))
+            pipeline_insights.analyze, profile_id, db.list_series(), use_cache=False)
+        await status.edit_text(_pipeline_text(data))
     except Exception as exc:
         await status.edit_text(f"Не удалось посчитать очередь: {exc}")
+
+
+async def cb_pipeline_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    profile_id = query.data.split(":", 1)[1]
+    await _send_pipeline_insights(query.message, profile_id)
 
 
 async def toggle_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3569,6 +3593,7 @@ def run_bot():
     app.add_handler(CallbackQueryHandler(cb_series_interval, pattern=r"^seri:\d+:[^:]+$"))
     app.add_handler(CallbackQueryHandler(cb_series_boost, pattern=r"^serb:\d+:[^:]+$"))
     app.add_handler(CallbackQueryHandler(cb_series_action, pattern=r"^sera:\d+:[a-z_]+$"))
+    app.add_handler(CallbackQueryHandler(cb_pipeline_profile, pattern=r"^pipeline:[A-Za-z0-9_.-]+$"))
 
     # --- last in group 0: catch-alls, reached only when nothing above claimed
     # the update. Free text used to get dead silence (especially bad after the

@@ -99,6 +99,9 @@ def test_schedule_ui_exposes_durable_series_controls():
     assert "Завершённые серии" in html
     assert "Временное ускорение" in html
     assert "saveSeries(event" in html
+    assert "insights-table" in html
+    assert "Рекомендация" in html
+    assert "pipelineProfileSelect" in html
 
 
 def test_workflow_setup_preflight_accepts_repo_provider_and_gate(isolated_db, monkeypatch):

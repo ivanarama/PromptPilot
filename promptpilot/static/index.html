@@ -385,6 +385,20 @@
   .prov-form { border-top: 1px solid var(--border); margin-top: 14px; padding-top: 14px; display: flex; flex-direction: column; gap: 8px; }
   .prov-form input, .prov-form textarea { background: var(--surface2); border: 1px solid var(--border); border-radius: 6px; color: inherit; padding: 7px 10px; font-size: 13px; }
   .prov-form label { font-size: 13px; color: var(--text2); }
+  #schedModal .modal { max-width: 980px; }
+  .insights-tools { display:flex; gap:7px; align-items:center; margin-bottom:10px; flex-wrap:wrap; }
+  .insights-tools select { background:var(--surface2); border:1px solid var(--border); border-radius:6px; color:inherit; padding:6px 9px; }
+  .insights-table { width:100%; margin-top:9px; font-size:12px; border-collapse:collapse; table-layout:fixed; }
+  .insights-table th, .insights-table td { padding:4px 7px; text-align:left; vertical-align:top; overflow-wrap:anywhere; }
+  .insights-table th.num, .insights-table td.num { text-align:right; font-variant-numeric:tabular-nums; }
+  .insights-table tr.bottleneck { color:var(--yellow); }
+  .insights-recommendation { color:var(--text2); }
+  @media (max-width: 720px) {
+    .insights-table { table-layout:auto; display:block; overflow-x:auto; white-space:nowrap; }
+    .insights-table th, .insights-table td { min-width:75px; }
+    .insights-table th:first-child, .insights-table td:first-child { min-width:130px; }
+    .insights-table th:last-child, .insights-table td:last-child { min-width:250px; white-space:normal; }
+  }
 
   /* Workflow orchestrator */
   .wf-grid { display: grid; grid-template-columns: minmax(220px, 34%) 1fr; gap: 12px; }
@@ -768,7 +782,7 @@
       Настройки применяются ко всей серии, включая будущие запуски. «Ускорить временно»
       автоматически вернёт основной интервал по сроку или после заданного числа итогов «ПУСТО».
     </div>
-    <div style="margin-bottom:10px"><button class="btn btn-sm btn-ghost" onclick="loadPipelineInsights('onebase',true)">📈 Обновить анализ очереди OneBase</button></div>
+    <div class="insights-tools" id="pipelineProfileTools"><span style="color:var(--muted);font-size:12px">Загрузка профилей…</span></div>
     <div id="pipelineInsights"></div>
     <div id="schedList"></div>
   </div>
@@ -2369,6 +2383,7 @@ async function wfSendKey(key) {
 async function openSchedule() {
   document.getElementById('schedModal').classList.add('open');
   const box = document.getElementById('schedList');
+  loadPipelineProfiles();
   box.innerHTML = 'Загрузка…';
   let series;
   try { series = await fetchJSON(`${API}/schedule`); }
@@ -2435,13 +2450,27 @@ async function openSchedule() {
   box.innerHTML = activeHtml + brokenHtml;
 }
 
+async function loadPipelineProfiles() {
+  const box = document.getElementById('pipelineProfileTools');
+  try {
+    const profiles = await fetchJSON(`${API}/pipeline-insights/profiles`);
+    if (!profiles.length) { box.innerHTML = ''; return; }
+    box.innerHTML = `<select id="pipelineProfileSelect">${profiles.map(p=>`<option value="${escAttr(p.id)}">${esc(p.title)}</option>`).join('')}</select><button class="btn btn-sm btn-ghost" onclick="loadSelectedPipelineInsights(true)">📈 Обновить анализ очереди</button>`;
+  } catch(e) { box.innerHTML = `<span style="color:var(--red);font-size:12px">Профили анализа недоступны: ${esc(e.message)}</span>`; }
+}
+
+function loadSelectedPipelineInsights(refresh=false) {
+  const select = document.getElementById('pipelineProfileSelect');
+  if (select) loadPipelineInsights(select.value, refresh);
+}
+
 async function loadPipelineInsights(profile='onebase', refresh=false) {
   const box = document.getElementById('pipelineInsights');
   box.innerHTML = '<div class="prov-cmd">Считаю очереди GitHub…</div>';
   try {
     const data = await fetchJSON(`${API}/pipeline-insights/${encodeURIComponent(profile)}${refresh?'?refresh=true':''}`);
-    const rows = data.queues.map(q => `<tr${data.bottleneck===q.id?' style="color:var(--yellow)"':''}><td>${data.bottleneck===q.id?'⚠ ':''}${esc(q.title)}</td><td>${q.backlog}</td><td>${q.capacity}</td><td>${q.runs_needed}</td><td>${esc(q.interval || 'нет серии')}</td></tr>`).join('');
-    box.innerHTML = `<div style="border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:12px"><b>📈 ${esc(data.title)}</b><div class="prov-cmd">Узкое место выделено по числу необходимых прогонов (backlog / ёмкость одного запуска).</div><table style="width:100%;margin-top:7px;font-size:12px"><thead><tr><th align="left">Этап</th><th>Очередь</th><th>За прогон</th><th>Нужно прогонов</th><th>Интервал</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+    const rows = data.queues.map(q => `<tr class="${data.bottleneck===q.id?'bottleneck':''}"><td>${data.bottleneck===q.id?'⚠ ':''}${esc(q.title)}</td><td class="num">${q.backlog}</td><td class="num">${q.capacity}</td><td class="num">${q.runs_needed}</td><td>${esc(q.interval || 'нет серии')}</td><td class="insights-recommendation">${esc(q.recommendation || '—')}</td></tr>`).join('');
+    box.innerHTML = `<div style="border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:12px"><b>📈 ${esc(data.title)}</b><div class="prov-cmd">Оценка без учёта нового входящего потока. Цель: разобрать текущую очередь примерно за ${data.target_clear_hours} ч. Human-gate этапы автоматически не ускоряются.</div><table class="insights-table"><colgroup><col style="width:19%"><col style="width:9%"><col style="width:10%"><col style="width:11%"><col style="width:10%"><col style="width:41%"></colgroup><thead><tr><th>Этап</th><th class="num">Очередь</th><th class="num">За прогон</th><th class="num">Прогонов</th><th>Сейчас</th><th>Рекомендация</th></tr></thead><tbody>${rows}</tbody></table></div>`;
   } catch(e) { box.innerHTML = `<div style="color:var(--red);margin-bottom:10px">Анализ очереди недоступен: ${esc(e.message)}</div>`; }
 }
 

@@ -1,6 +1,7 @@
 """Config-driven backlog/capacity diagnostics for external work queues."""
 
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -14,11 +15,13 @@ DEFAULT_PROFILES = {
     "onebase": {
         "title": "OneBase: GitHub-конвейер",
         "repository": "ivanarama/onebase",
+        "target_clear_hours": 8,
         "queues": [
             {
                 "id": "triage", "title": "Триаж заявок", "capacity": 5,
                 "query": "is:issue is:open -label:needs-decision -label:ready-fix -label:approved -label:in-work -label:hold -label:manual",
                 "series_contains": "TRIAGE",
+                "manual_gate": True,
             },
             {
                 "id": "fix", "title": "Исправления", "capacity": 1,
@@ -40,6 +43,8 @@ DEFAULT_PROFILES = {
 }
 
 _cache = {}
+_INTERVAL_PRESETS = ((0.25, "15m"), (0.5, "30m"), (1, "1h"), (2, "2h"),
+                     (4, "4h"), (8, "8h"), (12, "12h"), (24, "24h"))
 
 
 def _profiles() -> dict:
@@ -75,6 +80,46 @@ def _github_count(repository: str, query: str) -> int:
     return int(run.stdout.strip())
 
 
+def _interval_hours(value: str | None) -> float | None:
+    if not value:
+        return None
+    value = value.strip().lower()
+    try:
+        if value.endswith("m"):
+            return float(value[:-1]) / 60
+        if value.endswith("h"):
+            return float(value[:-1])
+    except ValueError:
+        return None
+    return None
+
+
+def _recommendation(item: dict, backlog: int, capacity: int,
+                    current_interval: str | None, target_hours: float) -> dict:
+    runs_needed = backlog / capacity if backlog else 0
+    current_hours = _interval_hours(current_interval)
+    eta = round(runs_needed * current_hours, 1) if current_hours is not None else None
+    if not backlog:
+        return {"recommended_interval": None, "eta_hours": 0,
+                "recommendation": "очередь пуста — можно оставить базовый интервал"}
+    if item.get("manual_gate"):
+        return {"recommended_interval": None, "eta_hours": eta,
+                "recommendation": "не ускорять автоматически: этап зависит от решения человека"}
+    required = target_hours / runs_needed
+    recommended_hours, recommended = min(
+        _INTERVAL_PRESETS, key=lambda pair: abs(math.log(pair[0]) - math.log(required)))
+    if current_hours is None:
+        message = f"настроить {recommended}: очередь примерно за {target_hours:g} ч"
+    elif current_hours > recommended_hours * 1.15:
+        message = f"ускорить до {recommended}: примерно {target_hours:g} ч вместо {eta:g} ч"
+    elif current_hours < recommended_hours / 1.5:
+        message = f"текущий {current_interval} быстрее необходимого; {recommended} достаточно"
+    else:
+        message = f"оставить {current_interval}: очередь примерно за {eta:g} ч"
+    return {"recommended_interval": recommended, "eta_hours": eta,
+            "recommendation": message}
+
+
 def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True) -> dict:
     profiles = _profiles()
     if profile_id not in profiles:
@@ -83,6 +128,7 @@ def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True) -> d
     if use_cache and cached and time.time() - cached[0] < 300:
         return cached[1]
     profile = profiles[profile_id]
+    target_hours = float(profile.get("target_clear_hours", 8))
     queues = []
     for item in profile["queues"]:
         backlog = _github_count(profile["repository"], item["query"])
@@ -90,6 +136,9 @@ def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True) -> d
         matching = next((s for s in series
                          if item.get("series_contains", "").lower() in s["title"].lower()), None)
         runs_needed = round(backlog / capacity, 1)
+        recommendation = _recommendation(item, backlog, capacity,
+                                         matching["effective_recurrence"] if matching else None,
+                                         target_hours)
         queues.append({
             "id": item["id"], "title": item["title"], "backlog": backlog,
             "capacity": capacity, "runs_needed": runs_needed,
@@ -97,11 +146,13 @@ def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True) -> d
             "interval": matching["effective_recurrence"] if matching else None,
             "failure_rate": matching["failure_rate"] if matching else None,
             "empty_rate": matching["empty_rate"] if matching else None,
+            **recommendation,
         })
     bottleneck = max(queues, key=lambda q: q["runs_needed"], default=None)
     result = {
         "profile_id": profile_id, "title": profile["title"],
         "repository": profile["repository"], "queues": queues,
+        "target_clear_hours": target_hours,
         "bottleneck": bottleneck["id"] if bottleneck and bottleneck["backlog"] else None,
         "generated_at": time.time(),
     }
