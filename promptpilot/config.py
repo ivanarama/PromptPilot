@@ -238,11 +238,13 @@ BUILTIN_PROVIDERS = {
         "cmd": f"{_q(CLAUDE_EXE)} -p --verbose --output-format stream-json {{prompt}}",
         "description": "Claude Code (Anthropic)",
         "supports_skills": True,
+        "supports_effort": True,
     },
     "claude-z": {
         "cmd": f"{_q(CLAUDE_EXE)} -p --verbose --output-format stream-json {{prompt}}",
         "description": "Claude Code (GLM)",
         "supports_skills": True,
+        "supports_effort": True,
         "env": {
             "ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic",
             "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-4.7",
@@ -254,9 +256,11 @@ BUILTIN_PROVIDERS = {
         # then truncated at its first newline by cmd.exe. Codex natively reads
         # the full prompt from stdin when its prompt argument is '-'.
         "cmd": "codex exec -",
+        "kind": "codex",
         "prompt_stdin": True,
         "description": "OpenAI Codex",
         "supports_skills": False,
+        "supports_effort": True,
     },
     "qwen": {
         "cmd": "qwen -p {prompt}",
@@ -350,6 +354,8 @@ def load_providers_detailed() -> dict:
                 if name in providers:
                     if "supports_skills" not in entry:
                         entry["supports_skills"] = providers[name].get("supports_skills", False)
+                    if "supports_effort" not in entry:
+                        entry["supports_effort"] = providers[name].get("supports_effort", False)
                     entry["_source"] = "builtin + providers.json"
                 else:
                     entry["_source"] = "providers.json"
@@ -403,6 +409,9 @@ def save_provider(name: str, cmd: str = None, description: str = "", env: dict =
             entry["keep_pane"] = True
         if kind in (None, "claude"):
             entry["supports_skills"] = True
+            entry["supports_effort"] = True
+        elif kind == "codex":
+            entry["supports_effort"] = True
     else:
         entry["cmd"] = cmd
         # Клон встроенного claude, собранный руками в форме, — это тот же Claude
@@ -411,6 +420,9 @@ def save_provider(name: str, cmd: str = None, description: str = "", env: dict =
         # ронял всё перечисленное на пол.
         if cmd_runs_claude(cmd):
             entry["supports_skills"] = True
+            entry["supports_effort"] = True
+        elif cmd_runs_codex(cmd):
+            entry["supports_effort"] = True
     if env:
         entry["env"] = env
     custom[name] = entry
@@ -590,6 +602,19 @@ def cmd_runs_claude(cmd: str) -> bool:
     return bool(parts) and os.path.basename(parts[0]).lower().startswith("claude")
 
 
+def cmd_runs_codex(cmd: str) -> bool:
+    """Шаблон команды запускает Codex CLI (с путём, .exe или .cmd)."""
+    parts = _split_cmd(cmd or "")
+    return bool(parts) and os.path.basename(parts[0]).lower().startswith("codex")
+
+
+def provider_is_codex(cfg: dict) -> bool:
+    """Провайдер запускает Codex CLI и принимает config overrides через ``-c``."""
+    if cfg.get("kind") == "codex":
+        return True
+    return cmd_runs_codex(cfg.get("cmd") or "")
+
+
 def resolve_effort(provider_cfg: dict, task_effort: str = None) -> str:
     """Эффорт запуска: задача → провайдер → дефолт CLI (пустая строка).
 
@@ -624,6 +649,7 @@ def build_cmd(provider: str, prompt: str, skip_permissions: bool = False, sessio
     # (codex spells the skip flag differently, qwen has none). --model is shared
     # by Claude and opencode, so it stays general.
     is_claude = provider_is_claude(cfg)
+    is_codex = provider_is_codex(cfg)
     extras = []
     if model:
         extras += ["--model", model]
@@ -633,6 +659,10 @@ def build_cmd(provider: str, prompt: str, skip_permissions: bool = False, sessio
     eff = resolve_effort(cfg, effort)
     if eff and is_claude and "--effort" not in cmd:
         extras += ["--effort", eff]
+    if eff and is_codex and not any("model_reasoning_effort" in part for part in cmd):
+        # Codex CLI reads reasoning effort from config.toml. ``-c`` is the
+        # documented one-run override and keeps the user's global config intact.
+        extras += ["-c", f'model_reasoning_effort="{eff}"']
     if session_id and is_claude:
         extras += ["--resume", session_id]
     if skip_permissions and is_claude:

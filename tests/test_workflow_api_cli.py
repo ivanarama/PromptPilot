@@ -83,6 +83,13 @@ def test_openapi_contains_read_models_and_workflow_routes(isolated_db):
     assert "WorkflowEventInDB" in schema["components"]["schemas"]
 
 
+def test_codex_provider_exposes_effort_without_claude_skill_toggle(isolated_db):
+    codex = request("GET", "/api/providers").json()["codex"]
+
+    assert codex["supports_effort"] is True
+    assert codex["supports_skills"] is False
+
+
 def test_workflow_setup_preflight_accepts_repo_provider_and_gate(isolated_db, monkeypatch):
     monkeypatch.setattr("promptpilot.api.load_providers", lambda: {"test-provider": {"cmd": "test"}})
     monkeypatch.setattr("promptpilot.api.provider_available", lambda info: True)

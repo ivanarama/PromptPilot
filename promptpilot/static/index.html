@@ -799,7 +799,7 @@
         <label><input type="checkbox" id="pfKeep"> Оставлять сессию открытой после задачи (keep pane)</label>
       </div>
       <input id="pfModels" placeholder="модели для выбора (через запятую), например: opencode/big-pickle, opencode/mimo-v2.5-free">
-      <label style="display:flex; align-items:center; gap:8px">Эффорт (Claude Code)
+      <label style="display:flex; align-items:center; gap:8px">Эффорт рассуждений
         <select id="pfEffort">
           <option value="">по умолчанию CLI</option>
           <option value="low">low</option>
@@ -2749,9 +2749,8 @@ function updateModelSelect() {
   }
 }
 
-// Эффорт показываем только у Claude-провайдеров: у остальных агентов флага
-// --effort нет. В «по умолчанию» подписан уровень провайдера, чтобы было видно,
-// что унаследует задача, если ничего не выбирать.
+// Эффорт показываем только у провайдеров, для которых PromptPilot умеет
+// передать настройку CLI. В «по умолчанию» подписан уровень провайдера.
 const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'];
 
 function updateEffortSelect() {
@@ -2759,7 +2758,7 @@ function updateEffortSelect() {
   const prov = providersData[sel ? sel.value : ''] || {};
   const label = document.getElementById('effortLabel');
   const effSel = document.getElementById('effortInput');
-  if (!prov.supports_skills) {
+  if (!prov.supports_effort) {
     label.style.display = 'none';
     effSel.value = '';
     return;

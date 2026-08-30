@@ -761,6 +761,7 @@ def api_providers():
         name: {
             "description": info.get("description", name),
             "supports_skills": info.get("supports_skills", False),
+            "supports_effort": info.get("supports_effort", False),
             # Dynamic discovery for Claude-type providers (cached); falls back to
             # the provider's own list or the sonnet/opus/haiku tiers.
             "models": get_provider_models(name),
@@ -909,6 +910,7 @@ def api_providers_manage():
             "args": info.get("args") or [],
             "effort": info.get("effort", ""),
             "supports_skills": info.get("supports_skills", False),
+            "supports_effort": info.get("supports_effort", False),
             "env": {k: mask_secret_value(k, v) for k, v in (info.get("env") or {}).items()},
             "available": provider_available(info),
             "hidden": bool(info.get("hidden")),

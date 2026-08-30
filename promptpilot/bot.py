@@ -42,7 +42,7 @@ from .config import (
     DEFAULT_CLI, HERDR_RENOTIFY_COOLDOWN, HERDR_WATCH, HERDR_WATCH_INTERVAL, LOG_PROMPTS,
     get_provider_models, get_proxy_url, get_skills, load_machines, load_providers,
     load_providers_detailed, mask_proxy_url, pickable_providers,
-    PROJECTS_ROOT, TASK_PASSWORD, EFFORT_LEVELS, provider_is_claude,
+    PROJECTS_ROOT, TASK_PASSWORD, EFFORT_LEVELS,
 )
 from .models import TaskCreate
 from .tg_auth import authorize_user, is_authorized, list_authorized, load_allowed_phones
@@ -1815,8 +1815,8 @@ _EXTRAS_TEXT = (
 )
 
 
-def _provider_claude(name: str) -> bool:
-    return provider_is_claude(load_providers().get(name, {}))
+def _provider_supports_effort(name: str) -> bool:
+    return bool(load_providers().get(name, {}).get("supports_effort"))
 
 
 def _effort_keyboard(provider: str) -> InlineKeyboardMarkup:
@@ -1838,9 +1838,8 @@ def _extras_keyboard(context) -> InlineKeyboardMarkup:
             callback_data="ex_perms")],
         [InlineKeyboardButton(f"Повтор: {ud.get('new_recurrence') or 'нет'}", callback_data="ex_rec")],
     ]
-    # Эффорт есть только у Claude Code: у остальных агентов такого флага нет, и
-    # кнопка-обманка хуже отсутствующей.
-    if _provider_claude(provider):
+    # Показываем настройку только там, где PromptPilot умеет передать её CLI.
+    if _provider_supports_effort(provider):
         rows.append([InlineKeyboardButton(
             f"Эффорт: {ud.get('new_effort') or 'по умолчанию'}", callback_data="ex_eff")])
     rows += [
@@ -1903,7 +1902,7 @@ async def cb_extras_effort(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     provider = context.user_data.get("new_provider") or DEFAULT_CLI
     await query.edit_message_text(
-        "Усилие рассуждений (--effort). Дороже — дольше и качественнее:",
+        "Усилие рассуждений. Дороже — дольше и качественнее:",
         reply_markup=_effort_keyboard(provider))
     return ASK_EFFORT
 
