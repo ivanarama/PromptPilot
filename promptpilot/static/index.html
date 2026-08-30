@@ -402,6 +402,48 @@
     border-radius: 6px; color: var(--text); padding: 7px 9px; font-size: 12px;
   }
   .wf-form textarea { min-height: 110px; resize: vertical; font-family: var(--mono); }
+  .wf-wizard { display:none; margin:12px 0 16px; padding:16px; border:1px solid var(--accent); border-radius:10px; background:var(--surface2); }
+  .wf-wizard.open { display:block; }
+  .wf-wizard-head { display:flex; justify-content:space-between; gap:12px; align-items:center; margin-bottom:14px; }
+  .wf-wizard-head h3 { margin:0; font-size:15px; }
+  .wf-wizard-profile { display:flex; gap:6px; align-items:center; }
+  .wf-wizard-profile select, .wf-wizard-profile input { background:var(--bg); border:1px solid var(--border); border-radius:6px; color:var(--text); padding:6px 8px; font-size:12px; }
+  .wf-wizard-steps { display:grid; grid-template-columns:repeat(4,1fr); gap:7px; margin-bottom:16px; }
+  .wf-wizard-step { border:1px solid var(--border); border-radius:8px; padding:8px 9px; color:var(--text2); background:var(--bg); font-size:11px; }
+  .wf-wizard-step b { display:block; color:inherit; font-size:12px; margin-bottom:2px; }
+  .wf-wizard-step.active { border-color:var(--accent); color:var(--text); background:#7781ff18; }
+  .wf-wizard-step.done { border-color:var(--green); color:var(--green); }
+  .wf-wizard-panel { display:none; }
+  .wf-wizard-panel.active { display:block; }
+  .wf-wizard-panel h4 { margin:0 0 5px; font-size:14px; }
+  .wf-wizard-help { color:var(--text2); font-size:11px; margin-bottom:12px; line-height:1.5; }
+  .wf-wizard-fields { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  .wf-wizard-fields .wide { grid-column:1/-1; }
+  .wf-wizard-fields label { display:flex; flex-direction:column; gap:5px; color:var(--text2); font-size:12px; }
+  .wf-wizard-fields label.check { flex-direction:row; align-items:center; }
+  .wf-wizard-fields input, .wf-wizard-fields select, .wf-wizard-fields textarea { width:100%; background:var(--bg); border:1px solid var(--border); border-radius:6px; color:var(--text); padding:8px 9px; font-size:12px; }
+  .wf-wizard-fields textarea { min-height:88px; resize:vertical; font-family:var(--mono); }
+  .wf-wizard-roles { display:grid; grid-template-columns:repeat(3,1fr); gap:9px; }
+  .wf-wizard-role { border:1px solid var(--border); border-radius:8px; background:var(--bg); padding:10px; }
+  .wf-wizard-role.reviewer { border-color:#ed6e8666; }
+  .wf-wizard-role.executor { border-color:#7781ff66; }
+  .wf-wizard-role h5 { margin:0 0 5px; font-size:13px; }
+  .wf-wizard-role p { min-height:30px; margin:0 0 8px; color:var(--text2); font-size:10px; }
+  .wf-wizard-role label { display:flex; flex-direction:column; gap:3px; margin-top:7px; color:var(--text2); font-size:11px; }
+  .wf-wizard-role label.check { flex-direction:row; align-items:center; }
+  .wf-wizard-role input, .wf-wizard-role select { width:100%; background:var(--surface2); border:1px solid var(--border); border-radius:6px; color:var(--text); padding:7px; }
+  .wf-wizard-role label.check input, .wf-wizard-fields label.check input { width:auto; }
+  .wf-wizard-danger { margin-top:8px; padding:8px 10px; border:1px solid #ed6e8666; border-radius:7px; color:#f59aad; font-size:11px; }
+  .wf-wizard-summary { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin:10px 0; }
+  .wf-wizard-summary > div { background:var(--bg); border:1px solid var(--border); border-radius:7px; padding:9px; font-size:11px; }
+  .wf-wizard-summary b { display:block; margin-bottom:3px; color:var(--text); }
+  .wf-preflight { display:flex; flex-direction:column; gap:5px; margin:10px 0; }
+  .wf-preflight-row { padding:7px 9px; border-radius:6px; background:var(--bg); font-size:11px; border-left:3px solid var(--border); }
+  .wf-preflight-row[data-status="ok"] { border-left-color:var(--green); }
+  .wf-preflight-row[data-status="warning"] { border-left-color:var(--yellow); }
+  .wf-preflight-row[data-status="error"] { border-left-color:var(--red); color:#f59aad; }
+  .wf-wizard-nav { display:flex; justify-content:space-between; align-items:center; gap:8px; margin-top:14px; padding-top:12px; border-top:1px solid var(--border); }
+  .wf-wizard-nav-right { display:flex; gap:7px; }
   .wf-settings-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:10px; }
   .wf-settings-card { background:var(--bg); border:1px solid var(--border); border-radius:8px; padding:10px; }
   .wf-settings-card h4 { margin:0 0 8px; font-size:13px; }
@@ -431,7 +473,7 @@
   .wf-round.current { border-left-color: var(--accent2); }
   .wf-round-summary { font-size: 12px; margin-top: 2px; }
   .wf-technical summary { cursor: pointer; color: var(--text2); font-size: 11px; margin-top: 12px; }
-  @media (max-width: 720px) { .wf-grid, .wf-settings-grid, .wf-stage-editor { grid-template-columns: 1fr; } .wf-stage-editor .wide { grid-column:auto; } }
+  @media (max-width: 720px) { .wf-grid, .wf-settings-grid, .wf-stage-editor, .wf-wizard-fields, .wf-wizard-roles, .wf-wizard-summary { grid-template-columns: 1fr; } .wf-stage-editor .wide, .wf-wizard-fields .wide { grid-column:auto; } .wf-wizard-steps { grid-template-columns:1fr 1fr; } .wf-wizard-head { align-items:flex-start; flex-direction:column; } }
 
   /* Update banner */
   .update-banner {
@@ -612,27 +654,105 @@
 </div>
 
 <div class="modal-overlay" id="workflowModal" onclick="if(event.target===this)closeWorkflows()">
-  <div class="modal" style="max-width:1040px">
+  <div class="modal" style="max-width:1160px">
     <h2>Workflow-оркестратор <button class="btn btn-sm btn-ghost" style="margin-left:auto" onclick="closeWorkflows()">Закрыть</button></h2>
+    <div class="wf-actions">
+      <button class="btn btn-sm btn-primary" onclick="toggleWorkflowCreate()">Новый workflow</button>
+      <button class="btn btn-sm btn-ghost" onclick="loadWorkflows()">Обновить</button>
+    </div>
+    <form id="wfCreateForm" class="wf-wizard" onsubmit="return createWorkflow(event)">
+      <div class="wf-wizard-head">
+        <div><h3>Новый автономный workflow</h3><div class="wf-meta">Сначала настройте безопасный контур, затем PromptPilot сформирует редактируемый план.</div></div>
+        <div class="wf-wizard-profile">
+          <select id="wfWizardPreset" onchange="wfWizardApplySelectedTemplate()" title="Профиль настройки"></select>
+          <button class="btn btn-sm btn-ghost" type="button" onclick="wfWizardSaveTemplate()">Сохранить шаблон</button>
+          <button class="btn btn-sm btn-danger" type="button" id="wfWizardDeleteTemplate" onclick="wfWizardDeleteTemplate()" style="display:none">Удалить</button>
+        </div>
+      </div>
+      <div class="wf-wizard-steps">
+        <div class="wf-wizard-step active" data-step="1"><b>1. Задача</b>Репозиторий и цель</div>
+        <div class="wf-wizard-step" data-step="2"><b>2. Команда</b>Planner, executor, reviewer</div>
+        <div class="wf-wizard-step" data-step="3"><b>3. Правила</b>Лимиты и проверки</div>
+        <div class="wf-wizard-step" data-step="4"><b>4. Проверка</b>Preflight и запуск</div>
+      </div>
+
+      <section class="wf-wizard-panel active" data-step="1">
+        <h4>Что нужно получить?</h4>
+        <div class="wf-wizard-help">Опишите проверяемый результат целиком. Планировщик позже нарежет его на короткие этапы.</div>
+        <div class="wf-wizard-fields">
+          <label>Короткое имя<input id="wfNewSlug" placeholder="например: aa-bp3-u4" required></label>
+          <label>Ветка кандидата<input id="wfNewBranch" placeholder="feature/aa-bp3-u4" required></label>
+          <label class="wide">Рабочий репозиторий<input id="wfNewRepo" placeholder="D:\Projects\exchange" required></label>
+          <label class="wide">Общая цель<textarea id="wfNewObjective" placeholder="Что должно работать и как это проверить" required></textarea></label>
+        </div>
+      </section>
+
+      <section class="wf-wizard-panel" data-step="2">
+        <h4>Кто планирует, делает и проверяет?</h4>
+        <div class="wf-wizard-help">Рекомендуемый вариант: сильный planner, дешёвый исполнитель и отдельный сильный аудитор.</div>
+        <div class="wf-wizard-roles">
+          <div class="wf-wizard-role">
+            <h5>Планировщик</h5><p>Один раз исследует задачу и предлагает этапы.</p>
+            <label>Provider<select id="wfNewPlannerProvider"></select></label>
+            <label>Модель<input id="wfNewPlannerModel" placeholder="по умолчанию"></label>
+            <label>Effort<select id="wfNewPlannerEffort"><option value="">по умолчанию</option><option>medium</option><option>high</option><option>xhigh</option><option>max</option></select></label>
+            <label>Timeout, сек<input id="wfNewPlannerTimeout" type="number" min="0" value="3600"></label>
+          </div>
+          <div class="wf-wizard-role executor">
+            <h5>Исполнитель</h5><p>Пишет код и исправляет замечания аудитора.</p>
+            <label>Provider<select id="wfNewExecutorProvider"></select></label>
+            <label>Модель<input id="wfNewExecutorModel" placeholder="например Gemini Flash"></label>
+            <label>Effort<select id="wfNewExecutorEffort"><option value="">по умолчанию</option><option>medium</option><option>high</option><option>xhigh</option><option>max</option></select></label>
+            <label>Timeout, сек<input id="wfNewExecutorTimeout" type="number" min="0" value="14400"></label>
+            <label class="check"><input id="wfNewExecutorWorktree" type="checkbox" checked> отдельный worktree</label>
+            <label class="check"><input id="wfNewExecutorSkip" type="checkbox" onchange="wfWizardSkipChanged()"> skip permissions</label>
+          </div>
+          <div class="wf-wizard-role reviewer">
+            <h5>Независимый аудитор</h5><p>Не исправляет код, а ищет ложные доказательства.</p>
+            <label>Provider<select id="wfNewReviewerProvider"></select></label>
+            <label>Модель<input id="wfNewReviewerModel" placeholder="по умолчанию"></label>
+            <label>Effort<select id="wfNewReviewerEffort"><option value="">по умолчанию</option><option>medium</option><option>high</option><option>xhigh</option><option>max</option></select></label>
+            <label>Timeout, сек<input id="wfNewReviewerTimeout" type="number" min="0" value="3600"></label>
+          </div>
+        </div>
+        <div class="wf-wizard-danger" id="wfWizardSkipWarning" style="display:none">⚠ Skip permissions разрешает исполнителю действия без подтверждений. Используйте только вместе с отдельным worktree и disposable-тестовой средой.</div>
+      </section>
+
+      <section class="wf-wizard-panel" data-step="3">
+        <h4>Когда автоматика продолжает работу?</h4>
+        <div class="wf-wizard-help">Gate выполняется обычным shell-кодом до дорогого LLM-аудита. Команды здесь не запускаются — preflight проверит только их синтаксис.</div>
+        <div class="wf-wizard-fields">
+          <label class="check"><input id="wfNewAuto" type="checkbox" checked> автономно передавать мяч между ролями</label>
+          <label class="check"><input id="wfNewPlanning" type="checkbox" checked> сначала сформировать план этапов</label>
+          <label class="check"><input id="wfNewPlanApproval" type="checkbox" checked> требовать утверждение плана человеком</label>
+          <label class="check"><input id="wfNewGateEnabled" type="checkbox" checked> выполнять deterministic gate</label>
+          <label>Максимум новых раундов<input id="wfNewRounds" type="number" min="1" max="100" value="10"></label>
+          <label>Максимум этапов<input id="wfNewMaxStages" type="number" min="1" max="50" value="15"></label>
+          <label>Возвратов на один этап<input id="wfNewStageRevisions" type="number" min="1" max="20" value="3"></label>
+          <label>Timeout одной gate-команды, сек<input id="wfNewGateTimeout" type="number" min="1" value="1800"></label>
+          <label class="wide">Gate-команды — по одной на строке<textarea id="wfNewGateCommands" placeholder="git diff --check&#10;python -m pytest tests/... -q"></textarea></label>
+        </div>
+      </section>
+
+      <section class="wf-wizard-panel" data-step="4">
+        <h4>Проверка перед созданием</h4>
+        <div class="wf-wizard-help">PromptPilot проверяет Git-репозиторий, имя ветки, доступность агентов и синтаксис gate-команд. Никакой код проекта на этом шаге не выполняется.</div>
+        <div class="wf-wizard-summary" id="wfWizardSummary"></div>
+        <div class="wf-preflight" id="wfWizardPreflight"><div class="wf-meta">Проверка ещё не запускалась.</div></div>
+        <button class="btn btn-sm btn-ghost" type="button" onclick="wfWizardRunPreflight()">Проверить ещё раз</button>
+      </section>
+
+      <div class="wf-wizard-nav">
+        <button class="btn btn-sm btn-ghost" type="button" onclick="toggleWorkflowCreate()">Отмена</button>
+        <div class="wf-wizard-nav-right">
+          <button class="btn btn-sm btn-ghost" type="button" id="wfWizardBack" onclick="wfWizardMove(-1)" style="display:none">← Назад</button>
+          <button class="btn btn-sm btn-primary" type="button" id="wfWizardNext" onclick="wfWizardMove(1)">Настроить команду →</button>
+          <button class="btn btn-sm btn-primary" type="submit" id="wfWizardCreate" style="display:none" disabled>Создать и сформировать план</button>
+        </div>
+      </div>
+    </form>
     <div class="wf-grid">
       <div>
-        <div class="wf-actions">
-          <button class="btn btn-sm btn-primary" onclick="toggleWorkflowCreate()">Новый workflow</button>
-          <button class="btn btn-sm btn-ghost" onclick="loadWorkflows()">Обновить</button>
-        </div>
-        <form id="wfCreateForm" class="wf-form" style="display:none" onsubmit="return createWorkflow(event)">
-          <input id="wfNewSlug" placeholder="slug: ut10-bp3" required>
-          <input id="wfNewBranch" placeholder="ветка" required>
-          <input class="wide" id="wfNewObjective" placeholder="цель" required>
-          <input class="wide" id="wfNewRepo" placeholder="D:\Projects\exchange" required>
-          <input id="wfNewRounds" type="number" min="1" value="6" title="максимум новых раундов">
-          <label style="display:flex;flex-direction:row;align-items:center;gap:6px"><input id="wfNewAuto" type="checkbox" style="width:auto"> автономный цикл</label>
-          <label style="display:flex;flex-direction:row;align-items:center;gap:6px"><input id="wfNewPlanning" type="checkbox" checked style="width:auto"> сначала составить план этапов</label>
-          <select id="wfNewPlannerProvider" title="провайдер планировщика"></select>
-          <select id="wfNewExecutorProvider" title="провайдер исполнителя"></select>
-          <select id="wfNewReviewerProvider" title="провайдер аудитора"></select>
-          <button class="btn btn-sm btn-primary" type="submit">Создать</button>
-        </form>
         <div id="wfList" class="wf-list"></div>
       </div>
       <div id="wfDetail" class="wf-panel"><span class="wf-meta">Выберите workflow слева.</span></div>
@@ -1264,46 +1384,327 @@ async function autoRefreshWorkflowState() {
   try { await loadWorkflows(); } finally { workflowAutoRefreshBusy = false; }
 }
 
-function toggleWorkflowCreate() {
-  const form = document.getElementById('wfCreateForm');
-  form.style.display = form.style.display === 'none' ? 'grid' : 'none';
-  if (form.style.display !== 'none') {
-    const preferredExecutor = providersData.agy ? 'agy' : '';
-    const preferredReviewer = providersData.codex ? 'codex' : preferredExecutor;
-    document.getElementById('wfNewPlannerProvider').innerHTML = workflowProviderOptions(preferredReviewer, false);
-    document.getElementById('wfNewExecutorProvider').innerHTML = workflowProviderOptions(preferredExecutor, false);
-    document.getElementById('wfNewReviewerProvider').innerHTML = workflowProviderOptions(preferredReviewer, false);
-  }
+const WF_WIZARD_TEMPLATE_KEY = 'promptpilot.workflow.templates.v1';
+const WF_WIZARD_PRESETS = {
+  recommended: {label:'Рекомендуемый', planner:'high', executor:'high', reviewer:'xhigh', rounds:10, stages:15, revisions:3},
+  economy: {label:'Экономный', planner:'high', executor:'high', reviewer:'high', rounds:8, stages:12, revisions:3},
+  quality: {label:'Максимальное качество', planner:'xhigh', executor:'high', reviewer:'max', rounds:12, stages:15, revisions:5},
+};
+let workflowWizardStep = 1;
+let workflowWizardReady = false;
+
+function wfWizardTemplates() {
+  try { return JSON.parse(localStorage.getItem(WF_WIZARD_TEMPLATE_KEY) || '{}') || {}; }
+  catch (_) { return {}; }
 }
 
-async function createWorkflow(event) {
-  event.preventDefault();
-  const body = {
+function wfWizardRefreshTemplates(selected = 'recommended') {
+  const picker = document.getElementById('wfWizardPreset');
+  const saved = wfWizardTemplates();
+  picker.innerHTML = Object.entries(WF_WIZARD_PRESETS)
+    .map(([key, item]) => `<option value="${key}">${esc(item.label)}</option>`).join('')
+    + (Object.keys(saved).length ? '<optgroup label="Мои шаблоны">'
+      + Object.keys(saved).sort().map(name => `<option value="saved:${escAttr(name)}">${esc(name)}</option>`).join('') + '</optgroup>' : '');
+  picker.value = [...picker.options].some(option => option.value === selected) ? selected : 'recommended';
+  document.getElementById('wfWizardDeleteTemplate').style.display = picker.value.startsWith('saved:') ? '' : 'none';
+}
+
+function wfWizardPreferred(name, fallback = '') {
+  if (providersData[name] && providersData[name].available !== false && !providersData[name].hidden) return name;
+  if (fallback && providersData[fallback] && providersData[fallback].available !== false) return fallback;
+  return Object.entries(providersData).find(([, info]) => !info.hidden && info.available !== false)?.[0] || '';
+}
+
+function wfWizardSetValue(id, value) {
+  const element = document.getElementById(id);
+  if (!element || value === undefined) return;
+  if (element.type === 'checkbox') element.checked = !!value;
+  else element.value = value ?? '';
+}
+
+function wfWizardApplyPreset(key) {
+  const preset = WF_WIZARD_PRESETS[key];
+  if (!preset) return;
+  const codex = wfWizardPreferred('codex');
+  const agy = wfWizardPreferred('agy', codex);
+  wfWizardSetValue('wfNewPlannerProvider', codex);
+  wfWizardSetValue('wfNewExecutorProvider', agy);
+  wfWizardSetValue('wfNewReviewerProvider', codex);
+  wfWizardSetValue('wfNewPlannerEffort', preset.planner);
+  wfWizardSetValue('wfNewExecutorEffort', preset.executor);
+  wfWizardSetValue('wfNewReviewerEffort', preset.reviewer);
+  wfWizardSetValue('wfNewRounds', preset.rounds);
+  wfWizardSetValue('wfNewMaxStages', preset.stages);
+  wfWizardSetValue('wfNewStageRevisions', preset.revisions);
+  wfWizardSetValue('wfNewAuto', true);
+  wfWizardSetValue('wfNewPlanning', true);
+  wfWizardSetValue('wfNewPlanApproval', true);
+  wfWizardSetValue('wfNewGateEnabled', true);
+  wfWizardSetValue('wfNewExecutorWorktree', true);
+  wfWizardSetValue('wfNewExecutorSkip', false);
+  wfWizardSkipChanged();
+}
+
+function wfWizardTemplateSnapshot() {
+  return {
+    repository_path: document.getElementById('wfNewRepo').value.trim(),
+    roles: {
+      planner: wfWizardRole('Planner'), executor: wfWizardRole('Executor'), reviewer: wfWizardRole('Reviewer'),
+    },
+    automation: document.getElementById('wfNewAuto').checked,
+    planning: document.getElementById('wfNewPlanning').checked,
+    require_approval: document.getElementById('wfNewPlanApproval').checked,
+    gate_enabled: document.getElementById('wfNewGateEnabled').checked,
+    max_rounds: parseInt(document.getElementById('wfNewRounds').value, 10) || 10,
+    max_stages: parseInt(document.getElementById('wfNewMaxStages').value, 10) || 15,
+    stage_revisions: parseInt(document.getElementById('wfNewStageRevisions').value, 10) || 3,
+    gate_timeout: parseInt(document.getElementById('wfNewGateTimeout').value, 10) || 1800,
+    gate_commands: document.getElementById('wfNewGateCommands').value,
+  };
+}
+
+function wfWizardApplyTemplateData(template) {
+  if (!template) return;
+  wfWizardSetValue('wfNewRepo', template.repository_path);
+  for (const [prefix, role] of [['Planner', template.roles?.planner], ['Executor', template.roles?.executor], ['Reviewer', template.roles?.reviewer]]) {
+    if (!role) continue;
+    wfWizardSetValue(`wfNew${prefix}Provider`, role.provider);
+    wfWizardSetValue(`wfNew${prefix}Model`, role.model);
+    wfWizardSetValue(`wfNew${prefix}Effort`, role.effort);
+    wfWizardSetValue(`wfNew${prefix}Timeout`, role.task_timeout);
+  }
+  wfWizardSetValue('wfNewExecutorWorktree', template.roles?.executor?.worktree);
+  wfWizardSetValue('wfNewExecutorSkip', template.roles?.executor?.skip_permissions);
+  wfWizardSetValue('wfNewAuto', template.automation);
+  wfWizardSetValue('wfNewPlanning', template.planning);
+  wfWizardSetValue('wfNewPlanApproval', template.require_approval);
+  wfWizardSetValue('wfNewGateEnabled', template.gate_enabled);
+  wfWizardSetValue('wfNewRounds', template.max_rounds);
+  wfWizardSetValue('wfNewMaxStages', template.max_stages);
+  wfWizardSetValue('wfNewStageRevisions', template.stage_revisions);
+  wfWizardSetValue('wfNewGateTimeout', template.gate_timeout);
+  wfWizardSetValue('wfNewGateCommands', template.gate_commands);
+  wfWizardSkipChanged();
+}
+
+function wfWizardApplySelectedTemplate() {
+  const value = document.getElementById('wfWizardPreset').value;
+  if (value.startsWith('saved:')) wfWizardApplyTemplateData(wfWizardTemplates()[value.slice(6)]);
+  else wfWizardApplyPreset(value);
+  document.getElementById('wfWizardDeleteTemplate').style.display = value.startsWith('saved:') ? '' : 'none';
+  workflowWizardReady = false;
+  if (workflowWizardStep === 4) { wfWizardRenderSummary(); wfWizardRunPreflight(); }
+}
+
+function wfWizardSaveTemplate() {
+  const name = prompt('Название шаблона настроек:');
+  if (!name?.trim()) return;
+  const templates = wfWizardTemplates();
+  templates[name.trim()] = wfWizardTemplateSnapshot();
+  localStorage.setItem(WF_WIZARD_TEMPLATE_KEY, JSON.stringify(templates));
+  wfWizardRefreshTemplates(`saved:${name.trim()}`);
+  toast('Шаблон сохранён в этом браузере', false);
+}
+
+function wfWizardDeleteTemplate() {
+  const value = document.getElementById('wfWizardPreset').value;
+  if (!value.startsWith('saved:')) return;
+  const name = value.slice(6);
+  if (!confirm(`Удалить шаблон «${name}»?`)) return;
+  const templates = wfWizardTemplates(); delete templates[name];
+  localStorage.setItem(WF_WIZARD_TEMPLATE_KEY, JSON.stringify(templates));
+  wfWizardRefreshTemplates(); wfWizardApplyPreset('recommended');
+}
+
+function wfWizardReset() {
+  const form = document.getElementById('wfCreateForm');
+  form.reset();
+  const codex = wfWizardPreferred('codex');
+  const agy = wfWizardPreferred('agy', codex);
+  document.getElementById('wfNewPlannerProvider').innerHTML = workflowProviderOptions(codex, false);
+  document.getElementById('wfNewExecutorProvider').innerHTML = workflowProviderOptions(agy, false);
+  document.getElementById('wfNewReviewerProvider').innerHTML = workflowProviderOptions(codex, false);
+  wfWizardRefreshTemplates();
+  wfWizardApplyPreset('recommended');
+  workflowWizardReady = false;
+  document.getElementById('wfWizardPreflight').innerHTML = '<div class="wf-meta">Проверка ещё не запускалась.</div>';
+  wfWizardShowStep(1);
+}
+
+function toggleWorkflowCreate() {
+  const form = document.getElementById('wfCreateForm');
+  const opening = !form.classList.contains('open');
+  form.classList.toggle('open', opening);
+  if (opening) { wfWizardReset(); form.scrollIntoView({behavior:'smooth', block:'start'}); }
+}
+
+function wfWizardShowStep(step) {
+  workflowWizardStep = Math.max(1, Math.min(4, step));
+  document.querySelectorAll('.wf-wizard-panel').forEach(panel => panel.classList.toggle('active', Number(panel.dataset.step) === workflowWizardStep));
+  document.querySelectorAll('.wf-wizard-step').forEach(marker => {
+    const value = Number(marker.dataset.step);
+    marker.classList.toggle('active', value === workflowWizardStep);
+    marker.classList.toggle('done', value < workflowWizardStep);
+  });
+  document.getElementById('wfWizardBack').style.display = workflowWizardStep > 1 ? '' : 'none';
+  document.getElementById('wfWizardNext').style.display = workflowWizardStep < 4 ? '' : 'none';
+  document.getElementById('wfWizardCreate').style.display = workflowWizardStep === 4 ? '' : 'none';
+  const labels = {1:'Настроить команду →', 2:'Настроить правила →', 3:'Проверить и запустить →'};
+  document.getElementById('wfWizardNext').textContent = labels[workflowWizardStep] || 'Далее →';
+  wfWizardUpdateFinalLabel();
+}
+
+function wfWizardProviderReady(id) {
+  const name = document.getElementById(id).value;
+  return !!name && !!providersData[name] && providersData[name].available !== false;
+}
+
+function wfWizardValidateStep(step) {
+  if (step === 1) {
+    const slug = document.getElementById('wfNewSlug').value.trim();
+    if (!/^[a-z0-9][a-z0-9._-]*$/.test(slug)) { toast('Короткое имя: только строчные латинские буквы, цифры, точка, _ и -'); return false; }
+    for (const id of ['wfNewBranch','wfNewRepo','wfNewObjective']) if (!document.getElementById(id).value.trim()) { toast('Заполните все поля задачи'); return false; }
+  }
+  if (step === 2) {
+    for (const [id, role] of [['wfNewPlannerProvider','планировщик'],['wfNewExecutorProvider','исполнитель'],['wfNewReviewerProvider','аудитор']]) {
+      if (!wfWizardProviderReady(id)) { toast(`Недоступен provider: ${role}`); return false; }
+    }
+    if (document.getElementById('wfNewExecutorSkip').checked && !document.getElementById('wfNewExecutorWorktree').checked) {
+      toast('Skip permissions разрешён только с отдельным worktree'); return false;
+    }
+  }
+  if (step === 3) {
+    const commands = wfWizardGateCommands();
+    if (commands.length > 20) { toast('Допускается не больше 20 gate-команд'); return false; }
+  }
+  return true;
+}
+
+function wfWizardMove(delta) {
+  if (delta > 0 && !wfWizardValidateStep(workflowWizardStep)) return;
+  wfWizardShowStep(workflowWizardStep + delta);
+  if (workflowWizardStep === 4) { wfWizardRenderSummary(); wfWizardRunPreflight(); }
+}
+
+function wfWizardSkipChanged() {
+  const enabled = document.getElementById('wfNewExecutorSkip').checked;
+  document.getElementById('wfWizardSkipWarning').style.display = enabled ? '' : 'none';
+  workflowWizardReady = false;
+}
+
+function wfWizardNumber(id, fallback) {
+  const value = parseInt(document.getElementById(id).value, 10);
+  return Number.isFinite(value) ? value : fallback;
+}
+
+function wfWizardRole(prefix) {
+  const timeout = wfWizardNumber(`wfNew${prefix}Timeout`, 0);
+  return {
+    provider: document.getElementById(`wfNew${prefix}Provider`).value || null,
+    model: document.getElementById(`wfNew${prefix}Model`).value.trim() || null,
+    effort: document.getElementById(`wfNew${prefix}Effort`).value || null,
+    task_timeout: timeout || null,
+    worktree: prefix === 'Executor' ? document.getElementById('wfNewExecutorWorktree').checked : false,
+    skip_permissions: prefix === 'Executor' ? document.getElementById('wfNewExecutorSkip').checked : false,
+  };
+}
+
+function wfWizardGateCommands() {
+  return document.getElementById('wfNewGateCommands').value.split(/\r?\n/).map(value => value.trim()).filter(Boolean);
+}
+
+function wfWizardBody() {
+  const planning = document.getElementById('wfNewPlanning').checked;
+  const automation = document.getElementById('wfNewAuto').checked;
+  return {
     slug: document.getElementById('wfNewSlug').value.trim(),
     objective: document.getElementById('wfNewObjective').value.trim(),
     repository_path: document.getElementById('wfNewRepo').value.trim(),
     candidate_branch: document.getElementById('wfNewBranch').value.trim(),
     config: {
       schema_version: 1,
-      limits: { max_rounds: parseInt(document.getElementById('wfNewRounds').value) || 6 },
-      automation: { enabled: document.getElementById('wfNewAuto').checked },
-      planning: { enabled: document.getElementById('wfNewPlanning').checked, require_approval: true },
-      roles: {
-        planner: { provider: document.getElementById('wfNewPlannerProvider').value || null },
-        executor: { provider: document.getElementById('wfNewExecutorProvider').value || null },
-        reviewer: { provider: document.getElementById('wfNewReviewerProvider').value || null },
-      },
+      limits: {max_rounds: wfWizardNumber('wfNewRounds', 10)},
+      automation: {enabled:automation, auto_dispatch_executor:true, auto_gate:true, auto_dispatch_reviewer:true, auto_apply_review:true, auto_resume_revision:true},
+      planning: {enabled:planning, require_approval:document.getElementById('wfNewPlanApproval').checked, max_stages:wfWizardNumber('wfNewMaxStages', 15), max_revisions_per_stage:wfWizardNumber('wfNewStageRevisions', 3)},
+      gate: {enabled:document.getElementById('wfNewGateEnabled').checked, commands:wfWizardGateCommands(), timeout_seconds:wfWizardNumber('wfNewGateTimeout', 1800)},
+      roles: {planner:wfWizardRole('Planner'), executor:wfWizardRole('Executor'), reviewer:wfWizardRole('Reviewer')},
     },
   };
+}
+
+function wfWizardRenderSummary() {
+  const body = wfWizardBody(); const roles = body.config.roles;
+  const role = value => `${esc(value.provider || '—')} · ${esc(value.model || 'default')} · ${esc(value.effort || 'default')}`;
+  document.getElementById('wfWizardSummary').innerHTML = `
+    <div><b>Задача</b>${esc(body.slug)} · ${esc(body.candidate_branch)}<br>${esc(body.repository_path)}</div>
+    <div><b>Режим</b>${body.config.planning.enabled ? 'Planner → утверждение → этапы' : 'Один этап'}<br>${body.config.automation.enabled ? 'Автономный ping-pong' : 'Ручные переходы'}</div>
+    <div><b>Команда</b>Planner: ${role(roles.planner)}<br>Executor: ${role(roles.executor)}<br>Reviewer: ${role(roles.reviewer)}</div>
+    <div><b>Ограничения</b>${body.config.limits.max_rounds} раундов · ${body.config.planning.max_revisions_per_stage} возврата/этап<br>${body.config.gate.commands.length} gate-команд · worktree: ${roles.executor.worktree ? 'да' : 'нет'}</div>`;
+  wfWizardUpdateFinalLabel();
+}
+
+function wfWizardUpdateFinalLabel() {
+  const button = document.getElementById('wfWizardCreate');
+  if (!button) return;
+  const planning = document.getElementById('wfNewPlanning')?.checked;
+  const automation = document.getElementById('wfNewAuto')?.checked;
+  button.textContent = planning ? 'Создать и сформировать план' : automation ? 'Создать и запустить' : 'Создать черновик';
+  button.disabled = !workflowWizardReady;
+}
+
+async function wfWizardRunPreflight() {
+  workflowWizardReady = false; wfWizardUpdateFinalLabel();
+  const target = document.getElementById('wfWizardPreflight');
+  target.innerHTML = '<div class="wf-meta">Проверяем окружение…</div>';
+  const body = wfWizardBody();
+  try {
+    const result = await fetchJSON(`${API}/workflows/validate-setup`, {
+      method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({
+        repository_path:body.repository_path, candidate_branch:body.candidate_branch,
+        providers:[body.config.roles.planner.provider, body.config.roles.executor.provider, body.config.roles.reviewer.provider].filter(Boolean),
+        gate_commands:body.config.gate.enabled ? body.config.gate.commands : [],
+      }),
+    });
+    target.innerHTML = result.checks.map(check => `<div class="wf-preflight-row" data-status="${escAttr(check.status)}">${check.status === 'ok' ? '✓' : check.status === 'warning' ? '!' : '×'} ${esc(check.message)}</div>`).join('');
+    workflowWizardReady = !!result.ready;
+  } catch (error) {
+    target.innerHTML = `<div class="wf-preflight-row" data-status="error">× Preflight: ${esc(error.message)}</div>`;
+  }
+  wfWizardUpdateFinalLabel(); return workflowWizardReady;
+}
+
+async function createWorkflow(event) {
+  event.preventDefault();
+  for (const step of [1,2,3]) if (!wfWizardValidateStep(step)) { wfWizardShowStep(step); return false; }
+  if (!await wfWizardRunPreflight()) { toast('Исправьте ошибки preflight'); return false; }
+  const body = wfWizardBody();
+  if (body.config.roles.executor.skip_permissions && !confirm('Исполнитель получит skip permissions в отдельном worktree. Продолжить?')) return false;
+  const button = document.getElementById('wfWizardCreate'); button.disabled = true;
   try {
     const created = await fetchJSON(`${API}/workflows`, {
-      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
+      method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body),
     });
     selectedWorkflowId = created.id;
-    document.getElementById('wfCreateForm').style.display = 'none';
+    document.getElementById('wfCreateForm').classList.remove('open');
     await loadWorkflows();
-    toast('Workflow создан', false);
-  } catch (e) { toast('Не удалось создать workflow: ' + e.message); }
+    try {
+      if (body.config.planning.enabled) {
+        await fetchJSON(`${API}/workflows/${created.id}/plan/dispatch`, {
+          method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({expected_version:created.state_version, provider:body.config.roles.planner.provider, prompt:'', keep_pane:true}),
+        });
+        toast('Workflow создан, планировщик запущен', false);
+      } else if (body.config.automation.enabled) {
+        await fetchJSON(`${API}/workflows/${created.id}/start`, {
+          method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({expected_version:created.state_version}),
+        });
+        toast('Workflow создан и запущен', false);
+      } else toast('Черновик workflow создан', false);
+    } catch (startError) {
+      toast('Workflow создан, но автоматический старт не выполнен: ' + startError.message);
+    }
+    await loadWorkflows();
+  } catch (error) { toast('Не удалось создать workflow: ' + error.message); }
+  finally { button.disabled = !workflowWizardReady; }
   return false;
 }
 

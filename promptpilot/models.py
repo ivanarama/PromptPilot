@@ -279,6 +279,26 @@ class WorkflowConfig(BaseModel):
     stage: dict[str, Any] = Field(default_factory=dict)
 
 
+class WorkflowSetupValidationRequest(BaseModel):
+    """Read-only preflight for the workflow creation wizard."""
+
+    repository_path: str = Field(min_length=1)
+    candidate_branch: str = Field(min_length=1)
+    providers: list[str] = Field(default_factory=list, max_length=3)
+    gate_commands: list[str] = Field(default_factory=list, max_length=20)
+
+
+class WorkflowSetupCheck(BaseModel):
+    code: str
+    status: str
+    message: str
+
+
+class WorkflowSetupValidationResponse(BaseModel):
+    ready: bool
+    checks: list[WorkflowSetupCheck]
+
+
 def normalize_workflow_config(value: Any = None) -> dict[str, Any]:
     """Validate raw/legacy JSON and return the canonical versioned shape."""
 

@@ -64,6 +64,12 @@
   сохраняет непрерывный журнал. Настройка описана в
   [`docs/WORKFLOW_AUTOMATION_GUIDE.md`](docs/WORKFLOW_AUTOMATION_GUIDE.md).
 
+В Web UI кнопка `Workflows` → `Новый workflow` открывает четырёхшаговый мастер:
+задача, команда агентов, правила автоматизации и preflight. Перед созданием он
+без выполнения проектного кода проверяет Git-путь, имя ветки, доступность
+providers и синтаксис gate-команд. Есть рекомендуемый, экономный и усиленный
+профили, а повторяющиеся настройки можно сохранить как локальный шаблон.
+
 Минимальный ручной пилот:
 
 ```bash
@@ -1190,6 +1196,7 @@ POST   /api/providers/{name}/hide|unhide — скрыть/показать в с
 GET    /api/skills                 — скилы (?provider=claude&workdir=/path)
 GET    /api/projects               — проекты из PP_PROJECTS_ROOT ({name, path, git})
 POST   /api/workflows              — создать draft workflow
+POST   /api/workflows/validate-setup — read-only preflight мастера создания
 GET    /api/workflows              — список workflow (?status=draft&limit=50)
 GET    /api/workflows/{id}         — детали workflow
 PATCH  /api/workflows/{id}         — обновить draft-метаданные с expected_version

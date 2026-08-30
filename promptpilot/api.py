@@ -2,6 +2,7 @@
 
 import base64
 import secrets
+import subprocess
 import sys
 import uuid
 from pathlib import Path
@@ -44,6 +45,9 @@ from .models import (
     WorkflowStageInDB,
     WorkflowStartRequest,
     WorkflowStatus,
+    WorkflowSetupCheck,
+    WorkflowSetupValidationRequest,
+    WorkflowSetupValidationResponse,
     WorkflowTaskDispatch,
     WorkflowUpdate,
     WorkflowVersionRequest,
@@ -217,6 +221,106 @@ def api_set_note(task_id: int, body: NoteBody):
 
 
 # --- Workflow orchestrator W0/W1 ------------------------------------------
+
+
+def _setup_check(code: str, status: str, message: str) -> WorkflowSetupCheck:
+    return WorkflowSetupCheck(code=code, status=status, message=message)
+
+
+def _validate_gate_syntax(command: str) -> tuple[bool, str]:
+    """Parse one gate command without executing it."""
+    try:
+        if os.name == "nt":
+            env = os.environ.copy()
+            env["PP_GATE_VALIDATE_COMMAND"] = command
+            script = (
+                "$tokens=$null; $errors=$null; "
+                "[System.Management.Automation.Language.Parser]::ParseInput("
+                "$env:PP_GATE_VALIDATE_COMMAND,[ref]$tokens,[ref]$errors) | Out-Null; "
+                "if($errors.Count){$errors | ForEach-Object {$_.Message}; exit 1}"
+            )
+            parsed = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+                capture_output=True, text=True, timeout=5, errors="replace", env=env,
+            )
+        else:
+            parsed = subprocess.run(
+                ["/bin/sh", "-n", "-c", command], capture_output=True,
+                text=True, timeout=5, errors="replace",
+            )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, f"не удалось запустить parser: {exc}"
+    detail = ((parsed.stdout or "") + (parsed.stderr or "")).strip()
+    return parsed.returncode == 0, detail
+
+
+@app.post(
+    "/api/workflows/validate-setup",
+    response_model=WorkflowSetupValidationResponse,
+)
+def api_validate_workflow_setup(request: WorkflowSetupValidationRequest):
+    """Validate repository, branch, providers and gate syntax without mutation."""
+    checks: list[WorkflowSetupCheck] = []
+    repo = Path(request.repository_path).expanduser()
+    if not repo.exists():
+        checks.append(_setup_check("repository", "error", "Каталог репозитория не найден"))
+    elif not repo.is_dir():
+        checks.append(_setup_check("repository", "error", "Путь не является каталогом"))
+    else:
+        try:
+            git = subprocess.run(
+                ["git", "-C", str(repo), "rev-parse", "--show-toplevel"],
+                capture_output=True, text=True, timeout=5, errors="replace",
+            )
+            if git.returncode:
+                checks.append(_setup_check(
+                    "repository", "error", "Каталог не является доступным Git-репозиторием",
+                ))
+            else:
+                checks.append(_setup_check(
+                    "repository", "ok", f"Git-репозиторий: {git.stdout.strip()}",
+                ))
+        except (OSError, subprocess.SubprocessError) as exc:
+            checks.append(_setup_check("repository", "error", f"Git недоступен: {exc}"))
+
+    try:
+        branch = subprocess.run(
+            ["git", "check-ref-format", "--branch", request.candidate_branch],
+            capture_output=True, text=True, timeout=5, errors="replace",
+        )
+        checks.append(_setup_check(
+            "branch", "ok" if branch.returncode == 0 else "error",
+            (f"Допустимое имя ветки: {request.candidate_branch}"
+             if branch.returncode == 0 else "Недопустимое имя Git-ветки"),
+        ))
+    except (OSError, subprocess.SubprocessError) as exc:
+        checks.append(_setup_check("branch", "error", f"Git недоступен: {exc}"))
+
+    configured = load_providers()
+    for name in dict.fromkeys(request.providers):
+        info = configured.get(name)
+        if not info:
+            checks.append(_setup_check("provider", "error", f"Провайдер «{name}» не настроен"))
+        elif not provider_available(info):
+            checks.append(_setup_check("provider", "error", f"Провайдер «{name}» недоступен"))
+        else:
+            checks.append(_setup_check("provider", "ok", f"Провайдер «{name}» доступен"))
+
+    if not request.gate_commands:
+        checks.append(_setup_check(
+            "gate", "warning", "Gate-команды не заданы: функциональная готовность не проверяется",
+        ))
+    for index, command in enumerate(request.gate_commands, start=1):
+        ok, detail = _validate_gate_syntax(command)
+        checks.append(_setup_check(
+            "gate", "ok" if ok else "error",
+            (f"Gate #{index}: синтаксис корректен"
+             if ok else f"Gate #{index}: {detail or 'ошибка синтаксиса'}"),
+        ))
+
+    return WorkflowSetupValidationResponse(
+        ready=not any(check.status == "error" for check in checks), checks=checks,
+    )
 
 
 @app.post("/api/workflows", response_model=WorkflowInDB, status_code=201)

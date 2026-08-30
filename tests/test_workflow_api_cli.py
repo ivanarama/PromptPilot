@@ -71,6 +71,7 @@ def test_openapi_contains_read_models_and_workflow_routes(isolated_db):
     paths = schema["paths"]
 
     assert "/api/workflows" in paths
+    assert "/api/workflows/validate-setup" in paths
     assert "/api/workflows/{workflow_id}/events" in paths
     assert "/api/workflows/{workflow_id}/rounds/{round_id}/runs" in paths
     assert "/api/workflows/{workflow_id}/advance" in paths
@@ -80,6 +81,40 @@ def test_openapi_contains_read_models_and_workflow_routes(isolated_db):
     assert "/api/workflows/{workflow_id}/plan/dispatch" in paths
     assert "/api/workflows/{workflow_id}/plan/approve" in paths
     assert "WorkflowEventInDB" in schema["components"]["schemas"]
+
+
+def test_workflow_setup_preflight_accepts_repo_provider_and_gate(isolated_db, monkeypatch):
+    monkeypatch.setattr("promptpilot.api.load_providers", lambda: {"test-provider": {"cmd": "test"}})
+    monkeypatch.setattr("promptpilot.api.provider_available", lambda info: True)
+    response = request(
+        "POST", "/api/workflows/validate-setup", json={
+            "repository_path": str(Path(__file__).parents[1]),
+            "candidate_branch": "feature/workflow-wizard",
+            "providers": ["test-provider"],
+            "gate_commands": ["python --version"],
+        },
+    )
+    assert response.status_code == 200
+    result = response.json()
+    assert result["ready"] is True
+    assert {item["code"] for item in result["checks"]} >= {
+        "repository", "branch", "provider", "gate",
+    }
+
+
+def test_workflow_setup_preflight_rejects_invalid_inputs(isolated_db, tmp_path):
+    response = request(
+        "POST", "/api/workflows/validate-setup", json={
+            "repository_path": str(tmp_path / "missing"),
+            "candidate_branch": "bad branch",
+            "providers": ["missing-provider"],
+            "gate_commands": ["if ("],
+        },
+    )
+    assert response.status_code == 200
+    result = response.json()
+    assert result["ready"] is False
+    assert sum(item["status"] == "error" for item in result["checks"]) >= 4
 
 
 def test_active_workflow_allows_config_but_not_metadata_edits(isolated_db):
@@ -137,6 +172,17 @@ def test_web_ui_exposes_workflow_and_live_agent_controls():
     assert "История завершённых раундов" in html
     assert "Технический журнал" in html
     assert "Настройки автономного workflow" in html
+    assert "Новый автономный workflow" in html
+    assert "1. Задача" in html
+    assert "2. Команда" in html
+    assert "3. Правила" in html
+    assert "4. Проверка" in html
+    assert "function wfWizardRunPreflight" in html
+    assert "function wfWizardApplyPreset" in html
+    assert "function wfWizardSaveTemplate" in html
+    assert "workflows/validate-setup" in html
+    assert "Создать и сформировать план" in html
+    assert "skip permissions" in html
     assert "function wfSaveSettings" in html
     assert "function wfPlannerDispatch" in html
     assert "function wfSavePlan" in html
