@@ -183,6 +183,10 @@ def test_web_ui_exposes_workflow_and_live_agent_controls():
     assert "workflows/validate-setup" in html
     assert "Создать и сформировать план" in html
     assert "skip permissions" in html
+    assert "function preferredTaskProvider" in html
+    assert "promptpilot.last-provider" in html
+    assert 'id="providerModeHint"' in html
+    assert "Живая сессия уже имеет свой каталог" in html
     assert "function wfSaveSettings" in html
     assert "function wfPlannerDispatch" in html
     assert "function wfSavePlan" in html

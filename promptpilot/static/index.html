@@ -611,7 +611,7 @@
       <label>Schedule
         <input type="datetime-local" id="scheduleInput">
       </label>
-      <label id="workdirLabel">Dir
+      <label id="workdirLabel" style="display:none">Dir
         <select id="workdirSelect" style="display:none" onchange="onProjectSelect()"></select>
         <input type="text" id="workdirInput" placeholder="C:\Projects\MyApp">
       </label>
@@ -621,7 +621,7 @@
       <label>Timeout
         <input type="number" id="timeoutInput" placeholder="0 = no limit" min="0" style="width:80px" title="Per-task timeout in seconds (0 = no limit, empty = default)">
       </label>
-      <label id="skipPermsLabel" style="flex-direction:row;align-items:center;gap:8px;cursor:pointer">
+      <label id="skipPermsLabel" style="flex-direction:row;align-items:center;gap:8px;cursor:pointer;display:none">
         <input type="checkbox" id="skipPermissions" style="width:auto;margin:0">
         <span style="font-size:13px;color:var(--yellow)">--dangerously-skip-permissions</span>
       </label>
@@ -629,10 +629,11 @@
         <input type="checkbox" id="keepPane" checked style="width:auto;margin:0">
         <span style="font-size:13px" title="Панель herdr останется открытой — можно вернуться и продолжить диалог">🖥 оставить сессию открытой</span>
       </label>
-      <label id="worktreeLabel" style="flex-direction:row;align-items:center;gap:8px;cursor:pointer">
+      <label id="worktreeLabel" style="flex-direction:row;align-items:center;gap:8px;cursor:pointer;display:none">
         <input type="checkbox" id="worktree" style="width:auto;margin:0">
         <span style="font-size:13px" title="Агент работает в отдельном git worktree на ветке pp/t<id> — твоё рабочее дерево не трогается, результат виден как diff">🌿 свой worktree</span>
       </label>
+      <span id="providerModeHint" class="skills-hint" style="display:none;max-width:360px">Живая сессия уже имеет свой каталог и режим доступа — Dir, permissions и worktree задаются в ней.</span>
       <button class="btn btn-primary" onclick="addTask()">Add Task</button>
     </div>
   </div>
@@ -2649,23 +2650,32 @@ function updateProvidersForMachine() {
   const machine = document.getElementById('machineInput').value;
   const allowed = machine ? (machinesData[machine]?.providers || []) : null;
   const sel = document.getElementById('providerInput');
-  sel.innerHTML = Object.entries(providersData)
+  const previous = sel.value;
+  const choices = Object.entries(providersData)
     // для машины наличие CLI определяет её собственная проба, а не эта машина
-    .filter(([name, info]) => !info.hidden && (allowed ? allowed.includes(name) : info.available !== false))
-    .map(([name, info]) => `<option value="${escAttr(name)}">${esc(name)} — ${esc(info.description || info)}</option>`)
-    .join('');
+    .filter(([name, info]) => !info.hidden && (allowed ? allowed.includes(name) : info.available !== false));
+  sel.innerHTML = choices.map(([name, info]) => `<option value="${escAttr(name)}">${esc(name)} — ${esc(info.description || info)}</option>`).join('');
+  sel.value = preferredTaskProvider(choices.map(([name]) => name), previous);
   updateSkillsToggle(); updateModelSelect(); updateEffortSelect(); updateKeepPane();
+}
+
+function preferredTaskProvider(names, current = '') {
+  const remembered = localStorage.getItem('promptpilot.last-provider') || '';
+  return [current, remembered, 'agy', 'codex', names[0] || ''].find(name => names.includes(name)) || '';
 }
 
 async function loadProviders() {
   providersData = await fetchJSON(`${API}/providers`);
   await loadMachines();
   const sel = document.getElementById('providerInput');
-  sel.innerHTML = Object.entries(providersData)
-    .filter(([name, info]) => info.available !== false && !info.hidden)
-    .map(([name, info]) => `<option value="${escAttr(name)}">${esc(name)} — ${esc(info.description || info)}</option>`)
-    .join('');
-  sel.addEventListener('change', () => { skillsCache = {}; updateSkillsToggle(); closeSkillsPanel(); updateModelSelect(); updateEffortSelect(); updateKeepPane(); });
+  const previous = sel.value;
+  const choices = Object.entries(providersData).filter(([name, info]) => info.available !== false && !info.hidden);
+  sel.innerHTML = choices.map(([name, info]) => `<option value="${escAttr(name)}">${esc(name)} — ${esc(info.description || info)}</option>`).join('');
+  sel.value = preferredTaskProvider(choices.map(([name]) => name), previous);
+  sel.onchange = () => {
+    localStorage.setItem('promptpilot.last-provider', sel.value);
+    skillsCache = {}; updateSkillsToggle(); closeSkillsPanel(); updateModelSelect(); updateEffortSelect(); updateKeepPane();
+  };
   updateSkillsToggle();
   updateModelSelect();
   updateEffortSelect();
@@ -2682,6 +2692,7 @@ function updateKeepPane() {
   // в target-режиме директория и permissions не применимы — прячем
   document.getElementById('workdirLabel').style.display = prov.session_target ? 'none' : 'flex';
   document.getElementById('skipPermsLabel').style.display = prov.session_target ? 'none' : 'flex';
+  document.getElementById('providerModeHint').style.display = prov.session_target ? '' : 'none';
   updateWorktree();
   if (prov.session_target) loadHerdrAgents();
 }
