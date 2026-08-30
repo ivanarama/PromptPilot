@@ -644,10 +644,8 @@ def build_cmd(provider: str, prompt: str, skip_permissions: bool = False, sessio
     marker = "\x00PROMPT\x00"
     parts = _split_cmd(template.replace("{prompt}", marker))
     cmd = [prompt if p == marker else p for p in parts]
-    # Claude Code owns --resume and --dangerously-skip-permissions; adding them
-    # to codex/qwen/opencode just makes the CLI abort on an unknown argument
-    # (codex spells the skip flag differently, qwen has none). --model is shared
-    # by Claude and opencode, so it stays general.
+    # Claude and Codex spell autonomous mode differently; qwen/opencode do not
+    # receive either flag. --model is shared by several CLIs and stays general.
     is_claude = provider_is_claude(cfg)
     is_codex = provider_is_codex(cfg)
     extras = []
@@ -667,6 +665,9 @@ def build_cmd(provider: str, prompt: str, skip_permissions: bool = False, sessio
         extras += ["--resume", session_id]
     if skip_permissions and is_claude:
         extras.append("--dangerously-skip-permissions")
+    if skip_permissions and is_codex and \
+            "--dangerously-bypass-approvals-and-sandbox" not in cmd:
+        extras.append("--dangerously-bypass-approvals-and-sandbox")
     if guard and guard_enabled(providers.get(provider, {}), skip_permissions):
         settings = guard_settings_file()
         if settings:

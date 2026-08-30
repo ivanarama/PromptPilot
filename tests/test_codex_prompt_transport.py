@@ -40,3 +40,11 @@ def test_codex_command_detection_accepts_windows_shims_and_paths():
     assert cmd_runs_codex("codex exec -")
     assert cmd_runs_codex(r'"C:\\Tools\\codex.CMD" exec -')
     assert not cmd_runs_codex("claude -p {prompt}")
+
+
+def test_codex_skip_permissions_uses_codex_autonomous_flag():
+    command = build_cmd("codex", "run maintenance", skip_permissions=True)
+
+    assert command == [
+        "codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "-",
+    ]
