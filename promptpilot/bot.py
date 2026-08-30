@@ -37,7 +37,7 @@ from telegram.ext import (
     filters,
 )
 
-from . import db
+from . import db, pipeline_insights
 from .config import (
     DEFAULT_CLI, HERDR_RENOTIFY_COOLDOWN, HERDR_WATCH, HERDR_WATCH_INTERVAL, LOG_PROMPTS,
     get_provider_models, get_proxy_url, get_skills, load_machines, load_providers,
@@ -100,7 +100,8 @@ def _main_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
             ["📋 Задачи", "🖥 Окна", "➕ Добавить задачу"],
-            ["📊 Статистика", "🔌 Провайдеры", "⚡ Скилы"],
+            ["📊 Статистика", "🗓 Расписание", "🔌 Провайдеры"],
+            ["📈 Очередь", "⚡ Скилы"],
             [pause_label],
         ],
         resize_keyboard=True,
@@ -768,6 +769,118 @@ async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"💰 Всего:     ${costs['total']:.4f}"
         )
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=_main_menu())
+
+
+def _series_keyboard(series: dict) -> InlineKeyboardMarkup:
+    sid = series["id"]
+    state = "▶ Возобновить" if series["paused"] else "⏸ Пауза"
+    state_action = "resume" if series["paused"] else "pause"
+    rows = [
+        [InlineKeyboardButton("30м", callback_data=f"seri:{sid}:30m"),
+         InlineKeyboardButton("1ч", callback_data=f"seri:{sid}:1h"),
+         InlineKeyboardButton("2ч", callback_data=f"seri:{sid}:2h"),
+         InlineKeyboardButton("4ч", callback_data=f"seri:{sid}:4h")],
+        [InlineKeyboardButton("⚡ временно 30м", callback_data=f"serb:{sid}:30m"),
+         InlineKeyboardButton("⚡ временно 1ч", callback_data=f"serb:{sid}:1h")],
+        [InlineKeyboardButton("▶ Сейчас", callback_data=f"sera:{sid}:run_now"),
+         InlineKeyboardButton(state, callback_data=f"sera:{sid}:{state_action}")],
+        [InlineKeyboardButton("← К расписанию", callback_data="series:list")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def _series_text(s: dict) -> str:
+    boost = ""
+    if s["temporary_recurrence"]:
+        boost = (f"\n⚡ Временно: {s['effective_recurrence']}; "
+                 f"ПУСТО {s['temporary_empty_count']}/{s['temporary_empty_limit'] or '∞'}")
+    state = "завершена" if s["ended"] else "пауза" if s["paused"] else "активна"
+    return (f"{s['title']}\n\nСостояние: {state}\nОсновной интервал: {s['recurrence']}"
+            f"{boost}\nЭффорт: {s['effort'] or 'по умолчанию'}\n"
+            f"Следующий запуск: {_local_str(s['next_run_at'])}\n"
+            f"Прогонов: {s['runs']}; ошибок {round(s['failure_rate']*100)}%; "
+            f"ПУСТО {round(s['empty_rate']*100)}%")
+
+
+async def show_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_user.id):
+        await _deny(update)
+        return
+    active = [s for s in db.list_series() if not s["ended"]]
+    buttons = [[InlineKeyboardButton(
+        ("⏸ " if s["paused"] else "⚠ " if s["broken"] else "▶ ") + s["title"][:45],
+        callback_data=f"series:{s['id']}")]
+        for s in active]
+    text = "🗓 Расписание\n\nВыберите серию для интервала, ускорения и запуска."
+    markup = InlineKeyboardMarkup(buttons) if buttons else _main_menu()
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text(text, reply_markup=markup)
+    else:
+        await update.message.reply_text(text, reply_markup=markup)
+
+
+async def cb_series_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    sid = int(query.data.split(":")[1])
+    series = db.get_series(sid)
+    if not series:
+        await query.edit_message_text("Серия не найдена.")
+        return
+    await query.edit_message_text(_series_text(series), reply_markup=_series_keyboard(series))
+
+
+async def cb_series_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    _, sid, interval = query.data.split(":")
+    ok = db.update_series(int(sid), {"base_recurrence": interval})
+    await query.answer("Интервал сохранён" if ok else "Не удалось", show_alert=not ok)
+    if ok:
+        series = db.get_series(int(sid))
+        await query.edit_message_text(_series_text(series), reply_markup=_series_keyboard(series))
+
+
+async def cb_series_boost(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    _, sid, interval = query.data.split(":")
+    ok = db.update_series(int(sid), {"temporary_recurrence": interval,
+                                     "temporary_empty_limit": 2})
+    await query.answer("Ускорено до двух ПУСТО" if ok else "Не удалось", show_alert=not ok)
+    if ok:
+        series = db.get_series(int(sid))
+        await query.edit_message_text(_series_text(series), reply_markup=_series_keyboard(series))
+
+
+async def cb_series_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    _, sid, action = query.data.split(":")
+    ok = db.series_action(int(sid), action)
+    await query.answer("Готово" if ok else "Действие неприменимо", show_alert=not ok)
+    if ok:
+        series = db.get_series(int(sid))
+        await query.edit_message_text(_series_text(series), reply_markup=_series_keyboard(series))
+
+
+async def show_pipeline_insights(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_user.id):
+        await _deny(update)
+        return
+    import asyncio
+    status = await update.message.reply_text("📈 Считаю очереди GitHub…")
+    try:
+        data = await asyncio.to_thread(
+            pipeline_insights.analyze, "onebase", db.list_series(), use_cache=False)
+        lines = [f"📈 {data['title']}", ""]
+        for queue in data["queues"]:
+            marker = "⚠" if queue["id"] == data["bottleneck"] else "•"
+            lines.append(f"{marker} {queue['title']}: {queue['backlog']} в очереди / "
+                         f"{queue['capacity']} за прогон = {queue['runs_needed']} прогонов; "
+                         f"интервал {queue['interval'] or 'не настроен'}")
+        lines.extend(["", "⚠ — текущее узкое место по backlog / ёмкость запуска."])
+        await status.edit_text("\n".join(lines))
+    except Exception as exc:
+        await status.edit_text(f"Не удалось посчитать очередь: {exc}")
 
 
 async def toggle_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3205,6 +3318,8 @@ def run_bot():
                 BotCommand("windows", "Окна herdr"),
                 BotCommand("add", "Новая задача"),
                 BotCommand("stats", "Статистика"),
+                BotCommand("schedule", "Расписание и ускорение серий"),
+                BotCommand("pipeline", "Узкие места внешней очереди"),
                 BotCommand("providers", "Провайдеры"),
                 BotCommand("pause", "Пауза / продолжить воркер"),
                 BotCommand("skills", "Скилы Claude Code"),
@@ -3421,6 +3536,8 @@ def run_bot():
     app.add_handler(CommandHandler("tasks", show_tasks))
     app.add_handler(CommandHandler("windows", show_windows))
     app.add_handler(CommandHandler("stats", show_stats))
+    app.add_handler(CommandHandler("schedule", show_schedule))
+    app.add_handler(CommandHandler("pipeline", show_pipeline_insights))
     app.add_handler(CommandHandler("providers", show_providers))
     app.add_handler(CommandHandler("pause", toggle_pause))
     app.add_handler(MessageHandler(filters.CONTACT, handle_contact))
@@ -3430,6 +3547,8 @@ def run_bot():
     app.add_handler(MessageHandler(filters.Regex("^📋 Задачи$"), show_tasks))
     app.add_handler(MessageHandler(filters.Regex("^🖥 Окна$"), show_windows))
     app.add_handler(MessageHandler(filters.Regex("^📊 Статистика$"), show_stats))
+    app.add_handler(MessageHandler(filters.Regex("^🗓 Расписание$"), show_schedule))
+    app.add_handler(MessageHandler(filters.Regex("^📈 Очередь$"), show_pipeline_insights))
     app.add_handler(MessageHandler(filters.Regex("^🔌 Провайдеры$"), show_providers))
     app.add_handler(MessageHandler(filters.Regex("^⚡ Скилы$"), cmd_skills))
     app.add_handler(MessageHandler(filters.Regex(r"^(⏸ Пауза|▶ Продолжить)$"), toggle_pause))
@@ -3445,6 +3564,11 @@ def run_bot():
     app.add_handler(CallbackQueryHandler(cb_full_result, pattern=r"^full_result:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_provider_detail, pattern=r"^prov_detail:"))
     app.add_handler(CallbackQueryHandler(cb_provider_list, pattern=r"^prov_list$"))
+    app.add_handler(CallbackQueryHandler(show_schedule, pattern=r"^series:list$"))
+    app.add_handler(CallbackQueryHandler(cb_series_detail, pattern=r"^series:\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_series_interval, pattern=r"^seri:\d+:[^:]+$"))
+    app.add_handler(CallbackQueryHandler(cb_series_boost, pattern=r"^serb:\d+:[^:]+$"))
+    app.add_handler(CallbackQueryHandler(cb_series_action, pattern=r"^sera:\d+:[a-z_]+$"))
 
     # --- last in group 0: catch-alls, reached only when nothing above claimed
     # the update. Free text used to get dead silence (especially bad after the

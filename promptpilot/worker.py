@@ -396,7 +396,11 @@ def _maybe_recur(task, failed: bool = False):
     """Enqueue the next occurrence of a recurring task."""
     if not task.recurrence:
         return
-    next_dt = db.parse_recurrence(task.recurrence)
+    series = db.prepare_series_recurrence(task.series_id, task.verdict) if task.series_id else None
+    recurrence = series["effective_recurrence"] if series else task.recurrence
+    if task.series_id and series is None:  # series was explicitly ended
+        return
+    next_dt = db.parse_recurrence(recurrence)
     if not next_dt:
         return
     from .models import TaskCreate
@@ -406,16 +410,17 @@ def _maybe_recur(task, failed: bool = False):
     db.create_task(TaskCreate(
         prompt=(stored.prompt if stored else task.prompt),
         working_dir=task.working_dir,
-        provider=task.provider,
-        priority=task.priority,
+        provider=series["provider"] if series else task.provider,
+        priority=series["priority"] if series else task.priority,
         scheduled_at=next_dt,
         max_retries=task.max_retries,
         skip_permissions=task.skip_permissions,
-        model=task.model,
-        effort=task.effort,
-        recurrence=task.recurrence,
+        model=series["model"] if series else task.model,
+        effort=series["effort"] if series else task.effort,
+        recurrence=series["base_recurrence"] if series else task.recurrence,
+        series_id=task.series_id,
         tg_chat_id=task.tg_chat_id,
-        task_timeout=task.task_timeout,
+        task_timeout=series["task_timeout"] if series else task.task_timeout,
         detached=task.detached,
         # Where and how it ran is part of the schedule, not of one occurrence:
         # without these a recurring task silently drifts back to this machine,

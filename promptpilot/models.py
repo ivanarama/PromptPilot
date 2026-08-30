@@ -36,6 +36,7 @@ class TaskCreate(BaseModel):
     herdr_target: Optional[str] = None  # herdr: send the prompt into an EXISTING session (agent name or pane id)
     machine: Optional[str] = None  # run on a registered remote machine (machines.json) over ssh
     worktree: bool = False  # run in a fresh git worktree of working_dir (branch pp/t<id>)
+    series_id: Optional[int] = None  # durable recurring-series identity (internal/API)
 
 
 class TaskUpdate(BaseModel):
@@ -88,6 +89,7 @@ class TaskInDB(BaseModel):
     herdr_pane: Optional[str] = None  # pane of a herdr-executor run (📺 in the bot)
     note: Optional[str] = None  # the human's late word, injected into the next attempt
     verdict: Optional[str] = None  # ГОТОВО | УЖЕ СДЕЛАНО | НУЖЕН ЧЕЛОВЕК | НЕ СМОГ | ПУСТО (тихий: без TG-уведомления)
+    series_id: Optional[int] = None
 
 
 class Stats(BaseModel):

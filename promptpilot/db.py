@@ -70,6 +70,28 @@ CREATE TABLE IF NOT EXISTS tasks (
     worktree_branch TEXT,
     note TEXT,
     verdict TEXT
+    ,series_id INTEGER REFERENCES task_series(id)
+);
+
+CREATE TABLE IF NOT EXISTS task_series (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL,
+    prompt TEXT NOT NULL,
+    working_dir TEXT,
+    base_recurrence TEXT NOT NULL,
+    temporary_recurrence TEXT,
+    temporary_until TEXT,
+    temporary_empty_limit INTEGER,
+    temporary_empty_count INTEGER NOT NULL DEFAULT 0,
+    provider TEXT,
+    model TEXT,
+    effort TEXT,
+    priority INTEGER NOT NULL DEFAULT 5,
+    task_timeout INTEGER,
+    paused INTEGER NOT NULL DEFAULT 0,
+    ended_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS settings (
@@ -297,6 +319,17 @@ MIGRATIONS = [
     )""",
     "ALTER TABLE workflow_rounds ADD COLUMN stage_id TEXT REFERENCES workflow_stages(id) ON DELETE RESTRICT",
     "CREATE INDEX IF NOT EXISTS idx_workflow_stages_workflow ON workflow_stages(workflow_id, position)",
+    "ALTER TABLE tasks ADD COLUMN series_id INTEGER REFERENCES task_series(id)",
+    """CREATE TABLE IF NOT EXISTS task_series (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL,
+        prompt TEXT NOT NULL, working_dir TEXT, base_recurrence TEXT NOT NULL,
+        temporary_recurrence TEXT, temporary_until TEXT,
+        temporary_empty_limit INTEGER, temporary_empty_count INTEGER NOT NULL DEFAULT 0,
+        provider TEXT, model TEXT, effort TEXT, priority INTEGER NOT NULL DEFAULT 5,
+        task_timeout INTEGER, paused INTEGER NOT NULL DEFAULT 0, ended_at TEXT,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_tasks_series ON tasks(series_id, id)",
 ]
 
 WORKFLOW_SCHEMA_VERSION = "workflow_orchestrator_w0_v1"
@@ -377,16 +410,65 @@ def init_db():
                VALUES (?, ?)""",
             (WORKFLOW_STAGE_SCHEMA_VERSION, _now()),
         )
+        _backfill_task_series(conn)
+
+
+def _series_title(prompt: str) -> str:
+    return (prompt or "").splitlines()[0].strip()[:160] or "Повторяющаяся задача"
+
+
+def _create_series(conn: sqlite3.Connection, task: TaskCreate) -> int:
+    now = _now()
+    cur = conn.execute(
+        """INSERT INTO task_series
+           (title, prompt, working_dir, base_recurrence, provider, model, effort,
+            priority, task_timeout, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (_series_title(task.prompt), task.prompt, task.working_dir, task.recurrence,
+         task.provider, task.model, task.effort, task.priority, task.task_timeout,
+         now, now),
+    )
+    return cur.lastrowid
+
+
+def _backfill_task_series(conn: sqlite3.Connection):
+    """Give legacy recurrence chains a stable identity without changing runs."""
+    rows = conn.execute(
+        """SELECT * FROM tasks
+           WHERE recurrence IS NOT NULL AND recurrence != '' AND series_id IS NULL
+           ORDER BY id"""
+    ).fetchall()
+    groups = {}
+    for row in rows:
+        groups.setdefault((row["prompt"], row["working_dir"] or ""), []).append(row)
+    for chain in groups.values():
+        head = next((r for r in reversed(chain)
+                     if r["status"] in ("pending", "rate_limited", "running")), chain[-1])
+        now = _now()
+        cur = conn.execute(
+            """INSERT INTO task_series
+               (title, prompt, working_dir, base_recurrence, provider, model, effort,
+                priority, task_timeout, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (_series_title(head["prompt"]), head["prompt"], head["working_dir"],
+             head["recurrence"], head["provider"], head["model"], head["effort"],
+             head["priority"], head["task_timeout"], chain[0]["created_at"], now),
+        )
+        conn.executemany("UPDATE tasks SET series_id = ? WHERE id = ?",
+                         [(cur.lastrowid, r["id"]) for r in chain])
 
 
 def _insert_task(conn: sqlite3.Connection, task: TaskCreate) -> TaskInDB:
     """Insert a queue task inside the caller's transaction."""
+    series_id = task.series_id
+    if task.recurrence and series_id is None:
+        series_id = _create_series(conn, task)
     cur = conn.execute(
         """INSERT INTO tasks (prompt, working_dir, provider, status, priority,
            scheduled_at, created_at, max_retries, skip_permissions, model,
            session_id, parent_task_id, tg_chat_id, recurrence, task_timeout,
-           detached, keep_pane, herdr_target, machine, worktree, effort)
-           VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           detached, keep_pane, herdr_target, machine, worktree, effort, series_id)
+           VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             task.prompt,
             task.working_dir,
@@ -408,6 +490,7 @@ def _insert_task(conn: sqlite3.Connection, task: TaskCreate) -> TaskInDB:
             task.machine,
             int(task.worktree),
             task.effort,
+            series_id,
         ),
     )
     return get_task(cur.lastrowid, conn=conn)
@@ -497,6 +580,9 @@ def get_next_runnable(busy_keys=(), key_fn=None) -> Optional[TaskInDB]:
                WHERE status IN ('pending', 'rate_limited')
                  AND (scheduled_at IS NULL OR scheduled_at <= ?)
                  AND (next_run_at IS NULL OR next_run_at <= ?)
+                 AND (series_id IS NULL OR EXISTS (
+                       SELECT 1 FROM task_series s WHERE s.id = tasks.series_id
+                         AND s.paused = 0 AND s.ended_at IS NULL))
                ORDER BY priority ASC, created_at ASC{limit_clause}""",
             (now, now),
         ).fetchall()
@@ -646,57 +732,166 @@ def update_priority(task_id: int, priority: int) -> bool:
         return cur.rowcount > 0
 
 
-def list_series() -> list:
-    """Повторяющиеся задачи, собранные в серии — то, что человек называет «расписанием».
+def _effective_series_recurrence(row: dict, now: Optional[datetime] = None) -> str:
+    now = now or datetime.now(timezone.utc)
+    temporary = row.get("temporary_recurrence")
+    until = _parse_dt(row.get("temporary_until"))
+    if temporary and (until is None or until > now):
+        return temporary
+    return row["base_recurrence"]
 
-    Серии как объекта в базе нет: каждое вхождение — отдельная строка, которую
-    создаёт предыдущая. Поэтому серию восстанавливаем по тому, что от вхождения
-    к вхождению не меняется — промпт и рабочая директория. Отдаём ближайшее
-    запланированное вхождение и последнее завершённое: без второго не видно, что
-    серия давно падает или что её вовсе некому продолжить.
-    """
+
+def list_series() -> list:
+    """Durable recurring series with current occurrence and health counters."""
     with _connect() as conn:
-        rows = [dict(r) for r in conn.execute(
-            "SELECT * FROM tasks WHERE recurrence IS NOT NULL AND recurrence != ''"
-            " ORDER BY id DESC")]
-    series = {}
-    for r in rows:
-        key = (r["prompt"], r["working_dir"] or "")
-        s = series.setdefault(key, {"prompt": r["prompt"], "working_dir": r["working_dir"],
-                                    "runs": 0, "next": None, "last": None})
-        s["runs"] += 1
-        if r["status"] in ("pending", "rate_limited", "running") and s["next"] is None:
-            s["next"] = r
-        elif r["status"] in ("completed", "failed", "cancelled") and s["last"] is None:
-            s["last"] = r
-    out = []
-    for s in series.values():
-        head = s["next"] or s["last"]
-        last = s["last"]
-        out.append({
-            "prompt": s["prompt"],
-            "working_dir": s["working_dir"],
-            "runs": s["runs"],
-            "recurrence": head["recurrence"],
-            "provider": head["provider"],
-            "model": head["model"],
-            "effort": head["effort"],
-            "priority": head["priority"],
-            "machine": head["machine"],
-            "next_task_id": s["next"]["id"] if s["next"] else None,
-            "next_status": s["next"]["status"] if s["next"] else None,
-            "next_run_at": s["next"]["scheduled_at"] if s["next"] else None,
-            "last_task_id": last["id"] if last else None,
-            "last_status": last["status"] if last else None,
-            "last_at": (last["completed_at"] or last["started_at"]) if last else None,
-            "last_verdict": last["verdict"] if last else None,
-            # Серия без запланированного вхождения продолжаться не будет: либо
-            # её отменили руками, либо она оборвалась до того, как продление
-            # стало переживать падения.
-            "broken": s["next"] is None,
-        })
-    out.sort(key=lambda s: (not s["broken"], s["next_run_at"] or ""))
+        series_rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM task_series ORDER BY id DESC")]
+        out = []
+        for s in series_rows:
+            tasks = [dict(r) for r in conn.execute(
+                "SELECT * FROM tasks WHERE series_id = ? ORDER BY id DESC", (s["id"],))]
+            active = next((r for r in tasks
+                           if r["status"] in ("pending", "rate_limited", "running")), None)
+            last = next((r for r in tasks
+                         if r["status"] in ("completed", "failed", "cancelled")), None)
+            completed = [r for r in tasks if r["status"] in ("completed", "failed")]
+            failures = sum(r["status"] == "failed" for r in completed)
+            empties = sum((r["verdict"] or "").upper() == "ПУСТО" for r in completed)
+            durations = []
+            for r in completed:
+                if r["started_at"] and r["completed_at"]:
+                    durations.append((_parse_dt(r["completed_at"]) -
+                                      _parse_dt(r["started_at"])).total_seconds())
+            out.append({
+                "id": s["id"], "title": s["title"], "prompt": s["prompt"],
+                "working_dir": s["working_dir"], "runs": len(tasks),
+                "recurrence": s["base_recurrence"],
+                "effective_recurrence": _effective_series_recurrence(s),
+                "temporary_recurrence": s["temporary_recurrence"],
+                "temporary_until": s["temporary_until"],
+                "temporary_empty_limit": s["temporary_empty_limit"],
+                "temporary_empty_count": s["temporary_empty_count"],
+                "provider": s["provider"], "model": s["model"], "effort": s["effort"],
+                "priority": s["priority"], "task_timeout": s["task_timeout"],
+                "machine": active["machine"] if active else (last["machine"] if last else None),
+                "paused": bool(s["paused"]), "ended": bool(s["ended_at"]),
+                "next_task_id": active["id"] if active else None,
+                "next_status": active["status"] if active else None,
+                "next_run_at": active["scheduled_at"] if active else None,
+                "last_task_id": last["id"] if last else None,
+                "last_status": last["status"] if last else None,
+                "last_at": (last["completed_at"] or last["started_at"]) if last else None,
+                "last_verdict": last["verdict"] if last else None,
+                "failure_rate": round(failures / len(completed), 3) if completed else 0,
+                "empty_rate": round(empties / len(completed), 3) if completed else 0,
+                "avg_duration_seconds": round(sum(durations) / len(durations)) if durations else None,
+                "broken": not active and not s["ended_at"],
+            })
+    out.sort(key=lambda x: (x["ended"], x["broken"], x["paused"], x["next_run_at"] or ""))
     return out
+
+
+def get_series(series_id: int) -> Optional[dict]:
+    return next((s for s in list_series() if s["id"] == series_id), None)
+
+
+SERIES_EDITABLE_FIELDS = ("title", "base_recurrence", "temporary_recurrence",
+                          "temporary_until", "temporary_empty_limit", "provider",
+                          "model", "effort", "priority", "task_timeout")
+
+
+def update_series(series_id: int, fields: dict) -> bool:
+    fields = {k: v for k, v in fields.items() if k in SERIES_EDITABLE_FIELDS}
+    if not fields:
+        return False
+    if "temporary_until" in fields and isinstance(fields["temporary_until"], datetime):
+        fields["temporary_until"] = _to_utc_iso(fields["temporary_until"])
+    if fields.get("temporary_recurrence") is None:
+        fields.setdefault("temporary_until", None)
+        fields.setdefault("temporary_empty_limit", None)
+        fields["temporary_empty_count"] = 0
+    fields["updated_at"] = _now()
+    sets = ", ".join(f"{k} = ?" for k in fields)
+    with _connect() as conn:
+        cur = conn.execute(f"UPDATE task_series SET {sets} WHERE id = ? AND ended_at IS NULL",
+                           (*fields.values(), series_id))
+        if not cur.rowcount:
+            return False
+        task_fields = {"recurrence": fields.get("base_recurrence")}
+        for name in ("provider", "model", "effort", "priority", "task_timeout"):
+            if name in fields:
+                task_fields[name] = fields[name]
+        task_fields = {k: v for k, v in task_fields.items() if v is not None}
+        if task_fields:
+            task_sets = ", ".join(f"{k} = ?" for k in task_fields)
+            conn.execute(
+                f"UPDATE tasks SET {task_sets} WHERE series_id = ? "
+                "AND status IN ('pending', 'rate_limited')",
+                (*task_fields.values(), series_id),
+            )
+        return True
+
+
+def series_action(series_id: int, action: str) -> bool:
+    with _connect() as conn:
+        row = conn.execute("SELECT * FROM task_series WHERE id = ?", (series_id,)).fetchone()
+        if not row:
+            return False
+        now = _now()
+        if action == "pause":
+            conn.execute("UPDATE task_series SET paused = 1, updated_at = ? WHERE id = ?",
+                         (now, series_id))
+        elif action == "resume":
+            conn.execute("UPDATE task_series SET paused = 0, updated_at = ? WHERE id = ? AND ended_at IS NULL",
+                         (now, series_id))
+        elif action == "run_now":
+            cur = conn.execute(
+                """UPDATE tasks SET scheduled_at = ?, next_run_at = NULL
+                   WHERE series_id = ? AND status IN ('pending', 'rate_limited')""",
+                (now, series_id),
+            )
+            return cur.rowcount > 0
+        elif action == "end":
+            conn.execute("UPDATE task_series SET ended_at = ?, updated_at = ? WHERE id = ?",
+                         (now, now, series_id))
+            conn.execute("UPDATE tasks SET status = 'cancelled', completed_at = ? "
+                         "WHERE series_id = ? AND status IN ('pending', 'rate_limited')",
+                         (now, series_id))
+        else:
+            return False
+        return True
+
+
+def prepare_series_recurrence(series_id: int, verdict: Optional[str]) -> Optional[dict]:
+    """Update temporary-boost counters and return settings for the next run."""
+    with _connect() as conn:
+        row = conn.execute("SELECT * FROM task_series WHERE id = ?", (series_id,)).fetchone()
+        if not row or row["ended_at"]:
+            return None
+        s = dict(row)
+        now = datetime.now(timezone.utc)
+        until = _parse_dt(s["temporary_until"])
+        expired = bool(until and until <= now)
+        empty_count = s["temporary_empty_count"] or 0
+        if s["temporary_recurrence"]:
+            empty_count = empty_count + 1 if (verdict or "").upper() == "ПУСТО" else 0
+        reached = bool(s["temporary_empty_limit"] and
+                       empty_count >= s["temporary_empty_limit"])
+        if expired or reached:
+            conn.execute(
+                """UPDATE task_series SET temporary_recurrence = NULL,
+                   temporary_until = NULL, temporary_empty_limit = NULL,
+                   temporary_empty_count = 0, updated_at = ? WHERE id = ?""",
+                (_now(), series_id),
+            )
+            s.update(temporary_recurrence=None, temporary_until=None,
+                     temporary_empty_limit=None, temporary_empty_count=0)
+        else:
+            conn.execute("UPDATE task_series SET temporary_empty_count = ?, updated_at = ? WHERE id = ?",
+                         (empty_count, _now(), series_id))
+            s["temporary_empty_count"] = empty_count
+        s["effective_recurrence"] = _effective_series_recurrence(s, now)
+        return s
 
 
 EDITABLE_FIELDS = ("provider", "model", "effort", "priority", "recurrence",

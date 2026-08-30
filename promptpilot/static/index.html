@@ -765,9 +765,11 @@
   <div class="modal">
     <h2>Расписание <button class="btn btn-sm btn-ghost" style="margin-left:auto" onclick="closeSchedule()">✕ Закрыть</button></h2>
     <div style="font-size:12px; color:var(--muted); margin-bottom:10px">
-      Повторяющиеся задачи, собранные в серии. Серия без запланированного вхождения
-      («оборвана») сама не продолжится — её надо запустить заново.
+      Настройки применяются ко всей серии, включая будущие запуски. «Ускорить временно»
+      автоматически вернёт основной интервал по сроку или после заданного числа итогов «ПУСТО».
     </div>
+    <div style="margin-bottom:10px"><button class="btn btn-sm btn-ghost" onclick="loadPipelineInsights('onebase',true)">📈 Обновить анализ очереди OneBase</button></div>
+    <div id="pipelineInsights"></div>
     <div id="schedList"></div>
   </div>
 </div>
@@ -2383,27 +2385,98 @@ async function openSchedule() {
     const next = s.broken
       ? '<span style="color:var(--red)">серия оборвана — следующего запуска нет</span>'
       : `#${s.next_task_id} — ${STATUS_RU[s.next_status] || s.next_status}, ${when(s.next_run_at)}`;
-    const title = (s.prompt || '').split(/\r?\n/, 1)[0] || '(без названия)';
-    return `<div class="prov-row">
+    const title = s.title || (s.prompt || '').split(/\r?\n/, 1)[0] || '(без названия)';
+    const boost = s.temporary_recurrence
+      ? `<span class="prov-badge" style="color:var(--yellow)">временно ${esc(s.effective_recurrence)} · ПУСТО ${s.temporary_empty_count || 0}/${s.temporary_empty_limit || '∞'}${s.temporary_until ? ` · до ${when(s.temporary_until)}` : ''}</span>` : '';
+    const state = s.ended ? '<span class="prov-badge" style="color:var(--red)">завершена</span>'
+      : s.paused ? '<span class="prov-badge" style="color:var(--yellow)">пауза</span>'
+      : s.broken ? '<span class="prov-badge" style="color:var(--red)">оборвана</span>' : '';
+    return `<div class="prov-row" id="series-${s.id}">
       <span class="prov-name">${esc(title.slice(0, 90))}</span>
-      <span class="prov-badge">каждые ${esc(s.recurrence)}</span>
+      <span class="prov-badge">каждые ${esc(s.recurrence)}</span>${boost}
       <span class="prov-badge">прогонов: ${s.runs}</span>
-      ${s.broken ? '<span class="prov-badge" style="color:var(--red)">оборвана</span>' : ''}
+      ${state}
       <div class="prov-cmd">${esc(s.working_dir || 'без директории')}</div>
       <div class="prov-cmd">${esc(params)}</div>
+      <div class="prov-cmd">Здоровье: ошибок ${Math.round((s.failure_rate || 0)*100)}% · ПУСТО ${Math.round((s.empty_rate || 0)*100)}%${s.avg_duration_seconds ? ` · среднее ${Math.round(s.avg_duration_seconds/60)} мин` : ''}</div>
       <div class="prov-cmd">След.: ${next}</div>
       <div class="prov-cmd">Прошлый: ${last}</div>
+      ${!s.ended ? `<div class="prov-actions" style="margin-top:9px">
+        <button class="btn btn-sm btn-ghost" onclick="toggleSeriesEditor(${s.id})">⚙ Изменить</button>
+        <button class="btn btn-sm btn-ghost" onclick="seriesAction(${s.id},'run_now')" ${!s.next_task_id ? 'disabled' : ''}>▶ Сейчас</button>
+        <button class="btn btn-sm btn-ghost" onclick="seriesAction(${s.id},'${s.paused ? 'resume' : 'pause'}')">${s.paused ? '▶ Возобновить' : '⏸ Пауза'}</button>
+        <button class="btn btn-sm btn-danger" onclick="seriesAction(${s.id},'end',true)">Завершить серию</button>
+      </div>
+      <form id="series-edit-${s.id}" style="display:none;margin-top:10px;padding:10px;border:1px solid var(--border);border-radius:8px" onsubmit="return saveSeries(event,${s.id})">
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <label>Основной интервал<br><input name="recurrence" value="${escAttr(s.recurrence || '')}" placeholder="4h" required style="width:110px"></label>
+          <label>Эффорт<br><select name="effort"><option value="">по умолчанию</option>${['low','medium','high','xhigh','max'].map(x=>`<option ${s.effort===x?'selected':''}>${x}</option>`).join('')}</select></label>
+          <label>Приоритет<br><input name="priority" type="number" min="1" max="10" value="${s.priority || 5}" style="width:80px"></label>
+          <label>Таймаут, сек<br><input name="task_timeout" type="number" min="0" value="${s.task_timeout ?? ''}" placeholder="общий" style="width:110px"></label>
+        </div>
+        <div style="margin-top:10px"><b>Временное ускорение</b> <span style="color:var(--muted)">(пусто — отключить)</span></div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:5px">
+          <label>Интервал<br><input name="temporary_recurrence" value="${escAttr(s.temporary_recurrence || '')}" placeholder="1h" style="width:110px"></label>
+          <label>До даты<br><input name="temporary_until" type="datetime-local" value="${s.temporary_until ? new Date(s.temporary_until).toISOString().slice(0,16) : ''}"></label>
+          <label>Вернуть после ПУСТО<br><input name="temporary_empty_limit" type="number" min="1" max="20" value="${s.temporary_empty_limit || 2}" style="width:90px"></label>
+        </div>
+        <div class="prov-actions" style="margin-top:9px"><button class="btn btn-sm btn-primary" type="submit">Сохранить</button><button class="btn btn-sm btn-ghost" type="button" onclick="toggleSeriesEditor(${s.id})">Отмена</button></div>
+      </form>` : ''}
     </div>`;
   };
-  const active = series.filter(s => !s.broken);
-  const broken = series.filter(s => s.broken);
+  const active = series.filter(s => !s.ended);
+  const broken = series.filter(s => s.ended);
   const activeHtml = active.length
     ? active.map(renderSeries).join('')
     : '<div style="color:var(--muted);margin-bottom:12px">Активных серий нет.</div>';
   const brokenHtml = broken.length
-    ? `<details style="margin-top:14px"><summary style="cursor:pointer;color:var(--muted)">Завершённые и оборванные серии (${broken.length})</summary><div style="margin-top:10px">${broken.map(renderSeries).join('')}</div></details>`
+    ? `<details style="margin-top:14px"><summary style="cursor:pointer;color:var(--muted)">Завершённые серии (${broken.length})</summary><div style="margin-top:10px">${broken.map(renderSeries).join('')}</div></details>`
     : '';
   box.innerHTML = activeHtml + brokenHtml;
+}
+
+async function loadPipelineInsights(profile='onebase', refresh=false) {
+  const box = document.getElementById('pipelineInsights');
+  box.innerHTML = '<div class="prov-cmd">Считаю очереди GitHub…</div>';
+  try {
+    const data = await fetchJSON(`${API}/pipeline-insights/${encodeURIComponent(profile)}${refresh?'?refresh=true':''}`);
+    const rows = data.queues.map(q => `<tr${data.bottleneck===q.id?' style="color:var(--yellow)"':''}><td>${data.bottleneck===q.id?'⚠ ':''}${esc(q.title)}</td><td>${q.backlog}</td><td>${q.capacity}</td><td>${q.runs_needed}</td><td>${esc(q.interval || 'нет серии')}</td></tr>`).join('');
+    box.innerHTML = `<div style="border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:12px"><b>📈 ${esc(data.title)}</b><div class="prov-cmd">Узкое место выделено по числу необходимых прогонов (backlog / ёмкость одного запуска).</div><table style="width:100%;margin-top:7px;font-size:12px"><thead><tr><th align="left">Этап</th><th>Очередь</th><th>За прогон</th><th>Нужно прогонов</th><th>Интервал</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+  } catch(e) { box.innerHTML = `<div style="color:var(--red);margin-bottom:10px">Анализ очереди недоступен: ${esc(e.message)}</div>`; }
+}
+
+function toggleSeriesEditor(id) {
+  const form = document.getElementById(`series-edit-${id}`);
+  if (form) form.style.display = form.style.display === 'none' ? 'block' : 'none';
+}
+
+async function saveSeries(event, id) {
+  event.preventDefault();
+  const fd = new FormData(event.target);
+  const temporary = String(fd.get('temporary_recurrence') || '').trim();
+  const until = String(fd.get('temporary_until') || '');
+  const timeout = String(fd.get('task_timeout') || '');
+  const body = {
+    recurrence: String(fd.get('recurrence') || '').trim(),
+    effort: String(fd.get('effort') || ''), priority: Number(fd.get('priority')),
+    task_timeout: timeout === '' ? null : Number(timeout),
+    temporary_recurrence: temporary || null,
+    temporary_until: temporary && until ? new Date(until).toISOString() : null,
+    temporary_empty_limit: temporary ? Number(fd.get('temporary_empty_limit') || 2) : null,
+  };
+  try {
+    await fetchJSON(`${API}/schedule/${id}`, {method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    toast('Настройки серии сохранены', false); await openSchedule();
+  } catch(e) { toast('Не удалось сохранить: ' + e.message); }
+  return false;
+}
+
+async function seriesAction(id, action, confirmEnd=false) {
+  if (confirmEnd && !confirm('Завершить серию? Будущие запуски будут отменены.')) return;
+  try {
+    await fetchJSON(`${API}/schedule/${id}/action`, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action})});
+    await openSchedule();
+  } catch(e) { toast('Не удалось: ' + e.message); }
 }
 
 function closeSchedule() { document.getElementById('schedModal').classList.remove('open'); }

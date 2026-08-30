@@ -90,14 +90,15 @@ def test_codex_provider_exposes_effort_without_claude_skill_toggle(isolated_db):
     assert codex["supports_skills"] is False
 
 
-def test_schedule_ui_separates_broken_series_and_uses_first_line_as_title():
+def test_schedule_ui_exposes_durable_series_controls():
     html = (Path(__file__).parents[1] / "promptpilot" / "static" / "index.html").read_text(
         encoding="utf-8"
     )
 
-    assert "const active = series.filter(s => !s.broken);" in html
-    assert "Завершённые и оборванные серии" in html
-    assert ".split(/\\r?\\n/, 1)[0]" in html
+    assert "const active = series.filter(s => !s.ended);" in html
+    assert "Завершённые серии" in html
+    assert "Временное ускорение" in html
+    assert "saveSeries(event" in html
 
 
 def test_workflow_setup_preflight_accepts_repo_provider_and_gate(isolated_db, monkeypatch):

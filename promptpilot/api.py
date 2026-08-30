@@ -5,6 +5,7 @@ import secrets
 import subprocess
 import sys
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
@@ -17,6 +18,7 @@ import os
 import re as _re
 
 from . import db, workflows
+from . import pipeline_insights
 from .config import API_TOKEN, DB_DIR, EFFORT_LEVELS, get_provider_models, get_skills, load_providers, mask_secret_value, provider_available, PROJECTS_ROOT
 from .models import (
     CostStats,
@@ -178,6 +180,94 @@ def api_update_task(task_id: int, update: TaskUpdate):
 def api_schedule():
     """Повторяющиеся задачи как серии: период, следующий запуск, исход прошлого."""
     return db.list_series()
+
+
+class SeriesUpdate(BaseModel):
+    title: Optional[str] = None
+    recurrence: Optional[str] = None
+    temporary_recurrence: Optional[str] = None
+    temporary_until: Optional[datetime] = None
+    temporary_empty_limit: Optional[int] = None
+    provider: Optional[str] = None
+    model: Optional[str] = None
+    effort: Optional[str] = None
+    priority: Optional[int] = None
+    task_timeout: Optional[int] = None
+
+
+class SeriesAction(BaseModel):
+    action: str
+
+
+@app.patch("/api/schedule/{series_id}")
+def api_update_series(series_id: int, update: SeriesUpdate):
+    fields = {}
+    supplied = update.model_fields_set
+    if "title" in supplied:
+        fields["title"] = (update.title or "").strip() or "Повторяющаяся задача"
+    if "recurrence" in supplied:
+        recurrence = (update.recurrence or "").strip()
+        if not recurrence or db.parse_recurrence(recurrence) is None:
+            raise HTTPException(400, "Повтор не разобран: «6h», «90m», «daily@09:00»")
+        fields["base_recurrence"] = recurrence
+    if "temporary_recurrence" in supplied:
+        temporary = (update.temporary_recurrence or "").strip()
+        if temporary and db.parse_recurrence(temporary) is None:
+            raise HTTPException(400, "Временный интервал не разобран")
+        fields["temporary_recurrence"] = temporary or None
+    if "temporary_until" in supplied:
+        fields["temporary_until"] = update.temporary_until
+    if "temporary_empty_limit" in supplied:
+        if update.temporary_empty_limit is not None and not 1 <= update.temporary_empty_limit <= 20:
+            raise HTTPException(400, "Порог ПУСТО: от 1 до 20")
+        fields["temporary_empty_limit"] = update.temporary_empty_limit
+    if "provider" in supplied:
+        provider = (update.provider or "").strip()
+        if provider and provider not in load_providers():
+            raise HTTPException(400, f"Провайдер «{provider}» не найден")
+        fields["provider"] = provider or None
+    if "model" in supplied:
+        fields["model"] = (update.model or "").strip() or None
+    if "effort" in supplied:
+        effort = (update.effort or "").strip().lower()
+        if effort and effort not in EFFORT_LEVELS:
+            raise HTTPException(400, f"Эффорт: {', '.join(EFFORT_LEVELS)} или пусто")
+        fields["effort"] = effort or None
+    if "priority" in supplied:
+        if update.priority is None or not 1 <= update.priority <= 10:
+            raise HTTPException(400, "Приоритет: от 1 до 10")
+        fields["priority"] = update.priority
+    if "task_timeout" in supplied:
+        if update.task_timeout is not None and update.task_timeout < 0:
+            raise HTTPException(400, "Таймаут не может быть отрицательным")
+        fields["task_timeout"] = update.task_timeout
+    if not fields or not db.update_series(series_id, fields):
+        raise HTTPException(404, "Активная серия не найдена")
+    return db.get_series(series_id)
+
+
+@app.post("/api/schedule/{series_id}/action")
+def api_series_action(series_id: int, body: SeriesAction):
+    if body.action not in ("run_now", "pause", "resume", "end"):
+        raise HTTPException(400, "Неизвестное действие")
+    if not db.series_action(series_id, body.action):
+        raise HTTPException(400, "Действие неприменимо к этой серии")
+    return {"ok": True, "series": db.get_series(series_id)}
+
+
+@app.get("/api/pipeline-insights/profiles")
+def api_pipeline_profiles():
+    return pipeline_insights.list_profiles()
+
+
+@app.get("/api/pipeline-insights/{profile_id}")
+def api_pipeline_insights(profile_id: str, refresh: bool = False):
+    try:
+        return pipeline_insights.analyze(profile_id, db.list_series(), use_cache=not refresh)
+    except KeyError:
+        raise HTTPException(404, "Профиль анализа не найден")
+    except (RuntimeError, ValueError, OSError) as exc:
+        raise HTTPException(503, str(exc))
 
 
 @app.delete("/api/tasks/{task_id}", response_model=dict)
