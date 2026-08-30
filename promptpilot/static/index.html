@@ -2373,7 +2373,7 @@ async function openSchedule() {
   catch (e) { box.innerHTML = `<div style="color:var(--red)">Не удалось загрузить: ${esc(e.message)}</div>`; return; }
   if (!series.length) { box.innerHTML = '<div style="color:var(--muted)">Повторяющихся задач нет.</div>'; return; }
   const when = s => s ? new Date(s).toLocaleString() : '—';
-  box.innerHTML = series.map(s => {
+  const renderSeries = s => {
     const params = [s.provider || 'по умолчанию', s.model, s.effort && `эффорт ${s.effort}`,
                     s.machine, `приоритет ${s.priority}`].filter(Boolean).join(' · ');
     const last = s.last_task_id
@@ -2383,8 +2383,9 @@ async function openSchedule() {
     const next = s.broken
       ? '<span style="color:var(--red)">серия оборвана — следующего запуска нет</span>'
       : `#${s.next_task_id} — ${STATUS_RU[s.next_status] || s.next_status}, ${when(s.next_run_at)}`;
-    return `<div class="prov-row${s.broken ? '' : ''}">
-      <span class="prov-name">${esc(s.prompt.slice(0, 60))}</span>
+    const title = (s.prompt || '').split(/\r?\n/, 1)[0] || '(без названия)';
+    return `<div class="prov-row">
+      <span class="prov-name">${esc(title.slice(0, 90))}</span>
       <span class="prov-badge">каждые ${esc(s.recurrence)}</span>
       <span class="prov-badge">прогонов: ${s.runs}</span>
       ${s.broken ? '<span class="prov-badge" style="color:var(--red)">оборвана</span>' : ''}
@@ -2393,7 +2394,16 @@ async function openSchedule() {
       <div class="prov-cmd">След.: ${next}</div>
       <div class="prov-cmd">Прошлый: ${last}</div>
     </div>`;
-  }).join('');
+  };
+  const active = series.filter(s => !s.broken);
+  const broken = series.filter(s => s.broken);
+  const activeHtml = active.length
+    ? active.map(renderSeries).join('')
+    : '<div style="color:var(--muted);margin-bottom:12px">Активных серий нет.</div>';
+  const brokenHtml = broken.length
+    ? `<details style="margin-top:14px"><summary style="cursor:pointer;color:var(--muted)">Завершённые и оборванные серии (${broken.length})</summary><div style="margin-top:10px">${broken.map(renderSeries).join('')}</div></details>`
+    : '';
+  box.innerHTML = activeHtml + brokenHtml;
 }
 
 function closeSchedule() { document.getElementById('schedModal').classList.remove('open'); }
