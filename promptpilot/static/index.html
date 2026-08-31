@@ -2507,6 +2507,7 @@ async function loadPipelineInsights(profile, refresh=false) {
     const runs = h5.runs;
     const deltaByQueue = h5.queue_deltas || {};
     const diagnostics = data.diagnostics;
+    const healthLabel = data.health.label === 'нужна проверка' ? 'есть ожидания' : data.health.label;
     const diagnosticFindings = diagnostics && diagnostics.findings ? diagnostics.findings : [];
     const diagnosticHtml = diagnostics ? `<div style="border:1px solid var(--border);border-radius:6px;padding:9px;margin:10px 0">
       <b>Проверка текущих инвариантов: ${esc(diagnostics.state)}</b> · ${esc(diagnostics.summary || '')}
@@ -2514,7 +2515,7 @@ async function loadPipelineInsights(profile, refresh=false) {
     </div>` : '';
     const rows = data.queues.map(q => `<tr class="${data.bottleneck===q.id?'bottleneck':''}"><td>${data.bottleneck===q.id?'⚠ ':''}${esc(q.title)}</td><td class="num">${q.backlog}</td><td class="num">${h5.complete?signed(deltaByQueue[q.id]||0):'—'}</td><td class="num">${q.capacity}</td><td class="num">${q.runs_needed}</td><td>${age(q.age.oldest_hours)}</td><td>${esc(q.interval || 'нет серии')}</td><td class="insights-recommendation">${esc(q.recommendation || '—')}</td></tr>`).join('');
     box.innerHTML = `<div style="border:1px solid var(--border);border-radius:8px;padding:12px;margin-bottom:12px">
-      <div><b>${esc(data.title)}</b><span class="pipeline-health ${escAttr(data.health.state)}">${esc(data.health.label)}</span></div>
+      <div><b>${esc(data.title)}</b><span class="pipeline-health ${escAttr(data.health.state)}">${esc(healthLabel)}</span></div>
       <div class="prov-cmd">${esc(data.repository)} · ${esc(data.health.reason)} · история хранится локально</div>
       <div class="pipeline-summary">
         <div class="pipeline-metric"><div class="pipeline-metric-label">Backlog сейчас</div><div class="pipeline-metric-value">${data.backlog_total}</div><div class="pipeline-metric-note">Δ 5 ч: ${h5.complete?signed(h5.backlog_delta):'копится история'}</div></div>
