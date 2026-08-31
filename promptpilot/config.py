@@ -599,13 +599,18 @@ def provider_is_claude(cfg: dict) -> bool:
 def cmd_runs_claude(cmd: str) -> bool:
     """Шаблон команды запускает сам Claude Code (с путём, .exe и кавычками)."""
     parts = _split_cmd(cmd or "")
-    return bool(parts) and os.path.basename(parts[0]).lower().startswith("claude")
+    return bool(parts) and _command_basename(parts[0]).startswith("claude")
 
 
 def cmd_runs_codex(cmd: str) -> bool:
     """Шаблон команды запускает Codex CLI (с путём, .exe или .cmd)."""
     parts = _split_cmd(cmd or "")
-    return bool(parts) and os.path.basename(parts[0]).lower().startswith("codex")
+    return bool(parts) and _command_basename(parts[0]).startswith("codex")
+
+
+def _command_basename(command: str) -> str:
+    """Return a basename for either path syntax, independent of host OS."""
+    return command.replace("\\", "/").rsplit("/", 1)[-1].lower()
 
 
 def provider_is_codex(cfg: dict) -> bool:
