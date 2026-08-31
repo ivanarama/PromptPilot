@@ -1,18 +1,80 @@
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 from promptpilot.models import TaskCreate
 from promptpilot import pipeline_insights
 
 
+PIPELINE_PROFILE = {
+    "title": "ExampleProject pipeline", "repository": "owner/example",
+    "target_clear_hours": 8,
+    "queues": [
+        {"id": "triage", "title": "Triage", "capacity": 5,
+         "query": "is:issue is:open label:triage", "series_contains": "TRIAGE",
+         "manual_gate": True},
+        {"id": "fix", "title": "Fix", "capacity": 1,
+         "queries": ["is:issue is:open label:fix", "is:pr is:open label:fix"],
+         "series_contains": "FIX"},
+        {"id": "review", "title": "Review", "capacity": 2,
+         "query": "is:pr is:open label:review", "series_contains": "REVIEW"},
+        {"id": "merge", "title": "Merge", "capacity": 3,
+         "query": "is:pr is:open label:merge", "series_contains": "MERGE"},
+    ],
+}
+
+
+def test_fresh_install_has_no_project_specific_pipeline_profiles(tmp_path, monkeypatch):
+    monkeypatch.setenv("PP_PIPELINE_PROFILES", str(tmp_path / "missing.json"))
+
+    assert pipeline_insights.DEFAULT_PROFILES == {}
+    assert pipeline_insights.list_profiles() == []
+
+
+def test_project_health_check_is_immediate_and_accepts_red_json(monkeypatch):
+    monkeypatch.setattr(pipeline_insights.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(
+        returncode=1,
+        stdout='{"state":"red","summary":"broken route","findings":[]}',
+        stderr="",
+    ))
+    profile = {"health_check": {"command": ["project-health", "-json"]}}
+
+    diagnostics = pipeline_insights._run_profile_health_check(profile)
+    health = pipeline_insights._health(
+        10, {"5h": {"complete": False}}, 0, diagnostics=diagnostics)
+
+    assert diagnostics["state"] == "red"
+    assert diagnostics["exit_code"] == 1
+    assert health["state"] == "red"
+    assert health["label"] == "нарушен инвариант"
+
+
+def test_project_health_attention_overrides_warming_history():
+    diagnostics = {"state": "yellow", "summary": "нужен человек", "findings": []}
+
+    health = pipeline_insights._health(
+        10, {"5h": {"complete": False}}, 0, diagnostics=diagnostics)
+
+    assert health["state"] == "yellow"
+    assert health["reason"] == "нужен человек"
+
+
+def test_paused_series_is_visible_without_history():
+    health = pipeline_insights._health(
+        10, {"5h": {"complete": False}}, 0, paused_series=2)
+
+    assert health["state"] == "yellow"
+    assert health["label"] == "конвейер на паузе"
+
+
 def test_recurring_task_creates_durable_series(isolated_db):
     task = isolated_db.create_task(TaskCreate(
-        prompt="OneBase - FIX\nDo one fix", working_dir=r"D:\Projects\onebase",
+        prompt="ExampleProject - FIX\nDo one fix", working_dir=r"D:\Projects\example",
         provider="codex", effort="high", recurrence="4h",
     ))
 
     assert task.series_id is not None
     series = isolated_db.get_series(task.series_id)
-    assert series["title"] == "OneBase - FIX"
+    assert series["title"] == "ExampleProject - FIX"
     assert series["recurrence"] == "4h"
     assert series["next_task_id"] == task.id
 
@@ -72,10 +134,14 @@ def test_temporary_boost_expiry_uses_base_interval(isolated_db):
 
 def test_pipeline_insights_finds_capacity_bottleneck(isolated_db, monkeypatch):
     counts = iter([15, 5, 0, 17, 9])
-    monkeypatch.setattr(pipeline_insights, "_github_count", lambda repo, query: next(counts))
+    monkeypatch.setattr(pipeline_insights, "_github_search", lambda repo, query: {
+        "count": next(counts), "items": [], "membership_complete": False,
+    })
+    monkeypatch.setattr(pipeline_insights, "_profiles",
+                        lambda: {"example": PIPELINE_PROFILE})
     pipeline_insights._cache.clear()
 
-    result = pipeline_insights.analyze("onebase", [], use_cache=False)
+    result = pipeline_insights.analyze("example", [], use_cache=False)
 
     assert result["bottleneck"] == "review"
     review = next(q for q in result["queues"] if q["id"] == "review")
@@ -85,11 +151,77 @@ def test_pipeline_insights_finds_capacity_bottleneck(isolated_db, monkeypatch):
     assert "оставить 1h" not in review["recommendation"]  # no matching series in this unit test
     assert "решения человека" in triage["recommendation"]
 
+def test_pipeline_insights_history_is_profile_scoped_and_tracks_movement(isolated_db, monkeypatch):
+    profile = {
+        "title": "OtherProject pipeline", "repository": "owner/other",
+        "target_clear_hours": 6,
+        "queues": [
+            {"id": "build", "title": "Build", "query": "label:build",
+             "capacity": 2, "series_contains": "Other - BUILD"},
+            {"id": "review", "title": "Review", "query": "label:review",
+             "capacity": 1, "series_contains": "Other - REVIEW"},
+        ],
+    }
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"other": profile})
+    responses = {
+        "label:build": {
+            "count": 2, "membership_complete": True,
+            "items": [
+                {"key": "issue:2", "kind": "issue", "number": 2,
+                 "created_at": "2026-08-30T00:00:00Z", "updated_at": None, "url": None},
+                {"key": "issue:3", "kind": "issue", "number": 3,
+                 "created_at": "2026-08-31T00:00:00Z", "updated_at": None, "url": None},
+            ],
+        },
+        "label:review": {
+            "count": 1, "membership_complete": True,
+            "items": [{"key": "issue:1", "kind": "issue", "number": 1,
+                       "created_at": "2026-08-29T00:00:00Z", "updated_at": None, "url": None}],
+        },
+    }
+    monkeypatch.setattr(pipeline_insights, "_github_search",
+                        lambda repo, query: responses[query])
+    old = {
+        "captured_at": (datetime.now(timezone.utc) - timedelta(hours=6)).isoformat(),
+        "queues": {
+            "build": {"backlog": 2, "membership_complete": True, "items": [
+                {"key": "issue:1"}, {"key": "issue:2"}]},
+            "review": {"backlog": 0, "membership_complete": True, "items": []},
+        },
+    }
+    isolated_db.add_pipeline_snapshot(
+        "other", "owner/other", old, datetime.now(timezone.utc) - timedelta(hours=6))
+    pipeline_insights._cache.clear()
 
-def test_onebase_profile_excludes_parked_prs_from_machine_queues():
-    profile = pipeline_insights.DEFAULT_PROFILES["onebase"]
-    queues = {item["id"]: item for item in profile["queues"]}
+    result = pipeline_insights.analyze("other", [], use_cache=False)
 
-    assert "-label:needs-decision" in queues["review"]["query"]
-    assert "-label:needs-decision" in queues["merge"]["query"]
-    assert all("-label:needs-decision" in query for query in queues["fix"]["queries"])
+    assert result["profile_id"] == "other"
+    assert result["backlog_total"] == 3
+    assert result["history"]["5h"]["complete"] is True
+    assert result["history"]["5h"]["backlog_delta"] == 1
+    assert result["history"]["5h"]["entered"] == 1
+    assert result["history"]["5h"]["moved"] == 1
+    assert result["history"]["5h"]["transitions"] == 1
+    assert len(isolated_db.list_pipeline_snapshots("other")) == 2
+    assert isolated_db.list_pipeline_snapshots("unrelated") == []
+
+
+def test_pipeline_run_metrics_distinguish_semantic_failure_from_process_failure(isolated_db):
+    ready = isolated_db.create_task(TaskCreate(prompt="Project - FIX", recurrence="1h"))
+    unable = isolated_db.create_task(TaskCreate(
+        prompt="Project - FIX", recurrence="1h", series_id=ready.series_id))
+    failed = isolated_db.create_task(TaskCreate(
+        prompt="Project - FIX", recurrence="1h", series_id=ready.series_id))
+    isolated_db.set_verdict(ready.id, "ГОТОВО")
+    isolated_db.mark_completed(ready.id, "ok")
+    isolated_db.set_verdict(unable.id, "НЕ СМОГ")
+    isolated_db.mark_completed(unable.id, "blocked")
+    isolated_db.mark_failed(failed.id, "boom")
+
+    metrics = isolated_db.pipeline_run_metrics(
+        [ready.series_id], datetime.now(timezone.utc) - timedelta(hours=1))
+
+    assert metrics["runs"] == 3
+    assert metrics["ready"] == 1
+    assert metrics["unable"] == 1
+    assert metrics["failed"] == 1

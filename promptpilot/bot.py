@@ -867,25 +867,49 @@ async def show_pipeline_insights(update: Update, context: ContextTypes.DEFAULT_T
         await _deny(update)
         return
     profiles = pipeline_insights.list_profiles()
+    if not profiles:
+        await update.message.reply_text(
+            "📈 Профили конвейеров не настроены. Добавьте их в "
+            "~/.promptpilot/pipeline_profiles.json."
+        )
+        return
     if len(profiles) > 1:
         buttons = [[InlineKeyboardButton(p["title"][:55], callback_data=f"pipeline:{p['id']}")]
                    for p in profiles]
         await update.message.reply_text("📈 Выберите проект/цепочку:",
                                         reply_markup=InlineKeyboardMarkup(buttons))
         return
-    await _send_pipeline_insights(update.message, profiles[0]["id"] if profiles else "onebase")
+    await _send_pipeline_insights(update.message, profiles[0]["id"])
 
 
 def _pipeline_text(data: dict) -> str:
+    recent = data.get("history", {}).get("5h", {})
+    health = data.get("health", {})
+    coverage = ("5 ч" if recent.get("complete")
+                else f"{recent.get('coverage_hours', 0):g} из 5 ч")
+    delta = recent.get("backlog_delta") if recent.get("complete") else None
     lines = [f"📈 {data['title']}",
+             f"Состояние: {health.get('label', '—')} — {health.get('reason', '—')}",
+             f"Backlog: {data.get('backlog_total', 0)}"
+             + (f" (Δ 5 ч: {delta:+d})" if delta is not None else " (история копится)"),
+             f"Вход / выход / переходы: {recent.get('entered', 0)} / "
+             f"{recent.get('exited', 0)} / {recent.get('transitions', 0)}; покрытие {coverage}",
              f"Цель оценки: текущая очередь примерно за {data['target_clear_hours']:g} ч.", ""]
+    diagnostics = data.get("diagnostics")
+    if diagnostics:
+        lines.insert(3, f"Инварианты: {diagnostics.get('state', '—')} — "
+                        f"{diagnostics.get('summary', 'нет описания')}")
     for queue in data["queues"]:
         marker = "⚠" if queue["id"] == data["bottleneck"] else "•"
         lines.append(f"{marker} {queue['title']}: {queue['backlog']} / "
                      f"{queue['capacity']} за прогон = {queue['runs_needed']} прогонов; "
                      f"сейчас {queue['interval'] or 'не настроено'}\n"
                      f"   Рекомендация: {queue['recommendation']}")
-    lines.extend(["", "⚠ — текущее узкое место по backlog / ёмкость запуска."])
+    runs = recent.get("runs", {})
+    lines.extend(["", f"Прогоны за окно: {runs.get('runs', 0)}; готово {runs.get('ready', 0)}, "
+                  f"нужен человек {runs.get('human', 0)}, не смог {runs.get('unable', 0)}, "
+                  f"упало {runs.get('failed', 0)}.",
+                  "⚠ — текущее узкое место по backlog / ёмкость запуска."])
     return "\n".join(lines)
 
 

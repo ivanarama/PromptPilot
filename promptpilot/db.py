@@ -127,9 +127,19 @@ CREATE TABLE IF NOT EXISTS prompt_log (
     source TEXT
 );
 
+CREATE TABLE IF NOT EXISTS pipeline_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    profile_id TEXT NOT NULL,
+    repository TEXT NOT NULL,
+    captured_at TEXT NOT NULL,
+    payload_json TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_runnable ON tasks(status, priority, next_run_at);
 CREATE INDEX IF NOT EXISTS idx_prompt_log_project ON prompt_log(project);
+CREATE INDEX IF NOT EXISTS idx_pipeline_snapshots_profile_time
+    ON pipeline_snapshots(profile_id, captured_at);
 
 CREATE TABLE IF NOT EXISTS workflows (
     id TEXT PRIMARY KEY,
@@ -330,6 +340,12 @@ MIGRATIONS = [
         created_at TEXT NOT NULL, updated_at TEXT NOT NULL
     )""",
     "CREATE INDEX IF NOT EXISTS idx_tasks_series ON tasks(series_id, id)",
+    """CREATE TABLE IF NOT EXISTS pipeline_snapshots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        profile_id TEXT NOT NULL, repository TEXT NOT NULL,
+        captured_at TEXT NOT NULL, payload_json TEXT NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_pipeline_snapshots_profile_time ON pipeline_snapshots(profile_id, captured_at)",
 ]
 
 WORKFLOW_SCHEMA_VERSION = "workflow_orchestrator_w0_v1"
@@ -941,6 +957,89 @@ def get_stats() -> Stats:
             cancelled=data.get("cancelled", 0),
             total=total,
         )
+
+
+def add_pipeline_snapshot(profile_id: str, repository: str, payload: dict,
+                          captured_at: Optional[datetime] = None) -> dict:
+    """Persist one deterministic observation of an external pipeline.
+
+    Snapshots intentionally contain only public queue metadata (counts, issue/
+    PR identifiers and timestamps), never prompts, credentials or agent output.
+    """
+    captured = _to_utc_iso(captured_at or datetime.now(timezone.utc))
+    encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    with _connect() as conn:
+        cur = conn.execute(
+            """INSERT INTO pipeline_snapshots
+               (profile_id, repository, captured_at, payload_json)
+               VALUES (?, ?, ?, ?)""",
+            (profile_id, repository, captured, encoded),
+        )
+        row_id = cur.lastrowid
+    return {"id": row_id, "profile_id": profile_id, "repository": repository,
+            "captured_at": captured, "payload": payload}
+
+
+def list_pipeline_snapshots(profile_id: str, since: Optional[datetime] = None,
+                            limit: int = 1000) -> list[dict]:
+    """Return profile snapshots oldest-first for trend calculations."""
+    clauses = ["profile_id = ?"]
+    params: list = [profile_id]
+    if since is not None:
+        clauses.append("captured_at >= ?")
+        params.append(_to_utc_iso(since))
+    params.append(max(1, min(int(limit), 10000)))
+    with _connect() as conn:
+        rows = conn.execute(
+            f"""SELECT id, profile_id, repository, captured_at, payload_json
+                FROM pipeline_snapshots WHERE {' AND '.join(clauses)}
+                ORDER BY captured_at ASC LIMIT ?""",
+            params,
+        ).fetchall()
+    return [{"id": row["id"], "profile_id": row["profile_id"],
+             "repository": row["repository"], "captured_at": row["captured_at"],
+             "payload": json.loads(row["payload_json"])} for row in rows]
+
+
+def prune_pipeline_snapshots(before: datetime) -> int:
+    """Bound local history; aggregated dashboard windows need no raw data forever."""
+    with _connect() as conn:
+        cur = conn.execute("DELETE FROM pipeline_snapshots WHERE captured_at < ?",
+                           (_to_utc_iso(before),))
+        return cur.rowcount
+
+
+def pipeline_run_metrics(series_ids: list[int], since: datetime) -> dict:
+    """Semantic outcomes of scheduled runs belonging to one pipeline profile."""
+    ids = sorted({int(value) for value in series_ids if value is not None})
+    empty = {"runs": 0, "ready": 0, "empty": 0, "human": 0,
+             "unable": 0, "failed": 0, "other": 0}
+    if not ids:
+        return empty
+    marks = ",".join("?" for _ in ids)
+    with _connect() as conn:
+        rows = conn.execute(
+            f"""SELECT status, verdict FROM tasks
+                WHERE series_id IN ({marks}) AND completed_at >= ?""",
+            (*ids, _to_utc_iso(since)),
+        ).fetchall()
+    result = dict(empty)
+    for row in rows:
+        result["runs"] += 1
+        verdict = (row["verdict"] or "").strip().upper()
+        if row["status"] == "failed":
+            result["failed"] += 1
+        elif verdict in ("ГОТОВО", "УЖЕ СДЕЛАНО"):
+            result["ready"] += 1
+        elif verdict == "ПУСТО":
+            result["empty"] += 1
+        elif verdict == "НУЖЕН ЧЕЛОВЕК":
+            result["human"] += 1
+        elif verdict == "НЕ СМОГ":
+            result["unable"] += 1
+        else:
+            result["other"] += 1
+    return result
 
 
 def get_setting(key: str, default: str = None) -> Optional[str]:

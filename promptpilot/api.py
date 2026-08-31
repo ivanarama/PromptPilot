@@ -1,10 +1,12 @@
 """FastAPI web API + static file serving."""
 
+import asyncio
 import base64
 import secrets
 import subprocess
 import sys
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
@@ -19,7 +21,7 @@ import re as _re
 
 from . import db, workflows
 from . import pipeline_insights
-from .config import API_TOKEN, DB_DIR, EFFORT_LEVELS, get_provider_models, get_skills, load_providers, mask_secret_value, provider_available, PROJECTS_ROOT
+from .config import API_TOKEN, DB_DIR, EFFORT_LEVELS, PIPELINE_SNAPSHOT_INTERVAL, get_provider_models, get_skills, load_providers, mask_secret_value, provider_available, PROJECTS_ROOT
 from .models import (
     CostStats,
     FindingStatus,
@@ -56,7 +58,35 @@ from .models import (
 )
 from .version import check_for_update
 
-app = FastAPI(title="PromptPilot", version="0.1.0")
+
+async def _pipeline_sampler():
+    """Collect profile-scoped queue history without invoking an LLM."""
+    while True:
+        await asyncio.sleep(PIPELINE_SNAPSHOT_INTERVAL)
+        try:
+            await asyncio.to_thread(pipeline_insights.sample_active_profiles, db.list_series())
+        except Exception as exc:
+            print(f"pipeline sampler: {exc}", file=sys.stderr)
+
+
+@asynccontextmanager
+async def _lifespan(application: FastAPI):
+    task = None
+    if PIPELINE_SNAPSHOT_INTERVAL:
+        task = asyncio.create_task(_pipeline_sampler())
+        application.state.pipeline_sampler = task
+    try:
+        yield
+    finally:
+        if task:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+
+app = FastAPI(title="PromptPilot", version="0.1.0", lifespan=_lifespan)
 
 
 _SAFE_METHODS = ("GET", "HEAD", "OPTIONS")

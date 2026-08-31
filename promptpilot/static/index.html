@@ -393,7 +393,19 @@
   .insights-table th.num, .insights-table td.num { text-align:right; font-variant-numeric:tabular-nums; }
   .insights-table tr.bottleneck { color:var(--yellow); }
   .insights-recommendation { color:var(--text2); }
+  .pipeline-summary { display:grid; grid-template-columns:repeat(4,minmax(135px,1fr)); gap:8px; margin:11px 0; }
+  .pipeline-metric { border:1px solid var(--border); border-radius:8px; padding:9px 10px; background:var(--surface2); }
+  .pipeline-metric-label { color:var(--muted); font-size:11px; }
+  .pipeline-metric-value { font-size:20px; font-weight:650; margin-top:2px; font-variant-numeric:tabular-nums; }
+  .pipeline-metric-note { color:var(--text2); font-size:11px; margin-top:2px; }
+  .pipeline-health { display:inline-flex; align-items:center; gap:6px; border:1px solid var(--border); border-radius:999px; padding:3px 9px; font-size:11px; margin-left:7px; }
+  .pipeline-health.green { color:var(--green); border-color:var(--green); }
+  .pipeline-health.yellow { color:var(--yellow); border-color:var(--yellow); }
+  .pipeline-health.red { color:var(--red); border-color:var(--red); }
+  .pipeline-health.warming { color:var(--accent); border-color:var(--accent); }
+  #pipelineModal .modal { max-width:1120px; }
   @media (max-width: 720px) {
+    .pipeline-summary { grid-template-columns:repeat(2,minmax(120px,1fr)); }
     .insights-table { table-layout:auto; display:block; overflow-x:auto; white-space:nowrap; }
     .insights-table th, .insights-table td { min-width:75px; }
     .insights-table th:first-child, .insights-table td:first-child { min-width:130px; }
@@ -660,6 +672,7 @@
     <button class="filter-btn" data-filter="failed">Failed</button>
     <button class="filter-btn" data-filter="rate_limited">Rate Limited</button>
     <button id="pauseBtn" class="btn-pause" onclick="toggleWorkerPause()" style="margin-left:auto">⏸ Pause</button>
+    <button class="btn-pause" onclick="openPipelines()" style="margin-left:8px">📈 Конвейеры</button>
     <button class="btn-pause" onclick="openSchedule()" style="margin-left:8px">🗓 Расписание</button>
     <button class="btn-pause" onclick="openWorkflows()" style="margin-left:8px">Workflows</button>
     <button class="btn-pause" onclick="openProviders()" style="margin-left:8px">⚙ Providers</button>
@@ -775,6 +788,17 @@
   </div>
 </div>
 
+<div class="modal-overlay" id="pipelineModal" onclick="if(event.target===this)closePipelines()">
+  <div class="modal">
+    <h2>📈 Конвейеры <button class="btn btn-sm btn-ghost" style="margin-left:auto" onclick="closePipelines()">✕ Закрыть</button></h2>
+    <div style="font-size:12px;color:var(--muted);margin-bottom:10px">
+      Профиль объединяет внешние очереди и связанные повторяющиеся серии. Метрики считаются обычным кодом; токены не расходуются.
+    </div>
+    <div class="insights-tools" id="pipelineProfileTools"><span style="color:var(--muted);font-size:12px">Загрузка профилей…</span></div>
+    <div id="pipelineInsights"></div>
+  </div>
+</div>
+
 <div class="modal-overlay" id="schedModal" onclick="if(event.target===this)closeSchedule()">
   <div class="modal">
     <h2>Расписание <button class="btn btn-sm btn-ghost" style="margin-left:auto" onclick="closeSchedule()">✕ Закрыть</button></h2>
@@ -782,8 +806,6 @@
       Настройки применяются ко всей серии, включая будущие запуски. «Ускорить временно»
       автоматически вернёт основной интервал по сроку или после заданного числа итогов «ПУСТО».
     </div>
-    <div class="insights-tools" id="pipelineProfileTools"><span style="color:var(--muted);font-size:12px">Загрузка профилей…</span></div>
-    <div id="pipelineInsights"></div>
     <div id="schedList"></div>
   </div>
 </div>
@@ -2383,7 +2405,6 @@ async function wfSendKey(key) {
 async function openSchedule() {
   document.getElementById('schedModal').classList.add('open');
   const box = document.getElementById('schedList');
-  loadPipelineProfiles();
   box.innerHTML = 'Загрузка…';
   let series;
   try { series = await fetchJSON(`${API}/schedule`); }
@@ -2454,23 +2475,60 @@ async function loadPipelineProfiles() {
   const box = document.getElementById('pipelineProfileTools');
   try {
     const profiles = await fetchJSON(`${API}/pipeline-insights/profiles`);
-    if (!profiles.length) { box.innerHTML = ''; return; }
-    box.innerHTML = `<select id="pipelineProfileSelect">${profiles.map(p=>`<option value="${escAttr(p.id)}">${esc(p.title)}</option>`).join('')}</select><button class="btn btn-sm btn-ghost" onclick="loadSelectedPipelineInsights(true)">📈 Обновить анализ очереди</button>`;
+    if (!profiles.length) { box.innerHTML = '<span style="color:var(--muted);font-size:12px">Профили не настроены.</span>'; return; }
+    box.innerHTML = `<select id="pipelineProfileSelect" onchange="loadSelectedPipelineInsights(false)">${profiles.map(p=>`<option value="${escAttr(p.id)}">${esc(p.title)}</option>`).join('')}</select><button class="btn btn-sm btn-ghost" onclick="loadSelectedPipelineInsights(true)">↻ Обновить</button>`;
+    loadSelectedPipelineInsights(false);
   } catch(e) { box.innerHTML = `<span style="color:var(--red);font-size:12px">Профили анализа недоступны: ${esc(e.message)}</span>`; }
 }
+
+function openPipelines() {
+  document.getElementById('pipelineModal').classList.add('open');
+  document.getElementById('pipelineInsights').innerHTML = '';
+  loadPipelineProfiles();
+}
+
+function closePipelines() { document.getElementById('pipelineModal').classList.remove('open'); }
 
 function loadSelectedPipelineInsights(refresh=false) {
   const select = document.getElementById('pipelineProfileSelect');
   if (select) loadPipelineInsights(select.value, refresh);
 }
 
-async function loadPipelineInsights(profile='onebase', refresh=false) {
+async function loadPipelineInsights(profile, refresh=false) {
   const box = document.getElementById('pipelineInsights');
   box.innerHTML = '<div class="prov-cmd">Считаю очереди GitHub…</div>';
   try {
     const data = await fetchJSON(`${API}/pipeline-insights/${encodeURIComponent(profile)}${refresh?'?refresh=true':''}`);
-    const rows = data.queues.map(q => `<tr class="${data.bottleneck===q.id?'bottleneck':''}"><td>${data.bottleneck===q.id?'⚠ ':''}${esc(q.title)}</td><td class="num">${q.backlog}</td><td class="num">${q.capacity}</td><td class="num">${q.runs_needed}</td><td>${esc(q.interval || 'нет серии')}</td><td class="insights-recommendation">${esc(q.recommendation || '—')}</td></tr>`).join('');
-    box.innerHTML = `<div style="border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:12px"><b>📈 ${esc(data.title)}</b><div class="prov-cmd">Оценка без учёта нового входящего потока. Цель: разобрать текущую очередь примерно за ${data.target_clear_hours} ч. Human-gate этапы автоматически не ускоряются.</div><table class="insights-table"><colgroup><col style="width:19%"><col style="width:9%"><col style="width:10%"><col style="width:11%"><col style="width:10%"><col style="width:41%"></colgroup><thead><tr><th>Этап</th><th class="num">Очередь</th><th class="num">За прогон</th><th class="num">Прогонов</th><th>Сейчас</th><th>Рекомендация</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+    const h5 = data.history['5h'];
+    const h24 = data.history['24h'];
+    const signed = n => n > 0 ? `+${n}` : String(n);
+    const age = value => value == null ? '—' : value < 24 ? `${Math.round(value)} ч` : `${(value/24).toFixed(1)} д`;
+    const historyNote = h5.complete ? 'за последние 5 часов' : `история ${h5.coverage_hours} из 5 ч`;
+    const runs = h5.runs;
+    const deltaByQueue = h5.queue_deltas || {};
+    const diagnostics = data.diagnostics;
+    const diagnosticFindings = diagnostics && diagnostics.findings ? diagnostics.findings : [];
+    const diagnosticHtml = diagnostics ? `<div style="border:1px solid var(--border);border-radius:6px;padding:9px;margin:10px 0">
+      <b>Проверка текущих инвариантов: ${esc(diagnostics.state)}</b> · ${esc(diagnostics.summary || '')}
+      ${diagnosticFindings.length ? `<ul style="margin:7px 0 0 18px">${diagnosticFindings.slice(0,8).map(f=>`<li class="${f.severity==='red'?'error-text':''}">${f.pr?'PR #'+f.pr+' · ':''}${esc(f.message || f.code)}</li>`).join('')}</ul>` : ''}
+    </div>` : '';
+    const rows = data.queues.map(q => `<tr class="${data.bottleneck===q.id?'bottleneck':''}"><td>${data.bottleneck===q.id?'⚠ ':''}${esc(q.title)}</td><td class="num">${q.backlog}</td><td class="num">${h5.complete?signed(deltaByQueue[q.id]||0):'—'}</td><td class="num">${q.capacity}</td><td class="num">${q.runs_needed}</td><td>${age(q.age.oldest_hours)}</td><td>${esc(q.interval || 'нет серии')}</td><td class="insights-recommendation">${esc(q.recommendation || '—')}</td></tr>`).join('');
+    box.innerHTML = `<div style="border:1px solid var(--border);border-radius:8px;padding:12px;margin-bottom:12px">
+      <div><b>${esc(data.title)}</b><span class="pipeline-health ${escAttr(data.health.state)}">${esc(data.health.label)}</span></div>
+      <div class="prov-cmd">${esc(data.repository)} · ${esc(data.health.reason)} · история хранится локально</div>
+      <div class="pipeline-summary">
+        <div class="pipeline-metric"><div class="pipeline-metric-label">Backlog сейчас</div><div class="pipeline-metric-value">${data.backlog_total}</div><div class="pipeline-metric-note">Δ 5 ч: ${h5.complete?signed(h5.backlog_delta):'копится история'}</div></div>
+        <div class="pipeline-metric"><div class="pipeline-metric-label">Вход / выход</div><div class="pipeline-metric-value">${h5.complete?`${h5.entered} / ${h5.exited}`:'—'}</div><div class="pipeline-metric-note">${historyNote}</div></div>
+        <div class="pipeline-metric"><div class="pipeline-metric-label">Переходы / churn</div><div class="pipeline-metric-value">${h5.complete?`${h5.transitions} / ${h5.churn_items}`:'—'}</div><div class="pipeline-metric-note">между очередями / 3+ состояний</div></div>
+        <div class="pipeline-metric"><div class="pipeline-metric-label">Возраст p90 / max</div><div class="pipeline-metric-value">${age(data.age.p90_hours)} / ${age(data.age.oldest_hours)}</div><div class="pipeline-metric-note">текущие элементы</div></div>
+        <div class="pipeline-metric"><div class="pipeline-metric-label">Прогоны 5 ч</div><div class="pipeline-metric-value">${runs.runs}</div><div class="pipeline-metric-note">готово ${runs.ready} · пусто ${runs.empty}</div></div>
+        <div class="pipeline-metric"><div class="pipeline-metric-label">Смысловые проблемы</div><div class="pipeline-metric-value">${runs.human + runs.unable + runs.failed}</div><div class="pipeline-metric-note">человек ${runs.human} · не смог ${runs.unable} · упало ${runs.failed}</div></div>
+        <div class="pipeline-metric"><div class="pipeline-metric-label">Δ backlog 24 ч</div><div class="pipeline-metric-value">${h24.complete?signed(h24.backlog_delta):'—'}</div><div class="pipeline-metric-note">покрытие ${h24.coverage_hours} из 24 ч</div></div>
+        <div class="pipeline-metric"><div class="pipeline-metric-label">Цель очистки</div><div class="pipeline-metric-value">${data.target_clear_hours} ч</div><div class="pipeline-metric-note">без прогноза нового входа</div></div>
+      </div>
+      ${diagnosticHtml}
+      <table class="insights-table"><thead><tr><th>Этап</th><th class="num">Очередь</th><th class="num">Δ 5 ч</th><th class="num">За прогон</th><th class="num">Прогонов</th><th>Самый старый</th><th>Интервал</th><th>Рекомендация</th></tr></thead><tbody>${rows}</tbody></table>
+    </div>`;
   } catch(e) { box.innerHTML = `<div style="color:var(--red);margin-bottom:10px">Анализ очереди недоступен: ${esc(e.message)}</div>`; }
 }
 

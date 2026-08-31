@@ -940,6 +940,9 @@ WORKTREE_COPY = [p.strip() for p in os.environ.get("PP_WORKTREE_COPY", ".env").s
 
 # How many tasks the worker runs at once. 1 = the historical sequential worker.
 CONCURRENCY = max(1, _int_env("PP_CONCURRENCY", 1))
+# Deterministic external-pipeline snapshots. The API server samples only
+# profiles that match at least one live recurring series; 0 disables sampling.
+PIPELINE_SNAPSHOT_INTERVAL = max(0, _int_env("PP_PIPELINE_SNAPSHOT_INTERVAL", 300))
 # Don't start another agent with less than this much RAM available (MB).
 # Slots alone say nothing about whether the box can carry one more run: what
 # it actually does is swap, and then the API starts refusing. 0 = no check.
