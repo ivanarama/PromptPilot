@@ -3115,6 +3115,7 @@ loadWorkerStatus();
 loadVersion();
 loadCosts();
 refresh();
+if (location.hash === '#pipelines') openPipelines();
 setInterval(refresh, 5000);
 setInterval(() => pollScreen(), 4000);  // только для раскрытой карточки с herdr-панелью
 setInterval(() => wfRefreshScreen(), 4000);  // экран активного task прямо в workflow

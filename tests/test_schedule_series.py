@@ -55,6 +55,7 @@ def test_project_health_attention_overrides_warming_history():
         10, {"5h": {"complete": False}}, 0, diagnostics=diagnostics)
 
     assert health["state"] == "yellow"
+    assert health["label"] == "есть ожидания"
     assert health["reason"] == "нужен человек"
 
 

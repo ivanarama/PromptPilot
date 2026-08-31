@@ -255,7 +255,7 @@ def _health(backlog: int, windows: dict, broken_series: int, paused_series: int 
         return {"state": "yellow", "label": "конвейер на паузе",
                 "reason": f"приостановлено серий: {paused_series}"}
     if diagnostics and diagnostics.get("state") == "yellow":
-        return {"state": "yellow", "label": "нужна проверка",
+        return {"state": "yellow", "label": "есть ожидания",
                 "reason": diagnostics.get("summary", "health-check требует внимания")}
     recent = windows.get("5h", {})
     runs = recent.get("runs", {})
