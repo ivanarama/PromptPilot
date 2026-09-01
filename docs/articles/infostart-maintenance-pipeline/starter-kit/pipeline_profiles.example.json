@@ -1,0 +1,56 @@
+{
+  "profiles": {
+    "PROJECT_KEY": {
+      "title": "PROJECT_KEY: GitHub maintenance",
+      "repository": "OWNER/REPOSITORY",
+      "target_clear_hours": 8,
+      "queues": [
+        {
+          "id": "triage",
+          "title": "Triage",
+          "capacity": 5,
+          "query": "is:issue is:open -label:needs-decision -label:ready-fix -label:approved -label:in-work -label:hold -label:manual",
+          "series_contains": "PROJECT_KEY - TRIAGE",
+          "manual_gate": true
+        },
+        {
+          "id": "fix",
+          "title": "Fix",
+          "capacity": 1,
+          "queries": [
+            "is:issue is:open label:ready-fix,approved -label:in-work -label:hold -label:manual -label:needs-decision",
+            "is:pr is:open label:changes-requested -label:hold -label:needs-decision"
+          ],
+          "series_contains": "PROJECT_KEY - FIX"
+        },
+        {
+          "id": "review",
+          "title": "Review",
+          "capacity": 2,
+          "query": "is:pr is:open draft:false -label:ship -label:reviewed -label:changes-requested -label:needs-decision -label:hold",
+          "series_contains": "PROJECT_KEY - REVIEW"
+        },
+        {
+          "id": "merge",
+          "title": "Merge",
+          "capacity": 3,
+          "query": "is:pr is:open label:ship -label:hold -label:needs-decision",
+          "series_contains": "PROJECT_KEY - MERGE"
+        }
+      ],
+      "health_check": {
+        "command": [
+          "python",
+          "tools/pipeline_health.py",
+          "--repo",
+          "OWNER/REPOSITORY",
+          "--trusted-login",
+          "OWNER",
+          "--json"
+        ],
+        "working_dir": "ABSOLUTE/PATH/TO/REVIEW/CLONE",
+        "timeout_seconds": 60
+      }
+    }
+  }
+}

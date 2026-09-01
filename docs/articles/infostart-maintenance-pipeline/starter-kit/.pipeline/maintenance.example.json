@@ -1,0 +1,17 @@
+{
+  "repository": "OWNER/REPOSITORY",
+  "trusted_login": "OWNER",
+  "project_key": "PROJECT_KEY",
+  "base_branch": "main",
+  "check_commands": [
+    "REPLACE WITH A FAST DETERMINISTIC CHECK",
+    "REPLACE WITH THE PROJECT TEST COMMAND"
+  ],
+  "smoke_commands": [],
+  "limits": {
+    "triage": 5,
+    "fix": 1,
+    "review": 2,
+    "merge": 3
+  }
+}
