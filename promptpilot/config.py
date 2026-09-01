@@ -599,13 +599,18 @@ def provider_is_claude(cfg: dict) -> bool:
 def cmd_runs_claude(cmd: str) -> bool:
     """Шаблон команды запускает сам Claude Code (с путём, .exe и кавычками)."""
     parts = _split_cmd(cmd or "")
-    return bool(parts) and os.path.basename(parts[0]).lower().startswith("claude")
+    return bool(parts) and _command_basename(parts[0]).startswith("claude")
 
 
 def cmd_runs_codex(cmd: str) -> bool:
     """Шаблон команды запускает Codex CLI (с путём, .exe или .cmd)."""
     parts = _split_cmd(cmd or "")
-    return bool(parts) and os.path.basename(parts[0]).lower().startswith("codex")
+    return bool(parts) and _command_basename(parts[0]).startswith("codex")
+
+
+def _command_basename(command: str) -> str:
+    """Return a basename for either path syntax, independent of host OS."""
+    return command.replace("\\", "/").rsplit("/", 1)[-1].lower()
 
 
 def provider_is_codex(cfg: dict) -> bool:
@@ -940,6 +945,9 @@ WORKTREE_COPY = [p.strip() for p in os.environ.get("PP_WORKTREE_COPY", ".env").s
 
 # How many tasks the worker runs at once. 1 = the historical sequential worker.
 CONCURRENCY = max(1, _int_env("PP_CONCURRENCY", 1))
+# Deterministic external-pipeline snapshots. The API server samples only
+# profiles that match at least one live recurring series; 0 disables sampling.
+PIPELINE_SNAPSHOT_INTERVAL = max(0, _int_env("PP_PIPELINE_SNAPSHOT_INTERVAL", 300))
 # Don't start another agent with less than this much RAM available (MB).
 # Slots alone say nothing about whether the box can carry one more run: what
 # it actually does is swap, and then the API starts refusing. 0 = no check.
