@@ -536,23 +536,29 @@ def list_tasks(
 ):
     """statuses — a list of TaskStatus/str values for multi-status filters
     (e.g. the bot's «Активные» view = pending+running+rate_limited)."""
+    select = (
+        "SELECT tasks.*, task_series.title AS series_title, "
+        "COALESCE(task_series.paused, 0) AS series_paused FROM tasks "
+        "LEFT JOIN task_series ON task_series.id = tasks.series_id"
+    )
     with _connect() as conn:
         if statuses:
             vals = [s.value if hasattr(s, "value") else s for s in statuses]
             marks = ",".join("?" * len(vals))
             rows = conn.execute(
-                f"SELECT * FROM tasks WHERE status IN ({marks})"
-                " ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                f"{select} WHERE tasks.status IN ({marks})"
+                " ORDER BY tasks.created_at DESC LIMIT ? OFFSET ?",
                 (*vals, limit, offset),
             ).fetchall()
         elif status:
             rows = conn.execute(
-                "SELECT * FROM tasks WHERE status = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                f"{select} WHERE tasks.status = ? "
+                "ORDER BY tasks.created_at DESC LIMIT ? OFFSET ?",
                 (status.value, limit, offset),
             ).fetchall()
         else:
             rows = conn.execute(
-                "SELECT * FROM tasks ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                f"{select} ORDER BY tasks.created_at DESC LIMIT ? OFFSET ?",
                 (limit, offset),
             ).fetchall()
         return [_row_to_task(r) for r in rows]
