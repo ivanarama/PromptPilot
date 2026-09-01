@@ -248,6 +248,12 @@
     font-family: var(--mono);
     white-space: nowrap;
   }
+  .task-schedule.paused {
+    border: 1px solid var(--yellow);
+    border-radius: 999px;
+    padding: 2px 7px;
+    font-weight: 650;
+  }
 
   /* Expanded detail */
   .task-detail {
@@ -958,6 +964,7 @@ function renderResultMeta(parsed) {
 function scheduleInfo(t) {
   if (t.status === 'completed' || t.status === 'failed' || t.status === 'cancelled') return '';
   if (t.status === 'running') return '<span class="task-schedule">running now</span>';
+  if (t.series_paused) return '<span class="task-schedule paused" title="Recurring series is paused">PAUSED</span>';
   if (t.next_run_at) {
     return `<span class="task-schedule">retry ${formatTime(t.next_run_at)}</span>`;
   }
@@ -978,6 +985,12 @@ function formatTime(iso) {
   if (diff < 3600000) return `in ${Math.ceil(diff / 60000)}m`;
   if (diff < 86400000) return `in ${Math.ceil(diff / 3600000)}h`;
   return d.toLocaleDateString() + ' ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+function taskDisplayTitle(t) {
+  if (t.series_title) return t.series_title;
+  const firstLine = String(t.prompt || '').split(/\r?\n/).find(line => line.trim());
+  return firstLine ? firstLine.trim() : `Task #${t.id}`;
 }
 
 async function loadTasks() {
@@ -1025,7 +1038,7 @@ async function loadTasks() {
       <div class="task-header" onclick="toggleTask(${t.id})">
         <span class="task-id">#${t.id}</span>
         <span class="task-status" data-s="${t.status}">${t.status.replace('_', ' ')}</span>
-        <span class="task-prompt">${esc(t.prompt)}</span>
+        <span class="task-prompt" title="${escAttr(taskDisplayTitle(t))}">${esc(taskDisplayTitle(t))}</span>
         ${t.working_dir ? `<span class="task-meta">📁 ${esc(t.working_dir.split(/[/\\]/).filter(Boolean).pop() || t.working_dir)}</span>` : ''}
         ${t.worktree ? `<span class="task-meta" title="отдельный git worktree">🌿 ${esc(t.worktree_branch || 'worktree')}</span>` : ''}
         ${t.verdict ? `<span class="task-meta" title="итог, которым задача сама себя закрыла">${verdictIcon(t.verdict)} ${esc(t.verdict)}</span>` : ''}
@@ -2494,6 +2507,31 @@ function loadSelectedPipelineInsights(refresh=false) {
   if (select) loadPipelineInsights(select.value, refresh);
 }
 
+function diagnosticStateLabel(state) {
+  return ({green: 'штатно', yellow: 'есть ожидания', red: 'нарушение'})[state] || state;
+}
+
+function aggregateDiagnosticFindings(findings) {
+  const groups = new Map();
+  findings.forEach(finding => {
+    const key = [finding.severity || '', finding.code || '', finding.message || ''].join('\u0000');
+    if (!groups.has(key)) groups.set(key, {...finding, prs: []});
+    if (finding.pr && !groups.get(key).prs.includes(finding.pr)) groups.get(key).prs.push(finding.pr);
+  });
+  return [...groups.values()].sort((a, b) => {
+    const rank = finding => finding.code === 'single_flight_barrier' ? 0 : finding.severity === 'red' ? 1 : 2;
+    return rank(a) - rank(b) || b.prs.length - a.prs.length;
+  });
+}
+
+function renderDiagnosticFinding(finding) {
+  const shown = finding.prs.slice(0, 5).map(pr => `#${pr}`).join(', ');
+  const rest = finding.prs.length > 5 ? ` и ещё ${finding.prs.length - 5}` : '';
+  const prs = finding.prs.length ? `PR ${shown}${rest} · ` : '';
+  const owner = finding.code === 'single_flight_barrier' ? 'Текущий владелец барьера: ' : '';
+  return `<li class="${finding.severity === 'red' ? 'error-text' : ''}">${owner}${prs}${esc(finding.message || finding.code)}</li>`;
+}
+
 async function loadPipelineInsights(profile, refresh=false) {
   const box = document.getElementById('pipelineInsights');
   box.innerHTML = '<div class="prov-cmd">Считаю очереди GitHub…</div>';
@@ -2511,9 +2549,11 @@ async function loadPipelineInsights(profile, refresh=false) {
     const runtime = data.runtime || {};
     const healthLabel = data.health.label === 'нужна проверка' ? 'есть ожидания' : data.health.label;
     const diagnosticFindings = diagnostics && diagnostics.findings ? diagnostics.findings : [];
+    const diagnosticGroups = aggregateDiagnosticFindings(diagnosticFindings);
     const diagnosticHtml = diagnostics ? `<div style="border:1px solid var(--border);border-radius:6px;padding:9px;margin:10px 0">
-      <b>Проверка текущих инвариантов: ${esc(diagnostics.state)}</b> · ${esc(diagnostics.summary || '')}
-      ${diagnosticFindings.length ? `<ul style="margin:7px 0 0 18px">${diagnosticFindings.slice(0,8).map(f=>`<li class="${f.severity==='red'?'error-text':''}">${f.pr?'PR #'+f.pr+' · ':''}${esc(f.message || f.code)}</li>`).join('')}</ul>` : ''}
+      <div><b>Текущая проверка</b><span class="pipeline-health ${escAttr(diagnostics.state)}">${esc(diagnosticStateLabel(diagnostics.state))}</span></div>
+      ${diagnostics.summary ? `<div class="prov-cmd">${esc(diagnostics.summary)}</div>` : ''}
+      ${diagnosticGroups.length ? `<ul style="margin:7px 0 0 18px">${diagnosticGroups.slice(0,8).map(renderDiagnosticFinding).join('')}</ul>` : ''}
     </div>` : '';
     const rows = data.queues.map(q => `<tr class="${data.bottleneck===q.id?'bottleneck':''}"><td>${data.bottleneck===q.id?'⚠ ':''}${esc(q.title)}</td><td class="num">${q.backlog}</td><td class="num">${h5.complete?signed(deltaByQueue[q.id]||0):'—'}</td><td class="num">${q.capacity}</td><td class="num">${q.runs_needed}</td><td>${duration(q.avg_duration_seconds)}</td><td>${q.eta_hours == null ? '—' : q.eta_hours+' ч'}</td><td>${age(q.age.oldest_hours)}</td><td>${esc(q.interval || 'нет серии')}</td><td class="insights-recommendation">${esc(q.recommendation || '—')}</td></tr>`).join('');
     box.innerHTML = `<div style="border:1px solid var(--border);border-radius:8px;padding:12px;margin-bottom:12px">

@@ -168,6 +168,10 @@ def test_pause_hides_series_task_from_runnable_queue(isolated_db):
     assert isolated_db.series_action(task.series_id, "pause")
     assert isolated_db.get_next_runnable() is None
 
+    listed = next(item for item in isolated_db.list_tasks() if item.id == task.id)
+    assert listed.series_title == "Triage"
+    assert listed.series_paused is True
+
     assert isolated_db.series_action(task.series_id, "resume")
     assert isolated_db.get_next_runnable().id == task.id
 

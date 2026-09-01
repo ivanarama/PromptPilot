@@ -102,6 +102,12 @@ def test_schedule_ui_exposes_durable_series_controls():
     assert "insights-table" in html
     assert "Рекомендация" in html
     assert "pipelineProfileSelect" in html
+    assert "taskDisplayTitle(t)" in html
+    assert "if (t.series_paused)" in html
+    assert "PAUSED" in html
+    assert "aggregateDiagnosticFindings" in html
+    assert "Текущий владелец барьера" in html
+    assert "diagnosticGroups.slice(0,8)" in html
 
 
 def test_workflow_setup_preflight_accepts_repo_provider_and_gate(isolated_db, monkeypatch):
