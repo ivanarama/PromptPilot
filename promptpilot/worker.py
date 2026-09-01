@@ -8,6 +8,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -941,6 +942,20 @@ def run_worker():
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
 
+    heartbeat_stop = threading.Event()
+
+    def publish_heartbeat():
+        while not heartbeat_stop.is_set():
+            try:
+                db.touch_worker_heartbeat(os.getpid())
+            except Exception as exc:
+                print(f"Не удалось записать heartbeat worker: {exc}", file=sys.stderr, flush=True)
+            heartbeat_stop.wait(max(1, min(POLL_INTERVAL, 10)))
+
+    heartbeat_thread = threading.Thread(
+        target=publish_heartbeat, name="pp-worker-heartbeat", daemon=True)
+    heartbeat_thread.start()
+
     # Recover tasks stuck in 'running' from a previous crash — but leave alone
     # any whose agent is still working: the worker dying doesn't kill the agent.
     alive = live_task_ids()
@@ -1027,4 +1042,7 @@ def run_worker():
         if in_flight:
             print(f"Жду завершения задач в работе: {len(in_flight)}...")
         pool.shutdown(wait=True)
+    heartbeat_stop.set()
+    heartbeat_thread.join(timeout=2)
+    db.mark_worker_stopped(os.getpid())
     print("Worker stopped.")

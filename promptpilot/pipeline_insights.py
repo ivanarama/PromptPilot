@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from . import db
-from .config import DB_DIR
+from .config import DB_DIR, POLL_INTERVAL, TASK_TIMEOUT
 
 
 DEFAULT_PROFILES: dict = {}
@@ -105,17 +105,38 @@ def _interval_hours(value: str | None) -> float | None:
 
 
 def _recommendation(item: dict, backlog: int, capacity: int,
-                    current_interval: str | None, target_hours: float) -> dict:
+                    current_interval: str | None, target_hours: float,
+                    avg_duration_seconds: int | None = None) -> dict:
     runs_needed = backlog / capacity if backlog else 0
     current_hours = _interval_hours(current_interval)
-    eta = round(runs_needed * current_hours, 1) if current_hours is not None else None
+    duration_hours = max(0, avg_duration_seconds or 0) / 3600
+    cycle_hours = current_hours + duration_hours if current_hours is not None else None
+    eta = round(runs_needed * cycle_hours, 1) if cycle_hours is not None else None
+    throughput = (round(capacity / cycle_hours, 2)
+                  if cycle_hours is not None and cycle_hours > 0 else None)
+    timing = {
+        "avg_duration_seconds": avg_duration_seconds,
+        "cycle_hours": round(cycle_hours, 2) if cycle_hours is not None else None,
+        "throughput_per_hour": throughput,
+    }
     if not backlog:
         return {"recommended_interval": None, "eta_hours": 0,
-                "recommendation": "очередь пуста — можно оставить базовый интервал"}
+                "recommendation": "очередь пуста — можно оставить базовый интервал",
+                **timing}
     if item.get("manual_gate"):
         return {"recommended_interval": None, "eta_hours": eta,
-                "recommendation": "не ускорять автоматически: этап зависит от решения человека"}
-    required = target_hours / runs_needed
+                "recommendation": "не ускорять автоматически: этап зависит от решения человека",
+                **timing}
+    required = target_hours / runs_needed - duration_hours
+    if required <= 0:
+        duration_minutes = round(duration_hours * 60)
+        return {
+            "recommended_interval": _INTERVAL_PRESETS[0][1], "eta_hours": eta,
+            "recommendation": (
+                f"одной частоты недостаточно: прогон занимает около {duration_minutes} мин; "
+                "увеличьте ёмкость или параллелизм"),
+            **timing,
+        }
     recommended_hours, recommended = min(
         _INTERVAL_PRESETS, key=lambda pair: abs(math.log(pair[0]) - math.log(required)))
     if current_hours is None:
@@ -127,7 +148,7 @@ def _recommendation(item: dict, backlog: int, capacity: int,
     else:
         message = f"оставить {current_interval}: очередь примерно за {eta:g} ч"
     return {"recommended_interval": recommended, "eta_hours": eta,
-            "recommendation": message}
+            "recommendation": message, **timing}
 
 
 def _parse_time(value: str | None) -> datetime | None:
@@ -243,8 +264,43 @@ def _run_profile_health_check(profile: dict) -> dict | None:
         }
 
 
+def _pipeline_runtime(matching_series: list[dict], now: datetime) -> dict:
+    runtime = db.worker_runtime_status(
+        now=now, stale_after_seconds=max(30, POLL_INTERVAL * 4))
+    live = [series for series in matching_series
+            if not series.get("ended") and not series.get("paused")]
+    runtime["required"] = bool(live)
+    stalled = []
+    for series in live:
+        if series.get("next_status") != "running":
+            continue
+        started = _parse_time(series.get("next_started_at"))
+        if started is None:
+            continue
+        age_seconds = max(0, round((now - started).total_seconds()))
+        timeout = series.get("task_timeout")
+        timeout = TASK_TIMEOUT if timeout is None else int(timeout)
+        if timeout > 0 and age_seconds > timeout + max(30, POLL_INTERVAL * 4):
+            stalled.append({
+                "series_id": series["id"], "title": series["title"],
+                "task_id": series.get("next_task_id"), "age_seconds": age_seconds,
+                "timeout_seconds": timeout,
+            })
+    runtime["stalled"] = stalled
+    return runtime
+
+
 def _health(backlog: int, windows: dict, broken_series: int, paused_series: int = 0,
-            diagnostics: dict | None = None) -> dict:
+            diagnostics: dict | None = None, runtime: dict | None = None) -> dict:
+    if runtime and runtime.get("required") and runtime.get("state") != "online":
+        age = runtime.get("age_seconds")
+        detail = f"; последний heartbeat {age} сек назад" if age is not None else ""
+        return {"state": "red", "label": "worker не работает",
+                "reason": f"нет свежего heartbeat worker{detail}"}
+    if runtime and runtime.get("stalled"):
+        tasks = ", ".join(f"#{item['task_id']}" for item in runtime["stalled"])
+        return {"state": "red", "label": "зависший запуск",
+                "reason": f"превышен task timeout: {tasks}"}
     if broken_series:
         return {"state": "red", "label": "требует внимания",
                 "reason": f"оборванных серий: {broken_series}"}
@@ -309,6 +365,7 @@ def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True) -> d
         series_ids = []
         broken_series = 0
         paused_series = 0
+        matching_series = []
         all_items = {}
 
         for item in profile["queues"]:
@@ -324,13 +381,15 @@ def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True) -> d
             matching = next((s for s in series
                              if item.get("series_contains", "").lower() in s["title"].lower()), None)
             if matching:
+                matching_series.append(matching)
                 series_ids.append(matching["id"])
                 broken_series += int(bool(matching.get("broken")))
                 paused_series += int(bool(matching.get("paused")))
             runs_needed = round(backlog / capacity, 1)
             recommendation = _recommendation(
                 item, backlog, capacity,
-                matching["effective_recurrence"] if matching else None, target_hours)
+                matching["effective_recurrence"] if matching else None, target_hours,
+                matching.get("avg_duration_seconds") if matching else None)
             age = _age_stats(list(members.values()), now)
             membership_complete = all(search["membership_complete"] for search in searches)
             queues.append({
@@ -356,17 +415,25 @@ def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True) -> d
         windows = {f"{hours}h": _window_metrics(
             history_rows, snapshot, series_ids, now, hours) for hours in _HISTORY_WINDOWS}
 
-        bottleneck = max(queues, key=lambda q: q["runs_needed"], default=None)
+        bottleneck = max(
+            queues,
+            key=lambda q: q["eta_hours"] if q.get("eta_hours") is not None
+            else q["runs_needed"],
+            default=None,
+        )
         backlog_total = sum(queue["backlog"] for queue in queues)
         diagnostics = _run_profile_health_check(profile)
+        runtime = _pipeline_runtime(matching_series, now)
         result = {
             "profile_id": profile_id, "title": profile["title"],
             "repository": profile["repository"], "queues": queues,
             "target_clear_hours": target_hours, "backlog_total": backlog_total,
             "age": _age_stats(list(all_items.values()), now),
             "history": windows,
-            "health": _health(backlog_total, windows, broken_series, paused_series, diagnostics),
+            "health": _health(
+                backlog_total, windows, broken_series, paused_series, diagnostics, runtime),
             "diagnostics": diagnostics,
+            "runtime": runtime,
             "bottleneck": bottleneck["id"] if bottleneck and bottleneck["backlog"] else None,
             "generated_at": now.timestamp(),
         }

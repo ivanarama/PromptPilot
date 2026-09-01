@@ -2503,17 +2503,19 @@ async function loadPipelineInsights(profile, refresh=false) {
     const h24 = data.history['24h'];
     const signed = n => n > 0 ? `+${n}` : String(n);
     const age = value => value == null ? '—' : value < 24 ? `${Math.round(value)} ч` : `${(value/24).toFixed(1)} д`;
+    const duration = seconds => seconds == null ? '—' : seconds < 3600 ? `${Math.round(seconds/60)} мин` : `${(seconds/3600).toFixed(1)} ч`;
     const historyNote = h5.complete ? 'за последние 5 часов' : `история ${h5.coverage_hours} из 5 ч`;
     const runs = h5.runs;
     const deltaByQueue = h5.queue_deltas || {};
     const diagnostics = data.diagnostics;
+    const runtime = data.runtime || {};
     const healthLabel = data.health.label === 'нужна проверка' ? 'есть ожидания' : data.health.label;
     const diagnosticFindings = diagnostics && diagnostics.findings ? diagnostics.findings : [];
     const diagnosticHtml = diagnostics ? `<div style="border:1px solid var(--border);border-radius:6px;padding:9px;margin:10px 0">
       <b>Проверка текущих инвариантов: ${esc(diagnostics.state)}</b> · ${esc(diagnostics.summary || '')}
       ${diagnosticFindings.length ? `<ul style="margin:7px 0 0 18px">${diagnosticFindings.slice(0,8).map(f=>`<li class="${f.severity==='red'?'error-text':''}">${f.pr?'PR #'+f.pr+' · ':''}${esc(f.message || f.code)}</li>`).join('')}</ul>` : ''}
     </div>` : '';
-    const rows = data.queues.map(q => `<tr class="${data.bottleneck===q.id?'bottleneck':''}"><td>${data.bottleneck===q.id?'⚠ ':''}${esc(q.title)}</td><td class="num">${q.backlog}</td><td class="num">${h5.complete?signed(deltaByQueue[q.id]||0):'—'}</td><td class="num">${q.capacity}</td><td class="num">${q.runs_needed}</td><td>${age(q.age.oldest_hours)}</td><td>${esc(q.interval || 'нет серии')}</td><td class="insights-recommendation">${esc(q.recommendation || '—')}</td></tr>`).join('');
+    const rows = data.queues.map(q => `<tr class="${data.bottleneck===q.id?'bottleneck':''}"><td>${data.bottleneck===q.id?'⚠ ':''}${esc(q.title)}</td><td class="num">${q.backlog}</td><td class="num">${h5.complete?signed(deltaByQueue[q.id]||0):'—'}</td><td class="num">${q.capacity}</td><td class="num">${q.runs_needed}</td><td>${duration(q.avg_duration_seconds)}</td><td>${q.eta_hours == null ? '—' : q.eta_hours+' ч'}</td><td>${age(q.age.oldest_hours)}</td><td>${esc(q.interval || 'нет серии')}</td><td class="insights-recommendation">${esc(q.recommendation || '—')}</td></tr>`).join('');
     box.innerHTML = `<div style="border:1px solid var(--border);border-radius:8px;padding:12px;margin-bottom:12px">
       <div><b>${esc(data.title)}</b><span class="pipeline-health ${escAttr(data.health.state)}">${esc(healthLabel)}</span></div>
       <div class="prov-cmd">${esc(data.repository)} · ${esc(data.health.reason)} · история хранится локально</div>
@@ -2526,9 +2528,10 @@ async function loadPipelineInsights(profile, refresh=false) {
         <div class="pipeline-metric"><div class="pipeline-metric-label">Смысловые проблемы</div><div class="pipeline-metric-value">${runs.human + runs.unable + runs.failed}</div><div class="pipeline-metric-note">человек ${runs.human} · не смог ${runs.unable} · упало ${runs.failed}</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Δ backlog 24 ч</div><div class="pipeline-metric-value">${h24.complete?signed(h24.backlog_delta):'—'}</div><div class="pipeline-metric-note">покрытие ${h24.coverage_hours} из 24 ч</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Цель очистки</div><div class="pipeline-metric-value">${data.target_clear_hours} ч</div><div class="pipeline-metric-note">без прогноза нового входа</div></div>
+        <div class="pipeline-metric"><div class="pipeline-metric-label">Worker</div><div class="pipeline-metric-value">${runtime.state==='online'?'online':'offline'}</div><div class="pipeline-metric-note">${runtime.age_seconds == null ? 'heartbeat отсутствует' : 'heartbeat '+runtime.age_seconds+' сек назад'}</div></div>
       </div>
       ${diagnosticHtml}
-      <table class="insights-table"><thead><tr><th>Этап</th><th class="num">Очередь</th><th class="num">Δ 5 ч</th><th class="num">За прогон</th><th class="num">Прогонов</th><th>Самый старый</th><th>Интервал</th><th>Рекомендация</th></tr></thead><tbody>${rows}</tbody></table>
+      <table class="insights-table"><thead><tr><th>Этап</th><th class="num">Очередь</th><th class="num">Δ 5 ч</th><th class="num">За прогон</th><th class="num">Прогонов</th><th>Средний запуск</th><th>ETA</th><th>Самый старый</th><th>Интервал</th><th>Рекомендация</th></tr></thead><tbody>${rows}</tbody></table>
     </div>`;
   } catch(e) { box.innerHTML = `<div style="color:var(--red);margin-bottom:10px">Анализ очереди недоступен: ${esc(e.message)}</div>`; }
 }
