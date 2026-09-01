@@ -794,6 +794,7 @@ def list_series() -> list:
                 "next_task_id": active["id"] if active else None,
                 "next_status": active["status"] if active else None,
                 "next_run_at": active["scheduled_at"] if active else None,
+                "next_started_at": active["started_at"] if active else None,
                 "last_task_id": last["id"] if last else None,
                 "last_status": last["status"] if last else None,
                 "last_at": (last["completed_at"] or last["started_at"]) if last else None,
@@ -1051,6 +1052,48 @@ def get_setting(key: str, default: str = None) -> Optional[str]:
 def set_setting(key: str, value: str):
     with _connect() as conn:
         conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
+
+
+def touch_worker_heartbeat(pid: int, now: Optional[datetime] = None):
+    """Publish a portable worker liveness signal for the server and dashboards."""
+    stamp = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    payload = {"pid": int(pid), "heartbeat_at": stamp.isoformat(), "stopped": False}
+    set_setting("worker_runtime", json.dumps(payload, separators=(",", ":")))
+
+
+def mark_worker_stopped(pid: int, now: Optional[datetime] = None):
+    """Make a graceful worker stop visible immediately instead of after TTL."""
+    stamp = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    payload = {"pid": int(pid), "heartbeat_at": stamp.isoformat(), "stopped": True}
+    set_setting("worker_runtime", json.dumps(payload, separators=(",", ":")))
+
+
+def worker_runtime_status(now: Optional[datetime] = None,
+                          stale_after_seconds: int = 30) -> dict:
+    """Return heartbeat age without relying on platform-specific process APIs."""
+    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    raw = get_setting("worker_runtime")
+    if not raw:
+        return {
+            "state": "offline", "heartbeat_at": None, "age_seconds": None,
+            "pid": None, "paused": is_paused(),
+        }
+    try:
+        payload = json.loads(raw)
+        heartbeat = _parse_dt(payload.get("heartbeat_at"))
+        age = max(0, round((current - heartbeat).total_seconds())) if heartbeat else None
+        online = not payload.get("stopped") and age is not None and age <= stale_after_seconds
+        return {
+            "state": "online" if online else "offline",
+            "heartbeat_at": heartbeat.isoformat() if heartbeat else None,
+            "age_seconds": age, "pid": payload.get("pid"),
+            "paused": is_paused(),
+        }
+    except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+        return {
+            "state": "offline", "heartbeat_at": None, "age_seconds": None,
+            "pid": None, "paused": is_paused(),
+        }
 
 
 def is_paused() -> bool:

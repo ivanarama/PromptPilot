@@ -854,7 +854,7 @@ def api_usage(hours: float = 5.0):
 
 @app.get("/api/worker/status")
 def api_worker_status():
-    return {"paused": db.is_paused()}
+    return db.worker_runtime_status()
 
 
 @app.post("/api/worker/pause")

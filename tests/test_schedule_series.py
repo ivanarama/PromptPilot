@@ -67,6 +67,57 @@ def test_paused_series_is_visible_without_history():
     assert health["label"] == "конвейер на паузе"
 
 
+def test_missing_worker_heartbeat_is_red_for_active_pipeline():
+    health = pipeline_insights._health(
+        10, {"5h": {"complete": True}}, 0,
+        runtime={"required": True, "state": "offline", "age_seconds": 47})
+
+    assert health["state"] == "red"
+    assert health["label"] == "worker не работает"
+    assert "47 сек" in health["reason"]
+
+
+def test_worker_heartbeat_reports_online_stale_and_graceful_stop(isolated_db):
+    now = datetime(2026, 9, 1, 10, 0, tzinfo=timezone.utc)
+
+    isolated_db.touch_worker_heartbeat(1234, now)
+    online = isolated_db.worker_runtime_status(now + timedelta(seconds=20), 30)
+    stale = isolated_db.worker_runtime_status(now + timedelta(seconds=31), 30)
+    isolated_db.mark_worker_stopped(1234, now + timedelta(seconds=32))
+    stopped = isolated_db.worker_runtime_status(now + timedelta(seconds=33), 30)
+
+    assert online["state"] == "online"
+    assert online["pid"] == 1234
+    assert stale["state"] == "offline"
+    assert stopped["state"] == "offline"
+
+
+def test_eta_includes_execution_duration_and_exposes_capacity_limit():
+    result = pipeline_insights._recommendation(
+        {"id": "fix"}, backlog=26, capacity=1, current_interval="15m",
+        target_hours=8, avg_duration_seconds=1800)
+
+    assert result["cycle_hours"] == 0.75
+    assert result["eta_hours"] == 19.5
+    assert result["throughput_per_hour"] == 1.33
+    assert result["recommended_interval"] == "15m"
+    assert "увеличьте ёмкость" in result["recommendation"]
+
+
+def test_running_past_timeout_is_reported_as_stalled(isolated_db):
+    now = datetime.now(timezone.utc)
+    isolated_db.touch_worker_heartbeat(1234, now)
+    runtime = pipeline_insights._pipeline_runtime([{
+        "id": 9, "title": "Project - FIX", "ended": False, "paused": False,
+        "next_status": "running", "next_started_at": (now - timedelta(hours=2)).isoformat(),
+        "next_task_id": 77, "task_timeout": 3600,
+    }], now)
+
+    assert runtime["state"] == "online"
+    assert runtime["required"] is True
+    assert runtime["stalled"][0]["task_id"] == 77
+
+
 def test_recurring_task_creates_durable_series(isolated_db):
     task = isolated_db.create_task(TaskCreate(
         prompt="ExampleProject - FIX\nDo one fix", working_dir=r"D:\Projects\example",

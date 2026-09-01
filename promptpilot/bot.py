@@ -895,21 +895,30 @@ def _pipeline_text(data: dict) -> str:
              f"Вход / выход / переходы: {recent.get('entered', 0)} / "
              f"{recent.get('exited', 0)} / {recent.get('transitions', 0)}; покрытие {coverage}",
              f"Цель оценки: текущая очередь примерно за {data['target_clear_hours']:g} ч.", ""]
+    runtime = data.get("runtime", {})
+    if runtime:
+        heartbeat = runtime.get("age_seconds")
+        lines.insert(2, f"Worker: {runtime.get('state', '—')}"
+                        + (f", heartbeat {heartbeat} сек назад" if heartbeat is not None else ""))
     diagnostics = data.get("diagnostics")
     if diagnostics:
         lines.insert(3, f"Инварианты: {diagnostics.get('state', '—')} — "
                         f"{diagnostics.get('summary', 'нет описания')}")
     for queue in data["queues"]:
         marker = "⚠" if queue["id"] == data["bottleneck"] else "•"
+        duration = queue.get("avg_duration_seconds")
+        duration_text = (f"{round(duration / 60)} мин" if duration is not None else "нет истории")
+        eta = queue.get("eta_hours")
         lines.append(f"{marker} {queue['title']}: {queue['backlog']} / "
                      f"{queue['capacity']} за прогон = {queue['runs_needed']} прогонов; "
-                     f"сейчас {queue['interval'] or 'не настроено'}\n"
+                     f"сейчас {queue['interval'] or 'не настроено'}; "
+                     f"средний запуск {duration_text}; ETA {eta if eta is not None else '—'} ч\n"
                      f"   Рекомендация: {queue['recommendation']}")
     runs = recent.get("runs", {})
     lines.extend(["", f"Прогоны за окно: {runs.get('runs', 0)}; готово {runs.get('ready', 0)}, "
                   f"нужен человек {runs.get('human', 0)}, не смог {runs.get('unable', 0)}, "
                   f"упало {runs.get('failed', 0)}.",
-                  "⚠ — текущее узкое место по backlog / ёмкость запуска."])
+                  "⚠ — текущее узкое место по ETA с учётом интервала и средней длительности."])
     return "\n".join(lines)
 
 
