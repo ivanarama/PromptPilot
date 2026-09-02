@@ -8,11 +8,25 @@ $ErrorActionPreference = "Stop"
 
 Write-Host "=== PromptPilot Build ===" -ForegroundColor Cyan
 
-# Install pyinstaller if missing
-python -m PyInstaller --version 2>$null | Out-Null
-if ($LASTEXITCODE -ne 0) {
+$python = "python"
+if (Test-Path -LiteralPath "$PSScriptRoot\.venv\Scripts\python.exe" -PathType Leaf) {
+    $python = "$PSScriptRoot\.venv\Scripts\python.exe"
+}
+Write-Host "Using: $python" -ForegroundColor DarkGray
+
+# Install pyinstaller if missing. Windows PowerShell turns redirected native
+# stderr into an ErrorRecord, so probe it without the script-wide Stop policy.
+$savedErrorActionPreference = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+& $python -m PyInstaller --version 2>$null | Out-Null
+$pyInstallerMissing = $LASTEXITCODE -ne 0
+$ErrorActionPreference = $savedErrorActionPreference
+if ($pyInstallerMissing) {
     Write-Host "Installing PyInstaller..." -ForegroundColor Yellow
-    python -m pip install pyinstaller
+    & $python -m pip install pyinstaller
+    if ($LASTEXITCODE -ne 0) {
+        throw "Cannot install PyInstaller."
+    }
 }
 
 # Clean previous build
@@ -22,10 +36,10 @@ if (Test-Path build) { Remove-Item build -Recurse -Force }
 # Build
 if ($Debug) {
     Write-Host "Building pp.exe (debug)..." -ForegroundColor Yellow
-    python -m PyInstaller pp.spec --clean --debug all
+    & $python -m PyInstaller pp.spec --clean --debug all
 } else {
     Write-Host "Building pp.exe..." -ForegroundColor Yellow
-    python -m PyInstaller pp.spec --clean
+    & $python -m PyInstaller pp.spec --clean
 }
 
 if (Test-Path "dist\pp.exe") {
