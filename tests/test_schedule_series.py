@@ -217,6 +217,22 @@ def test_dependency_defer_returns_claimed_task_without_retry(isolated_db):
     assert deferred.error == "waiting for review"
 
 
+def test_successful_retry_clears_stale_error_and_backoff(isolated_db):
+    task = isolated_db.create_task(TaskCreate(prompt="Fix"))
+    claimed = isolated_db.get_next_runnable()
+    isolated_db.mark_rate_limited(
+        claimed.id, datetime.now(timezone.utc) - timedelta(minutes=1), "old failure",
+    )
+    retried = isolated_db.get_next_runnable()
+
+    isolated_db.mark_completed(retried.id, "done")
+
+    completed = isolated_db.get_task(task.id)
+    assert completed.status.value == "completed"
+    assert completed.error is None
+    assert completed.next_run_at is None
+
+
 def test_temporary_boost_returns_to_base_after_consecutive_empty(isolated_db):
     task = isolated_db.create_task(TaskCreate(prompt="Merge", recurrence="2h"))
     isolated_db.update_series(task.series_id, {

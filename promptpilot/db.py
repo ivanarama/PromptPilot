@@ -672,7 +672,9 @@ def mark_completed(task_id: int, result: str, exit_code: int = 0, model_used: st
     clear_note(task_id)
     with _connect() as conn:
         conn.execute(
-            "UPDATE tasks SET status = 'completed', result = ?, exit_code = ?, completed_at = ?, model_used = ?, session_id = COALESCE(?, session_id) WHERE id = ?",
+            "UPDATE tasks SET status = 'completed', result = ?, error = NULL, "
+            "next_run_at = NULL, exit_code = ?, completed_at = ?, model_used = ?, "
+            "session_id = COALESCE(?, session_id) WHERE id = ?",
             (result, exit_code, _now(), model_used, session_id, task_id),
         )
         _drop_cancel_flag(conn, task_id)
