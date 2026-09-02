@@ -366,6 +366,45 @@ def test_dispatch_gate_defers_dependency_without_provider(isolated_db, monkeypat
     assert gate["defer_for"] == "7m"
     assert "review_candidates" in gate["reason"]
 
+
+def test_dispatch_gate_defers_only_matching_diagnostic_stages(isolated_db, monkeypatch):
+    task = isolated_db.create_task(TaskCreate(
+        prompt="ExampleProject - MERGE", recurrence="2h",
+    ))
+    profile = {
+        "title": "Example", "repository": "owner/example",
+        "queues": [{
+            "id": "merge", "title": "Merge", "query": "is:pr label:ship",
+            "series_contains": "ExampleProject - MERGE",
+            "dispatch_gate": {
+                "defer_when_diagnostics_match": [{
+                    "field": "review_candidates", "key": "stage",
+                    "values": ["integration-review", "legacy-integration-review"],
+                }],
+                "defer_for": "7m",
+            },
+        }],
+    }
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"example": profile})
+    diagnostics = {"review_candidates": [
+        {"number": 42, "stage": "legacy-integration-review"},
+        {"number": 43, "stage": "integration-merge-ready"},
+    ]}
+    monkeypatch.setattr(pipeline_insights, "analyze", lambda *args, **kwargs: {
+        "queues": [{"id": "merge", "title": "Merge", "backlog": 2}],
+        "diagnostics": diagnostics,
+    })
+
+    gate = pipeline_insights.dispatch_gate(task)
+    assert gate["action"] == "defer"
+    assert "совпал (1)" in gate["reason"]
+
+    diagnostics["review_candidates"] = [
+        {"number": 43, "stage": "integration-merge-ready"},
+        {"number": 44, "stage": "integration-merge-recovery"},
+    ]
+    assert pipeline_insights.dispatch_gate(task) is None
+
 def test_pipeline_insights_history_is_profile_scoped_and_tracks_movement(isolated_db, monkeypatch):
     profile = {
         "title": "OtherProject pipeline", "repository": "owner/other",

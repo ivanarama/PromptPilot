@@ -757,7 +757,11 @@ Worker публикует heartbeat в общей SQLite БД. Активный 
           "series_contains": "MyProject - MERGE",
           "dispatch_gate": {
             "skip_when_empty": true,
-            "defer_when_diagnostics_nonempty": ["review_candidates"],
+            "defer_when_diagnostics_match": [{
+              "field": "review_candidates",
+              "key": "stage",
+              "values": ["integration-review", "legacy-integration-review"]
+            }],
             "defer_for": "10m"
           }
         }
@@ -784,10 +788,12 @@ PromptPilot запускает её при каждом снимке и пока
 `dispatch_gate` тоже необязателен и настраивается у конкретного этапа. Перед
 запуском провайдера PromptPilot получает свежий снимок профиля. При
 `skip_when_empty` пустой запуск завершается как `ПУСТО`, не запуская LLM. Поле
-`defer_when_diagnostics_nonempty` задаёт зависимости через массивы из JSON
-`health_check`: в примере MERGE возвращается в pending на 10 минут, пока checker
-видит `review_candidates`. Это даёт автоматический порядок REVIEW → MERGE даже
-при более высоком приоритете MERGE и не расходует токены на ожидание. Если
+`defer_when_diagnostics_nonempty` задаёт простую зависимость от непустого массива
+в JSON `health_check`. Когда один массив содержит несколько состояний, используйте
+`defer_when_diagnostics_match`: в примере MERGE возвращается в pending только для
+элементов со stage `integration-review`/`legacy-integration-review`, но проходит
+для `integration-merge-ready`. Это даёт автоматический порядок REVIEW → MERGE
+даже при более высоком приоритете MERGE и не расходует токены на ожидание. Если
 профиль или checker сломан, gate fail-open: задача запускается обычным способом,
 чтобы ошибка наблюдаемости не остановила полезную работу.
 
