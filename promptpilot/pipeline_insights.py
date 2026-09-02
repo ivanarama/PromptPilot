@@ -356,6 +356,35 @@ def _tool_available(execution: dict, command: list[str], working_dir: str | None
     return True, "инструмент доступен"
 
 
+def _tool_preflight(execution: dict, command: list[str], working_dir: str | None) -> dict:
+    root = Path(working_dir or os.getcwd())
+    try:
+        result = subprocess.run(
+            command, cwd=str(root), capture_output=True, text=True,
+            timeout=max(1, min(int(execution.get("timeout_seconds", 180)), 900)),
+            encoding="utf-8", errors="replace",
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"pipeline preflight не выполнен: {exc}") from exc
+    if len(result.stdout) > 131072:
+        raise RuntimeError("pipeline preflight вернул слишком большой ответ")
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        detail = (result.stderr or result.stdout or "пустой ответ").strip().splitlines()
+        raise RuntimeError(
+            f"pipeline preflight вернул неверный JSON: {detail[-1] if detail else exc}"
+        ) from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("action"), str):
+        raise RuntimeError("pipeline preflight должен вернуть JSON-объект с action")
+    if result.returncode and payload.get("action") != "error":
+        raise RuntimeError(
+            (result.stderr or payload.get("reason") or
+             f"pipeline preflight завершился с кодом {result.returncode}").strip()
+        )
+    return payload
+
+
 def execution_route(task, fallback_prompt: str, working_dir: str | None = None) -> dict:
     """Choose the project tool or the original skill prompt without invoking an LLM.
 
@@ -399,23 +428,82 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None) 
             "profile_id": profile_id, "queue_id": queue.get("id"),
         }
 
+    try:
+        preflight = _tool_preflight(execution, command, working_dir)
+    except RuntimeError as exc:
+        reason = str(exc)
+        if mode == "auto":
+            return {
+                "action": "prompt", "mode": "skill", "prompt": fallback_prompt,
+                "fallback_reason": reason, "profile_id": profile_id,
+                "queue_id": queue.get("id"),
+            }
+        return {
+            "action": "block", "mode": "tool", "reason": reason,
+            "profile_id": profile_id, "queue_id": queue.get("id"),
+        }
+
+    preflight_action = preflight["action"].lower()
+    preflight_reason = str(preflight.get("reason") or preflight_action)
+    if preflight_action in {"empty", "wait"}:
+        return {
+            "action": "complete_empty", "mode": "tool", "reason": preflight_reason,
+            "verdict": str(preflight.get("verdict") or "ПУСТО"),
+            "profile_id": profile_id, "queue_id": queue.get("id"),
+            "preflight": preflight,
+        }
+    if preflight_action in {"fallback", "error"}:
+        if mode == "auto":
+            return {
+                "action": "prompt", "mode": "skill", "prompt": fallback_prompt,
+                "fallback_reason": preflight_reason, "profile_id": profile_id,
+                "queue_id": queue.get("id"), "preflight": preflight,
+            }
+        return {
+            "action": "block", "mode": "tool", "reason": preflight_reason,
+            "profile_id": profile_id, "queue_id": queue.get("id"),
+            "preflight": preflight,
+        }
+    if preflight_action not in {"audit", "merge"}:
+        reason = f"pipeline preflight вернул неподдерживаемое action={preflight_action}"
+        if mode == "auto":
+            return {
+                "action": "prompt", "mode": "skill", "prompt": fallback_prompt,
+                "fallback_reason": reason, "profile_id": profile_id,
+                "queue_id": queue.get("id"), "preflight": preflight,
+            }
+        return {
+            "action": "block", "mode": "tool", "reason": reason,
+            "profile_id": profile_id, "queue_id": queue.get("id"),
+        }
+
     rendered = subprocess.list2cmdline(command)
     prompt = execution.get("prompt")
-    if not isinstance(prompt, str) or not prompt.strip():
+    custom_prompt = isinstance(prompt, str) and bool(prompt.strip())
+    if not custom_prompt:
         prompt = (
             f"Запусти `{rendered}` из корня проекта и следуй его JSON-ответу. "
             "Инструмент выбирает цель и проверяет изменяемое состояние; сам оцени только "
             "код, дифф и результаты тестов. Если он вернул action=fallback, выполни "
             "исходный скилл ниже. Не заменяй отказ инструмента ручными GitHub-мутациями."
         )
+    if not custom_prompt:
+        prompt = (
+            f"PromptPilot уже выполнил `{rendered}` и зафиксировал цель и lease. "
+            "Не запускай next повторно. Проверь только код, diff и тесты, затем вызови complete "
+            "с lease из JSON ниже. Не заменяй отказ complete ручными GitHub-мутациями."
+        )
     prompt = (
         f"{prompt.strip()}\n\n"
+        "Результат preflight (точные данные):\n"
+        f"```json\n{json.dumps(preflight, ensure_ascii=False, indent=2)}\n```\n\n"
         "Исходный скилл для fallback:\n"
         f"{fallback_prompt.strip()}"
     )
     return {
         "action": "prompt", "mode": "tool", "prompt": prompt,
-        "command": command, "profile_id": profile_id, "queue_id": queue.get("id"),
+        "command": command, "preflight": preflight,
+        "profile_id": profile_id, "queue_id": queue.get("id"),
     }
 
 
