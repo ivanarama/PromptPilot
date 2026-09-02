@@ -686,6 +686,19 @@ def _execute_task_inner(task):
             )
             print(f"  -> Blocked without agent: {reason}")
             return
+        if route["action"] == "complete_empty":
+            reason = route["reason"]
+            verdict = route.get("verdict") or "ПУСТО"
+            db.set_verdict(task.id, verdict)
+            db.mark_completed(
+                task.id,
+                f"Pipeline preflight PromptPilot: {reason}\n"
+                "Провайдер не запускался, токены не потрачены.\n\n"
+                f"ИТОГ: {verdict} ({reason})",
+                exit_code=0,
+            )
+            print(f"  -> Pipeline preflight completed without agent: {reason}")
+            return
         agent_prompt = route["prompt"]
         if route.get("fallback_reason"):
             print(f"  -> Pipeline tool unavailable, using skill: {route['fallback_reason']}")
