@@ -236,6 +236,7 @@ def _run_profile_health_check(profile: dict) -> dict | None:
             isinstance(value, str) and value for value in command):
         return {
             "state": "red", "summary": "health_check настроен неверно",
+            "checker_failed": True,
             "findings": [{"severity": "red", "code": "invalid_health_check",
                           "message": "command должен быть непустым массивом строк"}],
         }
@@ -246,7 +247,7 @@ def _run_profile_health_check(profile: dict) -> dict | None:
         run = subprocess.run(
             command, cwd=config.get("working_dir") or None, env=env,
             capture_output=True, text=True,
-            timeout=max(1, min(int(config.get("timeout_seconds", 60)), 300)),
+            timeout=max(1, min(int(config.get("timeout_seconds", 180)), 900)),
             encoding="utf-8", errors="replace",
         )
         payload = json.loads(run.stdout)
@@ -259,6 +260,7 @@ def _run_profile_health_check(profile: dict) -> dict | None:
     except (OSError, subprocess.TimeoutExpired, ValueError, json.JSONDecodeError) as exc:
         return {
             "state": "red", "summary": f"health-check не выполнен: {exc}",
+            "checker_failed": True,
             "findings": [{"severity": "red", "code": "health_check_failed",
                           "message": str(exc)}],
         }
@@ -304,6 +306,9 @@ def _health(backlog: int, windows: dict, broken_series: int, paused_series: int 
     if broken_series:
         return {"state": "red", "label": "требует внимания",
                 "reason": f"оборванных серий: {broken_series}"}
+    if diagnostics and diagnostics.get("checker_failed"):
+        return {"state": "red", "label": "диагностика не выполнена",
+                "reason": diagnostics.get("summary", "health-check недоступен")}
     if diagnostics and diagnostics.get("state") == "red":
         return {"state": "red", "label": "нарушен инвариант",
                 "reason": diagnostics.get("summary", "health-check обнаружил ошибку")}
@@ -396,6 +401,8 @@ def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True) -> d
                 "id": item["id"], "title": item["title"], "backlog": backlog,
                 "capacity": capacity, "runs_needed": runs_needed,
                 "series_id": matching["id"] if matching else None,
+                "task_id": matching.get("next_task_id") if matching else None,
+                "task_status": matching.get("next_status") if matching else None,
                 "interval": matching["effective_recurrence"] if matching else None,
                 "failure_rate": matching["failure_rate"] if matching else None,
                 "empty_rate": matching["empty_rate"] if matching else None,
