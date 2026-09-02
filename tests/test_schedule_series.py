@@ -3,7 +3,7 @@ import os
 from types import SimpleNamespace
 
 from promptpilot.models import TaskCreate
-from promptpilot import pipeline_insights
+from promptpilot import pipeline_insights, worker
 
 
 PIPELINE_PROFILE = {
@@ -487,6 +487,32 @@ def test_pipeline_execution_empty_completes_without_provider(isolated_db, monkey
     assert route["action"] == "complete_empty"
     assert route["verdict"] == "ПУСТО"
     assert route["reason"] == "queue is empty"
+
+
+def test_worker_settles_preflight_empty_without_loading_provider(isolated_db, monkeypatch):
+    task = isolated_db.create_task(TaskCreate(
+        prompt="ExampleProject - REVIEW", recurrence="4h",
+    ))
+    task = isolated_db.get_next_runnable()
+    monkeypatch.setattr(pipeline_insights, "dispatch_gate", lambda _task: None)
+    monkeypatch.setattr(
+        pipeline_insights, "execution_route",
+        lambda *_args, **_kwargs: {
+            "action": "complete_empty", "mode": "tool",
+            "reason": "queue is empty", "verdict": "ПУСТО",
+        },
+    )
+    monkeypatch.setattr(
+        worker, "load_providers",
+        lambda: (_ for _ in ()).throw(AssertionError("provider must not be loaded")),
+    )
+
+    worker._execute_task_inner(task)
+
+    settled = isolated_db.get_task(task.id)
+    assert settled.status.value == "completed"
+    assert settled.verdict == "ПУСТО"
+    assert "токены не потрачены" in settled.result
 
 
 def test_pipeline_execution_tool_fallback_skips_preflight_prompt(isolated_db, monkeypatch, tmp_path):
