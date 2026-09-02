@@ -2526,7 +2526,7 @@ function aggregateDiagnosticFindings(findings) {
 
 function diagnosticFindingMessage(finding) {
   const messages = {
-    single_flight_barrier: 'Пока этот PR не завершит цикл REVIEW → MERGE, остальные остаются в очереди.',
+    single_flight_barrier: 'Интеграционная полоса занята этим PR; обычное содержательное ревью других PR продолжает работать.',
     legacy_ship_waiting_review_validation: 'Переход со старого формата: очередь безопасно перепроверит эти PR перед слиянием.',
     base_sync_base_advanced: 'Ветка main обновилась после подготовки PR; перед слиянием нужна повторная синхронизация.',
     health_check_failed: 'Сама проверка состояния не завершилась. Повторите обновление; это ещё не означает нарушение конвейера.',
@@ -2545,7 +2545,7 @@ function renderDiagnosticFinding(finding, data) {
   const rest = finding.prs.length > 5 ? ` и ещё ${finding.prs.length - 5}` : '';
   const prefix = finding.prs.length
     ? finding.code === 'single_flight_barrier'
-      ? `${queueTaskIsRunning(data, 'review') ? 'Сейчас на ревью' : 'Первый в очереди'}: ${shown}${rest} · `
+      ? `Интеграционный владелец: ${shown}${rest} · `
       : `PR ${shown}${rest} · `
     : '';
   return `<li class="${finding.severity === 'red' ? 'error-text' : ''}">${prefix}${esc(diagnosticFindingMessage(finding))}</li>`;
@@ -2555,11 +2555,22 @@ function diagnosticOverview(data) {
   const diagnostics = data.diagnostics || {};
   const parts = [];
   const review = diagnostics.review_candidates || [];
+  const reviewBacklog = diagnostics.review_backlog || review;
+  const content = diagnostics.content_review_candidates || [];
+  const waitingShip = diagnostics.reviewed_waiting_ship || [];
+  const merge = diagnostics.merge_candidates || [];
+  const owner = diagnostics.integration_owner;
   const fix = diagnostics.fix_candidates || [];
   const human = diagnostics.human_waiting || [];
   const findings = diagnostics.findings || [];
   const legacy = findings.filter(f => f.code === 'legacy_ship_waiting_review_validation').length;
-  if (review.length) parts.push(`${queueTaskIsRunning(data, 'review') ? 'сейчас на ревью' : 'следующий в очереди на ревью'}: #${review[0].number}`);
+  if (queueTaskIsRunning(data, 'review')) parts.push('REVIEW сейчас выполняется');
+  if (reviewBacklog.length) parts.push(`всего ждут REVIEW: ${reviewBacklog.length}`);
+  if (review.length) parts.push(`к REVIEW готовы: ${review.length} (следующий #${review[0].number})`);
+  if (content.length) parts.push(`содержательная очередь: ${content.length}`);
+  if (owner) parts.push(`интеграция: #${owner.number} · ${owner.stage}`);
+  if (waitingShip.length) parts.push(`прошли ревью, ждут ship: ${waitingShip.length}`);
+  if (merge.length) parts.push(`готовы к слиянию: ${merge.length}`);
   if (fix.length) parts.push(`готовы к исправлению: ${fix.length}`);
   if (human.length) parts.push(`ждут решения человека: ${human.length}`);
   if (legacy) parts.push(`переходят со старого формата: ${legacy}`);

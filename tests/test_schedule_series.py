@@ -335,6 +335,38 @@ def test_pipeline_insights_exposes_actual_series_task_status(isolated_db, monkey
     assert review["task_status"] == "running"
 
 
+def test_pipeline_backlog_can_use_exact_project_diagnostics(isolated_db, monkeypatch):
+    profile = {
+        "title": "Example", "repository": "owner/example",
+        "health_check": {"command": ["health"]},
+        "queues": [{
+            "id": "review", "title": "Review", "capacity": 2,
+            "query": "is:pr", "series_contains": "REVIEW",
+            "backlog_diagnostic_field": "review_candidates",
+        }],
+    }
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"example": profile})
+    monkeypatch.setattr(pipeline_insights, "_run_profile_health_check", lambda _profile: {
+        "state": "green", "review_candidates": [{"number": 2}], "findings": [],
+    })
+    monkeypatch.setattr(pipeline_insights, "_github_search", lambda _repo, _query: {
+        "count": 3, "membership_complete": True,
+        "items": [
+            {"key": f"pr:{number}", "kind": "pr", "number": number,
+             "title": f"PR {number}", "labels": [], "created_at": "2026-09-01T00:00:00Z"}
+            for number in (1, 2, 3)
+        ],
+    })
+    pipeline_insights._cache.clear()
+
+    result = pipeline_insights.analyze("example", [], use_cache=False)
+    review = result["queues"][0]
+    assert review["backlog"] == 1
+    assert [item["number"] for item in review["items"]] == []  # priority UI is opt-in
+    snapshot = isolated_db.list_pipeline_snapshots("example")[-1]["payload"]
+    assert snapshot["queues"]["review"]["backlog"] == 1
+
+
 def test_pipeline_item_priority_manual_override_and_aging():
     settings = pipeline_insights._priority_settings({"priority_control": {"aging_hours": 24}})
     now = datetime(2026, 9, 2, tzinfo=timezone.utc)
@@ -471,6 +503,92 @@ def test_dispatch_gate_defers_only_matching_diagnostic_stages(isolated_db, monke
         {"number": 44, "stage": "integration-merge-recovery"},
     ]
     assert pipeline_insights.dispatch_gate(task) is None
+
+
+def test_productive_completion_wakes_every_ready_stage(monkeypatch):
+    profile = {
+        "title": "Example", "repository": "owner/example",
+        "queues": [
+            {"id": "fix", "series_contains": "Example - FIX"},
+            {"id": "review", "series_contains": "Example - REVIEW",
+             "wake_when": {"field": "review_candidates"}},
+            {"id": "merge", "series_contains": "Example - MERGE",
+             "wake_when": {"field": "integration_owner", "key": "stage",
+                           "values": ["integration-merge-ready"]}},
+        ],
+    }
+    series = [
+        {"id": 7, "title": "Example - REVIEW", "paused": False, "ended": False},
+        {"id": 8, "title": "Example - MERGE", "paused": False, "ended": False},
+    ]
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"example": profile})
+    monkeypatch.setattr(pipeline_insights.db, "list_series", lambda: series)
+    monkeypatch.setattr(pipeline_insights, "analyze", lambda *args, **kwargs: {
+        "diagnostics": {
+            "review_candidates": [{"number": 42}],
+            "integration_owner": {"number": 10, "stage": "integration-merge-ready"},
+        },
+    })
+    calls = []
+    monkeypatch.setattr(
+        pipeline_insights.db, "series_action",
+        lambda series_id, action: calls.append((series_id, action)) or True,
+    )
+    task = SimpleNamespace(series_id=1, series_title="Example - FIX", prompt="Example - FIX")
+
+    assert pipeline_insights.after_task_completed(task, "ГОТОВО") == ["review", "merge"]
+    assert calls == [(7, "run_now"), (8, "run_now")]
+
+
+def test_wakeup_skips_empty_paused_and_nonproductive_runs(monkeypatch):
+    profile = {
+        "title": "Example", "repository": "owner/example",
+        "queues": [
+            {"id": "fix", "series_contains": "Example - FIX"},
+            {"id": "review", "series_contains": "Example - REVIEW",
+             "wake_when": {"field": "review_candidates"}},
+            {"id": "merge", "series_contains": "Example - MERGE",
+             "wake_when": {"field": "merge_candidates"}},
+        ],
+    }
+    series = [
+        {"id": 7, "title": "Example - REVIEW", "paused": True, "ended": False},
+        {"id": 8, "title": "Example - MERGE", "paused": False, "ended": False},
+    ]
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"example": profile})
+    monkeypatch.setattr(pipeline_insights.db, "list_series", lambda: series)
+    monkeypatch.setattr(pipeline_insights, "analyze", lambda *args, **kwargs: {
+        "diagnostics": {"review_candidates": [{"number": 42}], "merge_candidates": []},
+    })
+    calls = []
+    monkeypatch.setattr(
+        pipeline_insights.db, "series_action",
+        lambda series_id, action: calls.append((series_id, action)) or True,
+    )
+    task = SimpleNamespace(series_id=1, series_title="Example - FIX", prompt="Example - FIX")
+
+    assert pipeline_insights.after_task_completed(task, "ПУСТО") == []
+    assert pipeline_insights.after_task_completed(task, "ГОТОВО") == []
+    assert calls == []
+
+
+def test_worker_wakes_pipeline_only_after_next_recurrence_exists(monkeypatch):
+    from promptpilot import workflows
+
+    events = []
+    task = SimpleNamespace(id=42)
+    fresh = SimpleNamespace(id=42, status=SimpleNamespace(value="completed"), verdict="ГОТОВО")
+    monkeypatch.setattr(worker, "_execute_task_inner", lambda _task: events.append("execute"))
+    monkeypatch.setattr(worker, "_recur_after_run", lambda _task: events.append("recur"))
+    monkeypatch.setattr(worker, "_notify_pipeline_completion",
+                        lambda _task, _verdict: events.append("wake"))
+    monkeypatch.setattr(worker.db, "get_task", lambda _task_id: fresh)
+    monkeypatch.setattr(workflows, "sync_task", lambda _task_id: None)
+    monkeypatch.setattr(workflows, "advance_linked_task", lambda _task_id: None)
+
+    worker.execute_task(task)
+
+    assert events == ["execute", "recur", "wake"]
 
 
 def test_pipeline_execution_auto_uses_tool_when_available(isolated_db, monkeypatch, tmp_path):

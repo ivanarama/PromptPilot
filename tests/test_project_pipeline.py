@@ -139,3 +139,44 @@ def test_health_exposes_configured_gh_to_nested_checker(monkeypatch):
     assert pp.run_health({"health_command": ["project-health", "-json"]})["state"] == "green"
     assert captured["env"]["GH_EXE"] == gh
     assert captured["env"]["PATH"].split(os.pathsep)[0] == os.path.dirname(gh)
+
+
+def test_content_review_digest_ignores_only_base_tip_movement():
+    before = snapshot()
+    after = dict(before, baseRefOid="c" * 40)
+    assert pp.content_review_digest(before) == pp.content_review_digest(after)
+
+    changed_head = dict(after, headRefOid="d" * 40)
+    assert pp.content_review_digest(before) != pp.content_review_digest(changed_head)
+
+    changed_timeline = dict(after, updatedAt="2026-01-02T00:00:00Z")
+    assert pp.content_review_digest(before) != pp.content_review_digest(changed_timeline)
+
+
+def test_content_review_stays_executable_while_integration_owner_waits_merge(monkeypatch):
+    health = {
+        "state": "yellow",
+        "review_candidates": [{"number": 42, "head": HEAD, "stage": "review", "review_depth": 0}],
+        "integration_owner": {"number": 10, "stage": "integration-merge-ready"},
+        "findings": [{"code": "single_flight_barrier"}],
+    }
+    monkeypatch.setattr(pp, "run_health", lambda _config: health)
+    monkeypatch.setattr(pp, "stable_timeline", lambda _gh, _config, _number: snapshot())
+
+    result = pp.next_review(object(), {
+        "repository": "owner/repo", "trusted_account": "owner", "base_branch": "main",
+    })
+    assert result["action"] == "audit"
+    assert result["target"]["number"] == 42
+
+
+def test_empty_review_reason_explains_waiting_state():
+    reason = pp.review_empty_reason({
+        "integration_owner": {"number": 10, "stage": "integration-merge-ready"},
+    })
+    assert "#10" in reason
+    assert "integration-merge-ready" in reason
+
+    reason = pp.review_empty_reason({"reviewed_waiting_ship": [{"number": 11}]})
+    assert "ship" in reason
+    assert "#11" in reason
