@@ -2623,6 +2623,31 @@ async function loadPipelineInsights(profile, refresh=false) {
       const routeLine = `маршрут: ${route.configured}${route.configured!==route.effective ? ` → ${route.effective}` : ''}${route.reason && route.effective!=='tool' ? ` · ${route.reason}` : ''}`;
       return `<tr class="${data.bottleneck===q.id?'bottleneck':''}"><td>${data.bottleneck===q.id?'⚠ ':''}${esc(q.title)}<div class="prov-cmd" title="${escAttr(last?.summary || '')}">${esc(lastLine)}</div><div class="prov-cmd">${esc(stageLine)}</div><div class="prov-cmd">${esc(routeLine)}</div></td><td class="num">${q.backlog}</td><td class="num">${h5.complete?signed(deltaByQueue[q.id]||0):'—'}</td><td class="num">${q.capacity}</td><td class="num">${q.runs_needed}</td><td>${duration(q.avg_duration_seconds)}</td><td>${q.eta_hours == null ? '—' : q.eta_hours+' ч'}</td><td>${age(q.age.oldest_hours)}</td><td>${esc(q.interval || 'нет серии')}</td><td class="insights-recommendation">${esc(q.recommendation || '—')}</td></tr>`;
     }).join('');
+    const priorityHtml = data.priority_control ? `<details style="margin-top:12px" open>
+      <summary style="cursor:pointer"><b>Приоритет элементов очереди</b> · P0 выполняется первым, старые задачи повышаются каждые ${data.priority_control.aging_hours} ч до P1</summary>
+      <div style="margin-top:8px">${data.queues.map(q => {
+        const items = q.items || [];
+        if (!items.length) return '';
+        return `<div style="border-top:1px solid var(--border);padding:8px 0">
+          <div style="margin-bottom:5px"><b>${esc(q.title)}</b> <span class="prov-cmd">показано ${items.length} из ${q.backlog}</span></div>
+          ${items.map(item => {
+            const priority = item.priority || {level:'p2',base_level:'p2',source:'auto',reason:'default',age_boost:0};
+            const note = priority.source === 'manual' ? 'вручную' : `авто: ${priority.reason}`;
+            const aging = priority.age_boost ? ` · старение +${priority.age_boost}` : '';
+            const actionData = `data-profile="${escAttr(profile)}" data-queue="${escAttr(q.id)}" data-kind="${escAttr(item.kind)}" data-number="${item.number}"`;
+            return `<div style="display:flex;align-items:center;gap:7px;flex-wrap:wrap;padding:4px 0">
+              <a href="${escAttr(item.url || '#')}" target="_blank" rel="noopener">#${item.number}</a>
+              <span style="flex:1;min-width:260px">${esc(item.title)}</span>
+              <span class="prov-cmd">${esc(priority.level.toUpperCase())} · ${esc(note + aging)}</span>
+              <select ${actionData} aria-label="Приоритет #${item.number}" onchange="setPipelineItemPriorityFromElement(this,false)">
+                ${['p0','p1','p2','p3','auto'].map(level => `<option value="${level}" ${level===(priority.source==='manual'?priority.base_level:'auto')?'selected':''}>${level==='auto'?'Авто':level.toUpperCase()}</option>`).join('')}
+              </select>
+              <button ${actionData} class="btn btn-sm btn-primary" onclick="setPipelineItemPriorityFromElement(this,true)">⚡ Следующим</button>
+            </div>`;
+          }).join('')}
+        </div>`;
+      }).join('')}</div>
+    </details>` : '';
     box.innerHTML = `<div style="border:1px solid var(--border);border-radius:8px;padding:12px;margin-bottom:12px">
       <div><b>${esc(data.title)}</b><span class="pipeline-health ${escAttr(data.health.state)}">${esc(healthLabel)}</span></div>
       <div class="prov-cmd">${esc(data.repository)} · ${esc(pipelineHealthReason(data))} · история хранится локально</div>
@@ -2641,8 +2666,27 @@ async function loadPipelineInsights(profile, refresh=false) {
       </div>
       ${diagnosticHtml}
       <table class="insights-table"><thead><tr><th>Этап</th><th class="num">Очередь</th><th class="num">Δ 5 ч</th><th class="num">За прогон</th><th class="num">Прогонов</th><th>Средний запуск</th><th>ETA</th><th>Самый старый</th><th>Интервал</th><th>Рекомендация</th></tr></thead><tbody>${rows}</tbody></table>
+      ${priorityHtml}
     </div>`;
   } catch(e) { box.innerHTML = `<div style="color:var(--red);margin-bottom:10px">Анализ очереди недоступен: ${esc(e.message)}</div>`; }
+}
+
+async function setPipelineItemPriority(profile, queue, kind, number, level, runNow) {
+  try {
+    const path = `${API}/pipeline-insights/${encodeURIComponent(profile)}/queues/${encodeURIComponent(queue)}/items/${encodeURIComponent(kind)}/${number}/priority`;
+    const result = await fetchJSON(path, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({level,run_now:runNow})});
+    const wake = runNow ? (result.series_woken ? ' Серия поставлена на ближайший запуск.' : result.series_paused ? ' Серия на паузе.' : '') : '';
+    toast(level === 'auto' ? `#${number}: автоматический приоритет.${wake}` : `#${number}: ${level.toUpperCase()}.${wake}`, false);
+    await loadPipelineInsights(profile, true);
+  } catch(e) { toast('Не удалось изменить приоритет: ' + e.message); }
+}
+
+function setPipelineItemPriorityFromElement(element, runNow) {
+  const value = runNow ? 'p0' : element.value;
+  return setPipelineItemPriority(
+    element.dataset.profile, element.dataset.queue, element.dataset.kind,
+    Number(element.dataset.number), value, runNow,
+  );
 }
 
 function toggleSeriesEditor(id) {

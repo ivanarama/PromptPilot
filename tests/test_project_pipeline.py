@@ -1,6 +1,7 @@
 import json
 import os
 from types import SimpleNamespace
+from datetime import datetime, timezone
 
 import pytest
 
@@ -111,6 +112,16 @@ def test_capabilities_is_executor_neutral(tmp_path):
     }), encoding="utf-8")
     config = pp.load_config(str(config_path))
     assert pp.capabilities(config)["protocol"] == "promptpilot-pipelinectl-v1"
+
+
+def test_queue_priority_manual_auto_and_aging():
+    now = datetime(2026, 9, 2, tzinfo=timezone.utc)
+    config = {"priority": {"aging_hours": 24}}
+
+    assert pp.queue_priority({"labels": [{"name": "bug"}], "created_at": "2026-09-02T00:00:00Z"}, config, now) == 1
+    assert pp.queue_priority({"labels": [{"name": "queue:auto:p3"}], "created_at": "2026-09-02T00:00:00Z"}, config, now) == 3
+    assert pp.queue_priority({"labels": [{"name": "queue:p0"}, {"name": "queue:auto:p3"}]}, config, now) == 0
+    assert pp.queue_priority({"labels": [{"name": "enhancement"}], "created_at": "2026-08-31T00:00:00Z"}, config, now) == 1
 
 
 def test_health_exposes_configured_gh_to_nested_checker(monkeypatch):
