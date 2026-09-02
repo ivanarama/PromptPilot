@@ -2536,9 +2536,10 @@ function diagnosticFindingMessage(finding) {
 function renderDiagnosticFinding(finding) {
   const shown = finding.prs.slice(0, 5).map(pr => `#${pr}`).join(', ');
   const rest = finding.prs.length > 5 ? ` и ещё ${finding.prs.length - 5}` : '';
-  const prs = finding.prs.length ? `PR ${shown}${rest} · ` : '';
-  const owner = finding.code === 'single_flight_barrier' ? 'Текущий PR: ' : '';
-  return `<li class="${finding.severity === 'red' ? 'error-text' : ''}">${owner}${prs}${esc(diagnosticFindingMessage(finding))}</li>`;
+  const prefix = finding.prs.length
+    ? finding.code === 'single_flight_barrier' ? `Текущий PR: ${shown}${rest} · ` : `PR ${shown}${rest} · `
+    : '';
+  return `<li class="${finding.severity === 'red' ? 'error-text' : ''}">${prefix}${esc(diagnosticFindingMessage(finding))}</li>`;
 }
 
 function diagnosticOverview(data) {
