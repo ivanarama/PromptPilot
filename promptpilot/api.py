@@ -229,6 +229,11 @@ class SeriesAction(BaseModel):
     action: str
 
 
+class PipelinePriorityUpdate(BaseModel):
+    level: str
+    run_now: bool = False
+
+
 @app.patch("/api/schedule/{series_id}")
 def api_update_series(series_id: int, update: SeriesUpdate):
     fields = {}
@@ -297,6 +302,22 @@ def api_pipeline_insights(profile_id: str, refresh: bool = False):
     except KeyError:
         raise HTTPException(404, "Профиль анализа не найден")
     except (RuntimeError, ValueError, OSError) as exc:
+        raise HTTPException(503, str(exc))
+
+
+@app.post("/api/pipeline-insights/{profile_id}/queues/{queue_id}/items/{kind}/{number}/priority")
+def api_pipeline_item_priority(profile_id: str, queue_id: str, kind: str, number: int,
+                               body: PipelinePriorityUpdate):
+    try:
+        return pipeline_insights.set_item_priority(
+            profile_id, queue_id, kind, number, body.level.lower(), body.run_now,
+            db.list_series(),
+        )
+    except KeyError:
+        raise HTTPException(404, "Профиль анализа не найден")
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    except (RuntimeError, OSError) as exc:
         raise HTTPException(503, str(exc))
 
 

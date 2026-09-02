@@ -10,6 +10,7 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import quote
 
 from . import db
 from .config import DB_DIR, POLL_INTERVAL, TASK_TIMEOUT
@@ -22,6 +23,13 @@ _locks: dict[str, threading.Lock] = {}
 _INTERVAL_PRESETS = ((0.25, "15m"), (0.5, "30m"), (1, "1h"), (2, "2h"),
                      (4, "4h"), (8, "8h"), (12, "12h"), (24, "24h"))
 _HISTORY_WINDOWS = (5, 24)
+_PRIORITY_LEVELS = ("p0", "p1", "p2", "p3")
+_DEFAULT_PRIORITY_RULES = (
+    ({"security", "severity:critical", "blocker", "data-loss"}, 0, "critical label"),
+    ({"bug"}, 1, "bug"),
+    ({"enhancement", "documentation"}, 2, "planned change"),
+    ({"question"}, 3, "question"),
+)
 
 def _profiles() -> dict:
     """Load user-owned profiles; PromptPilot ships without project-specific data."""
@@ -79,6 +87,9 @@ def _github_search(repository: str, query: str) -> dict:
         number = int(item["number"])
         items.append({
             "key": f"{kind}:{number}", "kind": kind, "number": number,
+            "title": item.get("title") or f"#{number}",
+            "labels": sorted(label.get("name", "") for label in item.get("labels", [])
+                             if label.get("name")),
             "created_at": item.get("created_at"), "updated_at": item.get("updated_at"),
             "url": item.get("html_url"),
         })
@@ -88,6 +99,135 @@ def _github_search(repository: str, query: str) -> dict:
 def _github_count(repository: str, query: str) -> int:
     """Compatibility helper for callers that only need the current count."""
     return _github_search(repository, query)["count"]
+
+
+def _priority_settings(profile: dict) -> dict | None:
+    control = profile.get("priority_control")
+    if not isinstance(control, dict) or control.get("enabled", True) is False:
+        return None
+    manual = control.get("manual_labels") or {
+        "p0": "queue:p0", "p1": "queue:p1", "p2": "queue:p2", "p3": "queue:p3",
+    }
+    automatic = control.get("auto_labels") or {
+        "p0": "queue:auto:p0", "p1": "queue:auto:p1",
+        "p2": "queue:auto:p2", "p3": "queue:auto:p3",
+    }
+    if set(manual) != set(_PRIORITY_LEVELS) or set(automatic) != set(_PRIORITY_LEVELS):
+        raise ValueError("priority_control labels must define p0, p1, p2 and p3")
+    default_level = str(control.get("default_level", "p2")).lower()
+    if default_level not in _PRIORITY_LEVELS:
+        raise ValueError("priority_control default_level must be p0, p1, p2 or p3")
+    return {
+        **control, "manual_labels": manual, "auto_labels": automatic,
+        "default_level": default_level,
+        "aging_hours": max(1, int(control.get("aging_hours", 168))),
+        "max_items": max(1, min(int(control.get("max_items", 12)), 50)),
+    }
+
+
+def _item_priority(item: dict, settings: dict, now: datetime) -> dict:
+    labels = set(item.get("labels") or [])
+    manual_matches = [(index, label) for index, level in enumerate(_PRIORITY_LEVELS)
+                      if (label := settings["manual_labels"][level]) in labels]
+    auto_matches = [(index, label) for index, level in enumerate(_PRIORITY_LEVELS)
+                    if (label := settings["auto_labels"][level]) in labels]
+    if manual_matches:
+        base, label = min(manual_matches)
+        source, reason = "manual", label
+    elif auto_matches:
+        base, label = min(auto_matches)
+        source, reason = "auto", label
+    else:
+        base = _PRIORITY_LEVELS.index(settings["default_level"])
+        source, reason = "auto", "default"
+        for rule_labels, rule_level, rule_reason in _DEFAULT_PRIORITY_RULES:
+            if labels & rule_labels:
+                base, reason = rule_level, rule_reason
+                break
+    created = _parse_time(item.get("created_at"))
+    age_hours = max(0, (now - created).total_seconds() / 3600) if created else 0
+    boost = min(max(0, base - 1), int(age_hours // settings["aging_hours"]))
+    effective = base - boost
+    return {
+        "level": _PRIORITY_LEVELS[effective], "base_level": _PRIORITY_LEVELS[base],
+        "source": source, "reason": reason, "age_boost": boost,
+        "conflict": len(manual_matches) > 1 or len(auto_matches) > 1,
+    }
+
+
+def _gh_api_json(args: list[str], input_value: dict | None = None):
+    command = [_gh_executable(), "api", *args]
+    encoded = None
+    if input_value is not None:
+        command += ["--input", "-"]
+        encoded = json.dumps(input_value, ensure_ascii=False)
+    run = subprocess.run(
+        command, input=encoded, capture_output=True, text=True, timeout=30,
+        encoding="utf-8", errors="strict",
+    )
+    if run.returncode:
+        raise RuntimeError((run.stderr or run.stdout or "gh api failed").strip())
+    return json.loads(run.stdout) if run.stdout.strip() else None
+
+
+def set_item_priority(profile_id: str, queue_id: str, kind: str, number: int,
+                      level: str, run_now: bool, series: list[dict]) -> dict:
+    profiles = _profiles()
+    profile = profiles.get(profile_id)
+    if not profile:
+        raise KeyError(profile_id)
+    settings = _priority_settings(profile)
+    if not settings:
+        raise ValueError("priority control is not enabled for this profile")
+    queue = next((item for item in profile.get("queues", []) if item.get("id") == queue_id), None)
+    if not queue:
+        raise ValueError("unknown pipeline queue")
+    if kind not in {"issue", "pr"} or number < 1:
+        raise ValueError("invalid GitHub item")
+    if level not in {*_PRIORITY_LEVELS, "auto"}:
+        raise ValueError("priority must be p0, p1, p2, p3 or auto")
+
+    identity = _gh_api_json(["user"])
+    trusted = settings.get("trusted_account")
+    if trusted and identity.get("login") != trusted:
+        raise RuntimeError(f"authenticated as {identity.get('login')}, expected {trusted}")
+    repository = profile["repository"]
+    item = _gh_api_json([f"repos/{repository}/issues/{number}"])
+    actual_kind = "pr" if item.get("pull_request") else "issue"
+    if actual_kind != kind or item.get("state") != "open":
+        raise ValueError(f"open {kind} #{number} not found")
+
+    current = {entry["name"] for entry in item.get("labels", [])}
+    manual_labels = set(settings["manual_labels"].values())
+    selected = settings["manual_labels"].get(level)
+    if selected and selected not in current:
+        _gh_api_json(
+            [f"repos/{repository}/issues/{number}/labels", "--method", "POST"],
+            {"labels": [selected]},
+        )
+    for label in sorted((current & manual_labels) - ({selected} if selected else set())):
+        _gh_api_json([
+            f"repos/{repository}/issues/{number}/labels/{quote(label, safe='')}",
+            "--method", "DELETE",
+        ])
+
+    woke = False
+    paused = False
+    if run_now:
+        marker = str(queue.get("series_contains") or "").lower()
+        target = next((entry for entry in series
+                       if marker and marker in str(entry.get("title", "")).lower()
+                       and not entry.get("ended")), None)
+        if target:
+            woke = db.series_action(int(target["id"]), "run_now")
+            paused = bool(target.get("paused"))
+    _cache.pop(profile_id, None)
+    return {
+        "ok": True, "profile_id": profile_id, "queue_id": queue_id,
+        "kind": kind, "number": number, "level": level,
+        "label": selected, "run_now": run_now, "series_woken": woke,
+        "series_paused": paused,
+    }
 
 
 def _interval_hours(value: str | None) -> float | None:
@@ -664,6 +804,7 @@ def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True) -> d
         if use_cache and cached and time.time() - cached[0] < 300:
             return cached[1]
         profile = profiles[profile_id]
+        priority_settings = _priority_settings(profile)
         target_hours = float(profile.get("target_clear_hours", 8))
         now = datetime.now(timezone.utc)
         queues = []
@@ -698,6 +839,14 @@ def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True) -> d
                 matching.get("avg_duration_seconds") if matching else None)
             age = _age_stats(list(members.values()), now)
             membership_complete = all(search["membership_complete"] for search in searches)
+            ordered_members = list(members.values())
+            if priority_settings:
+                for member in ordered_members:
+                    member["priority"] = _item_priority(member, priority_settings, now)
+                ordered_members.sort(key=lambda member: (
+                    _PRIORITY_LEVELS.index(member["priority"]["level"]),
+                    member.get("created_at") or "", member["number"],
+                ))
             queues.append({
                 "id": item["id"], "title": item["title"], "backlog": backlog,
                 "capacity": capacity, "runs_needed": runs_needed,
@@ -708,6 +857,8 @@ def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True) -> d
                 "failure_rate": matching["failure_rate"] if matching else None,
                 "empty_rate": matching["empty_rate"] if matching else None,
                 "membership_complete": membership_complete, "age": age,
+                "items": ordered_members[:priority_settings["max_items"]]
+                if priority_settings else [],
                 "execution": _execution_status(item, matching.get("working_dir") if matching else None),
                 **recommendation,
             })
@@ -750,6 +901,11 @@ def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True) -> d
                 backlog_total, windows, broken_series, paused_series, diagnostics, runtime),
             "diagnostics": diagnostics,
             "runtime": runtime,
+            "priority_control": ({
+                "levels": list(_PRIORITY_LEVELS),
+                "aging_hours": priority_settings["aging_hours"],
+                "manual_labels": priority_settings["manual_labels"],
+            } if priority_settings else None),
             "bottleneck": bottleneck["id"] if bottleneck and bottleneck["backlog"] else None,
             "generated_at": now.timestamp(),
         }

@@ -16,6 +16,7 @@ import re
 import shutil
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -128,6 +129,45 @@ def load_config(path: str) -> dict:
     data.setdefault("base_branch", "main")
     data.setdefault("merge_method", "merge")
     return data
+
+
+def queue_priority(item: dict, config: dict, now: datetime | None = None) -> int:
+    """Return P0..P3 as 0..3. Manual labels beat auto labels and classification."""
+    settings = config.get("priority") or {}
+    manual = settings.get("manual_labels") or {
+        "p0": "queue:p0", "p1": "queue:p1", "p2": "queue:p2", "p3": "queue:p3",
+    }
+    automatic = settings.get("auto_labels") or {
+        "p0": "queue:auto:p0", "p1": "queue:auto:p1",
+        "p2": "queue:auto:p2", "p3": "queue:auto:p3",
+    }
+    labels = {value.get("name", "") if isinstance(value, dict) else str(value)
+              for value in item.get("labels", [])}
+    base = next((level for level in range(4) if manual.get(f"p{level}") in labels), None)
+    if base is None:
+        base = next((level for level in range(4)
+                     if automatic.get(f"p{level}") in labels), None)
+    if base is None:
+        if labels & {"security", "severity:critical", "blocker", "data-loss"}:
+            base = 0
+        elif "bug" in labels:
+            base = 1
+        elif labels & {"enhancement", "documentation"}:
+            base = 2
+        elif "question" in labels:
+            base = 3
+        else:
+            value = str(settings.get("default_level", "p2")).lower()
+            base = int(value[1]) if re.fullmatch(r"p[0-3]", value) else 2
+    created_raw = item.get("created_at") or item.get("createdAt")
+    try:
+        created = datetime.fromisoformat(str(created_raw).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        created = None
+    aging_hours = max(1, int(settings.get("aging_hours", 168)))
+    current = now or datetime.now(timezone.utc)
+    boost = min(max(0, base - 1), int(max(0, (current - created).total_seconds()) // (aging_hours * 3600))) if created else 0
+    return base - boost
 
 
 def run_health(config: dict) -> dict:
@@ -480,7 +520,7 @@ def list_ship(gh: GitHub, config: dict) -> list[dict]:
         labels = {label["name"] for label in item.get("labels", [])}
         if "ship" in labels and not labels & {"hold", "needs-decision"} and item.get("base", {}).get("ref") == config["base_branch"]:
             result.append(item)
-    return sorted(result, key=lambda value: value["number"])
+    return sorted(result, key=lambda value: (queue_priority(value, config), value["number"]))
 
 
 def pr_checks(gh: GitHub, config: dict, number: int) -> tuple[dict, list[dict]]:

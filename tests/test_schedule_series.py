@@ -335,6 +335,53 @@ def test_pipeline_insights_exposes_actual_series_task_status(isolated_db, monkey
     assert review["task_status"] == "running"
 
 
+def test_pipeline_item_priority_manual_override_and_aging():
+    settings = pipeline_insights._priority_settings({"priority_control": {"aging_hours": 24}})
+    now = datetime(2026, 9, 2, tzinfo=timezone.utc)
+    manual = pipeline_insights._item_priority({
+        "labels": ["bug", "queue:p3"], "created_at": "2026-09-02T00:00:00Z",
+    }, settings, now)
+    aged = pipeline_insights._item_priority({
+        "labels": ["enhancement"], "created_at": "2026-08-30T00:00:00Z",
+    }, settings, now)
+
+    assert manual["base_level"] == "p3"
+    assert manual["level"] == "p3"
+    assert manual["source"] == "manual"
+    assert aged["base_level"] == "p2"
+    assert aged["level"] == "p1"
+    assert aged["age_boost"] == 1
+
+
+def test_set_pipeline_item_priority_replaces_manual_label_and_wakes_series(monkeypatch):
+    profile = {
+        "repository": "owner/repo", "priority_control": {"trusted_account": "owner"},
+        "queues": [{"id": "fix", "series_contains": "Project - FIX"}],
+    }
+    calls = []
+
+    def fake_api(args, input_value=None):
+        calls.append((args, input_value))
+        if args == ["user"]:
+            return {"login": "owner"}
+        if args == ["repos/owner/repo/issues/42"]:
+            return {"state": "open", "labels": [{"name": "queue:p2"}]}
+        return None
+
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"example": profile})
+    monkeypatch.setattr(pipeline_insights, "_gh_api_json", fake_api)
+    monkeypatch.setattr(pipeline_insights.db, "series_action", lambda series_id, action: (series_id, action) == (7, "run_now"))
+
+    result = pipeline_insights.set_item_priority(
+        "example", "fix", "issue", 42, "p0", True,
+        [{"id": 7, "title": "Project - FIX", "ended": False, "paused": False}],
+    )
+
+    assert result["series_woken"] is True
+    assert (["repos/owner/repo/issues/42/labels", "--method", "POST"], {"labels": ["queue:p0"]}) in calls
+    assert (["repos/owner/repo/issues/42/labels/queue%3Ap2", "--method", "DELETE"], None) in calls
+
+
 def test_dispatch_gate_completes_empty_queue_without_provider(isolated_db, monkeypatch):
     task = isolated_db.create_task(TaskCreate(
         prompt="ExampleProject - TRIAGE", recurrence="4h",
