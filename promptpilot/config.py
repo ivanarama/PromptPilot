@@ -671,6 +671,15 @@ def build_cmd(provider: str, prompt: str, skip_permissions: bool = False, sessio
         extras += ["-c", f'model_reasoning_effort="{eff}"']
     if session_id and is_claude:
         extras += ["--resume", session_id]
+    if session_id and is_codex:
+        # Codex uses an ``exec resume`` subcommand rather than a flag.  Keep all
+        # options before SESSION_ID and the stdin marker after it:
+        # codex exec resume --json ... <session> -
+        try:
+            exec_idx = cmd.index("exec")
+        except ValueError:
+            exec_idx = 0
+        cmd.insert(exec_idx + 1, "resume")
     if skip_permissions and is_claude:
         extras.append("--dangerously-skip-permissions")
     if skip_permissions and is_codex and \
@@ -680,6 +689,10 @@ def build_cmd(provider: str, prompt: str, skip_permissions: bool = False, sessio
         settings = guard_settings_file()
         if settings:
             extras += ["--settings", settings]
+    if session_id and is_codex:
+        # Positional SESSION_ID must follow every resume option and precede the
+        # final stdin marker.
+        extras.append(session_id)
     if extras:
         if prompt in cmd:
             prompt_idx = cmd.index(prompt)
