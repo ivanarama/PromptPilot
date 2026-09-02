@@ -498,10 +498,17 @@ def _expanded_command(values, stage: str) -> list[str] | None:
     if not isinstance(command, list) or not command or not all(
             isinstance(value, str) and value for value in command):
         return None
-    return [
+    expanded = [
         value.replace("{python}", sys.executable).replace("{stage}", stage)
         for value in command
     ]
+    # In a PyInstaller bundle sys.executable is pp.exe, not a Python
+    # interpreter. Keep existing portable profile commands working by routing
+    # the bundled project adapter through pp's hidden pipelinectl command.
+    if (getattr(sys, "frozen", False) and len(expanded) >= 3 and
+            expanded[:3] == [sys.executable, "-m", "promptpilot.project_pipeline"]):
+        return [sys.executable, "pipelinectl", *expanded[3:]]
+    return expanded
 
 
 def _tool_command(execution: dict, stage: str) -> list[str] | None:
