@@ -624,6 +624,21 @@ def test_pipeline_execution_auto_uses_tool_when_available(isolated_db, monkeypat
     assert "/review-queue" in route["prompt"]
 
 
+def test_bundled_pipeline_command_routes_through_pp_cli(monkeypatch):
+    monkeypatch.setattr(pipeline_insights.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(pipeline_insights.sys, "executable", "C:\\PromptPilot\\pp.exe")
+
+    command = pipeline_insights._expanded_command([
+        "{python}", "-m", "promptpilot.project_pipeline",
+        "--config", "pipelinectl.json", "next", "{stage}",
+    ], "review")
+
+    assert command == [
+        "C:\\PromptPilot\\pp.exe", "pipelinectl",
+        "--config", "pipelinectl.json", "next", "review",
+    ]
+
+
 def test_pipeline_execution_empty_completes_without_provider(isolated_db, monkeypatch, tmp_path):
     helper = tmp_path / "pipelinectl.py"
     helper.write_text(

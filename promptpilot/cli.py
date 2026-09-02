@@ -882,6 +882,18 @@ def worker():
     run_worker()
 
 
+@cli.command(
+    "pipelinectl",
+    hidden=True,
+    context_settings={"ignore_unknown_options": True, "allow_extra_args": True},
+)
+@click.argument("args", nargs=-1, type=click.UNPROCESSED)
+def pipelinectl(args):
+    """Run the bundled project pipeline adapter."""
+    from .project_pipeline import run
+    raise SystemExit(run(list(args)))
+
+
 @cli.command()
 def bot():
     """Start the Telegram bot (requires PP_TG_TOKEN env var)."""
