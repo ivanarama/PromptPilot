@@ -65,6 +65,13 @@ def digest(value) -> str:
     return hashlib.sha256(canonical(value)).hexdigest()
 
 
+def content_review_digest(snapshot: dict) -> str:
+    """Bind an audit to PR content without invalidating it on a normal base advance."""
+    stable = dict(snapshot)
+    stable.pop("baseRefOid", None)
+    return digest(stable)
+
+
 def encode_lease(value: dict) -> str:
     return base64.urlsafe_b64encode(canonical(value)).decode("ascii").rstrip("=")
 
@@ -369,8 +376,20 @@ def ensure_identity(gh: GitHub, config: dict) -> None:
 
 def capabilities(config: dict) -> dict:
     return {"protocol": "promptpilot-pipelinectl-v1", "repository": config["repository"],
-            "stages": {"review": "ordinary", "merge": "clean-ordinary"},
+            "stages": {"review": "content-or-integration", "merge": "clean-ordinary"},
             "fallback": "repository skill"}
+
+
+def review_empty_reason(health: dict) -> str:
+    owner = health.get("integration_owner")
+    if isinstance(owner, dict) and owner.get("number"):
+        return (f"содержательная очередь пуста; интеграционный владелец "
+                f"#{owner['number']} находится на этапе {owner.get('stage', 'unknown')}")
+    waiting = health.get("reviewed_waiting_ship") or []
+    if waiting:
+        numbers = ", ".join(f"#{item.get('number')}" for item in waiting[:5])
+        return f"содержательная очередь пуста; ждут решения ship: {numbers}"
+    return str(health.get("summary") or "содержательная очередь ревью пуста")
 
 
 def next_review(gh: GitHub, config: dict) -> dict:
@@ -379,9 +398,9 @@ def next_review(gh: GitHub, config: dict) -> dict:
         return {"action": "fallback", "reason": "health check is red"}
     candidates = health.get("review_candidates") or []
     if not candidates:
-        return {"action": "empty", "verdict": "ПУСТО", "reason": "review queue is empty"}
+        return {"action": "empty", "verdict": "ПУСТО", "reason": review_empty_reason(health)}
     item = candidates[0]
-    if item.get("stage") != "review" or any(f.get("code") == "single_flight_barrier" for f in health.get("findings", [])):
+    if item.get("stage") != "review":
         return {"action": "fallback", "reason": "integration/base-sync state requires the full skill"}
     if int(item.get("review_depth", 0)) >= 2:
         return {"action": "fallback", "reason": "third review round requires human-escalation rules"}
@@ -398,7 +417,7 @@ def next_review(gh: GitHub, config: dict) -> dict:
             return {"action": "fallback", "reason": "current epoch contains recovery/protocol state"}
     lease = {"version": 1, "stage": "review", "repository": config["repository"],
              "number": item["number"], "head": snapshot["headRefOid"],
-             "snapshot": digest(snapshot), "epoch": info["hash"],
+             "snapshot": content_review_digest(snapshot), "epoch": info["hash"],
              "anchor": info["anchor_id"], "depth": int(item.get("review_depth", 0))}
     return {"action": "audit", "target": item, "lease": encode_lease(lease),
             "inspect": [f"gh pr view {item['number']} --repo {config['repository']} --json title,body,headRefName,files,statusCheckRollup",
@@ -466,12 +485,11 @@ def complete_review(gh: GitHub, config: dict, lease_value: str, report_path: str
         raise PipelineError("health check became red")
     candidates = health.get("review_candidates") or []
     if (not candidates or int(candidates[0].get("number", 0)) != int(lease["number"])
-            or candidates[0].get("stage") != "review"
-            or any(item.get("code") == "single_flight_barrier" for item in health.get("findings", []))):
+            or candidates[0].get("stage") != "review"):
         raise PipelineError("global REVIEW allowlist changed; rerun next review")
     snapshot = stable_timeline(gh, config, int(lease["number"]))
     validate_common(snapshot, config, lease)
-    if digest(snapshot) != lease["snapshot"]:
+    if content_review_digest(snapshot) != lease["snapshot"]:
         raise PipelineError("lease is stale; rerun next review")
     info = review_gate(snapshot, config, lease)
     review = post_comment(gh, config, lease["number"], body)

@@ -441,6 +441,58 @@ def _matching_queue(task) -> tuple[str, dict, dict] | None:
     return None
 
 
+def _diagnostic_match_count(diagnostics: dict, condition: dict) -> int:
+    field = condition.get("field")
+    if not isinstance(field, str):
+        return 0
+    value = diagnostics.get(field)
+    key, values = condition.get("key"), condition.get("values")
+    if key is None and values is None:
+        if isinstance(value, (list, dict, str)):
+            return len(value)
+        return int(bool(value))
+    if not isinstance(key, str) or not isinstance(values, list):
+        return 0
+    allowed = set(values)
+    if isinstance(value, dict):
+        return int(value.get(key) in allowed)
+    if isinstance(value, list):
+        return sum(1 for item in value if isinstance(item, dict) and item.get(key) in allowed)
+    return 0
+
+
+def _wake_ready_queues(profile: dict, data: dict, series: list[dict]) -> list[str]:
+    """Wake configured queues whose project-owned diagnostics say work is ready."""
+    diagnostics = data.get("diagnostics") or {}
+    woken = []
+    for queue in profile.get("queues", []):
+        condition = queue.get("wake_when")
+        marker = str(queue.get("series_contains") or "").lower()
+        if not isinstance(condition, dict) or not marker:
+            continue
+        if _diagnostic_match_count(diagnostics, condition) == 0:
+            continue
+        target = next((item for item in series
+                       if marker in str(item.get("title", "")).lower()
+                       and not item.get("ended") and not item.get("paused")), None)
+        if target and db.series_action(int(target["id"]), "run_now"):
+            woken.append(str(queue.get("id")))
+    return woken
+
+
+def after_task_completed(task, verdict: str | None) -> list[str]:
+    """Immediately advance ready pipeline stages after a productive run."""
+    if str(verdict or "").upper() != "ГОТОВО":
+        return []
+    matched = _matching_queue(task)
+    if matched is None:
+        return []
+    profile_id, profile, _queue = matched
+    series = db.list_series()
+    data = analyze(profile_id, series, use_cache=False)
+    return _wake_ready_queues(profile, data, series)
+
+
 def _expanded_command(values, stage: str) -> list[str] | None:
     command = values
     if not isinstance(command, list) or not command or not all(
@@ -805,6 +857,7 @@ def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True) -> d
             return cached[1]
         profile = profiles[profile_id]
         priority_settings = _priority_settings(profile)
+        diagnostics = _run_profile_health_check(profile)
         target_hours = float(profile.get("target_clear_hours", 8))
         now = datetime.now(timezone.utc)
         queues = []
@@ -823,7 +876,16 @@ def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True) -> d
             for search in searches:
                 for member in search["items"]:
                     members[member["key"]] = member
-                    all_items[member["key"]] = member
+            diagnostic_field = item.get("backlog_diagnostic_field")
+            diagnostic_items = (diagnostics or {}).get(diagnostic_field) if isinstance(diagnostic_field, str) else None
+            if isinstance(diagnostic_items, list):
+                allowed_numbers = {int(candidate["number"]) for candidate in diagnostic_items
+                                   if isinstance(candidate, dict) and str(candidate.get("number", "")).isdigit()}
+                backlog = len(diagnostic_items)
+                members = {key: member for key, member in members.items()
+                           if str(member.get("number", "")).isdigit()
+                           and int(member["number"]) in allowed_numbers}
+            all_items.update(members)
             capacity = max(1, int(item.get("capacity", 1)))
             matching = next((s for s in series
                              if item.get("series_contains", "").lower() in s["title"].lower()), None)
@@ -889,7 +951,6 @@ def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True) -> d
                 [queue["series_id"]] if queue.get("series_id") else [],
                 now - timedelta(hours=5),
             )
-        diagnostics = _run_profile_health_check(profile)
         runtime = _pipeline_runtime(matching_series, now)
         result = {
             "profile_id": profile_id, "title": profile["title"],
@@ -920,8 +981,9 @@ def sample_active_profiles(series: list[dict]) -> dict[str, str]:
         if not _profile_active(profile, series):
             continue
         try:
-            analyze(profile_id, series, use_cache=False)
-            outcomes[profile_id] = "ok"
+            data = analyze(profile_id, series, use_cache=False)
+            woken = _wake_ready_queues(profile, data, series)
+            outcomes[profile_id] = "ok" + (f"; woken={','.join(woken)}" if woken else "")
         except Exception as exc:  # one external repository must not stop the sampler
             outcomes[profile_id] = str(exc)
     return outcomes

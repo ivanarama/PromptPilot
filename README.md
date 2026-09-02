@@ -748,6 +748,8 @@ Worker публикует heartbeat в общей SQLite БД. Активный 
           "query": "is:issue is:open label:ready-fix -label:in-work",
           "capacity": 1,
           "series_contains": "MyProject - FIX",
+          "backlog_diagnostic_field": "fix_candidates",
+          "wake_when": {"field": "fix_candidates"},
           "dispatch_gate": {
             "skip_when_empty": true
           }
@@ -755,9 +757,11 @@ Worker публикует heartbeat в общей SQLite БД. Активный 
         {
           "id": "review",
           "title": "Ревью",
-          "query": "is:pr is:open -label:reviewed",
+          "query": "is:pr is:open -label:ship -label:changes-requested -label:needs-decision -label:hold",
           "capacity": 2,
-          "series_contains": "MyProject - REVIEW"
+          "series_contains": "MyProject - REVIEW",
+          "backlog_diagnostic_field": "review_backlog",
+          "wake_when": {"field": "review_candidates"}
         },
         {
           "id": "merge",
@@ -765,6 +769,8 @@ Worker публикует heartbeat в общей SQLite БД. Активный 
           "query": "is:pr is:open label:ship",
           "capacity": 1,
           "series_contains": "MyProject - MERGE",
+          "backlog_diagnostic_field": "merge_candidates",
+          "wake_when": {"field": "merge_candidates"},
           "dispatch_gate": {
             "skip_when_empty": true,
             "defer_when_diagnostics_match": [{
@@ -818,6 +824,28 @@ PromptPilot запускает её при каждом снимке и пока
 даже при более высоком приоритете MERGE и не расходует токены на ожидание. Если
 профиль или checker сломан, gate fail-open: задача запускается обычным способом,
 чтобы ошибка наблюдаемости не остановила полезную работу.
+
+`wake_when` необязателен. Он указывает поле диагностики, которое означает, что
+этапу уже есть что делать. После любого полезного (`ГОТОВО`) запуска и при
+фоновом обновлении профиля PromptPilot переводит ближайший pending-запуск этой
+серии на «сейчас». Поэтому FIX → REVIEW и REVIEW → MERGE не ждут следующего
+периодического интервала. Можно добавить `key` и `values`, если готовность
+определяется только некоторыми состояниями элементов. При `ПУСТО`, паузе серии
+или пустом поле пробуждения нет.
+
+`backlog_diagnostic_field` заменяет приблизительный размер GitHub Search точным
+массивом из `health_check`. Это особенно важно для REVIEW: поисковый запрос
+намеренно не исключает stale-метку `reviewed`, а checker уже различает новый
+HEAD, актуально проверенный HEAD и интеграционный handoff. Для REVIEW используйте
+`review_backlog` (вся ожидающая работа), а `wake_when` оставьте на
+`review_candidates` (только исполняемая сейчас работа).
+
+Не исключайте `reviewed` из поискового запроса REVIEW: метка относится к старому
+HEAD и после нового push может остаться. Канонический `health_check` отличает
+актуальное ревью (`reviewed_waiting_ship`) от устаревшей метки и возвращает новый
+HEAD в `review_candidates`. Для двухполосной схемы он также публикует
+`content_review_candidates`, `integration_owner` и `merge_candidates`:
+single-flight сериализует интеграцию, но не останавливает содержательные ревью.
 
 #### Детерминированный `pipelinectl` и fallback на скилл
 

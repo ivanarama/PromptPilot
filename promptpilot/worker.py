@@ -55,6 +55,20 @@ RETRY_REASON_ERR = {
 }
 
 
+def _notify_pipeline_completion(task, verdict: str | None) -> None:
+    if str(verdict or "").upper() != "ГОТОВО":
+        return
+    try:
+        from . import pipeline_insights
+        woken = pipeline_insights.after_task_completed(task, verdict)
+        if woken:
+            print(f"  -> Pipeline stages woken: {', '.join(woken)}", flush=True)
+    except Exception as exc:
+        # Completion is already durable; a dashboard/wakeup failure must not
+        # rewrite the successful task outcome. The periodic sampler retries it.
+        print(f"  !! pipeline wake-up unavailable for #{task.id}: {exc}", flush=True)
+
+
 def retry_reason(text: str, exit_code: int) -> Optional[str]:
     """Why the run must be requeued: RETRY_RATE_LIMIT, RETRY_OVERLOAD or None.
 
@@ -979,6 +993,12 @@ def execute_task(task):
             _recur_after_run(task)
         except Exception as exc:
             print(f"  !! не смог продлить расписание #{task.id}: {exc}", flush=True)
+        try:
+            fresh = db.get_task(task.id)
+            if fresh and fresh.status.value == "completed":
+                _notify_pipeline_completion(fresh, fresh.verdict)
+        except Exception as exc:
+            print(f"  !! pipeline wake-up after recurrence #{task.id}: {exc}", flush=True)
         try:
             workflows.sync_task(task.id)
             workflows.advance_linked_task(task.id)
