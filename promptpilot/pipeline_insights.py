@@ -5,6 +5,7 @@ import math
 import os
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -287,6 +288,153 @@ def dispatch_gate(task) -> dict | None:
     return None
 
 
+def _matching_queue(task) -> tuple[str, dict, dict] | None:
+    """Return the profile and queue owning a recurring task, if configured."""
+    if not getattr(task, "series_id", None):
+        return None
+    title = (getattr(task, "series_title", None) or task.prompt.splitlines()[0]).lower()
+    for profile_id, profile in _profiles().items():
+        for queue in profile.get("queues", []):
+            marker = str(queue.get("series_contains", "")).lower()
+            if marker and marker in title:
+                return profile_id, profile, queue
+    return None
+
+
+def _expanded_command(values, stage: str) -> list[str] | None:
+    command = values
+    if not isinstance(command, list) or not command or not all(
+            isinstance(value, str) and value for value in command):
+        return None
+    return [
+        value.replace("{python}", sys.executable).replace("{stage}", stage)
+        for value in command
+    ]
+
+
+def _tool_command(execution: dict, stage: str) -> list[str] | None:
+    return _expanded_command(execution.get("command"), stage)
+
+
+def _tool_available(execution: dict, command: list[str], working_dir: str | None,
+                    stage: str) -> tuple[bool, str]:
+    root = Path(working_dir or os.getcwd())
+    for value in execution.get("required_paths", []):
+        if not isinstance(value, str) or not value:
+            return False, "required_paths должен содержать непустые строки"
+        candidate = Path(value)
+        if not candidate.is_absolute():
+            candidate = root / candidate
+        if not candidate.exists():
+            return False, f"не найден {value}"
+
+    executable = command[0]
+    candidate = Path(executable)
+    if candidate.is_absolute() or candidate.parent != Path("."):
+        if not candidate.is_absolute():
+            candidate = root / candidate
+        if not candidate.exists():
+            return False, f"не найдена команда {executable}"
+    elif shutil.which(executable) is None and executable != sys.executable:
+        return False, f"команда {executable} отсутствует в PATH"
+    probe = execution.get("probe_command")
+    if probe is not None:
+        probe_command = _expanded_command(probe, stage)
+        if probe_command is None:
+            return False, "probe_command должен быть непустым массивом строк"
+        try:
+            result = subprocess.run(
+                probe_command, cwd=str(root), capture_output=True, text=True,
+                timeout=max(1, min(int(execution.get("probe_timeout_seconds", 30)), 120)),
+                encoding="utf-8", errors="replace",
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return False, f"probe не выполнен: {exc}"
+        if result.returncode:
+            detail = (result.stderr or result.stdout or "unknown error").strip().splitlines()
+            return False, f"probe завершился с ошибкой: {detail[-1] if detail else 'unknown error'}"
+    return True, "инструмент доступен"
+
+
+def execution_route(task, fallback_prompt: str, working_dir: str | None = None) -> dict:
+    """Choose the project tool or the original skill prompt without invoking an LLM.
+
+    The profile owns this opt-in. PromptPilot only checks local availability and
+    renders a compact executor-neutral prompt; all repository semantics stay in
+    the project tool and its fallback skill.
+    """
+    matched = _matching_queue(task)
+    if matched is None:
+        return {"action": "prompt", "mode": "skill", "prompt": fallback_prompt}
+    profile_id, _profile, queue = matched
+    execution = queue.get("execution")
+    if not isinstance(execution, dict):
+        return {"action": "prompt", "mode": "skill", "prompt": fallback_prompt}
+
+    mode = str(execution.get("mode", "auto")).lower()
+    if mode not in {"auto", "tool", "skill"}:
+        return {
+            "action": "block", "mode": mode,
+            "reason": f"неизвестный pipeline execution mode: {mode}",
+            "profile_id": profile_id, "queue_id": queue.get("id"),
+        }
+    if mode == "skill":
+        return {"action": "prompt", "mode": "skill", "prompt": fallback_prompt}
+
+    stage = str(execution.get("stage") or queue.get("id") or "").lower()
+    command = _tool_command(execution, stage)
+    if command is None:
+        available, reason = False, "execution.command должен быть непустым массивом строк"
+    else:
+        available, reason = _tool_available(execution, command, working_dir, stage)
+    if not available:
+        if mode == "auto":
+            return {
+                "action": "prompt", "mode": "skill", "prompt": fallback_prompt,
+                "fallback_reason": reason, "profile_id": profile_id,
+                "queue_id": queue.get("id"),
+            }
+        return {
+            "action": "block", "mode": "tool", "reason": reason,
+            "profile_id": profile_id, "queue_id": queue.get("id"),
+        }
+
+    rendered = subprocess.list2cmdline(command)
+    prompt = execution.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        prompt = (
+            f"Запусти `{rendered}` из корня проекта и следуй его JSON-ответу. "
+            "Инструмент выбирает цель и проверяет изменяемое состояние; сам оцени только "
+            "код, дифф и результаты тестов. Если он вернул action=fallback, выполни "
+            "исходный скилл ниже. Не заменяй отказ инструмента ручными GitHub-мутациями."
+        )
+    prompt = (
+        f"{prompt.strip()}\n\n"
+        "Исходный скилл для fallback:\n"
+        f"{fallback_prompt.strip()}"
+    )
+    return {
+        "action": "prompt", "mode": "tool", "prompt": prompt,
+        "command": command, "profile_id": profile_id, "queue_id": queue.get("id"),
+    }
+
+
+def _execution_status(queue: dict, working_dir: str | None) -> dict:
+    execution = queue.get("execution")
+    if not isinstance(execution, dict):
+        return {"configured": "skill", "effective": "skill", "available": None}
+    mode = str(execution.get("mode", "auto")).lower()
+    if mode == "skill":
+        return {"configured": mode, "effective": "skill", "available": None}
+    stage = str(execution.get("stage") or queue.get("id") or "").lower()
+    command = _tool_command(execution, stage)
+    available, reason = ((False, "execution.command не настроен") if command is None
+                         else _tool_available(execution, command, working_dir, stage))
+    effective = "tool" if available else ("skill" if mode == "auto" else "blocked")
+    return {"configured": mode, "effective": effective, "available": available,
+            "reason": reason, "command": command}
+
+
 def _run_profile_health_check(profile: dict) -> dict | None:
     """Run an optional project-owned, token-free invariant checker."""
     config = profile.get("health_check")
@@ -468,6 +616,7 @@ def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True) -> d
                 "failure_rate": matching["failure_rate"] if matching else None,
                 "empty_rate": matching["empty_rate"] if matching else None,
                 "membership_complete": membership_complete, "age": age,
+                "execution": _execution_status(item, matching.get("working_dir") if matching else None),
                 **recommendation,
             })
             snapshot_queues[item["id"]] = {

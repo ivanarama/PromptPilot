@@ -425,7 +425,7 @@ def _wait_settled(name, until_args, deadline, cancel_check, host=None):
 
 def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
                  cancel_check=None, keep_pane: bool = None, host: str = None,
-                 on_worktree=None, on_pane=None) -> dict:
+                 on_worktree=None, on_pane=None, prompt_override: str = None) -> dict:
     """Run a task in a herdr-managed agent session.
 
     on_blocked(pane_id) is called once when the agent first enters ``blocked``.
@@ -449,7 +449,7 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
                "worktree_path": "", "worktree_branch": ""}
     attach = attach_hint(host)
     from .worker import effective_prompt
-    prompt = effective_prompt(task)  # task + the human's late word, if any
+    prompt = prompt_override if prompt_override is not None else effective_prompt(task)
     workspace_id = ""  # set only when the task got its own worktree workspace
     repo_root = ""
     wt_copied = []

@@ -405,6 +405,87 @@ def test_dispatch_gate_defers_only_matching_diagnostic_stages(isolated_db, monke
     ]
     assert pipeline_insights.dispatch_gate(task) is None
 
+
+def test_pipeline_execution_auto_uses_tool_when_available(isolated_db, monkeypatch, tmp_path):
+    helper = tmp_path / "pipelinectl.py"
+    helper.write_text("print('ok')", encoding="utf-8")
+    task = isolated_db.create_task(TaskCreate(
+        prompt="ExampleProject - REVIEW\n/review-queue", recurrence="4h",
+    ))
+    profile = {
+        "title": "Example", "repository": "owner/example",
+        "queues": [{
+            "id": "review", "title": "Review", "query": "is:pr",
+            "series_contains": "ExampleProject - REVIEW",
+            "execution": {
+                "mode": "auto", "stage": "review",
+                "command": ["{python}", "pipelinectl.py", "next", "{stage}"],
+                "required_paths": ["pipelinectl.py"],
+            },
+        }],
+    }
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"example": profile})
+
+    route = pipeline_insights.execution_route(task, task.prompt, str(tmp_path))
+
+    assert route["action"] == "prompt"
+    assert route["mode"] == "tool"
+    assert "pipelinectl.py next review" in route["prompt"]
+    assert "/review-queue" in route["prompt"]
+
+
+def test_pipeline_execution_auto_falls_back_but_tool_mode_blocks(isolated_db, monkeypatch, tmp_path):
+    task = isolated_db.create_task(TaskCreate(
+        prompt="ExampleProject - MERGE\n/merge-shepherd", recurrence="4h",
+    ))
+    execution = {
+        "mode": "auto", "command": ["{python}", "missing.py", "{stage}"],
+        "required_paths": ["missing.py"],
+    }
+    profile = {
+        "title": "Example", "repository": "owner/example",
+        "queues": [{
+            "id": "merge", "title": "Merge", "query": "is:pr label:ship",
+            "series_contains": "ExampleProject - MERGE", "execution": execution,
+        }],
+    }
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"example": profile})
+
+    automatic = pipeline_insights.execution_route(task, task.prompt, str(tmp_path))
+    assert automatic["mode"] == "skill"
+    assert "не найден missing.py" in automatic["fallback_reason"]
+
+    execution["mode"] = "tool"
+    required = pipeline_insights.execution_route(task, task.prompt, str(tmp_path))
+    assert required["action"] == "block"
+    assert required["mode"] == "tool"
+
+
+def test_pipeline_execution_probe_failure_uses_skill_in_auto(isolated_db, monkeypatch, tmp_path):
+    helper = tmp_path / "pipelinectl.py"
+    helper.write_text("print('present')", encoding="utf-8")
+    task = isolated_db.create_task(TaskCreate(
+        prompt="ExampleProject - REVIEW\n/review-queue", recurrence="4h",
+    ))
+    profile = {
+        "title": "Example", "repository": "owner/example",
+        "queues": [{
+            "id": "review", "title": "Review", "query": "is:pr",
+            "series_contains": "ExampleProject - REVIEW",
+            "execution": {
+                "mode": "auto", "command": ["{python}", "pipelinectl.py"],
+                "required_paths": ["pipelinectl.py"],
+                "probe_command": ["{python}", "-c", "raise SystemExit(7)"],
+            },
+        }],
+    }
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"example": profile})
+
+    route = pipeline_insights.execution_route(task, task.prompt, str(tmp_path))
+
+    assert route["mode"] == "skill"
+    assert "probe завершился с ошибкой" in route["fallback_reason"]
+
 def test_pipeline_insights_history_is_profile_scoped_and_tracks_movement(isolated_db, monkeypatch):
     profile = {
         "title": "OtherProject pipeline", "repository": "owner/other",

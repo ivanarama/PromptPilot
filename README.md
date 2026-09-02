@@ -797,6 +797,56 @@ PromptPilot запускает её при каждом снимке и пока
 профиль или checker сломан, gate fail-open: задача запускается обычным способом,
 чтобы ошибка наблюдаемости не остановила полезную работу.
 
+#### Детерминированный `pipelinectl` и fallback на скилл
+
+Для REVIEW/MERGE повторяемые GitHub-проверки можно вынести из промпта в
+проектный CLI. PromptPilot не привязан ни к Claude, ни к Codex: он только
+выбирает короткий prompt до запуска провайдера. В очередь профиля добавляется:
+
+```json
+"execution": {
+  "mode": "auto",
+  "stage": "review",
+  "command": [
+    "{python}", "-m", "promptpilot.project_pipeline",
+    "--config", "pipelinectl.json", "next", "{stage}"
+  ],
+  "required_paths": ["pipelinectl.json"],
+  "probe_command": [
+    "{python}", "-m", "promptpilot.project_pipeline",
+    "--config", "pipelinectl.json", "capabilities"
+  ]
+}
+```
+
+`{python}` заменяется интерпретатором запущенного PromptPilot, `{stage}` — `id`
+этапа. Команда и относительные пути проверяются в `working_dir` серии без
+вызова LLM. Режимы:
+
+| Режим | Поведение |
+|---|---|
+| `auto` | доступен CLI — короткий tool-prompt; недоступен — исходный prompt/скилл |
+| `tool` | CLI обязателен; при отсутствии запуск завершается `НУЖЕН ЧЕЛОВЕК` без токенов |
+| `skill` | всегда используется исходный prompt, как до появления `pipelinectl` |
+
+Эффективный маршрут (`auto → tool`, `auto → skill` или `blocked`) виден в
+дашборде и боте для каждого этапа. Это позволяет заметить незапланированный
+fallback сразу, а не по суточному расходу токенов.
+
+Встроенный `promptpilot.project_pipeline` реализует общий protocol v1. Проект
+задаёт `repository`, доверенный аккаунт, health-команду, base branch и required
+checks в `pipelinectl.json`. Обычный REVIEW получает ровно один кандидат и
+opaque lease; `complete review` повторно проверяет HEAD и два одинаковых полных
+GraphQL snapshot, затем сам выполняет review → claim → label → completion.
+Обычный CLEAN MERGE аналогично повторяет proof/labels/CI и использует merge с
+точным SHA. Base-sync, carry, legacy re-ship, конфликт, recovery и третий круг
+намеренно возвращают `action=fallback`: их продолжает полная проектная
+процедура. Таким образом быстрый путь не ослабляет сложные гейты.
+
+Claude и Codex получают одну и ту же команду и JSON. Различаются только тонкие
+файлы обнаружения навыка (`.claude/skills` и `.agents/skills`); логика CLI и
+lease от модели не зависят.
+
 Статус в Web UI и боте читается так:
 
 | Статус | Значение |

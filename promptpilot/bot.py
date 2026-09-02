@@ -909,10 +909,15 @@ def _pipeline_text(data: dict) -> str:
         duration = queue.get("avg_duration_seconds")
         duration_text = (f"{round(duration / 60)} мин" if duration is not None else "нет истории")
         eta = queue.get("eta_hours")
+        route = queue.get("execution") or {"configured": "skill", "effective": "skill"}
+        route_text = route["configured"]
+        if route.get("effective") != route.get("configured"):
+            route_text += f" → {route.get('effective')}"
         lines.append(f"{marker} {queue['title']}: {queue['backlog']} / "
                      f"{queue['capacity']} за прогон = {queue['runs_needed']} прогонов; "
                      f"сейчас {queue['interval'] or 'не настроено'}; "
                      f"средний запуск {duration_text}; ETA {eta if eta is not None else '—'} ч\n"
+                     f"   Маршрут: {route_text}\n"
                      f"   Рекомендация: {queue['recommendation']}")
     runs = recent.get("runs", {})
     lines.extend(["", f"Прогоны за окно: {runs.get('runs', 0)}; готово {runs.get('ready', 0)}, "
