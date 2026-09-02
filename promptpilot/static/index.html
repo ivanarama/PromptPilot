@@ -2526,18 +2526,27 @@ function aggregateDiagnosticFindings(findings) {
 
 function diagnosticFindingMessage(finding) {
   const messages = {
-    single_flight_barrier: 'В работе только этот PR; остальные ждут завершения текущего шага.',
+    single_flight_barrier: 'Пока этот PR не завершит цикл REVIEW → MERGE, остальные остаются в очереди.',
     legacy_ship_waiting_review_validation: 'Переход со старого формата: очередь безопасно перепроверит эти PR перед слиянием.',
-    base_sync_base_advanced: 'Ветка main обновилась после подготовки PR; перед слиянием нужна повторная синхронизация.'
+    base_sync_base_advanced: 'Ветка main обновилась после подготовки PR; перед слиянием нужна повторная синхронизация.',
+    health_check_failed: 'Сама проверка состояния не завершилась. Повторите обновление; это ещё не означает нарушение конвейера.',
+    invalid_health_check: 'Команда проверки состояния настроена неверно.'
   };
   return messages[finding.code] || finding.message || finding.code;
 }
 
-function renderDiagnosticFinding(finding) {
+function queueTaskIsRunning(data, queueId) {
+  const queue = (data.queues || []).find(item => item.id === queueId);
+  return Boolean(queue && queue.task_status === 'running');
+}
+
+function renderDiagnosticFinding(finding, data) {
   const shown = finding.prs.slice(0, 5).map(pr => `#${pr}`).join(', ');
   const rest = finding.prs.length > 5 ? ` и ещё ${finding.prs.length - 5}` : '';
   const prefix = finding.prs.length
-    ? finding.code === 'single_flight_barrier' ? `Текущий PR: ${shown}${rest} · ` : `PR ${shown}${rest} · `
+    ? finding.code === 'single_flight_barrier'
+      ? `${queueTaskIsRunning(data, 'review') ? 'Сейчас на ревью' : 'Первый в очереди'}: ${shown}${rest} · `
+      : `PR ${shown}${rest} · `
     : '';
   return `<li class="${finding.severity === 'red' ? 'error-text' : ''}">${prefix}${esc(diagnosticFindingMessage(finding))}</li>`;
 }
@@ -2550,7 +2559,7 @@ function diagnosticOverview(data) {
   const human = diagnostics.human_waiting || [];
   const findings = diagnostics.findings || [];
   const legacy = findings.filter(f => f.code === 'legacy_ship_waiting_review_validation').length;
-  if (review.length) parts.push(`следующий на ревью: #${review[0].number}`);
+  if (review.length) parts.push(`${queueTaskIsRunning(data, 'review') ? 'сейчас на ревью' : 'следующий в очереди на ревью'}: #${review[0].number}`);
   if (fix.length) parts.push(`готовы к исправлению: ${fix.length}`);
   if (human.length) parts.push(`ждут решения человека: ${human.length}`);
   if (legacy) parts.push(`переходят со старого формата: ${legacy}`);
@@ -2559,9 +2568,14 @@ function diagnosticOverview(data) {
 
 function pipelineHealthReason(data) {
   const diagnostics = data.diagnostics;
+  if (diagnostics && diagnostics.checker_failed) return 'сама диагностика не завершилась — состояние конвейера не подтверждено';
   if (diagnostics && diagnostics.state === 'red') return 'проверка обнаружила нарушение — подробности ниже';
   if (diagnostics && diagnostics.state === 'yellow') return `очередь работает · ${diagnosticOverview(data)}`;
   return data.health.reason;
+}
+
+function diagnosticBadgeLabel(diagnostics) {
+  return diagnostics && diagnostics.checker_failed ? 'проверка недоступна' : diagnosticStateLabel(diagnostics.state);
 }
 
 async function loadPipelineInsights(profile, refresh=false) {
@@ -2583,9 +2597,9 @@ async function loadPipelineInsights(profile, refresh=false) {
     const diagnosticFindings = diagnostics && diagnostics.findings ? diagnostics.findings : [];
     const diagnosticGroups = aggregateDiagnosticFindings(diagnosticFindings);
     const diagnosticHtml = diagnostics ? `<div style="border:1px solid var(--border);border-radius:6px;padding:9px;margin:10px 0">
-      <div><b>Что сейчас происходит</b><span class="pipeline-health ${escAttr(diagnostics.state)}">${esc(diagnosticStateLabel(diagnostics.state))}</span></div>
+      <div><b>Состояние очереди</b><span class="pipeline-health ${escAttr(diagnostics.state)}">${esc(diagnosticBadgeLabel(diagnostics))}</span></div>
       <div class="prov-cmd">${esc(diagnosticOverview(data))}</div>
-      ${diagnosticGroups.length ? `<ul style="margin:7px 0 0 18px">${diagnosticGroups.slice(0,8).map(renderDiagnosticFinding).join('')}</ul>` : ''}
+      ${diagnosticGroups.length ? `<ul style="margin:7px 0 0 18px">${diagnosticGroups.slice(0,8).map(finding => renderDiagnosticFinding(finding, data)).join('')}</ul>` : ''}
     </div>` : '';
     const rows = data.queues.map(q => `<tr class="${data.bottleneck===q.id?'bottleneck':''}"><td>${data.bottleneck===q.id?'⚠ ':''}${esc(q.title)}</td><td class="num">${q.backlog}</td><td class="num">${h5.complete?signed(deltaByQueue[q.id]||0):'—'}</td><td class="num">${q.capacity}</td><td class="num">${q.runs_needed}</td><td>${duration(q.avg_duration_seconds)}</td><td>${q.eta_hours == null ? '—' : q.eta_hours+' ч'}</td><td>${age(q.age.oldest_hours)}</td><td>${esc(q.interval || 'нет серии')}</td><td class="insights-recommendation">${esc(q.recommendation || '—')}</td></tr>`).join('');
     box.innerHTML = `<div style="border:1px solid var(--border);border-radius:8px;padding:12px;margin-bottom:12px">

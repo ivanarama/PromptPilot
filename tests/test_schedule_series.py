@@ -31,11 +31,17 @@ def test_fresh_install_has_no_project_specific_pipeline_profiles(tmp_path, monke
 
 
 def test_project_health_check_is_immediate_and_accepts_red_json(monkeypatch):
-    monkeypatch.setattr(pipeline_insights.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(
-        returncode=1,
-        stdout='{"state":"red","summary":"broken route","findings":[]}',
-        stderr="",
-    ))
+    calls = []
+
+    def fake_run(*args, **kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(
+            returncode=1,
+            stdout='{"state":"red","summary":"broken route","findings":[]}',
+            stderr="",
+        )
+
+    monkeypatch.setattr(pipeline_insights.subprocess, "run", fake_run)
     profile = {"health_check": {"command": ["project-health", "-json"]}}
 
     diagnostics = pipeline_insights._run_profile_health_check(profile)
@@ -44,8 +50,27 @@ def test_project_health_check_is_immediate_and_accepts_red_json(monkeypatch):
 
     assert diagnostics["state"] == "red"
     assert diagnostics["exit_code"] == 1
+    assert calls[0]["timeout"] == 180
     assert health["state"] == "red"
     assert health["label"] == "нарушен инвариант"
+
+
+def test_health_check_failure_is_not_reported_as_broken_invariant(monkeypatch):
+    monkeypatch.setattr(
+        pipeline_insights.subprocess, "run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            pipeline_insights.subprocess.TimeoutExpired(args[0], 180)),
+    )
+
+    diagnostics = pipeline_insights._run_profile_health_check({
+        "health_check": {"command": ["project-health", "-json"]},
+    })
+    health = pipeline_insights._health(
+        10, {"5h": {"complete": False}}, 0, diagnostics=diagnostics)
+
+    assert diagnostics["checker_failed"] is True
+    assert health["state"] == "red"
+    assert health["label"] == "диагностика не выполнена"
 
 
 def test_project_health_attention_overrides_warming_history():
@@ -206,6 +231,28 @@ def test_pipeline_insights_finds_capacity_bottleneck(isolated_db, monkeypatch):
     assert review["recommended_interval"] == "1h"
     assert "оставить 1h" not in review["recommendation"]  # no matching series in this unit test
     assert "решения человека" in triage["recommendation"]
+
+
+def test_pipeline_insights_exposes_actual_series_task_status(isolated_db, monkeypatch):
+    counts = iter([0, 0, 0, 1, 0])
+    monkeypatch.setattr(pipeline_insights, "_github_search", lambda repo, query: {
+        "count": next(counts), "items": [], "membership_complete": False,
+    })
+    monkeypatch.setattr(pipeline_insights, "_profiles",
+                        lambda: {"example": PIPELINE_PROFILE})
+    task = isolated_db.create_task(TaskCreate(
+        prompt="ExampleProject - REVIEW", recurrence="4h",
+    ))
+    claimed = isolated_db.get_next_runnable()
+    assert claimed.id == task.id
+    pipeline_insights._cache.clear()
+
+    result = pipeline_insights.analyze(
+        "example", isolated_db.list_series(), use_cache=False)
+
+    review = next(q for q in result["queues"] if q["id"] == "review")
+    assert review["task_id"] == task.id
+    assert review["task_status"] == "running"
 
 def test_pipeline_insights_history_is_profile_scoped_and_tracks_movement(isolated_db, monkeypatch):
     profile = {

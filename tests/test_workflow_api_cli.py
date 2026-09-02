@@ -109,8 +109,12 @@ def test_schedule_ui_exposes_durable_series_controls():
     assert "diagnosticOverview(data)" in html
     assert "pipelineHealthReason(data)" in html
     assert "Переход со старого формата" in html
-    assert "Что сейчас происходит" in html
-    assert "Текущий PR: ${shown}${rest}" in html
+    assert "Состояние очереди" in html
+    assert "queueTaskIsRunning(data, 'review')" in html
+    assert "Первый в очереди" in html
+    assert "Сейчас на ревью" in html
+    assert "diagnosticBadgeLabel" in html
+    assert "это ещё не означает нарушение конвейера" in html
     assert "Текущая проверка" not in html
     assert "diagnosticGroups.slice(0,8)" in html
 
