@@ -1,4 +1,6 @@
 import json
+import os
+from types import SimpleNamespace
 
 import pytest
 
@@ -109,3 +111,20 @@ def test_capabilities_is_executor_neutral(tmp_path):
     }), encoding="utf-8")
     config = pp.load_config(str(config_path))
     assert pp.capabilities(config)["protocol"] == "promptpilot-pipelinectl-v1"
+
+
+def test_health_exposes_configured_gh_to_nested_checker(monkeypatch):
+    captured = {}
+
+    def fake_run(*args, **kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(returncode=0, stdout='{"state":"green"}', stderr="")
+
+    gh = os.path.join("tools", "github", "gh.exe")
+    monkeypatch.setenv("PP_GH_EXE", gh)
+    monkeypatch.setenv("PATH", "existing")
+    monkeypatch.setattr(pp.subprocess, "run", fake_run)
+
+    assert pp.run_health({"health_command": ["project-health", "-json"]})["state"] == "green"
+    assert captured["env"]["GH_EXE"] == gh
+    assert captured["env"]["PATH"].split(os.pathsep)[0] == os.path.dirname(gh)
