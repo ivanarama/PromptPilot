@@ -22,7 +22,6 @@ _INTERVAL_PRESETS = ((0.25, "15m"), (0.5, "30m"), (1, "1h"), (2, "2h"),
                      (4, "4h"), (8, "8h"), (12, "12h"), (24, "24h"))
 _HISTORY_WINDOWS = (5, 24)
 
-
 def _profiles() -> dict:
     """Load user-owned profiles; PromptPilot ships without project-specific data."""
     result = dict(DEFAULT_PROFILES)
@@ -224,6 +223,47 @@ def _window_metrics(snapshots: list[dict], current: dict, series_ids: list[int],
         "queue_deltas": queue_deltas,
         "runs": db.pipeline_run_metrics(series_ids, now - timedelta(hours=hours)),
     }
+
+
+def dispatch_gate(task) -> dict | None:
+    """Evaluate an optional user-owned, token-free gate for a series task.
+
+    Profiles are deliberately generic: PromptPilot knows neither OneBase nor
+    any stage semantics unless the local profile opts into these conditions.
+    """
+    if not getattr(task, "series_id", None):
+        return None
+    title = (getattr(task, "series_title", None) or task.prompt.splitlines()[0]).lower()
+    for profile_id, profile in _profiles().items():
+        for queue_config in profile.get("queues", []):
+            marker = queue_config.get("series_contains", "").lower()
+            config = queue_config.get("dispatch_gate")
+            if not marker or marker not in title or not isinstance(config, dict):
+                continue
+            # Dispatch checks must be fresh. A five-minute dashboard cache is
+            # fine for a chart, but unsafe for deciding whether to run an agent.
+            data = analyze(profile_id, db.list_series(), use_cache=False)
+            queue = next((item for item in data["queues"]
+                          if item["id"] == queue_config["id"]), None)
+            if config.get("skip_when_empty") and queue and queue["backlog"] == 0:
+                return {
+                    "action": "complete_empty",
+                    "reason": f"очередь «{queue['title']}» пуста",
+                    "profile_id": profile_id, "queue_id": queue["id"],
+                }
+            diagnostics = data.get("diagnostics") or {}
+            for field in config.get("defer_when_diagnostics_nonempty", []):
+                value = diagnostics.get(field)
+                if value:
+                    count = len(value) if isinstance(value, list) else 1
+                    return {
+                        "action": "defer",
+                        "defer_for": config.get("defer_for", "10m"),
+                        "reason": f"ожидание этапа по diagnostics.{field} ({count})",
+                        "profile_id": profile_id, "queue_id": queue_config["id"],
+                    }
+            return None
+    return None
 
 
 def _run_profile_health_check(profile: dict) -> dict | None:
@@ -429,6 +469,13 @@ def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True) -> d
             default=None,
         )
         backlog_total = sum(queue["backlog"] for queue in queues)
+        activity = db.pipeline_series_activity(series_ids)
+        for queue in queues:
+            queue["last_run"] = activity.get(queue.get("series_id"))
+            queue["runs_5h"] = db.pipeline_run_metrics(
+                [queue["series_id"]] if queue.get("series_id") else [],
+                now - timedelta(hours=5),
+            )
         diagnostics = _run_profile_health_check(profile)
         runtime = _pipeline_runtime(matching_series, now)
         result = {

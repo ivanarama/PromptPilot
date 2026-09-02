@@ -2590,6 +2590,15 @@ async function loadPipelineInsights(profile, refresh=false) {
     const duration = seconds => seconds == null ? '—' : seconds < 3600 ? `${Math.round(seconds/60)} мин` : `${(seconds/3600).toFixed(1)} ч`;
     const historyNote = h5.complete ? 'за последние 5 часов' : `история ${h5.coverage_hours} из 5 ч`;
     const runs = h5.runs;
+    const reviewQueue = (data.queues || []).find(q => q.id === 'review');
+    const lastReview = reviewQueue && reviewQueue.last_run;
+    const lastReviewValue = lastReview && lastReview.at ? timeAgo(lastReview.at) : 'ещё не было';
+    const lastReviewNote = lastReview && lastReview.at
+      ? `#${lastReview.task_id} · ${new Date(lastReview.at).toLocaleString()} · ${lastReview.verdict || lastReview.status}`
+      : 'в истории этой серии нет завершённого запуска';
+    const tokenValue = runs.tokens_known_runs
+      ? Number(runs.total_tokens || 0).toLocaleString()
+      : 'нет данных';
     const deltaByQueue = h5.queue_deltas || {};
     const diagnostics = data.diagnostics;
     const runtime = data.runtime || {};
@@ -2601,7 +2610,17 @@ async function loadPipelineInsights(profile, refresh=false) {
       <div class="prov-cmd">${esc(diagnosticOverview(data))}</div>
       ${diagnosticGroups.length ? `<ul style="margin:7px 0 0 18px">${diagnosticGroups.slice(0,8).map(finding => renderDiagnosticFinding(finding, data)).join('')}</ul>` : ''}
     </div>` : '';
-    const rows = data.queues.map(q => `<tr class="${data.bottleneck===q.id?'bottleneck':''}"><td>${data.bottleneck===q.id?'⚠ ':''}${esc(q.title)}</td><td class="num">${q.backlog}</td><td class="num">${h5.complete?signed(deltaByQueue[q.id]||0):'—'}</td><td class="num">${q.capacity}</td><td class="num">${q.runs_needed}</td><td>${duration(q.avg_duration_seconds)}</td><td>${q.eta_hours == null ? '—' : q.eta_hours+' ч'}</td><td>${age(q.age.oldest_hours)}</td><td>${esc(q.interval || 'нет серии')}</td><td class="insights-recommendation">${esc(q.recommendation || '—')}</td></tr>`).join('');
+    const rows = data.queues.map(q => {
+      const last = q.last_run;
+      const stageRuns = q.runs_5h || {};
+      const lastTokens = last && last.input_tokens != null && last.output_tokens != null
+        ? ` · ${(last.input_tokens + last.output_tokens).toLocaleString()} ток.` : '';
+      const lastLine = last && last.at
+        ? `последний #${last.task_id}: ${timeAgo(last.at)} · ${last.verdict || last.status}${lastTokens}`
+        : 'завершённых запусков нет';
+      const stageLine = `5 ч: ${stageRuns.runs || 0} запусков · действий ${stageRuns.ready || 0} · холостых ${stageRuns.no_change || 0}`;
+      return `<tr class="${data.bottleneck===q.id?'bottleneck':''}"><td>${data.bottleneck===q.id?'⚠ ':''}${esc(q.title)}<div class="prov-cmd" title="${escAttr(last?.summary || '')}">${esc(lastLine)}</div><div class="prov-cmd">${esc(stageLine)}</div></td><td class="num">${q.backlog}</td><td class="num">${h5.complete?signed(deltaByQueue[q.id]||0):'—'}</td><td class="num">${q.capacity}</td><td class="num">${q.runs_needed}</td><td>${duration(q.avg_duration_seconds)}</td><td>${q.eta_hours == null ? '—' : q.eta_hours+' ч'}</td><td>${age(q.age.oldest_hours)}</td><td>${esc(q.interval || 'нет серии')}</td><td class="insights-recommendation">${esc(q.recommendation || '—')}</td></tr>`;
+    }).join('');
     box.innerHTML = `<div style="border:1px solid var(--border);border-radius:8px;padding:12px;margin-bottom:12px">
       <div><b>${esc(data.title)}</b><span class="pipeline-health ${escAttr(data.health.state)}">${esc(healthLabel)}</span></div>
       <div class="prov-cmd">${esc(data.repository)} · ${esc(pipelineHealthReason(data))} · история хранится локально</div>
@@ -2610,8 +2629,10 @@ async function loadPipelineInsights(profile, refresh=false) {
         <div class="pipeline-metric"><div class="pipeline-metric-label">Вход / выход</div><div class="pipeline-metric-value">${h5.complete?`${h5.entered} / ${h5.exited}`:'—'}</div><div class="pipeline-metric-note">${historyNote}</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Переходы / churn</div><div class="pipeline-metric-value">${h5.complete?`${h5.transitions} / ${h5.churn_items}`:'—'}</div><div class="pipeline-metric-note">между очередями / 3+ состояний</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Возраст p90 / max</div><div class="pipeline-metric-value">${age(data.age.p90_hours)} / ${age(data.age.oldest_hours)}</div><div class="pipeline-metric-note">текущие элементы</div></div>
-        <div class="pipeline-metric"><div class="pipeline-metric-label">Прогоны 5 ч</div><div class="pipeline-metric-value">${runs.runs}</div><div class="pipeline-metric-note">готово ${runs.ready} · пусто ${runs.empty}</div></div>
+        <div class="pipeline-metric"><div class="pipeline-metric-label">Прогоны 5 ч</div><div class="pipeline-metric-value">${runs.runs}</div><div class="pipeline-metric-note">с действием ${runs.ready} · без действий ${runs.no_change || 0} · пусто ${runs.empty}</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Смысловые проблемы</div><div class="pipeline-metric-value">${runs.human + runs.unable + runs.failed}</div><div class="pipeline-metric-note">человек ${runs.human} · не смог ${runs.unable} · упало ${runs.failed}</div></div>
+        <div class="pipeline-metric"><div class="pipeline-metric-label">Последнее REVIEW</div><div class="pipeline-metric-value">${esc(lastReviewValue)}</div><div class="pipeline-metric-note">${esc(lastReviewNote)}</div></div>
+        <div class="pipeline-metric"><div class="pipeline-metric-label">Токены 5 ч</div><div class="pipeline-metric-value">${esc(tokenValue)}</div><div class="pipeline-metric-note">измерено запусков: ${runs.tokens_known_runs || 0} из ${runs.runs}</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Δ backlog 24 ч</div><div class="pipeline-metric-value">${h24.complete?signed(h24.backlog_delta):'—'}</div><div class="pipeline-metric-note">покрытие ${h24.coverage_hours} из 24 ч</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Цель очистки</div><div class="pipeline-metric-value">${data.target_clear_hours} ч</div><div class="pipeline-metric-note">без прогноза нового входа</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Worker</div><div class="pipeline-metric-value">${runtime.state==='online'?'online':'offline'}</div><div class="pipeline-metric-note">${runtime.age_seconds == null ? 'heartbeat отсутствует' : 'heartbeat '+runtime.age_seconds+' сек назад'}</div></div>

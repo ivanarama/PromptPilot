@@ -255,7 +255,10 @@ BUILTIN_PROVIDERS = {
         # Windows resolves the npm shim as codex.CMD. A multiline argv value is
         # then truncated at its first newline by cmd.exe. Codex natively reads
         # the full prompt from stdin when its prompt argument is '-'.
-        "cmd": "codex exec -",
+        # JSONL carries the final response plus per-turn token usage. Without
+        # it the run succeeds, but PromptPilot can only store opaque text and
+        # the dashboard has no honest Codex usage figures.
+        "cmd": "codex exec --json -",
         "kind": "codex",
         "prompt_stdin": True,
         "description": "OpenAI Codex",
