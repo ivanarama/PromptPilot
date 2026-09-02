@@ -345,6 +345,32 @@ def format_result(parsed: dict) -> str:
     return "\n".join(parts)
 
 
+def _remember_stream_session(task_id: int, line: str) -> None:
+    """Commit a resumable session as soon as the provider announces it."""
+    try:
+        event = json.loads(line)
+    except (TypeError, json.JSONDecodeError):
+        return
+    session_id = None
+    if event.get("type") == "thread.started":
+        session_id = event.get("thread_id")
+    elif event.get("type") == "system":
+        session_id = event.get("session_id")
+    if session_id:
+        db.set_session_id(task_id, session_id)
+
+
+def _read_process_pipe(pipe, chunks: list[str], task_id: int | None = None) -> None:
+    """Drain one provider pipe without blocking the cancellation poll loop."""
+    try:
+        for line in iter(pipe.readline, ""):
+            chunks.append(line)
+            if task_id is not None:
+                _remember_stream_session(task_id, line)
+    finally:
+        pipe.close()
+
+
 def is_stream_json(stdout: str) -> bool:
     """Check if output looks like stream-json (multiple JSON lines)."""
     if not stdout:
@@ -756,26 +782,48 @@ def _execute_task_inner(task):
         finally:
             proc.stdin = None
 
+    # Drain both pipes while polling. Besides avoiding pipe deadlocks, the
+    # stdout reader persists Codex/Claude session ids immediately, so a worker
+    # crash can resume the same conversation instead of mistaking its own dirty
+    # checkout for foreign work on a fresh run.
+    stdout_parts: list[str] = []
+    stderr_parts: list[str] = []
+    stdout_thread = threading.Thread(
+        target=_read_process_pipe, args=(proc.stdout, stdout_parts, task.id), daemon=True)
+    stderr_thread = threading.Thread(
+        target=_read_process_pipe, args=(proc.stderr, stderr_parts), daemon=True)
+    stdout_thread.start()
+    stderr_thread.start()
+
     # Poll instead of blocking: allows user-requested cancellation of a
     # RUNNING task (Web UI/bot) and the per-task timeout.
     started = time.monotonic()
     while True:
         try:
-            stdout, stderr = proc.communicate(timeout=2)
+            proc.wait(timeout=2)
             break
         except subprocess.TimeoutExpired:
             if db.is_cancel_requested(task.id):
                 _kill_process_tree(proc)
-                _drain(proc)
+                proc.wait(timeout=10)
+                stdout_thread.join(timeout=10)
+                stderr_thread.join(timeout=10)
                 db.clear_cancel_request(task.id)
                 db.mark_cancelled(task.id, "Отменена пользователем во время выполнения")
                 print("  -> Cancelled by user")
                 return
             if effective_timeout and time.monotonic() - started > effective_timeout:
                 _kill_process_tree(proc)
-                _drain(proc)
+                proc.wait(timeout=10)
+                stdout_thread.join(timeout=10)
+                stderr_thread.join(timeout=10)
                 db.mark_failed(task.id, f"Execution timed out after {effective_timeout}s", exit_code=-1)
                 return
+
+    stdout_thread.join(timeout=10)
+    stderr_thread.join(timeout=10)
+    stdout = "".join(stdout_parts)
+    stderr = "".join(stderr_parts)
 
     result = subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
 

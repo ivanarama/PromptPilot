@@ -1,5 +1,5 @@
 from promptpilot.config import build_cmd, cmd_runs_codex, load_providers
-from promptpilot.worker import format_result, parse_stream_json
+from promptpilot.worker import _remember_stream_session, format_result, parse_stream_json
 
 
 def test_codex_multiline_prompt_uses_stdin_transport():
@@ -49,6 +49,31 @@ def test_codex_skip_permissions_uses_codex_autonomous_flag():
     assert command == [
         "codex", "exec", "--json", "--dangerously-bypass-approvals-and-sandbox", "-",
     ]
+
+
+def test_codex_resume_uses_exec_resume_with_stdin_after_session():
+    command = build_cmd(
+        "codex", "continue", session_id="01a06119-37cf-7522-a071-14386645fd47",
+        effort="high", skip_permissions=True,
+    )
+
+    assert command == [
+        "codex", "exec", "resume", "--json", "-c", 'model_reasoning_effort="high"',
+        "--dangerously-bypass-approvals-and-sandbox",
+        "01a06119-37cf-7522-a071-14386645fd47", "-",
+    ]
+
+
+def test_codex_stream_persists_session_before_completion(monkeypatch):
+    seen = []
+    monkeypatch.setattr("promptpilot.worker.db.set_session_id",
+                        lambda task_id, session_id: seen.append((task_id, session_id)))
+
+    _remember_stream_session(
+        182, '{"type":"thread.started","thread_id":"thread-live"}\n')
+    _remember_stream_session(182, '{"type":"turn.started"}\n')
+
+    assert seen == [(182, "thread-live")]
 
 
 def test_codex_jsonl_extracts_final_message_session_and_usage():

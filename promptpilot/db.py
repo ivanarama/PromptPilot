@@ -650,6 +650,23 @@ def set_verdict(task_id: int, verdict: str):
         conn.execute("UPDATE tasks SET verdict = ? WHERE id = ?", (verdict or None, task_id))
 
 
+def set_session_id(task_id: int, session_id: str) -> bool:
+    """Persist a resumable provider session while its process is still alive.
+
+    Waiting until normal completion loses the session exactly when it matters:
+    after a worker/process crash.  The next retry can safely resume only when
+    the first stream event was committed independently of the final result.
+    """
+    if not session_id:
+        return False
+    with _connect() as conn:
+        cur = conn.execute(
+            "UPDATE tasks SET session_id = ? WHERE id = ? AND status = 'running'",
+            (session_id, task_id),
+        )
+        return cur.rowcount > 0
+
+
 def set_worktree(task_id: int, path: str, branch: str):
     """Record where a task's checkout landed, so the UI can point at the diff."""
     with _connect() as conn:
