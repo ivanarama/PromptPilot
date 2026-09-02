@@ -106,7 +106,11 @@ def test_schedule_ui_exposes_durable_series_controls():
     assert "if (t.series_paused)" in html
     assert "PAUSED" in html
     assert "aggregateDiagnosticFindings" in html
-    assert "Текущий владелец барьера" in html
+    assert "diagnosticOverview(data)" in html
+    assert "pipelineHealthReason(data)" in html
+    assert "Переход со старого формата" in html
+    assert "Что сейчас происходит" in html
+    assert "Текущая проверка" not in html
     assert "diagnosticGroups.slice(0,8)" in html
 
 
