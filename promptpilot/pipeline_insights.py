@@ -452,6 +452,10 @@ def _run_profile_health_check(profile: dict) -> dict | None:
     env = os.environ.copy()
     if env.get("PP_GH_EXE"):
         env.setdefault("GH_EXE", env["PP_GH_EXE"])
+        gh_dir = str(Path(env["PP_GH_EXE"]).parent)
+        path_parts = env.get("PATH", "").split(os.pathsep)
+        if gh_dir and gh_dir not in path_parts:
+            env["PATH"] = gh_dir + os.pathsep + env.get("PATH", "")
     try:
         run = subprocess.run(
             command, cwd=config.get("working_dir") or None, env=env,

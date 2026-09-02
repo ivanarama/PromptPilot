@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+import os
 from types import SimpleNamespace
 
 from promptpilot.models import TaskCreate
@@ -53,6 +54,25 @@ def test_project_health_check_is_immediate_and_accepts_red_json(monkeypatch):
     assert calls[0]["timeout"] == 180
     assert health["state"] == "red"
     assert health["label"] == "нарушен инвариант"
+
+
+def test_profile_health_exposes_configured_gh_to_nested_checker(monkeypatch):
+    calls = []
+    gh = os.path.join("tools", "github", "gh.exe")
+    monkeypatch.setenv("PP_GH_EXE", gh)
+    monkeypatch.setenv("PATH", "existing")
+    monkeypatch.setattr(
+        pipeline_insights.subprocess, "run",
+        lambda *args, **kwargs: calls.append(kwargs) or SimpleNamespace(
+            returncode=0, stdout='{"state":"green","findings":[]}', stderr=""),
+    )
+
+    pipeline_insights._run_profile_health_check({
+        "health_check": {"command": ["project-health", "-json"]},
+    })
+
+    assert calls[0]["env"]["GH_EXE"] == gh
+    assert calls[0]["env"]["PATH"].split(os.pathsep)[0] == os.path.dirname(gh)
 
 
 def test_health_check_failure_is_not_reported_as_broken_invariant(monkeypatch):

@@ -139,6 +139,10 @@ def run_health(config: dict) -> dict:
     env = os.environ.copy()
     if env.get("PP_GH_EXE"):
         env.setdefault("GH_EXE", env["PP_GH_EXE"])
+        gh_dir = str(Path(env["PP_GH_EXE"]).parent)
+        path_parts = env.get("PATH", "").split(os.pathsep)
+        if gh_dir and gh_dir not in path_parts:
+            env["PATH"] = gh_dir + os.pathsep + env.get("PATH", "")
     result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="strict", env=env)
     if result.returncode not in (0, 1):
         raise PipelineError((result.stderr or result.stdout or "health command failed").strip())
