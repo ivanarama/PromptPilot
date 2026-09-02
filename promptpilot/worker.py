@@ -253,6 +253,39 @@ def parse_stream_json(stdout: str) -> dict:
                 meta["output_tokens"] = tokens.get("output")
                 meta["total_tokens"] = tokens.get("total")
 
+        elif etype == "thread.started":
+            # Codex exec --json: the thread id is the resumable session id.
+            if event.get("thread_id"):
+                meta["session_id"] = event["thread_id"]
+
+        elif etype == "item.completed":
+            # Codex exec --json: only the final agent_message belongs in the
+            # human-readable result. Command/reasoning items stay structured.
+            item = event.get("item", {})
+            if item.get("type") == "agent_message" and item.get("text"):
+                text_parts.append(item["text"])
+            elif item.get("type") == "error" and item.get("message"):
+                text_parts.append(f"Codex warning: {item['message']}")
+
+        elif etype == "turn.completed":
+            # Codex counts cached input inside input_tokens and exposes the
+            # cached part separately. Keep both so the UI does not invent an
+            # estimate from wall clock time.
+            usage = event.get("usage", {})
+            if usage:
+                meta["input_tokens"] = usage.get("input_tokens")
+                meta["cached_input_tokens"] = usage.get("cached_input_tokens")
+                meta["output_tokens"] = usage.get("output_tokens")
+                meta["reasoning_output_tokens"] = usage.get("reasoning_output_tokens")
+                if usage.get("input_tokens") is not None and usage.get("output_tokens") is not None:
+                    meta["total_tokens"] = usage["input_tokens"] + usage["output_tokens"]
+
+        elif etype in ("turn.failed", "error"):
+            error = event.get("error", event)
+            message = error.get("message") if isinstance(error, dict) else str(error)
+            if message:
+                text_parts.append(f"Codex error: {message}")
+
         elif etype == "system":
             # System events (api_retry, errors, etc.)
             subtype = event.get("subtype", "")
@@ -292,6 +325,10 @@ def format_result(parsed: dict) -> str:
             parts.append(f"Time: {meta['duration_ms'] / 1000:.1f}s")
         if meta.get("input_tokens") is not None:
             parts.append(f"Tokens: {meta['input_tokens']} in / {meta.get('output_tokens', '?')} out")
+        if meta.get("cached_input_tokens") is not None:
+            parts.append(f"Cached input: {meta['cached_input_tokens']}")
+        if meta.get("reasoning_output_tokens") is not None:
+            parts.append(f"Reasoning output: {meta['reasoning_output_tokens']}")
         if meta.get("session_id"):
             parts.append(f"Session: {meta['session_id']}")
         if meta.get("rate_limit"):
@@ -570,6 +607,37 @@ def _wrap_ssh(remote, cmd, env_extra):
 
 def _execute_task_inner(task):
     """Run CLI with the task's prompt."""
+    if task.series_id:
+        # Optional profile-owned gates are deterministic and token-free. They
+        # stop empty stages before a provider is launched and defer dependent
+        # stages (for example MERGE while REVIEW owns a single-flight barrier).
+        try:
+            from . import pipeline_insights
+            gate = pipeline_insights.dispatch_gate(task)
+        except Exception as exc:
+            gate = None
+            print(f"  !! pipeline dispatch gate unavailable for #{task.id}: {exc}", flush=True)
+        if gate:
+            reason = gate["reason"]
+            if gate["action"] == "defer":
+                next_run = db.parse_recurrence(gate["defer_for"])
+                if next_run:
+                    db.defer_task(task.id, next_run, reason)
+                    print(f"  -> Deferred without agent: {reason}")
+                    return
+                print(f"  !! invalid pipeline defer interval: {gate['defer_for']}", flush=True)
+            elif gate["action"] == "complete_empty":
+                db.set_verdict(task.id, "ПУСТО")
+                db.mark_completed(
+                    task.id,
+                    f"Предварительная проверка PromptPilot: {reason}\n"
+                    "Провайдер не запускался, токены не потрачены.\n\n"
+                    f"ИТОГ: ПУСТО ({reason})",
+                    exit_code=0,
+                )
+                print(f"  -> Completed without agent: {reason}")
+                return
+
     provider = task.provider or DEFAULT_CLI
 
     provider_cfg = load_providers().get(provider, {})

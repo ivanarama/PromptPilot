@@ -702,6 +702,24 @@ def mark_rate_limited(task_id: int, next_run_at: datetime, error: str = None):
         _drop_cancel_flag(conn, task_id)
 
 
+def defer_task(task_id: int, next_run_at: datetime, reason: str = None):
+    """Return a claimed task to pending without consuming a retry attempt.
+
+    Used by deterministic pipeline dependency gates. This is waiting, not a
+    provider failure and not a completed run, so retry and run metrics must not
+    move.
+    """
+    with _connect() as conn:
+        conn.execute(
+            """UPDATE tasks SET status = 'pending', scheduled_at = ?,
+                      next_run_at = NULL, started_at = NULL,
+                      error = COALESCE(?, error)
+               WHERE id = ? AND status = 'running'""",
+            (_to_utc_iso(next_run_at), reason, task_id),
+        )
+        _drop_cancel_flag(conn, task_id)
+
+
 def request_cancel(task_id: int) -> bool:
     """Ask the worker to kill a RUNNING task's process (worker polls this)."""
     # immediate: the read-then-write must not race a concurrent writer, or WAL
@@ -852,6 +870,25 @@ def update_series(series_id: int, fields: dict) -> bool:
                 "AND status IN ('pending', 'rate_limited')",
                 (*task_fields.values(), series_id),
             )
+        if any(name in fields for name in (
+                "base_recurrence", "temporary_recurrence", "temporary_until")):
+            # A shorter interval must affect the occurrence that is already in
+            # the queue. Previously only future occurrences used it, so a user
+            # selecting 30m could still wait four hours. Never postpone an
+            # earlier pending run and never override retry backoff.
+            updated = conn.execute(
+                "SELECT * FROM task_series WHERE id = ?", (series_id,)
+            ).fetchone()
+            recurrence = _effective_series_recurrence(dict(updated)) if updated else None
+            candidate = parse_recurrence(recurrence) if recurrence else None
+            if candidate:
+                candidate_iso = _to_utc_iso(candidate)
+                conn.execute(
+                    """UPDATE tasks SET scheduled_at = ?
+                       WHERE series_id = ? AND status = 'pending'
+                         AND scheduled_at > ?""",
+                    (candidate_iso, series_id, candidate_iso),
+                )
         return True
 
 
@@ -1020,13 +1057,15 @@ def pipeline_run_metrics(series_ids: list[int], since: datetime) -> dict:
     """Semantic outcomes of scheduled runs belonging to one pipeline profile."""
     ids = sorted({int(value) for value in series_ids if value is not None})
     empty = {"runs": 0, "ready": 0, "empty": 0, "human": 0,
-             "unable": 0, "failed": 0, "other": 0}
+             "no_change": 0, "unable": 0, "failed": 0, "other": 0,
+             "tokens_known_runs": 0, "input_tokens": 0,
+             "output_tokens": 0, "total_tokens": 0}
     if not ids:
         return empty
     marks = ",".join("?" for _ in ids)
     with _connect() as conn:
         rows = conn.execute(
-            f"""SELECT status, verdict FROM tasks
+            f"""SELECT status, verdict, result FROM tasks
                 WHERE series_id IN ({marks}) AND completed_at >= ?""",
             (*ids, _to_utc_iso(since)),
         ).fetchall()
@@ -1034,9 +1073,24 @@ def pipeline_run_metrics(series_ids: list[int], since: datetime) -> dict:
     for row in rows:
         result["runs"] += 1
         verdict = (row["verdict"] or "").strip().upper()
+        output = row["result"] or ""
+        usage = re.search(r"(?mi)^Tokens:\s*(\d+)\s+in\s*/\s*(\d+)\s+out\s*$", output)
+        if usage:
+            input_tokens, output_tokens = map(int, usage.groups())
+            result["tokens_known_runs"] += 1
+            result["input_tokens"] += input_tokens
+            result["output_tokens"] += output_tokens
+            result["total_tokens"] += input_tokens + output_tokens
+        reported_no_change = any(pattern in output.lower() for pattern in (
+            "github не изменялся", "очередь оставлена без изменений",
+            "ничего не влито", "изменений не выполнялось",
+            "no github changes", "no changes were made", "nothing was merged",
+        ))
         if row["status"] == "failed":
             result["failed"] += 1
-        elif verdict in ("ГОТОВО", "УЖЕ СДЕЛАНО"):
+        elif verdict == "УЖЕ СДЕЛАНО" or (verdict == "ГОТОВО" and reported_no_change):
+            result["no_change"] += 1
+        elif verdict == "ГОТОВО":
             result["ready"] += 1
         elif verdict == "ПУСТО":
             result["empty"] += 1
@@ -1047,6 +1101,46 @@ def pipeline_run_metrics(series_ids: list[int], since: datetime) -> dict:
         else:
             result["other"] += 1
     return result
+
+
+def pipeline_series_activity(series_ids: list[int]) -> dict[int, dict]:
+    """Return the latest terminal run per series for pipeline dashboards."""
+    ids = sorted({int(value) for value in series_ids if value is not None})
+    if not ids:
+        return {}
+    marks = ",".join("?" for _ in ids)
+    with _connect() as conn:
+        rows = conn.execute(
+            f"""SELECT id, series_id, status, verdict, started_at, completed_at,
+                       result
+                FROM tasks WHERE series_id IN ({marks})
+                  AND status IN ('completed', 'failed', 'cancelled')
+                ORDER BY id DESC""",
+            ids,
+        ).fetchall()
+    activity = {}
+    for row in rows:
+        series_id = int(row["series_id"])
+        if series_id in activity:
+            continue
+        output = (row["result"] or "").split("\n--- Meta ---", 1)[0].strip()
+        lines = [line.strip() for line in output.splitlines() if line.strip()]
+        outcome = next((line for line in reversed(lines)
+                        if line.upper().startswith("ИТОГ:")), lines[-1] if lines else "")
+        duration = None
+        if row["started_at"] and row["completed_at"]:
+            duration = round((_parse_dt(row["completed_at"]) -
+                              _parse_dt(row["started_at"])).total_seconds())
+        usage = re.search(r"(?mi)^Tokens:\s*(\d+)\s+in\s*/\s*(\d+)\s+out\s*$",
+                          row["result"] or "")
+        activity[series_id] = {
+            "task_id": row["id"], "status": row["status"],
+            "verdict": row["verdict"], "at": row["completed_at"],
+            "duration_seconds": duration, "summary": outcome[:300],
+            "input_tokens": int(usage.group(1)) if usage else None,
+            "output_tokens": int(usage.group(2)) if usage else None,
+        }
+    return activity
 
 
 def get_setting(key: str, default: str = None) -> Optional[str]:

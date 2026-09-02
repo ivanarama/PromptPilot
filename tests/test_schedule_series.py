@@ -173,6 +173,50 @@ def test_series_settings_persist_and_update_pending_occurrence(isolated_db):
     assert occurrence.priority == 2
 
 
+def test_shorter_series_interval_reschedules_existing_future_occurrence(isolated_db):
+    original = datetime.now(timezone.utc) + timedelta(hours=4)
+    task = isolated_db.create_task(TaskCreate(
+        prompt="Review", recurrence="4h", scheduled_at=original,
+    ))
+    before = datetime.now(timezone.utc)
+
+    assert isolated_db.update_series(task.series_id, {
+        "temporary_recurrence": "30m", "temporary_empty_limit": 2,
+    })
+
+    updated = isolated_db.get_task(task.id)
+    assert before + timedelta(minutes=29) <= updated.scheduled_at
+    assert updated.scheduled_at <= before + timedelta(minutes=31)
+    assert updated.scheduled_at < original
+
+
+def test_longer_series_interval_never_postpones_existing_occurrence(isolated_db):
+    original = datetime.now(timezone.utc) + timedelta(minutes=5)
+    task = isolated_db.create_task(TaskCreate(
+        prompt="Review", recurrence="15m", scheduled_at=original,
+    ))
+
+    assert isolated_db.update_series(task.series_id, {"base_recurrence": "1h"})
+
+    updated = isolated_db.get_task(task.id)
+    assert updated.scheduled_at == original
+
+
+def test_dependency_defer_returns_claimed_task_without_retry(isolated_db):
+    task = isolated_db.create_task(TaskCreate(prompt="Merge", recurrence="2h"))
+    claimed = isolated_db.get_next_runnable()
+    next_run = datetime.now(timezone.utc) + timedelta(minutes=10)
+
+    isolated_db.defer_task(claimed.id, next_run, "waiting for review")
+
+    deferred = isolated_db.get_task(task.id)
+    assert deferred.status.value == "pending"
+    assert deferred.started_at is None
+    assert deferred.retry_count == 0
+    assert deferred.scheduled_at == next_run
+    assert deferred.error == "waiting for review"
+
+
 def test_temporary_boost_returns_to_base_after_consecutive_empty(isolated_db):
     task = isolated_db.create_task(TaskCreate(prompt="Merge", recurrence="2h"))
     isolated_db.update_series(task.series_id, {
@@ -254,6 +298,58 @@ def test_pipeline_insights_exposes_actual_series_task_status(isolated_db, monkey
     assert review["task_id"] == task.id
     assert review["task_status"] == "running"
 
+
+def test_dispatch_gate_completes_empty_queue_without_provider(isolated_db, monkeypatch):
+    task = isolated_db.create_task(TaskCreate(
+        prompt="ExampleProject - TRIAGE", recurrence="4h",
+    ))
+    profile = {
+        "title": "Example", "repository": "owner/example",
+        "queues": [{
+            "id": "triage", "title": "Triage", "query": "is:issue",
+            "series_contains": "ExampleProject - TRIAGE",
+            "dispatch_gate": {"skip_when_empty": True},
+        }],
+    }
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"example": profile})
+    monkeypatch.setattr(pipeline_insights, "analyze", lambda *args, **kwargs: {
+        "queues": [{"id": "triage", "title": "Triage", "backlog": 0}],
+        "diagnostics": {},
+    })
+
+    gate = pipeline_insights.dispatch_gate(task)
+
+    assert gate["action"] == "complete_empty"
+    assert "пуста" in gate["reason"]
+
+
+def test_dispatch_gate_defers_dependency_without_provider(isolated_db, monkeypatch):
+    task = isolated_db.create_task(TaskCreate(
+        prompt="ExampleProject - MERGE", recurrence="2h",
+    ))
+    profile = {
+        "title": "Example", "repository": "owner/example",
+        "queues": [{
+            "id": "merge", "title": "Merge", "query": "is:pr label:ship",
+            "series_contains": "ExampleProject - MERGE",
+            "dispatch_gate": {
+                "defer_when_diagnostics_nonempty": ["review_candidates"],
+                "defer_for": "7m",
+            },
+        }],
+    }
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"example": profile})
+    monkeypatch.setattr(pipeline_insights, "analyze", lambda *args, **kwargs: {
+        "queues": [{"id": "merge", "title": "Merge", "backlog": 3}],
+        "diagnostics": {"review_candidates": [{"number": 42}]},
+    })
+
+    gate = pipeline_insights.dispatch_gate(task)
+
+    assert gate["action"] == "defer"
+    assert gate["defer_for"] == "7m"
+    assert "review_candidates" in gate["reason"]
+
 def test_pipeline_insights_history_is_profile_scoped_and_tracks_movement(isolated_db, monkeypatch):
     profile = {
         "title": "OtherProject pipeline", "repository": "owner/other",
@@ -328,3 +424,24 @@ def test_pipeline_run_metrics_distinguish_semantic_failure_from_process_failure(
     assert metrics["ready"] == 1
     assert metrics["unable"] == 1
     assert metrics["failed"] == 1
+
+
+def test_pipeline_metrics_separate_successful_noop_and_sum_known_tokens(isolated_db):
+    task = isolated_db.create_task(TaskCreate(prompt="Project - MERGE", recurrence="1h"))
+    isolated_db.set_verdict(task.id, "ГОТОВО")
+    isolated_db.mark_completed(
+        task.id,
+        "GitHub не изменялся, PR не вливали.\nИТОГ: ГОТОВО\n\n"
+        "--- Meta ---\nTokens: 120 in / 30 out",
+    )
+
+    metrics = isolated_db.pipeline_run_metrics(
+        [task.series_id], datetime.now(timezone.utc) - timedelta(hours=1))
+    activity = isolated_db.pipeline_series_activity([task.series_id])[task.series_id]
+
+    assert metrics["ready"] == 0
+    assert metrics["no_change"] == 1
+    assert metrics["tokens_known_runs"] == 1
+    assert metrics["total_tokens"] == 150
+    assert activity["summary"] == "ИТОГ: ГОТОВО"
+    assert activity["input_tokens"] == 120
