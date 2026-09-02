@@ -262,6 +262,27 @@ def dispatch_gate(task) -> dict | None:
                         "reason": f"ожидание этапа по diagnostics.{field} ({count})",
                         "profile_id": profile_id, "queue_id": queue_config["id"],
                     }
+            for rule in config.get("defer_when_diagnostics_match", []):
+                if not isinstance(rule, dict):
+                    continue
+                field = rule.get("field")
+                key = rule.get("key")
+                values = rule.get("values")
+                source = diagnostics.get(field) if isinstance(field, str) else None
+                if not isinstance(source, list) or not isinstance(key, str) or not isinstance(values, list):
+                    continue
+                allowed = set(values)
+                matches = [item for item in source
+                           if isinstance(item, dict) and item.get(key) in allowed]
+                if matches:
+                    return {
+                        "action": "defer",
+                        "defer_for": config.get("defer_for", "10m"),
+                        "reason": (
+                            f"ожидание этапа по diagnostics.{field}: "
+                            f"{key} совпал ({len(matches)})"),
+                        "profile_id": profile_id, "queue_id": queue_config["id"],
+                    }
             return None
     return None
 
