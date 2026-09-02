@@ -547,7 +547,7 @@ def _notify_requeued(task, next_run, reason: str):
         print(f"  -> notify requeue failed: {e}")
 
 
-def _execute_herdr_task(task, provider_cfg, host=None, machine=None):
+def _execute_herdr_task(task, provider_cfg, host=None, machine=None, prompt_override=None):
     """Run the task in a live herdr session (providers with executor=herdr).
 
     host is the ssh target of the machine the session lives on (None = local).
@@ -585,7 +585,8 @@ def _execute_herdr_task(task, provider_cfg, host=None, machine=None):
                            timeout=_effective_timeout(task),
                            cancel_check=lambda: db.is_cancel_requested(task.id),
                            keep_pane=task.keep_pane, host=host,
-                           on_worktree=on_worktree, on_pane=on_pane)
+                           on_worktree=on_worktree, on_pane=on_pane,
+                           prompt_override=prompt_override)
 
     if outcome.get("cancelled"):
         db.clear_cancel_request(task.id)
@@ -664,6 +665,33 @@ def _execute_task_inner(task):
                 print(f"  -> Completed without agent: {reason}")
                 return
 
+    agent_prompt = effective_prompt(task)
+    if task.series_id:
+        try:
+            from . import pipeline_insights
+            route = pipeline_insights.execution_route(
+                task, agent_prompt, getattr(task, "working_dir", None))
+        except Exception as exc:
+            route = {"action": "prompt", "mode": "skill", "prompt": agent_prompt}
+            print(f"  !! pipeline execution route unavailable for #{task.id}: {exc}", flush=True)
+        if route["action"] == "block":
+            reason = route["reason"]
+            db.set_verdict(task.id, "НУЖЕН ЧЕЛОВЕК")
+            db.mark_completed(
+                task.id,
+                f"Предварительная проверка PromptPilot: {reason}\n"
+                "Провайдер не запускался, токены не потрачены.\n\n"
+                f"ИТОГ: НУЖЕН ЧЕЛОВЕК ({reason})",
+                exit_code=0,
+            )
+            print(f"  -> Blocked without agent: {reason}")
+            return
+        agent_prompt = route["prompt"]
+        if route.get("fallback_reason"):
+            print(f"  -> Pipeline tool unavailable, using skill: {route['fallback_reason']}")
+        elif route.get("mode") == "tool":
+            print(f"  -> Pipeline tool route: {route['queue_id']}")
+
     provider = task.provider or DEFAULT_CLI
 
     provider_cfg = load_providers().get(provider, {})
@@ -681,7 +709,8 @@ def _execute_task_inner(task):
     if provider_cfg.get("executor") == "herdr":
         # herdr sessions work the same way on any machine: the CLI calls go
         # over ssh, the pane lives there (attach with `herdr --remote <host>`).
-        _execute_herdr_task(task, provider_cfg, host=host, machine=machine)
+        _execute_herdr_task(task, provider_cfg, host=host, machine=machine,
+                            prompt_override=agent_prompt)
         return
 
     # The task's own checkout, when it asked for one. Done before the CLI starts
@@ -706,7 +735,6 @@ def _execute_task_inner(task):
         wt_note = "\n\n" + worktree.summary(wt["path"], wt["branch"], wt["copied"])
         print(f"  -> Worktree {wt['path']} ({wt['branch']})")
 
-    agent_prompt = effective_prompt(task)
     cmd = build_cmd(provider, agent_prompt, skip_permissions=task.skip_permissions,
                     session_id=task.session_id, model=task.model, guard=not machine,
                     effort=task.effort)
