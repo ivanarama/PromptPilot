@@ -13,8 +13,8 @@ $logDir  = "$PSScriptRoot\logs"
 
 # Load .env if present (same logic as config.py)
 $envFile = "$PSScriptRoot\.env"
-if (Test-Path $envFile) {
-    Get-Content $envFile | ForEach-Object {
+if (Test-Path -LiteralPath $envFile -PathType Leaf) {
+    Get-Content -LiteralPath $envFile -Encoding UTF8 | ForEach-Object {
         if ($_ -match '^\s*([^#][^=]*?)\s*=\s*"?([^"]*)"?\s*$') {
             $k = $Matches[1].Trim(); $v = $Matches[2].Trim()
             if ($k -and -not (Test-Path "env:$k")) {
@@ -82,6 +82,6 @@ if ($Bot -or $env:PP_TG_TOKEN) {
     }
 }
 
-$pids | ConvertTo-Json | Set-Content $pidFile
+$pids | ConvertTo-Json | Set-Content -LiteralPath $pidFile -Encoding UTF8
 
 Write-Host "`nAll logs in .\logs\   Stop with: .\stop.ps1" -ForegroundColor DarkGray
