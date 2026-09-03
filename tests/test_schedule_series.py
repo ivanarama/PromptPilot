@@ -750,6 +750,37 @@ def test_pipeline_execution_auto_uses_tool_when_available(isolated_db, monkeypat
     assert "/review-queue" in route["prompt"]
 
 
+def test_pipeline_execution_auto_accepts_merge_cleanup_action(isolated_db, monkeypatch, tmp_path):
+    helper = tmp_path / "pipelinectl.py"
+    helper.write_text(
+        "import json; print(json.dumps({'action':'cleanup','lease':'abc','target':{'number':42}}))",
+        encoding="utf-8",
+    )
+    task = isolated_db.create_task(TaskCreate(
+        prompt="ExampleProject - MERGE\n/merge-shepherd", recurrence="4h",
+    ))
+    profile = {
+        "title": "Example", "repository": "owner/example",
+        "queues": [{
+            "id": "merge", "title": "Merge", "query": "is:pr label:ship",
+            "series_contains": "ExampleProject - MERGE",
+            "execution": {
+                "mode": "auto", "stage": "merge",
+                "command": ["{python}", "pipelinectl.py", "next", "{stage}"],
+                "required_paths": ["pipelinectl.py"],
+            },
+        }],
+    }
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"example": profile})
+
+    route = pipeline_insights.execution_route(task, task.prompt, str(tmp_path))
+
+    assert route["action"] == "prompt"
+    assert route["mode"] == "tool"
+    assert '"action": "cleanup"' in route["prompt"]
+    assert '"lease": "abc"' in route["prompt"]
+
+
 def test_bundled_pipeline_command_routes_through_pp_cli(monkeypatch):
     monkeypatch.setattr(pipeline_insights.sys, "frozen", True, raising=False)
     monkeypatch.setattr(pipeline_insights.sys, "executable", "C:\\PromptPilot\\pp.exe")

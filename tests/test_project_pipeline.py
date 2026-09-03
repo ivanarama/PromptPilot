@@ -250,6 +250,8 @@ def test_plan_handoff_returns_approved_issue_to_fix():
             raise AssertionError(path)
 
         def run(self, *args, input_value=None, allow=(0,)):
+            if "--paginate" in args:
+                return ""
             self.removed.append(args[-1].rsplit("/", 1)[-1])
             return ""
 
@@ -286,3 +288,95 @@ def test_plan_handoff_accepts_repository_native_unicode_filename():
     }, 1401, "Plan-Issue: #7\nPlan-Path: Plans/7-план-исправления.md")
 
     assert result == {"issue": 7, "path": "Plans/7-план-исправления.md"}
+
+
+def test_same_repo_closing_issues_preserve_repository_identity():
+    body = (
+        "Fixes #9\n"
+        "closed: OWNER/REPO#9\n"
+        "Resolves owner/repo#17\n"
+        "Fixes other/project#42\n"
+        "fixed #3"
+    )
+    assert pp.same_repo_closing_issues(body, "owner/repo") == [3, 9, 17]
+
+
+def test_pending_merge_intents_skip_completed_and_untrusted_comments():
+    intent_1 = (
+        f"<!-- pp:merge-cleanup-intent head={HEAD} proof-sha256={'b' * 64} "
+        f"body-sha256={'c' * 64} issues=3,9 -->"
+    )
+    intent_2 = (
+        f"<!-- pp:merge-cleanup-intent head={'d' * 40} proof-sha256={'e' * 64} "
+        f"body-sha256={'f' * 64} issues=none -->"
+    )
+    done = f"<!-- pp:merge-cleanup-done intent=101 head={HEAD} merge={'1' * 40} -->"
+    comments = [
+        {"id": 101, "body": intent_1, "user": {"login": "owner"},
+         "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
+         "issue_url": "https://api.github.com/repos/owner/repo/issues/41"},
+        {"id": 102, "body": done, "user": {"login": "owner"},
+         "created_at": "2026-01-01T00:01:00Z", "updated_at": "2026-01-01T00:01:00Z",
+         "issue_url": "https://api.github.com/repos/owner/repo/issues/41"},
+        {"id": 103, "body": intent_2, "user": {"login": "owner"},
+         "created_at": "2026-01-01T00:02:00Z", "updated_at": "2026-01-01T00:02:00Z",
+         "issue_url": "https://api.github.com/repos/owner/repo/issues/42"},
+        {"id": 104, "body": intent_1, "user": {"login": "attacker"},
+         "created_at": "2026-01-01T00:03:00Z", "updated_at": "2026-01-01T00:03:00Z",
+         "issue_url": "https://api.github.com/repos/owner/repo/issues/43"},
+    ]
+
+    class FakeGitHub:
+        def run(self, *args, **kwargs):
+            return "\n".join(json.dumps(item) for item in comments)
+
+    pending = pp.pending_merge_intents(FakeGitHub(), {
+        "repository": "owner/repo", "trusted_account": "owner",
+    })
+    assert [(item["id"], item["number"], item["issues"]) for item in pending] == [
+        (103, 42, []),
+    ]
+
+
+def test_recover_merge_cleanup_finishes_labels_before_done(monkeypatch):
+    comments = []
+
+    class FakeGitHub:
+        def __init__(self):
+            self.labels = {9: {"in-work"}, 42: {"ship"}}
+
+        def json(self, *args, input_value=None):
+            path = args[1]
+            if path == "user":
+                return {"login": "owner"}
+            if path.endswith("/comments"):
+                comments.append(input_value["body"])
+                return {"id": 900, "body": input_value["body"], "user": {"login": "owner"}}
+            number = int(path.rsplit("/", 1)[-1])
+            return {"state": "closed", "labels": [{"name": value} for value in sorted(self.labels[number])]}
+
+        def run(self, *args, input_value=None, allow=(0,)):
+            if "--paginate" in args:
+                return ""
+            path = args[-1]
+            number = int(path.split("/issues/", 1)[1].split("/", 1)[0])
+            label = path.rsplit("/", 1)[-1]
+            self.labels[number].discard(label)
+            return ""
+
+    intent = {"id": 700, "number": 42, "head": HEAD, "issues": [9]}
+    monkeypatch.setattr(
+        pp, "validate_merged_intent",
+        lambda gh, config, value: ({"body": "Fixes #9"}, "f" * 40),
+    )
+    gh = FakeGitHub()
+    result = pp.recover_merge_cleanup(gh, {
+        "repository": "owner/repo", "trusted_account": "owner",
+    }, intent)
+
+    assert result["action"] == "completed"
+    assert result["in_work_removed"] == [9]
+    assert gh.labels == {9: set(), 42: set()}
+    assert comments == [
+        f"<!-- pp:merge-cleanup-done intent=700 head={HEAD} merge={'f' * 40} -->",
+    ]

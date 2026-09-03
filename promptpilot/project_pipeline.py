@@ -1,8 +1,9 @@
 """Deterministic, executor-neutral helper for GitHub maintenance pipelines.
 
-The helper intentionally supports only the ordinary REVIEW transaction and an
-already-clean ordinary MERGE. Complicated base-sync/carry/recovery states return
-``fallback`` so the repository's full skill remains the authority for them.
+The helper supports the ordinary REVIEW transaction and an already-clean
+ordinary MERGE, including durable post-merge cleanup recovery. Complicated
+base-sync/carry states return ``fallback`` so the repository's full skill
+remains the authority for them.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -25,8 +27,21 @@ CLAIM = re.compile(r"^<!-- pp:review-claim ([0-9a-f]{40}) review-comment=([0-9]+
 COMPLETE = re.compile(r"^<!-- pp:head-reviewed ([0-9a-f]{40}) review-comment=([0-9]+) claim=([0-9]+) epoch-sha256=([0-9a-f]{64}) -->$")
 OVERRIDE = re.compile(r"(?m)^pp:review-again$")
 BASE_SYNC = re.compile(r"(?m)^<!-- pp:base-sync-(?:intent|done) ")
-LINKED = re.compile(r"(?i)\b(?:fix(?:e[sd])?|close[sd]?|resolve[sd]?)\s+#([0-9]+)")
+LINKED = re.compile(
+    r"(?i)\b(?:close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved)"
+    r"\s*:?\s+(?:([a-z0-9_.-]+)/([a-z0-9_.-]+))?#([1-9][0-9]*)\b"
+)
 PLAN_LINK = re.compile(r"(?m)^Plan-Issue: #([0-9]+)\r?\nPlan-Path: (Plans/[^/\r\n]+\.md)$")
+MERGE_CLEANUP_INTENT = re.compile(
+    r"^<!-- pp:merge-cleanup-intent head=([0-9a-f]{40}) "
+    r"proof-sha256=([0-9a-f]{64}) body-sha256=([0-9a-f]{64}) "
+    r"issues=(none|[1-9][0-9]*(?:,[1-9][0-9]*)*) -->$"
+)
+MERGE_CLEANUP_DONE = re.compile(
+    r"^<!-- pp:merge-cleanup-done intent=([0-9]+) head=([0-9a-f]{40}) "
+    r"merge=([0-9a-f]{40}) -->$"
+)
+ISSUE_URL_NUMBER = re.compile(r"/issues/([1-9][0-9]*)$")
 
 TIMELINE_QUERY = r"""
 query($owner:String!,$name:String!,$number:Int!,$cursor:String){
@@ -399,6 +414,92 @@ def remove_label(gh: GitHub, config: dict, number: int, label: str) -> None:
            f"repos/{config['repository']}/issues/{number}/labels/{label}", allow=(0, 1))
 
 
+def same_repo_closing_issues(body: str, repository: str) -> list[int]:
+    owner, name = repository.split("/", 1)
+    result = set()
+    for match in LINKED.finditer(body or ""):
+        ref_owner, ref_name, number = match.groups()
+        if ref_owner and (ref_owner.lower() != owner.lower() or ref_name.lower() != name.lower()):
+            continue
+        result.add(int(number))
+    return sorted(result)
+
+
+def repository_comments(gh: GitHub, config: dict) -> list[dict]:
+    raw = gh.run(
+        "api", "--paginate",
+        f"repos/{config['repository']}/issues/comments?per_page=100&sort=created&direction=asc",
+        "--jq", ".[]",
+    )
+    return [json.loads(line) for line in raw.splitlines() if line.strip()]
+
+
+def parse_merge_intent(comment: dict, config: dict) -> dict | None:
+    if (comment.get("user") or {}).get("login") != config["trusted_account"]:
+        return None
+    if comment.get("created_at") != comment.get("updated_at"):
+        return None
+    match = MERGE_CLEANUP_INTENT.fullmatch((comment.get("body") or "").strip())
+    issue_match = ISSUE_URL_NUMBER.search(comment.get("issue_url") or "")
+    if not match or not issue_match:
+        return None
+    issues = [] if match.group(4) == "none" else [int(value) for value in match.group(4).split(",")]
+    return {
+        "id": int(comment["id"]),
+        "number": int(issue_match.group(1)),
+        "head": match.group(1),
+        "proof_sha256": match.group(2),
+        "body_sha256": match.group(3),
+        "issues": issues,
+        "body": (comment.get("body") or "").strip(),
+    }
+
+
+def parse_merge_done(comment: dict, config: dict) -> dict | None:
+    if (comment.get("user") or {}).get("login") != config["trusted_account"]:
+        return None
+    if comment.get("created_at") != comment.get("updated_at"):
+        return None
+    match = MERGE_CLEANUP_DONE.fullmatch((comment.get("body") or "").strip())
+    issue_match = ISSUE_URL_NUMBER.search(comment.get("issue_url") or "")
+    if not match or not issue_match:
+        return None
+    return {"intent": int(match.group(1)), "head": match.group(2),
+            "merge": match.group(3), "number": int(issue_match.group(1))}
+
+
+def pending_merge_intents(gh: GitHub, config: dict) -> list[dict]:
+    comments_value = repository_comments(gh, config)
+    done_values = [done for comment in comments_value
+                   if (done := parse_merge_done(comment, config)) is not None]
+    intents = []
+    for comment in comments_value:
+        intent = parse_merge_intent(comment, config)
+        if intent is None:
+            continue
+        completed = any(done["intent"] == intent["id"] and
+                        done["number"] == intent["number"] and
+                        done["head"] == intent["head"] for done in done_values)
+        if not completed:
+            intents.append(intent)
+    return sorted(intents, key=lambda item: item["id"])
+
+
+def remove_in_work_from_closed_issue(gh: GitHub, config: dict, number: int) -> bool:
+    path = f"repos/{config['repository']}/issues/{number}"
+    issue = gh.json("api", path)
+    labels = {item.get("name") for item in issue.get("labels", [])}
+    if issue.get("state") != "closed":
+        raise PipelineError(f"closing issue #{number} is not closed after merge")
+    if "in-work" not in labels:
+        return False
+    remove_label(gh, config, number, "in-work")
+    confirmed = gh.json("api", path)
+    if "in-work" in {item.get("name") for item in confirmed.get("labels", [])}:
+        raise PipelineError(f"in-work removal was not confirmed for issue #{number}")
+    return True
+
+
 def finish_plan_handoff(gh: GitHub, config: dict, pr_number: int, body: str) -> dict | None:
     """Return an issue to FIX after its reviewed plan PR was merged."""
     match = PLAN_LINK.search(body or "")
@@ -407,15 +508,132 @@ def finish_plan_handoff(gh: GitHub, config: dict, pr_number: int, body: str) -> 
     issue_number, plan_path = int(match.group(1)), match.group(2)
     issue = gh.json("api", f"repos/{config['repository']}/issues/{issue_number}")
     labels = {item.get("name") for item in issue.get("labels", [])}
-    if issue.get("state") != "open" or "approved" not in labels or "plan-in-review" not in labels:
-        raise PipelineError(f"plan issue #{issue_number} is not in the approved plan-in-review state")
+    if issue.get("state") != "open" or "approved" not in labels:
+        raise PipelineError(f"plan issue #{issue_number} is not open and approved")
     marker = (f"План `{plan_path}` влит через PR #{pr_number}; заявка возвращена в FIX.\n"
               f"<!-- pp:plan-ready issue={issue_number} pr={pr_number} path={plan_path} -->")
-    post_comment(gh, config, issue_number, marker)
-    add_label(gh, config, issue_number, "ready-fix")
-    remove_label(gh, config, issue_number, "plan-in-review")
-    remove_label(gh, config, issue_number, "needs-decision")
+    raw = gh.run("api", "--paginate",
+                 f"repos/{config['repository']}/issues/{issue_number}/comments?per_page=100",
+                 "--jq", ".[]")
+    issue_comments = [json.loads(line) for line in raw.splitlines() if line.strip()]
+    marker_exists = any(
+        (item.get("user") or {}).get("login") == config["trusted_account"]
+        and item.get("created_at") == item.get("updated_at")
+        and item.get("body") == marker
+        for item in issue_comments
+    )
+    if not marker_exists:
+        if "plan-in-review" not in labels:
+            raise PipelineError(f"plan issue #{issue_number} has no recoverable plan-in-review marker")
+        post_comment(gh, config, issue_number, marker)
+    if "ready-fix" not in labels:
+        add_label(gh, config, issue_number, "ready-fix")
+    if "plan-in-review" in labels:
+        remove_label(gh, config, issue_number, "plan-in-review")
+    if "needs-decision" in labels:
+        remove_label(gh, config, issue_number, "needs-decision")
     return {"issue": issue_number, "path": plan_path}
+
+
+def validate_merged_intent(gh: GitHub, config: dict, intent: dict) -> tuple[dict, str]:
+    pr = gh.json("api", f"repos/{config['repository']}/pulls/{intent['number']}")
+    head = (pr.get("head") or {}).get("sha")
+    base = (pr.get("base") or {}).get("ref")
+    merge_sha = pr.get("merge_commit_sha")
+    body = pr.get("body") or ""
+    if (pr.get("state") != "closed" or pr.get("merged") is not True or
+            head != intent["head"] or base != config["base_branch"] or
+            not re.fullmatch(r"[0-9a-f]{40}", merge_sha or "")):
+        raise PipelineError(f"PR #{intent['number']} is not the exact merged cleanup target")
+    if hashlib.sha256(body.encode("utf-8")).hexdigest() != intent["body_sha256"]:
+        raise PipelineError("merged PR body changed after cleanup intent")
+    if same_repo_closing_issues(body, config["repository"]) != intent["issues"]:
+        raise PipelineError("closing issue set no longer matches cleanup intent")
+
+    snapshot = stable_timeline(gh, config, intent["number"])
+    if (snapshot.get("state") != "MERGED" or snapshot.get("baseRefName") != config["base_branch"]
+            or not snapshot.get("labelsComplete")):
+        raise PipelineError("merged GraphQL snapshot does not match cleanup target")
+    intent_index = None
+    merged_events = []
+    forbidden = {"PullRequestCommit", "HeadRefForcePushedEvent", "HeadRefRestoredEvent",
+                 "BaseRefChangedEvent", "BaseRefForcePushedEvent", "BaseRefDeletedEvent",
+                 "CommentDeletedEvent"}
+    for index, edge in enumerate(snapshot["edges"]):
+        node = edge.get("node") or {}
+        if (node.get("__typename") == "IssueComment" and
+                comment_id(node) == intent["id"] and node.get("body") == intent["body"] and
+                (node.get("author") or {}).get("login") == config["trusted_account"] and
+                node.get("lastEditedAt") is None):
+            intent_index = index
+        if intent_index is not None and index > intent_index:
+            if node.get("__typename") in forbidden:
+                raise PipelineError(f"unsupported event after merge cleanup intent: {node.get('__typename')}")
+            if node.get("__typename") == "MergedEvent":
+                merged_events.append((index, (node.get("commit") or {}).get("oid")))
+    if intent_index is None:
+        raise PipelineError("merge cleanup intent is missing or edited in GraphQL timeline")
+    matching = [value for index, value in merged_events if index > intent_index and value == merge_sha]
+    if len(matching) != 1:
+        raise PipelineError("cleanup intent is not followed by one matching merged event")
+
+    proof_snapshot = dict(snapshot)
+    proof_snapshot["headRefOid"] = intent["head"]
+    established = proof(epoch(proof_snapshot, config["trusted_account"]),
+                        intent["head"], config["trusted_account"])
+    if not established or digest(established) != intent["proof_sha256"]:
+        raise PipelineError("review proof no longer matches merge cleanup intent")
+    return pr, merge_sha
+
+
+def recover_merge_cleanup(gh: GitHub, config: dict, intent: dict) -> dict:
+    ensure_identity(gh, config)
+    # REST can report a successful merge a fraction earlier than the GraphQL
+    # timeline exposes its MergedEvent. Retry only that transient observation;
+    # every actual invariant violation remains fail-closed on the first read.
+    for attempt in range(3):
+        try:
+            pr, merge_sha = validate_merged_intent(gh, config, intent)
+            break
+        except PipelineError as exc:
+            transient = (
+                "matching merged event" in str(exc)
+                or "merged GraphQL snapshot" in str(exc)
+            )
+            if not transient or attempt == 2:
+                raise
+            time.sleep(0.5 * (attempt + 1))
+    removed = []
+    for issue in intent["issues"]:
+        if remove_in_work_from_closed_issue(gh, config, issue):
+            removed.append(issue)
+    plan_ready = finish_plan_handoff(gh, config, intent["number"], pr.get("body") or "")
+
+    pr_issue_path = f"repos/{config['repository']}/issues/{intent['number']}"
+    pr_issue = gh.json("api", pr_issue_path)
+    if "ship" in {item.get("name") for item in pr_issue.get("labels", [])}:
+        remove_label(gh, config, intent["number"], "ship")
+        confirmed = gh.json("api", pr_issue_path)
+        if "ship" in {item.get("name") for item in confirmed.get("labels", [])}:
+            raise PipelineError("ship removal was not confirmed after merge")
+
+    done_body = (f"<!-- pp:merge-cleanup-done intent={intent['id']} "
+                 f"head={intent['head']} merge={merge_sha} -->")
+    raw = gh.run("api", "--paginate",
+                 f"repos/{config['repository']}/issues/{intent['number']}/comments?per_page=100",
+                 "--jq", ".[]")
+    pr_comments = [json.loads(line) for line in raw.splitlines() if line.strip()]
+    done_exists = any(
+        (item.get("user") or {}).get("login") == config["trusted_account"]
+        and item.get("created_at") == item.get("updated_at")
+        and (item.get("body") or "").strip() == done_body
+        for item in pr_comments
+    )
+    if not done_exists:
+        post_comment(gh, config, intent["number"], done_body)
+    return {"action": "completed", "stage": "merge-cleanup", "number": intent["number"],
+            "head": intent["head"], "merge_sha": merge_sha,
+            "in_work_removed": removed, "plan_ready": plan_ready}
 
 
 def ensure_identity(gh: GitHub, config: dict) -> None:
@@ -426,7 +644,8 @@ def ensure_identity(gh: GitHub, config: dict) -> None:
 
 def capabilities(config: dict) -> dict:
     return {"protocol": "promptpilot-pipelinectl-v1", "repository": config["repository"],
-            "stages": {"review": "content-or-integration", "merge": "clean-ordinary"},
+            "stages": {"review": "content-or-integration",
+                       "merge": "clean-ordinary-with-cleanup-recovery"},
             "fallback": "repository skill"}
 
 
@@ -628,7 +847,54 @@ def checks_ready(config: dict, checks: list[dict]) -> tuple[bool, str]:
     return (not bad, "checks are green" if not bad else "checks not green: " + ", ".join(f"{k}={v}" for k, v in bad.items()))
 
 
+def intent_body(head: str, established: dict, body: str, issues: list[int]) -> str:
+    issues_value = ",".join(str(value) for value in issues) or "none"
+    return (f"<!-- pp:merge-cleanup-intent head={head} proof-sha256={digest(established)} "
+            f"body-sha256={hashlib.sha256(body.encode('utf-8')).hexdigest()} "
+            f"issues={issues_value} -->")
+
+
+def pending_merge_action(gh: GitHub, config: dict, intent: dict) -> dict:
+    pr = gh.json("api", f"repos/{config['repository']}/pulls/{intent['number']}")
+    if pr.get("merged") is True:
+        lease = {"version": 1, "stage": "merge-cleanup", "repository": config["repository"],
+                 "intent": intent}
+        return {"action": "cleanup", "target": {"number": intent["number"], "head": intent["head"]},
+                "lease": encode_lease(lease),
+                "complete": "run the same command with: complete merge-cleanup --lease <lease>"}
+    if (pr.get("state") != "open" or (pr.get("head") or {}).get("sha") != intent["head"] or
+            (pr.get("base") or {}).get("ref") != config["base_branch"]):
+        return {"action": "fallback", "reason": "merge cleanup intent target changed ambiguously"}
+
+    snapshot = stable_timeline(gh, config, intent["number"])
+    validate_common(snapshot, config, intent)
+    info = epoch(snapshot, config["trusted_account"])
+    validate_epoch_safety(info, config["trusted_account"])
+    established = proof(info, intent["head"], config["trusted_account"])
+    if not established or digest(established) != intent["proof_sha256"]:
+        return {"action": "fallback", "reason": "merge cleanup intent review proof is stale"}
+    if not trusted_ship_authorized(info, config["trusted_account"]):
+        return {"action": "fallback", "reason": "merge cleanup intent lost trusted ship"}
+    status, checks = pr_checks(gh, config, intent["number"])
+    body = status.get("body") or ""
+    if (hashlib.sha256(body.encode("utf-8")).hexdigest() != intent["body_sha256"] or
+            same_repo_closing_issues(body, config["repository"]) != intent["issues"]):
+        return {"action": "fallback", "reason": "merge cleanup payload changed"}
+    ready, reason = checks_ready(config, checks)
+    if status.get("mergeStateStatus") != "CLEAN" or status.get("mergeable") != "MERGEABLE" or not ready:
+        return {"action": "wait", "reason": reason, "number": intent["number"]}
+    lease = {"version": 1, "stage": "merge", "repository": config["repository"],
+             "number": intent["number"], "head": intent["head"],
+             "snapshot": digest(snapshot), "proof": established, "intent": intent}
+    return {"action": "merge", "target": {"number": intent["number"], "head": intent["head"]},
+            "lease": encode_lease(lease),
+            "complete": "run the same command with: complete merge --lease <lease>"}
+
+
 def next_merge(gh: GitHub, config: dict) -> dict:
+    pending = pending_merge_intents(gh, config)
+    if pending:
+        return pending_merge_action(gh, config, pending[0])
     health = run_health(config)
     if health.get("state") == "red":
         return {"action": "fallback", "reason": "health check is red"}
@@ -688,22 +954,50 @@ def complete_merge(gh: GitHub, config: dict, lease_value: str) -> dict:
     ready, reason = checks_ready(config, checks)
     if status.get("mergeStateStatus") != "CLEAN" or status.get("mergeable") != "MERGEABLE" or not ready:
         raise PipelineError(f"merge is no longer ready: {reason}")
+    body = status.get("body") or ""
+    intent = lease.get("intent")
+    if intent is None:
+        issues = same_repo_closing_issues(body, config["repository"])
+        marker = intent_body(lease["head"], established, body, issues)
+        posted = post_comment(gh, config, lease["number"], marker)
+        all_pending = pending_merge_intents(gh, config)
+        candidates = [item for item in all_pending
+                      if item["number"] == lease["number"] and item["head"] == lease["head"]]
+        if (not candidates or candidates[0]["id"] != int(posted["id"]) or
+                not all_pending or all_pending[0]["id"] != int(posted["id"])):
+            return {"action": "wait", "stage": "merge", "number": lease["number"],
+                    "reason": "another merge cleanup intent won"}
+        intent = candidates[0]
+    elif int(intent.get("number", 0)) != int(lease["number"]):
+        raise PipelineError("merge intent belongs to another PR")
+
+    snapshot = stable_timeline(gh, config, lease["number"])
+    validate_common(snapshot, config, lease)
+    labels = set(snapshot["labels"])
+    if "ship" not in labels or labels & {"hold", "needs-decision"}:
+        raise PipelineError("merge label gate closed after cleanup intent")
+    info = epoch(snapshot, config["trusted_account"])
+    validate_epoch_safety(info, config["trusted_account"])
+    current_proof = proof(info, lease["head"], config["trusted_account"])
+    if not current_proof or current_proof != lease["proof"] or digest(current_proof) != intent["proof_sha256"]:
+        raise PipelineError("review proof changed after cleanup intent")
+    if not trusted_ship_authorized(info, config["trusted_account"]):
+        raise PipelineError("trusted ship changed after cleanup intent")
+    status, checks = pr_checks(gh, config, lease["number"])
+    ready, reason = checks_ready(config, checks)
+    if status.get("mergeStateStatus") != "CLEAN" or status.get("mergeable") != "MERGEABLE" or not ready:
+        raise PipelineError(f"merge is no longer ready after cleanup intent: {reason}")
+    current_body = status.get("body") or ""
+    if (hashlib.sha256(current_body.encode("utf-8")).hexdigest() != intent["body_sha256"] or
+            same_repo_closing_issues(current_body, config["repository"]) != intent["issues"]):
+        raise PipelineError("cleanup payload changed after intent")
+
     result = gh.json("api", f"repos/{config['repository']}/pulls/{lease['number']}/merge",
                      "--method", "PUT", "--input", "-",
                      input_value={"merge_method": config["merge_method"], "sha": lease["head"]})
     if result.get("merged") is not True:
         raise PipelineError(result.get("message") or "GitHub did not confirm merge")
-    removed = []
-    for issue in sorted({int(value) for value in LINKED.findall(status.get("body") or "")}):
-        output = gh.run("api", "--method", "DELETE",
-                        f"repos/{config['repository']}/issues/{issue}/labels/in-work", allow=(0, 1))
-        if output is not None:
-            removed.append(issue)
-    plan_ready = finish_plan_handoff(
-        gh, config, int(lease["number"]), status.get("body") or "")
-    return {"action": "completed", "stage": "merge", "number": lease["number"],
-            "head": lease["head"], "merge_sha": result.get("sha"),
-            "in_work_checked": removed, "plan_ready": plan_ready}
+    return recover_merge_cleanup(gh, config, intent)
 
 
 def run(argv=None) -> int:
@@ -717,7 +1011,7 @@ def run(argv=None) -> int:
     next_parser = sub.add_parser("next")
     next_parser.add_argument("stage", choices=("review", "merge"))
     complete_parser = sub.add_parser("complete")
-    complete_parser.add_argument("stage", choices=("review", "merge"))
+    complete_parser.add_argument("stage", choices=("review", "merge", "merge-cleanup"))
     complete_parser.add_argument("--lease", required=True)
     complete_parser.add_argument("--report")
     args = parser.parse_args(argv)
@@ -733,8 +1027,15 @@ def run(argv=None) -> int:
                 if not args.report:
                     raise PipelineError("complete review requires --report")
                 value = complete_review(gh, config, args.lease, args.report)
-            else:
+            elif args.stage == "merge":
                 value = complete_merge(gh, config, args.lease)
+            else:
+                lease = decode_lease(args.lease)
+                if (lease.get("stage") != "merge-cleanup" or
+                        lease.get("repository") != config["repository"] or
+                        not isinstance(lease.get("intent"), dict)):
+                    raise PipelineError("lease belongs to another stage or repository")
+                value = recover_merge_cleanup(gh, config, lease["intent"])
         print(json.dumps(value, ensure_ascii=False, indent=2))
         return 0
     except (PipelineError, OSError, ValueError, json.JSONDecodeError) as exc:

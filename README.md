@@ -921,7 +921,7 @@ HEAD в `review_candidates`. Для двухполосной схемы он т�
 
 | Режим | Поведение |
 |---|---|
-| `auto` | `empty`/`wait` завершается без модели; `audit`/`merge` получает короткий prompt с готовым lease; `fallback` или недоступный CLI использует исходный prompt/скилл |
+| `auto` | `empty`/`wait` завершается без модели; `audit`/`merge`/`cleanup` получает короткий prompt с готовым lease; `fallback` или недоступный CLI использует исходный prompt/скилл |
 | `tool` | CLI обязателен; при отсутствии, ошибке или `fallback` запуск завершается `НУЖЕН ЧЕЛОВЕК` без токенов |
 | `skill` | всегда используется исходный prompt, как до появления `pipelinectl` |
 
@@ -939,6 +939,16 @@ GraphQL snapshot, затем сам выполняет review → claim → labe
 точным SHA. Base-sync, carry, legacy re-ship, конфликт, recovery и третий круг
 намеренно возвращают `action=fallback`: их продолжает полная проектная
 процедура. Таким образом быстрый путь не ослабляет сложные гейты.
+
+До необратимого merge быстрый путь публикует в PR неизменяемый
+`pp:merge-cleanup-intent`: точный HEAD, hash review-proof и тела PR, а также
+same-repository closing issues. Только после него повторяются proof/labels/CI и
+отправляется compare-and-merge. Если процесс оборвался до ответа GitHub, новый
+запуск по серверному `MergedEvent` различает открытый PR и уже выполненный merge.
+Для влитого PR он продолжает `action=cleanup`: снимает `in-work` только с
+закрытых связанных issues, идемпотентно завершает PLAN-handoff, снимает `ship` и
+последним публикует `pp:merge-cleanup-done`. Поэтому crash после успешного merge
+не вызывает второй merge и не оставляет промежуточные метки навсегда.
 
 Claude и Codex получают одну и ту же команду и JSON. Различаются только тонкие
 файлы обнаружения навыка (`.claude/skills` и `.agents/skills`); логика CLI и
