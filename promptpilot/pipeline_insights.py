@@ -1,5 +1,6 @@
 """Profile-driven, token-free diagnostics for external GitHub pipelines."""
 
+import hashlib
 import json
 import math
 import os
@@ -461,7 +462,44 @@ def _diagnostic_match_count(diagnostics: dict, condition: dict) -> int:
     return 0
 
 
-def _wake_ready_queues(profile: dict, data: dict, series: list[dict]) -> list[str]:
+def _wake_latch_key(profile_id: str, queue_id: str) -> str:
+    return f"pipeline_wake:{profile_id}:{queue_id}"
+
+
+def _wake_fingerprint(diagnostics: dict, condition: dict) -> str | None:
+    """Return a stable fingerprint of the work matched by one wake condition."""
+    if _diagnostic_match_count(diagnostics, condition) == 0:
+        return None
+    value = diagnostics.get(condition.get("field"))
+    key, values = condition.get("key"), condition.get("values")
+    if isinstance(key, str) and isinstance(values, list):
+        allowed = set(values)
+        if isinstance(value, list):
+            value = [item for item in value
+                     if isinstance(item, dict) and item.get(key) in allowed]
+        elif isinstance(value, dict):
+            value = value if value.get(key) in allowed else None
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True,
+                         separators=(",", ":"), default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _wake_status(profile_id: str, queue: dict, diagnostics: dict) -> dict | None:
+    condition = queue.get("wake_when")
+    if not isinstance(condition, dict):
+        return None
+    fingerprint = _wake_fingerprint(diagnostics, condition)
+    latch = db.get_setting(_wake_latch_key(profile_id, str(queue.get("id"))))
+    return {
+        "matches": _diagnostic_match_count(diagnostics, condition),
+        "ready": fingerprint is not None,
+        "suppressed": fingerprint is not None and latch == fingerprint,
+        "fingerprint": fingerprint[:12] if fingerprint else None,
+    }
+
+
+def _wake_ready_queues(profile_id: str, profile: dict, data: dict,
+                       series: list[dict]) -> list[str]:
     """Wake configured queues whose project-owned diagnostics say work is ready."""
     diagnostics = data.get("diagnostics") or {}
     woken = []
@@ -470,12 +508,16 @@ def _wake_ready_queues(profile: dict, data: dict, series: list[dict]) -> list[st
         marker = str(queue.get("series_contains") or "").lower()
         if not isinstance(condition, dict) or not marker:
             continue
-        if _diagnostic_match_count(diagnostics, condition) == 0:
+        latch_key = _wake_latch_key(profile_id, str(queue.get("id")))
+        fingerprint = _wake_fingerprint(diagnostics, condition)
+        if fingerprint is None:
+            db.delete_setting(latch_key)
             continue
         target = next((item for item in series
                        if marker in str(item.get("title", "")).lower()
                        and not item.get("ended") and not item.get("paused")), None)
-        if target and db.series_action(int(target["id"]), "run_now"):
+        if target and db.wake_series_once(
+                int(target["id"]), latch_key, fingerprint):
             woken.append(str(queue.get("id")))
     return woken
 
@@ -490,7 +532,7 @@ def after_task_completed(task, verdict: str | None) -> list[str]:
     profile_id, profile, _queue = matched
     series = db.list_series()
     data = analyze(profile_id, series, use_cache=False)
-    return _wake_ready_queues(profile, data, series)
+    return _wake_ready_queues(profile_id, profile, data, series)
 
 
 def _expanded_command(values, stage: str) -> list[str] | None:
@@ -929,6 +971,7 @@ def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True) -> d
                 "items": ordered_members[:priority_settings["max_items"]]
                 if priority_settings else [],
                 "execution": _execution_status(item, matching.get("working_dir") if matching else None),
+                "wake": _wake_status(profile_id, item, diagnostics),
                 **recommendation,
             })
             snapshot_queues[item["id"]] = {
@@ -989,7 +1032,7 @@ def sample_active_profiles(series: list[dict]) -> dict[str, str]:
             continue
         try:
             data = analyze(profile_id, series, use_cache=False)
-            woken = _wake_ready_queues(profile, data, series)
+            woken = _wake_ready_queues(profile_id, profile, data, series)
             outcomes[profile_id] = "ok" + (f"; woken={','.join(woken)}" if woken else "")
         except Exception as exc:  # one external repository must not stop the sampler
             outcomes[profile_id] = str(exc)

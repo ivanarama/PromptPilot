@@ -2559,6 +2559,7 @@ function diagnosticOverview(data) {
   const content = diagnostics.content_review_candidates || [];
   const waitingShip = diagnostics.reviewed_waiting_ship || [];
   const merge = diagnostics.merge_candidates || [];
+  const mergeExecutable = diagnostics.merge_executable || [];
   const owner = diagnostics.integration_owner;
   const fix = diagnostics.fix_candidates || [];
   const human = diagnostics.human_waiting || [];
@@ -2570,7 +2571,8 @@ function diagnosticOverview(data) {
   if (content.length) parts.push(`содержательная очередь: ${content.length}`);
   if (owner) parts.push(`интеграция: #${owner.number} · ${owner.stage}`);
   if (waitingShip.length) parts.push(`прошли ревью, ждут ship: ${waitingShip.length}`);
-  if (merge.length) parts.push(`готовы к слиянию: ${merge.length}`);
+  if (merge.length) parts.push(`всего ждут MERGE: ${merge.length}`);
+  if (mergeExecutable.length) parts.push(`к MERGE готовы сейчас: ${mergeExecutable.length}`);
   if (fix.length) parts.push(`готовы к исправлению: ${fix.length}`);
   if (human.length) parts.push(`ждут решения человека: ${human.length}`);
   if (legacy) parts.push(`переходят со старого формата: ${legacy}`);
@@ -2632,7 +2634,11 @@ async function loadPipelineInsights(profile, refresh=false) {
       const stageLine = `5 ч: ${stageRuns.runs || 0} запусков · действий ${stageRuns.ready || 0} · холостых ${stageRuns.no_change || 0}`;
       const route = q.execution || {configured:'skill',effective:'skill'};
       const routeLine = `маршрут: ${route.configured}${route.configured!==route.effective ? ` → ${route.effective}` : ''}${route.reason && route.effective!=='tool' ? ` · ${route.reason}` : ''}`;
-      return `<tr class="${data.bottleneck===q.id?'bottleneck':''}"><td>${data.bottleneck===q.id?'⚠ ':''}${esc(q.title)}<div class="prov-cmd" title="${escAttr(last?.summary || '')}">${esc(lastLine)}</div><div class="prov-cmd">${esc(stageLine)}</div><div class="prov-cmd">${esc(routeLine)}</div></td><td class="num">${q.backlog}</td><td class="num">${h5.complete?signed(deltaByQueue[q.id]||0):'—'}</td><td class="num">${q.capacity}</td><td class="num">${q.runs_needed}</td><td>${duration(q.avg_duration_seconds)}</td><td>${q.eta_hours == null ? '—' : q.eta_hours+' ч'}</td><td>${age(q.age.oldest_hours)}</td><td>${esc(q.interval || 'нет серии')}</td><td class="insights-recommendation">${esc(q.recommendation || '—')}</td></tr>`;
+      const wake = q.wake;
+      const wakeLine = wake ? (wake.suppressed
+        ? `автозапуск: ждёт изменения состояния · снимок ${wake.fingerprint}`
+        : wake.ready ? `автозапуск: готов · ${wake.matches}` : 'автозапуск: работы нет') : null;
+      return `<tr class="${data.bottleneck===q.id?'bottleneck':''}"><td>${data.bottleneck===q.id?'⚠ ':''}${esc(q.title)}<div class="prov-cmd" title="${escAttr(last?.summary || '')}">${esc(lastLine)}</div><div class="prov-cmd">${esc(stageLine)}</div><div class="prov-cmd">${esc(routeLine)}</div>${wakeLine?`<div class="prov-cmd">${esc(wakeLine)}</div>`:''}</td><td class="num">${q.backlog}</td><td class="num">${h5.complete?signed(deltaByQueue[q.id]||0):'—'}</td><td class="num">${q.capacity}</td><td class="num">${q.runs_needed}</td><td>${duration(q.avg_duration_seconds)}</td><td>${q.eta_hours == null ? '—' : q.eta_hours+' ч'}</td><td>${age(q.age.oldest_hours)}</td><td>${esc(q.interval || 'нет серии')}</td><td class="insights-recommendation">${esc(q.recommendation || '—')}</td></tr>`;
     }).join('');
     const priorityHtml = data.priority_control ? `<details style="margin-top:12px" open>
       <summary style="cursor:pointer"><b>Приоритет элементов очереди</b> · P0 выполняется первым, старые задачи повышаются каждые ${data.priority_control.aging_hours} ч до P1</summary>
