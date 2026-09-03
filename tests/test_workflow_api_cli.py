@@ -106,6 +106,9 @@ def test_schedule_ui_exposes_durable_series_controls():
     assert "Рекомендация" in html
     assert "pipelineProfileSelect" in html
     assert "taskDisplayTitle(t)" in html
+    assert "function taskStatusLabel(t)" in html
+    assert "return 'scheduled'" in html
+    assert "${taskStatusLabel(t)}" in html
     assert "if (t.series_paused)" in html
     assert "PAUSED" in html
     assert "aggregateDiagnosticFindings" in html

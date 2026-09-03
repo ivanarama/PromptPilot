@@ -854,17 +854,17 @@ def _health(backlog: int, windows: dict, broken_series: int, paused_series: int 
     if diagnostics and diagnostics.get("state") == "red":
         return {"state": "red", "label": "нарушен инвариант",
                 "reason": diagnostics.get("summary", "health-check обнаружил ошибку")}
+    recent = windows.get("5h", {})
+    runs = recent.get("runs", {})
+    if runs.get("failed", 0) or runs.get("unable", 0):
+        return {"state": "red", "label": "прогон не отработал",
+                "reason": f"упало: {runs.get('failed', 0)}; НЕ СМОГ: {runs.get('unable', 0)}"}
     if paused_series:
         return {"state": "yellow", "label": "конвейер на паузе",
                 "reason": f"приостановлено серий: {paused_series}"}
     if diagnostics and diagnostics.get("state") == "yellow":
         return {"state": "yellow", "label": "есть ожидания",
                 "reason": diagnostics.get("summary", "health-check требует внимания")}
-    recent = windows.get("5h", {})
-    runs = recent.get("runs", {})
-    if runs.get("failed", 0) or runs.get("unable", 0):
-        return {"state": "red", "label": "прогон не отработал",
-                "reason": f"упало: {runs.get('failed', 0)}; НЕ СМОГ: {runs.get('unable', 0)}"}
     if runs.get("human", 0):
         return {"state": "yellow", "label": "нужен человек",
                 "reason": f"прогонов с НУЖЕН ЧЕЛОВЕК: {runs['human']}"}
