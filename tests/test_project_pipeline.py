@@ -378,5 +378,24 @@ def test_recover_merge_cleanup_finishes_labels_before_done(monkeypatch):
     assert result["in_work_removed"] == [9]
     assert gh.labels == {9: set(), 42: set()}
     assert comments == [
+        f"{pp.MERGE_DONE_MESSAGE}\n"
         f"<!-- pp:merge-cleanup-done intent=700 head={HEAD} merge={'f' * 40} -->",
     ]
+
+
+def test_visible_service_markers_preserve_legacy_protocol_parsing():
+    claim = (
+        f"<!-- pp:review-claim {HEAD} review-comment=17 epoch-sha256={'a' * 64} -->"
+    )
+    completion = (
+        f"<!-- pp:head-reviewed {HEAD} review-comment=17 claim=18 "
+        f"epoch-sha256={'a' * 64} -->"
+    )
+    assert pp.CLAIM.fullmatch(claim)
+    assert pp.CLAIM.fullmatch(f"{pp.CLAIM_MESSAGE}\n{claim}")
+    assert pp.COMPLETE.fullmatch(completion)
+    assert pp.COMPLETE.fullmatch(f"{pp.COMPLETE_MESSAGE}\n{completion}")
+
+    intent = pp.intent_body(HEAD, {"review_id": 17}, "Fixes #9", [9])
+    assert intent.startswith(pp.MERGE_INTENT_MESSAGE + "\n")
+    assert pp.MERGE_CLEANUP_INTENT.fullmatch(intent)

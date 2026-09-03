@@ -23,8 +23,12 @@ from pathlib import Path
 
 
 REVIEW = re.compile(r"(?m)^Reviewed-SHA: ([0-9a-f]{40})$.*^Outcome-Label: (reviewed|changes-requested|needs-decision)$.*^<!-- pp:review pp:tail=([0-9]+) -->$", re.S)
-CLAIM = re.compile(r"^<!-- pp:review-claim ([0-9a-f]{40}) review-comment=([0-9]+) epoch-sha256=([0-9a-f]{64}) -->$")
-COMPLETE = re.compile(r"^<!-- pp:head-reviewed ([0-9a-f]{40}) review-comment=([0-9]+) claim=([0-9]+) epoch-sha256=([0-9a-f]{64}) -->$")
+CLAIM_MESSAGE = "PromptPilot service marker: REVIEW result publication claimed."
+COMPLETE_MESSAGE = "PromptPilot service marker: REVIEW result committed."
+MERGE_INTENT_MESSAGE = "PromptPilot service marker: MERGE transaction reserved."
+MERGE_DONE_MESSAGE = "PromptPilot service marker: MERGE cleanup completed."
+CLAIM = re.compile(r"^(?:PromptPilot service marker: REVIEW result publication claimed\.\n)?<!-- pp:review-claim ([0-9a-f]{40}) review-comment=([0-9]+) epoch-sha256=([0-9a-f]{64}) -->$")
+COMPLETE = re.compile(r"^(?:PromptPilot service marker: REVIEW result committed\.\n)?<!-- pp:head-reviewed ([0-9a-f]{40}) review-comment=([0-9]+) claim=([0-9]+) epoch-sha256=([0-9a-f]{64}) -->$")
 OVERRIDE = re.compile(r"(?m)^pp:review-again$")
 BASE_SYNC = re.compile(r"(?m)^<!-- pp:base-sync-(?:intent|done) ")
 LINKED = re.compile(
@@ -33,12 +37,14 @@ LINKED = re.compile(
 )
 PLAN_LINK = re.compile(r"(?m)^Plan-Issue: #([0-9]+)\r?\nPlan-Path: (Plans/[^/\r\n]+\.md)$")
 MERGE_CLEANUP_INTENT = re.compile(
-    r"^<!-- pp:merge-cleanup-intent head=([0-9a-f]{40}) "
+    r"^(?:PromptPilot service marker: MERGE transaction reserved\.\n)?"
+    r"<!-- pp:merge-cleanup-intent head=([0-9a-f]{40}) "
     r"proof-sha256=([0-9a-f]{64}) body-sha256=([0-9a-f]{64}) "
     r"issues=(none|[1-9][0-9]*(?:,[1-9][0-9]*)*) -->$"
 )
 MERGE_CLEANUP_DONE = re.compile(
-    r"^<!-- pp:merge-cleanup-done intent=([0-9]+) head=([0-9a-f]{40}) "
+    r"^(?:PromptPilot service marker: MERGE cleanup completed\.\n)?"
+    r"<!-- pp:merge-cleanup-done intent=([0-9]+) head=([0-9a-f]{40}) "
     r"merge=([0-9a-f]{40}) -->$"
 )
 ISSUE_URL_NUMBER = re.compile(r"/issues/([1-9][0-9]*)$")
@@ -617,7 +623,8 @@ def recover_merge_cleanup(gh: GitHub, config: dict, intent: dict) -> dict:
         if "ship" in {item.get("name") for item in confirmed.get("labels", [])}:
             raise PipelineError("ship removal was not confirmed after merge")
 
-    done_body = (f"<!-- pp:merge-cleanup-done intent={intent['id']} "
+    done_body = (f"{MERGE_DONE_MESSAGE}\n"
+                 f"<!-- pp:merge-cleanup-done intent={intent['id']} "
                  f"head={intent['head']} merge={merge_sha} -->")
     raw = gh.run("api", "--paginate",
                  f"repos/{config['repository']}/issues/{intent['number']}/comments?per_page=100",
@@ -779,7 +786,8 @@ def complete_review(gh: GitHub, config: dict, lease_value: str, report_path: str
            for _index, _edge, node in comments(info, config["trusted_account"])):
         raise PipelineError("another review claim appeared before claim publication")
     review_id = int(review["id"])
-    claim_body = f"<!-- pp:review-claim {lease['head']} review-comment={review_id} epoch-sha256={lease['epoch']} -->"
+    claim_body = (f"{CLAIM_MESSAGE}\n<!-- pp:review-claim {lease['head']} "
+                  f"review-comment={review_id} epoch-sha256={lease['epoch']} -->")
     claim = post_comment(gh, config, lease["number"], claim_body)
 
     snapshot = stable_timeline(gh, config, lease["number"])
@@ -796,7 +804,8 @@ def complete_review(gh: GitHub, config: dict, lease_value: str, report_path: str
 
     snapshot = stable_timeline(gh, config, lease["number"])
     info = review_gate(snapshot, config, lease, require_outcome=outcome)
-    completion_body = (f"<!-- pp:head-reviewed {lease['head']} review-comment={review_id} "
+    completion_body = (f"{COMPLETE_MESSAGE}\n"
+                       f"<!-- pp:head-reviewed {lease['head']} review-comment={review_id} "
                        f"claim={int(claim['id'])} epoch-sha256={lease['epoch']} -->")
     completion = post_comment(gh, config, lease["number"], completion_body)
     final = stable_timeline(gh, config, lease["number"])
@@ -849,7 +858,8 @@ def checks_ready(config: dict, checks: list[dict]) -> tuple[bool, str]:
 
 def intent_body(head: str, established: dict, body: str, issues: list[int]) -> str:
     issues_value = ",".join(str(value) for value in issues) or "none"
-    return (f"<!-- pp:merge-cleanup-intent head={head} proof-sha256={digest(established)} "
+    return (f"{MERGE_INTENT_MESSAGE}\n"
+            f"<!-- pp:merge-cleanup-intent head={head} proof-sha256={digest(established)} "
             f"body-sha256={hashlib.sha256(body.encode('utf-8')).hexdigest()} "
             f"issues={issues_value} -->")
 
