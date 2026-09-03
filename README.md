@@ -743,9 +743,24 @@ Worker публикует heartbeat в общей SQLite БД. Активный 
       },
       "queues": [
         {
+          "id": "plan",
+          "title": "Планы",
+          "query": "is:issue is:open label:plan-needed label:approved -label:hold -label:manual -label:plan-in-review",
+          "capacity": 1,
+          "series_contains": "MyProject - PLAN",
+          "backlog_diagnostic_field": "plan_candidates",
+          "wake_when": {"field": "plan_candidates"},
+          "dispatch_gate": {
+            "skip_when_empty": true
+          }
+        },
+        {
           "id": "fix",
           "title": "Исправления",
-          "query": "is:issue is:open label:ready-fix -label:in-work",
+          "queries": [
+            "is:issue is:open label:ready-fix -label:in-work -label:needs-decision -label:plan-needed -label:plan-in-review -label:hold -label:manual",
+            "is:issue is:open label:approved -label:in-work -label:plan-needed -label:plan-in-review -label:hold -label:manual"
+          ],
           "capacity": 1,
           "series_contains": "MyProject - FIX",
           "backlog_diagnostic_field": "fix_candidates",
@@ -803,6 +818,13 @@ P2, question — P3. Каждые `aging_hours` ожидания эффекти�
 правила: PromptPilot управляет метками и показывает порядок, но не подменяет
 безопасный выбор внутри репозитория. Проверка `trusted_account` не даёт случайно
 менять приоритет под другой учётной записью GitHub CLI.
+
+Если выбранное решение требует сначала архитектурного плана, FIX должен
+передать issue меткой `plan-needed`, сохранив человеческий `approved`. Отдельная
+серия PLAN создаёт PR только с плановым документом и переводит issue в
+`plan-in-review`; такой PR проходит обычные REVIEW, человеческий `ship` и MERGE.
+После merge проектный handoff снимает `plan-in-review` и возвращает issue в FIX.
+Так «сначала план» является исполняемым этапом, а не тупиком `needs-decision`.
 
 В workflow со sticky-разрешением метка `ship` означает «слить этот точный HEAD,
 когда его REVIEW успешно завершится». Она не исключает PR из первой review-
@@ -940,7 +962,7 @@ lease от модели не зависят.
 всю цепочку из шаблона» пока нет: этапы создаются как повторяющиеся задачи, а
 потом собираются профилем. Это важное отличие от Workflow-оркестратора:
 workflow ведёт конечную разработку «исполнитель → аудитор → исправление», а
-расписание обслуживает бесконечные дежурные очереди TRIAGE/FIX/REVIEW/MERGE.
+расписание обслуживает бесконечные дежурные очереди TRIAGE/PLAN/FIX/REVIEW/MERGE.
 
 Серия без запланированного вхождения помечается **«оборвана»** — она сама не
 продолжится. Раньше в это состояние приводило любое падение: следующее

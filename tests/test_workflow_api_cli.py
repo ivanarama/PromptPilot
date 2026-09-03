@@ -117,6 +117,8 @@ def test_schedule_ui_exposes_durable_series_controls():
     assert "queueTaskIsRunning(data, 'review')" in html
     assert "Интеграционный владелец" in html
     assert "REVIEW сейчас выполняется" in html
+    assert "PLAN сейчас выполняется" in html
+    assert "нужно подготовить план" in html
     assert "всего ждут REVIEW" in html
     assert "diagnosticBadgeLabel" in html
     assert "это ещё не означает нарушение конвейера" in html

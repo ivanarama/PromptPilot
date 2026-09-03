@@ -225,3 +225,64 @@ def test_empty_review_reason_explains_waiting_state():
     reason = pp.review_empty_reason({"reviewed_waiting_ship": [{"number": 11}]})
     assert "ship" in reason
     assert "#11" in reason
+
+
+def test_plan_handoff_returns_approved_issue_to_fix():
+    class FakeGitHub:
+        def __init__(self):
+            self.comments = []
+            self.added = []
+            self.removed = []
+
+        def json(self, *args, input_value=None):
+            path = args[1]
+            if path.endswith("/issues/1274"):
+                return {"state": "open", "labels": [
+                    {"name": "approved"}, {"name": "plan-in-review"},
+                    {"name": "needs-decision"},
+                ]}
+            if path.endswith("/issues/1274/comments"):
+                self.comments.append(input_value["body"])
+                return {"body": input_value["body"], "user": {"login": "owner"}}
+            if path.endswith("/issues/1274/labels"):
+                self.added.extend(input_value["labels"])
+                return [{"name": value} for value in input_value["labels"]]
+            raise AssertionError(path)
+
+        def run(self, *args, input_value=None, allow=(0,)):
+            self.removed.append(args[-1].rsplit("/", 1)[-1])
+            return ""
+
+    gh = FakeGitHub()
+    result = pp.finish_plan_handoff(gh, {
+        "repository": "owner/repo", "trusted_account": "owner",
+    }, 1400, "Summary\nPlan-Issue: #1274\nPlan-Path: Plans/159-undefined-values.md")
+
+    assert result == {"issue": 1274, "path": "Plans/159-undefined-values.md"}
+    assert gh.added == ["ready-fix"]
+    assert gh.removed == ["plan-in-review", "needs-decision"]
+    assert "pp:plan-ready issue=1274 pr=1400" in gh.comments[0]
+
+
+def test_plan_handoff_accepts_repository_native_unicode_filename():
+    class FakeGitHub:
+        def json(self, *args, input_value=None):
+            path = args[1]
+            if path.endswith("/issues/7"):
+                return {"state": "open", "labels": [
+                    {"name": "approved"}, {"name": "plan-in-review"},
+                ]}
+            if path.endswith("/issues/7/comments"):
+                return {"body": input_value["body"], "user": {"login": "owner"}}
+            if path.endswith("/issues/7/labels"):
+                return [{"name": value} for value in input_value["labels"]]
+            raise AssertionError(path)
+
+        def run(self, *args, input_value=None, allow=(0,)):
+            return ""
+
+    result = pp.finish_plan_handoff(FakeGitHub(), {
+        "repository": "owner/repo", "trusted_account": "owner",
+    }, 1401, "Plan-Issue: #7\nPlan-Path: Plans/7-план-исправления.md")
+
+    assert result == {"issue": 7, "path": "Plans/7-план-исправления.md"}
