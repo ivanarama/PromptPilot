@@ -705,7 +705,7 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None) 
             "profile_id": profile_id, "queue_id": queue.get("id"),
             "preflight": preflight,
         }
-    if preflight_action not in {"audit", "merge"}:
+    if preflight_action not in {"audit", "merge", "cleanup"}:
         reason = f"pipeline preflight вернул неподдерживаемое action={preflight_action}"
         if mode == "auto":
             return {
