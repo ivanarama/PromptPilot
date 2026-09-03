@@ -531,13 +531,17 @@ def test_productive_completion_wakes_every_ready_stage(monkeypatch):
     })
     calls = []
     monkeypatch.setattr(
-        pipeline_insights.db, "series_action",
-        lambda series_id, action: calls.append((series_id, action)) or True,
+        pipeline_insights.db, "wake_series_once",
+        lambda series_id, key, fingerprint: calls.append(
+            (series_id, key, fingerprint)) or True,
     )
     task = SimpleNamespace(series_id=1, series_title="Example - FIX", prompt="Example - FIX")
 
     assert pipeline_insights.after_task_completed(task, "ГОТОВО") == ["review", "merge"]
-    assert calls == [(7, "run_now"), (8, "run_now")]
+    assert [(series_id, key) for series_id, key, _fingerprint in calls] == [
+        (7, "pipeline_wake:example:review"),
+        (8, "pipeline_wake:example:merge"),
+    ]
 
 
 def test_wakeup_skips_empty_paused_and_nonproductive_runs(monkeypatch):
@@ -562,14 +566,48 @@ def test_wakeup_skips_empty_paused_and_nonproductive_runs(monkeypatch):
     })
     calls = []
     monkeypatch.setattr(
-        pipeline_insights.db, "series_action",
-        lambda series_id, action: calls.append((series_id, action)) or True,
+        pipeline_insights.db, "wake_series_once",
+        lambda series_id, key, fingerprint: calls.append(
+            (series_id, key, fingerprint)) or True,
     )
+    monkeypatch.setattr(pipeline_insights.db, "delete_setting", lambda _key: None)
     task = SimpleNamespace(series_id=1, series_title="Example - FIX", prompt="Example - FIX")
 
     assert pipeline_insights.after_task_completed(task, "ПУСТО") == []
     assert pipeline_insights.after_task_completed(task, "ГОТОВО") == []
     assert calls == []
+
+
+def test_wake_fingerprint_changes_only_when_matched_work_changes():
+    condition = {"field": "review_candidates", "key": "stage",
+                 "values": ["integration-review"]}
+    before = {"review_candidates": [
+        {"number": 42, "stage": "integration-review", "updated_at": "t1"},
+        {"number": 43, "stage": "review", "updated_at": "t1"},
+    ]}
+    unrelated = {"review_candidates": [
+        {"number": 42, "stage": "integration-review", "updated_at": "t1"},
+        {"number": 43, "stage": "review", "updated_at": "t2"},
+    ]}
+    changed = {"review_candidates": [
+        {"number": 42, "stage": "integration-review", "updated_at": "t2"},
+    ]}
+
+    assert pipeline_insights._wake_fingerprint(before, condition) == \
+        pipeline_insights._wake_fingerprint(unrelated, condition)
+    assert pipeline_insights._wake_fingerprint(before, condition) != \
+        pipeline_insights._wake_fingerprint(changed, condition)
+
+
+def test_series_wake_latch_suppresses_unchanged_snapshot(isolated_db):
+    task = isolated_db.create_task(TaskCreate(
+        prompt="Example - REVIEW", recurrence="4h",
+    ))
+    series_id = task.series_id
+
+    assert isolated_db.wake_series_once(series_id, "wake:test", "snapshot-a")
+    assert not isolated_db.wake_series_once(series_id, "wake:test", "snapshot-a")
+    assert isolated_db.wake_series_once(series_id, "wake:test", "snapshot-b")
 
 
 def test_worker_wakes_pipeline_only_after_next_recurrence_exists(monkeypatch):

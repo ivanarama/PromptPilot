@@ -108,6 +108,7 @@ def test_schedule_ui_exposes_durable_series_controls():
     assert "aggregateDiagnosticFindings" in html
     assert "diagnosticOverview(data)" in html
     assert "pipelineHealthReason(data)" in html
+    assert "автозапуск: ждёт изменения состояния" in html
     assert "Переход со старого формата" in html
     assert "Состояние очереди" in html
     assert "queueTaskIsRunning(data, 'review')" in html

@@ -473,6 +473,15 @@ def format_review(lease: dict, report: dict) -> tuple[str, str]:
     return rendered, outcome
 
 
+def content_review_allowed(health: dict, number: int) -> bool:
+    """Keep an ordinary lease valid across unrelated integration-lane moves."""
+    candidates = health.get("content_review_candidates")
+    if not isinstance(candidates, list):
+        candidates = health.get("review_candidates") or []
+    return any(int(item.get("number", 0)) == int(number)
+               and item.get("stage") == "review" for item in candidates)
+
+
 def complete_review(gh: GitHub, config: dict, lease_value: str, report_path: str) -> dict:
     lease = decode_lease(lease_value)
     if lease.get("stage") != "review" or lease.get("repository") != config["repository"]:
@@ -483,10 +492,11 @@ def complete_review(gh: GitHub, config: dict, lease_value: str, report_path: str
     health = run_health(config)
     if health.get("state") == "red":
         raise PipelineError("health check became red")
-    candidates = health.get("review_candidates") or []
-    if (not candidates or int(candidates[0].get("number", 0)) != int(lease["number"])
-            or candidates[0].get("stage") != "review"):
-        raise PipelineError("global REVIEW allowlist changed; rerun next review")
+    # Integration work may become the global single-flight owner while an
+    # ordinary content audit is running. That unrelated lane transition must
+    # not invalidate a lease whose own HEAD/timeline is still unchanged.
+    if not content_review_allowed(health, int(lease["number"])):
+        raise PipelineError("content REVIEW target left the allowlist; rerun next review")
     snapshot = stable_timeline(gh, config, int(lease["number"]))
     validate_common(snapshot, config, lease)
     if content_review_digest(snapshot) != lease["snapshot"]:

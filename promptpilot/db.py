@@ -941,6 +941,39 @@ def series_action(series_id: int, action: str) -> bool:
         return True
 
 
+def wake_series_once(series_id: int, latch_key: str, fingerprint: str) -> bool:
+    """Move one pending series task to now once per diagnostic fingerprint.
+
+    The settings check and task update share a transaction so the API sampler
+    and worker completion hook cannot both wake the same unchanged queue.
+    Manual ``run_now`` intentionally bypasses this latch.
+    """
+    with _connect() as conn:
+        previous = conn.execute(
+            "SELECT value FROM settings WHERE key = ?", (latch_key,),
+        ).fetchone()
+        if previous and previous["value"] == fingerprint:
+            return False
+        series = conn.execute(
+            "SELECT paused, ended_at FROM task_series WHERE id = ?", (series_id,),
+        ).fetchone()
+        if not series or series["paused"] or series["ended_at"]:
+            return False
+        now = _now()
+        task = conn.execute(
+            """UPDATE tasks SET scheduled_at = ?, next_run_at = NULL
+               WHERE series_id = ? AND status IN ('pending', 'rate_limited')""",
+            (now, series_id),
+        )
+        if not task.rowcount:
+            return False
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+            (latch_key, fingerprint),
+        )
+        return True
+
+
 def prepare_series_recurrence(series_id: int, verdict: Optional[str]) -> Optional[dict]:
     """Update temporary-boost counters and return settings for the next run."""
     with _connect() as conn:
@@ -1171,6 +1204,11 @@ def get_setting(key: str, default: str = None) -> Optional[str]:
 def set_setting(key: str, value: str):
     with _connect() as conn:
         conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
+
+
+def delete_setting(key: str):
+    with _connect() as conn:
+        conn.execute("DELETE FROM settings WHERE key = ?", (key,))
 
 
 def touch_worker_heartbeat(pid: int, now: Optional[datetime] = None):

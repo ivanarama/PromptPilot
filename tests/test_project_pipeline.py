@@ -170,6 +170,28 @@ def test_content_review_stays_executable_while_integration_owner_waits_merge(mon
     assert result["target"]["number"] == 42
 
 
+def test_content_review_completion_ignores_unrelated_integration_owner():
+    health = {
+        "review_candidates": [
+            {"number": 10, "stage": "integration-review"},
+        ],
+        "content_review_candidates": [
+            {"number": 42, "stage": "review"},
+            {"number": 43, "stage": "review"},
+        ],
+    }
+
+    assert pp.content_review_allowed(health, 42)
+    assert not pp.content_review_allowed(health, 10)
+    assert not pp.content_review_allowed(health, 99)
+
+
+def test_content_review_completion_supports_older_health_contract():
+    assert pp.content_review_allowed({
+        "review_candidates": [{"number": 42, "stage": "review"}],
+    }, 42)
+
+
 def test_empty_review_reason_explains_waiting_state():
     reason = pp.review_empty_reason({
         "integration_owner": {"number": 10, "stage": "integration-merge-ready"},
