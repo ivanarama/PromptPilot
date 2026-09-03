@@ -927,7 +927,13 @@ def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True) -> d
                     members[member["key"]] = member
             diagnostic_field = item.get("backlog_diagnostic_field")
             diagnostic_items = (diagnostics or {}).get(diagnostic_field) if isinstance(diagnostic_field, str) else None
+            diagnostic_order = {}
             if isinstance(diagnostic_items, list):
+                diagnostic_order = {
+                    int(candidate["number"]): index
+                    for index, candidate in enumerate(diagnostic_items)
+                    if isinstance(candidate, dict) and str(candidate.get("number", "")).isdigit()
+                }
                 allowed_numbers = {int(candidate["number"]) for candidate in diagnostic_items
                                    if isinstance(candidate, dict) and str(candidate.get("number", "")).isdigit()}
                 backlog = len(diagnostic_items)
@@ -955,6 +961,8 @@ def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True) -> d
                 for member in ordered_members:
                     member["priority"] = _item_priority(member, priority_settings, now)
                 ordered_members.sort(key=lambda member: (
+                    diagnostic_order.get(int(member["number"]), len(diagnostic_order))
+                    if diagnostic_order else 0,
                     _PRIORITY_LEVELS.index(member["priority"]["level"]),
                     member.get("created_at") or "", member["number"],
                 ))

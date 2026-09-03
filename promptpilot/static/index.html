@@ -395,10 +395,22 @@
   .insights-tools { display:flex; gap:7px; align-items:center; margin-bottom:10px; flex-wrap:wrap; }
   .insights-tools select { background:var(--surface2); border:1px solid var(--border); border-radius:6px; color:inherit; padding:6px 9px; }
   .insights-table { width:100%; margin-top:9px; font-size:12px; border-collapse:collapse; table-layout:fixed; }
-  .insights-table th, .insights-table td { padding:4px 7px; text-align:left; vertical-align:top; overflow-wrap:anywhere; }
+  .insights-table th, .insights-table td { padding:6px 7px; text-align:left; vertical-align:top; overflow-wrap:normal; }
   .insights-table th.num, .insights-table td.num { text-align:right; font-variant-numeric:tabular-nums; }
   .insights-table tr.bottleneck { color:var(--yellow); }
   .insights-recommendation { color:var(--text2); }
+  .insights-col-stage { width:14%; }
+  .insights-col-small { width:6%; }
+  .insights-col-capacity { width:7%; }
+  .insights-col-duration { width:10%; }
+  .insights-col-oldest { width:9%; }
+  .insights-col-interval { width:7%; }
+  .insights-col-recommendation { width:28%; }
+  .insights-stage-title { font-weight:600; }
+  .insights-stage-detail td { padding:0 7px 9px; border-bottom:1px solid var(--border); }
+  .insights-stage-detail:last-child td { border-bottom:0; }
+  .insights-stage-meta { display:flex; flex-wrap:wrap; gap:3px 16px; }
+  .insights-stage-meta .prov-cmd { margin:0; word-break:normal; overflow-wrap:anywhere; }
   .pipeline-summary { display:grid; grid-template-columns:repeat(4,minmax(135px,1fr)); gap:8px; margin:11px 0; }
   .pipeline-metric { border:1px solid var(--border); border-radius:8px; padding:9px 10px; background:var(--surface2); }
   .pipeline-metric-label { color:var(--muted); font-size:11px; }
@@ -416,6 +428,7 @@
     .insights-table th, .insights-table td { min-width:75px; }
     .insights-table th:first-child, .insights-table td:first-child { min-width:130px; }
     .insights-table th:last-child, .insights-table td:last-child { min-width:250px; white-space:normal; }
+    .insights-stage-detail td { min-width:0 !important; white-space:normal; }
   }
 
   /* Workflow orchestrator */
@@ -2529,6 +2542,7 @@ function diagnosticFindingMessage(finding) {
     single_flight_barrier: 'Интеграционная полоса занята этим PR; обычное содержательное ревью других PR продолжает работать.',
     legacy_ship_waiting_review_validation: 'Переход со старого формата: очередь безопасно перепроверит эти PR перед слиянием.',
     base_sync_base_advanced: 'Ветка main обновилась после подготовки PR; перед слиянием нужна повторная синхронизация.',
+    ship_waiting_initial_review: 'Разрешение ship сохранено; этот HEAD сначала пройдёт обычное содержательное ревью.',
     health_check_failed: 'Сама проверка состояния не завершилась. Повторите обновление; это ещё не означает нарушение конвейера.',
     invalid_health_check: 'Команда проверки состояния настроена неверно.'
   };
@@ -2638,7 +2652,9 @@ async function loadPipelineInsights(profile, refresh=false) {
       const wakeLine = wake ? (wake.suppressed
         ? `автозапуск: ждёт изменения состояния · снимок ${wake.fingerprint}`
         : wake.ready ? `автозапуск: готов · ${wake.matches}` : 'автозапуск: работы нет') : null;
-      return `<tr class="${data.bottleneck===q.id?'bottleneck':''}"><td>${data.bottleneck===q.id?'⚠ ':''}${esc(q.title)}<div class="prov-cmd" title="${escAttr(last?.summary || '')}">${esc(lastLine)}</div><div class="prov-cmd">${esc(stageLine)}</div><div class="prov-cmd">${esc(routeLine)}</div>${wakeLine?`<div class="prov-cmd">${esc(wakeLine)}</div>`:''}</td><td class="num">${q.backlog}</td><td class="num">${h5.complete?signed(deltaByQueue[q.id]||0):'—'}</td><td class="num">${q.capacity}</td><td class="num">${q.runs_needed}</td><td>${duration(q.avg_duration_seconds)}</td><td>${q.eta_hours == null ? '—' : q.eta_hours+' ч'}</td><td>${age(q.age.oldest_hours)}</td><td>${esc(q.interval || 'нет серии')}</td><td class="insights-recommendation">${esc(q.recommendation || '—')}</td></tr>`;
+      const bottleneck = data.bottleneck===q.id ? 'bottleneck' : '';
+      return `<tr class="${bottleneck}"><td class="insights-stage-title">${data.bottleneck===q.id?'⚠ ':''}${esc(q.title)}</td><td class="num">${q.backlog}</td><td class="num">${h5.complete?signed(deltaByQueue[q.id]||0):'—'}</td><td class="num">${q.capacity}</td><td class="num">${q.runs_needed}</td><td>${duration(q.avg_duration_seconds)}</td><td>${q.eta_hours == null ? '—' : q.eta_hours+' ч'}</td><td>${age(q.age.oldest_hours)}</td><td>${esc(q.interval || 'нет серии')}</td><td class="insights-recommendation">${esc(q.recommendation || '—')}</td></tr>
+        <tr class="insights-stage-detail ${bottleneck}"><td colspan="10"><div class="insights-stage-meta"><span class="prov-cmd" title="${escAttr(last?.summary || '')}">${esc(lastLine)}</span><span class="prov-cmd">${esc(stageLine)}</span><span class="prov-cmd">${esc(routeLine)}</span>${wakeLine?`<span class="prov-cmd">${esc(wakeLine)}</span>`:''}</div></td></tr>`;
     }).join('');
     const priorityHtml = data.priority_control ? `<details style="margin-top:12px" open>
       <summary style="cursor:pointer"><b>Приоритет элементов очереди</b> · P0 выполняется первым, старые задачи повышаются каждые ${data.priority_control.aging_hours} ч до P1</summary>
@@ -2682,7 +2698,7 @@ async function loadPipelineInsights(profile, refresh=false) {
         <div class="pipeline-metric"><div class="pipeline-metric-label">Worker</div><div class="pipeline-metric-value">${runtime.state==='online'?'online':'offline'}</div><div class="pipeline-metric-note">${runtime.age_seconds == null ? 'heartbeat отсутствует' : 'heartbeat '+runtime.age_seconds+' сек назад'}</div></div>
       </div>
       ${diagnosticHtml}
-      <table class="insights-table"><thead><tr><th>Этап</th><th class="num">Очередь</th><th class="num">Δ 5 ч</th><th class="num">За прогон</th><th class="num">Прогонов</th><th>Средний запуск</th><th>ETA</th><th>Самый старый</th><th>Интервал</th><th>Рекомендация</th></tr></thead><tbody>${rows}</tbody></table>
+      <table class="insights-table"><colgroup><col class="insights-col-stage"><col class="insights-col-small"><col class="insights-col-small"><col class="insights-col-capacity"><col class="insights-col-capacity"><col class="insights-col-duration"><col class="insights-col-small"><col class="insights-col-oldest"><col class="insights-col-interval"><col class="insights-col-recommendation"></colgroup><thead><tr><th>Этап</th><th class="num">Очередь</th><th class="num">Δ 5 ч</th><th class="num">За прогон</th><th class="num">Прогонов</th><th>Средний запуск</th><th>ETA</th><th>Самый старый</th><th>Интервал</th><th>Рекомендация</th></tr></thead><tbody>${rows}</tbody></table>
       ${priorityHtml}
     </div>`;
   } catch(e) { box.innerHTML = `<div style="color:var(--red);margin-bottom:10px">Анализ очереди недоступен: ${esc(e.message)}</div>`; }

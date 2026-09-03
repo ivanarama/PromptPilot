@@ -30,6 +30,11 @@ def trusted_comment(cursor, database_id, body):
                 lastEditedAt=None, author={"login": "owner"}, body=body)
 
 
+def ship_event(cursor, kind="LabeledEvent", actor="owner"):
+    return edge(cursor, kind, id=f"ship-{cursor}", createdAt="2026-01-01T00:00:00Z",
+                actor={"login": actor}, label={"name": "ship"})
+
+
 def test_lease_round_trip_is_stable():
     value = {"version": 1, "stage": "review", "number": 42, "head": HEAD}
     assert pp.decode_lease(pp.encode_lease(value)) == value
@@ -68,6 +73,24 @@ def test_proof_accepts_claim_bound_transaction():
     assert established["claim_id"] == 102
     assert established["completion_id"] == 103
     assert established["outcome"] == "reviewed"
+
+
+def test_ship_before_completion_is_sticky_for_same_head():
+    value = snapshot(ship_event("c2"))
+    assert pp.trusted_ship_authorized(pp.epoch(value, "owner"), "owner")
+
+    value["edges"].append(ship_event("c3", "UnlabeledEvent"))
+    assert not pp.trusted_ship_authorized(pp.epoch(value, "owner"), "owner")
+
+
+def test_review_gate_allows_sticky_ship_on_current_head():
+    value = snapshot(ship_event("c2"))
+    value["labels"] = ["ship"]
+    info = pp.epoch(value, "owner")
+    lease = {"head": HEAD, "epoch": info["hash"], "anchor": info["anchor_id"]}
+    assert pp.review_gate(value, {
+        "trusted_account": "owner", "base_branch": "main",
+    }, lease) == info
 
 
 def test_epoch_safety_rejects_head_or_delete_events():

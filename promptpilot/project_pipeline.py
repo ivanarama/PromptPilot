@@ -303,7 +303,10 @@ def validate_epoch_safety(info: dict, trusted: str) -> None:
 def review_gate(snapshot: dict, config: dict, lease: dict, *, require_outcome: str | None = None) -> dict:
     validate_common(snapshot, config, lease)
     labels = set(snapshot["labels"])
-    if labels & {"hold", "ship", "needs-decision"}:
+    # ``ship`` is a sticky human intent: merge this exact HEAD if its review
+    # succeeds.  It may be applied while REVIEW is still publishing its
+    # claim/completion transaction, so it must not hide the PR from REVIEW.
+    if labels & {"hold", "needs-decision"}:
         raise PipelineError("review routing gate closed")
     info = epoch(snapshot, config["trusted_account"])
     validate_epoch_safety(info, config["trusted_account"])
@@ -351,6 +354,28 @@ def proof(info: dict, head: str, trusted: str) -> dict | None:
                 "completion_id": completion_id, "completion_node": completion_node.get("id"),
                 "outcome": match.group(2), "completion_index": index}
     return None
+
+
+def trusted_ship_authorized(info: dict, trusted: str) -> bool:
+    """Accept the latest trusted ship transition anywhere in this HEAD epoch.
+
+    The canonical review proof is checked separately.  Requiring the label
+    event to occur after the final completion comment created a UI race: a
+    human could set ship after seeing the reviewed result but before the worker
+    finished its bookkeeping.  The epoch anchor still binds this permission to
+    the current HEAD, and a later unlabel or foreign label remains invalid.
+    """
+    transitions = []
+    for index, edge in enumerate(info["edges"]):
+        node = edge.get("node") or {}
+        if (node.get("__typename") in {"LabeledEvent", "UnlabeledEvent"} and
+                (node.get("label") or {}).get("name") == "ship"):
+            transitions.append((index, node))
+    if not transitions:
+        return False
+    latest = transitions[-1][1]
+    return (latest.get("__typename") == "LabeledEvent" and
+            (latest.get("actor") or {}).get("login") == trusted)
 
 
 def post_comment(gh: GitHub, config: dict, number: int, body: str) -> dict:
@@ -407,7 +432,7 @@ def next_review(gh: GitHub, config: dict) -> dict:
     snapshot = stable_timeline(gh, config, int(item["number"]))
     validate_common(snapshot, config, item)
     labels = set(snapshot["labels"])
-    if labels & {"hold", "ship", "changes-requested", "needs-decision"}:
+    if labels & {"hold", "changes-requested", "needs-decision"}:
         return {"action": "fallback", "reason": "routing labels require the full skill"}
     info = epoch(snapshot, config["trusted_account"])
     validate_epoch_safety(info, config["trusted_account"])
@@ -597,13 +622,8 @@ def next_merge(gh: GitHub, config: dict) -> dict:
     established = proof(info, snapshot["headRefOid"], config["trusted_account"])
     if not established:
         return {"action": "fallback", "reason": "ordinary canonical review proof not found"}
-    ship_events = []
-    for index, edge in enumerate(info["edges"]):
-        node = edge.get("node") or {}
-        if node.get("__typename") in {"LabeledEvent", "UnlabeledEvent"} and (node.get("label") or {}).get("name") == "ship":
-            ship_events.append((index, node))
-    if not ship_events or ship_events[-1][1].get("__typename") != "LabeledEvent" or (ship_events[-1][1].get("actor") or {}).get("login") != config["trusted_account"] or ship_events[-1][0] <= established["completion_index"]:
-        return {"action": "fallback", "reason": "ship authorization is not an ordinary trusted post-review event"}
+    if not trusted_ship_authorized(info, config["trusted_account"]):
+        return {"action": "fallback", "reason": "ship authorization is not a trusted current-HEAD event"}
     status, checks = pr_checks(gh, config, item["number"])
     if status.get("mergeStateStatus") != "CLEAN" or status.get("mergeable") != "MERGEABLE":
         return {"action": "fallback", "reason": f"merge state {status.get('mergeStateStatus')}/{status.get('mergeable')} requires the full skill"}
