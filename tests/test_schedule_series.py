@@ -367,6 +367,41 @@ def test_pipeline_backlog_can_use_exact_project_diagnostics(isolated_db, monkeyp
     assert snapshot["queues"]["review"]["backlog"] == 1
 
 
+def test_pipeline_items_follow_executable_diagnostic_order(isolated_db, monkeypatch):
+    profile = {
+        "title": "Example", "repository": "owner/example",
+        "health_check": {"command": ["health"]},
+        "priority_control": {"max_items": 1},
+        "queues": [{
+            "id": "review", "title": "Review", "capacity": 1,
+            "query": "is:pr", "series_contains": "REVIEW",
+            "backlog_diagnostic_field": "review_candidates",
+        }],
+    }
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"example": profile})
+    monkeypatch.setattr(pipeline_insights, "_run_profile_health_check", lambda _profile: {
+        "state": "green",
+        "review_candidates": [{"number": 1310}, {"number": 1218}],
+        "findings": [],
+    })
+    monkeypatch.setattr(pipeline_insights, "_github_search", lambda _repo, _query: {
+        "count": 2, "membership_complete": True,
+        "items": [
+            {"key": f"pr:{number}", "kind": "pr", "number": number,
+             "title": f"PR {number}", "labels": [], "created_at": created_at}
+            for number, created_at in (
+                (1218, "2026-08-01T00:00:00Z"),
+                (1310, "2026-09-01T00:00:00Z"),
+            )
+        ],
+    })
+    pipeline_insights._cache.clear()
+
+    result = pipeline_insights.analyze("example", [], use_cache=False)
+
+    assert [item["number"] for item in result["queues"][0]["items"]] == [1310]
+
+
 def test_pipeline_item_priority_manual_override_and_aging():
     settings = pipeline_insights._priority_settings({"priority_control": {"aging_hours": 24}})
     now = datetime(2026, 9, 2, tzinfo=timezone.utc)

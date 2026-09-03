@@ -100,6 +100,9 @@ def test_schedule_ui_exposes_durable_series_controls():
     assert "Временное ускорение" in html
     assert "saveSeries(event" in html
     assert "insights-table" in html
+    assert "insights-stage-detail" in html
+    assert 'colspan="10"' in html
+    assert "insights-col-recommendation" in html
     assert "Рекомендация" in html
     assert "pipelineProfileSelect" in html
     assert "taskDisplayTitle(t)" in html

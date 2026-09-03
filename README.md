@@ -757,7 +757,7 @@ Worker публикует heartbeat в общей SQLite БД. Активный 
         {
           "id": "review",
           "title": "Ревью",
-          "query": "is:pr is:open -label:ship -label:changes-requested -label:needs-decision -label:hold",
+          "query": "is:pr is:open -label:changes-requested -label:needs-decision -label:hold",
           "capacity": 2,
           "series_contains": "MyProject - REVIEW",
           "backlog_diagnostic_field": "review_backlog",
@@ -803,6 +803,13 @@ P2, question — P3. Каждые `aging_hours` ожидания эффекти�
 правила: PromptPilot управляет метками и показывает порядок, но не подменяет
 безопасный выбор внутри репозитория. Проверка `trusted_account` не даёт случайно
 менять приоритет под другой учётной записью GitHub CLI.
+
+В workflow со sticky-разрешением метка `ship` означает «слить этот точный HEAD,
+когда его REVIEW успешно завершится». Она не исключает PR из первой review-
+очереди и может быть поставлена до финального служебного completion: HEAD epoch,
+последний trusted label-transition и последующий каноничный review proof вместе
+защищают решение от переноса на другой код. Поэтому человеку не приходится
+снимать и повторно ставить `ship` из-за гонки между UI и завершением REVIEW.
 
 `health_check` необязателен. Это проектная команда без shell, которая должна
 вернуть JSON со `state: green|yellow|red`, `summary` и массивом `findings`.
