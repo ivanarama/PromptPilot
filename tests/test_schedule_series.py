@@ -104,6 +104,20 @@ def test_project_health_attention_overrides_warming_history():
     assert health["reason"] == "нужен человек"
 
 
+def test_semantic_failure_is_not_hidden_by_yellow_project_diagnostics():
+    diagnostics = {"state": "yellow", "summary": "есть ожидающие решения", "findings": []}
+    health = pipeline_insights._health(
+        10,
+        {"5h": {"complete": True, "runs": {"failed": 0, "unable": 2}}},
+        0,
+        diagnostics=diagnostics,
+    )
+
+    assert health["state"] == "red"
+    assert health["label"] == "прогон не отработал"
+    assert "НЕ СМОГ: 2" in health["reason"]
+
+
 def test_paused_series_is_visible_without_history():
     health = pipeline_insights._health(
         10, {"5h": {"complete": False}}, 0, paused_series=2)

@@ -989,6 +989,13 @@ function scheduleInfo(t) {
   return '<span class="task-schedule">queued</span>';
 }
 
+function taskStatusLabel(t) {
+  if (t.status !== 'pending') return t.status.replace('_', ' ');
+  if (t.series_paused) return 'paused';
+  if (t.scheduled_at && new Date(t.scheduled_at) > new Date()) return 'scheduled';
+  return 'queued';
+}
+
 function formatTime(iso) {
   const d = new Date(iso);
   const now = new Date();
@@ -1050,7 +1057,7 @@ async function loadTasks() {
     <div class="task-row${expanded ? ' expanded' : ''}">
       <div class="task-header" onclick="toggleTask(${t.id})">
         <span class="task-id">#${t.id}</span>
-        <span class="task-status" data-s="${t.status}">${t.status.replace('_', ' ')}</span>
+        <span class="task-status" data-s="${t.status}">${taskStatusLabel(t)}</span>
         <span class="task-prompt" title="${escAttr(taskDisplayTitle(t))}">${esc(taskDisplayTitle(t))}</span>
         ${t.working_dir ? `<span class="task-meta">📁 ${esc(t.working_dir.split(/[/\\]/).filter(Boolean).pop() || t.working_dir)}</span>` : ''}
         ${t.worktree ? `<span class="task-meta" title="отдельный git worktree">🌿 ${esc(t.worktree_branch || 'worktree')}</span>` : ''}
