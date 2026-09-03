@@ -26,6 +26,7 @@ COMPLETE = re.compile(r"^<!-- pp:head-reviewed ([0-9a-f]{40}) review-comment=([0
 OVERRIDE = re.compile(r"(?m)^pp:review-again$")
 BASE_SYNC = re.compile(r"(?m)^<!-- pp:base-sync-(?:intent|done) ")
 LINKED = re.compile(r"(?i)\b(?:fix(?:e[sd])?|close[sd]?|resolve[sd]?)\s+#([0-9]+)")
+PLAN_LINK = re.compile(r"(?m)^Plan-Issue: #([0-9]+)\r?\nPlan-Path: (Plans/[^/\r\n]+\.md)$")
 
 TIMELINE_QUERY = r"""
 query($owner:String!,$name:String!,$number:Int!,$cursor:String){
@@ -393,6 +394,30 @@ def add_label(gh: GitHub, config: dict, number: int, label: str) -> None:
         raise PipelineError(f"label {label} was not confirmed")
 
 
+def remove_label(gh: GitHub, config: dict, number: int, label: str) -> None:
+    gh.run("api", "--method", "DELETE",
+           f"repos/{config['repository']}/issues/{number}/labels/{label}", allow=(0, 1))
+
+
+def finish_plan_handoff(gh: GitHub, config: dict, pr_number: int, body: str) -> dict | None:
+    """Return an issue to FIX after its reviewed plan PR was merged."""
+    match = PLAN_LINK.search(body or "")
+    if not match:
+        return None
+    issue_number, plan_path = int(match.group(1)), match.group(2)
+    issue = gh.json("api", f"repos/{config['repository']}/issues/{issue_number}")
+    labels = {item.get("name") for item in issue.get("labels", [])}
+    if issue.get("state") != "open" or "approved" not in labels or "plan-in-review" not in labels:
+        raise PipelineError(f"plan issue #{issue_number} is not in the approved plan-in-review state")
+    marker = (f"План `{plan_path}` влит через PR #{pr_number}; заявка возвращена в FIX.\n"
+              f"<!-- pp:plan-ready issue={issue_number} pr={pr_number} path={plan_path} -->")
+    post_comment(gh, config, issue_number, marker)
+    add_label(gh, config, issue_number, "ready-fix")
+    remove_label(gh, config, issue_number, "plan-in-review")
+    remove_label(gh, config, issue_number, "needs-decision")
+    return {"issue": issue_number, "path": plan_path}
+
+
 def ensure_identity(gh: GitHub, config: dict) -> None:
     identity = gh.json("api", "user")
     if identity.get("login") != config["trusted_account"]:
@@ -674,8 +699,11 @@ def complete_merge(gh: GitHub, config: dict, lease_value: str) -> dict:
                         f"repos/{config['repository']}/issues/{issue}/labels/in-work", allow=(0, 1))
         if output is not None:
             removed.append(issue)
+    plan_ready = finish_plan_handoff(
+        gh, config, int(lease["number"]), status.get("body") or "")
     return {"action": "completed", "stage": "merge", "number": lease["number"],
-            "head": lease["head"], "merge_sha": result.get("sha"), "in_work_checked": removed}
+            "head": lease["head"], "merge_sha": result.get("sha"),
+            "in_work_checked": removed, "plan_ready": plan_ready}
 
 
 def run(argv=None) -> int:

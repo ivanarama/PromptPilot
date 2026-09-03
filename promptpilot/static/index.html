@@ -2575,11 +2575,13 @@ function diagnosticOverview(data) {
   const merge = diagnostics.merge_candidates || [];
   const mergeExecutable = diagnostics.merge_executable || [];
   const owner = diagnostics.integration_owner;
+  const plan = diagnostics.plan_candidates || [];
   const fix = diagnostics.fix_candidates || [];
   const human = diagnostics.human_waiting || [];
   const findings = diagnostics.findings || [];
   const legacy = findings.filter(f => f.code === 'legacy_ship_waiting_review_validation').length;
   if (queueTaskIsRunning(data, 'review')) parts.push('REVIEW сейчас выполняется');
+  if (queueTaskIsRunning(data, 'plan')) parts.push('PLAN сейчас выполняется');
   if (reviewBacklog.length) parts.push(`всего ждут REVIEW: ${reviewBacklog.length}`);
   if (review.length) parts.push(`к REVIEW готовы: ${review.length} (следующий #${review[0].number})`);
   if (content.length) parts.push(`содержательная очередь: ${content.length}`);
@@ -2587,6 +2589,7 @@ function diagnosticOverview(data) {
   if (waitingShip.length) parts.push(`прошли ревью, ждут ship: ${waitingShip.length}`);
   if (merge.length) parts.push(`всего ждут MERGE: ${merge.length}`);
   if (mergeExecutable.length) parts.push(`к MERGE готовы сейчас: ${mergeExecutable.length}`);
+  if (plan.length) parts.push(`нужно подготовить план: ${plan.length} (следующая #${plan[0].number})`);
   if (fix.length) parts.push(`готовы к исправлению: ${fix.length}`);
   if (human.length) parts.push(`ждут решения человека: ${human.length}`);
   if (legacy) parts.push(`переходят со старого формата: ${legacy}`);
