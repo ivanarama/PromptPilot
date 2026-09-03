@@ -295,6 +295,45 @@ def test_pause_hides_series_task_from_runnable_queue(isolated_db):
     assert isolated_db.get_next_runnable().id == task.id
 
 
+def test_run_now_recreates_missing_occurrence_after_cancel(isolated_db):
+    task = isolated_db.create_task(TaskCreate(
+        prompt="Review", working_dir="repo", recurrence="4h",
+        provider="codex", priority=2, max_retries=3, effort="high",
+        task_timeout=5400, skip_permissions=True, keep_pane=False,
+        machine="builder", worktree=True,
+    ))
+    assert isolated_db.cancel_task(task.id)
+
+    assert isolated_db.series_action(task.series_id, "run_now")
+
+    series = isolated_db.get_series(task.series_id)
+    recreated = isolated_db.get_task(series["next_task_id"])
+    assert recreated.id != task.id
+    assert recreated.status.value == "pending"
+    assert recreated.series_id == task.series_id
+    assert recreated.scheduled_at <= datetime.now(timezone.utc)
+    assert recreated.prompt == "Review"
+    assert recreated.working_dir == "repo"
+    assert recreated.recurrence == "4h"
+    assert recreated.provider == "codex"
+    assert recreated.priority == 2
+    assert recreated.max_retries == 3
+    assert recreated.effort == "high"
+    assert recreated.task_timeout == 5400
+    assert recreated.skip_permissions is True
+    assert recreated.keep_pane is False
+    assert recreated.machine == "builder"
+    assert recreated.worktree is True
+
+
+def test_run_now_does_not_duplicate_running_occurrence(isolated_db):
+    task = isolated_db.create_task(TaskCreate(prompt="Review", recurrence="4h"))
+    assert isolated_db.get_next_runnable().id == task.id
+
+    assert isolated_db.series_action(task.series_id, "run_now") is False
+    assert len([item for item in isolated_db.list_tasks() if item.series_id == task.series_id]) == 1
+
+
 def test_temporary_boost_expiry_uses_base_interval(isolated_db):
     task = isolated_db.create_task(TaskCreate(prompt="Review", recurrence="4h"))
     isolated_db.update_series(task.series_id, {

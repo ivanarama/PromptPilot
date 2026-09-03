@@ -929,7 +929,48 @@ def series_action(series_id: int, action: str) -> bool:
                    WHERE series_id = ? AND status IN ('pending', 'rate_limited')""",
                 (now, series_id),
             )
-            return cur.rowcount > 0
+            if cur.rowcount > 0:
+                return True
+            if row["ended_at"] or conn.execute(
+                "SELECT 1 FROM tasks WHERE series_id = ? AND status = 'running'",
+                (series_id,),
+            ).fetchone():
+                return False
+
+            # Cancelling the only occurrence used to leave an active series
+            # broken forever: there was no pending row for run_now to move and
+            # resume only toggles the pause flag. Recreate exactly one fresh
+            # occurrence from the durable series plus non-editable execution
+            # settings of its latest run. The UPDATE above takes the SQLite
+            # write lock first, so concurrent run_now calls cannot insert two.
+            latest_row = conn.execute(
+                "SELECT * FROM tasks WHERE series_id = ? ORDER BY id DESC LIMIT 1",
+                (series_id,),
+            ).fetchone()
+            if not latest_row:
+                return False
+            latest = _row_to_task(latest_row)
+            _insert_task(conn, TaskCreate(
+                prompt=row["prompt"],
+                working_dir=row["working_dir"],
+                provider=row["provider"],
+                priority=row["priority"],
+                scheduled_at=datetime.now(timezone.utc),
+                max_retries=latest.max_retries,
+                skip_permissions=latest.skip_permissions,
+                model=row["model"],
+                effort=row["effort"],
+                tg_chat_id=latest.tg_chat_id,
+                recurrence=row["base_recurrence"],
+                task_timeout=row["task_timeout"],
+                detached=latest.detached,
+                keep_pane=latest.keep_pane,
+                herdr_target=latest.herdr_target,
+                machine=latest.machine,
+                worktree=latest.worktree,
+                series_id=series_id,
+            ))
+            return True
         elif action == "end":
             conn.execute("UPDATE task_series SET ended_at = ?, updated_at = ? WHERE id = ?",
                          (now, now, series_id))
