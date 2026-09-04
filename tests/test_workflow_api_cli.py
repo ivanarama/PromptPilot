@@ -99,6 +99,11 @@ def test_schedule_ui_exposes_durable_series_controls():
     assert "Завершённые серии" in html
     assert "Временное ускорение" in html
     assert "saveSeries(event" in html
+    assert 'name="provider"' in html
+    assert 'name="model"' in html
+    assert "provider: String(fd.get('provider') || '').trim()" in html
+    assert "model: String(fd.get('model') || '').trim()" in html
+    assert "ae.id.startsWith('ed-')" in html
     assert "insights-table" in html
     assert "insights-stage-detail" in html
     assert 'colspan="10"' in html

@@ -2479,6 +2479,8 @@ async function openSchedule() {
       <form id="series-edit-${s.id}" style="display:none;margin-top:10px;padding:10px;border:1px solid var(--border);border-radius:8px" onsubmit="return saveSeries(event,${s.id})">
         <div style="display:flex;gap:8px;flex-wrap:wrap">
           <label>Основной интервал<br><input name="recurrence" value="${escAttr(s.recurrence || '')}" placeholder="4h" required style="width:110px"></label>
+          <label>Провайдер<br><select name="provider">${providerOptions(s.provider)}</select></label>
+          <label>Модель<br><input name="model" value="${escAttr(s.model || '')}" placeholder="по умолчанию" style="width:190px"></label>
           <label>Эффорт<br><select name="effort"><option value="">по умолчанию</option>${['low','medium','high','xhigh','max'].map(x=>`<option ${s.effort===x?'selected':''}>${x}</option>`).join('')}</select></label>
           <label>Приоритет<br><input name="priority" type="number" min="1" max="10" value="${s.priority || 5}" style="width:80px"></label>
           <label>Таймаут, сек<br><input name="task_timeout" type="number" min="0" value="${s.task_timeout ?? ''}" placeholder="общий" style="width:110px"></label>
@@ -2748,6 +2750,8 @@ async function saveSeries(event, id) {
   const timeout = String(fd.get('task_timeout') || '');
   const body = {
     recurrence: String(fd.get('recurrence') || '').trim(),
+    provider: String(fd.get('provider') || '').trim(),
+    model: String(fd.get('model') || '').trim(),
     effort: String(fd.get('effort') || ''), priority: Number(fd.get('priority')),
     task_timeout: timeout === '' ? null : Number(timeout),
     temporary_recurrence: temporary || null,
@@ -2959,9 +2963,9 @@ function timeAgo(iso) {
 function refresh() {
   loadStats();
   // Keep the list live even with a card expanded (a running task used to freeze
-  // once opened) — but don't re-render out from under a note being typed.
+  // once opened) — but don't re-render out from under an unsaved inline edit.
   const ae = document.activeElement;
-  if (ae && ae.id && ae.id.startsWith('note-')) return;
+  if (ae && ae.id && (ae.id.startsWith('note-') || ae.id.startsWith('ed-'))) return;
   loadTasks();
 }
 
