@@ -2627,6 +2627,9 @@ async function loadPipelineInsights(profile, refresh=false) {
     const duration = seconds => seconds == null ? '—' : seconds < 3600 ? `${Math.round(seconds/60)} мин` : `${(seconds/3600).toFixed(1)} ч`;
     const historyNote = h5.complete ? 'за последние 5 часов' : `история ${h5.coverage_hours} из 5 ч`;
     const runs = h5.runs;
+    const activeUnable = runs.unresolved_unable ?? runs.unable;
+    const activeFailed = runs.unresolved_failed ?? runs.failed;
+    const recoveredRuns = (runs.recovered_unable || 0) + (runs.recovered_failed || 0);
     const reviewQueue = (data.queues || []).find(q => q.id === 'review');
     const lastReview = reviewQueue && reviewQueue.last_run;
     const lastReviewValue = lastReview && lastReview.at ? timeAgo(lastReview.at) : 'ещё не было';
@@ -2700,7 +2703,7 @@ async function loadPipelineInsights(profile, refresh=false) {
         <div class="pipeline-metric"><div class="pipeline-metric-label">Переходы / churn</div><div class="pipeline-metric-value">${h5.complete?`${h5.transitions} / ${h5.churn_items}`:'—'}</div><div class="pipeline-metric-note">между очередями / 3+ состояний</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Возраст p90 / max</div><div class="pipeline-metric-value">${age(data.age.p90_hours)} / ${age(data.age.oldest_hours)}</div><div class="pipeline-metric-note">текущие элементы</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Прогоны 5 ч</div><div class="pipeline-metric-value">${runs.runs}</div><div class="pipeline-metric-note">с действием ${runs.ready} · без действий ${runs.no_change || 0} · пусто ${runs.empty}</div></div>
-        <div class="pipeline-metric"><div class="pipeline-metric-label">Смысловые проблемы</div><div class="pipeline-metric-value">${runs.human + runs.unable + runs.failed}</div><div class="pipeline-metric-note">человек ${runs.human} · не смог ${runs.unable} · упало ${runs.failed}</div></div>
+        <div class="pipeline-metric"><div class="pipeline-metric-label">Требуют внимания</div><div class="pipeline-metric-value">${runs.human + activeUnable + activeFailed}</div><div class="pipeline-metric-note">человек ${runs.human} · не смог ${activeUnable} · упало ${activeFailed}${recoveredRuns ? ` · восстановлено ${recoveredRuns}` : ''}</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Последнее REVIEW</div><div class="pipeline-metric-value">${esc(lastReviewValue)}</div><div class="pipeline-metric-note">${esc(lastReviewNote)}</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Токены 5 ч</div><div class="pipeline-metric-value">${esc(tokenValue)}</div><div class="pipeline-metric-note">измерено запусков: ${runs.tokens_known_runs || 0} из ${runs.runs}</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Δ backlog 24 ч</div><div class="pipeline-metric-value">${h24.complete?signed(h24.backlog_delta):'—'}</div><div class="pipeline-metric-note">покрытие ${h24.coverage_hours} из 24 ч</div></div>

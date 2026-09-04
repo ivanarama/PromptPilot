@@ -856,9 +856,13 @@ def _health(backlog: int, windows: dict, broken_series: int, paused_series: int 
                 "reason": diagnostics.get("summary", "health-check обнаружил ошибку")}
     recent = windows.get("5h", {})
     runs = recent.get("runs", {})
-    if runs.get("failed", 0) or runs.get("unable", 0):
+    failed = runs.get("unresolved_failed", runs.get("failed", 0))
+    unable = runs.get("unresolved_unable", runs.get("unable", 0))
+    if failed or unable:
+        recovered = runs.get("recovered_failed", 0) + runs.get("recovered_unable", 0)
+        recovered_note = f"; восстановлено: {recovered}" if recovered else ""
         return {"state": "red", "label": "прогон не отработал",
-                "reason": f"упало: {runs.get('failed', 0)}; НЕ СМОГ: {runs.get('unable', 0)}"}
+                "reason": f"активно — упало: {failed}; НЕ СМОГ: {unable}{recovered_note}"}
     if paused_series:
         return {"state": "yellow", "label": "конвейер на паузе",
                 "reason": f"приостановлено серий: {paused_series}"}

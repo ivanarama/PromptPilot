@@ -1011,6 +1011,57 @@ def test_pipeline_run_metrics_distinguish_semantic_failure_from_process_failure(
     assert metrics["ready"] == 1
     assert metrics["unable"] == 1
     assert metrics["failed"] == 1
+    assert metrics["unresolved_unable"] == 1
+    assert metrics["unresolved_failed"] == 1
+    assert metrics["recovered_unable"] == 0
+    assert metrics["recovered_failed"] == 0
+
+
+def test_pipeline_run_metrics_clear_incident_after_later_success(isolated_db):
+    unable = isolated_db.create_task(TaskCreate(prompt="Project - REVIEW", recurrence="1h"))
+    ready = isolated_db.create_task(TaskCreate(
+        prompt="Project - REVIEW", recurrence="1h", series_id=unable.series_id))
+    isolated_db.set_verdict(unable.id, "НЕ СМОГ")
+    isolated_db.mark_completed(unable.id, "blocked")
+    isolated_db.set_verdict(ready.id, "ГОТОВО")
+    isolated_db.mark_completed(ready.id, "recovered")
+
+    metrics = isolated_db.pipeline_run_metrics(
+        [unable.series_id], datetime.now(timezone.utc) - timedelta(hours=1))
+
+    assert metrics["unable"] == 1
+    assert metrics["unresolved_unable"] == 0
+    assert metrics["recovered_unable"] == 1
+
+
+def test_health_reports_only_unresolved_incidents():
+    health = pipeline_insights._health(
+        10,
+        {"5h": {"complete": True, "runs": {
+            "failed": 1, "unable": 2,
+            "unresolved_failed": 0, "unresolved_unable": 1,
+            "recovered_failed": 1, "recovered_unable": 1,
+        }}},
+        0,
+    )
+
+    assert health["state"] == "red"
+    assert health["reason"] == "активно — упало: 0; НЕ СМОГ: 1; восстановлено: 2"
+
+
+def test_health_does_not_keep_recovered_incident_red():
+    health = pipeline_insights._health(
+        0,
+        {"5h": {"complete": True, "runs": {
+            "failed": 0, "unable": 1,
+            "unresolved_failed": 0, "unresolved_unable": 0,
+            "recovered_failed": 0, "recovered_unable": 1,
+        }}},
+        0,
+    )
+
+    assert health["state"] == "green"
+    assert health["label"] == "очередь пуста"
 
 
 def test_pipeline_metrics_separate_successful_noop_and_sum_known_tokens(isolated_db):

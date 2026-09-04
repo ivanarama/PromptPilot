@@ -732,7 +732,13 @@ def mask_secret_value(name: str, value: str) -> str:
 
 def get_provider_env(provider: str) -> dict:
     """Environment for a provider's subprocess: current env minus PromptPilot's
-    own secrets, plus the provider's declared env on top."""
+    own secrets, plus the provider's declared env on top.
+
+    A service/tray process on Windows often starts with a stale PATH even when
+    GitHub CLI and Go are installed. Pipeline prompts invoke ``gh`` and ``go``
+    by name, so expose configured executables and well-known installations in
+    PATH instead of making every agent rediscover them heuristically.
+    """
     providers = load_providers()
     extra = providers.get(provider, {}).get("env", {})
     env = os.environ.copy()
@@ -740,6 +746,30 @@ def get_provider_env(provider: str) -> dict:
         env.pop(k, None)
     # Skip empty values — don't override existing env vars with empty strings
     env.update({k: v for k, v in extra.items() if v})
+    tool_dirs = []
+    for variable, alias in (("PP_GH_EXE", "GH_EXE"), ("PP_GO_EXE", "GO_EXE")):
+        executable = env.get(variable, "").strip()
+        if executable and Path(executable).is_file():
+            env.setdefault(alias, executable)
+            tool_dirs.append(str(Path(executable).parent))
+    if sys.platform == "win32":
+        program_files = Path(env.get("ProgramFiles") or r"C:\Program Files")
+        for executable in (
+            program_files / "GitHub CLI" / "gh.exe",
+            program_files / "Go" / "bin" / "go.exe",
+        ):
+            if executable.is_file():
+                tool_dirs.append(str(executable.parent))
+    existing_parts = [part for part in env.get("PATH", "").split(os.pathsep) if part]
+    seen = {os.path.normcase(os.path.normpath(part)) for part in existing_parts}
+    prepend = []
+    for directory in tool_dirs:
+        normalized = os.path.normcase(os.path.normpath(directory))
+        if normalized not in seen:
+            prepend.append(directory)
+            seen.add(normalized)
+    if prepend:
+        env["PATH"] = os.pathsep.join([*prepend, *existing_parts])
     return env
 
 

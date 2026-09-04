@@ -1,4 +1,6 @@
-from promptpilot.config import build_cmd, cmd_runs_codex, load_providers
+import os
+
+from promptpilot.config import build_cmd, cmd_runs_codex, get_provider_env, load_providers
 from promptpilot.worker import _remember_stream_session, format_result, parse_stream_json
 
 
@@ -49,6 +51,26 @@ def test_codex_skip_permissions_uses_codex_autonomous_flag():
     assert command == [
         "codex", "exec", "--json", "--dangerously-bypass-approvals-and-sandbox", "-",
     ]
+
+
+def test_provider_env_exposes_configured_pipeline_tools_on_path(monkeypatch, tmp_path):
+    gh = tmp_path / "github" / "gh.exe"
+    go = tmp_path / "golang" / "go.exe"
+    gh.parent.mkdir()
+    go.parent.mkdir()
+    gh.touch()
+    go.touch()
+    monkeypatch.setenv("PP_GH_EXE", str(gh))
+    monkeypatch.setenv("PP_GO_EXE", str(go))
+    monkeypatch.setenv("PATH", "existing")
+
+    env = get_provider_env("codex")
+
+    assert env["GH_EXE"] == str(gh)
+    assert env["GO_EXE"] == str(go)
+    path_parts = env["PATH"].split(os.pathsep)
+    assert path_parts[:2] == [str(gh.parent), str(go.parent)]
+    assert "existing" in path_parts
 
 
 def test_codex_resume_uses_exec_resume_with_stdin_after_session():

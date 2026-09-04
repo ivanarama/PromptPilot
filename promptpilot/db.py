@@ -1151,6 +1151,8 @@ def pipeline_run_metrics(series_ids: list[int], since: datetime) -> dict:
     ids = sorted({int(value) for value in series_ids if value is not None})
     empty = {"runs": 0, "ready": 0, "empty": 0, "human": 0,
              "no_change": 0, "unable": 0, "failed": 0, "other": 0,
+             "unresolved_unable": 0, "unresolved_failed": 0,
+             "recovered_unable": 0, "recovered_failed": 0,
              "tokens_known_runs": 0, "input_tokens": 0,
              "output_tokens": 0, "total_tokens": 0}
     if not ids:
@@ -1158,11 +1160,13 @@ def pipeline_run_metrics(series_ids: list[int], since: datetime) -> dict:
     marks = ",".join("?" for _ in ids)
     with _connect() as conn:
         rows = conn.execute(
-            f"""SELECT status, verdict, result FROM tasks
+            f"""SELECT id, series_id, status, verdict, result FROM tasks
                 WHERE series_id IN ({marks}) AND completed_at >= ?""",
             (*ids, _to_utc_iso(since)),
         ).fetchall()
+    rows = sorted(rows, key=lambda row: row["id"])
     result = dict(empty)
+    unresolved = {series_id: {"unable": 0, "failed": 0} for series_id in ids}
     for row in rows:
         result["runs"] += 1
         verdict = (row["verdict"] or "").strip().upper()
@@ -1181,18 +1185,30 @@ def pipeline_run_metrics(series_ids: list[int], since: datetime) -> dict:
         ))
         if row["status"] == "failed":
             result["failed"] += 1
+            unresolved[int(row["series_id"])]["failed"] += 1
         elif verdict == "УЖЕ СДЕЛАНО" or (verdict == "ГОТОВО" and reported_no_change):
             result["no_change"] += 1
+            unresolved[int(row["series_id"])] = {"unable": 0, "failed": 0}
         elif verdict == "ГОТОВО":
             result["ready"] += 1
+            unresolved[int(row["series_id"])] = {"unable": 0, "failed": 0}
         elif verdict == "ПУСТО":
             result["empty"] += 1
+            unresolved[int(row["series_id"])] = {"unable": 0, "failed": 0}
         elif verdict == "НУЖЕН ЧЕЛОВЕК":
             result["human"] += 1
+            # The stage itself completed correctly even if the selected item
+            # now waits for a person, so an older execution incident is over.
+            unresolved[int(row["series_id"])] = {"unable": 0, "failed": 0}
         elif verdict == "НЕ СМОГ":
             result["unable"] += 1
+            unresolved[int(row["series_id"])]["unable"] += 1
         else:
             result["other"] += 1
+    result["unresolved_unable"] = sum(item["unable"] for item in unresolved.values())
+    result["unresolved_failed"] = sum(item["failed"] for item in unresolved.values())
+    result["recovered_unable"] = result["unable"] - result["unresolved_unable"]
+    result["recovered_failed"] = result["failed"] - result["unresolved_failed"]
     return result
 
 
