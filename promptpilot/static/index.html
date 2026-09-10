@@ -2607,10 +2607,15 @@ function diagnosticOverview(data) {
 
 function pipelineHealthReason(data) {
   const diagnostics = data.diagnostics;
+  // The aggregate health also accounts for runtime failures, broken/paused
+  // series and unresolved run outcomes.  A yellow project diagnostic must not
+  // overwrite those stronger conclusions with the misleading "queue works"
+  // message.
+  if (data.health && data.health.label !== 'есть ожидания') return data.health.reason;
   if (diagnostics && diagnostics.checker_failed) return 'сама диагностика не завершилась — состояние конвейера не подтверждено';
   if (diagnostics && diagnostics.state === 'red') return 'проверка обнаружила нарушение — подробности ниже';
   if (diagnostics && diagnostics.state === 'yellow') return `очередь работает · ${diagnosticOverview(data)}`;
-  return data.health.reason;
+  return data.health ? data.health.reason : 'состояние конвейера неизвестно';
 }
 
 function diagnosticBadgeLabel(diagnostics) {

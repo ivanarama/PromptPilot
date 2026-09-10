@@ -717,6 +717,29 @@ def test_worker_wakes_pipeline_only_after_next_recurrence_exists(monkeypatch):
     assert events == ["execute", "recur", "wake"]
 
 
+def test_worker_internal_failure_keeps_recurring_series_alive(isolated_db, monkeypatch):
+    from promptpilot import workflows
+
+    created = isolated_db.create_task(TaskCreate(
+        prompt="Example - REVIEW", recurrence="4h",
+    ))
+    running = isolated_db.get_next_runnable()
+    assert running is not None
+    assert running.id == created.id
+    monkeypatch.setattr(workflows, "sync_task", lambda _task_id: None)
+    monkeypatch.setattr(workflows, "advance_linked_task", lambda _task_id: None)
+
+    worker._fail_stuck(running.id, RuntimeError("boom"))
+
+    failed = isolated_db.get_task(running.id)
+    series = next(item for item in isolated_db.list_series()
+                  if item["id"] == running.series_id)
+    assert failed.status.value == "failed"
+    assert series["broken"] is False
+    assert series["next_task_id"] != running.id
+    assert series["next_status"] == "pending"
+
+
 def test_pipeline_execution_auto_uses_tool_when_available(isolated_db, monkeypatch, tmp_path):
     helper = tmp_path / "pipelinectl.py"
     helper.write_text(

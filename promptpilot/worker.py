@@ -1071,6 +1071,11 @@ def _fail_stuck(task_id, exc):
         t = db.get_task(task_id)
         if t and t.status.value == "running":
             db.mark_failed(task_id, f"Внутренняя ошибка воркера: {type(exc).__name__}: {exc}")
+            # execute_task's finally block could not extend the series while
+            # this row was still running.  Once recovery marks it failed, do
+            # the same recurrence handoff as the normal failure path so one
+            # unexpected exception cannot leave a durable schedule broken.
+            _recur_after_run(t)
             from . import workflows
             workflows.sync_task(task_id)
             workflows.advance_linked_task(task_id)
