@@ -900,6 +900,12 @@ def _pipeline_text(data: dict) -> str:
         heartbeat = runtime.get("age_seconds")
         lines.insert(2, f"Worker: {runtime.get('state', '—')}"
                         + (f", heartbeat {heartbeat} сек назад" if heartbeat is not None else ""))
+    limits = data.get("github_rate_limit") or {}
+    core = limits.get("core")
+    if core:
+        reset = core.get("reset_at") or "—"
+        lines.insert(3, f"GitHub REST API: {core.get('remaining', 0)} / "
+                        f"{core.get('limit', 0)}; сброс {reset}")
     diagnostics = data.get("diagnostics")
     if diagnostics:
         lines.insert(3, f"Инварианты: {diagnostics.get('state', '—')} — "
@@ -932,7 +938,8 @@ async def _send_pipeline_insights(message, profile_id: str):
     status = await message.reply_text("📈 Считаю очереди GitHub…")
     try:
         data = await asyncio.to_thread(
-            pipeline_insights.analyze, profile_id, db.list_series(), use_cache=False)
+            pipeline_insights.analyze, profile_id, db.list_series(), use_cache=False,
+            refresh_diagnostics=True)
         await status.edit_text(_pipeline_text(data))
     except Exception as exc:
         await status.edit_text(f"Не удалось посчитать очередь: {exc}")

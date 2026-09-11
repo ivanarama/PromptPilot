@@ -171,6 +171,30 @@ def _gh_api_json(args: list[str], input_value: dict | None = None):
     return json.loads(run.stdout) if run.stdout.strip() else None
 
 
+def _github_rate_limits() -> dict | None:
+    """Return the authenticated GitHub budgets without spending core quota."""
+    try:
+        payload = _gh_api_json(["rate_limit"])
+    except (RuntimeError, OSError, ValueError, json.JSONDecodeError):
+        return None
+    resources = payload.get("resources", {}) if isinstance(payload, dict) else {}
+    result = {}
+    for name in ("core", "search", "graphql"):
+        item = resources.get(name)
+        if not isinstance(item, dict):
+            continue
+        reset = item.get("reset")
+        result[name] = {
+            "limit": int(item.get("limit") or 0),
+            "used": int(item.get("used") or 0),
+            "remaining": int(item.get("remaining") or 0),
+            "reset": int(reset) if reset is not None else None,
+            "reset_at": datetime.fromtimestamp(int(reset), timezone.utc).isoformat()
+            if reset is not None else None,
+        }
+    return result or None
+
+
 def set_item_priority(profile_id: str, queue_id: str, kind: str, number: int,
                       level: str, run_now: bool, series: list[dict]) -> dict:
     profiles = _profiles()
@@ -382,9 +406,11 @@ def dispatch_gate(task) -> dict | None:
             config = queue_config.get("dispatch_gate")
             if not marker or marker not in title or not isinstance(config, dict):
                 continue
-            # Dispatch checks must be fresh. A five-minute dashboard cache is
-            # fine for a chart, but unsafe for deciding whether to run an agent.
-            data = analyze(profile_id, db.list_series(), use_cache=False)
+            # Dispatch only decides whether starting an agent is useful; every
+            # mutation is still protected by the project's own fresh gate.
+            # Reuse the five-minute snapshot so several due stages cannot each
+            # spend hundreds of GitHub requests on the same queue state.
+            data = analyze(profile_id, db.list_series(), use_cache=True)
             queue = next((item for item in data["queues"]
                           if item["id"] == queue_config["id"]), None)
             if config.get("skip_when_empty") and queue and queue["backlog"] == 0:
@@ -531,7 +557,10 @@ def after_task_completed(task, verdict: str | None) -> list[str]:
         return []
     profile_id, profile, _queue = matched
     series = db.list_series()
-    data = analyze(profile_id, series, use_cache=False)
+    # A productive stage changes the GitHub protocol state. Refresh the project
+    # checker once here so the next stage is woken immediately; routine sampler
+    # and dispatch reads can then share that result.
+    data = analyze(profile_id, series, use_cache=False, refresh_diagnostics=True)
     return _wake_ready_queues(profile_id, profile, data, series)
 
 
@@ -898,13 +927,17 @@ def _health(backlog: int, windows: dict, broken_series: int, paused_series: int 
 def _profile_active(profile: dict, series: list[dict]) -> bool:
     if profile.get("always_sample"):
         return True
-    titles = [item.get("title", "").lower() for item in series if not item.get("ended")]
+    # A paused pipeline must not spend GitHub quota merely to maintain charts.
+    # An explicit dashboard refresh still analyzes it on demand.
+    titles = [item.get("title", "").lower() for item in series
+              if not item.get("ended") and not item.get("paused")]
     return any(queue.get("series_contains", "").lower() in title
                for queue in profile.get("queues", []) for title in titles
                if queue.get("series_contains"))
 
 
-def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True) -> dict:
+def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True,
+            refresh_diagnostics: bool = False) -> dict:
     profiles = _profiles()
     if profile_id not in profiles:
         raise KeyError(profile_id)
@@ -919,7 +952,22 @@ def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True) -> d
             return cached[1]
         profile = profiles[profile_id]
         priority_settings = _priority_settings(profile)
-        diagnostics = _run_profile_health_check(profile)
+        health_config = profile.get("health_check") or {}
+        health_cache_seconds = max(0, int(health_config.get("cache_seconds", 1800)))
+        diagnostics = None
+        diagnostics_generated_at = None
+        if not refresh_diagnostics and cached:
+            diagnostics_generated_at = cached[1].get("diagnostics_generated_at")
+            cached_diagnostics = cached[1].get("diagnostics")
+            effective_health_ttl = min(60, health_cache_seconds) if (
+                isinstance(cached_diagnostics, dict)
+                and cached_diagnostics.get("checker_failed")) else health_cache_seconds
+            if (diagnostics_generated_at is not None
+                    and time.time() - float(diagnostics_generated_at) < effective_health_ttl):
+                diagnostics = cached_diagnostics
+        if diagnostics is None:
+            diagnostics = _run_profile_health_check(profile)
+            diagnostics_generated_at = time.time()
         target_hours = float(profile.get("target_clear_hours", 8))
         now = datetime.now(timezone.utc)
         queues = []
@@ -1032,6 +1080,8 @@ def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True) -> d
             "health": _health(
                 backlog_total, windows, broken_series, paused_series, diagnostics, runtime),
             "diagnostics": diagnostics,
+            "diagnostics_generated_at": diagnostics_generated_at,
+            "github_rate_limit": _github_rate_limits(),
             "runtime": runtime,
             "priority_control": ({
                 "levels": list(_PRIORITY_LEVELS),

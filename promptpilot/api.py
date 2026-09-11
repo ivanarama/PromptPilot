@@ -298,7 +298,10 @@ def api_pipeline_profiles():
 @app.get("/api/pipeline-insights/{profile_id}")
 def api_pipeline_insights(profile_id: str, refresh: bool = False):
     try:
-        return pipeline_insights.analyze(profile_id, db.list_series(), use_cache=not refresh)
+        return pipeline_insights.analyze(
+            profile_id, db.list_series(), use_cache=not refresh,
+            refresh_diagnostics=refresh,
+        )
     except KeyError:
         raise HTTPException(404, "Профиль анализа не найден")
     except (RuntimeError, ValueError, OSError) as exc:
