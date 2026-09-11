@@ -2646,6 +2646,16 @@ async function loadPipelineInsights(profile, refresh=false) {
     const tokenValue = runs.tokens_known_runs
       ? Number(runs.total_tokens || 0).toLocaleString()
       : 'нет данных';
+    const githubLimits = data.github_rate_limit || {};
+    const githubBudget = name => {
+      const limit = githubLimits[name];
+      if (!limit) return 'нет данных';
+      const reset = limit.reset_at ? ` · сброс ${new Date(limit.reset_at).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}` : '';
+      return `${Number(limit.remaining).toLocaleString()} / ${Number(limit.limit).toLocaleString()}${reset}`;
+    };
+    const coreLimit = githubLimits.core;
+    const coreShare = coreLimit && coreLimit.limit ? coreLimit.remaining / coreLimit.limit : null;
+    const coreColor = coreShare == null ? 'var(--muted)' : coreShare <= 0.05 ? 'var(--red)' : coreShare <= 0.2 ? 'var(--yellow)' : '';
     const deltaByQueue = h5.queue_deltas || {};
     const diagnostics = data.diagnostics;
     const runtime = data.runtime || {};
@@ -2716,6 +2726,7 @@ async function loadPipelineInsights(profile, refresh=false) {
         <div class="pipeline-metric"><div class="pipeline-metric-label">Δ backlog 24 ч</div><div class="pipeline-metric-value">${h24.complete?signed(h24.backlog_delta):'—'}</div><div class="pipeline-metric-note">покрытие ${h24.coverage_hours} из 24 ч</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Цель очистки</div><div class="pipeline-metric-value">${data.target_clear_hours} ч</div><div class="pipeline-metric-note">без прогноза нового входа</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Worker</div><div class="pipeline-metric-value">${runtime.state==='online'?'online':'offline'}</div><div class="pipeline-metric-note">${runtime.age_seconds == null ? 'heartbeat отсутствует' : 'heartbeat '+runtime.age_seconds+' сек назад'}</div></div>
+        <div class="pipeline-metric"><div class="pipeline-metric-label">GitHub REST API</div><div class="pipeline-metric-value" style="${coreColor ? `color:${coreColor}` : ''}">${esc(githubBudget('core'))}</div><div class="pipeline-metric-note">Search ${esc(githubBudget('search'))} · GraphQL ${esc(githubBudget('graphql'))}</div></div>
       </div>
       ${diagnosticHtml}
       <table class="insights-table"><colgroup><col class="insights-col-stage"><col class="insights-col-small"><col class="insights-col-small"><col class="insights-col-capacity"><col class="insights-col-capacity"><col class="insights-col-duration"><col class="insights-col-small"><col class="insights-col-oldest"><col class="insights-col-interval"><col class="insights-col-recommendation"></colgroup><thead><tr><th>Этап</th><th class="num">Очередь</th><th class="num">Δ 5 ч</th><th class="num">За прогон</th><th class="num">Прогонов</th><th>Средний запуск</th><th>ETA</th><th>Самый старый</th><th>Интервал</th><th>Рекомендация</th></tr></thead><tbody>${rows}</tbody></table>

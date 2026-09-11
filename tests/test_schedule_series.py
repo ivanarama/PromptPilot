@@ -2,8 +2,18 @@ from datetime import datetime, timedelta, timezone
 import os
 from types import SimpleNamespace
 
+import pytest
+
 from promptpilot.models import TaskCreate
 from promptpilot import pipeline_insights, worker
+
+
+@pytest.fixture(autouse=True)
+def no_live_github_rate_limit(monkeypatch):
+    """Pipeline unit tests must never call the operator's real GitHub account."""
+    real = pipeline_insights._github_rate_limits
+    monkeypatch.setattr(pipeline_insights, "_github_rate_limits", lambda: None)
+    return real
 
 
 PIPELINE_PROFILE = {
@@ -91,6 +101,23 @@ def test_health_check_failure_is_not_reported_as_broken_invariant(monkeypatch):
     assert diagnostics["checker_failed"] is True
     assert health["state"] == "red"
     assert health["label"] == "диагностика не выполнена"
+
+
+def test_github_rate_limits_are_normalized(monkeypatch, no_live_github_rate_limit):
+    monkeypatch.setattr(pipeline_insights, "_gh_api_json", lambda _args: {
+        "resources": {
+            "core": {"limit": 5000, "used": 125, "remaining": 4875, "reset": 1},
+            "search": {"limit": 30, "used": 2, "remaining": 28, "reset": 2},
+            "graphql": {"limit": 5000, "used": 0, "remaining": 5000, "reset": 3},
+        },
+    })
+
+    limits = no_live_github_rate_limit()
+
+    assert limits["core"]["remaining"] == 4875
+    assert limits["core"]["reset_at"] == "1970-01-01T00:00:01+00:00"
+    assert limits["search"]["used"] == 2
+    assert limits["graphql"]["limit"] == 5000
 
 
 def test_project_health_attention_overrides_warming_history():
@@ -366,6 +393,42 @@ def test_pipeline_insights_finds_capacity_bottleneck(isolated_db, monkeypatch):
     assert "решения человека" in triage["recommendation"]
 
 
+def test_forced_queue_refresh_reuses_expensive_diagnostics(isolated_db, monkeypatch):
+    profile = {
+        **PIPELINE_PROFILE,
+        "health_check": {"command": ["health"], "cache_seconds": 1800},
+    }
+    calls = []
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"example": profile})
+    monkeypatch.setattr(pipeline_insights, "_github_search", lambda _repo, _query: {
+        "count": 0, "items": [], "membership_complete": True,
+    })
+    monkeypatch.setattr(pipeline_insights, "_github_rate_limits", lambda: None)
+    monkeypatch.setattr(
+        pipeline_insights, "_run_profile_health_check",
+        lambda _profile: calls.append("health") or {"state": "green", "findings": []},
+    )
+    pipeline_insights._cache.clear()
+
+    first = pipeline_insights.analyze("example", [], use_cache=False)
+    second = pipeline_insights.analyze("example", [], use_cache=False)
+    refreshed = pipeline_insights.analyze(
+        "example", [], use_cache=False, refresh_diagnostics=True)
+
+    assert first["diagnostics"] == second["diagnostics"]
+    assert len(calls) == 2
+    assert refreshed["diagnostics_generated_at"] >= second["diagnostics_generated_at"]
+
+
+def test_paused_pipeline_is_not_background_sampled():
+    profile = {"queues": [{"series_contains": "Example - REVIEW"}]}
+    paused = [{"title": "Example - REVIEW", "paused": True, "ended": False}]
+    active = [{"title": "Example - REVIEW", "paused": False, "ended": False}]
+
+    assert pipeline_insights._profile_active(profile, paused) is False
+    assert pipeline_insights._profile_active(profile, active) is True
+
+
 def test_pipeline_insights_exposes_actual_series_task_status(isolated_db, monkeypatch):
     counts = iter([0, 0, 0, 1, 0])
     monkeypatch.setattr(pipeline_insights, "_github_search", lambda repo, query: {
@@ -524,6 +587,32 @@ def test_dispatch_gate_completes_empty_queue_without_provider(isolated_db, monke
 
     assert gate["action"] == "complete_empty"
     assert "пуста" in gate["reason"]
+
+
+def test_dispatch_gate_reuses_recent_pipeline_snapshot(isolated_db, monkeypatch):
+    task = isolated_db.create_task(TaskCreate(
+        prompt="ExampleProject - TRIAGE", recurrence="4h",
+    ))
+    profile = {
+        "title": "Example", "repository": "owner/example",
+        "queues": [{
+            "id": "triage", "title": "Triage", "query": "is:issue",
+            "series_contains": "ExampleProject - TRIAGE",
+            "dispatch_gate": {"skip_when_empty": True},
+        }],
+    }
+    calls = []
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"example": profile})
+    monkeypatch.setattr(pipeline_insights, "analyze", lambda *args, **kwargs: (
+        calls.append(kwargs) or {
+            "queues": [{"id": "triage", "title": "Triage", "backlog": 0}],
+            "diagnostics": {},
+        }
+    ))
+
+    pipeline_insights.dispatch_gate(task)
+
+    assert calls == [{"use_cache": True}]
 
 
 def test_dispatch_gate_defers_dependency_without_provider(isolated_db, monkeypatch):
