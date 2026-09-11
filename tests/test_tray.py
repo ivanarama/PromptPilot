@@ -1,3 +1,12 @@
+import sys
+from unittest.mock import MagicMock
+
+# The tray dependencies are intentionally optional in the lean test install.
+# Process supervision itself does not need a desktop, so provide import-only
+# stand-ins instead of skipping these tests on headless CI runners.
+sys.modules.setdefault("pystray", MagicMock())
+sys.modules.setdefault("PIL", MagicMock())
+
 from promptpilot import tray
 
 
