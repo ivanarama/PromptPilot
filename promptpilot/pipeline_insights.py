@@ -685,7 +685,9 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None) 
         }
 
     preflight_action = preflight["action"].lower()
-    preflight_reason = str(preflight.get("reason") or preflight_action)
+    preflight_reason = str(
+        preflight.get("reason") or preflight.get("error") or preflight_action
+    )
     if preflight_action in {"empty", "wait"}:
         return {
             "action": "complete_empty", "mode": "tool", "reason": preflight_reason,
@@ -693,7 +695,14 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None) 
             "profile_id": profile_id, "queue_id": queue.get("id"),
             "preflight": preflight,
         }
-    if preflight_action in {"fallback", "error"}:
+    if preflight_action == "error":
+        return {
+            "action": "defer", "mode": "tool", "reason": preflight_reason,
+            "defer_for": str(execution.get("error_defer_for") or "30m"),
+            "profile_id": profile_id, "queue_id": queue.get("id"),
+            "preflight": preflight,
+        }
+    if preflight_action == "fallback":
         if mode == "auto":
             return {
                 "action": "prompt", "mode": "skill", "prompt": fallback_prompt,

@@ -700,6 +700,22 @@ def _execute_task_inner(task):
             )
             print(f"  -> Blocked without agent: {reason}")
             return
+        if route["action"] == "defer":
+            reason = route["reason"]
+            next_run = db.parse_recurrence(route["defer_for"])
+            if next_run:
+                db.defer_task(task.id, next_run, reason)
+                print(f"  -> Pipeline preflight deferred without agent: {reason}")
+                return
+            db.set_verdict(task.id, "НУЖЕН ЧЕЛОВЕК")
+            db.mark_completed(
+                task.id,
+                f"Pipeline preflight PromptPilot: {reason}\n"
+                f"Некорректный интервал повтора: {route['defer_for']}\n\n"
+                f"ИТОГ: НУЖЕН ЧЕЛОВЕК ({reason})",
+                exit_code=0,
+            )
+            return
         if route["action"] == "complete_empty":
             reason = route["reason"]
             verdict = route.get("verdict") or "ПУСТО"
