@@ -157,6 +157,8 @@ def load_config(path: str) -> dict:
         raise PipelineError("invalid repository or health_command")
     data.setdefault("base_branch", "main")
     data.setdefault("merge_method", "merge")
+    if not isinstance(data.get("sync_base_before_health", False), bool):
+        raise PipelineError("sync_base_before_health must be a boolean")
     return data
 
 
@@ -199,7 +201,45 @@ def queue_priority(item: dict, config: dict, now: datetime | None = None) -> int
     return base - boost
 
 
+def sync_base_before_health(config: dict) -> None:
+    """Fast-forward a clean base checkout before running repository health.
+
+    Repository-owned health tools are versioned with the project. Running one
+    from a stale automation checkout can make decisions using an obsolete queue
+    contract, so opt-in profiles refresh that checkout and fail closed when it
+    cannot be updated safely. Untracked review artifacts are intentionally
+    allowed; tracked changes are not.
+    """
+    if not config.get("sync_base_before_health", False):
+        return
+
+    base = str(config.get("base_branch") or "main")
+
+    def git(*args: str):
+        result = subprocess.run(
+            ["git", *args], capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+        )
+        if result.returncode:
+            detail = (result.stderr or result.stdout or "git command failed").strip()
+            raise PipelineError(f"cannot synchronize {base} before health: {detail}")
+        return result.stdout.strip()
+
+    branch = git("branch", "--show-current")
+    if branch != base:
+        raise PipelineError(
+            f"cannot synchronize {base} before health: current branch is {branch or 'detached HEAD'}"
+        )
+    if git("status", "--porcelain", "--untracked-files=no"):
+        raise PipelineError(
+            f"cannot synchronize {base} before health: checkout has tracked changes"
+        )
+    git("fetch", "origin", "--prune")
+    git("merge", "--ff-only", f"origin/{base}")
+
+
 def run_health(config: dict) -> dict:
+    sync_base_before_health(config)
     command = [str(value) for value in config["health_command"]]
     if command and command[0] in {"go", "go.exe"} and shutil.which(command[0]) is None:
         standard = Path(r"C:\Program Files\Go\bin\go.exe")

@@ -700,6 +700,22 @@ def _execute_task_inner(task):
             )
             print(f"  -> Blocked without agent: {reason}")
             return
+        if route["action"] == "defer":
+            reason = route["reason"]
+            next_run = db.parse_recurrence(route["defer_for"])
+            if next_run:
+                db.defer_task(task.id, next_run, reason)
+                print(f"  -> Pipeline preflight deferred without agent: {reason}")
+                return
+            db.set_verdict(task.id, "НУЖЕН ЧЕЛОВЕК")
+            db.mark_completed(
+                task.id,
+                f"Pipeline preflight PromptPilot: {reason}\n"
+                f"Некорректный интервал повтора: {route['defer_for']}\n\n"
+                f"ИТОГ: НУЖЕН ЧЕЛОВЕК ({reason})",
+                exit_code=0,
+            )
+            return
         if route["action"] == "complete_empty":
             reason = route["reason"]
             verdict = route.get("verdict") or "ПУСТО"
@@ -1071,6 +1087,11 @@ def _fail_stuck(task_id, exc):
         t = db.get_task(task_id)
         if t and t.status.value == "running":
             db.mark_failed(task_id, f"Внутренняя ошибка воркера: {type(exc).__name__}: {exc}")
+            # execute_task's finally block could not extend the series while
+            # this row was still running.  Once recovery marks it failed, do
+            # the same recurrence handoff as the normal failure path so one
+            # unexpected exception cannot leave a durable schedule broken.
+            _recur_after_run(t)
             from . import workflows
             workflows.sync_task(task_id)
             workflows.advance_linked_task(task_id)

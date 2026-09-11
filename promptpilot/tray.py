@@ -20,7 +20,9 @@ from .config import HOST, PORT
 _LOG_DIR = Path.home() / ".promptpilot"
 
 _procs = {}  # service name -> Popen
+_desired = set()  # services explicitly started and therefore supervised
 _lock = threading.Lock()
+_shutdown = threading.Event()
 
 
 # ---------------------------------------------------------------------------
@@ -85,35 +87,59 @@ def _open_path(path):
         pass
 
 
+def _spawn_locked(service: str):
+    """Start a child while _lock is held."""
+    if service == "bot":
+        import datetime
+        log_path = _bot_log_path()
+        log_file = open(log_path, "a", encoding="utf-8")
+        log_file.write(f"\n--- bot start {datetime.datetime.now():%Y-%m-%d %H:%M:%S} ---\n")
+        log_file.flush()
+        _procs[service] = subprocess.Popen(
+            _cmd(service),
+            stdout=log_file,
+            stderr=log_file,
+        )
+    else:
+        _procs[service] = subprocess.Popen(_cmd(service))
+
+
 def _start(service: str):
     with _lock:
+        _desired.add(service)
         if _is_running(service):
             return
-        if service == "bot":
-            import datetime
-            log_path = _bot_log_path()
-            log_file = open(log_path, "a", encoding="utf-8")
-            log_file.write(f"\n--- bot start {datetime.datetime.now():%Y-%m-%d %H:%M:%S} ---\n")
-            log_file.flush()
-            _procs[service] = subprocess.Popen(
-                _cmd(service),
-                stdout=log_file,
-                stderr=log_file,
-            )
-        else:
-            _procs[service] = subprocess.Popen(_cmd(service))
+        _spawn_locked(service)
 
 
 def _stop(service: str):
     with _lock:
+        _desired.discard(service)
         p = _procs.pop(service, None)
         if p and p.poll() is None:
             p.terminate()
 
 
 def _stop_all():
-    for service in list(_procs):
+    for service in list(set(_procs) | _desired):
         _stop(service)
+
+
+def _supervise_once() -> bool:
+    """Restart unexpectedly exited services; return whether anything changed."""
+    restarted = False
+    with _lock:
+        for service in list(_desired):
+            if not _is_running(service):
+                _spawn_locked(service)
+                restarted = True
+    return restarted
+
+
+def _supervisor_loop(icon):
+    while not _shutdown.wait(5):
+        if _supervise_once():
+            _refresh(icon)
 
 
 # ---------------------------------------------------------------------------
@@ -176,6 +202,7 @@ def _build_menu(icon: pystray.Icon) -> pystray.Menu:
         _refresh(i)
 
     def quit_app(i, it):
+        _shutdown.set()
         _stop_all()
         i.stop()
 
@@ -217,6 +244,7 @@ def _build_menu(icon: pystray.Icon) -> pystray.Menu:
 
 def run_tray():
     """Start the system tray application and auto-launch worker + server."""
+    _shutdown.clear()
     atexit.register(_stop_all)
 
     icon = pystray.Icon(
@@ -233,4 +261,7 @@ def run_tray():
         _start("bot")
 
     _refresh(icon)
+    threading.Thread(
+        target=_supervisor_loop, args=(icon,), name="pp-tray-supervisor", daemon=True,
+    ).start()
     icon.run()

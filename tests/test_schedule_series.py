@@ -717,6 +717,29 @@ def test_worker_wakes_pipeline_only_after_next_recurrence_exists(monkeypatch):
     assert events == ["execute", "recur", "wake"]
 
 
+def test_worker_internal_failure_keeps_recurring_series_alive(isolated_db, monkeypatch):
+    from promptpilot import workflows
+
+    created = isolated_db.create_task(TaskCreate(
+        prompt="Example - REVIEW", recurrence="4h",
+    ))
+    running = isolated_db.get_next_runnable()
+    assert running is not None
+    assert running.id == created.id
+    monkeypatch.setattr(workflows, "sync_task", lambda _task_id: None)
+    monkeypatch.setattr(workflows, "advance_linked_task", lambda _task_id: None)
+
+    worker._fail_stuck(running.id, RuntimeError("boom"))
+
+    failed = isolated_db.get_task(running.id)
+    series = next(item for item in isolated_db.list_series()
+                  if item["id"] == running.series_id)
+    assert failed.status.value == "failed"
+    assert series["broken"] is False
+    assert series["next_task_id"] != running.id
+    assert series["next_status"] == "pending"
+
+
 def test_pipeline_execution_auto_uses_tool_when_available(isolated_db, monkeypatch, tmp_path):
     helper = tmp_path / "pipelinectl.py"
     helper.write_text(
@@ -883,6 +906,91 @@ def test_pipeline_execution_tool_fallback_skips_preflight_prompt(isolated_db, mo
     strict = pipeline_insights.execution_route(task, task.prompt, str(tmp_path))
     assert strict["action"] == "block"
     assert strict["reason"] == "complex state"
+
+
+def test_pipeline_execution_preflight_error_defers_without_skill_fallback(
+        isolated_db, monkeypatch, tmp_path):
+    helper = tmp_path / "pipelinectl.py"
+    helper.write_text(
+        "import json; print(json.dumps({'action':'error','error':'cannot fast-forward main'}))",
+        encoding="utf-8",
+    )
+    task = isolated_db.create_task(TaskCreate(
+        prompt="ExampleProject - REVIEW\n/review-queue", recurrence="4h",
+    ))
+    profile = {
+        "title": "Example", "repository": "owner/example",
+        "queues": [{
+            "id": "review", "title": "Review", "query": "is:pr",
+            "series_contains": "ExampleProject - REVIEW",
+            "execution": {
+                "mode": "auto", "command": ["{python}", "pipelinectl.py"],
+                "required_paths": ["pipelinectl.py"], "error_defer_for": "12m",
+            },
+        }],
+    }
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"example": profile})
+
+    route = pipeline_insights.execution_route(task, task.prompt, str(tmp_path))
+
+    assert route["action"] == "defer"
+    assert route["defer_for"] == "12m"
+    assert route["reason"] == "cannot fast-forward main"
+    assert "prompt" not in route
+
+
+def test_pipeline_execution_error_defers_without_skill_fallback(isolated_db, monkeypatch, tmp_path):
+    helper = tmp_path / "pipelinectl.py"
+    helper.write_text(
+        "import json; print(json.dumps({'action':'error','error':'GitHub rate limited'})); raise SystemExit(2)",
+        encoding="utf-8",
+    )
+    task = isolated_db.create_task(TaskCreate(
+        prompt="ExampleProject - REVIEW\n/review-queue", recurrence="4h",
+    ))
+    profile = {
+        "title": "Example", "repository": "owner/example",
+        "queues": [{
+            "id": "review", "title": "Review", "query": "is:pr",
+            "series_contains": "ExampleProject - REVIEW",
+            "execution": {
+                "mode": "auto", "command": ["{python}", "pipelinectl.py"],
+                "required_paths": ["pipelinectl.py"], "error_defer_for": "11m",
+            },
+        }],
+    }
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"example": profile})
+
+    route = pipeline_insights.execution_route(task, task.prompt, str(tmp_path))
+
+    assert route["action"] == "defer"
+    assert route["defer_for"] == "11m"
+    assert route["reason"] == "GitHub rate limited"
+
+
+def test_worker_defers_preflight_error_without_loading_provider(isolated_db, monkeypatch):
+    task = isolated_db.create_task(TaskCreate(
+        prompt="ExampleProject - REVIEW", recurrence="4h",
+    ))
+    task = isolated_db.get_next_runnable()
+    monkeypatch.setattr(pipeline_insights, "dispatch_gate", lambda _task: None)
+    monkeypatch.setattr(
+        pipeline_insights, "execution_route",
+        lambda *_args, **_kwargs: {
+            "action": "defer", "mode": "tool", "reason": "GitHub rate limited",
+            "defer_for": "11m",
+        },
+    )
+    monkeypatch.setattr(
+        worker, "load_providers",
+        lambda: (_ for _ in ()).throw(AssertionError("provider must not be loaded")),
+    )
+
+    worker._execute_task_inner(task)
+
+    deferred = isolated_db.get_task(task.id)
+    assert deferred.status.value == "pending"
+    assert deferred.error == "GitHub rate limited"
 
 
 def test_pipeline_execution_auto_falls_back_but_tool_mode_blocks(isolated_db, monkeypatch, tmp_path):

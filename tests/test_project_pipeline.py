@@ -164,6 +164,60 @@ def test_health_exposes_configured_gh_to_nested_checker(monkeypatch):
     assert captured["env"]["PATH"].split(os.pathsep)[0] == os.path.dirname(gh)
 
 
+def test_health_fast_forwards_clean_base_before_checker(monkeypatch):
+    calls = []
+    outputs = iter(["main\n", "", "", "", '{"state":"green"}'])
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        return SimpleNamespace(returncode=0, stdout=next(outputs), stderr="")
+
+    monkeypatch.setattr(pp.subprocess, "run", fake_run)
+
+    result = pp.run_health({
+        "health_command": ["project-health", "-json"],
+        "base_branch": "main", "sync_base_before_health": True,
+    })
+
+    assert result["state"] == "green"
+    assert calls == [
+        ["git", "branch", "--show-current"],
+        ["git", "status", "--porcelain", "--untracked-files=no"],
+        ["git", "fetch", "origin", "--prune"],
+        ["git", "merge", "--ff-only", "origin/main"],
+        ["project-health", "-json"],
+    ]
+
+
+def test_health_refuses_to_sync_wrong_branch(monkeypatch):
+    monkeypatch.setattr(
+        pp.subprocess, "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0, stdout="feature\n", stderr=""),
+    )
+
+    with pytest.raises(pp.PipelineError, match="current branch is feature"):
+        pp.run_health({
+            "health_command": ["project-health"],
+            "base_branch": "main", "sync_base_before_health": True,
+        })
+
+
+def test_health_refuses_to_sync_tracked_changes(monkeypatch):
+    outputs = iter(["main\n", " M pipelinectl.json\n"])
+    monkeypatch.setattr(
+        pp.subprocess, "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0, stdout=next(outputs), stderr=""),
+    )
+
+    with pytest.raises(pp.PipelineError, match="tracked changes"):
+        pp.run_health({
+            "health_command": ["project-health"],
+            "base_branch": "main", "sync_base_before_health": True,
+        })
+
+
 def test_content_review_digest_ignores_only_base_tip_movement():
     before = snapshot()
     after = dict(before, baseRefOid="c" * 40)
