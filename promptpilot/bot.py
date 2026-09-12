@@ -884,16 +884,23 @@ async def show_pipeline_insights(update: Update, context: ContextTypes.DEFAULT_T
 
 def _pipeline_text(data: dict) -> str:
     recent = data.get("history", {}).get("5h", {})
+    week = data.get("history", {}).get("168h", {})
+    month = data.get("history", {}).get("720h", {})
     health = data.get("health", {})
     coverage = ("5 ч" if recent.get("complete")
                 else f"{recent.get('coverage_hours', 0):g} из 5 ч")
     delta = recent.get("backlog_delta") if recent.get("complete") else None
+    week_trend = (f"{week.get('backlog_delta'):+d}" if week.get("complete")
+                  else f"— (покрытие {week.get('coverage_hours', 0):g} ч)")
+    month_trend = (f"{month.get('backlog_delta'):+d}" if month.get("complete")
+                   else f"— (покрытие {month.get('coverage_hours', 0):g} ч)")
     lines = [f"📈 {data['title']}",
              f"Состояние: {health.get('label', '—')} — {health.get('reason', '—')}",
              f"Backlog: {data.get('backlog_total', 0)}"
              + (f" (Δ 5 ч: {delta:+d})" if delta is not None else " (история копится)"),
              f"Вход / выход / переходы: {recent.get('entered', 0)} / "
              f"{recent.get('exited', 0)} / {recent.get('transitions', 0)}; покрытие {coverage}",
+             f"Тренд backlog: 7 дней {week_trend}; 30 дней {month_trend}",
              f"Цель оценки: текущая очередь примерно за {data['target_clear_hours']:g} ч.", ""]
     runtime = data.get("runtime", {})
     if runtime:
@@ -935,11 +942,10 @@ def _pipeline_text(data: dict) -> str:
 
 async def _send_pipeline_insights(message, profile_id: str):
     import asyncio
-    status = await message.reply_text("📈 Считаю очереди GitHub…")
+    status = await message.reply_text("📈 Читаю последний снимок очередей…")
     try:
         data = await asyncio.to_thread(
-            pipeline_insights.analyze, profile_id, db.list_series(), use_cache=False,
-            refresh_diagnostics=True)
+            pipeline_insights.analyze, profile_id, db.list_series(), use_cache=True)
         await status.edit_text(_pipeline_text(data))
     except Exception as exc:
         await status.edit_text(f"Не удалось посчитать очередь: {exc}")

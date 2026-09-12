@@ -2629,6 +2629,8 @@ async function loadPipelineInsights(profile, refresh=false) {
     const data = await fetchJSON(`${API}/pipeline-insights/${encodeURIComponent(profile)}${refresh?'?refresh=true':''}`);
     const h5 = data.history['5h'];
     const h24 = data.history['24h'];
+    const h7d = data.history['168h'] || {complete:false, coverage_hours:0};
+    const h30d = data.history['720h'] || {complete:false, coverage_hours:0};
     const signed = n => n > 0 ? `+${n}` : String(n);
     const age = value => value == null ? '—' : value < 24 ? `${Math.round(value)} ч` : `${(value/24).toFixed(1)} д`;
     const duration = seconds => seconds == null ? '—' : seconds < 3600 ? `${Math.round(seconds/60)} мин` : `${(seconds/3600).toFixed(1)} ч`;
@@ -2724,6 +2726,8 @@ async function loadPipelineInsights(profile, refresh=false) {
         <div class="pipeline-metric"><div class="pipeline-metric-label">Последнее REVIEW</div><div class="pipeline-metric-value">${esc(lastReviewValue)}</div><div class="pipeline-metric-note">${esc(lastReviewNote)}</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Токены 5 ч</div><div class="pipeline-metric-value">${esc(tokenValue)}</div><div class="pipeline-metric-note">измерено запусков: ${runs.tokens_known_runs || 0} из ${runs.runs}</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Δ backlog 24 ч</div><div class="pipeline-metric-value">${h24.complete?signed(h24.backlog_delta):'—'}</div><div class="pipeline-metric-note">покрытие ${h24.coverage_hours} из 24 ч</div></div>
+        <div class="pipeline-metric"><div class="pipeline-metric-label">Δ backlog 7 дней</div><div class="pipeline-metric-value">${h7d.complete?signed(h7d.backlog_delta):'—'}</div><div class="pipeline-metric-note">покрытие ${h7d.coverage_hours} из 168 ч</div></div>
+        <div class="pipeline-metric"><div class="pipeline-metric-label">Δ backlog 30 дней</div><div class="pipeline-metric-value">${h30d.complete?signed(h30d.backlog_delta):'—'}</div><div class="pipeline-metric-note">покрытие ${h30d.coverage_hours} из 720 ч</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Цель очистки</div><div class="pipeline-metric-value">${data.target_clear_hours} ч</div><div class="pipeline-metric-note">без прогноза нового входа</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Worker</div><div class="pipeline-metric-value">${runtime.state==='online'?'online':'offline'}</div><div class="pipeline-metric-note">${runtime.age_seconds == null ? 'heartbeat отсутствует' : 'heartbeat '+runtime.age_seconds+' сек назад'}</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">GitHub REST API</div><div class="pipeline-metric-value" style="${coreColor ? `color:${coreColor}` : ''}">${esc(githubBudget('core'))}</div><div class="pipeline-metric-note">Search ${esc(githubBudget('search'))} · GraphQL ${esc(githubBudget('graphql'))}</div></div>

@@ -1185,6 +1185,8 @@ def test_pipeline_insights_history_is_profile_scoped_and_tracks_movement(isolate
     assert result["history"]["5h"]["entered"] == 1
     assert result["history"]["5h"]["moved"] == 1
     assert result["history"]["5h"]["transitions"] == 1
+    assert result["history"]["168h"]["complete"] is False
+    assert result["history"]["720h"]["complete"] is False
     assert len(isolated_db.list_pipeline_snapshots("other")) == 2
     assert isolated_db.list_pipeline_snapshots("unrelated") == []
 

@@ -23,7 +23,7 @@ _cache = {}
 _locks: dict[str, threading.Lock] = {}
 _INTERVAL_PRESETS = ((0.25, "15m"), (0.5, "30m"), (1, "1h"), (2, "2h"),
                      (4, "4h"), (8, "8h"), (12, "12h"), (24, "24h"))
-_HISTORY_WINDOWS = (5, 24)
+_HISTORY_WINDOWS = (5, 24, 24 * 7, 24 * 30)
 _PRIORITY_LEVELS = ("p0", "p1", "p2", "p3")
 _DEFAULT_PRIORITY_RULES = (
     ({"security", "severity:critical", "blocker", "data-loss"}, 0, "critical label"),
