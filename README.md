@@ -1010,10 +1010,13 @@ review-depth, HEAD и два одинаковых полных GraphQL snapshot 
 `action=validated` — только read-only scheduling proof; ответ явно содержит
 `mutation_authorized=false`. Все GraphQL, ship, CI, base-sync и CAS-проверки
 остаются в полном скилле. Handoff обслуживает один PR и при отказе не переходит
-к другому. На доказанном handoff-пути выполняются два полных health scan:
-election и свежий gate перед первой мутацией. Cleanup-проверки и GraphQL по-прежнему
-расходуют GitHub API. Для ручного запуска и legacy/recovery fallback без доказанной
-цели ограничение двумя scan не обещается.
+к другому. До первой мутации на доказанном handoff-пути выполняются ровно два
+полных health scan: election и свежий gate. После продуктивного completion
+PromptPilot отдельно делает ещё один свежий scan для wake-up следующих этапов.
+Поэтому полный продуктивный fallback расходует три scan вместо прежних четырёх
+(`4 → 3`), а не два за весь запуск. Cleanup-проверки и GraphQL по-прежнему
+расходуют GitHub API. Для ручного запуска и legacy/recovery fallback без
+доказанной цели такой бюджет scan не обещается.
 
 До необратимого merge быстрый путь публикует в PR неизменяемый
 `pp:merge-cleanup-intent`: точный HEAD, hash review-proof и тела PR, а также

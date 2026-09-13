@@ -103,6 +103,14 @@ def test_cli_dispatch_handoff_runs_exactly_election_and_fresh_gate(config, monke
     assert len(cleanup_reads) == (2 if stage == "merge" else 0)
 
 
+def test_documented_scan_budget_includes_productive_wake_up():
+    readme = (Path(__file__).parents[1] / "README.md").read_text(encoding="utf-8")
+    assert "До первой мутации на доказанном handoff-пути выполняются ровно два" in readme
+    assert "ещё один свежий scan для wake-up следующих этапов" in readme
+    assert "три scan вместо прежних четырёх" in readme
+    assert "`4 → 3`" in readme
+
+
 @pytest.mark.parametrize("field,value", [
     ("number", 43), ("number", True), ("head", "b" * 40), ("head", "short"),
     ("stage", "legacy-integration-merge-ready"), ("stage", "review"),

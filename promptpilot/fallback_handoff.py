@@ -81,6 +81,28 @@ def validate_health(health: dict) -> None:
         raise PipelineError("fallback PR appears in conflicting executable stages")
 
 
+def rest_only_review_owner(health: dict) -> bool:
+    """Recognize the one legacy REST snapshot that lacks the MERGE allowlist.
+
+    Older pipelinehealth output can represent an integration-review owner while
+    leaving ``merge_executable`` null. MERGE must keep routing that state to the
+    full skill (which reconstructs GraphQL lineage), never turn it into a signed
+    MERGE handoff and never defer it as a tool error. All other health fields
+    still have to satisfy the target-v1 schema.
+    """
+    from .project_pipeline import PipelineError
+
+    if health.get("merge_executable") is not None:
+        return False
+    compatible = dict(health, merge_executable=[])
+    try:
+        validate_health(compatible)
+        owner = identity(compatible.get("integration_owner"))
+    except PipelineError:
+        return False
+    return owner["stage"] in {"integration-review", "legacy-integration-review"}
+
+
 def health_gate(health: dict, stage: str, target: dict, *, election: bool) -> None:
     from .project_pipeline import PipelineError
 

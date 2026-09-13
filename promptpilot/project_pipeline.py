@@ -1181,8 +1181,11 @@ def next_merge(gh: GitHub, config: dict, *, config_path: str | None = None) -> d
         return pending_merge_action(gh, config, pending[0])
     health = run_health(config, config_path=config_path)
     if config.get("fallback_handoff") == "target-v1":
-        from .fallback_handoff import validate_health
+        from .fallback_handoff import rest_only_review_owner, validate_health
 
+        if rest_only_review_owner(health):
+            return {"action": "fallback",
+                    "reason": "single-flight/base-sync owner requires the full skill"}
         validate_health(health)
     if health.get("state") == "red":
         return {"action": "fallback", "reason": "health check is red"}

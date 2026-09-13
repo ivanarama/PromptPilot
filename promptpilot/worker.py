@@ -709,7 +709,11 @@ def _execute_task_inner(task):
             return
         agent_prompt = route["prompt"]
         if route.get("fallback_reason"):
-            print(f"  -> Pipeline tool unavailable, using skill: {route['fallback_reason']}")
+            if route.get("next_already_run"):
+                print("  -> Pipeline tool selected target; continuing full skill: "
+                      f"{route['fallback_reason']}")
+            else:
+                print(f"  -> Pipeline tool unavailable, using skill: {route['fallback_reason']}")
         elif route.get("mode") == "tool":
             print(f"  -> Pipeline tool route: {route['queue_id']}")
 

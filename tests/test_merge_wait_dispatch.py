@@ -58,9 +58,10 @@ def test_rest_only_integration_wait_keeps_full_merge_fallback(
 
 
 @pytest.mark.parametrize("stage", ["integration-review", "legacy-integration-review"])
+@pytest.mark.parametrize("executable", [None, []])
 def test_signed_handoff_opt_in_keeps_rest_only_review_carry_on_full_merge_fallback(
-        monkeypatch, stage):
-    health = rest_only_waiting_health(stage, [])
+        monkeypatch, stage, executable):
+    health = rest_only_waiting_health(stage, executable)
     monkeypatch.setattr(pp, "pending_merge_intents", lambda *_: [])
     monkeypatch.setattr(pp, "run_health", lambda *_args, **_kwargs: health)
     monkeypatch.setattr(
