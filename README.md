@@ -952,8 +952,12 @@ fallback сразу, а не по суточному расходу токено
 Встроенный `promptpilot.project_pipeline` реализует общий protocol v1. Проект
 задаёт `repository`, доверенный аккаунт, health-команду, base branch и required
 checks в `pipelinectl.json`. Обычный REVIEW получает ровно один кандидат и
-opaque lease; `complete review` повторно проверяет HEAD и два одинаковых полных
-GraphQL snapshot, затем сам выполняет review → claim → label → completion.
+opaque lease. При `review_completion_gate: "target-v1"` полный health служит
+только начальным election: `complete review` пересчитывает draft, routing,
+review-depth, HEAD и два одинаковых полных GraphQL snapshot только выданного PR,
+затем сам выполняет review → claim → label → completion. Изменения чужих PR не
+отменяют уже выполненный содержательный аудит. Без явного opt-in сохраняется
+совместимый режим `health` с повторным глобальным allowlist-check.
 Обычный CLEAN MERGE аналогично повторяет proof/labels/CI и использует merge с
 точным SHA. Base-sync, carry, legacy re-ship, конфликт, recovery и третий круг
 намеренно возвращают `action=fallback`: их продолжает полная проектная
@@ -973,6 +977,14 @@ same-repository closing issues. Только после него повторя�
 неизменяемой строкой есть короткая видимая подпись `PromptPilot service marker`.
 Старые HTML-only markers продолжают распознаваться, поэтому их не нужно
 редактировать и уже созданные review-proof не обесцениваются.
+
+Target-v1 lease ограничен по времени и защищён HMAC локальным 256-битным ключом
+из `PP_PIPELINE_LEASE_KEY_FILE` либо каталога `PP_DATA_DIR`. Подпись обнаруживает
+повреждение или подмену opaque-токена в штатном cooperative execution, но не
+является OS-песочницей: локальный процесс с доступом к ключу и GitHub-аккаунту
+входит в доверенную границу. Поэтому подпись не заменяет live-авторизацию: все
+разрешающие факты цели пересчитываются, а MERGE и интеграционные состояния
+по-прежнему сохраняют глобальный gate.
 
 Claude и Codex получают одну и ту же команду и JSON. Различаются только тонкие
 файлы обнаружения навыка (`.claude/skills` и `.agents/skills`); логика CLI и
