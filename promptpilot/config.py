@@ -746,6 +746,15 @@ def get_provider_env(provider: str) -> dict:
         env.pop(k, None)
     # Skip empty values — don't override existing env vars with empty strings
     env.update({k: v for k, v in extra.items() if v})
+    # PyInstaller's private runtime variables describe the currently running
+    # frozen application and are only valid for children from the same bundle.
+    # A provider is an independent process; if it inherits this state and later
+    # launches another frozen ``pp.exe``, PyInstaller can reject the unrelated
+    # parent executable. Sanitize only this copied provider environment so
+    # PromptPilot's own frozen subprocesses keep their bootstrap state.
+    for key in tuple(env):
+        if key.upper().startswith("_PYI_"):
+            env.pop(key, None)
     tool_dirs = []
     for variable, alias in (("PP_GH_EXE", "GH_EXE"), ("PP_GO_EXE", "GO_EXE")):
         executable = env.get(variable, "").strip()
