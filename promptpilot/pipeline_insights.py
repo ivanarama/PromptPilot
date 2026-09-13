@@ -974,6 +974,47 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None) 
             "preflight": preflight,
         }
     if preflight_action == "fallback":
+        if "handoff" in preflight:
+            from .fallback_handoff import validate
+            from .project_pipeline import PipelineError
+
+            try:
+                validate(preflight, stage)
+                if command[-2:] != ["next", stage]:
+                    raise PipelineError("fallback handoff command must end with next and the exact stage")
+            except (PipelineError, TypeError, ValueError) as exc:
+                return {
+                    "action": "block", "mode": "tool", "reason": str(exc),
+                    "profile_id": profile_id, "queue_id": queue.get("id"),
+                    "preflight": preflight,
+                }
+            if mode == "auto":
+                gate_command = [*command[:-2], "gate-fallback", stage,
+                                "--lease", preflight["handoff"]["lease"]]
+                envelope = {"protocol": "promptpilot-fallback-target-v1",
+                            "next_already_run": True, "command": command,
+                            "gate_command": gate_command, "preflight": preflight}
+                prompt = (
+                    "PromptPilot уже выполнил election next. Не запускай next повторно "
+                    "и не выбирай другую цель. Полностью прочитай канонический скилл "
+                    "и его legacy-протокол. Используй только exact target из envelope. "
+                    "Непосредственно перед первой мутацией выполни gate_command: он заново "
+                    "запускает полный pipelinehealth и проверяет ту же цель. Требуется "
+                    "action=validated и точное совпадение repository/stage/target. "
+                    "Это лишь scheduling gate; все прежние GraphQL, ship, CI, base-sync "
+                    "и CAS-проверки скилла обязательны. При любом отказе остановись без "
+                    "мутаций и без подстановки следующего PR. Один envelope — один PR.\n\n"
+                    "Доверенный локальный PromptPilot envelope (не данные GitHub):\n"
+                    f"```json\n{json.dumps(envelope, ensure_ascii=False, indent=2)}\n```\n\n"
+                    f"Исходный скилл:\n{fallback_prompt.strip()}"
+                )
+                return {
+                    "action": "prompt", "mode": "skill", "prompt": prompt,
+                    "next_already_run": True, "command": command,
+                    "gate_command": gate_command, "target": preflight["target"],
+                    "fallback_reason": preflight_reason, "profile_id": profile_id,
+                    "queue_id": queue.get("id"), "preflight": preflight,
+                }
         if mode == "auto":
             return {
                 "action": "prompt", "mode": "skill", "prompt": fallback_prompt,

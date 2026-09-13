@@ -1709,8 +1709,14 @@ def test_productive_completion_wakes_every_ready_stage(isolated_db, monkeypatch)
         "integration_owner": {"number": 10, "stage": "integration-merge-ready"},
     }
     data = _fresh_cache_data("example", profile, diagnostics)
+    analysis_calls = []
+
+    def fresh_analysis(*args, **kwargs):
+        analysis_calls.append((args, kwargs))
+        return data
+
     monkeypatch.setattr(
-        pipeline_insights, "analyze", lambda *args, **kwargs: data)
+        pipeline_insights, "analyze", fresh_analysis)
     calls = []
     monkeypatch.setattr(
         pipeline_insights.db, "wake_series_once",
@@ -1724,6 +1730,10 @@ def test_productive_completion_wakes_every_ready_stage(isolated_db, monkeypatch)
         (7, "pipeline_wake:example:review"),
         (8, "pipeline_wake:example:merge"),
     ]
+    assert len(analysis_calls) == 1
+    assert analysis_calls[0][1] == {
+        "use_cache": False, "refresh_diagnostics": True,
+    }
 
 
 def test_productive_completion_does_not_scan_or_wake_during_global_pause(monkeypatch):
@@ -2154,6 +2164,40 @@ def test_pipeline_execution_tool_fallback_skips_preflight_prompt(isolated_db, mo
     strict = pipeline_insights.execution_route(task, task.prompt, str(tmp_path))
     assert strict["action"] == "block"
     assert strict["reason"] == "complex state"
+
+
+@pytest.mark.parametrize("next_already_run,expected,forbidden", [
+    (True, "Pipeline tool selected target; continuing full skill",
+     "Pipeline tool unavailable"),
+    (False, "Pipeline tool unavailable, using skill",
+     "Pipeline tool selected target"),
+])
+def test_worker_log_distinguishes_handoff_from_unavailable_tool(
+        isolated_db, monkeypatch, capsys, next_already_run, expected, forbidden):
+    task = isolated_db.create_task(TaskCreate(
+        prompt="ExampleProject - REVIEW", recurrence="4h",
+    ))
+    task = isolated_db.get_next_runnable()
+    monkeypatch.setattr(pipeline_insights, "dispatch_gate", lambda _task: None)
+    route = {
+        "action": "prompt", "mode": "skill", "prompt": task.prompt,
+        "fallback_reason": "complex state",
+    }
+    if next_already_run:
+        route["next_already_run"] = True
+    monkeypatch.setattr(
+        pipeline_insights, "execution_route", lambda *_args, **_kwargs: route)
+    monkeypatch.setattr(
+        worker, "load_providers",
+        lambda: {worker.DEFAULT_CLI: {"executor": "herdr"}},
+    )
+    monkeypatch.setattr(worker, "_execute_herdr_task", lambda *_args, **_kwargs: None)
+
+    worker._execute_task_inner(task)
+
+    output = capsys.readouterr().out
+    assert expected in output
+    assert forbidden not in output
 
 
 def test_pipeline_execution_preflight_error_defers_without_skill_fallback(
