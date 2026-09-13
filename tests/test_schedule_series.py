@@ -346,6 +346,24 @@ def test_dependency_defer_returns_claimed_task_without_retry(isolated_db):
     assert deferred.error == "waiting for review"
 
 
+def test_reclaim_after_dependency_defer_clears_stale_error(isolated_db):
+    task = isolated_db.create_task(TaskCreate(prompt="Merge"))
+    claimed = isolated_db.get_next_runnable()
+    deferred_until = datetime.now(timezone.utc) - timedelta(minutes=1)
+    isolated_db.defer_task(claimed.id, deferred_until, "waiting for review")
+
+    reclaimed = isolated_db.get_next_runnable()
+    persisted = isolated_db.get_task(task.id)
+
+    assert reclaimed.status.value == "running"
+    assert reclaimed.error is None
+    assert reclaimed.next_run_at is None
+    assert persisted.status.value == "running"
+    assert persisted.error is None
+    assert persisted.next_run_at is None
+    assert persisted.scheduled_at == deferred_until
+
+
 def test_successful_retry_clears_stale_error_and_backoff(isolated_db):
     task = isolated_db.create_task(TaskCreate(prompt="Fix"))
     claimed = isolated_db.get_next_runnable()
@@ -353,6 +371,13 @@ def test_successful_retry_clears_stale_error_and_backoff(isolated_db):
         claimed.id, datetime.now(timezone.utc) - timedelta(minutes=1), "old failure",
     )
     retried = isolated_db.get_next_runnable()
+
+    assert retried.status.value == "running"
+    assert retried.error is None
+    assert retried.next_run_at is None
+    running = isolated_db.get_task(task.id)
+    assert running.error is None
+    assert running.next_run_at is None
 
     isolated_db.mark_completed(retried.id, "done")
 
