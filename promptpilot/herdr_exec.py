@@ -23,6 +23,8 @@ working directory belong to that machine, and the user attaches with
 Semantics notes:
   - task timeout bounds the *active* prompt turn (herdr-side, clean abort);
     time spent in ``blocked`` is intentionally unbounded — it is human time.
+    A task-created pane is closed and verified; an explicit ``herdr_target``
+    belongs to the user, so only PromptPilot's wait ends and the agent may run on.
   - ``detached`` submits the prompt and completes the task immediately,
     leaving the pane open (herdr keeps the session alive).
   - the interactive session produces no stream-json, so cost/session_id
@@ -37,7 +39,9 @@ import time
 
 from . import worktree
 from .config import (HERDR_BIN, HERDR_KEEP_PANE, HERDR_READ_LINES, HERDR_START_TIMEOUT_MS,
-                     guard_enabled, guard_settings_file, resolve_effort)
+                     HERDR_WORKTREE_TIMEOUT_SECONDS, guard_enabled,
+                     guard_settings_file, resolve_effort)
+from .process_tree import run_owned
 from .remote import (POWERSHELL, REMOTE_CALL_TIMEOUT, as_remote, ps_quote,
                      ssh_command, ssh_script)
 
@@ -90,12 +94,32 @@ def attach_hint(host=None) -> str:
     return f"herdr --remote {remote.host}" if remote else "herdr"
 
 
+def _command_timeout(args, host=None) -> int:
+    """Bound a herdr CLI call without truncating its legitimate operation."""
+    baseline = REMOTE_CALL_TIMEOUT if host else 30
+    operation = tuple(str(value) for value in args[:2])
+    if operation == ("agent", "start"):
+        # herdr itself gets HERDR_START_TIMEOUT_MS; leave enough time for CLI
+        # startup, JSON serialization and (for remote calls) ssh overhead.
+        start_seconds = (max(0, HERDR_START_TIMEOUT_MS) + 999) // 1000
+        return max(baseline, start_seconds + 10)
+    if operation in {
+        ("worktree", "create"),
+        ("worktree", "open"),
+        ("worktree", "remove"),
+    }:
+        return max(baseline, HERDR_WORKTREE_TIMEOUT_SECONDS)
+    return baseline
+
+
 def _run(args, host=None, timeout=None):
     """Run a herdr CLI command. Returns (rc, parsed_json_or_None, raw_output)."""
-    if host and timeout is None:
-        timeout = REMOTE_CALL_TIMEOUT
+    if timeout is None:
+        # A wedged CLI/socket must not make task cancellation unbounded. Long
+        # operations receive their own allowance instead of the probe timeout.
+        timeout = _command_timeout(args, host)
     try:
-        proc = subprocess.run(
+        proc = run_owned(
             herdr_argv(args, host),
             capture_output=True,
             text=True,
@@ -115,6 +139,30 @@ def _run(args, host=None, timeout=None):
     except (json.JSONDecodeError, ValueError):
         data = None
     return proc.returncode, data, raw
+
+
+def _close_owned_session(name: str, close_args: list, host=None) -> str:
+    """Close and verify a PromptPilot-owned herdr session.
+
+    A failed best-effort close must not be reported as a successful task
+    cancellation: the agent could still be changing its checkout.  Repeating
+    the exact tab/workspace command is safe, and never targets the shared
+    server or a user-provided ``herdr_target``.
+    """
+    last_raw = ""
+    for _ in range(3):
+        # Let _run choose the operation-aware bound: worktree removal gets the
+        # longer configured allowance, while tab/workspace close stays short.
+        _, _, close_raw = _run(close_args, host=host)
+        rc, data, probe_raw = _run(["agent", "get", name], host=host, timeout=10)
+        # Only herdr's explicit not-found response proves absence. A successful
+        # but incomplete/unknown schema is not evidence that the agent stopped.
+        if rc != 0 and _error_code(data) == "agent_not_found":
+            return ""
+        last_raw = probe_raw or close_raw
+        time.sleep(0.2)
+    return (f"herdr: could not confirm that owned session {name!r} stopped"
+            + (f": {last_raw[:300]}" if last_raw else ""))
 
 
 def _dig(data, *keys, default=""):
@@ -156,7 +204,7 @@ def _start_server(host=None):
     else:
         script = f"nohup {binary} server >/dev/null 2>&1 </dev/null &"
     try:
-        subprocess.run(
+        run_owned(
             ssh_script(remote, script),
             capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL,
         )
@@ -188,15 +236,37 @@ def _close_stale_tabs(task_id: int, host=None):
     """
     prefix = f"pp-t{task_id}-"
     rc, data, _ = _run(["tab", "list"], host=host)
-    if rc == 0:
-        for tab in _dig(data, "result", "tabs", default=[]) or []:
-            if str(tab.get("label", "")).startswith(prefix):
-                _run(["tab", "close", tab.get("tab_id", "")], host=host)
+    tabs = _dig(data, "result", "tabs", default=None)
+    if rc != 0 or not isinstance(tabs, list):
+        raise HerdrError("herdr: could not verify stale task tabs before retry")
+    errors = []
+    for tab in tabs:
+        if not isinstance(tab, dict):
+            raise HerdrError("herdr: malformed tab list while checking stale task sessions")
+        name = str(tab.get("label", ""))
+        if name.startswith(prefix):
+            error = _close_owned_session(
+                name, ["tab", "close", tab.get("tab_id", "")], host,
+            )
+            if error:
+                errors.append(error)
     rc, data, _ = _run(["workspace", "list"], host=host)
-    if rc == 0:
-        for ws in _dig(data, "result", "workspaces", default=[]) or []:
-            if str(ws.get("label", "")).startswith(prefix):
-                _run(["workspace", "close", ws.get("workspace_id", "")], host=host)
+    workspaces = _dig(data, "result", "workspaces", default=None)
+    if rc != 0 or not isinstance(workspaces, list):
+        raise HerdrError("herdr: could not verify stale task workspaces before retry")
+    for workspace in workspaces:
+        if not isinstance(workspace, dict):
+            raise HerdrError("herdr: malformed workspace list while checking stale task sessions")
+        name = str(workspace.get("label", ""))
+        if name.startswith(prefix):
+            error = _close_owned_session(
+                name, ["workspace", "close", workspace.get("workspace_id", "")], host,
+            )
+            if error:
+                errors.append(error)
+    if errors:
+        raise HerdrError("herdr: stale task session could not be stopped safely\n"
+                         + "\n".join(errors))
 
 
 def _open_worktree(task, cwd, label, host=None) -> dict:
@@ -434,8 +504,10 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
     on_worktree(path, branch) is called as soon as a ``worktree`` task has its
     own checkout — long before the run ends, which is when the user wants it.
     timeout (seconds) bounds the ACTIVE prompt turn; time spent in ``blocked``
-    is human time and is not counted. cancel_check() → True aborts the run
-    (pane is closed) — the worker maps it to the cancelled status.
+    is human time and is not counted. cancel_check() → True aborts the run;
+    PromptPilot-owned panes are closed and verified, while an explicit
+    ``herdr_target`` belongs to the user and remains running. The worker maps
+    a verified owned-session cancellation to the cancelled status.
     host: ssh target of the machine to run on; None = this machine.
 
     Returns {"ok", "rate_limited", "retry_reason", "cancelled", "output",
@@ -518,24 +590,26 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
             if on_pane:
                 on_pane(pane_id)
 
-        def close_tab():
+        def close_tab(remove_untouched=True):
             if workspace_id:
                 # The checkout IS the result — drop it only when the agent
                 # provably left nothing there, so failures don't litter disks.
-                if repo_root and worktree.is_untouched(repo_root, outcome["worktree_path"], host):
-                    _run(["worktree", "remove", "--workspace", workspace_id], host=host)
+                if (remove_untouched and repo_root
+                        and worktree.is_untouched(repo_root, outcome["worktree_path"], host)):
+                    close_args = ["worktree", "remove", "--workspace", workspace_id]
                 else:
-                    _run(["workspace", "close", workspace_id], host=host)
-                return
+                    close_args = ["workspace", "close", workspace_id]
+                return _close_owned_session(name, close_args, host)
             if tab_id:
-                _run(["tab", "close", tab_id], host=host)
+                return _close_owned_session(name, ["tab", "close", tab_id], host)
+            return ""  # herdr_target: foreign pane, intentionally untouched.
 
         def fail(msg, keep_pane=True):
             if keep_pane:
                 outcome["error"] = f"{msg}\n(панель {pane_id} оставлена — подключись командой: {attach})"
             else:
-                close_tab()
-                outcome["error"] = msg
+                close_error = close_tab(remove_untouched=False)
+                outcome["error"] = f"{msg}\n{close_error}" if close_error else msg
             return outcome
 
         # Start the agent, forwarding per-task flags to its CLI.
@@ -572,8 +646,9 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
                     break
                 time.sleep(0.5)
             if rc != 0:
-                close_tab()
-                outcome["error"] = f"herdr agent start failed: {raw}"
+                message = f"herdr agent start failed: {raw}"
+                close_error = close_tab(remove_untouched=False)
+                outcome["error"] = f"{message}\n{close_error}" if close_error else message
                 return outcome
 
         # Detached: submit the prompt, confirm it landed, leave the pane open.
@@ -646,11 +721,27 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
             )
 
         if state == "__cancel__":
-            close_tab()
+            if target:
+                outcome["cancel_note"] = (
+                    "Отменено ожидание PromptPilot; пользовательская herdr-сессия "
+                    f"{name} не закрывалась и агент в ней может продолжать работу"
+                )
+            else:
+                close_error = close_tab(remove_untouched=False)
+                if close_error:
+                    outcome["error"] = (
+                        "herdr: cancellation requested, but the owned session "
+                        f"could not be stopped safely\n{close_error}"
+                    )
+                    return outcome
             outcome["cancelled"] = True
             return outcome
         if state == "__timeout__":
-            return fail(f"herdr: таймаут задачи ({timeout}s)", keep_pane=False)
+            message = f"herdr: таймаут задачи ({timeout}s)"
+            if target:
+                message += (f"; пользовательская сессия {name} не закрывалась "
+                            "и агент в ней может продолжать работу")
+            return fail(message, keep_pane=False)
         if state == "__error__":
             return fail(f"herdr agent wait failed: {raw}")
 
@@ -664,7 +755,10 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
 
         reason = _retry_reason(cleaned)
         if reason:
-            close_tab()  # no-op for target mode (foreign pane)
+            close_error = close_tab(remove_untouched=False)
+            if close_error:
+                outcome["error"] = f"{cleaned}\n{close_error}"
+                return outcome
             outcome["rate_limited"] = True
             outcome["retry_reason"] = reason
             outcome["error"] = cleaned
@@ -672,7 +766,10 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
 
         env_marker = _looks_env_failure(cleaned)
         if env_marker:
-            close_tab()
+            close_error = close_tab(remove_untouched=False)
+            if close_error:
+                outcome["error"] = f"{cleaned}\n{close_error}"
+                return outcome
             outcome["env_failure"] = env_marker
             outcome["error"] = cleaned
             return outcome
@@ -712,7 +809,11 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
             )
             return outcome
 
-        close_tab()
+        close_error = close_tab()
+        if close_error:
+            outcome["error"] = ("herdr task finished, but its owned session could not "
+                                f"be stopped safely\n{close_error}")
+            return outcome
         outcome["ok"] = True
         outcome["output"] = (f"{cleaned}\n\n--- Meta ---\n"
                              f"Executor: herdr (pane {pane_id}{where}){wt_meta}")

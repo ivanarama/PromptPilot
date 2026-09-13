@@ -17,6 +17,7 @@ from . import db, worktree
 from .config import (BASE_DELAY, CONCURRENCY, DEFAULT_CLI, MAX_DELAY, MIN_FREE_MB,
                      POLL_INTERVAL, TASK_TIMEOUT, VERDICT_REQUIRED, build_cmd,
                      get_provider_env, load_providers)
+from .process_tree import OwnedProcess, ProcessTreeError
 
 # Our quota is spent — the wait is measured in hours and nothing else will get
 # through either.
@@ -399,46 +400,20 @@ def is_stream_json(stdout: str) -> bool:
         return False
 
 
-def _kill_process_tree(proc):
-    """Kill the task's process and its children (process group on POSIX)."""
+def _stop_owned_process(tree: OwnedProcess) -> None:
+    """End an owned process tree, then release its lifetime boundary."""
     try:
-        if os.name == "posix":
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        else:
-            # proc.kill() ends only the top process. An npm-installed CLI on
-            # Windows is a .cmd wrapper (cmd.exe) that spawns node — killing the
-            # wrapper leaves the real agent editing files. taskkill /T takes the
-            # whole tree.
-            subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)],
-                           capture_output=True, check=False)
-    except (ProcessLookupError, PermissionError, OSError):
+        tree.terminate()
+    except (ProcessLookupError, PermissionError, OSError) as exc:
+        print(f"  !! could not terminate full task process tree: {exc}", flush=True)
         try:
-            proc.kill()
+            tree.process.kill()
         except OSError:
             pass
-
-
-def _drain(proc, timeout=10):
-    """Collect a killed process's final output without hanging forever.
-
-    A grandchild the agent detached into its own session (setsid) survives the
-    process-group SIGKILL and keeps the inherited stdout/stderr pipe open, so a
-    bare communicate() would block until it too dies. Give up after a timeout
-    and return whatever was read.
-    """
-    try:
-        return proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        for stream in (proc.stdout, proc.stderr):
-            try:
-                if stream is not None:
-                    stream.close()
-            except OSError:
-                pass
-        try:
-            return proc.communicate(timeout=1)
-        except (subprocess.TimeoutExpired, ValueError, OSError):
-            return ("", "")
+    finally:
+        # On Windows this closes a KILL_ON_JOB_CLOSE handle, an independent
+        # second guarantee that every process assigned to this task is ended.
+        tree.close()
 
 
 def _effective_timeout(task):
@@ -604,7 +579,10 @@ def _execute_herdr_task(task, provider_cfg, host=None, machine=None, prompt_over
 
     if outcome.get("cancelled"):
         db.clear_cancel_request(task.id)
-        db.mark_cancelled(task.id, "Отменена пользователем во время выполнения")
+        db.mark_cancelled(
+            task.id,
+            outcome.get("cancel_note") or "Отменена пользователем во время выполнения",
+        )
         print("  -> Cancelled by user")
         return
 
@@ -825,7 +803,7 @@ def _execute_task_inner(task):
     effective_timeout = _effective_timeout(task)
 
     try:
-        proc = subprocess.Popen(
+        tree = OwnedProcess.start(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -835,11 +813,16 @@ def _execute_task_inner(task):
             cwd=run_dir,
             stdin=subprocess.PIPE if prompt_stdin is not None else subprocess.DEVNULL,
             env=env,
-            start_new_session=(os.name == "posix"),
         )
     except FileNotFoundError:
         db.mark_failed(task.id, f"CLI '{provider}' not found. Is it installed and in PATH?", exit_code=-1)
         return
+    except ProcessTreeError as exc:
+        # Fail closed: without a lifetime boundary a timed-out agent can keep
+        # changing the checkout after the queue has already moved on.
+        db.mark_failed(task.id, f"Could not isolate CLI process tree: {exc}", exit_code=-1)
+        return
+    proc = tree.process
 
     if prompt_stdin is not None:
         # Write once and detach the handle before polling communicate(). This
@@ -875,8 +858,11 @@ def _execute_task_inner(task):
             break
         except subprocess.TimeoutExpired:
             if db.is_cancel_requested(task.id):
-                _kill_process_tree(proc)
-                proc.wait(timeout=10)
+                _stop_owned_process(tree)
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    pass
                 stdout_thread.join(timeout=10)
                 stderr_thread.join(timeout=10)
                 db.clear_cancel_request(task.id)
@@ -884,13 +870,20 @@ def _execute_task_inner(task):
                 print("  -> Cancelled by user")
                 return
             if effective_timeout and time.monotonic() - started > effective_timeout:
-                _kill_process_tree(proc)
-                proc.wait(timeout=10)
+                _stop_owned_process(tree)
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    pass
                 stdout_thread.join(timeout=10)
                 stderr_thread.join(timeout=10)
                 db.mark_failed(task.id, f"Execution timed out after {effective_timeout}s", exit_code=-1)
                 return
 
+    # A successful wrapper may exit while a child still owns the pipes. Close
+    # the task boundary before joining readers so such a child cannot survive
+    # (or hold this worker forever).
+    tree.close()
     stdout_thread.join(timeout=10)
     stderr_thread.join(timeout=10)
     stdout = "".join(stdout_parts)

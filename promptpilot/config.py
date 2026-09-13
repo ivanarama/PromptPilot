@@ -973,6 +973,9 @@ def get_skills(working_dir: str = None) -> list:
 HERDR_BIN = os.environ.get("PP_HERDR_BIN", "herdr")
 HERDR_READ_LINES = _int_env("PP_HERDR_READ_LINES", 300)
 HERDR_START_TIMEOUT_MS = _int_env("PP_HERDR_START_TIMEOUT_MS", 60000)
+# Creating or removing a checkout may legitimately take longer than a small
+# status/probe command, especially for large repositories on Windows.
+HERDR_WORKTREE_TIMEOUT_SECONDS = _int_env("PP_HERDR_WORKTREE_TIMEOUT_SECONDS", 300)
 # Keep the pane open after a successful task (also per-provider "keep_pane")
 HERDR_KEEP_PANE = os.environ.get("PP_HERDR_KEEP_PANE", "0") == "1"
 
