@@ -1,11 +1,13 @@
 import asyncio
 import io
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import httpx
 from click.testing import CliRunner
 
-from promptpilot import pipeline_insights
+from promptpilot import bot, pipeline_insights
 from promptpilot.api import HERDR_UI_KEYS, app
 from promptpilot.cli import cli
 from promptpilot.models import TaskCreate, WorkflowCreate
@@ -139,6 +141,28 @@ def test_worker_pause_resume_invalidates_pipeline_insights_cache(isolated_db, mo
         assert len(search_calls) == 3
     finally:
         pipeline_insights.invalidate_cache()
+
+
+def test_bot_pause_resume_invalidates_pipeline_insights_cache(isolated_db, monkeypatch):
+    invalidations = []
+    message = SimpleNamespace(reply_text=AsyncMock())
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=123),
+        message=message,
+    )
+    monkeypatch.setattr(bot, "is_authorized", lambda _user_id: True)
+    monkeypatch.setattr(
+        bot.pipeline_insights, "invalidate_cache",
+        lambda: invalidations.append(isolated_db.is_paused()),
+    )
+    isolated_db.set_setting("worker_paused", "0")
+
+    asyncio.run(bot.toggle_pause(update, None))
+    asyncio.run(bot.toggle_pause(update, None))
+
+    assert invalidations == [True, False]
+    assert isolated_db.is_paused() is False
+    assert message.reply_text.await_count == 2
 
 
 def test_schedule_ui_exposes_durable_series_controls():

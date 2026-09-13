@@ -21,6 +21,8 @@ DEFAULT_PROFILES: dict = {}
 
 _cache = {}
 _locks: dict[str, threading.Lock] = {}
+_cache_state_lock = threading.Lock()
+_cache_generation = 0
 _INTERVAL_PRESETS = ((0.25, "15m"), (0.5, "30m"), (1, "1h"), (2, "2h"),
                      (4, "4h"), (8, "8h"), (12, "12h"), (24, "24h"))
 _HISTORY_WINDOWS = (5, 24, 24 * 7, 24 * 30)
@@ -47,9 +49,41 @@ def list_profiles() -> list[dict]:
             for key, value in _profiles().items()]
 
 
+def _cache_snapshot(profile_id: str) -> tuple[object | None, int]:
+    """Read one entry and the generation guarding an eventual cache write."""
+    with _cache_state_lock:
+        return _cache.get(profile_id), _cache_generation
+
+
+def _profile_lock(profile_id: str) -> threading.Lock:
+    # Do not hold the state lock while acquiring the returned per-profile lock.
+    # analyze() may take the locks in the opposite order when it publishes.
+    with _cache_state_lock:
+        return _locks.setdefault(profile_id, threading.Lock())
+
+
+def _publish_cache(profile_id: str, generation: int, result: dict) -> bool:
+    """Publish only if no invalidation happened while the result was built."""
+    with _cache_state_lock:
+        if generation != _cache_generation:
+            return False
+        _cache[profile_id] = (time.time(), result)
+        return True
+
+
+def _discard_cache(profile_id: str | None = None) -> None:
+    global _cache_generation
+    with _cache_state_lock:
+        _cache_generation += 1
+        if profile_id is None:
+            _cache.clear()
+        else:
+            _cache.pop(profile_id, None)
+
+
 def invalidate_cache() -> None:
-    """Discard cached dashboard state after a runtime control changes."""
-    _cache.clear()
+    """Discard cached dashboard state and reject already-running publishers."""
+    _discard_cache()
 
 
 def _gh_executable() -> str:
@@ -251,7 +285,7 @@ def set_item_priority(profile_id: str, queue_id: str, kind: str, number: int,
         if target:
             woke = db.series_action(int(target["id"]), "run_now")
             paused = bool(target.get("paused"))
-    _cache.pop(profile_id, None)
+    _discard_cache(profile_id)
     return {
         "ok": True, "profile_id": profile_id, "queue_id": queue_id,
         "kind": kind, "number": number, "level": level,
@@ -946,16 +980,16 @@ def _profile_active(profile: dict, series: list[dict]) -> bool:
 
 def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True,
             refresh_diagnostics: bool = False) -> dict:
+    cached, cache_generation = _cache_snapshot(profile_id)
     profiles = _profiles()
     if profile_id not in profiles:
         raise KeyError(profile_id)
-    cached = _cache.get(profile_id)
     if use_cache and cached and time.time() - cached[0] < 300:
         return cached[1]
 
-    lock = _locks.setdefault(profile_id, threading.Lock())
+    lock = _profile_lock(profile_id)
     with lock:
-        cached = _cache.get(profile_id)
+        cached, _ = _cache_snapshot(profile_id)
         if use_cache and cached and time.time() - cached[0] < 300:
             return cached[1]
         profile = profiles[profile_id]
@@ -1099,7 +1133,7 @@ def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True,
             "bottleneck": bottleneck["id"] if bottleneck and bottleneck["backlog"] else None,
             "generated_at": now.timestamp(),
         }
-        _cache[profile_id] = (time.time(), result)
+        _publish_cache(profile_id, cache_generation, result)
         return result
 
 
