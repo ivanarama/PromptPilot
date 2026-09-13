@@ -1150,6 +1150,45 @@ def pending_merge_action(gh: GitHub, config: dict, intent: dict) -> dict:
             "complete": "run the same command with: complete merge --lease <lease>"}
 
 
+def integration_review_wait(health: dict) -> dict | None:
+    """Recognize only a coherent, explicit single-flight REVIEW wait.
+
+    Called on the fresh project health result, never the dashboard cache. This
+    authorizes no mutation: ambiguous/older schemas still use the full skill.
+    Go's empty merge_executable slice may be encoded as either null or [].
+    """
+    if health.get("state") != "yellow":
+        return None
+    owner = health.get("integration_owner")
+    if not isinstance(owner, dict):
+        return None
+    number, head, stage = owner.get("number"), owner.get("head"), owner.get("stage")
+    if (type(number) is not int or number <= 0
+            or not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head)
+            or stage not in {"integration-review", "legacy-integration-review"}):
+        return None
+    if "merge_executable" not in health or health["merge_executable"] not in (None, []):
+        return None
+    candidates = health.get("review_candidates")
+    if not isinstance(candidates, list) or len(candidates) != 1:
+        return None
+    candidate = candidates[0]
+    if (not isinstance(candidate, dict)
+            or any(candidate.get(key) != owner[key] for key in ("number", "head", "stage"))
+            or type(candidate.get("number")) is not int):
+        return None
+    findings = health.get("findings")
+    if (not isinstance(findings, list)
+            or any(not isinstance(item, dict) or item.get("severity") == "red" for item in findings)):
+        return None
+    barriers = [item for item in findings if item.get("code") == "single_flight_barrier"]
+    if (len(barriers) != 1 or type(barriers[0].get("pr")) is not int
+            or barriers[0]["pr"] != number):
+        return None
+    return {"action": "wait", "stage": "merge", "number": number, "head": head,
+            "reason": f"integration owner #{number} is waiting for {stage}; no merge is executable"}
+
+
 def next_merge(gh: GitHub, config: dict, *, config_path: str | None = None) -> dict:
     pending = pending_merge_intents(gh, config)
     if pending:
@@ -1157,6 +1196,9 @@ def next_merge(gh: GitHub, config: dict, *, config_path: str | None = None) -> d
     health = run_health(config, config_path=config_path)
     if health.get("state") == "red":
         return {"action": "fallback", "reason": "health check is red"}
+    waiting = integration_review_wait(health)
+    if waiting is not None:
+        return waiting
     if any(item.get("code") == "single_flight_barrier" for item in health.get("findings", [])):
         return {"action": "fallback", "reason": "single-flight/base-sync owner requires the full skill"}
     queue = list_ship(gh, config)
