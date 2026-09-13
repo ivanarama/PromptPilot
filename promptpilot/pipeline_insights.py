@@ -55,6 +55,14 @@ def _cache_snapshot(profile_id: str) -> tuple[object | None, int]:
         return _cache.get(profile_id), _cache_generation
 
 
+def _cache_is_fresh(cached: object | None, paused: bool) -> bool:
+    """Accept cached dashboard state only while its durable pause state matches."""
+    if not cached or time.time() - cached[0] >= 300:
+        return False
+    runtime = cached[1].get("runtime")
+    return isinstance(runtime, dict) and runtime.get("paused") is paused
+
+
 def _profile_lock(profile_id: str) -> threading.Lock:
     # Do not hold the state lock while acquiring the returned per-profile lock.
     # analyze() may take the locks in the opposite order when it publishes.
@@ -62,8 +70,15 @@ def _profile_lock(profile_id: str) -> threading.Lock:
         return _locks.setdefault(profile_id, threading.Lock())
 
 
-def _publish_cache(profile_id: str, generation: int, result: dict) -> bool:
-    """Publish only if no invalidation happened while the result was built."""
+def _publish_cache(profile_id: str, generation: int, paused: bool,
+                   result: dict) -> bool:
+    """Publish only if local generation and durable pause state stayed stable."""
+    current_paused = db.is_paused()
+    runtime = result.get("runtime")
+    if (current_paused is not paused
+            or not isinstance(runtime, dict)
+            or runtime.get("paused") is not current_paused):
+        return False
     with _cache_state_lock:
         if generation != _cache_generation:
             return False
@@ -980,17 +995,19 @@ def _profile_active(profile: dict, series: list[dict]) -> bool:
 
 def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True,
             refresh_diagnostics: bool = False) -> dict:
-    cached, cache_generation = _cache_snapshot(profile_id)
+    cached, _ = _cache_snapshot(profile_id)
     profiles = _profiles()
     if profile_id not in profiles:
         raise KeyError(profile_id)
-    if use_cache and cached and time.time() - cached[0] < 300:
+    paused = db.is_paused()
+    if use_cache and _cache_is_fresh(cached, paused):
         return cached[1]
 
     lock = _profile_lock(profile_id)
     with lock:
-        cached, _ = _cache_snapshot(profile_id)
-        if use_cache and cached and time.time() - cached[0] < 300:
+        cached, cache_generation = _cache_snapshot(profile_id)
+        paused = db.is_paused()
+        if use_cache and _cache_is_fresh(cached, paused):
             return cached[1]
         profile = profiles[profile_id]
         priority_settings = _priority_settings(profile)
@@ -1133,7 +1150,7 @@ def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True,
             "bottleneck": bottleneck["id"] if bottleneck and bottleneck["backlog"] else None,
             "generated_at": now.timestamp(),
         }
-        _publish_cache(profile_id, cache_generation, result)
+        _publish_cache(profile_id, cache_generation, paused, result)
         return result
 
 
