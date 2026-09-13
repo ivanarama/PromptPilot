@@ -153,6 +153,73 @@ def test_paused_series_is_visible_without_history():
     assert health["label"] == "конвейер на паузе"
 
 
+def test_global_worker_pause_is_visible_for_active_pipeline(isolated_db, monkeypatch):
+    profile = {
+        "title": "Example", "repository": "owner/example",
+        "queues": [{
+            "id": "review", "title": "Review", "capacity": 1,
+            "query": "is:pr", "series_contains": "REVIEW",
+        }],
+    }
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"example": profile})
+    monkeypatch.setattr(pipeline_insights, "_github_search", lambda _repo, _query: {
+        "count": 1, "items": [], "membership_complete": False,
+    })
+    monkeypatch.setattr(pipeline_insights, "_run_profile_health_check", lambda _profile: {
+        "state": "yellow", "summary": "есть ожидающие решения", "findings": [],
+    })
+    task = isolated_db.create_task(TaskCreate(
+        prompt="ExampleProject - REVIEW", recurrence="4h",
+    ))
+    isolated_db.touch_worker_heartbeat(1234)
+    isolated_db.set_setting("worker_paused", "1")
+    pipeline_insights._cache.clear()
+
+    result = pipeline_insights.analyze(
+        "example", isolated_db.list_series(), use_cache=False)
+
+    assert result["runtime"]["required"] is True
+    assert result["runtime"]["paused"] is True
+    assert result["runtime"]["state"] == "online"
+    assert result["queues"][0]["task_id"] == task.id
+    assert result["health"] == {
+        "state": "yellow",
+        "label": "конвейер на паузе",
+        "reason": "включена общая пауза: активные серии не запускаются",
+    }
+
+
+@pytest.mark.parametrize(
+    ("windows", "broken_series", "diagnostics", "runtime", "expected_label"),
+    [
+        ({"5h": {"complete": True}}, 0, None,
+         {"required": True, "paused": True, "state": "offline", "stalled": []},
+         "worker не работает"),
+        ({"5h": {"complete": True}}, 0, None,
+         {"required": True, "paused": True, "state": "online",
+          "stalled": [{"task_id": 77}]},
+         "зависший запуск"),
+        ({"5h": {"complete": True}}, 1, None,
+         {"required": True, "paused": True, "state": "online", "stalled": []},
+         "требует внимания"),
+        ({"5h": {"complete": True}}, 0,
+         {"state": "red", "summary": "нарушен порядок"},
+         {"required": True, "paused": True, "state": "online", "stalled": []},
+         "нарушен инвариант"),
+        ({"5h": {"complete": True, "runs": {"unresolved_unable": 1}}}, 0, None,
+         {"required": True, "paused": True, "state": "online", "stalled": []},
+         "прогон не отработал"),
+    ],
+)
+def test_global_worker_pause_does_not_hide_hard_failures(
+        windows, broken_series, diagnostics, runtime, expected_label):
+    health = pipeline_insights._health(
+        10, windows, broken_series, diagnostics=diagnostics, runtime=runtime)
+
+    assert health["state"] == "red"
+    assert health["label"] == expected_label
+
+
 def test_missing_worker_heartbeat_is_red_for_active_pipeline():
     health = pipeline_insights._health(
         10, {"5h": {"complete": True}}, 0,

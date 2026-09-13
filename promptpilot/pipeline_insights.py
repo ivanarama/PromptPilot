@@ -901,6 +901,9 @@ def _health(backlog: int, windows: dict, broken_series: int, paused_series: int 
         recovered_note = f"; восстановлено: {recovered}" if recovered else ""
         return {"state": "red", "label": "прогон не отработал",
                 "reason": f"активно — упало: {failed}; НЕ СМОГ: {unable}{recovered_note}"}
+    if runtime and runtime.get("required") and runtime.get("paused"):
+        return {"state": "yellow", "label": "конвейер на паузе",
+                "reason": "включена общая пауза: активные серии не запускаются"}
     if paused_series:
         return {"state": "yellow", "label": "конвейер на паузе",
                 "reason": f"приостановлено серий: {paused_series}"}
