@@ -5,9 +5,10 @@ from pathlib import Path
 import httpx
 from click.testing import CliRunner
 
+from promptpilot import pipeline_insights
 from promptpilot.api import HERDR_UI_KEYS, app
 from promptpilot.cli import cli
-from promptpilot.models import WorkflowCreate
+from promptpilot.models import TaskCreate, WorkflowCreate
 
 
 def payload(slug="api-workflow"):
@@ -88,6 +89,56 @@ def test_codex_provider_exposes_effort_without_claude_skill_toggle(isolated_db):
 
     assert codex["supports_effort"] is True
     assert codex["supports_skills"] is False
+
+
+def test_worker_pause_resume_invalidates_pipeline_insights_cache(isolated_db, monkeypatch):
+    profile = {
+        "title": "Example", "repository": "owner/example",
+        "queues": [{
+            "id": "review", "title": "Review", "capacity": 1,
+            "query": "is:pr", "series_contains": "REVIEW",
+        }],
+    }
+    search_calls = []
+
+    def fake_search(repository, query):
+        search_calls.append((repository, query))
+        return {"count": 1, "items": [], "membership_complete": False}
+
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"pause-api": profile})
+    monkeypatch.setattr(pipeline_insights, "_github_search", fake_search)
+    monkeypatch.setattr(pipeline_insights, "_github_rate_limits", lambda: None)
+    monkeypatch.setattr(pipeline_insights, "_run_profile_health_check", lambda _profile: {
+        "state": "green", "summary": "ok", "findings": [],
+    })
+    task = isolated_db.create_task(TaskCreate(
+        prompt="ExampleProject - REVIEW", recurrence="4h",
+    ))
+    isolated_db.touch_worker_heartbeat(1234)
+    pipeline_insights.invalidate_cache()
+
+    try:
+        before = request("GET", "/api/pipeline-insights/pause-api")
+        assert before.status_code == 200
+        assert before.json()["runtime"]["paused"] is False
+        assert len(search_calls) == 1
+
+        paused = request("POST", "/api/worker/pause")
+        assert paused.json() == {"ok": True, "paused": True}
+        after_pause = request("GET", "/api/pipeline-insights/pause-api")
+        assert after_pause.json()["runtime"]["paused"] is True
+        assert after_pause.json()["health"]["label"] == "конвейер на паузе"
+        assert after_pause.json()["queues"][0]["task_id"] == task.id
+        assert len(search_calls) == 2
+
+        resumed = request("POST", "/api/worker/resume")
+        assert resumed.json() == {"ok": True, "paused": False}
+        after_resume = request("GET", "/api/pipeline-insights/pause-api")
+        assert after_resume.json()["runtime"]["paused"] is False
+        assert after_resume.json()["health"]["label"] != "конвейер на паузе"
+        assert len(search_calls) == 3
+    finally:
+        pipeline_insights.invalidate_cache()
 
 
 def test_schedule_ui_exposes_durable_series_controls():

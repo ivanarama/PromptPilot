@@ -47,6 +47,11 @@ def list_profiles() -> list[dict]:
             for key, value in _profiles().items()]
 
 
+def invalidate_cache() -> None:
+    """Discard cached dashboard state after a runtime control changes."""
+    _cache.clear()
+
+
 def _gh_executable() -> str:
     configured = os.environ.get("PP_GH_EXE")
     found = configured or shutil.which("gh") or shutil.which("gh.exe")
@@ -901,6 +906,9 @@ def _health(backlog: int, windows: dict, broken_series: int, paused_series: int 
         recovered_note = f"; восстановлено: {recovered}" if recovered else ""
         return {"state": "red", "label": "прогон не отработал",
                 "reason": f"активно — упало: {failed}; НЕ СМОГ: {unable}{recovered_note}"}
+    if runtime and runtime.get("required") and runtime.get("paused"):
+        return {"state": "yellow", "label": "конвейер на паузе",
+                "reason": "включена общая пауза: активные серии не запускаются"}
     if paused_series:
         return {"state": "yellow", "label": "конвейер на паузе",
                 "reason": f"приостановлено серий: {paused_series}"}
@@ -1097,6 +1105,8 @@ def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True,
 
 def sample_active_profiles(series: list[dict]) -> dict[str, str]:
     """Refresh every configured pipeline that has a matching live series."""
+    if db.is_paused():
+        return {}
     outcomes = {}
     for profile_id, profile in _profiles().items():
         if not _profile_active(profile, series):

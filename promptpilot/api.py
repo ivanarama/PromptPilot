@@ -884,12 +884,14 @@ def api_worker_status():
 @app.post("/api/worker/pause")
 def api_worker_pause():
     db.set_setting("worker_paused", "1")
+    pipeline_insights.invalidate_cache()
     return {"ok": True, "paused": True}
 
 
 @app.post("/api/worker/resume")
 def api_worker_resume():
     db.set_setting("worker_paused", "0")
+    pipeline_insights.invalidate_cache()
     return {"ok": True, "paused": False}
 
 
