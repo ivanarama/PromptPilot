@@ -1,5 +1,7 @@
+import copy
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from datetime import datetime, timezone
 
@@ -18,7 +20,7 @@ def edge(cursor, kind, **values):
 def snapshot(*extra):
     return {
         "headRefOid": HEAD, "baseRefOid": "b" * 40, "baseRefName": "main",
-        "state": "OPEN", "labels": [], "labelsComplete": True,
+        "state": "OPEN", "isDraft": False, "labels": [], "labelsComplete": True,
         "updatedAt": "2026-01-01T00:00:00Z",
         "edges": [edge("c1", "PullRequestCommit", id="anchor", commit={"oid": HEAD}), *extra],
     }
@@ -267,6 +269,171 @@ def test_content_review_completion_supports_older_health_contract():
     assert pp.content_review_allowed({
         "review_candidates": [{"number": 42, "stage": "review"}],
     }, 42)
+
+
+def target_review_lease(value, *, depth=0):
+    info = pp.epoch(value, "owner")
+    issued_at = int(pp.time.time())
+    return {
+        "version": 1, "stage": "review", "repository": "owner/repo",
+        "number": 42, "head": HEAD,
+        "snapshot": pp.content_review_digest(value),
+        "epoch": info["hash"], "anchor": info["anchor_id"],
+        "depth": depth, "completion_gate": "target-v1",
+        "issued_at": issued_at, "expires_at": issued_at + 7200,
+        "nonce": "1" * 32,
+    }
+
+
+def test_content_review_target_gate_rejects_draft_and_live_depth_change():
+    config = {"trusted_account": "owner", "base_branch": "main"}
+    value = snapshot()
+    lease = target_review_lease(value)
+
+    draft = dict(value, isDraft=True)
+    with pytest.raises(pp.PipelineError, match="draft"):
+        pp.content_review_target_gate(draft, config, lease)
+
+    old_head = "d" * 40
+    prior_completion = (
+        f"<!-- pp:head-reviewed {old_head} review-comment=91 claim=92 "
+        f"epoch-sha256={'e' * 64} -->"
+    )
+    changed = copy.deepcopy(value)
+    changed["edges"].insert(0, trusted_comment("c0", 93, prior_completion))
+    with pytest.raises(pp.PipelineError, match="review depth changed"):
+        pp.content_review_target_gate(changed, config, lease)
+
+
+def test_complete_review_target_gate_does_not_run_global_health(tmp_path, monkeypatch):
+    config = {
+        "repository": "owner/repo", "trusted_account": "owner",
+        "base_branch": "main", "review_completion_gate": "target-v1",
+    }
+    current = snapshot()
+    lease = target_review_lease(current)
+    report = tmp_path / "report.json"
+    report.write_text(json.dumps({
+        "change": "safe change", "checks": ["pytest"],
+        "blocking": [], "tail": [],
+    }), encoding="utf-8")
+    next_id = iter((101, 102, 103))
+
+    monkeypatch.setenv("PP_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setattr(pp, "run_health", lambda _config: pytest.fail("global health was called"))
+    monkeypatch.setattr(pp, "ensure_identity", lambda _gh, _config: None)
+    monkeypatch.setattr(
+        pp, "stable_timeline",
+        lambda _gh, _config, _number: copy.deepcopy(current),
+    )
+
+    def fake_post(_gh, _config, _number, body):
+        database_id = next(next_id)
+        current["edges"].append(trusted_comment(f"c{database_id}", database_id, body))
+        return {"id": database_id, "body": body, "user": {"login": "owner"}}
+
+    def fake_add(_gh, _config, _number, label):
+        current["labels"] = sorted(set(current["labels"]) | {label})
+
+    monkeypatch.setattr(pp, "post_comment", fake_post)
+    monkeypatch.setattr(pp, "add_label", fake_add)
+
+    result = pp.complete_review(object(), config, pp.encode_signed_lease(lease), str(report))
+
+    assert result["action"] == "completed"
+    assert result["outcome"] == "reviewed"
+    assert result["completion"] == 103
+
+
+def test_signed_review_lease_rejects_payload_tampering(tmp_path, monkeypatch):
+    monkeypatch.setenv("PP_DATA_DIR", str(tmp_path / "data"))
+    lease = target_review_lease(snapshot())
+    encoded = pp.encode_signed_lease(lease)
+    payload, signature = encoded.split(".")
+    decoded = pp.decode_lease(payload)
+    decoded["number"] = 99
+    tampered = f"{pp.encode_lease(decoded)}.{signature}"
+
+    with pytest.raises(pp.PipelineError, match="signature"):
+        pp.decode_signed_lease(tampered)
+
+
+def test_pipeline_lease_key_concurrent_first_use_is_atomic(tmp_path, monkeypatch):
+    data_dir = tmp_path / "data"
+    monkeypatch.setenv("PP_DATA_DIR", str(data_dir))
+
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        keys = list(pool.map(lambda _index: pp.pipeline_lease_key(create=True), range(24)))
+
+    assert len(set(keys)) == 1
+    assert (data_dir / "pipeline-lease.key").read_bytes() == keys[0]
+    assert list(data_dir.iterdir()) == [data_dir / "pipeline-lease.key"]
+
+
+def test_complete_review_rechecks_expiry_before_first_mutation(tmp_path, monkeypatch):
+    config = {
+        "repository": "owner/repo", "trusted_account": "owner",
+        "base_branch": "main", "review_completion_gate": "target-v1",
+    }
+    current = snapshot()
+    lease = target_review_lease(current)
+    lease.update({"issued_at": 900, "expires_at": 1001})
+    report = tmp_path / "report.json"
+    report.write_text(json.dumps({
+        "change": "safe change", "checks": ["pytest"],
+        "blocking": [], "tail": [],
+    }), encoding="utf-8")
+    clock = iter((1000, 1002))
+
+    monkeypatch.setenv("PP_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setattr(pp.time, "time", lambda: next(clock))
+    monkeypatch.setattr(pp, "ensure_identity", lambda _gh, _config: None)
+    monkeypatch.setattr(
+        pp, "stable_timeline",
+        lambda _gh, _config, _number: copy.deepcopy(current),
+    )
+    monkeypatch.setattr(pp, "post_comment", lambda *_args: pytest.fail("mutation started"))
+
+    with pytest.raises(pp.PipelineError, match="expired"):
+        pp.complete_review(object(), config, pp.encode_signed_lease(lease), str(report))
+
+
+@pytest.mark.parametrize("label", ["hold", "needs-decision", "changes-requested"])
+def test_content_review_target_gate_rejects_routing_labels(label):
+    value = snapshot()
+    lease = target_review_lease(value)
+    value["labels"] = [label]
+
+    with pytest.raises(pp.PipelineError, match="routing|FIX"):
+        pp.content_review_target_gate(
+            value, {"trusted_account": "owner", "base_branch": "main"}, lease,
+        )
+
+
+def test_content_review_target_gate_rejects_protocol_state():
+    value = snapshot()
+    lease = target_review_lease(value)
+    value["edges"].append(trusted_comment(
+        "c2", 99,
+        f"<!-- pp:review-claim {HEAD} review-comment=98 epoch-sha256={lease['epoch']} -->",
+    ))
+
+    with pytest.raises(pp.PipelineError, match="protocol state"):
+        pp.content_review_target_gate(
+            value, {"trusted_account": "owner", "base_branch": "main"}, lease,
+        )
+
+
+def test_target_review_election_requires_exact_content_candidate():
+    selected = {"number": 42, "head": HEAD, "stage": "review", "review_depth": 1}
+    assert pp.content_review_elected({"content_review_candidates": [selected]}, selected)
+    assert not pp.content_review_elected({"review_candidates": [selected]}, selected)
+    assert not pp.content_review_elected({"content_review_candidates": [
+        dict(selected, head="d" * 40),
+    ]}, selected)
+    assert not pp.content_review_elected({"content_review_candidates": [
+        dict(selected, review_depth=0),
+    ]}, selected)
 
 
 def test_empty_review_reason_explains_waiting_state():

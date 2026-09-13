@@ -11,9 +11,11 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import hmac
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -52,7 +54,7 @@ ISSUE_URL_NUMBER = re.compile(r"/issues/([1-9][0-9]*)$")
 TIMELINE_QUERY = r"""
 query($owner:String!,$name:String!,$number:Int!,$cursor:String){
  repository(owner:$owner,name:$name){pullRequest(number:$number){
-  headRefOid baseRefOid baseRefName state
+  headRefOid baseRefOid baseRefName state isDraft
   labels(first:100){nodes{name} pageInfo{hasNextPage}}
   timelineItems(first:100,after:$cursor,itemTypes:[PULL_REQUEST_COMMIT,HEAD_REF_FORCE_PUSHED_EVENT,HEAD_REF_DELETED_EVENT,HEAD_REF_RESTORED_EVENT,BASE_REF_CHANGED_EVENT,BASE_REF_FORCE_PUSHED_EVENT,BASE_REF_DELETED_EVENT,MERGED_EVENT,ISSUE_COMMENT,COMMENT_DELETED_EVENT,LABELED_EVENT,UNLABELED_EVENT]){
    updatedAt pageInfo{hasNextPage endCursor}
@@ -109,6 +111,112 @@ def decode_lease(value: str) -> dict:
     return result
 
 
+def pipeline_lease_key(*, create: bool) -> bytes:
+    configured = os.environ.get("PP_PIPELINE_LEASE_KEY_FILE")
+    data_dir = Path(os.environ.get("PP_DATA_DIR", Path.home() / ".promptpilot"))
+    path = Path(configured) if configured else data_dir / "pipeline-lease.key"
+    try:
+        value = path.read_bytes()
+    except FileNotFoundError:
+        value = None
+    if value is not None:
+        if len(value) != 32:
+            raise PipelineError("pipeline lease signing key is invalid")
+        return value
+    if not create:
+        raise PipelineError("pipeline lease signing key is missing")
+
+    # Publish only a fully written key.  O_EXCL on the final path exposes a
+    # zero-length file between create and write; a same-time reader can then
+    # fail, and a crash leaves that invalid file permanently.  A hard link from
+    # a flushed sibling temp file is an atomic create-if-absent on NTFS and
+    # normal POSIX filesystems, so concurrent first use converges on one key.
+    path.parent.mkdir(parents=True, exist_ok=True)
+    candidate = secrets.token_bytes(32)
+    temporary = path.with_name(
+        f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+    )
+    try:
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(candidate)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            pass
+    finally:
+        temporary.unlink(missing_ok=True)
+    try:
+        value = path.read_bytes()
+    except FileNotFoundError as exc:
+        raise PipelineError("pipeline lease signing key was not published") from exc
+    if len(value) != 32:
+        raise PipelineError("pipeline lease signing key is invalid")
+    return value
+
+
+def encode_signed_lease(value: dict) -> str:
+    payload = encode_lease(value)
+    signature = hmac.new(
+        pipeline_lease_key(create=True), payload.encode("ascii"), hashlib.sha256,
+    ).digest()
+    encoded_signature = base64.urlsafe_b64encode(signature).decode("ascii").rstrip("=")
+    return f"{payload}.{encoded_signature}"
+
+
+def decode_signed_lease(value: str) -> dict:
+    try:
+        payload, encoded_signature = value.split(".")
+        signature = base64.urlsafe_b64decode(
+            encoded_signature + "=" * (-len(encoded_signature) % 4)
+        )
+    except (ValueError, TypeError) as exc:
+        raise PipelineError(f"invalid signed lease: {exc}") from exc
+    expected = hmac.new(
+        pipeline_lease_key(create=False), payload.encode("ascii"), hashlib.sha256,
+    ).digest()
+    if len(signature) != hashlib.sha256().digest_size or not hmac.compare_digest(signature, expected):
+        raise PipelineError("invalid pipeline lease signature")
+    return decode_lease(payload)
+
+
+def validate_review_lease(lease: dict, config: dict) -> None:
+    if lease.get("stage") != "review" or lease.get("repository") != config["repository"]:
+        raise PipelineError("lease belongs to another stage or repository")
+    if (not isinstance(lease.get("number"), int) or isinstance(lease.get("number"), bool)
+            or lease["number"] <= 0):
+        raise PipelineError("review lease has an invalid PR number")
+    if not isinstance(lease.get("head"), str) or not re.fullmatch(r"[0-9a-f]{40}", lease["head"]):
+        raise PipelineError("review lease has an invalid HEAD")
+    for field in ("snapshot", "epoch"):
+        if not isinstance(lease.get(field), str) or not re.fullmatch(r"[0-9a-f]{64}", lease[field]):
+            raise PipelineError(f"review lease has an invalid {field}")
+    if not isinstance(lease.get("anchor"), str) or not lease["anchor"]:
+        raise PipelineError("review lease has an invalid epoch anchor")
+    if (not isinstance(lease.get("depth"), int) or isinstance(lease.get("depth"), bool)
+            or lease["depth"] not in (0, 1)):
+        raise PipelineError("review lease depth requires human escalation")
+    completion_gate = lease.get("completion_gate", "health")
+    if completion_gate not in {"health", "target-v1"}:
+        raise PipelineError("review lease has an unsupported completion gate")
+    if completion_gate == "target-v1":
+        issued_at, expires_at = lease.get("issued_at"), lease.get("expires_at")
+        nonce = lease.get("nonce")
+        if (not isinstance(issued_at, int) or isinstance(issued_at, bool) or
+                not isinstance(expires_at, int) or isinstance(expires_at, bool)):
+            raise PipelineError("signed review lease has an invalid validity window")
+        now = int(time.time())
+        ttl = int(config.get("review_lease_seconds", 7200))
+        if issued_at > now + 60 or expires_at <= now or expires_at <= issued_at:
+            raise PipelineError("signed review lease is expired or not yet valid")
+        if expires_at - issued_at > ttl:
+            raise PipelineError("signed review lease validity exceeds configured limit")
+        if not isinstance(nonce, str) or not re.fullmatch(r"[0-9a-f]{32}", nonce):
+            raise PipelineError("signed review lease has an invalid nonce")
+
+
 class GitHub:
     def __init__(self, executable: str | None = None):
         self.executable = executable or os.environ.get("GH_EXE") or os.environ.get("PP_GH_EXE")
@@ -157,8 +265,16 @@ def load_config(path: str) -> dict:
         raise PipelineError("invalid repository or health_command")
     data.setdefault("base_branch", "main")
     data.setdefault("merge_method", "merge")
+    data.setdefault("review_completion_gate", "health")
+    data.setdefault("review_lease_seconds", 7200)
     if not isinstance(data.get("sync_base_before_health", False), bool):
         raise PipelineError("sync_base_before_health must be a boolean")
+    if data["review_completion_gate"] not in {"health", "target-v1"}:
+        raise PipelineError("review_completion_gate must be health or target-v1")
+    if (not isinstance(data["review_lease_seconds"], int) or
+            isinstance(data["review_lease_seconds"], bool) or
+            not 300 <= data["review_lease_seconds"] <= 28800):
+        raise PipelineError("review_lease_seconds must be an integer from 300 to 28800")
     return data
 
 
@@ -214,7 +330,6 @@ def sync_base_before_health(config: dict) -> None:
         return
 
     base = str(config.get("base_branch") or "main")
-
     def git(*args: str):
         result = subprocess.run(
             ["git", *args], capture_output=True, text=True,
@@ -274,7 +389,9 @@ def timeline_pass(gh: GitHub, config: dict, number: int) -> dict:
         pr = payload.get("data", {}).get("repository", {}).get("pullRequest")
         if not pr:
             raise PipelineError(f"PR #{number} not found")
-        current = {key: pr.get(key) for key in ("headRefOid", "baseRefOid", "baseRefName", "state")}
+        current = {key: pr.get(key) for key in (
+            "headRefOid", "baseRefOid", "baseRefName", "state", "isDraft",
+        )}
         current["labels"] = sorted(node["name"] for node in pr["labels"]["nodes"])
         current["labelsComplete"] = not pr["labels"]["pageInfo"]["hasNextPage"]
         if header is None:
@@ -342,6 +459,8 @@ def epoch(snapshot: dict, trusted: str) -> dict:
 def validate_common(snapshot: dict, config: dict, data: dict) -> None:
     if snapshot.get("state") != "OPEN" or snapshot.get("baseRefName") != config["base_branch"]:
         raise PipelineError("PR is not open against the configured base branch")
+    if snapshot.get("isDraft") is not False:
+        raise PipelineError("draft state is unknown or PR is still a draft")
     if not snapshot.get("labelsComplete"):
         raise PipelineError("more than 100 labels; cannot prove gate")
     if data and snapshot.get("headRefOid") != data.get("head"):
@@ -376,6 +495,38 @@ def review_gate(snapshot: dict, config: dict, lease: dict, *, require_outcome: s
         raise PipelineError("review epoch changed")
     if require_outcome and require_outcome not in labels:
         raise PipelineError(f"outcome label {require_outcome} disappeared")
+    return info
+
+
+def committed_review_depth(snapshot: dict, trusted: str) -> int:
+    """Count unique immutable claim-bound review completions in the full timeline."""
+    review_ids = set()
+    for edge in snapshot.get("edges", []):
+        node = edge.get("node") or {}
+        if (node.get("__typename") != "IssueComment" or
+                (node.get("author") or {}).get("login") != trusted or
+                node.get("lastEditedAt") is not None):
+            continue
+        match = COMPLETE.fullmatch((node.get("body") or "").strip())
+        if match:
+            review_ids.add(int(match.group(2)))
+    return len(review_ids)
+
+
+def content_review_target_gate(snapshot: dict, config: dict, lease: dict) -> dict:
+    """Prove a leased ordinary REVIEW locally, without rereading other PRs."""
+    info = review_gate(snapshot, config, lease)
+    labels = set(snapshot["labels"])
+    if "changes-requested" in labels:
+        raise PipelineError("content REVIEW target entered the FIX route")
+    depth = committed_review_depth(snapshot, config["trusted_account"])
+    if depth != int(lease.get("depth", -1)) or depth >= 2:
+        raise PipelineError("review depth changed or requires human escalation")
+    for _index, _edge, node in comments(info, config["trusted_account"]):
+        body = (node.get("body") or "").strip()
+        if (REVIEW.search(body) or CLAIM.fullmatch(body) or
+                COMPLETE.fullmatch(body) or BASE_SYNC.search(body)):
+            raise PipelineError("content REVIEW target contains recovery/protocol state")
     return info
 
 
@@ -693,6 +844,7 @@ def capabilities(config: dict) -> dict:
     return {"protocol": "promptpilot-pipelinectl-v1", "repository": config["repository"],
             "stages": {"review": "content-or-integration",
                        "merge": "clean-ordinary-with-cleanup-recovery"},
+            "review_completion_gate": config.get("review_completion_gate", "health"),
             "fallback": "repository skill"}
 
 
@@ -718,24 +870,36 @@ def next_review(gh: GitHub, config: dict) -> dict:
     item = candidates[0]
     if item.get("stage") != "review":
         return {"action": "fallback", "reason": "integration/base-sync state requires the full skill"}
+    completion_gate = config.get("review_completion_gate", "health")
+    if completion_gate == "target-v1" and not content_review_elected(health, item):
+        return {"action": "fallback", "reason": "health election did not prove the exact content target"}
     if int(item.get("review_depth", 0)) >= 2:
         return {"action": "fallback", "reason": "third review round requires human-escalation rules"}
     snapshot = stable_timeline(gh, config, int(item["number"]))
     validate_common(snapshot, config, item)
-    labels = set(snapshot["labels"])
-    if labels & {"hold", "changes-requested", "needs-decision"}:
-        return {"action": "fallback", "reason": "routing labels require the full skill"}
     info = epoch(snapshot, config["trusted_account"])
-    validate_epoch_safety(info, config["trusted_account"])
-    for _index, _edge, node in comments(info, config["trusted_account"]):
-        body = (node.get("body") or "").strip()
-        if REVIEW.search(body) or CLAIM.fullmatch(body) or COMPLETE.fullmatch(body) or BASE_SYNC.search(body):
-            return {"action": "fallback", "reason": "current epoch contains recovery/protocol state"}
+    depth = committed_review_depth(snapshot, config["trusted_account"])
+    if completion_gate == "target-v1" and depth != int(item.get("review_depth", 0)):
+        return {"action": "fallback", "reason": "review depth changed after health election", "target": item}
     lease = {"version": 1, "stage": "review", "repository": config["repository"],
              "number": item["number"], "head": snapshot["headRefOid"],
              "snapshot": content_review_digest(snapshot), "epoch": info["hash"],
-             "anchor": info["anchor_id"], "depth": int(item.get("review_depth", 0))}
-    return {"action": "audit", "target": item, "lease": encode_lease(lease),
+             "anchor": info["anchor_id"], "depth": depth,
+             "completion_gate": completion_gate}
+    if completion_gate == "target-v1":
+        issued_at = int(time.time())
+        lease.update({
+            "issued_at": issued_at,
+            "expires_at": issued_at + int(config.get("review_lease_seconds", 7200)),
+            "nonce": secrets.token_hex(16),
+        })
+    try:
+        content_review_target_gate(snapshot, config, lease)
+    except PipelineError as exc:
+        return {"action": "fallback", "reason": str(exc), "target": item}
+    lease_value = (encode_signed_lease(lease) if completion_gate == "target-v1"
+                   else encode_lease(lease))
+    return {"action": "audit", "target": item, "lease": lease_value,
             "inspect": [f"gh pr view {item['number']} --repo {config['repository']} --json title,body,headRefName,files,statusCheckRollup",
                         f"gh pr diff {item['number']} --repo {config['repository']}"],
             "complete": "write report JSON, then run the same command with: complete review --lease <lease> --report <file>",
@@ -798,26 +962,49 @@ def content_review_allowed(health: dict, number: int) -> bool:
                and item.get("stage") == "review" for item in candidates)
 
 
+def content_review_elected(health: dict, selected: dict) -> bool:
+    """Require the versioned target-gate election field, including exact state."""
+    candidates = health.get("content_review_candidates")
+    if not isinstance(candidates, list):
+        return False
+    expected_number = int(selected.get("number", 0))
+    expected_depth = int(selected.get("review_depth", 0))
+    return any(
+        int(item.get("number", 0)) == expected_number
+        and item.get("stage") == "review"
+        and item.get("head") == selected.get("head")
+        and int(item.get("review_depth", 0)) == expected_depth
+        for item in candidates
+    )
+
+
 def complete_review(gh: GitHub, config: dict, lease_value: str, report_path: str) -> dict:
-    lease = decode_lease(lease_value)
-    if lease.get("stage") != "review" or lease.get("repository") != config["repository"]:
-        raise PipelineError("lease belongs to another stage or repository")
+    expected_gate = config.get("review_completion_gate", "health")
+    lease = (decode_signed_lease(lease_value) if expected_gate == "target-v1"
+             else decode_lease(lease_value))
+    validate_review_lease(lease, config)
     report = json.loads(Path(report_path).read_text(encoding="utf-8-sig"))
     body, outcome = format_review(lease, report)
     ensure_identity(gh, config)
-    health = run_health(config)
-    if health.get("state") == "red":
-        raise PipelineError("health check became red")
-    # Integration work may become the global single-flight owner while an
-    # ordinary content audit is running. That unrelated lane transition must
-    # not invalidate a lease whose own HEAD/timeline is still unchanged.
-    if not content_review_allowed(health, int(lease["number"])):
-        raise PipelineError("content REVIEW target left the allowlist; rerun next review")
+    completion_gate = lease.get("completion_gate", "health")
+    if completion_gate != expected_gate:
+        raise PipelineError("review completion gate changed; rerun next review")
+    if completion_gate == "health":
+        health = run_health(config)
+        if health.get("state") == "red":
+            raise PipelineError("health check became red")
+        if not content_review_allowed(health, int(lease["number"])):
+            raise PipelineError("content REVIEW target left the allowlist; rerun next review")
     snapshot = stable_timeline(gh, config, int(lease["number"]))
     validate_common(snapshot, config, lease)
     if content_review_digest(snapshot) != lease["snapshot"]:
         raise PipelineError("lease is stale; rerun next review")
-    info = review_gate(snapshot, config, lease)
+    info = (content_review_target_gate(snapshot, config, lease)
+            if completion_gate == "target-v1" else review_gate(snapshot, config, lease))
+    if completion_gate == "target-v1":
+        # Stable GraphQL reads can be slow.  A lease that expired during them
+        # must not authorize the first externally visible mutation.
+        validate_review_lease(lease, config)
     review = post_comment(gh, config, lease["number"], body)
 
     snapshot = stable_timeline(gh, config, lease["number"])
