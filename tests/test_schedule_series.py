@@ -538,6 +538,97 @@ def test_invalidation_during_analysis_rejects_stale_cache_publish(isolated_db, m
         pipeline_insights.invalidate_cache()
 
 
+def test_external_pause_change_bypasses_cached_pipeline_state(isolated_db, monkeypatch):
+    profile = {
+        "title": "Example", "repository": "owner/example",
+        "queues": [{
+            "id": "review", "title": "Review", "capacity": 1,
+            "query": "is:pr", "series_contains": "REVIEW",
+        }],
+    }
+    search_calls = []
+
+    def fake_search(repository, query):
+        search_calls.append((repository, query))
+        return {"count": 1, "items": [], "membership_complete": False}
+
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"pause-cache": profile})
+    monkeypatch.setattr(pipeline_insights, "_github_search", fake_search)
+    monkeypatch.setattr(pipeline_insights, "_github_rate_limits", lambda: None)
+    monkeypatch.setattr(pipeline_insights, "_run_profile_health_check", lambda _profile: None)
+    isolated_db.set_setting("worker_paused", "0")
+    pipeline_insights.invalidate_cache()
+
+    try:
+        before = pipeline_insights.analyze("pause-cache", [], use_cache=True)
+        isolated_db.set_setting("worker_paused", "1")  # another process; no invalidation
+        after = pipeline_insights.analyze("pause-cache", [], use_cache=True)
+        cached = pipeline_insights.analyze("pause-cache", [], use_cache=True)
+
+        assert before["runtime"]["paused"] is False
+        assert after["runtime"]["paused"] is True
+        assert cached is after
+        assert len(search_calls) == 2
+    finally:
+        pipeline_insights.invalidate_cache()
+
+
+def test_external_pause_during_analysis_rejects_cache_publish(isolated_db, monkeypatch):
+    profile = {
+        "title": "Example", "repository": "owner/example",
+        "queues": [{
+            "id": "review", "title": "Review", "capacity": 1,
+            "query": "is:pr", "series_contains": "REVIEW",
+        }],
+    }
+    entered_search = threading.Event()
+    release_search = threading.Event()
+    search_calls = []
+    results = []
+    errors = []
+
+    def fake_search(repository, query):
+        search_calls.append((repository, query))
+        if len(search_calls) == 1:
+            entered_search.set()
+            if not release_search.wait(5):
+                raise TimeoutError("test did not release the in-flight analysis")
+        return {"count": 1, "items": [], "membership_complete": False}
+
+    def run_analysis():
+        try:
+            results.append(pipeline_insights.analyze(
+                "pause-during-analysis", [], use_cache=True))
+        except BaseException as exc:  # preserve the worker-thread failure for the assertion
+            errors.append(exc)
+
+    monkeypatch.setattr(
+        pipeline_insights, "_profiles", lambda: {"pause-during-analysis": profile})
+    monkeypatch.setattr(pipeline_insights, "_github_search", fake_search)
+    monkeypatch.setattr(pipeline_insights, "_github_rate_limits", lambda: None)
+    monkeypatch.setattr(pipeline_insights, "_run_profile_health_check", lambda _profile: None)
+    isolated_db.set_setting("worker_paused", "0")
+    pipeline_insights.invalidate_cache()
+    analysis = threading.Thread(target=run_analysis)
+    analysis.start()
+
+    try:
+        assert entered_search.wait(5)
+        isolated_db.set_setting("worker_paused", "1")  # another process; no invalidation
+        release_search.set()
+        analysis.join(5)
+        assert not analysis.is_alive()
+        assert errors == []
+        assert results[0]["runtime"]["paused"] is True
+
+        pipeline_insights.analyze("pause-during-analysis", [], use_cache=True)
+        assert len(search_calls) == 2
+    finally:
+        release_search.set()
+        analysis.join(5)
+        pipeline_insights.invalidate_cache()
+
+
 def test_paused_pipeline_is_not_background_sampled():
     profile = {"queues": [{"series_contains": "Example - REVIEW"}]}
     paused = [{"title": "Example - REVIEW", "paused": True, "ended": False}]
