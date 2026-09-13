@@ -21,6 +21,7 @@ def rest_only_waiting_health(stage="integration-review", executable=None):
         "state": "yellow",
         "integration_owner": owner,
         "review_candidates": [dict(owner)],
+        "content_review_candidates": [],
         "merge_executable": executable,
         "findings": [
             {"code": waiting_code, "severity": "yellow", "pr": 1232},
@@ -54,6 +55,26 @@ def test_rest_only_integration_wait_keeps_full_merge_fallback(
         "action": "fallback",
         "reason": "single-flight/base-sync owner requires the full skill",
     }
+
+
+@pytest.mark.parametrize("stage", ["integration-review", "legacy-integration-review"])
+def test_signed_handoff_opt_in_keeps_rest_only_review_carry_on_full_merge_fallback(
+        monkeypatch, stage):
+    health = rest_only_waiting_health(stage, [])
+    monkeypatch.setattr(pp, "pending_merge_intents", lambda *_: [])
+    monkeypatch.setattr(pp, "run_health", lambda *_args, **_kwargs: health)
+    monkeypatch.setattr(
+        pp, "list_ship",
+        lambda *_: pytest.fail("integration REVIEW owner must retain full MERGE fallback"),
+    )
+
+    result = pp.next_merge(object(), {"fallback_handoff": "target-v1"})
+
+    assert result == {
+        "action": "fallback",
+        "reason": "single-flight/base-sync owner requires the full skill",
+    }
+    assert "handoff" not in result
 
 
 def test_auto_execution_routes_rest_only_carry_to_skill(isolated_db, monkeypatch):

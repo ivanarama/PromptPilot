@@ -23,6 +23,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .pipeline_errors import PipelineError
 
 REVIEW = re.compile(r"(?m)^Reviewed-SHA: ([0-9a-f]{40})$.*^Outcome-Label: (reviewed|changes-requested|needs-decision)$.*^<!-- pp:review pp:tail=([0-9]+) -->$", re.S)
 CLAIM_MESSAGE = "PromptPilot service marker: REVIEW result publication claimed."
@@ -75,10 +76,6 @@ query($owner:String!,$name:String!,$number:Int!,$cursor:String){
   }
  }}}
 """
-
-
-class PipelineError(RuntimeError):
-    pass
 
 
 def canonical(value) -> bytes:
@@ -267,6 +264,9 @@ def load_config(path: str) -> dict:
     data.setdefault("merge_method", "merge")
     data.setdefault("review_completion_gate", "health")
     data.setdefault("review_lease_seconds", 7200)
+    data.setdefault("fallback_handoff", "legacy")
+    if not isinstance(data["fallback_handoff"], str) or data["fallback_handoff"] not in {"legacy", "target-v1"}:
+        raise PipelineError("fallback_handoff must be legacy or target-v1")
     if not isinstance(data.get("sync_base_before_health", False), bool):
         raise PipelineError("sync_base_before_health must be a boolean")
     if data["review_completion_gate"] not in {"health", "target-v1"}:
@@ -859,7 +859,20 @@ def capabilities(config: dict) -> dict:
             "stages": {"review": "content-or-integration",
                        "merge": "clean-ordinary-with-cleanup-recovery"},
             "review_completion_gate": config.get("review_completion_gate", "health"),
+            "fallback_handoff": config.get("fallback_handoff", "legacy"),
             "fallback": "repository skill"}
+
+
+def fallback_target(config: dict, health: dict, stage: str, target: dict, reason: str) -> dict:
+    if config.get("fallback_handoff") != "target-v1":
+        return {"action": "fallback", "reason": reason}
+    from .fallback_handoff import MERGE_STAGES, REVIEW_STAGES, create
+
+    allowed = REVIEW_STAGES if stage == "review" else MERGE_STAGES
+    if not isinstance(target, dict) or target.get("stage") not in allowed:
+        return {"action": "fallback", "reason": reason}
+
+    return create(config, health, stage, target, reason)
 
 
 def review_empty_reason(health: dict) -> str:
@@ -876,6 +889,10 @@ def review_empty_reason(health: dict) -> str:
 
 def next_review(gh: GitHub, config: dict, *, config_path: str | None = None) -> dict:
     health = run_health(config, config_path=config_path)
+    if config.get("fallback_handoff") == "target-v1":
+        from .fallback_handoff import validate_health
+
+        validate_health(health)
     if health.get("state") == "red":
         return {"action": "fallback", "reason": "health check is red"}
     candidates = health.get("review_candidates") or []
@@ -883,17 +900,23 @@ def next_review(gh: GitHub, config: dict, *, config_path: str | None = None) -> 
         return {"action": "empty", "verdict": "ПУСТО", "reason": review_empty_reason(health)}
     item = candidates[0]
     if item.get("stage") != "review":
-        return {"action": "fallback", "reason": "integration/base-sync state requires the full skill"}
+        return fallback_target(config, health, "review", item,
+                               "integration/base-sync state requires the full skill")
     completion_gate = config.get("review_completion_gate", "health")
     if completion_gate == "target-v1" and not content_review_elected(health, item):
+        if config.get("fallback_handoff") == "target-v1":
+            raise PipelineError("health election did not prove the exact content target")
         return {"action": "fallback", "reason": "health election did not prove the exact content target"}
     if int(item.get("review_depth", 0)) >= 2:
-        return {"action": "fallback", "reason": "third review round requires human-escalation rules"}
+        return fallback_target(config, health, "review", item,
+                               "third review round requires human-escalation rules")
     snapshot = stable_timeline(gh, config, int(item["number"]))
     validate_common(snapshot, config, item)
     info = epoch(snapshot, config["trusted_account"])
     depth = committed_review_depth(snapshot, config["trusted_account"])
     if completion_gate == "target-v1" and depth != int(item.get("review_depth", 0)):
+        if config.get("fallback_handoff") == "target-v1":
+            raise PipelineError("review depth changed after health election")
         return {"action": "fallback", "reason": "review depth changed after health election", "target": item}
     lease = {"version": 1, "stage": "review", "repository": config["repository"],
              "number": item["number"], "head": snapshot["headRefOid"],
@@ -910,6 +933,8 @@ def next_review(gh: GitHub, config: dict, *, config_path: str | None = None) -> 
     try:
         content_review_target_gate(snapshot, config, lease)
     except PipelineError as exc:
+        if config.get("fallback_handoff") == "target-v1":
+            return fallback_target(config, health, "review", item, str(exc))
         return {"action": "fallback", "reason": str(exc), "target": item}
     lease_value = (encode_signed_lease(lease) if completion_gate == "target-v1"
                    else encode_lease(lease))
@@ -1155,28 +1180,36 @@ def next_merge(gh: GitHub, config: dict, *, config_path: str | None = None) -> d
     if pending:
         return pending_merge_action(gh, config, pending[0])
     health = run_health(config, config_path=config_path)
+    if config.get("fallback_handoff") == "target-v1":
+        from .fallback_handoff import validate_health
+
+        validate_health(health)
     if health.get("state") == "red":
         return {"action": "fallback", "reason": "health check is red"}
     if any(item.get("code") == "single_flight_barrier" for item in health.get("findings", [])):
-        return {"action": "fallback", "reason": "single-flight/base-sync owner requires the full skill"}
+        return fallback_target(config, health, "merge", health.get("integration_owner"),
+                               "single-flight/base-sync owner requires the full skill")
     queue = list_ship(gh, config)
     if not queue:
         return {"action": "empty", "verdict": "ПУСТО", "reason": "merge queue is empty"}
     item = queue[0]
+    target = {"number": item["number"], "head": item["head"]["sha"], "stage": "merge"}
     snapshot = stable_timeline(gh, config, item["number"])
     validate_common(snapshot, config, {"head": item["head"]["sha"]})
     info = epoch(snapshot, config["trusted_account"])
     validate_epoch_safety(info, config["trusted_account"])
     if any(BASE_SYNC.search(node.get("body") or "") for _index, _edge, node in comments(info, config["trusted_account"])):
-        return {"action": "fallback", "reason": "base-sync lineage requires the full skill"}
+        return fallback_target(config, health, "merge", target, "base-sync lineage requires the full skill")
     established = proof(info, snapshot["headRefOid"], config["trusted_account"])
     if not established:
-        return {"action": "fallback", "reason": "ordinary canonical review proof not found"}
+        return fallback_target(config, health, "merge", target, "ordinary canonical review proof not found")
     if not trusted_ship_authorized(info, config["trusted_account"]):
-        return {"action": "fallback", "reason": "ship authorization is not a trusted current-HEAD event"}
+        return fallback_target(config, health, "merge", target,
+                               "ship authorization is not a trusted current-HEAD event")
     status, checks = pr_checks(gh, config, item["number"])
     if status.get("mergeStateStatus") != "CLEAN" or status.get("mergeable") != "MERGEABLE":
-        return {"action": "fallback", "reason": f"merge state {status.get('mergeStateStatus')}/{status.get('mergeable')} requires the full skill"}
+        return fallback_target(config, health, "merge", target,
+                               f"merge state {status.get('mergeStateStatus')}/{status.get('mergeable')} requires the full skill")
     ready, reason = checks_ready(config, checks)
     if not ready:
         return {"action": "wait", "reason": reason, "number": item["number"]}
@@ -1275,6 +1308,9 @@ def run(argv=None) -> int:
     sub.add_parser("capabilities")
     next_parser = sub.add_parser("next")
     next_parser.add_argument("stage", choices=("review", "merge"))
+    gate_parser = sub.add_parser("gate-fallback")
+    gate_parser.add_argument("stage", choices=("review", "merge"))
+    gate_parser.add_argument("--lease", required=True)
     complete_parser = sub.add_parser("complete")
     complete_parser.add_argument("stage", choices=("review", "merge", "merge-cleanup"))
     complete_parser.add_argument("--lease", required=True)
@@ -1290,6 +1326,10 @@ def run(argv=None) -> int:
                 value = (next_review(gh, config, config_path=args.config)
                          if args.stage == "review"
                          else next_merge(gh, config, config_path=args.config))
+            elif args.command == "gate-fallback":
+                from .fallback_handoff import gate
+
+                value = gate(gh, config, args.stage, args.lease, config_path=args.config)
             elif args.stage == "review":
                 if not args.report:
                     raise PipelineError("complete review requires --report")

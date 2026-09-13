@@ -992,6 +992,29 @@ review-depth, HEAD и два одинаковых полных GraphQL snapshot 
 намеренно возвращают `action=fallback`: их продолжает полная проектная
 процедура. Таким образом быстрый путь не ослабляет сложные гейты.
 
+Проект с обновлёнными каноническими скиллами может включить
+`fallback_handoff: "target-v1"` в `pipelinectl.json`. Тогда доказанный fallback
+передаёт точную цель в локальном envelope `promptpilot-fallback-target-v1` с
+`next_already_run=true`, выполненной командой, полным preflight и HMAC lease
+на два часа. `auto` не теряет эту информацию и не просит агента повторить
+`next`. Неполный/противоречивый handoff блокируется даже в `auto`; без opt-in
+остаётся старый путь. Непосредственно перед первой мутацией скилл обязан
+выполнить выданную `gate_command` (`gate-fallback <stage> --lease ...`). Она
+проверяет подпись, срок и конфигурацию, заново запускает полный проектный health
+и подтверждает тот же PR/HEAD/stage в allowlist. Интеграционный PR должен
+оставаться единственным executable owner, обычный MERGE — первой исполняемой
+целью без owner. Обычное REVIEW допускает перестановку чужой очереди при
+сохранении точной цели в content allowlist. Pending MERGE cleanup закрывает gate
+и возвращается в recovery следующим запуском.
+
+`action=validated` — только read-only scheduling proof; ответ явно содержит
+`mutation_authorized=false`. Все GraphQL, ship, CI, base-sync и CAS-проверки
+остаются в полном скилле. Handoff обслуживает один PR и при отказе не переходит
+к другому. На доказанном handoff-пути выполняются два полных health scan:
+election и свежий gate перед первой мутацией. Cleanup-проверки и GraphQL по-прежнему
+расходуют GitHub API. Для ручного запуска и legacy/recovery fallback без доказанной
+цели ограничение двумя scan не обещается.
+
 До необратимого merge быстрый путь публикует в PR неизменяемый
 `pp:merge-cleanup-intent`: точный HEAD, hash review-proof и тела PR, а также
 same-repository closing issues. Только после него повторяются proof/labels/CI и

@@ -1,0 +1,215 @@
+{
+  "protocol": "promptpilot-fallback-target-v1",
+  "cases": [
+    {
+      "stage": "review",
+      "target": {
+        "number": 42,
+        "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "stage": "review"
+      },
+      "health": {
+        "state": "green",
+        "findings": [],
+        "integration_owner": null,
+        "review_candidates": [
+          {
+            "number": 42,
+            "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "stage": "review"
+          }
+        ],
+        "content_review_candidates": [
+          {
+            "number": 42,
+            "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "stage": "review"
+          }
+        ],
+        "merge_executable": []
+      }
+    },
+    {
+      "stage": "merge",
+      "target": {
+        "number": 42,
+        "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "stage": "merge"
+      },
+      "health": {
+        "state": "green",
+        "findings": [],
+        "integration_owner": null,
+        "review_candidates": [],
+        "content_review_candidates": [],
+        "merge_executable": [
+          {
+            "number": 42,
+            "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "stage": "merge"
+          }
+        ]
+      }
+    },
+    {
+      "stage": "review",
+      "target": {
+        "number": 42,
+        "head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "stage": "integration-review"
+      },
+      "health": {
+        "state": "yellow",
+        "findings": [
+          {
+            "code": "single_flight_barrier",
+            "severity": "yellow",
+            "pr": 42
+          }
+        ],
+        "integration_owner": {
+          "number": 42,
+          "head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "stage": "integration-review"
+        },
+        "review_candidates": [
+          {
+            "number": 42,
+            "head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "stage": "integration-review"
+          }
+        ],
+        "content_review_candidates": [],
+        "merge_executable": []
+      }
+    },
+    {
+      "stage": "review",
+      "target": {
+        "number": 42,
+        "head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "stage": "legacy-integration-review"
+      },
+      "health": {
+        "state": "yellow",
+        "findings": [
+          {
+            "code": "single_flight_barrier",
+            "severity": "yellow",
+            "pr": 42
+          }
+        ],
+        "integration_owner": {
+          "number": 42,
+          "head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "stage": "legacy-integration-review"
+        },
+        "review_candidates": [
+          {
+            "number": 42,
+            "head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "stage": "legacy-integration-review"
+          }
+        ],
+        "content_review_candidates": [],
+        "merge_executable": []
+      }
+    },
+    {
+      "stage": "merge",
+      "target": {
+        "number": 42,
+        "head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "stage": "integration-merge-ready"
+      },
+      "health": {
+        "state": "yellow",
+        "findings": [
+          {
+            "code": "single_flight_barrier",
+            "severity": "yellow",
+            "pr": 42
+          }
+        ],
+        "integration_owner": {
+          "number": 42,
+          "head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "stage": "integration-merge-ready"
+        },
+        "review_candidates": [],
+        "content_review_candidates": [],
+        "merge_executable": [
+          {
+            "number": 42,
+            "head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "stage": "integration-merge-ready"
+          }
+        ]
+      }
+    },
+    {
+      "stage": "merge",
+      "target": {
+        "number": 42,
+        "head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "stage": "legacy-integration-merge-ready"
+      },
+      "health": {
+        "state": "yellow",
+        "findings": [
+          {
+            "code": "single_flight_barrier",
+            "severity": "yellow",
+            "pr": 42
+          }
+        ],
+        "integration_owner": {
+          "number": 42,
+          "head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "stage": "legacy-integration-merge-ready"
+        },
+        "review_candidates": [],
+        "content_review_candidates": [],
+        "merge_executable": [
+          {
+            "number": 42,
+            "head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "stage": "legacy-integration-merge-ready"
+          }
+        ]
+      }
+    },
+    {
+      "stage": "merge",
+      "target": {
+        "number": 42,
+        "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "stage": "integration-merge-recovery"
+      },
+      "health": {
+        "state": "yellow",
+        "findings": [
+          {
+            "code": "single_flight_barrier",
+            "severity": "yellow",
+            "pr": 42
+          }
+        ],
+        "integration_owner": {
+          "number": 42,
+          "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "stage": "integration-merge-recovery"
+        },
+        "review_candidates": [],
+        "content_review_candidates": [],
+        "merge_executable": [
+          {
+            "number": 42,
+            "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "stage": "integration-merge-recovery"
+          }
+        ]
+      }
+    }
+  ]
+}
