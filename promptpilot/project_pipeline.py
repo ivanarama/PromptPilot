@@ -317,17 +317,17 @@ def queue_priority(item: dict, config: dict, now: datetime | None = None) -> int
     return base - boost
 
 
-def sync_base_before_health(config: dict) -> None:
+def sync_base_before_health(config: dict) -> bool:
     """Fast-forward a clean base checkout before running repository health.
 
     Repository-owned health tools are versioned with the project. Running one
     from a stale automation checkout can make decisions using an obsolete queue
     contract, so opt-in profiles refresh that checkout and fail closed when it
     cannot be updated safely. Untracked review artifacts are intentionally
-    allowed; tracked changes are not.
+    allowed; tracked changes are not. Return whether the opt-in sync ran.
     """
     if not config.get("sync_base_before_health", False):
-        return
+        return False
 
     base = str(config.get("base_branch") or "main")
     def git(*args: str):
@@ -351,10 +351,24 @@ def sync_base_before_health(config: dict) -> None:
         )
     git("fetch", "origin", "--prune")
     git("merge", "--ff-only", f"origin/{base}")
+    return True
 
 
-def run_health(config: dict) -> dict:
-    sync_base_before_health(config)
+def run_health(config: dict, *, config_path: str | None = None) -> dict:
+    synced_base = str(config.get("base_branch") or "main")
+    synchronized = sync_base_before_health(config)
+    if synchronized and config_path is not None:
+        refreshed = load_config(config_path)
+        refreshed_base = str(refreshed.get("base_branch") or "main")
+        if refreshed_base != synced_base:
+            raise PipelineError(
+                "base branch changed while synchronizing pipeline config; rerun the command"
+            )
+        # The fast-forward can update pipelinectl.json itself. Keep the same
+        # dictionary object so every decision after health (including lease
+        # capabilities) observes the just-checked-out project contract.
+        config.clear()
+        config.update(refreshed)
     command = [str(value) for value in config["health_command"]]
     if command and command[0] in {"go", "go.exe"} and shutil.which(command[0]) is None:
         standard = Path(r"C:\Program Files\Go\bin\go.exe")
@@ -860,8 +874,8 @@ def review_empty_reason(health: dict) -> str:
     return str(health.get("summary") or "содержательная очередь ревью пуста")
 
 
-def next_review(gh: GitHub, config: dict) -> dict:
-    health = run_health(config)
+def next_review(gh: GitHub, config: dict, *, config_path: str | None = None) -> dict:
+    health = run_health(config, config_path=config_path)
     if health.get("state") == "red":
         return {"action": "fallback", "reason": "health check is red"}
     candidates = health.get("review_candidates") or []
@@ -978,23 +992,31 @@ def content_review_elected(health: dict, selected: dict) -> bool:
     )
 
 
-def complete_review(gh: GitHub, config: dict, lease_value: str, report_path: str) -> dict:
+def complete_review(gh: GitHub, config: dict, lease_value: str, report_path: str,
+                    *, config_path: str | None = None) -> dict:
     expected_gate = config.get("review_completion_gate", "health")
     lease = (decode_signed_lease(lease_value) if expected_gate == "target-v1"
              else decode_lease(lease_value))
     validate_review_lease(lease, config)
     report = json.loads(Path(report_path).read_text(encoding="utf-8-sig"))
     body, outcome = format_review(lease, report)
+    identity_contract = (config["repository"], config["trusted_account"])
     ensure_identity(gh, config)
     completion_gate = lease.get("completion_gate", "health")
     if completion_gate != expected_gate:
         raise PipelineError("review completion gate changed; rerun next review")
     if completion_gate == "health":
-        health = run_health(config)
+        health = run_health(config, config_path=config_path)
+        expected_gate = config.get("review_completion_gate", "health")
+        if completion_gate != expected_gate:
+            raise PipelineError("review completion gate changed; rerun next review")
+        validate_review_lease(lease, config)
         if health.get("state") == "red":
             raise PipelineError("health check became red")
         if not content_review_allowed(health, int(lease["number"])):
             raise PipelineError("content REVIEW target left the allowlist; rerun next review")
+        if (config["repository"], config["trusted_account"]) != identity_contract:
+            ensure_identity(gh, config)
     snapshot = stable_timeline(gh, config, int(lease["number"]))
     validate_common(snapshot, config, lease)
     if content_review_digest(snapshot) != lease["snapshot"]:
@@ -1128,11 +1150,11 @@ def pending_merge_action(gh: GitHub, config: dict, intent: dict) -> dict:
             "complete": "run the same command with: complete merge --lease <lease>"}
 
 
-def next_merge(gh: GitHub, config: dict) -> dict:
+def next_merge(gh: GitHub, config: dict, *, config_path: str | None = None) -> dict:
     pending = pending_merge_intents(gh, config)
     if pending:
         return pending_merge_action(gh, config, pending[0])
-    health = run_health(config)
+    health = run_health(config, config_path=config_path)
     if health.get("state") == "red":
         return {"action": "fallback", "reason": "health check is red"}
     if any(item.get("code") == "single_flight_barrier" for item in health.get("findings", [])):
@@ -1165,12 +1187,18 @@ def next_merge(gh: GitHub, config: dict) -> dict:
             "lease": encode_lease(lease), "complete": "run the same command with: complete merge --lease <lease>"}
 
 
-def complete_merge(gh: GitHub, config: dict, lease_value: str) -> dict:
+def complete_merge(gh: GitHub, config: dict, lease_value: str,
+                   *, config_path: str | None = None) -> dict:
     lease = decode_lease(lease_value)
     if lease.get("stage") != "merge" or lease.get("repository") != config["repository"]:
         raise PipelineError("lease belongs to another stage or repository")
+    identity_contract = (config["repository"], config["trusted_account"])
     ensure_identity(gh, config)
-    health = run_health(config)
+    health = run_health(config, config_path=config_path)
+    if lease.get("stage") != "merge" or lease.get("repository") != config["repository"]:
+        raise PipelineError("lease belongs to another stage or repository")
+    if (config["repository"], config["trusted_account"]) != identity_contract:
+        ensure_identity(gh, config)
     if health.get("state") == "red":
         raise PipelineError("health check became red")
     if any(item.get("code") == "single_flight_barrier" for item in health.get("findings", [])):
@@ -1259,13 +1287,17 @@ def run(argv=None) -> int:
         else:
             gh = GitHub()
             if args.command == "next":
-                value = next_review(gh, config) if args.stage == "review" else next_merge(gh, config)
+                value = (next_review(gh, config, config_path=args.config)
+                         if args.stage == "review"
+                         else next_merge(gh, config, config_path=args.config))
             elif args.stage == "review":
                 if not args.report:
                     raise PipelineError("complete review requires --report")
-                value = complete_review(gh, config, args.lease, args.report)
+                value = complete_review(
+                    gh, config, args.lease, args.report, config_path=args.config,
+                )
             elif args.stage == "merge":
-                value = complete_merge(gh, config, args.lease)
+                value = complete_merge(gh, config, args.lease, config_path=args.config)
             else:
                 lease = decode_lease(args.lease)
                 if (lease.get("stage") != "merge-cleanup" or

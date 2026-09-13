@@ -191,6 +191,120 @@ def test_health_fast_forwards_clean_base_before_checker(monkeypatch):
     ]
 
 
+def test_next_review_reloads_config_after_base_sync(tmp_path, monkeypatch, capsys):
+    config_path = tmp_path / "pipelinectl.json"
+    original = {
+        "repository": "owner/repo",
+        "trusted_account": "owner",
+        "health_command": ["old-health", "-json"],
+        "base_branch": "main",
+        "sync_base_before_health": True,
+    }
+    updated = {
+        **original,
+        "health_command": ["new-health", "-json"],
+        "review_completion_gate": "target-v1",
+        "review_lease_seconds": 600,
+    }
+    config_path.write_text(json.dumps(original), encoding="utf-8")
+    candidate = {
+        "number": 42, "head": HEAD, "stage": "review", "review_depth": 0,
+    }
+    health = {
+        "state": "green",
+        "review_candidates": [candidate],
+        "content_review_candidates": [candidate],
+    }
+    calls = []
+
+    def fake_run(command, **_kwargs):
+        calls.append(command)
+        if command == ["git", "branch", "--show-current"]:
+            return SimpleNamespace(returncode=0, stdout="main\n", stderr="")
+        if command == ["git", "status", "--porcelain", "--untracked-files=no"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if command == ["git", "fetch", "origin", "--prune"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if command == ["git", "merge", "--ff-only", "origin/main"]:
+            config_path.write_text(json.dumps(updated), encoding="utf-8")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if command in (["old-health", "-json"], ["new-health", "-json"]):
+            return SimpleNamespace(returncode=0, stdout=json.dumps(health), stderr="")
+        raise AssertionError(f"unexpected command: {command}")
+
+    monkeypatch.setenv("PP_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setattr(pp.subprocess, "run", fake_run)
+    monkeypatch.setattr(pp, "GitHub", lambda: object())
+    monkeypatch.setattr(pp, "stable_timeline", lambda _gh, _config, _number: snapshot())
+
+    assert pp.run(["--config", str(config_path), "next", "review"]) == 0
+
+    result = json.loads(capsys.readouterr().out)
+    lease = pp.decode_signed_lease(result["lease"])
+    assert result["action"] == "audit"
+    assert lease["completion_gate"] == "target-v1"
+    assert lease["expires_at"] - lease["issued_at"] == 600
+    assert ["new-health", "-json"] in calls
+    assert ["old-health", "-json"] not in calls
+
+
+def test_complete_review_fails_closed_if_gate_changes_during_sync(
+        tmp_path, monkeypatch):
+    config_path = tmp_path / "pipelinectl.json"
+    original = {
+        "repository": "owner/repo",
+        "trusted_account": "owner",
+        "health_command": ["project-health", "-json"],
+        "base_branch": "main",
+        "sync_base_before_health": True,
+    }
+    updated = {**original, "review_completion_gate": "target-v1"}
+    config_path.write_text(json.dumps(original), encoding="utf-8")
+    current = snapshot()
+    info = pp.epoch(current, "owner")
+    lease = pp.encode_lease({
+        "version": 1, "stage": "review", "repository": "owner/repo",
+        "number": 42, "head": HEAD,
+        "snapshot": pp.content_review_digest(current),
+        "epoch": info["hash"], "anchor": info["anchor_id"],
+        "depth": 0, "completion_gate": "health",
+    })
+    report = tmp_path / "report.json"
+    report.write_text(json.dumps({
+        "change": "safe change", "checks": ["pytest"],
+        "blocking": [], "tail": [],
+    }), encoding="utf-8")
+
+    def fake_run(command, **_kwargs):
+        if command == ["git", "branch", "--show-current"]:
+            return SimpleNamespace(returncode=0, stdout="main\n", stderr="")
+        if command == ["git", "status", "--porcelain", "--untracked-files=no"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if command == ["git", "fetch", "origin", "--prune"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if command == ["git", "merge", "--ff-only", "origin/main"]:
+            config_path.write_text(json.dumps(updated), encoding="utf-8")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if command == ["project-health", "-json"]:
+            return SimpleNamespace(
+                returncode=0, stdout=json.dumps({"state": "green"}), stderr="",
+            )
+        raise AssertionError(f"unexpected command: {command}")
+
+    monkeypatch.setattr(pp.subprocess, "run", fake_run)
+    monkeypatch.setattr(pp, "ensure_identity", lambda *_args: None)
+    monkeypatch.setattr(
+        pp, "post_comment",
+        lambda *_args: pytest.fail("mutation started after gate changed"),
+    )
+
+    with pytest.raises(pp.PipelineError, match="completion gate changed"):
+        pp.complete_review(
+            object(), pp.load_config(str(config_path)), lease, str(report),
+            config_path=str(config_path),
+        )
+
+
 def test_health_refuses_to_sync_wrong_branch(monkeypatch):
     monkeypatch.setattr(
         pp.subprocess, "run",
@@ -239,7 +353,7 @@ def test_content_review_stays_executable_while_integration_owner_waits_merge(mon
         "integration_owner": {"number": 10, "stage": "integration-merge-ready"},
         "findings": [{"code": "single_flight_barrier"}],
     }
-    monkeypatch.setattr(pp, "run_health", lambda _config: health)
+    monkeypatch.setattr(pp, "run_health", lambda _config, **_kwargs: health)
     monkeypatch.setattr(pp, "stable_timeline", lambda _gh, _config, _number: snapshot())
 
     result = pp.next_review(object(), {
