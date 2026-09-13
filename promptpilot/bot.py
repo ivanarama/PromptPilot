@@ -894,9 +894,19 @@ def _pipeline_text(data: dict) -> str:
                   else f"— (покрытие {week.get('coverage_hours', 0):g} ч)")
     month_trend = (f"{month.get('backlog_delta'):+d}" if month.get("complete")
                    else f"— (покрытие {month.get('coverage_hours', 0):g} ч)")
+    cache = data.get("cache") or {}
+    cache_age = cache.get("age_seconds")
+    cache_state = ("нет снимка" if not cache.get("available") else
+                   "частичный" if not cache.get("complete") else
+                   "устарел" if cache.get("stale") else "свежий")
+    cache_age_text = ("возраст неизвестен" if cache_age is None else
+                      f"{cache_age} сек назад" if cache_age < 60 else
+                      f"{round(cache_age / 60)} мин назад")
+    backlog_total = data.get("backlog_total")
     lines = [f"📈 {data['title']}",
              f"Состояние: {health.get('label', '—')} — {health.get('reason', '—')}",
-             f"Backlog: {data.get('backlog_total', 0)}"
+             f"Снимок GitHub: {cache_state}, {cache_age_text}; чтение без GitHub API",
+             f"Backlog: {backlog_total if backlog_total is not None else '—'}"
              + (f" (Δ 5 ч: {delta:+d})" if delta is not None else " (история копится)"),
              f"Вход / выход / переходы: {recent.get('entered', 0)} / "
              f"{recent.get('exited', 0)} / {recent.get('transitions', 0)}; покрытие {coverage}",
@@ -926,8 +936,10 @@ def _pipeline_text(data: dict) -> str:
         route_text = route["configured"]
         if route.get("effective") != route.get("configured"):
             route_text += f" → {route.get('effective')}"
-        lines.append(f"{marker} {queue['title']}: {queue['backlog']} / "
-                     f"{queue['capacity']} за прогон = {queue['runs_needed']} прогонов; "
+        backlog = queue.get("backlog")
+        runs_needed = queue.get("runs_needed")
+        lines.append(f"{marker} {queue['title']}: {backlog if backlog is not None else '—'} / "
+                     f"{queue['capacity']} за прогон = {runs_needed if runs_needed is not None else '—'} прогонов; "
                      f"сейчас {queue['interval'] or 'не настроено'}; "
                      f"средний запуск {duration_text}; ETA {eta if eta is not None else '—'} ч\n"
                      f"   Маршрут: {route_text}\n"
@@ -945,7 +957,7 @@ async def _send_pipeline_insights(message, profile_id: str):
     status = await message.reply_text("📈 Читаю последний снимок очередей…")
     try:
         data = await asyncio.to_thread(
-            pipeline_insights.analyze, profile_id, db.list_series(), use_cache=True)
+            pipeline_insights.read_cached, profile_id, db.list_series())
         await status.edit_text(_pipeline_text(data))
     except Exception as exc:
         await status.edit_text(f"Не удалось посчитать очередь: {exc}")

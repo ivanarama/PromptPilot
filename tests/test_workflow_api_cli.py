@@ -93,7 +93,7 @@ def test_codex_provider_exposes_effort_without_claude_skill_toggle(isolated_db):
     assert codex["supports_skills"] is False
 
 
-def test_worker_pause_resume_invalidates_pipeline_insights_cache(isolated_db, monkeypatch):
+def test_worker_pause_resume_reuses_durable_insights_without_github(isolated_db, monkeypatch):
     profile = {
         "title": "Example", "repository": "owner/example",
         "queues": [{
@@ -120,10 +120,16 @@ def test_worker_pause_resume_invalidates_pipeline_insights_cache(isolated_db, mo
     pipeline_insights.invalidate_cache()
 
     try:
-        before = request("GET", "/api/pipeline-insights/pause-api")
+        cold = request("GET", "/api/pipeline-insights/pause-api")
+        assert cold.status_code == 200
+        assert cold.json()["cache"]["source"] == "none"
+        assert len(search_calls) == 0
+
+        before = request("GET", "/api/pipeline-insights/pause-api?refresh=true")
         assert before.status_code == 200
         assert before.json()["runtime"]["paused"] is False
         assert len(search_calls) == 1
+        generated_at = before.json()["generated_at"]
 
         paused = request("POST", "/api/worker/pause")
         assert paused.json() == {"ok": True, "paused": True}
@@ -131,16 +137,52 @@ def test_worker_pause_resume_invalidates_pipeline_insights_cache(isolated_db, mo
         assert after_pause.json()["runtime"]["paused"] is True
         assert after_pause.json()["health"]["label"] == "конвейер на паузе"
         assert after_pause.json()["queues"][0]["task_id"] == task.id
-        assert len(search_calls) == 2
+        assert after_pause.json()["generated_at"] == generated_at
+        assert len(search_calls) == 1
+
+        blocked_refresh = request(
+            "GET", "/api/pipeline-insights/pause-api?refresh=true")
+        assert blocked_refresh.json()["cache"]["refresh_blocked"] == "worker_paused"
+        assert len(search_calls) == 1
 
         resumed = request("POST", "/api/worker/resume")
         assert resumed.json() == {"ok": True, "paused": False}
         after_resume = request("GET", "/api/pipeline-insights/pause-api")
         assert after_resume.json()["runtime"]["paused"] is False
         assert after_resume.json()["health"]["label"] != "конвейер на паузе"
-        assert len(search_calls) == 3
+        assert after_resume.json()["generated_at"] == generated_at
+        assert len(search_calls) == 1
     finally:
         pipeline_insights.invalidate_cache()
+
+
+def test_ordinary_insights_api_does_not_enter_refresh_handler_after_restart(
+        isolated_db, monkeypatch):
+    profile = {
+        "title": "Example", "repository": "owner/example",
+        "queues": [{
+            "id": "review", "title": "Review", "capacity": 1,
+            "query": "is:pr", "series_contains": "REVIEW",
+        }],
+    }
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"restart-api": profile})
+    monkeypatch.setattr(pipeline_insights, "_github_search", lambda *_args: {
+        "count": 1, "items": [], "membership_complete": False,
+    })
+    monkeypatch.setattr(pipeline_insights, "_run_profile_health_check", lambda _profile: None)
+    assert request(
+        "GET", "/api/pipeline-insights/restart-api?refresh=true").status_code == 200
+    pipeline_insights._cache.clear()
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("ordinary GET entered the synchronous refresh handler")
+
+    monkeypatch.setattr(pipeline_insights, "analyze", forbidden)
+    restored = request("GET", "/api/pipeline-insights/restart-api")
+
+    assert restored.status_code == 200
+    assert restored.json()["cache"]["source"] == "durable"
+    assert restored.json()["backlog_total"] == 1
 
 
 def test_bot_pause_resume_invalidates_pipeline_insights_cache(isolated_db, monkeypatch):
@@ -185,6 +227,10 @@ def test_schedule_ui_exposes_durable_series_controls():
     assert "insights-col-recommendation" in html
     assert "Рекомендация" in html
     assert "pipelineProfileSelect" in html
+    assert "Снимок GitHub" in html
+    assert "частичный исторический снимок" in html
+    assert "обычное открытие без GitHub API" in html
+    assert "Читаю сохранённый снимок" in html
     assert "taskDisplayTitle(t)" in html
     assert "function taskStatusLabel(t)" in html
     assert "return 'scheduled'" in html
