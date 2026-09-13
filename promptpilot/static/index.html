@@ -2624,7 +2624,9 @@ function diagnosticBadgeLabel(diagnostics) {
 
 async function loadPipelineInsights(profile, refresh=false) {
   const box = document.getElementById('pipelineInsights');
-  box.innerHTML = '<div class="prov-cmd">Считаю очереди GitHub…</div>';
+  box.innerHTML = refresh
+    ? '<div class="prov-cmd">Обновляю очереди GitHub…</div>'
+    : '<div class="prov-cmd">Читаю сохранённый снимок…</div>';
   try {
     const data = await fetchJSON(`${API}/pipeline-insights/${encodeURIComponent(profile)}${refresh?'?refresh=true':''}`);
     const h5 = data.history['5h'];
@@ -2649,6 +2651,24 @@ async function loadPipelineInsights(profile, refresh=false) {
       ? Number(runs.total_tokens || 0).toLocaleString()
       : 'нет данных';
     const githubLimits = data.github_rate_limit || {};
+    const cache = data.cache || {source:'unknown',available:false,stale:true,age_seconds:null};
+    const cacheSources = {live:'новый',memory:'память',durable:'SQLite',snapshot:'история',none:'нет'};
+    const cacheAge = cache.age_seconds == null ? 'возраст неизвестен'
+      : cache.age_seconds < 60 ? `${cache.age_seconds} сек назад`
+      : cache.age_seconds < 3600 ? `${Math.round(cache.age_seconds/60)} мин назад`
+      : `${(cache.age_seconds/3600).toFixed(1)} ч назад`;
+    const cacheValue = !cache.available ? 'нет снимка' : !cache.complete ? 'частичный' : cache.stale ? 'устарел' : 'свежий';
+    const cacheNote = `${cacheAge} · ${cacheSources[cache.source] || cache.source} · обычное открытие без GitHub API`;
+    const cacheColor = cache.stale || !cache.complete ? 'var(--yellow)' : '';
+    const cacheNotice = cache.refresh_blocked === 'worker_paused'
+      ? `<div class="prov-cmd" style="color:var(--yellow);margin-top:8px">Обновление GitHub пропущено: включена общая пауза. ${cache.available ? 'Показан последний локальный снимок.' : 'Снимка ещё нет.'}</div>`
+      : !cache.available
+        ? '<div class="prov-cmd" style="color:var(--yellow);margin-top:8px">Снимка GitHub ещё нет. Нажмите «Обновить» для первого явного запроса.</div>'
+        : !cache.complete
+        ? '<div class="prov-cmd" style="color:var(--yellow);margin-top:8px">Показан частичный исторический снимок. Для полной диагностики нажмите «Обновить».</div>'
+        : cache.stale
+        ? `<div class="prov-cmd" style="color:var(--yellow);margin-top:8px">Данные GitHub устарели (${esc(cacheAge)}). Нажмите «Обновить» для явного запроса.</div>`
+        : '';
     const githubBudget = name => {
       const limit = githubLimits[name];
       if (!limit) return 'нет данных';
@@ -2685,7 +2705,7 @@ async function loadPipelineInsights(profile, refresh=false) {
         ? `автозапуск: ждёт изменения состояния · снимок ${wake.fingerprint}`
         : wake.ready ? `автозапуск: готов · ${wake.matches}` : 'автозапуск: работы нет') : null;
       const bottleneck = data.bottleneck===q.id ? 'bottleneck' : '';
-      return `<tr class="${bottleneck}"><td class="insights-stage-title">${data.bottleneck===q.id?'⚠ ':''}${esc(q.title)}</td><td class="num">${q.backlog}</td><td class="num">${h5.complete?signed(deltaByQueue[q.id]||0):'—'}</td><td class="num">${q.capacity}</td><td class="num">${q.runs_needed}</td><td>${duration(q.avg_duration_seconds)}</td><td>${q.eta_hours == null ? '—' : q.eta_hours+' ч'}</td><td>${age(q.age.oldest_hours)}</td><td>${esc(q.interval || 'нет серии')}</td><td class="insights-recommendation">${esc(q.recommendation || '—')}</td></tr>
+      return `<tr class="${bottleneck}"><td class="insights-stage-title">${data.bottleneck===q.id?'⚠ ':''}${esc(q.title)}</td><td class="num">${q.backlog == null ? '—' : q.backlog}</td><td class="num">${h5.complete?signed(deltaByQueue[q.id]||0):'—'}</td><td class="num">${q.capacity}</td><td class="num">${q.runs_needed == null ? '—' : q.runs_needed}</td><td>${duration(q.avg_duration_seconds)}</td><td>${q.eta_hours == null ? '—' : q.eta_hours+' ч'}</td><td>${age(q.age.oldest_hours)}</td><td>${esc(q.interval || 'нет серии')}</td><td class="insights-recommendation">${esc(q.recommendation || '—')}</td></tr>
         <tr class="insights-stage-detail ${bottleneck}"><td colspan="10"><div class="insights-stage-meta"><span class="prov-cmd" title="${escAttr(last?.summary || '')}">${esc(lastLine)}</span><span class="prov-cmd">${esc(stageLine)}</span><span class="prov-cmd">${esc(routeLine)}</span>${wakeLine?`<span class="prov-cmd">${esc(wakeLine)}</span>`:''}</div></td></tr>`;
     }).join('');
     const priorityHtml = data.priority_control ? `<details style="margin-top:12px" open>
@@ -2694,7 +2714,7 @@ async function loadPipelineInsights(profile, refresh=false) {
         const items = q.items || [];
         if (!items.length) return '';
         return `<div style="border-top:1px solid var(--border);padding:8px 0">
-          <div style="margin-bottom:5px"><b>${esc(q.title)}</b> <span class="prov-cmd">показано ${items.length} из ${q.backlog}</span></div>
+          <div style="margin-bottom:5px"><b>${esc(q.title)}</b> <span class="prov-cmd">показано ${items.length} из ${q.backlog == null ? '—' : q.backlog}</span></div>
           ${items.map(item => {
             const priority = item.priority || {level:'p2',base_level:'p2',source:'auto',reason:'default',age_boost:0};
             const note = priority.source === 'manual' ? 'вручную' : `авто: ${priority.reason}`;
@@ -2716,8 +2736,10 @@ async function loadPipelineInsights(profile, refresh=false) {
     box.innerHTML = `<div style="border:1px solid var(--border);border-radius:8px;padding:12px;margin-bottom:12px">
       <div><b>${esc(data.title)}</b><span class="pipeline-health ${escAttr(data.health.state)}">${esc(healthLabel)}</span></div>
       <div class="prov-cmd">${esc(data.repository)} · ${esc(pipelineHealthReason(data))} · история хранится локально</div>
+      ${cacheNotice}
       <div class="pipeline-summary">
-        <div class="pipeline-metric"><div class="pipeline-metric-label">Backlog сейчас</div><div class="pipeline-metric-value">${data.backlog_total}</div><div class="pipeline-metric-note">Δ 5 ч: ${h5.complete?signed(h5.backlog_delta):'копится история'}</div></div>
+        <div class="pipeline-metric"><div class="pipeline-metric-label">Снимок GitHub</div><div class="pipeline-metric-value" style="${cacheColor ? `color:${cacheColor}` : ''}">${esc(cacheValue)}</div><div class="pipeline-metric-note">${esc(cacheNote)}</div></div>
+        <div class="pipeline-metric"><div class="pipeline-metric-label">Backlog сейчас</div><div class="pipeline-metric-value">${data.backlog_total == null ? '—' : data.backlog_total}</div><div class="pipeline-metric-note">Δ 5 ч: ${h5.complete?signed(h5.backlog_delta):'копится история'}</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Вход / выход</div><div class="pipeline-metric-value">${h5.complete?`${h5.entered} / ${h5.exited}`:'—'}</div><div class="pipeline-metric-note">${historyNote}</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Переходы / churn</div><div class="pipeline-metric-value">${h5.complete?`${h5.transitions} / ${h5.churn_items}`:'—'}</div><div class="pipeline-metric-note">между очередями / 3+ состояний</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Возраст p90 / max</div><div class="pipeline-metric-value">${age(data.age.p90_hours)} / ${age(data.age.oldest_hours)}</div><div class="pipeline-metric-note">текущие элементы</div></div>
@@ -2730,7 +2752,7 @@ async function loadPipelineInsights(profile, refresh=false) {
         <div class="pipeline-metric"><div class="pipeline-metric-label">Δ backlog 30 дней</div><div class="pipeline-metric-value">${h30d.complete?signed(h30d.backlog_delta):'—'}</div><div class="pipeline-metric-note">покрытие ${h30d.coverage_hours} из 720 ч</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Цель очистки</div><div class="pipeline-metric-value">${data.target_clear_hours} ч</div><div class="pipeline-metric-note">без прогноза нового входа</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Worker</div><div class="pipeline-metric-value">${runtime.state==='online'?'online':'offline'}</div><div class="pipeline-metric-note">${runtime.age_seconds == null ? 'heartbeat отсутствует' : 'heartbeat '+runtime.age_seconds+' сек назад'}</div></div>
-        <div class="pipeline-metric"><div class="pipeline-metric-label">GitHub REST API</div><div class="pipeline-metric-value" style="${coreColor ? `color:${coreColor}` : ''}">${esc(githubBudget('core'))}</div><div class="pipeline-metric-note">Search ${esc(githubBudget('search'))} · GraphQL ${esc(githubBudget('graphql'))}</div></div>
+        <div class="pipeline-metric"><div class="pipeline-metric-label">GitHub REST API</div><div class="pipeline-metric-value" style="${coreColor ? `color:${coreColor}` : ''}">${esc(githubBudget('core'))}</div><div class="pipeline-metric-note">на момент снимка · Search ${esc(githubBudget('search'))} · GraphQL ${esc(githubBudget('graphql'))}</div></div>
       </div>
       ${diagnosticHtml}
       <table class="insights-table"><colgroup><col class="insights-col-stage"><col class="insights-col-small"><col class="insights-col-small"><col class="insights-col-capacity"><col class="insights-col-capacity"><col class="insights-col-duration"><col class="insights-col-small"><col class="insights-col-oldest"><col class="insights-col-interval"><col class="insights-col-recommendation"></colgroup><thead><tr><th>Этап</th><th class="num">Очередь</th><th class="num">Δ 5 ч</th><th class="num">За прогон</th><th class="num">Прогонов</th><th>Средний запуск</th><th>ETA</th><th>Самый старый</th><th>Интервал</th><th>Рекомендация</th></tr></thead><tbody>${rows}</tbody></table>

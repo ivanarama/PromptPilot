@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+import json
 import os
 import threading
 from types import SimpleNamespace
@@ -33,6 +34,31 @@ PIPELINE_PROFILE = {
          "query": "is:pr is:open label:merge", "series_contains": "MERGE"},
     ],
 }
+
+
+def _fresh_cache_data(profile_id: str, profile: dict,
+                      diagnostics: dict | None = None) -> dict:
+    """Publish a real durable cache token for wake-up race tests."""
+    generated_at = datetime.now(timezone.utc).timestamp()
+    result = {
+        "profile_id": profile_id, "repository": profile.get("repository"),
+        "queues": [{"id": queue.get("id")}
+                   for queue in profile.get("queues", [])],
+        "generated_at": generated_at, "diagnostics": diagnostics,
+    }
+    _cached, generation = pipeline_insights._cache_snapshot(profile_id)
+    epoch = pipeline_insights._cache_epoch()
+    revision = pipeline_insights.db.increment_int_setting(
+        pipeline_insights._refresh_revision_key(profile_id))
+    assert pipeline_insights._publish_cache(
+        profile_id, profile, generation, epoch, revision, result)
+    return {
+        "cache": pipeline_insights._cache_metadata(
+            "live", generated_at, epoch, revision, epoch,
+            pipeline_insights._profile_fingerprint(profile),
+        ),
+        "diagnostics": diagnostics,
+    }
 
 
 def test_fresh_install_has_no_project_specific_pipeline_profiles(tmp_path, monkeypatch):
@@ -173,12 +199,16 @@ def test_global_worker_pause_is_visible_for_active_pipeline(isolated_db, monkeyp
         prompt="ExampleProject - REVIEW", recurrence="4h",
     ))
     isolated_db.touch_worker_heartbeat(1234)
-    isolated_db.set_setting("worker_paused", "1")
+    isolated_db.set_setting("worker_paused", "0")
     pipeline_insights._cache.clear()
 
-    result = pipeline_insights.analyze(
+    fresh = pipeline_insights.analyze(
         "example", isolated_db.list_series(), use_cache=False)
+    isolated_db.set_setting("worker_paused", "1")
+    result = pipeline_insights.read_cached(
+        "example", isolated_db.list_series())
 
+    assert fresh["runtime"]["paused"] is False
     assert result["runtime"]["required"] is True
     assert result["runtime"]["paused"] is True
     assert result["runtime"]["state"] == "online"
@@ -513,7 +543,628 @@ def test_forced_queue_refresh_reuses_expensive_diagnostics(isolated_db, monkeypa
     assert refreshed["diagnostics_generated_at"] >= second["diagnostics_generated_at"]
 
 
-def test_invalidation_during_analysis_rejects_stale_cache_publish(isolated_db, monkeypatch):
+def test_cache_only_miss_never_calls_github_or_health(isolated_db, monkeypatch):
+    profile = {
+        "title": "Example", "repository": "owner/example",
+        "health_check": {"command": ["health"]},
+        "queues": [{
+            "id": "review", "title": "Review", "capacity": 1,
+            "query": "is:pr", "series_contains": "REVIEW",
+            "execution": {
+                "mode": "auto", "command": ["pipeline-tool"],
+                "probe_command": ["pipeline-tool", "capabilities"],
+            },
+        }],
+    }
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"cold": profile})
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("cache-only read attempted external GitHub work")
+
+    monkeypatch.setattr(pipeline_insights, "_github_search", forbidden)
+    monkeypatch.setattr(pipeline_insights, "_github_rate_limits", forbidden)
+    monkeypatch.setattr(pipeline_insights, "_run_profile_health_check", forbidden)
+    monkeypatch.setattr(pipeline_insights.subprocess, "run", forbidden)
+    pipeline_insights._cache.clear()
+
+    result = pipeline_insights.read_cached("cold", [])
+
+    assert result["cache"] == {
+        "source": "none", "available": False, "complete": False,
+        "generated_at": None, "age_seconds": None, "ttl_seconds": 300,
+        "invalidated": False, "stale": True,
+        "profile_hash": pipeline_insights._profile_fingerprint(profile),
+        "token": None,
+    }
+    assert result["backlog_total"] is None
+    assert isolated_db.list_pipeline_snapshots("cold") == []
+
+
+def test_full_cache_survives_process_restart_without_github(isolated_db, monkeypatch):
+    profile = {
+        "title": "Example", "repository": "owner/example",
+        "queues": [{
+            "id": "review", "title": "Review", "capacity": 1,
+            "query": "is:pr", "series_contains": "REVIEW",
+        }],
+    }
+    calls = []
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"restart": profile})
+    monkeypatch.setattr(pipeline_insights, "_github_search", lambda *_args: (
+        calls.append("search") or {
+            "count": 2, "items": [], "membership_complete": False,
+        }))
+    monkeypatch.setattr(pipeline_insights, "_run_profile_health_check", lambda _profile: None)
+    pipeline_insights._cache.clear()
+
+    fresh = pipeline_insights.analyze("restart", [], use_cache=False)
+    pipeline_insights._cache.clear()  # simulate a new server process
+    restored = pipeline_insights.read_cached("restart", [])
+
+    assert calls == ["search"]
+    assert restored["cache"]["source"] == "durable"
+    assert restored["cache"]["available"] is True
+    assert restored["cache"]["stale"] is False
+    assert restored["backlog_total"] == 2
+    assert restored["generated_at"] == fresh["generated_at"]
+
+
+def test_cache_only_reader_does_not_wait_for_inflight_refresh(isolated_db, monkeypatch):
+    profile = {
+        "title": "Example", "repository": "owner/example",
+        "queues": [{
+            "id": "review", "title": "Review", "capacity": 1,
+            "query": "is:pr", "series_contains": "REVIEW",
+        }],
+    }
+    entered = threading.Event()
+    release = threading.Event()
+    calls = {"count": 0}
+
+    def search(*_args):
+        calls["count"] += 1
+        if calls["count"] == 2:
+            entered.set()
+            assert release.wait(5)
+        return {
+            "count": calls["count"], "items": [],
+            "membership_complete": False,
+        }
+
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"concurrent": profile})
+    monkeypatch.setattr(pipeline_insights, "_github_search", search)
+    monkeypatch.setattr(pipeline_insights, "_run_profile_health_check", lambda _profile: None)
+    pipeline_insights._cache.clear()
+    pipeline_insights.analyze("concurrent", [], use_cache=False)
+    writer = threading.Thread(
+        target=pipeline_insights.analyze,
+        args=("concurrent", []), kwargs={"use_cache": False},
+    )
+    writer.start()
+    assert entered.wait(5)
+    reader_result = []
+    reader = threading.Thread(
+        target=lambda: reader_result.append(
+            pipeline_insights.read_cached("concurrent", [])))
+    reader.start()
+
+    try:
+        reader.join(1)
+        assert not reader.is_alive()
+        assert reader_result[0]["backlog_total"] == 1
+    finally:
+        release.set()
+        writer.join(5)
+        reader.join(5)
+
+
+def test_older_cross_process_refresh_cannot_overwrite_newer_cache(
+        isolated_db, monkeypatch):
+    profile = {
+        "title": "Example", "repository": "owner/example",
+        "queues": [{
+            "id": "review", "title": "Review", "capacity": 1,
+            "query": "is:pr", "series_contains": "REVIEW",
+        }],
+    }
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"ordered": profile})
+    pipeline_insights._cache.clear()
+    _cached, generation = pipeline_insights._cache_snapshot("ordered")
+    epoch = pipeline_insights._cache_epoch()
+    older = pipeline_insights._empty_cached_result("ordered", profile)
+    older.update({"generated_at": 100.0, "backlog_total": 1})
+    older["queues"][0]["backlog"] = 1
+    newer = pipeline_insights._empty_cached_result("ordered", profile)
+    newer.update({"generated_at": 200.0, "backlog_total": 2})
+    newer["queues"][0]["backlog"] = 2
+
+    assert pipeline_insights._publish_cache(
+        "ordered", profile, generation, epoch, 2, newer) is True
+    assert pipeline_insights._publish_cache(
+        "ordered", profile, generation, epoch, 1, older) is False
+    pipeline_insights._cache.clear()
+
+    restored = pipeline_insights.read_cached("ordered", [])
+    assert restored["backlog_total"] == 2
+
+
+def test_stale_profile_analysis_uses_separate_durable_namespace(
+        isolated_db, monkeypatch):
+    old_profile = {
+        "title": "Example", "repository": "owner/example",
+        "queues": [{
+            "id": "review", "title": "Review", "capacity": 1,
+            "query": "label:old", "series_contains": "REVIEW",
+        }],
+    }
+    new_profile = {
+        **old_profile,
+        "queues": [{**old_profile["queues"][0], "query": "label:new"}],
+    }
+    current = {"profile": new_profile}
+    monkeypatch.setattr(
+        pipeline_insights, "_profiles", lambda: {"fingerprint": current["profile"]})
+    monkeypatch.setattr(pipeline_insights, "_github_search", lambda _repo, query: {
+        "count": 2 if query == "label:new" else 9,
+        "items": [], "membership_complete": False,
+    })
+    monkeypatch.setattr(pipeline_insights, "_run_profile_health_check", lambda _profile: None)
+    pipeline_insights._cache.clear()
+    newer = pipeline_insights.analyze("fingerprint", [], use_cache=False)
+    new_hash = pipeline_insights._profile_fingerprint(new_profile)
+    old_hash = pipeline_insights._profile_fingerprint(old_profile)
+    new_key = pipeline_insights._cache_key("fingerprint", new_hash)
+    old_key = pipeline_insights._cache_key("fingerprint", old_hash)
+    durable_before = isolated_db.get_setting(
+        new_key)
+
+    current["profile"] = old_profile  # stale process still sees its old config
+    stale = pipeline_insights.analyze("fingerprint", [], use_cache=False)
+    stale_payload = json.loads(isolated_db.get_setting(old_key))
+
+    current["profile"] = new_profile
+    pipeline_insights._cache.clear()
+    restored = pipeline_insights.read_cached("fingerprint", [])
+
+    assert newer["backlog_total"] == 2
+    assert stale["backlog_total"] == 9
+    assert stale_payload["revision"] > json.loads(durable_before)["revision"]
+    assert isolated_db.get_setting(new_key) == durable_before
+    assert restored["backlog_total"] == 2
+    assert restored["cache"]["source"] == "durable"
+    assert json.loads(durable_before)["profile_hash"] == \
+        new_hash
+
+
+def test_process_memory_reloads_newer_cross_process_durable_revision(
+        isolated_db, monkeypatch):
+    profile = {
+        "title": "Example", "repository": "owner/example",
+        "queues": [{
+            "id": "review", "title": "Review", "capacity": 1,
+            "query": "is:pr", "series_contains": "REVIEW",
+        }],
+    }
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"coherent": profile})
+    monkeypatch.setattr(pipeline_insights, "_github_search", lambda *_args: {
+        "count": 1, "items": [], "membership_complete": False,
+    })
+    monkeypatch.setattr(pipeline_insights, "_run_profile_health_check", lambda _profile: None)
+    pipeline_insights._cache.clear()
+    pipeline_insights.analyze("coherent", [], use_cache=False)
+    old_memory = pipeline_insights._cache["coherent"]
+    _cached, generation = pipeline_insights._cache_snapshot("coherent")
+    epoch = pipeline_insights._cache_epoch()
+    newer = pipeline_insights._empty_cached_result("coherent", profile)
+    newer.update({"generated_at": 200.0, "backlog_total": 2})
+    newer["queues"][0]["backlog"] = 2
+    assert pipeline_insights._publish_cache(
+        "coherent", profile, generation, epoch, 2, newer) is True
+    pipeline_insights._cache["coherent"] = old_memory  # another process' RAM
+
+    restored = pipeline_insights.read_cached("coherent", [])
+
+    assert restored["cache"]["source"] == "durable"
+    assert restored["backlog_total"] == 2
+
+
+def test_profile_query_change_never_reuses_incompatible_full_or_raw_cache(
+        isolated_db, monkeypatch):
+    profile = {
+        "title": "Example", "repository": "owner/example",
+        "queues": [{
+            "id": "review", "title": "Review", "capacity": 1,
+            "query": "label:old", "series_contains": "REVIEW",
+        }],
+    }
+    current = {"profile": profile}
+    monkeypatch.setattr(
+        pipeline_insights, "_profiles", lambda: {"changed": current["profile"]})
+    monkeypatch.setattr(pipeline_insights, "_github_search", lambda _repo, query: {
+        "count": 9 if query == "label:new" else 7,
+        "items": [], "membership_complete": False,
+    })
+    monkeypatch.setattr(pipeline_insights, "_run_profile_health_check", lambda _profile: None)
+    pipeline_insights._cache.clear()
+    assert pipeline_insights.analyze(
+        "changed", [], use_cache=False)["backlog_total"] == 7
+    current["profile"] = {
+        **profile,
+        "queues": [{**profile["queues"][0], "query": "label:new"}],
+    }
+    pipeline_insights._cache.clear()
+
+    result = pipeline_insights.read_cached("changed", [])
+
+    assert result["cache"]["source"] == "none"
+    assert result["backlog_total"] is None
+
+    refreshed = pipeline_insights.analyze("changed", [], use_cache=False)
+    pipeline_insights._cache.clear()
+    restored = pipeline_insights.read_cached("changed", [])
+
+    assert refreshed["backlog_total"] == 9
+    assert restored["backlog_total"] == 9
+    assert restored["cache"]["source"] == "durable"
+
+
+def test_failed_refresh_preserves_previous_last_good_cache(isolated_db, monkeypatch):
+    profile = {
+        "title": "Example", "repository": "owner/example",
+        "queues": [{
+            "id": "review", "title": "Review", "capacity": 1,
+            "query": "is:pr", "series_contains": "REVIEW",
+        }],
+    }
+    fail = {"value": False}
+
+    def search(*_args):
+        if fail["value"]:
+            raise RuntimeError("GitHub unavailable")
+        return {"count": 4, "items": [], "membership_complete": False}
+
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"last-good": profile})
+    monkeypatch.setattr(pipeline_insights, "_github_search", search)
+    monkeypatch.setattr(pipeline_insights, "_run_profile_health_check", lambda _profile: None)
+    pipeline_insights._cache.clear()
+    fresh = pipeline_insights.analyze("last-good", [], use_cache=False)
+    fail["value"] = True
+
+    with pytest.raises(RuntimeError, match="GitHub unavailable"):
+        pipeline_insights.analyze("last-good", [], use_cache=False)
+    restored = pipeline_insights.read_cached("last-good", [])
+
+    assert restored["generated_at"] == fresh["generated_at"]
+    assert restored["backlog_total"] == 4
+
+
+def test_rejected_refresh_returns_the_accepted_durable_state(
+        isolated_db, monkeypatch):
+    profile = {
+        "title": "Example", "repository": "owner/example",
+        "queues": [{
+            "id": "review", "title": "Review", "capacity": 1,
+            "query": "is:pr", "series_contains": "REVIEW",
+        }],
+    }
+    counts = iter([2, 9])
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"accepted": profile})
+    monkeypatch.setattr(pipeline_insights, "_github_search", lambda *_args: {
+        "count": next(counts), "items": [], "membership_complete": False,
+    })
+    monkeypatch.setattr(pipeline_insights, "_run_profile_health_check", lambda _profile: None)
+    pipeline_insights._cache.clear()
+    accepted = pipeline_insights.analyze("accepted", [], use_cache=False)
+    snapshots_before = isolated_db.list_pipeline_snapshots("accepted")
+    monkeypatch.setattr(pipeline_insights, "_publish_cache", lambda *_args: False)
+
+    rejected = pipeline_insights.analyze("accepted", [], use_cache=False)
+
+    assert accepted["backlog_total"] == 2
+    assert rejected["backlog_total"] == 2
+    assert rejected["generated_at"] == accepted["generated_at"]
+    assert rejected["cache"]["complete"] is True
+    assert rejected["cache"]["stale"] is False
+    assert isolated_db.list_pipeline_snapshots("accepted") == snapshots_before
+
+
+def test_cache_only_read_uses_legacy_durable_snapshot_without_github(
+        isolated_db, monkeypatch):
+    profile = {
+        "title": "Example", "repository": "owner/example",
+        "queues": [{
+            "id": "review", "title": "Review", "capacity": 2,
+            "query": "is:pr", "series_contains": "REVIEW",
+        }],
+    }
+    captured = datetime.now(timezone.utc) - timedelta(minutes=2)
+    isolated_db.add_pipeline_snapshot("legacy", "owner/example", {
+        "captured_at": captured.isoformat(),
+        "queues": {"review": {
+            "backlog": 3, "items": [], "membership_complete": True,
+        }},
+    }, captured)
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"legacy": profile})
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("legacy fallback attempted external work")
+
+    monkeypatch.setattr(pipeline_insights, "_github_search", forbidden)
+    monkeypatch.setattr(pipeline_insights, "_github_rate_limits", forbidden)
+    monkeypatch.setattr(pipeline_insights, "_run_profile_health_check", forbidden)
+    pipeline_insights._cache.clear()
+
+    result = pipeline_insights.read_cached("legacy", [])
+
+    assert result["cache"]["source"] == "snapshot"
+    assert result["cache"]["complete"] is False
+    assert result["cache"]["stale"] is False
+    assert result["backlog_total"] == 3
+    assert result["queues"][0]["runs_needed"] == 1.5
+
+
+def test_old_full_cache_suppresses_ambiguous_legacy_snapshot_fallback(
+        isolated_db, monkeypatch):
+    profile = {
+        "title": "Changed", "repository": "owner/example",
+        "queues": [{
+            "id": "new", "title": "New", "capacity": 1,
+            "query": "label:new", "series_contains": "NEW",
+        }],
+    }
+    captured = datetime.now(timezone.utc) - timedelta(minutes=2)
+    isolated_db.set_setting(
+        pipeline_insights._legacy_cache_key("legacy-changed"),
+        json.dumps({"profile_hash": "old-profile"}),
+    )
+    isolated_db.add_pipeline_snapshot("legacy-changed", "owner/example", {
+        "captured_at": captured.isoformat(),
+        "queues": {"new": {
+            "backlog": 99, "items": [], "membership_complete": True,
+        }},
+    }, captured)
+    monkeypatch.setattr(
+        pipeline_insights, "_profiles", lambda: {"legacy-changed": profile})
+    pipeline_insights._cache.clear()
+
+    result = pipeline_insights.read_cached("legacy-changed", [])
+
+    assert result["cache"]["source"] == "none"
+    assert result["cache"]["complete"] is False
+    assert result["backlog_total"] is None
+
+
+def test_stale_durable_cache_keeps_current_paused_runtime_without_github(
+        isolated_db, monkeypatch):
+    profile = {
+        "title": "Example", "repository": "owner/example",
+        "queues": [{
+            "id": "review", "title": "Review", "capacity": 1,
+            "query": "is:pr", "series_contains": "REVIEW",
+        }],
+    }
+    calls = []
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"stale": profile})
+    monkeypatch.setattr(pipeline_insights, "_github_search", lambda *_args: (
+        calls.append("search") or {
+            "count": 1, "items": [], "membership_complete": False,
+        }))
+    monkeypatch.setattr(pipeline_insights, "_run_profile_health_check", lambda _profile: None)
+    task = isolated_db.create_task(TaskCreate(
+        prompt="Example - REVIEW", recurrence="4h"))
+    isolated_db.touch_worker_heartbeat(1234)
+    pipeline_insights._cache.clear()
+    fresh = pipeline_insights.analyze(
+        "stale", isolated_db.list_series(), use_cache=False)
+    cache_key = pipeline_insights._cache_key(
+        "stale", pipeline_insights._profile_fingerprint(profile))
+    raw = json.loads(isolated_db.get_setting(cache_key))
+    raw["generated_at"] -= 601
+    raw["result"]["generated_at"] -= 601
+    isolated_db.set_setting(
+        cache_key,
+        json.dumps(raw, ensure_ascii=False, separators=(",", ":")),
+    )
+    pipeline_insights._cache.clear()
+    isolated_db.set_setting("worker_paused", "1")
+
+    cached = pipeline_insights.read_cached("stale", isolated_db.list_series())
+
+    assert fresh["runtime"]["paused"] is False
+    assert cached["runtime"]["paused"] is True
+    assert cached["runtime"]["state"] == "online"
+    assert cached["health"]["label"] == "конвейер на паузе"
+    assert cached["queues"][0]["task_id"] == task.id
+    assert cached["cache"]["source"] == "durable"
+    assert cached["cache"]["stale"] is True
+    assert cached["cache"]["age_seconds"] >= 601
+    assert calls == ["search"]
+
+
+def test_local_interval_overlay_recomputes_bottleneck(isolated_db):
+    profile = {
+        "title": "Example", "repository": "owner/example",
+        "queues": [
+            {"id": "a", "title": "A", "capacity": 1,
+             "query": "label:a", "series_contains": "STAGE A"},
+            {"id": "b", "title": "B", "capacity": 1,
+             "query": "label:b", "series_contains": "STAGE B"},
+        ],
+    }
+    isolated_db.create_task(TaskCreate(
+        prompt="Example - STAGE A", recurrence="15m"))
+    isolated_db.create_task(TaskCreate(
+        prompt="Example - STAGE B", recurrence="4h"))
+    result = pipeline_insights._empty_cached_result("bottleneck", profile)
+    result["queues"][0]["backlog"] = 10
+    result["queues"][1]["backlog"] = 2
+    result["backlog_total"] = 12
+    result["bottleneck"] = "a"  # value saved with now-obsolete intervals
+    generated_at = datetime.now(timezone.utc).timestamp()
+    result["generated_at"] = generated_at
+
+    overlaid = pipeline_insights._refresh_local_state(
+        result, profile, isolated_db.list_series(), source="durable",
+        generated_at=generated_at, entry_epoch=0, entry_revision=1,
+        current_epoch=0)
+
+    assert overlaid["queues"][0]["eta_hours"] == 2.5
+    assert overlaid["queues"][1]["eta_hours"] == 8.0
+    assert overlaid["bottleneck"] == "b"
+
+
+def test_global_pause_blocks_even_explicit_analysis(isolated_db, monkeypatch):
+    profile = {
+        "title": "Example", "repository": "owner/example",
+        "health_check": {"command": ["health"]},
+        "queues": [{
+            "id": "review", "title": "Review", "capacity": 1,
+            "query": "is:pr", "series_contains": "REVIEW",
+        }],
+    }
+    calls = []
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"paused": profile})
+    monkeypatch.setattr(pipeline_insights, "_github_search", lambda *_args: calls.append("search"))
+    monkeypatch.setattr(pipeline_insights, "_github_rate_limits", lambda: calls.append("rate"))
+    monkeypatch.setattr(
+        pipeline_insights, "_run_profile_health_check",
+        lambda _profile: calls.append("health"),
+    )
+    isolated_db.set_setting("worker_paused", "1")
+    pipeline_insights._cache.clear()
+
+    result = pipeline_insights.analyze(
+        "paused", [], use_cache=False, refresh_diagnostics=True)
+
+    assert calls == []
+    assert result["cache"]["refresh_blocked"] == "worker_paused"
+
+
+def test_pause_during_first_search_stops_all_subsequent_github_io(
+        isolated_db, monkeypatch):
+    profile = {
+        "title": "Example", "repository": "owner/example",
+        "queues": [{
+            "id": "review", "title": "Review", "capacity": 1,
+            "queries": ["label:first", "label:second"],
+            "series_contains": "REVIEW",
+        }],
+    }
+    calls = []
+
+    def search(_repository, query):
+        calls.append(f"search:{query}")
+        isolated_db.set_setting("worker_paused", "1")
+        return {"count": 1, "items": [], "membership_complete": False}
+
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"mid-pause": profile})
+    monkeypatch.setattr(pipeline_insights, "_github_search", search)
+    monkeypatch.setattr(
+        pipeline_insights, "_github_rate_limits",
+        lambda: calls.append("rate-limit"),
+    )
+    monkeypatch.setattr(pipeline_insights, "_run_profile_health_check", lambda _profile: None)
+    pipeline_insights._cache.clear()
+
+    result = pipeline_insights.analyze("mid-pause", [], use_cache=False)
+
+    assert calls == ["search:label:first"]
+    assert result["cache"]["source"] == "none"
+    assert result["cache"]["refresh_blocked"] == "worker_paused"
+    assert isolated_db.list_pipeline_snapshots("mid-pause") == []
+
+
+def test_github_search_does_not_start_page_two_after_pause(
+        isolated_db, monkeypatch):
+    calls = []
+
+    def run(command, **_kwargs):
+        calls.append(command)
+        isolated_db.set_setting("worker_paused", "1")
+        return SimpleNamespace(
+            returncode=0, stderr="",
+            stdout=json.dumps({"total_count": 250, "items": [{}] * 100}),
+        )
+
+    monkeypatch.setattr(pipeline_insights, "_gh_executable", lambda: "gh")
+    monkeypatch.setattr(pipeline_insights.subprocess, "run", run)
+
+    with pytest.raises(
+            pipeline_insights._GitHubScanPaused,
+            match="interrupted by global pause"):
+        pipeline_insights._github_search("owner/example", "is:pr")
+
+    assert len(calls) == 1
+    assert "page=1" in calls[0]
+
+
+def test_interrupted_pagination_never_publishes_partial_snapshot(
+        isolated_db, monkeypatch):
+    profile = {
+        "title": "Example", "repository": "owner/example",
+        "queues": [{
+            "id": "review", "title": "Review", "capacity": 1,
+            "query": "is:pr", "series_contains": "REVIEW",
+        }],
+    }
+    calls = []
+
+    def run(command, **_kwargs):
+        calls.append(command)
+        isolated_db.set_setting("worker_paused", "1")
+        return SimpleNamespace(
+            returncode=0, stderr="",
+            stdout=json.dumps({"total_count": 250, "items": [{}] * 100}),
+        )
+
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"pagination": profile})
+    monkeypatch.setattr(pipeline_insights, "_gh_executable", lambda: "gh")
+    monkeypatch.setattr(pipeline_insights.subprocess, "run", run)
+    monkeypatch.setattr(pipeline_insights, "_run_profile_health_check", lambda _profile: None)
+    pipeline_insights._cache.clear()
+
+    result = pipeline_insights.analyze("pagination", [], use_cache=False)
+
+    assert len(calls) == 1
+    assert result["cache"]["source"] == "none"
+    assert result["cache"]["complete"] is False
+    assert result["cache"]["refresh_blocked"] == "worker_paused"
+    assert isolated_db.get_setting(
+        pipeline_insights._cache_key(
+            "pagination", pipeline_insights._profile_fingerprint(profile))) is None
+    assert isolated_db.list_pipeline_snapshots("pagination") == []
+
+
+def test_completed_first_page_remains_a_valid_snapshot_when_pause_arrives(
+        isolated_db, monkeypatch):
+    item = {
+        "number": 42, "title": "Ready", "labels": [],
+        "created_at": "2026-09-01T00:00:00Z",
+        "updated_at": "2026-09-02T00:00:00Z",
+        "html_url": "https://example.test/42",
+    }
+    calls = []
+
+    def run(command, **_kwargs):
+        calls.append(command)
+        isolated_db.set_setting("worker_paused", "1")
+        return SimpleNamespace(
+            returncode=0, stderr="",
+            stdout=json.dumps({"total_count": 1, "items": [item]}),
+        )
+
+    monkeypatch.setattr(pipeline_insights, "_gh_executable", lambda: "gh")
+    monkeypatch.setattr(pipeline_insights.subprocess, "run", run)
+
+    result = pipeline_insights._github_search("owner/example", "is:pr")
+
+    assert len(calls) == 1
+    assert result["count"] == 1
+    assert result["membership_complete"] is True
+    assert result["items"][0]["key"] == "issue:42"
+
+
+def test_invalidation_during_analysis_rejects_stale_full_cache_publish(isolated_db, monkeypatch):
     profile = {
         "title": "Example", "repository": "owner/example",
         "queues": [{
@@ -536,31 +1187,76 @@ def test_invalidation_during_analysis_rejects_stale_cache_publish(isolated_db, m
 
     def run_analysis():
         try:
-            pipeline_insights.analyze("cache-race", [], use_cache=True)
+            pipeline_insights.analyze("cache-race", [], use_cache=False)
         except BaseException as exc:  # preserve the worker-thread failure for the assertion
             errors.append(exc)
 
     monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"cache-race": profile})
     monkeypatch.setattr(pipeline_insights, "_github_search", fake_search)
     monkeypatch.setattr(pipeline_insights, "_run_profile_health_check", lambda _profile: None)
-    pipeline_insights.invalidate_cache()
+    pipeline_insights._discard_cache()
     analysis = threading.Thread(target=run_analysis)
     analysis.start()
 
     try:
         assert entered_search.wait(5)
-        pipeline_insights.invalidate_cache()
+        pipeline_insights._discard_cache()
         release_search.set()
         analysis.join(5)
         assert not analysis.is_alive()
         assert errors == []
+        assert isolated_db.get_setting(
+            pipeline_insights._cache_key(
+                "cache-race", pipeline_insights._profile_fingerprint(profile))) is None
 
-        pipeline_insights.analyze("cache-race", [], use_cache=True)
+        pipeline_insights.analyze("cache-race", [], use_cache=False)
         assert len(search_calls) == 2
     finally:
         release_search.set()
         analysis.join(5)
-        pipeline_insights.invalidate_cache()
+        pipeline_insights._discard_cache()
+
+
+def test_cache_read_observes_invalidation_with_payload_at_one_snapshot(
+        isolated_db, monkeypatch):
+    profile = {
+        "title": "Example", "repository": "owner/example",
+        "queues": [{
+            "id": "review", "title": "Review", "capacity": 1,
+            "query": "is:pr", "series_contains": "REVIEW",
+        }],
+    }
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"coherent": profile})
+    monkeypatch.setattr(pipeline_insights, "_github_search", lambda *_args: {
+        "count": 1, "items": [], "membership_complete": False,
+    })
+    monkeypatch.setattr(
+        pipeline_insights, "_run_profile_health_check", lambda _profile: None)
+    pipeline_insights._cache.clear()
+    pipeline_insights.analyze("coherent", [], use_cache=False)
+    pipeline_insights._cache.clear()
+    real_snapshot = isolated_db.get_settings_snapshot
+    raced = {"done": False}
+
+    def invalidate_after_settings_snapshot(keys):
+        value = real_snapshot(keys)
+        if not raced["done"]:
+            raced["done"] = True
+            pipeline_insights._discard_cache("coherent")
+        return value
+
+    monkeypatch.setattr(
+        pipeline_insights.db, "get_settings_snapshot",
+        invalidate_after_settings_snapshot)
+
+    result = pipeline_insights.read_cached("coherent", [])
+
+    assert raced["done"] is True
+    assert result["cache"]["source"] in {"memory", "durable"}
+    assert result["cache"]["invalidated"] is True
+    assert result["cache"]["stale"] is True
+    assert result["cache"]["token"]["epoch"] < \
+        pipeline_insights._cache_epoch()
 
 
 def test_external_pause_change_bypasses_cached_pipeline_state(isolated_db, monkeypatch):
@@ -585,20 +1281,22 @@ def test_external_pause_change_bypasses_cached_pipeline_state(isolated_db, monke
     pipeline_insights.invalidate_cache()
 
     try:
-        before = pipeline_insights.analyze("pause-cache", [], use_cache=True)
-        isolated_db.set_setting("worker_paused", "1")  # another process; no invalidation
-        after = pipeline_insights.analyze("pause-cache", [], use_cache=True)
-        cached = pipeline_insights.analyze("pause-cache", [], use_cache=True)
+        before = pipeline_insights.analyze("pause-cache", [], use_cache=False)
+        isolated_db.set_setting("worker_paused", "1")  # another process changes runtime state
+        pipeline_insights.invalidate_cache()
+        after = pipeline_insights.read_cached("pause-cache", [])
+        cached = pipeline_insights.read_cached("pause-cache", [])
 
         assert before["runtime"]["paused"] is False
         assert after["runtime"]["paused"] is True
-        assert cached is after
-        assert len(search_calls) == 2
+        assert cached["generated_at"] == after["generated_at"] == before["generated_at"]
+        assert len(search_calls) == 1
     finally:
         pipeline_insights.invalidate_cache()
 
 
-def test_external_pause_during_analysis_rejects_cache_publish(isolated_db, monkeypatch):
+def test_external_pause_during_analysis_keeps_last_good_with_live_pause_overlay(
+        isolated_db, monkeypatch):
     profile = {
         "title": "Example", "repository": "owner/example",
         "queues": [{
@@ -623,7 +1321,7 @@ def test_external_pause_during_analysis_rejects_cache_publish(isolated_db, monke
     def run_analysis():
         try:
             results.append(pipeline_insights.analyze(
-                "pause-during-analysis", [], use_cache=True))
+                "pause-during-analysis", [], use_cache=False))
         except BaseException as exc:  # preserve the worker-thread failure for the assertion
             errors.append(exc)
 
@@ -639,15 +1337,22 @@ def test_external_pause_during_analysis_rejects_cache_publish(isolated_db, monke
 
     try:
         assert entered_search.wait(5)
-        isolated_db.set_setting("worker_paused", "1")  # another process; no invalidation
+        isolated_db.set_setting("worker_paused", "1")  # another process changes runtime state
+        pipeline_insights.invalidate_cache()
         release_search.set()
         analysis.join(5)
         assert not analysis.is_alive()
         assert errors == []
         assert results[0]["runtime"]["paused"] is True
+        assert isolated_db.get_setting(
+            pipeline_insights._cache_key(
+                "pause-during-analysis",
+                pipeline_insights._profile_fingerprint(profile))) is not None
 
-        pipeline_insights.analyze("pause-during-analysis", [], use_cache=True)
-        assert len(search_calls) == 2
+        cached = pipeline_insights.read_cached("pause-during-analysis", [])
+        assert cached["runtime"]["paused"] is True
+        assert cached["generated_at"] == results[0]["generated_at"]
+        assert len(search_calls) == 1
     finally:
         release_search.set()
         analysis.join(5)
@@ -664,7 +1369,8 @@ def test_paused_pipeline_is_not_background_sampled():
 
 
 def test_global_pause_skips_background_pipeline_sampling(isolated_db, monkeypatch):
-    profile = {"queues": [{"series_contains": "Example - REVIEW"}]}
+    profile = {"always_sample": True,
+               "queues": [{"series_contains": "Example - REVIEW"}]}
     active = [{"title": "Example - REVIEW", "paused": False, "ended": False}]
     calls = []
     monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"example": profile})
@@ -678,6 +1384,28 @@ def test_global_pause_skips_background_pipeline_sampling(isolated_db, monkeypatc
 
     assert result == {}
     assert calls == []
+
+
+def test_sampler_rechecks_pause_after_analysis_before_wake(isolated_db, monkeypatch):
+    profile = {"always_sample": True, "queues": []}
+    calls = []
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"example": profile})
+
+    def analyze(*_args, **_kwargs):
+        calls.append("analyze")
+        isolated_db.set_setting("worker_paused", "1")
+        return {"diagnostics": {}}
+
+    monkeypatch.setattr(pipeline_insights, "analyze", analyze)
+    monkeypatch.setattr(
+        pipeline_insights, "_wake_ready_queues",
+        lambda *_args, **_kwargs: calls.append("wake") or [],
+    )
+
+    result = pipeline_insights.sample_active_profiles([])
+
+    assert result == {"example": "paused"}
+    assert calls == ["analyze"]
 
 
 def test_pipeline_insights_exposes_actual_series_task_status(isolated_db, monkeypatch):
@@ -829,9 +1557,9 @@ def test_dispatch_gate_completes_empty_queue_without_provider(isolated_db, monke
         }],
     }
     monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"example": profile})
-    monkeypatch.setattr(pipeline_insights, "analyze", lambda *args, **kwargs: {
+    monkeypatch.setattr(pipeline_insights, "read_cached", lambda *args, **kwargs: {
         "queues": [{"id": "triage", "title": "Triage", "backlog": 0}],
-        "diagnostics": {},
+        "diagnostics": {}, "cache": {"stale": False, "complete": True},
     })
 
     gate = pipeline_insights.dispatch_gate(task)
@@ -854,16 +1582,38 @@ def test_dispatch_gate_reuses_recent_pipeline_snapshot(isolated_db, monkeypatch)
     }
     calls = []
     monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"example": profile})
-    monkeypatch.setattr(pipeline_insights, "analyze", lambda *args, **kwargs: (
-        calls.append(kwargs) or {
+    monkeypatch.setattr(pipeline_insights, "read_cached", lambda *args, **kwargs: (
+        calls.append((args, kwargs)) or {
             "queues": [{"id": "triage", "title": "Triage", "backlog": 0}],
-            "diagnostics": {},
+            "diagnostics": {}, "cache": {"stale": False, "complete": True},
         }
     ))
 
     pipeline_insights.dispatch_gate(task)
 
-    assert calls == [{"use_cache": True}]
+    assert len(calls) == 1
+    assert calls[0][1] == {}
+
+
+def test_dispatch_gate_ignores_stale_empty_snapshot(isolated_db, monkeypatch):
+    task = isolated_db.create_task(TaskCreate(
+        prompt="ExampleProject - TRIAGE", recurrence="4h",
+    ))
+    profile = {
+        "title": "Example", "repository": "owner/example",
+        "queues": [{
+            "id": "triage", "title": "Triage", "query": "is:issue",
+            "series_contains": "ExampleProject - TRIAGE",
+            "dispatch_gate": {"skip_when_empty": True},
+        }],
+    }
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"example": profile})
+    monkeypatch.setattr(pipeline_insights, "read_cached", lambda *args, **kwargs: {
+        "queues": [{"id": "triage", "title": "Triage", "backlog": 0}],
+        "diagnostics": {}, "cache": {"stale": True, "complete": True},
+    })
+
+    assert pipeline_insights.dispatch_gate(task) is None
 
 
 def test_dispatch_gate_defers_dependency_without_provider(isolated_db, monkeypatch):
@@ -882,9 +1632,10 @@ def test_dispatch_gate_defers_dependency_without_provider(isolated_db, monkeypat
         }],
     }
     monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"example": profile})
-    monkeypatch.setattr(pipeline_insights, "analyze", lambda *args, **kwargs: {
+    monkeypatch.setattr(pipeline_insights, "read_cached", lambda *args, **kwargs: {
         "queues": [{"id": "merge", "title": "Merge", "backlog": 3}],
         "diagnostics": {"review_candidates": [{"number": 42}]},
+        "cache": {"stale": False, "complete": True},
     })
 
     gate = pipeline_insights.dispatch_gate(task)
@@ -917,9 +1668,10 @@ def test_dispatch_gate_defers_only_matching_diagnostic_stages(isolated_db, monke
         {"number": 42, "stage": "legacy-integration-review"},
         {"number": 43, "stage": "integration-merge-ready"},
     ]}
-    monkeypatch.setattr(pipeline_insights, "analyze", lambda *args, **kwargs: {
+    monkeypatch.setattr(pipeline_insights, "read_cached", lambda *args, **kwargs: {
         "queues": [{"id": "merge", "title": "Merge", "backlog": 2}],
         "diagnostics": diagnostics,
+        "cache": {"stale": False, "complete": True},
     })
 
     gate = pipeline_insights.dispatch_gate(task)
@@ -933,7 +1685,7 @@ def test_dispatch_gate_defers_only_matching_diagnostic_stages(isolated_db, monke
     assert pipeline_insights.dispatch_gate(task) is None
 
 
-def test_productive_completion_wakes_every_ready_stage(monkeypatch):
+def test_productive_completion_wakes_every_ready_stage(isolated_db, monkeypatch):
     profile = {
         "title": "Example", "repository": "owner/example",
         "queues": [
@@ -951,16 +1703,18 @@ def test_productive_completion_wakes_every_ready_stage(monkeypatch):
     ]
     monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"example": profile})
     monkeypatch.setattr(pipeline_insights.db, "list_series", lambda: series)
-    monkeypatch.setattr(pipeline_insights, "analyze", lambda *args, **kwargs: {
-        "diagnostics": {
-            "review_candidates": [{"number": 42}],
-            "integration_owner": {"number": 10, "stage": "integration-merge-ready"},
-        },
-    })
+    monkeypatch.setattr(pipeline_insights.db, "is_paused", lambda: False)
+    diagnostics = {
+        "review_candidates": [{"number": 42}],
+        "integration_owner": {"number": 10, "stage": "integration-merge-ready"},
+    }
+    data = _fresh_cache_data("example", profile, diagnostics)
+    monkeypatch.setattr(
+        pipeline_insights, "analyze", lambda *args, **kwargs: data)
     calls = []
     monkeypatch.setattr(
         pipeline_insights.db, "wake_series_once",
-        lambda series_id, key, fingerprint: calls.append(
+        lambda series_id, key, fingerprint, **_kwargs: calls.append(
             (series_id, key, fingerprint)) or True,
     )
     task = SimpleNamespace(series_id=1, series_title="Example - FIX", prompt="Example - FIX")
@@ -970,6 +1724,52 @@ def test_productive_completion_wakes_every_ready_stage(monkeypatch):
         (7, "pipeline_wake:example:review"),
         (8, "pipeline_wake:example:merge"),
     ]
+
+
+def test_productive_completion_does_not_scan_or_wake_during_global_pause(monkeypatch):
+    profile = {
+        "title": "Example", "repository": "owner/example",
+        "queues": [{"id": "fix", "series_contains": "Example - FIX"}],
+    }
+    task = SimpleNamespace(
+        series_id=1, series_title="Example - FIX", prompt="Example - FIX")
+    calls = []
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"example": profile})
+    monkeypatch.setattr(pipeline_insights.db, "is_paused", lambda: True)
+    monkeypatch.setattr(
+        pipeline_insights, "analyze",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    assert pipeline_insights.after_task_completed(task, "ГОТОВО") == []
+    assert calls == []
+
+
+def test_productive_completion_rechecks_pause_after_analysis_before_wake(
+        isolated_db, monkeypatch):
+    profile = {
+        "title": "Example", "repository": "owner/example",
+        "queues": [{"id": "fix", "series_contains": "Example - FIX"}],
+    }
+    task = SimpleNamespace(
+        series_id=1, series_title="Example - FIX", prompt="Example - FIX")
+    calls = []
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"example": profile})
+    monkeypatch.setattr(pipeline_insights.db, "list_series", lambda: [])
+
+    def analyze(*_args, **_kwargs):
+        calls.append("analyze")
+        isolated_db.set_setting("worker_paused", "1")
+        return {"diagnostics": {}}
+
+    monkeypatch.setattr(pipeline_insights, "analyze", analyze)
+    monkeypatch.setattr(
+        pipeline_insights, "_wake_ready_queues",
+        lambda *_args, **_kwargs: calls.append("wake") or [],
+    )
+
+    assert pipeline_insights.after_task_completed(task, "ГОТОВО") == []
+    assert calls == ["analyze"]
 
 
 def test_wakeup_skips_empty_paused_and_nonproductive_runs(monkeypatch):
@@ -995,7 +1795,7 @@ def test_wakeup_skips_empty_paused_and_nonproductive_runs(monkeypatch):
     calls = []
     monkeypatch.setattr(
         pipeline_insights.db, "wake_series_once",
-        lambda series_id, key, fingerprint: calls.append(
+        lambda series_id, key, fingerprint, **_kwargs: calls.append(
             (series_id, key, fingerprint)) or True,
     )
     monkeypatch.setattr(pipeline_insights.db, "delete_setting", lambda _key: None)
@@ -1028,14 +1828,122 @@ def test_wake_fingerprint_changes_only_when_matched_work_changes():
 
 
 def test_series_wake_latch_suppresses_unchanged_snapshot(isolated_db):
+    profile = {
+        "title": "Example", "repository": "owner/example",
+        "queues": [{
+            "id": "review", "title": "Review", "capacity": 1,
+            "query": "is:pr", "series_contains": "REVIEW",
+        }],
+    }
+    data = _fresh_cache_data("example", profile)
+    guard = pipeline_insights._wake_cache_guard(
+        "example", profile, data["cache"])
     task = isolated_db.create_task(TaskCreate(
         prompt="Example - REVIEW", recurrence="4h",
     ))
     series_id = task.series_id
 
-    assert isolated_db.wake_series_once(series_id, "wake:test", "snapshot-a")
-    assert not isolated_db.wake_series_once(series_id, "wake:test", "snapshot-a")
-    assert isolated_db.wake_series_once(series_id, "wake:test", "snapshot-b")
+    assert isolated_db.wake_series_once(
+        series_id, "wake:test", "snapshot-a", cache_guard=guard)
+    assert not isolated_db.wake_series_once(
+        series_id, "wake:test", "snapshot-a", cache_guard=guard)
+    assert isolated_db.wake_series_once(
+        series_id, "wake:test", "snapshot-b", cache_guard=guard)
+
+
+def test_pipeline_wake_checks_pause_atomically_at_mutation(
+        isolated_db, monkeypatch):
+    scheduled = datetime.now(timezone.utc) + timedelta(hours=3)
+    task = isolated_db.create_task(TaskCreate(
+        prompt="Example - REVIEW", recurrence="4h", scheduled_at=scheduled))
+    series = isolated_db.list_series()
+    profile = {
+        "title": "Example", "repository": "owner/example",
+        "queues": [{
+            "id": "review", "title": "Review", "capacity": 1,
+            "query": "is:pr", "series_contains": "REVIEW",
+            "wake_when": {"field": "review_candidates"},
+        }],
+    }
+    data = _fresh_cache_data(
+        "example", profile, {"review_candidates": [{"number": 42}]})
+    real_wake = isolated_db.wake_series_once
+    calls = []
+
+    def pause_between_check_and_write(
+            series_id, latch_key, fingerprint, *, cache_guard):
+        calls.append("mutation")
+        isolated_db.set_setting("worker_paused", "1")
+        return real_wake(
+            series_id, latch_key, fingerprint, cache_guard=cache_guard)
+
+    monkeypatch.setattr(
+        pipeline_insights.db, "wake_series_once", pause_between_check_and_write)
+
+    assert pipeline_insights._wake_ready_queues(
+        "example", profile, data, series) == []
+    assert calls == ["mutation"]
+    assert isolated_db.get_task(task.id).scheduled_at == task.scheduled_at
+    assert isolated_db.get_setting("pipeline_wake:example:review") is None
+
+
+def test_pipeline_wake_keeps_latch_and_task_when_cache_token_changes(
+        isolated_db):
+    scheduled = datetime.now(timezone.utc) + timedelta(hours=3)
+    task = isolated_db.create_task(TaskCreate(
+        prompt="Example - REVIEW", recurrence="4h", scheduled_at=scheduled))
+    profile = {
+        "title": "Example", "repository": "owner/example",
+        "queues": [{
+            "id": "review", "title": "Review", "capacity": 1,
+            "query": "is:pr", "series_contains": "REVIEW",
+        }],
+    }
+    first = _fresh_cache_data("example", profile)
+    stale_guard = pipeline_insights._wake_cache_guard(
+        "example", profile, first["cache"])
+    isolated_db.set_setting("pipeline_wake:example:review", "snapshot-old")
+    _fresh_cache_data("example", profile)  # advances the accepted revision
+
+    assert not isolated_db.wake_series_once(
+        None, "pipeline_wake:example:review", None,
+        cache_guard=stale_guard)
+    assert not isolated_db.wake_series_once(
+        task.series_id, "pipeline_wake:example:review", "snapshot-new",
+        cache_guard=stale_guard)
+    assert isolated_db.get_setting(
+        "pipeline_wake:example:review") == "snapshot-old"
+    assert isolated_db.get_task(task.id).scheduled_at == task.scheduled_at
+
+
+def test_pipeline_wake_rejects_stale_or_partial_analysis(monkeypatch):
+    profile = {
+        "queues": [{
+            "id": "review", "series_contains": "REVIEW",
+            "wake_when": {"field": "review_candidates"},
+        }],
+    }
+    series = [{
+        "id": 7, "title": "Example - REVIEW",
+        "paused": False, "ended": False,
+    }]
+    calls = []
+    monkeypatch.setattr(pipeline_insights.db, "is_paused", lambda: False)
+    monkeypatch.setattr(
+        pipeline_insights.db, "wake_series_once",
+        lambda *_args: calls.append("wake") or True,
+    )
+    diagnostics = {"review_candidates": [{"number": 42}]}
+
+    assert pipeline_insights._wake_ready_queues(
+        "example", profile,
+        {"cache": {"stale": True, "complete": True},
+         "diagnostics": diagnostics}, series) == []
+    assert pipeline_insights._wake_ready_queues(
+        "example", profile,
+        {"cache": {"stale": False, "complete": False},
+         "diagnostics": diagnostics}, series) == []
+    assert calls == []
 
 
 def test_worker_wakes_pipeline_only_after_next_recurrence_exists(monkeypatch):
@@ -1415,8 +2323,10 @@ def test_pipeline_insights_history_is_profile_scoped_and_tracks_movement(isolate
     }
     monkeypatch.setattr(pipeline_insights, "_github_search",
                         lambda repo, query: responses[query])
+    profile_hash = pipeline_insights._profile_fingerprint(profile)
     old = {
         "captured_at": (datetime.now(timezone.utc) - timedelta(hours=6)).isoformat(),
+        "profile_hash": profile_hash,
         "queues": {
             "build": {"backlog": 2, "membership_complete": True, "items": [
                 {"key": "issue:1"}, {"key": "issue:2"}]},
@@ -1425,6 +2335,20 @@ def test_pipeline_insights_history_is_profile_scoped_and_tracks_movement(isolate
     }
     isolated_db.add_pipeline_snapshot(
         "other", "owner/other", old, datetime.now(timezone.utc) - timedelta(hours=6))
+    wrong_profile = {**profile, "target_clear_hours": 12}
+    wrong = {
+        "captured_at": (
+            datetime.now(timezone.utc) - timedelta(hours=5, minutes=45)
+        ).isoformat(),
+        "profile_hash": pipeline_insights._profile_fingerprint(wrong_profile),
+        "queues": {
+            "build": {"backlog": 100, "membership_complete": True, "items": []},
+            "review": {"backlog": 100, "membership_complete": True, "items": []},
+        },
+    }
+    isolated_db.add_pipeline_snapshot(
+        "other", "owner/other", wrong,
+        datetime.now(timezone.utc) - timedelta(hours=5, minutes=45))
     pipeline_insights._cache.clear()
 
     result = pipeline_insights.analyze("other", [], use_cache=False)
@@ -1438,7 +2362,7 @@ def test_pipeline_insights_history_is_profile_scoped_and_tracks_movement(isolate
     assert result["history"]["5h"]["transitions"] == 1
     assert result["history"]["168h"]["complete"] is False
     assert result["history"]["720h"]["complete"] is False
-    assert len(isolated_db.list_pipeline_snapshots("other")) == 2
+    assert len(isolated_db.list_pipeline_snapshots("other")) == 3
     assert isolated_db.list_pipeline_snapshots("unrelated") == []
 
 

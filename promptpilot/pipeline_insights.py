@@ -1,5 +1,6 @@
 """Profile-driven, token-free diagnostics for external GitHub pipelines."""
 
+import copy
 import hashlib
 import json
 import math
@@ -23,6 +24,12 @@ _cache = {}
 _locks: dict[str, threading.Lock] = {}
 _cache_state_lock = threading.Lock()
 _cache_generation = 0
+_CACHE_TTL_SECONDS = 300
+_CACHE_SCHEMA_VERSION = 1
+_CACHE_EPOCH_KEY = "pipeline_insights_cache_epoch:v1"
+_CACHE_KEY_PREFIX = "pipeline_insights_cache:v1:"
+_CACHE_REFRESH_REVISION_PREFIX = "pipeline_insights_refresh_revision:v1:"
+_CACHE_PUBLISHED_REVISION_PREFIX = "pipeline_insights_published_revision:v1:"
 _INTERVAL_PRESETS = ((0.25, "15m"), (0.5, "30m"), (1, "1h"), (2, "2h"),
                      (4, "4h"), (8, "8h"), (12, "12h"), (24, "24h"))
 _HISTORY_WINDOWS = (5, 24, 24 * 7, 24 * 30)
@@ -33,6 +40,11 @@ _DEFAULT_PRIORITY_RULES = (
     ({"enhancement", "documentation"}, 2, "planned change"),
     ({"question"}, 3, "question"),
 )
+
+
+class _GitHubScanPaused(RuntimeError):
+    """A multi-request GitHub observation stopped at a page boundary."""
+
 
 def _profiles() -> dict:
     """Load user-owned profiles; PromptPilot ships without project-specific data."""
@@ -50,17 +62,114 @@ def list_profiles() -> list[dict]:
 
 
 def _cache_snapshot(profile_id: str) -> tuple[object | None, int]:
-    """Read one entry and the generation guarding an eventual cache write."""
+    """Read one entry and the process generation guarding an eventual write."""
     with _cache_state_lock:
         return _cache.get(profile_id), _cache_generation
 
 
-def _cache_is_fresh(cached: object | None, paused: bool) -> bool:
-    """Accept cached dashboard state only while its durable pause state matches."""
-    if not cached or time.time() - cached[0] >= 300:
+def _cache_namespace_prefix(profile_id: str) -> str:
+    return f"{_CACHE_KEY_PREFIX}{quote(profile_id, safe='')}:"
+
+
+def _legacy_cache_key(profile_id: str) -> str:
+    """Key used by the first durable-cache build before fingerprint namespaces."""
+    return f"{_CACHE_KEY_PREFIX}{profile_id}"
+
+
+def _cache_key(profile_id: str, profile_hash: str) -> str:
+    return f"{_cache_namespace_prefix(profile_id)}{profile_hash}"
+
+
+def _refresh_revision_key(profile_id: str) -> str:
+    return f"{_CACHE_REFRESH_REVISION_PREFIX}{profile_id}"
+
+
+def _published_revision_key(profile_id: str, profile_hash: str) -> str:
+    return (f"{_CACHE_PUBLISHED_REVISION_PREFIX}"
+            f"{quote(profile_id, safe='')}:{profile_hash}")
+
+
+def _profile_fingerprint(profile: dict) -> str:
+    encoded = json.dumps(
+        profile, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":"), default=str,
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _cache_epoch() -> int:
+    try:
+        return max(0, int(db.get_setting(_CACHE_EPOCH_KEY, "0")))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _cache_matches_profile(result: object, profile_id: str, profile: dict) -> bool:
+    if not isinstance(result, dict):
         return False
-    runtime = cached[1].get("runtime")
-    return isinstance(runtime, dict) and runtime.get("paused") is paused
+    if (result.get("profile_id") != profile_id
+            or result.get("repository") != profile.get("repository")):
+        return False
+    cached_queues = result.get("queues")
+    if not isinstance(cached_queues, list):
+        return False
+    expected_ids = {str(queue.get("id")) for queue in profile.get("queues", [])}
+    actual_ids = {str(queue.get("id")) for queue in cached_queues
+                  if isinstance(queue, dict)}
+    return expected_ids == actual_ids and len(actual_ids) == len(cached_queues)
+
+
+def _decode_durable_cache(profile_id: str, profile: dict,
+                          raw: str | None) -> tuple | None:
+    profile_hash = _profile_fingerprint(profile)
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+        if payload.get("version") != _CACHE_SCHEMA_VERSION:
+            return None
+        if payload.get("profile_hash") != profile_hash:
+            return None
+        result = payload.get("result")
+        if not _cache_matches_profile(result, profile_id, profile):
+            return None
+        generated_at = float(payload.get("generated_at", result.get("generated_at")))
+        epoch = max(0, int(payload.get("epoch", 0)))
+        revision = max(0, int(payload.get("revision", 0)))
+        return generated_at, result, epoch, profile_hash, revision
+    except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _cached_entry(
+        profile_id: str, profile: dict) -> tuple[tuple | None, str | None, int]:
+    """Load one coherent full-cache payload, revision and invalidation epoch."""
+    cached, generation = _cache_snapshot(profile_id)
+    profile_hash = _profile_fingerprint(profile)
+    cache_key = _cache_key(profile_id, profile_hash)
+    revision_key = _published_revision_key(profile_id, profile_hash)
+    settings = db.get_settings_snapshot(
+        [cache_key, revision_key, _CACHE_EPOCH_KEY])
+    try:
+        current_epoch = max(0, int(settings.get(_CACHE_EPOCH_KEY, "0")))
+    except (TypeError, ValueError):
+        current_epoch = 0
+    try:
+        published_revision = max(0, int(settings.get(revision_key, "0")))
+    except (TypeError, ValueError):
+        published_revision = 0
+    if (cached and len(cached) >= 5 and cached[3] == profile_hash
+            and int(cached[4]) == published_revision
+            and _cache_matches_profile(cached[1], profile_id, profile)):
+        return cached, "memory", current_epoch
+    durable = _decode_durable_cache(
+        profile_id, profile, settings.get(cache_key))
+    if durable is None or int(durable[4]) != published_revision:
+        return None, None, current_epoch
+    with _cache_state_lock:
+        if generation == _cache_generation:
+            _cache[profile_id] = durable
+    return durable, "durable", current_epoch
 
 
 def _profile_lock(profile_id: str) -> threading.Lock:
@@ -70,26 +179,45 @@ def _profile_lock(profile_id: str) -> threading.Lock:
         return _locks.setdefault(profile_id, threading.Lock())
 
 
-def _publish_cache(profile_id: str, generation: int, paused: bool,
-                   result: dict) -> bool:
-    """Publish only if local generation and durable pause state stayed stable."""
-    current_paused = db.is_paused()
-    runtime = result.get("runtime")
-    if (current_paused is not paused
-            or not isinstance(runtime, dict)
-            or runtime.get("paused") is not current_paused):
-        return False
+def _publish_cache(profile_id: str, profile: dict, generation: int, epoch: int,
+                   revision: int, result: dict) -> bool:
+    """Atomically publish a complete last-good response if still current."""
     with _cache_state_lock:
         if generation != _cache_generation:
             return False
-        _cache[profile_id] = (time.time(), result)
+        profile_hash = _profile_fingerprint(profile)
+        generated_at = float(result["generated_at"])
+        payload = json.dumps({
+            "version": _CACHE_SCHEMA_VERSION,
+            "profile_id": profile_id,
+            "repository": result.get("repository"),
+            "generated_at": generated_at,
+            "epoch": epoch,
+            "revision": revision,
+            "profile_hash": profile_hash,
+            "result": result,
+        }, ensure_ascii=False, separators=(",", ":"))
+        if not db.set_setting_if_newer_revision(
+                _cache_key(profile_id, profile_hash), payload,
+                revision_key=_published_revision_key(profile_id, profile_hash),
+                revision=revision,
+                guard_key=_CACHE_EPOCH_KEY, expected_guard=str(epoch),
+                guard_default="0"):
+            return False
+        _cache[profile_id] = (
+            generated_at, result, epoch, profile_hash, revision)
         return True
 
 
-def _discard_cache(profile_id: str | None = None) -> None:
+def _discard_cache(profile_id: str | None = None, *,
+                   invalidate_durable: bool = True) -> None:
     global _cache_generation
     with _cache_state_lock:
         _cache_generation += 1
+        if invalidate_durable:
+            # Keep the last expensive snapshot available, but make its
+            # staleness durable across every server/bot process and restart.
+            db.increment_int_setting(_CACHE_EPOCH_KEY)
         if profile_id is None:
             _cache.clear()
         else:
@@ -97,8 +225,12 @@ def _discard_cache(profile_id: str | None = None) -> None:
 
 
 def invalidate_cache() -> None:
-    """Discard cached dashboard state and reject already-running publishers."""
-    _discard_cache()
+    """Clear process-local views after pause changes; saved GitHub data survives."""
+    # Pause is only a local runtime projection over external queue data. Do not
+    # advance either generation: a complete refresh already in flight remains
+    # valid and must still become the durable last-good snapshot.
+    with _cache_state_lock:
+        _cache.clear()
 
 
 def _gh_executable() -> str:
@@ -124,6 +256,8 @@ def _github_search(repository: str, query: str) -> dict:
                 (run.stderr or run.stdout or "gh api завершился с ошибкой").strip())
         return json.loads(run.stdout)
 
+    if db.is_paused():
+        raise _GitHubScanPaused("pipeline scan interrupted by global pause")
     payload = fetch_page(1)
     total = int(payload.get("total_count", len(payload.get("items", []))))
     raw_items = list(payload.get("items", []))
@@ -131,6 +265,10 @@ def _github_search(repository: str, query: str) -> dict:
     # movement metrics exact for ordinary queues instead of silently sampling 100.
     exposed_total = min(total, 1000)
     for page in range(2, math.ceil(exposed_total / 100) + 1):
+        # Page 1 may have been in flight when pause was enabled. It is safe to
+        # finish that request, but never start another page from a partial scan.
+        if db.is_paused():
+            raise _GitHubScanPaused("pipeline scan interrupted by global pause")
         page_items = fetch_page(page).get("items", [])
         raw_items.extend(page_items)
         if len(page_items) < 100:
@@ -464,7 +602,13 @@ def dispatch_gate(task) -> dict | None:
             # mutation is still protected by the project's own fresh gate.
             # Reuse the five-minute snapshot so several due stages cannot each
             # spend hundreds of GitHub requests on the same queue state.
-            data = analyze(profile_id, db.list_series(), use_cache=True)
+            data = read_cached(profile_id, db.list_series())
+            cache = data.get("cache") or {}
+            # A stale/partial empty snapshot must never complete a live stage as
+            # empty, and stale diagnostics must not defer it. The project-owned
+            # preflight remains the authoritative fallback.
+            if cache.get("stale") or not cache.get("complete"):
+                return None
             queue = next((item for item in data["queues"]
                           if item["id"] == queue_config["id"]), None)
             if config.get("skip_when_empty") and queue and queue["backlog"] == 0:
@@ -578,12 +722,44 @@ def _wake_status(profile_id: str, queue: dict, diagnostics: dict) -> dict | None
     }
 
 
+def _wake_cache_guard(profile_id: str, profile: dict,
+                      cache: dict) -> dict | None:
+    token = cache.get("token")
+    profile_hash = _profile_fingerprint(profile)
+    if (not isinstance(token, dict)
+            or token.get("profile_hash") != profile_hash):
+        return None
+    try:
+        return {
+            "cache_key": _cache_key(profile_id, profile_hash),
+            "revision_key": _published_revision_key(profile_id, profile_hash),
+            "epoch_key": _CACHE_EPOCH_KEY,
+            "epoch": int(token["epoch"]),
+            "revision": int(token["revision"]),
+            "profile_hash": profile_hash,
+            "generated_at": float(token["generated_at"]),
+            "ttl_seconds": _CACHE_TTL_SECONDS,
+        }
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 def _wake_ready_queues(profile_id: str, profile: dict, data: dict,
                        series: list[dict]) -> list[str]:
-    """Wake configured queues whose project-owned diagnostics say work is ready."""
+    """Wake queues only while the accepted full-cache token is still current."""
+    cache = data.get("cache") or {}
+    if cache.get("stale") or cache.get("complete") is not True:
+        return []
+    cache_guard = _wake_cache_guard(profile_id, profile, cache)
+    if cache_guard is None:
+        return []
+    if db.is_paused():
+        return []
     diagnostics = data.get("diagnostics") or {}
     woken = []
     for queue in profile.get("queues", []):
+        if db.is_paused():
+            break
         condition = queue.get("wake_when")
         marker = str(queue.get("series_contains") or "").lower()
         if not isinstance(condition, dict) or not marker:
@@ -591,13 +767,15 @@ def _wake_ready_queues(profile_id: str, profile: dict, data: dict,
         latch_key = _wake_latch_key(profile_id, str(queue.get("id")))
         fingerprint = _wake_fingerprint(diagnostics, condition)
         if fingerprint is None:
-            db.delete_setting(latch_key)
+            db.wake_series_once(
+                None, latch_key, None, cache_guard=cache_guard)
             continue
         target = next((item for item in series
                        if marker in str(item.get("title", "")).lower()
                        and not item.get("ended") and not item.get("paused")), None)
         if target and db.wake_series_once(
-                int(target["id"]), latch_key, fingerprint):
+                int(target["id"]), latch_key, fingerprint,
+                cache_guard=cache_guard):
             woken.append(str(queue.get("id")))
     return woken
 
@@ -609,13 +787,23 @@ def after_task_completed(task, verdict: str | None) -> list[str]:
     matched = _matching_queue(task)
     if matched is None:
         return []
+    # A global pause is also a GitHub-I/O barrier. A task that was already
+    # running may finish during a drain, but its completion must not launch the
+    # expensive cross-repository analysis. Resume/sampler will refresh later.
+    if db.is_paused():
+        return []
     profile_id, profile, _queue = matched
     series = db.list_series()
     # A productive stage changes the GitHub protocol state. Refresh the project
     # checker once here so the next stage is woken immediately; routine sampler
     # and dispatch reads can then share that result.
     data = analyze(profile_id, series, use_cache=False, refresh_diagnostics=True)
-    return _wake_ready_queues(profile_id, profile, data, series)
+    if db.is_paused():
+        return []
+    current_profile = _profiles().get(profile_id)
+    if current_profile is None:
+        return []
+    return _wake_ready_queues(profile_id, current_profile, data, series)
 
 
 def _expanded_command(values, stage: str) -> list[str] | None:
@@ -847,6 +1035,11 @@ def _execution_status(queue: dict, working_dir: str | None) -> dict:
     mode = str(execution.get("mode", "auto")).lower()
     if mode == "skill":
         return {"configured": mode, "effective": "skill", "available": None}
+    if db.is_paused():
+        return {
+            "configured": mode, "effective": mode, "available": None,
+            "reason": "проверка маршрута пропущена во время общей паузы",
+        }
     stage = str(execution.get("stage") or queue.get("id") or "").lower()
     command = _tool_command(execution, stage)
     available, reason = ((False, "execution.command не настроен") if command is None
@@ -984,8 +1177,9 @@ def _health(backlog: int, windows: dict, broken_series: int, paused_series: int 
 def _profile_active(profile: dict, series: list[dict]) -> bool:
     if profile.get("always_sample"):
         return True
-    # A paused pipeline must not spend GitHub quota merely to maintain charts.
-    # An explicit dashboard refresh still analyzes it on demand.
+    # Individually paused pipelines need no background samples. A global pause
+    # is enforced by sample_active_profiles() and analyze(), including profiles
+    # that opt into always_sample.
     titles = [item.get("title", "").lower() for item in series
               if not item.get("ended") and not item.get("paused")]
     return any(queue.get("series_contains", "").lower() in title
@@ -993,29 +1187,375 @@ def _profile_active(profile: dict, series: list[dict]) -> bool:
                if queue.get("series_contains"))
 
 
-def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True,
-            refresh_diagnostics: bool = False) -> dict:
-    cached, _ = _cache_snapshot(profile_id)
+def _series_for_queue(queue: dict, series: list[dict]) -> dict | None:
+    marker = str(queue.get("series_contains") or "").lower()
+    if not marker:
+        return None
+    return next((item for item in series
+                 if marker in str(item.get("title") or "").lower()), None)
+
+
+def _unknown_recommendation() -> dict:
+    return {
+        "recommended_interval": None, "eta_hours": None,
+        "recommendation": "нет сохранённого снимка GitHub — нажмите «Обновить»",
+        "avg_duration_seconds": None, "cycle_hours": None,
+        "throughput_per_hour": None,
+    }
+
+
+def _cache_metadata(source: str, generated_at: float | None,
+                    entry_epoch: int | None, entry_revision: int | None,
+                    current_epoch: int, profile_hash: str) -> dict:
+    age_seconds = None
+    if generated_at is not None:
+        age_seconds = max(0, round(time.time() - generated_at))
+    invalidated = entry_epoch is not None and entry_epoch != current_epoch
+    available = source != "none"
+    complete = source in {"live", "memory", "durable"}
+    token = ({
+        "profile_hash": profile_hash, "epoch": int(entry_epoch),
+        "revision": int(entry_revision), "generated_at": generated_at,
+    } if complete and entry_epoch is not None
+         and entry_revision is not None and generated_at is not None else None)
+    return {
+        "source": source,
+        "available": available,
+        "complete": complete,
+        "generated_at": generated_at,
+        "age_seconds": age_seconds,
+        "ttl_seconds": _CACHE_TTL_SECONDS,
+        "invalidated": invalidated,
+        "stale": (not available or age_seconds is None
+                  or age_seconds >= _CACHE_TTL_SECONDS or invalidated),
+        "profile_hash": profile_hash,
+        "token": token,
+    }
+
+
+def _refresh_local_state(result: dict, profile: dict, series: list[dict], *,
+                         source: str, generated_at: float | None,
+                         entry_epoch: int | None, entry_revision: int | None,
+                         current_epoch: int) -> dict:
+    """Overlay a saved GitHub snapshot with current, quota-free local state."""
+    data = copy.deepcopy(result)
+    now = datetime.now(timezone.utc)
+    diagnostics = data.get("diagnostics")
+    target_hours = float(profile.get("target_clear_hours", 8))
+    priority_settings = _priority_settings(profile)
+    queue_configs = {str(item.get("id")): item for item in profile.get("queues", [])}
+    matching_series = []
+    series_ids = []
+    broken_series = 0
+    paused_series = 0
+
+    for queue in data.get("queues", []):
+        config = queue_configs.get(str(queue.get("id")), {})
+        matching = _series_for_queue(config, series)
+        if matching:
+            matching_series.append(matching)
+            series_ids.append(int(matching["id"]))
+            broken_series += int(bool(matching.get("broken")))
+            paused_series += int(bool(matching.get("paused")))
+        queue.update({
+            "capacity": max(1, int(config.get("capacity", queue.get("capacity", 1)))),
+            "series_id": matching["id"] if matching else None,
+            "task_id": matching.get("next_task_id") if matching else None,
+            "task_status": matching.get("next_status") if matching else None,
+            "interval": matching.get("effective_recurrence") if matching else None,
+            "failure_rate": matching.get("failure_rate") if matching else None,
+            "empty_rate": matching.get("empty_rate") if matching else None,
+        })
+        backlog = queue.get("backlog")
+        if isinstance(backlog, int):
+            queue["runs_needed"] = round(backlog / queue["capacity"], 1)
+            queue.update(_recommendation(
+                config, backlog, queue["capacity"], queue["interval"], target_hours,
+                matching.get("avg_duration_seconds") if matching else None,
+            ))
+        else:
+            queue["runs_needed"] = None
+            queue.update(_unknown_recommendation())
+        if not isinstance(queue.get("execution"), dict):
+            configured = str((config.get("execution") or {}).get("mode", "skill"))
+            queue["execution"] = {
+                "configured": configured, "effective": configured,
+                "available": None, "reason": "не проверяется при чтении снимка",
+            }
+        queue["wake"] = (_wake_status(data["profile_id"], config, diagnostics)
+                         if isinstance(diagnostics, dict) else None)
+
+    bottleneck = max(
+        (queue for queue in data.get("queues", [])
+         if isinstance(queue.get("backlog"), int)),
+        key=lambda queue: (queue["eta_hours"]
+                           if queue.get("eta_hours") is not None
+                           else queue["runs_needed"]),
+        default=None,
+    )
+    data["bottleneck"] = (
+        bottleneck["id"] if bottleneck and bottleneck.get("backlog") else None)
+
+    activity = db.pipeline_series_activity(series_ids)
+    empty_runs = db.pipeline_run_metrics([], now - timedelta(hours=5))
+    metrics_by_series = {}
+    aggregate_runs = dict(empty_runs)
+    for queue in data.get("queues", []):
+        queue["last_run"] = activity.get(queue.get("series_id"))
+        series_id = queue.get("series_id")
+        if series_id is not None and series_id not in metrics_by_series:
+            metrics = db.pipeline_run_metrics(
+                [series_id], now - timedelta(hours=5))
+            metrics_by_series[series_id] = metrics
+            for key, value in metrics.items():
+                aggregate_runs[key] = aggregate_runs.get(key, 0) + value
+        queue["runs_5h"] = metrics_by_series.get(series_id, dict(empty_runs))
+
+    history = data.get("history")
+    if not isinstance(history, dict):
+        history = {}
+        data["history"] = history
+    for hours in _HISTORY_WINDOWS:
+        key = f"{hours}h"
+        window = history.get(key)
+        if not isinstance(window, dict):
+            window = {
+                "hours": hours, "coverage_hours": 0, "complete": False,
+                "backlog_delta": 0, "entered": 0, "exited": 0, "moved": 0,
+                "transitions": 0, "churn_items": 0, "queue_deltas": {},
+            }
+            history[key] = window
+        if hours == 5:
+            window["runs"] = aggregate_runs
+        elif not isinstance(window.get("runs"), dict):
+            window["runs"] = dict(empty_runs)
+
+    runtime = _pipeline_runtime(matching_series, now)
+    backlog_total = data.get("backlog_total")
+    health = _health(
+        backlog_total if isinstance(backlog_total, int) else 0,
+        history, broken_series, paused_series, diagnostics, runtime,
+    )
+    if source == "none" and health.get("state") in {"green", "warming"}:
+        health = {
+            "state": "warming", "label": "нет снимка GitHub",
+            "reason": "данные ещё не загружены; нажмите «Обновить» для явного запроса",
+        }
+    data["runtime"] = runtime
+    data["health"] = health
+    data["target_clear_hours"] = target_hours
+    data["priority_control"] = ({
+        "levels": list(_PRIORITY_LEVELS),
+        "aging_hours": priority_settings["aging_hours"],
+        "manual_labels": priority_settings["manual_labels"],
+    } if priority_settings else None)
+    data["cache"] = _cache_metadata(
+        source, generated_at, entry_epoch, entry_revision, current_epoch,
+        _profile_fingerprint(profile))
+    return data
+
+
+def _snapshot_fallback(profile_id: str, profile: dict,
+                       series: list[dict], *,
+                       allow_legacy: bool) -> tuple[dict, float] | None:
+    """Rebuild a partial response from append-only snapshots made by older PP."""
+    try:
+        row = db.latest_pipeline_snapshot(
+            profile_id, profile_hash=_profile_fingerprint(profile),
+            allow_legacy=allow_legacy)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not row or row.get("repository") != profile.get("repository"):
+        return None
+    snapshot = row.get("payload")
+    if not isinstance(snapshot, dict) or not isinstance(snapshot.get("queues"), dict):
+        return None
+    captured = _parse_time(row.get("captured_at"))
+    if captured is None:
+        return None
+    now = datetime.now(timezone.utc)
+    target_hours = float(profile.get("target_clear_hours", 8))
+    priority_settings = _priority_settings(profile)
+    queues = []
+    all_items = {}
+    for config in profile.get("queues", []):
+        saved = snapshot["queues"].get(str(config.get("id")))
+        saved = saved if isinstance(saved, dict) else {}
+        backlog = saved.get("backlog")
+        backlog = int(backlog) if isinstance(backlog, (int, float)) else None
+        members = [item for item in saved.get("items", []) if isinstance(item, dict)]
+        for member in members:
+            if member.get("key"):
+                all_items[member["key"]] = member
+        matching = _series_for_queue(config, series)
+        capacity = max(1, int(config.get("capacity", 1)))
+        recommendation = (_recommendation(
+            config, backlog, capacity,
+            matching.get("effective_recurrence") if matching else None,
+            target_hours,
+            matching.get("avg_duration_seconds") if matching else None,
+        ) if isinstance(backlog, int) else _unknown_recommendation())
+        ordered_members = copy.deepcopy(members)
+        if priority_settings:
+            for member in ordered_members:
+                member["priority"] = _item_priority(member, priority_settings, now)
+            ordered_members.sort(key=lambda member: (
+                _PRIORITY_LEVELS.index(member["priority"]["level"]),
+                member.get("created_at") or "", member.get("number") or 0,
+            ))
+        queues.append({
+            "id": config["id"], "title": config["title"], "backlog": backlog,
+            "capacity": capacity,
+            "runs_needed": round(backlog / capacity, 1)
+            if isinstance(backlog, int) else None,
+            "membership_complete": bool(saved.get("membership_complete")),
+            "age": _age_stats(members, now),
+            "items": ordered_members[:priority_settings["max_items"]]
+            if priority_settings else [],
+            **recommendation,
+        })
+
+    backlog_values = [queue["backlog"] for queue in queues
+                      if isinstance(queue.get("backlog"), int)]
+    complete_backlog = len(backlog_values) == len(queues)
+    result = {
+        "profile_id": profile_id, "title": profile["title"],
+        "repository": profile["repository"], "queues": queues,
+        "target_clear_hours": target_hours,
+        "backlog_total": sum(backlog_values) if complete_backlog else None,
+        "age": _age_stats(list(all_items.values()), now),
+        # Reconstructing churn from thousands of legacy JSON rows would make a
+        # supposedly cheap read slow. The newest queue counts remain useful;
+        # a full background/explicit refresh restores precomputed trends.
+        "history": {}, "diagnostics": None,
+        "diagnostics_generated_at": None, "github_rate_limit": None,
+        "priority_control": ({
+            "levels": list(_PRIORITY_LEVELS),
+            "aging_hours": priority_settings["aging_hours"],
+            "manual_labels": priority_settings["manual_labels"],
+        } if priority_settings else None),
+        "bottleneck": None, "generated_at": captured.timestamp(),
+    }
+    if complete_backlog:
+        bottleneck = max(
+            queues,
+            key=lambda queue: queue["eta_hours"] if queue.get("eta_hours") is not None
+            else queue["runs_needed"],
+            default=None,
+        )
+        result["bottleneck"] = (
+            bottleneck["id"] if bottleneck and bottleneck["backlog"] else None)
+    return result, captured.timestamp()
+
+
+def _empty_cached_result(profile_id: str, profile: dict) -> dict:
+    return {
+        "profile_id": profile_id, "title": profile["title"],
+        "repository": profile["repository"],
+        "queues": [{
+            "id": config["id"], "title": config["title"], "backlog": None,
+            "capacity": max(1, int(config.get("capacity", 1))),
+            "runs_needed": None, "membership_complete": False,
+            "age": {"median_hours": None, "p90_hours": None, "oldest_hours": None},
+            "items": [], **_unknown_recommendation(),
+        } for config in profile.get("queues", [])],
+        "target_clear_hours": float(profile.get("target_clear_hours", 8)),
+        "backlog_total": None,
+        "age": {"median_hours": None, "p90_hours": None, "oldest_hours": None},
+        "history": None, "diagnostics": None,
+        "diagnostics_generated_at": None, "github_rate_limit": None,
+        "priority_control": None, "bottleneck": None, "generated_at": None,
+    }
+
+
+def read_cached(profile_id: str, series: list[dict]) -> dict:
+    """Return saved insights plus live local state without any GitHub request."""
     profiles = _profiles()
     if profile_id not in profiles:
         raise KeyError(profile_id)
-    paused = db.is_paused()
-    if use_cache and _cache_is_fresh(cached, paused):
-        return cached[1]
+    profile = profiles[profile_id]
+    # The payload/revision/epoch come from one SQLite snapshot. Re-read the
+    # epoch afterwards as a seqlock: invalidation during the load must either
+    # retry against the new epoch or return the old last-good explicitly stale.
+    cached = None
+    source = None
+    current_epoch = 0
+    for _attempt in range(3):
+        cached, source, snapshot_epoch = _cached_entry(profile_id, profile)
+        current_epoch = _cache_epoch()
+        if snapshot_epoch == current_epoch:
+            break
+    if cached:
+        return _refresh_local_state(
+            cached[1], profile, series, source=source or "memory",
+            generated_at=float(cached[0]), entry_epoch=int(cached[2]),
+            entry_revision=int(cached[4]), current_epoch=current_epoch,
+        )
+    # A full cache that no longer matches the complete profile fingerprint
+    # proves that query semantics changed. Do not reinterpret its legacy raw
+    # snapshot under the new profile; wait for an explicit successful refresh.
+    incompatible_full_cache = (
+        db.get_setting(_legacy_cache_key(profile_id)) is not None
+        or db.has_setting_prefix(_cache_namespace_prefix(profile_id))
+    )
+    # Exact-fingerprint raw history is safe even if another configuration has
+    # a full cache. Only the unnamespaced legacy rows become ambiguous once a
+    # fingerprinted full-cache namespace exists.
+    fallback = _snapshot_fallback(
+        profile_id, profile, series,
+        allow_legacy=not incompatible_full_cache)
+    if fallback:
+        result, generated_at = fallback
+        return _refresh_local_state(
+            result, profile, series, source="snapshot",
+            generated_at=generated_at, entry_epoch=None,
+            entry_revision=None, current_epoch=current_epoch,
+        )
+    return _refresh_local_state(
+        _empty_cached_result(profile_id, profile), profile, series,
+        source="none", generated_at=None, entry_epoch=None,
+        entry_revision=None, current_epoch=current_epoch,
+    )
+
+
+def _paused_cached(profile_id: str, series: list[dict]) -> dict:
+    result = read_cached(profile_id, series)
+    result["cache"]["refresh_blocked"] = "worker_paused"
+    return result
+
+
+def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True,
+            refresh_diagnostics: bool = False) -> dict:
+    profiles = _profiles()
+    if profile_id not in profiles:
+        raise KeyError(profile_id)
+    if use_cache:
+        return read_cached(profile_id, series)
+    if db.is_paused():
+        return _paused_cached(profile_id, series)
 
     lock = _profile_lock(profile_id)
     with lock:
-        cached, cache_generation = _cache_snapshot(profile_id)
-        paused = db.is_paused()
-        if use_cache and _cache_is_fresh(cached, paused):
-            return cached[1]
+        if db.is_paused():
+            return _paused_cached(profile_id, series)
+        # The profile file can change while this process waits for a refresh
+        # already in flight. Reload it before allocating this scan's revision.
+        profiles = _profiles()
+        if profile_id not in profiles:
+            raise KeyError(profile_id)
         profile = profiles[profile_id]
+        cached, _source, cache_epoch = _cached_entry(profile_id, profile)
+        _unused, cache_generation = _cache_snapshot(profile_id)
+        refresh_revision = db.increment_int_setting(
+            _refresh_revision_key(profile_id))
+        if db.is_paused():
+            return _paused_cached(profile_id, series)
         priority_settings = _priority_settings(profile)
         health_config = profile.get("health_check") or {}
         health_cache_seconds = max(0, int(health_config.get("cache_seconds", 1800)))
         diagnostics = None
         diagnostics_generated_at = None
-        if not refresh_diagnostics and cached:
+        if not refresh_diagnostics and cached and int(cached[2]) == cache_epoch:
             diagnostics_generated_at = cached[1].get("diagnostics_generated_at")
             cached_diagnostics = cached[1].get("diagnostics")
             effective_health_ttl = min(60, health_cache_seconds) if (
@@ -1027,6 +1567,8 @@ def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True,
         if diagnostics is None:
             diagnostics = _run_profile_health_check(profile)
             diagnostics_generated_at = time.time()
+        if db.is_paused():
+            return _paused_cached(profile_id, series)
         target_hours = float(profile.get("target_clear_hours", 8))
         now = datetime.now(timezone.utc)
         queues = []
@@ -1039,7 +1581,16 @@ def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True,
 
         for item in profile["queues"]:
             queries = item.get("queries") or [item["query"]]
-            searches = [_github_search(profile["repository"], query) for query in queries]
+            searches = []
+            for query in queries:
+                if db.is_paused():
+                    return _paused_cached(profile_id, series)
+                try:
+                    searches.append(_github_search(profile["repository"], query))
+                except _GitHubScanPaused:
+                    # Never reinterpret page 1 of an interrupted paginated
+                    # query as a complete queue observation.
+                    return _paused_cached(profile_id, series)
             backlog = sum(search["count"] for search in searches)
             members = {}
             for search in searches:
@@ -1107,11 +1658,19 @@ def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True,
                 "membership_complete": membership_complete,
             }
 
-        snapshot = {"captured_at": now.isoformat(), "queues": snapshot_queues}
-        db.add_pipeline_snapshot(profile_id, profile["repository"], snapshot, now)
-        db.prune_pipeline_snapshots(now - timedelta(days=31))
+        profile_hash = _profile_fingerprint(profile)
+        snapshot = {
+            "captured_at": now.isoformat(), "profile_hash": profile_hash,
+            "queues": snapshot_queues,
+        }
         history_rows = db.list_pipeline_snapshots(
             profile_id, since=now - timedelta(hours=max(_HISTORY_WINDOWS) + 1), limit=10000)
+        history_rows = [
+            row for row in history_rows
+            if isinstance(row.get("payload"), dict)
+            and row["payload"].get("profile_hash") == profile_hash
+        ]
+        history_rows.append({"captured_at": now.isoformat(), "payload": snapshot})
         windows = {f"{hours}h": _window_metrics(
             history_rows, snapshot, series_ids, now, hours) for hours in _HISTORY_WINDOWS}
 
@@ -1130,6 +1689,11 @@ def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True,
                 now - timedelta(hours=5),
             )
         runtime = _pipeline_runtime(matching_series, now)
+        if db.is_paused():
+            github_rate_limit = (cached[1].get("github_rate_limit")
+                                 if cached else None)
+        else:
+            github_rate_limit = _github_rate_limits()
         result = {
             "profile_id": profile_id, "title": profile["title"],
             "repository": profile["repository"], "queues": queues,
@@ -1140,7 +1704,7 @@ def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True,
                 backlog_total, windows, broken_series, paused_series, diagnostics, runtime),
             "diagnostics": diagnostics,
             "diagnostics_generated_at": diagnostics_generated_at,
-            "github_rate_limit": _github_rate_limits(),
+            "github_rate_limit": github_rate_limit,
             "runtime": runtime,
             "priority_control": ({
                 "levels": list(_PRIORITY_LEVELS),
@@ -1150,8 +1714,20 @@ def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True,
             "bottleneck": bottleneck["id"] if bottleneck and bottleneck["backlog"] else None,
             "generated_at": now.timestamp(),
         }
-        _publish_cache(profile_id, cache_generation, paused, result)
-        return result
+        published = _publish_cache(
+            profile_id, profile, cache_generation, cache_epoch,
+            refresh_revision, result)
+        if not published:
+            return read_cached(profile_id, series)
+        # Raw trend history records only observations that won the same CAS as
+        # the full cache. A rejected/stale writer must not poison later charts.
+        db.add_pipeline_snapshot(profile_id, profile["repository"], snapshot, now)
+        db.prune_pipeline_snapshots(now - timedelta(days=31))
+        return _refresh_local_state(
+            result, profile, series, source="live",
+            generated_at=float(result["generated_at"]), entry_epoch=cache_epoch,
+            entry_revision=refresh_revision, current_epoch=_cache_epoch(),
+        )
 
 
 def sample_active_profiles(series: list[dict]) -> dict[str, str]:
@@ -1164,7 +1740,15 @@ def sample_active_profiles(series: list[dict]) -> dict[str, str]:
             continue
         try:
             data = analyze(profile_id, series, use_cache=False)
-            woken = _wake_ready_queues(profile_id, profile, data, series)
+            if db.is_paused():
+                outcomes[profile_id] = "paused"
+                break
+            current_profile = _profiles().get(profile_id)
+            if current_profile is None:
+                outcomes[profile_id] = "profile removed"
+                continue
+            woken = _wake_ready_queues(
+                profile_id, current_profile, data, series)
             outcomes[profile_id] = "ok" + (f"; woken={','.join(woken)}" if woken else "")
         except Exception as exc:  # one external repository must not stop the sampler
             outcomes[profile_id] = str(exc)

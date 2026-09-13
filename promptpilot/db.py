@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import sqlite3
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -984,18 +985,82 @@ def series_action(series_id: int, action: str) -> bool:
         return True
 
 
-def wake_series_once(series_id: int, latch_key: str, fingerprint: str) -> bool:
+def _pipeline_cache_guard_matches(conn, guard: dict) -> bool:
+    """Validate one full-cache token inside an existing write transaction."""
+    try:
+        cache_key = str(guard["cache_key"])
+        revision_key = str(guard["revision_key"])
+        epoch_key = str(guard["epoch_key"])
+        expected_epoch = int(guard["epoch"])
+        expected_revision = int(guard["revision"])
+        expected_hash = str(guard["profile_hash"])
+        generated_at = float(guard["generated_at"])
+        ttl_seconds = max(0, int(guard["ttl_seconds"]))
+    except (KeyError, TypeError, ValueError):
+        return False
+    epoch = conn.execute(
+        "SELECT value FROM settings WHERE key = ?", (epoch_key,)
+    ).fetchone()
+    try:
+        current_epoch = int(epoch["value"]) if epoch else 0
+    except (TypeError, ValueError):
+        return False
+    if current_epoch != expected_epoch:
+        return False
+    revision = conn.execute(
+        "SELECT value FROM settings WHERE key = ?", (revision_key,)
+    ).fetchone()
+    try:
+        current_revision = int(revision["value"]) if revision else 0
+    except (TypeError, ValueError):
+        return False
+    if current_revision != expected_revision:
+        return False
+    cached = conn.execute(
+        "SELECT value FROM settings WHERE key = ?", (cache_key,)
+    ).fetchone()
+    if cached is None:
+        return False
+    try:
+        payload = json.loads(cached["value"])
+        payload_epoch = int(payload.get("epoch"))
+        payload_revision = int(payload.get("revision"))
+        payload_generated_at = float(payload.get("generated_at"))
+    except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+    if (payload.get("profile_hash") != expected_hash
+            or payload_epoch != expected_epoch
+            or payload_revision != expected_revision
+            or payload_generated_at != generated_at):
+        return False
+    return time.time() - generated_at < ttl_seconds
+
+
+def wake_series_once(series_id: Optional[int], latch_key: str,
+                     fingerprint: Optional[str], *, cache_guard: dict) -> bool:
     """Move one pending series task to now once per diagnostic fingerprint.
 
-    The settings check and task update share a transaction so the API sampler
-    and worker completion hook cannot both wake the same unchanged queue.
-    Manual ``run_now`` intentionally bypasses this latch.
+    The global-pause, latch and task checks share one immediate transaction so
+    the API sampler and worker completion hook cannot race each other or a
+    pause transition. Manual ``run_now`` intentionally bypasses this latch.
     """
-    with _connect() as conn:
+    with _connect(immediate=True) as conn:
+        paused = conn.execute(
+            "SELECT value FROM settings WHERE key = 'worker_paused'"
+        ).fetchone()
+        if paused and paused["value"] == "1":
+            return False
+        if not _pipeline_cache_guard_matches(conn, cache_guard):
+            return False
+        if fingerprint is None:
+            conn.execute("DELETE FROM settings WHERE key = ?", (latch_key,))
+            return False
         previous = conn.execute(
             "SELECT value FROM settings WHERE key = ?", (latch_key,),
         ).fetchone()
         if previous and previous["value"] == fingerprint:
+            return False
+        if series_id is None:
             return False
         series = conn.execute(
             "SELECT paused, ended_at FROM task_series WHERE id = ?", (series_id,),
@@ -1140,6 +1205,42 @@ def list_pipeline_snapshots(profile_id: str, since: Optional[datetime] = None,
              "payload": json.loads(row["payload_json"])} for row in rows]
 
 
+def latest_pipeline_snapshot(
+        profile_id: str, profile_hash: Optional[str] = None,
+        allow_legacy: bool = True) -> Optional[dict]:
+    """Return the newest matching durable queue observation for one profile."""
+    selected = None
+    legacy = None
+    with _connect() as conn:
+        rows = conn.execute(
+            """SELECT id, profile_id, repository, captured_at, payload_json
+               FROM pipeline_snapshots WHERE profile_id = ?
+               ORDER BY captured_at DESC, id DESC""",
+            (profile_id,),
+        )
+        for row in rows:
+            try:
+                payload = json.loads(row["payload_json"])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            snapshot_hash = payload.get("profile_hash") \
+                if isinstance(payload, dict) else None
+            if profile_hash is None or snapshot_hash == profile_hash:
+                selected = (row, payload)
+                break
+            if allow_legacy and snapshot_hash is None and legacy is None:
+                legacy = (row, payload)
+    selected = selected or legacy
+    if selected is None:
+        return None
+    row, payload = selected
+    return {
+        "id": row["id"], "profile_id": row["profile_id"],
+        "repository": row["repository"], "captured_at": row["captured_at"],
+        "payload": payload,
+    }
+
+
 def prune_pipeline_snapshots(before: datetime) -> int:
     """Bound local history; aggregated dashboard windows need no raw data forever."""
     with _connect() as conn:
@@ -1260,9 +1361,83 @@ def get_setting(key: str, default: str = None) -> Optional[str]:
         return row["value"] if row else default
 
 
+def get_settings_snapshot(keys: list[str]) -> dict[str, str]:
+    """Read several settings at one SQLite snapshot/linearization point."""
+    unique_keys = list(dict.fromkeys(str(key) for key in keys))
+    if not unique_keys:
+        return {}
+    marks = ",".join("?" for _ in unique_keys)
+    with _connect() as conn:
+        rows = conn.execute(
+            f"SELECT key, value FROM settings WHERE key IN ({marks})",
+            unique_keys,
+        ).fetchall()
+    return {str(row["key"]): str(row["value"]) for row in rows}
+
+
 def set_setting(key: str, value: str):
     with _connect() as conn:
         conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
+
+
+def has_setting_prefix(prefix: str) -> bool:
+    """Return whether any setting key starts with the exact literal prefix."""
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM settings WHERE substr(key, 1, ?) = ? LIMIT 1",
+            (len(prefix), prefix),
+        ).fetchone()
+    return row is not None
+
+
+def increment_int_setting(key: str, default: int = 0) -> int:
+    """Atomically increment an integer setting shared by all PP processes."""
+    with _connect(immediate=True) as conn:
+        row = conn.execute(
+            "SELECT value FROM settings WHERE key = ?", (key,)
+        ).fetchone()
+        try:
+            current = int(row["value"]) if row else int(default)
+        except (TypeError, ValueError):
+            current = int(default)
+        updated = current + 1
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+            (key, str(updated)),
+        )
+    return updated
+
+
+def set_setting_if_newer_revision(
+        key: str, value: str, *, revision_key: str, revision: int,
+        guard_key: str, expected_guard: str,
+        guard_default: Optional[str] = None) -> bool:
+    """Atomically publish a newer revision while a durable guard matches."""
+    with _connect(immediate=True) as conn:
+        row = conn.execute(
+            "SELECT value FROM settings WHERE key = ?", (guard_key,)
+        ).fetchone()
+        actual = row["value"] if row else guard_default
+        if actual != expected_guard:
+            return False
+        row = conn.execute(
+            "SELECT value FROM settings WHERE key = ?", (revision_key,)
+        ).fetchone()
+        try:
+            published_revision = int(row["value"]) if row else 0
+        except (TypeError, ValueError):
+            published_revision = 0
+        if published_revision >= int(revision):
+            return False
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+            (key, value),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+            (revision_key, str(int(revision))),
+        )
+    return True
 
 
 def delete_setting(key: str):
