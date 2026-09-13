@@ -964,9 +964,11 @@ async def toggle_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if db.is_paused():
         db.set_setting("worker_paused", "0")
+        pipeline_insights.invalidate_cache()
         await update.message.reply_text("▶ Воркер возобновлён.", reply_markup=_main_menu())
     else:
         db.set_setting("worker_paused", "1")
+        pipeline_insights.invalidate_cache()
         await update.message.reply_text("⏸ Воркер на паузе. Текущие задачи завершатся, новые не запустятся.", reply_markup=_main_menu())
 
 

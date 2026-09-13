@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta, timezone
 import os
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -485,6 +486,56 @@ def test_forced_queue_refresh_reuses_expensive_diagnostics(isolated_db, monkeypa
     assert first["diagnostics"] == second["diagnostics"]
     assert len(calls) == 2
     assert refreshed["diagnostics_generated_at"] >= second["diagnostics_generated_at"]
+
+
+def test_invalidation_during_analysis_rejects_stale_cache_publish(isolated_db, monkeypatch):
+    profile = {
+        "title": "Example", "repository": "owner/example",
+        "queues": [{
+            "id": "review", "title": "Review", "capacity": 1,
+            "query": "is:pr", "series_contains": "REVIEW",
+        }],
+    }
+    entered_search = threading.Event()
+    release_search = threading.Event()
+    search_calls = []
+    errors = []
+
+    def fake_search(repository, query):
+        search_calls.append((repository, query))
+        if len(search_calls) == 1:
+            entered_search.set()
+            if not release_search.wait(5):
+                raise TimeoutError("test did not release the in-flight analysis")
+        return {"count": 1, "items": [], "membership_complete": False}
+
+    def run_analysis():
+        try:
+            pipeline_insights.analyze("cache-race", [], use_cache=True)
+        except BaseException as exc:  # preserve the worker-thread failure for the assertion
+            errors.append(exc)
+
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"cache-race": profile})
+    monkeypatch.setattr(pipeline_insights, "_github_search", fake_search)
+    monkeypatch.setattr(pipeline_insights, "_run_profile_health_check", lambda _profile: None)
+    pipeline_insights.invalidate_cache()
+    analysis = threading.Thread(target=run_analysis)
+    analysis.start()
+
+    try:
+        assert entered_search.wait(5)
+        pipeline_insights.invalidate_cache()
+        release_search.set()
+        analysis.join(5)
+        assert not analysis.is_alive()
+        assert errors == []
+
+        pipeline_insights.analyze("cache-race", [], use_cache=True)
+        assert len(search_calls) == 2
+    finally:
+        release_search.set()
+        analysis.join(5)
+        pipeline_insights.invalidate_cache()
 
 
 def test_paused_pipeline_is_not_background_sampled():
