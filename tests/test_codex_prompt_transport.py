@@ -73,6 +73,45 @@ def test_provider_env_exposes_configured_pipeline_tools_on_path(monkeypatch, tmp
     assert "existing" in path_parts
 
 
+def test_provider_env_strips_pyinstaller_runtime_state(monkeypatch):
+    monkeypatch.setenv("_PYI_PARENT_PROCESS_LEVEL", "1")
+    monkeypatch.setenv("_PYI_APPLICATION_HOME_DIR", r"C:\\PromptPilot")
+    monkeypatch.setattr(
+        "promptpilot.config.load_providers",
+        lambda: {
+            "codex": {
+                "env": {
+                    "_PYI_ARCHIVE_FILE": r"C:\\PromptPilot\\pp.exe",
+                    "_pyi_provider_override": "also-private",
+                },
+            },
+        },
+    )
+
+    env = get_provider_env("codex")
+
+    assert not any(key.upper().startswith("_PYI_") for key in env)
+    # Sanitizing the provider's copy must not mutate PromptPilot's own runtime.
+    assert os.environ["_PYI_PARENT_PROCESS_LEVEL"] == "1"
+
+
+def test_provider_env_preserves_normal_parent_and_provider_values(monkeypatch):
+    monkeypatch.setenv("PROMPTPILOT_TEST_PARENT_ENV", "parent-kept")
+    monkeypatch.setattr(
+        "promptpilot.config.load_providers",
+        lambda: {
+            "codex": {
+                "env": {"PROMPTPILOT_TEST_PROVIDER_ENV": "provider-kept"},
+            },
+        },
+    )
+
+    env = get_provider_env("codex")
+
+    assert env["PROMPTPILOT_TEST_PARENT_ENV"] == "parent-kept"
+    assert env["PROMPTPILOT_TEST_PROVIDER_ENV"] == "provider-kept"
+
+
 def test_codex_resume_uses_exec_resume_with_stdin_after_session():
     command = build_cmd(
         "codex", "continue", session_id="01a06119-37cf-7522-a071-14386645fd47",
