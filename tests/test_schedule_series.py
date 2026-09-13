@@ -496,6 +496,23 @@ def test_paused_pipeline_is_not_background_sampled():
     assert pipeline_insights._profile_active(profile, active) is True
 
 
+def test_global_pause_skips_background_pipeline_sampling(isolated_db, monkeypatch):
+    profile = {"queues": [{"series_contains": "Example - REVIEW"}]}
+    active = [{"title": "Example - REVIEW", "paused": False, "ended": False}]
+    calls = []
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"example": profile})
+    monkeypatch.setattr(
+        pipeline_insights, "analyze",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or {},
+    )
+    isolated_db.set_setting("worker_paused", "1")
+
+    result = pipeline_insights.sample_active_profiles(active)
+
+    assert result == {}
+    assert calls == []
+
+
 def test_pipeline_insights_exposes_actual_series_task_status(isolated_db, monkeypatch):
     counts = iter([0, 0, 0, 1, 0])
     monkeypatch.setattr(pipeline_insights, "_github_search", lambda repo, query: {
