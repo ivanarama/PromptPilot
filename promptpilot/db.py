@@ -612,13 +612,15 @@ def get_next_runnable(busy_keys=(), key_fn=None) -> Optional[TaskInDB]:
             task = _row_to_task(row)
             if busy and key_fn and key_fn(task) in busy:
                 continue
+            started_at = _now()
             cur = conn.execute(
-                """UPDATE tasks SET status = 'running', started_at = ?
+                """UPDATE tasks SET status = 'running', started_at = ?,
+                                  error = NULL, next_run_at = NULL
                    WHERE id = ? AND status IN ('pending', 'rate_limited')""",
-                (_now(), task.id),
+                (started_at, task.id),
             )
             if cur.rowcount:
-                return task
+                return get_task(task.id, conn=conn)
         return None
 
 
