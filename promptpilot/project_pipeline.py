@@ -387,6 +387,14 @@ def run_health(config: dict, *, config_path: str | None = None) -> dict:
     try:
         value = json.loads(result.stdout)
     except json.JSONDecodeError as exc:
+        # ``go run`` returns 1 when the wrapped health binary exits non-zero.
+        # That overlaps with the checker's documented health-status exit code,
+        # so JSON is still authoritative when present. If the wrapper instead
+        # produced no usable JSON, preserve its diagnostic (notably GitHub 403
+        # and rate-limit details) rather than hiding it behind a parser error.
+        detail = (result.stderr or "").strip()
+        if result.returncode and detail:
+            raise PipelineError(detail) from exc
         raise PipelineError(f"health command returned invalid JSON: {exc}") from exc
     if not isinstance(value, dict):
         raise PipelineError("health command must return a JSON object")
