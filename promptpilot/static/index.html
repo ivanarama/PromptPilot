@@ -2660,8 +2660,13 @@ async function loadPipelineInsights(profile, refresh=false) {
     const cacheValue = !cache.available ? 'нет снимка' : !cache.complete ? 'частичный' : cache.stale ? 'устарел' : 'свежий';
     const cacheNote = `${cacheAge} · ${cacheSources[cache.source] || cache.source} · обычное открытие без GitHub API`;
     const cacheColor = cache.stale || !cache.complete ? 'var(--yellow)' : '';
+    const blockedUntil = cache.refresh_deferred_until
+      ? ` Следующая попытка: ${new Date(cache.refresh_deferred_until).toLocaleString()}.`
+      : '';
     const cacheNotice = cache.refresh_blocked === 'worker_paused'
       ? `<div class="prov-cmd" style="color:var(--yellow);margin-top:8px">Обновление GitHub пропущено: включена общая пауза. ${cache.available ? 'Показан последний локальный снимок.' : 'Снимка ещё нет.'}</div>`
+      : cache.refresh_blocked
+      ? `<div class="prov-cmd" style="color:var(--yellow);margin-top:8px">Обновление GitHub отложено: ${esc(cache.refresh_blocked_reason || cache.refresh_blocked)}.${esc(blockedUntil)} ${cache.available ? 'Показан последний локальный снимок.' : 'Снимка ещё нет.'}</div>`
       : !cache.available
         ? '<div class="prov-cmd" style="color:var(--yellow);margin-top:8px">Снимка GitHub ещё нет. Нажмите «Обновить» для первого явного запроса.</div>'
         : !cache.complete

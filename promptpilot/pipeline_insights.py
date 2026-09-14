@@ -6,10 +6,13 @@ import json
 import math
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import threading
 import time
+import uuid
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote
@@ -40,10 +43,389 @@ _DEFAULT_PRIORITY_RULES = (
     ({"enhancement", "documentation"}, 2, "planned change"),
     ({"question"}, 3, "question"),
 )
+_DEFAULT_GITHUB_BUDGET_MINIMUM = {
+    "core": 4000,
+    "search": 10,
+    "graphql": 500,
+}
+_GITHUB_SCAN_LEASE_SCOPE = "github-default"
+_scan_lease_context = threading.local()
 
 
 class _GitHubScanPaused(RuntimeError):
     """A multi-request GitHub observation stopped at a page boundary."""
+
+
+class _GitHubScanLeaseLost(RuntimeError):
+    """The process can no longer prove exclusive ownership of a live scan."""
+
+
+class _GitHubScanLease:
+    """Renew one SQLite-backed scan lease while external work is in flight."""
+
+    def __init__(self, scope: str, token: str, ttl_seconds: int,
+                 status_revision: int | None = None):
+        self.scope = scope
+        self.token = token
+        self.ttl_seconds = ttl_seconds
+        self.status_revision = status_revision
+        self.expires_at: float | None = None
+        self._stop = threading.Event()
+        self._lost = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    @property
+    def lost(self) -> bool:
+        return self._lost.is_set()
+
+    @property
+    def guard(self) -> dict:
+        return {"scope": self.scope, "token": self.token}
+
+    def start(self) -> None:
+        interval = max(1.0, min(30.0, self.ttl_seconds / 3))
+
+        def heartbeat() -> None:
+            while not self._stop.wait(interval):
+                try:
+                    renewed = db.renew_pipeline_scan_lease(
+                        self.scope, self.token, self.ttl_seconds)
+                except Exception:
+                    renewed = None
+                if renewed is None:
+                    self._lost.set()
+                    return
+                self.expires_at = renewed
+
+        self._thread = threading.Thread(
+            target=heartbeat, name="promptpilot-github-scan-lease", daemon=True)
+        self._thread.start()
+
+    def ensure_owned(self, *, renew: bool = False) -> None:
+        if renew and not self.lost:
+            try:
+                renewed = db.renew_pipeline_scan_lease(
+                    self.scope, self.token, self.ttl_seconds)
+            except Exception:
+                renewed = None
+            if renewed is None:
+                self._lost.set()
+            else:
+                self.expires_at = renewed
+        if self.lost:
+            raise _GitHubScanLeaseLost(
+                "межпроцессная lease GitHub-сканирования потеряна")
+
+    def release(self, *, refresh_status: dict | None = None) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+        try:
+            db.release_pipeline_scan_lease(
+                self.scope, self.token, refresh_status=refresh_status)
+        except Exception:
+            # A failed release stays fail-closed until the renewable lease
+            # expires; never let cleanup hide the scan's original outcome.
+            pass
+
+
+def _bounded_int(config: dict, name: str, default: int,
+                 minimum: int, maximum: int) -> int:
+    value = config.get(name, default)
+    if (isinstance(value, bool)
+            or isinstance(value, float) and not value.is_integer()):
+        raise ValueError(f"github_budget.{name} должен быть целым числом")
+    try:
+        parsed = int(value)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise ValueError(
+            f"github_budget.{name} должен быть целым числом") from exc
+    if parsed < minimum or parsed > maximum:
+        raise ValueError(
+            f"github_budget.{name} должен быть от {minimum} до {maximum}")
+    return parsed
+
+
+def _github_budget_policy(profile: dict) -> dict | None:
+    """Normalize the opt-in admission policy without changing legacy profiles."""
+    raw = profile.get("github_budget")
+    if raw is None or raw is False:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("github_budget должен быть JSON-объектом")
+    enabled = raw.get("enabled", True)
+    if not isinstance(enabled, bool):
+        raise ValueError("github_budget.enabled должен быть true или false")
+    if not enabled:
+        return None
+
+    configured_minimum = raw.get("minimum_remaining", {})
+    if not isinstance(configured_minimum, dict):
+        raise ValueError("github_budget.minimum_remaining должен быть JSON-объектом")
+    minimum_remaining = {}
+    for resource, default in _DEFAULT_GITHUB_BUDGET_MINIMUM.items():
+        value = configured_minimum.get(resource, default)
+        if (isinstance(value, bool)
+                or isinstance(value, float) and not value.is_integer()):
+            raise ValueError(
+                f"github_budget.minimum_remaining.{resource} должен быть целым числом")
+        try:
+            value = int(value)
+        except (OverflowError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"github_budget.minimum_remaining.{resource} должен быть целым числом"
+            ) from exc
+        if value < 0:
+            raise ValueError(
+                f"github_budget.minimum_remaining.{resource} не может быть отрицательным")
+        minimum_remaining[resource] = value
+
+    return {
+        "minimum_remaining": minimum_remaining,
+        "reset_grace_seconds": _bounded_int(
+            raw, "reset_grace_seconds", 60, 0, 3600),
+        "lease_seconds": _bounded_int(raw, "lease_seconds", 900, 30, 3600),
+        "busy_retry_seconds": _bounded_int(
+            raw, "busy_retry_seconds", 30, 5, 300),
+        "unavailable_retry_seconds": _bounded_int(
+            raw, "unavailable_retry_seconds", 300, 30, 3600),
+        # GitHub primary budgets belong to the authenticated account, not to a
+        # repository/profile. Keep one scope per shared PromptPilot database so
+        # profiles cannot accidentally opt out of each other's reservation.
+        "lease_scope": _GITHUB_SCAN_LEASE_SCOPE,
+    }
+
+
+def _defer_at(epoch: float) -> str:
+    return datetime.fromtimestamp(epoch, timezone.utc).isoformat()
+
+
+def _budget_denied(policy: dict, *, state: str, reason: str,
+                   now: float, limits: dict | None = None,
+                   defer_at: float | None = None,
+                   blocked_resources: list[dict] | None = None,
+                   status_revision: int | None = None) -> dict:
+    retry_at = defer_at or (now + policy["unavailable_retry_seconds"])
+    return {
+        "enabled": True, "allowed": False, "state": state,
+        "reason": reason, "defer_until": _defer_at(retry_at),
+        "github_rate_limit": limits,
+        "minimum_remaining": dict(policy["minimum_remaining"]),
+        "blocked_resources": blocked_resources or [],
+        "lease_scope": policy["lease_scope"],
+        "status_revision": status_revision,
+    }
+
+
+def _lease_failure_decision(profile: dict, reason: str, *,
+                            status_revision: int | None = None) -> dict:
+    try:
+        policy = _github_budget_policy(profile)
+    except (TypeError, ValueError):
+        policy = None
+    policy = policy or {
+        "minimum_remaining": dict(_DEFAULT_GITHUB_BUDGET_MINIMUM),
+        "unavailable_retry_seconds": 300,
+        "lease_scope": _GITHUB_SCAN_LEASE_SCOPE,
+    }
+    return _budget_denied(
+        policy, state="lease_lost", reason=reason, now=time.time(),
+        status_revision=status_revision)
+
+
+def _evaluate_github_budget(policy: dict, limits: dict | None, *,
+                            now: float,
+                            status_revision: int | None = None) -> dict:
+    if not isinstance(limits, dict):
+        return _budget_denied(
+            policy, state="rate_limit_unavailable",
+            reason="GitHub /rate_limit недоступен; сканирование запрещено",
+            now=now, status_revision=status_revision,
+        )
+    blocked = []
+    malformed = []
+    for resource, minimum in policy["minimum_remaining"].items():
+        item = limits.get(resource)
+        try:
+            remaining = int(item["remaining"])
+            reset = int(item["reset"])
+        except (KeyError, OverflowError, TypeError, ValueError):
+            malformed.append(resource)
+            continue
+        if remaining < minimum:
+            blocked.append({
+                "resource": resource, "remaining": remaining,
+                "minimum_remaining": minimum, "reset": reset,
+            })
+    if malformed:
+        return _budget_denied(
+            policy, state="rate_limit_unavailable",
+            reason=("GitHub /rate_limit не содержит корректный budget: "
+                    + ", ".join(malformed)),
+            now=now, limits=limits, status_revision=status_revision,
+        )
+    if blocked:
+        reset_at = max(item["reset"] for item in blocked) + \
+            policy["reset_grace_seconds"]
+        if reset_at <= now:
+            reset_at = now + policy["unavailable_retry_seconds"]
+        summary = ", ".join(
+            f"{item['resource']} {item['remaining']} < {item['minimum_remaining']}"
+            for item in blocked)
+        return _budget_denied(
+            policy, state="low", reason=(
+                f"GitHub API-бюджет ниже порога сканирования: {summary}"),
+            now=now, limits=limits, defer_at=reset_at,
+            blocked_resources=blocked, status_revision=status_revision,
+        )
+    return {
+        "enabled": True, "allowed": True, "state": "ok",
+        "reason": "GitHub API-бюджет достаточен",
+        "defer_until": None, "github_rate_limit": limits,
+        "minimum_remaining": dict(policy["minimum_remaining"]),
+        "blocked_resources": [], "lease_scope": policy["lease_scope"],
+        "status_revision": status_revision,
+    }
+
+
+@contextmanager
+def _github_scan_admission(profile: dict, purpose: str,
+                           *, profile_id: str | None = None):
+    """Admit one expensive scan and hold its cross-process reservation."""
+    now = time.time()
+    try:
+        policy = _github_budget_policy(profile)
+    except (TypeError, ValueError) as exc:
+        fallback = {
+            "minimum_remaining": dict(_DEFAULT_GITHUB_BUDGET_MINIMUM),
+            "unavailable_retry_seconds": 300,
+            "lease_scope": _GITHUB_SCAN_LEASE_SCOPE,
+        }
+        yield _budget_denied(
+            fallback, state="invalid_config",
+            reason=f"Некорректный github_budget: {exc}", now=now)
+        return
+    if policy is None:
+        yield {"enabled": False, "allowed": True, "state": "legacy"}
+        return
+
+    token = uuid.uuid4().hex
+    try:
+        acquired = db.acquire_pipeline_scan_lease(
+            policy["lease_scope"], token, policy["lease_seconds"], now=now)
+    except Exception as exc:
+        yield _budget_denied(
+            policy, state="lease_unavailable",
+            reason=f"SQLite lease GitHub-сканирования недоступна: {exc}", now=now)
+        return
+    if not acquired.get("acquired"):
+        status_revision = acquired.get("status_revision")
+        state = acquired.get("state")
+        if state == "busy":
+            existing_expiry = acquired.get("expires_at")
+            retry_at = now + policy["busy_retry_seconds"]
+            if isinstance(existing_expiry, (int, float)):
+                retry_at = max(now + 1, min(retry_at, float(existing_expiry) + 1))
+            reason = "GitHub scan уже выполняется другим PromptPilot-процессом"
+            blocked_state = "scan_in_progress"
+        else:
+            retry_at = now + policy["unavailable_retry_seconds"]
+            reason = "SQLite lease GitHub-сканирования повреждена; scan запрещён"
+            blocked_state = "lease_unavailable"
+        yield _budget_denied(
+            policy, state=blocked_state, reason=reason, now=now,
+            defer_at=retry_at,
+            status_revision=(status_revision
+                             if isinstance(status_revision, int) else None))
+        return
+
+    status_revision = acquired.get("status_revision")
+    lease = _GitHubScanLease(
+        policy["lease_scope"], token, policy["lease_seconds"],
+        status_revision=(status_revision
+                         if isinstance(status_revision, int) else None))
+    lease.expires_at = acquired.get("expires_at")
+    previous = getattr(_scan_lease_context, "lease", None)
+    _scan_lease_context.lease = lease
+    try:
+        try:
+            lease.start()
+            try:
+                limits = _github_rate_limits()
+            except Exception:
+                limits = None
+            if lease.lost:
+                decision = _lease_failure_decision(
+                    profile, "SQLite lease потеряна во время GitHub /rate_limit",
+                    status_revision=lease.status_revision)
+            else:
+                decision = _evaluate_github_budget(
+                    policy, limits, now=time.time(),
+                    status_revision=lease.status_revision)
+        except Exception as exc:
+            decision = _lease_failure_decision(
+                profile, f"GitHub budget admission не выполнен: {exc}",
+                status_revision=lease.status_revision)
+        yield decision
+    finally:
+        _scan_lease_context.lease = previous
+        refresh_status = ({
+            "profile_id": profile_id,
+            "repository": profile.get("repository", ""),
+            "status": (None if decision.get("allowed")
+                       else _refresh_blocked_status(decision)),
+        } if profile_id is not None and not lease.lost else None)
+        lease.release(refresh_status=refresh_status)
+
+
+def _ensure_github_scan_lease(*, renew: bool = False) -> None:
+    lease = getattr(_scan_lease_context, "lease", None)
+    if lease is not None:
+        lease.ensure_owned(renew=renew)
+
+
+def _current_github_scan_status_revision() -> int | None:
+    lease = getattr(_scan_lease_context, "lease", None)
+    return lease.status_revision if lease is not None else None
+
+
+def _public_budget_decision(decision: dict) -> dict:
+    """Strip internal ordering and duplicate rate-limit fields from the UI."""
+    return {
+        key: copy.deepcopy(value) for key, value in decision.items()
+        if key not in {"github_rate_limit", "status_revision"}
+    }
+
+
+def _refresh_blocked_status(decision: dict) -> dict:
+    return {
+        "refresh_blocked": str(decision.get("state") or "github_budget"),
+        "refresh_blocked_reason": str(
+            decision.get("reason") or "GitHub scan запрещён"),
+        "refresh_deferred_until": decision.get("defer_until"),
+        "github_rate_limit": copy.deepcopy(decision.get("github_rate_limit")),
+        "github_budget": _public_budget_decision(decision),
+    }
+
+
+def _record_refresh_blocked(profile_id: str, profile: dict,
+                            decision: dict) -> bool:
+    """Persist a denial without replacing the last-good GitHub snapshot."""
+    lease = getattr(_scan_lease_context, "lease", None)
+    guard = lease.guard if lease is not None and not lease.lost else None
+    try:
+        return db.publish_pipeline_refresh_status(
+            profile_id, profile.get("repository", ""),
+            _refresh_blocked_status(decision),
+            revision=(decision.get("status_revision")
+                      if isinstance(decision.get("status_revision"), int)
+                      else None),
+            lease_guard=guard,
+        )
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        # The current caller still receives the denial. Persistence is a
+        # visibility aid and must not turn a safe refusal into a failed task.
+        return False
 
 
 def _profiles() -> dict:
@@ -90,8 +472,13 @@ def _published_revision_key(profile_id: str, profile_hash: str) -> str:
 
 
 def _profile_fingerprint(profile: dict) -> str:
+    # Admission tuning changes when a scan may run, not what the observation
+    # means. Keep last-good data readable when an operator enables/tunes the
+    # budget while GitHub quota is already low.
+    observed_profile = copy.deepcopy(profile)
+    observed_profile.pop("github_budget", None)
     encoded = json.dumps(
-        profile, ensure_ascii=False, sort_keys=True,
+        observed_profile, ensure_ascii=False, sort_keys=True,
         separators=(",", ":"), default=str,
     )
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
@@ -197,12 +584,19 @@ def _publish_cache(profile_id: str, profile: dict, generation: int, epoch: int,
             "profile_hash": profile_hash,
             "result": result,
         }, ensure_ascii=False, separators=(",", ":"))
+        lease = getattr(_scan_lease_context, "lease", None)
         if not db.set_setting_if_newer_revision(
                 _cache_key(profile_id, profile_hash), payload,
                 revision_key=_published_revision_key(profile_id, profile_hash),
                 revision=revision,
                 guard_key=_CACHE_EPOCH_KEY, expected_guard=str(epoch),
-                guard_default="0"):
+                guard_default="0",
+                lease_guard=lease.guard if lease is not None else None):
+            if lease is not None:
+                # The CAS can also lose to an ordinary cache invalidation or a
+                # newer refresh. Distinguish that benign race from a rejected
+                # lease fence by proving ownership again under SQLite.
+                lease.ensure_owned(renew=True)
             return False
         _cache[profile_id] = (
             generated_at, result, epoch, profile_hash, revision)
@@ -244,6 +638,7 @@ def _gh_executable() -> str:
 def _github_search(repository: str, query: str) -> dict:
     """Return count plus public item metadata used for age and movement metrics."""
     def fetch_page(page: int) -> dict:
+        _ensure_github_scan_lease(renew=True)
         command = [
             _gh_executable(), "api", "search/issues", "--method", "GET",
             "--field", f"q=repo:{repository} {query}", "--field", "per_page=100",
@@ -251,6 +646,7 @@ def _github_search(repository: str, query: str) -> dict:
         ]
         run = subprocess.run(command, capture_output=True, text=True, timeout=30,
                              encoding="utf-8", errors="replace")
+        _ensure_github_scan_lease()
         if run.returncode:
             raise RuntimeError(
                 (run.stderr or run.stdout or "gh api завершился с ошибкой").strip())
@@ -349,6 +745,7 @@ def _item_priority(item: dict, settings: dict, now: datetime) -> dict:
 
 
 def _gh_api_json(args: list[str], input_value: dict | None = None):
+    _ensure_github_scan_lease(renew=True)
     command = [_gh_executable(), "api", *args]
     encoded = None
     if input_value is not None:
@@ -358,6 +755,7 @@ def _gh_api_json(args: list[str], input_value: dict | None = None):
         command, input=encoded, capture_output=True, text=True, timeout=30,
         encoding="utf-8", errors="strict",
     )
+    _ensure_github_scan_lease()
     if run.returncode:
         raise RuntimeError((run.stderr or run.stdout or "gh api failed").strip())
     return json.loads(run.stdout) if run.stdout.strip() else None
@@ -367,24 +765,26 @@ def _github_rate_limits() -> dict | None:
     """Return the authenticated GitHub budgets without spending core quota."""
     try:
         payload = _gh_api_json(["rate_limit"])
-    except (RuntimeError, OSError, ValueError, json.JSONDecodeError):
+        resources = payload.get("resources", {}) if isinstance(payload, dict) else {}
+        result = {}
+        for name in ("core", "search", "graphql"):
+            item = resources.get(name)
+            if not isinstance(item, dict):
+                continue
+            reset = item.get("reset")
+            result[name] = {
+                "limit": int(item.get("limit") or 0),
+                "used": int(item.get("used") or 0),
+                "remaining": int(item.get("remaining") or 0),
+                "reset": int(reset) if reset is not None else None,
+                "reset_at": datetime.fromtimestamp(
+                    int(reset), timezone.utc).isoformat()
+                if reset is not None else None,
+            }
+        return result or None
+    except (RuntimeError, OSError, OverflowError, TypeError, ValueError,
+            json.JSONDecodeError):
         return None
-    resources = payload.get("resources", {}) if isinstance(payload, dict) else {}
-    result = {}
-    for name in ("core", "search", "graphql"):
-        item = resources.get(name)
-        if not isinstance(item, dict):
-            continue
-        reset = item.get("reset")
-        result[name] = {
-            "limit": int(item.get("limit") or 0),
-            "used": int(item.get("used") or 0),
-            "remaining": int(item.get("remaining") or 0),
-            "reset": int(reset) if reset is not None else None,
-            "reset_at": datetime.fromtimestamp(int(reset), timezone.utc).isoformat()
-            if reset is not None else None,
-        }
-    return result or None
 
 
 def set_item_priority(profile_id: str, queue_id: str, kind: str, number: int,
@@ -607,7 +1007,8 @@ def dispatch_gate(task) -> dict | None:
             # A stale/partial empty snapshot must never complete a live stage as
             # empty, and stale diagnostics must not defer it. The project-owned
             # preflight remains the authoritative fallback.
-            if cache.get("stale") or not cache.get("complete"):
+            if (cache.get("refresh_blocked") or cache.get("stale")
+                    or not cache.get("complete")):
                 return None
             queue = next((item for item in data["queues"]
                           if item["id"] == queue_config["id"]), None)
@@ -748,7 +1149,8 @@ def _wake_ready_queues(profile_id: str, profile: dict, data: dict,
                        series: list[dict]) -> list[str]:
     """Wake queues only while the accepted full-cache token is still current."""
     cache = data.get("cache") or {}
-    if cache.get("stale") or cache.get("complete") is not True:
+    if (cache.get("refresh_blocked") or cache.get("stale")
+            or cache.get("complete") is not True):
         return []
     cache_guard = _wake_cache_guard(profile_id, profile, cache)
     if cache_guard is None:
@@ -799,6 +1201,10 @@ def after_task_completed(task, verdict: str | None) -> list[str]:
     # and dispatch reads can then share that result.
     data = analyze(profile_id, series, use_cache=False, refresh_diagnostics=True)
     if db.is_paused():
+        return []
+    # A denied/busy budgeted refresh returns last-good cached data. Never use
+    # that pre-completion state to wake a downstream stage.
+    if (data.get("cache") or {}).get("refresh_blocked"):
         return []
     current_profile = _profiles().get(profile_id)
     if current_profile is None:
@@ -855,11 +1261,13 @@ def _tool_available(execution: dict, command: list[str], working_dir: str | None
         if probe_command is None:
             return False, "probe_command должен быть непустым массивом строк"
         try:
+            _ensure_github_scan_lease(renew=True)
             result = subprocess.run(
                 probe_command, cwd=str(root), capture_output=True, text=True,
                 timeout=max(1, min(int(execution.get("probe_timeout_seconds", 30)), 120)),
                 encoding="utf-8", errors="replace",
             )
+            _ensure_github_scan_lease()
         except (OSError, subprocess.TimeoutExpired) as exc:
             return False, f"probe не выполнен: {exc}"
         if result.returncode:
@@ -871,6 +1279,7 @@ def _tool_available(execution: dict, command: list[str], working_dir: str | None
 def _tool_preflight(execution: dict, command: list[str], working_dir: str | None) -> dict:
     root = Path(working_dir or os.getcwd())
     try:
+        _ensure_github_scan_lease(renew=True)
         result = subprocess.run(
             command, cwd=str(root), capture_output=True, text=True,
             timeout=max(1, min(int(execution.get("timeout_seconds", 180)), 900)),
@@ -878,6 +1287,7 @@ def _tool_preflight(execution: dict, command: list[str], working_dir: str | None
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise RuntimeError(f"pipeline preflight не выполнен: {exc}") from exc
+    _ensure_github_scan_lease()
     if len(result.stdout) > 131072:
         raise RuntimeError("pipeline preflight вернул слишком большой ответ")
     try:
@@ -897,6 +1307,20 @@ def _tool_preflight(execution: dict, command: list[str], working_dir: str | None
     return payload
 
 
+def _budget_defer_route(admission: dict, profile_id: str, profile: dict,
+                        queue: dict,
+                        *, mode: str = "tool") -> dict:
+    _record_refresh_blocked(profile_id, profile, admission)
+    return {
+        "action": "defer", "mode": mode,
+        "reason": str(admission.get("reason") or "GitHub scan отложен"),
+        "defer_until": admission.get("defer_until"),
+        "profile_id": profile_id, "queue_id": queue.get("id"),
+        "github_budget": _public_budget_decision(admission),
+        "github_rate_limit": admission.get("github_rate_limit"),
+    }
+
+
 def execution_route(task, fallback_prompt: str, working_dir: str | None = None) -> dict:
     """Choose the project tool or the original skill prompt without invoking an LLM.
 
@@ -907,9 +1331,15 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None) 
     matched = _matching_queue(task)
     if matched is None:
         return {"action": "prompt", "mode": "skill", "prompt": fallback_prompt}
-    profile_id, _profile, queue = matched
+    profile_id, profile, queue = matched
     execution = queue.get("execution")
     if not isinstance(execution, dict):
+        with _github_scan_admission(
+                profile, f"pipeline task {profile_id}/{queue.get('id')}",
+                profile_id=profile_id) as admission:
+            if not admission.get("allowed"):
+                return _budget_defer_route(
+                    admission, profile_id, profile, queue, mode="skill")
         return {"action": "prompt", "mode": "skill", "prompt": fallback_prompt}
 
     mode = str(execution.get("mode", "auto")).lower()
@@ -920,40 +1350,68 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None) 
             "profile_id": profile_id, "queue_id": queue.get("id"),
         }
     if mode == "skill":
+        with _github_scan_admission(
+                profile, f"pipeline task {profile_id}/{queue.get('id')}",
+                profile_id=profile_id) as admission:
+            if not admission.get("allowed"):
+                return _budget_defer_route(
+                    admission, profile_id, profile, queue, mode="skill")
         return {"action": "prompt", "mode": "skill", "prompt": fallback_prompt}
 
     stage = str(execution.get("stage") or queue.get("id") or "").lower()
     command = _tool_command(execution, stage)
-    if command is None:
-        available, reason = False, "execution.command должен быть непустым массивом строк"
-    else:
-        available, reason = _tool_available(execution, command, working_dir, stage)
-    if not available:
-        if mode == "auto":
+    with _github_scan_admission(
+            profile, f"pipeline preflight {profile_id}/{stage}",
+            profile_id=profile_id) as admission:
+        if not admission.get("allowed"):
+            return _budget_defer_route(
+                admission, profile_id, profile, queue)
+        try:
+            if command is None:
+                available, reason = (
+                    False, "execution.command должен быть непустым массивом строк")
+            else:
+                available, reason = _tool_available(
+                    execution, command, working_dir, stage)
+        except _GitHubScanLeaseLost as exc:
+            return _budget_defer_route(
+                _lease_failure_decision(
+                    profile, str(exc),
+                    status_revision=_current_github_scan_status_revision()),
+                profile_id,
+                profile, queue)
+        if not available:
+            if mode == "auto":
+                return {
+                    "action": "prompt", "mode": "skill", "prompt": fallback_prompt,
+                    "fallback_reason": reason, "profile_id": profile_id,
+                    "queue_id": queue.get("id"),
+                }
             return {
-                "action": "prompt", "mode": "skill", "prompt": fallback_prompt,
-                "fallback_reason": reason, "profile_id": profile_id,
-                "queue_id": queue.get("id"),
+                "action": "block", "mode": "tool", "reason": reason,
+                "profile_id": profile_id, "queue_id": queue.get("id"),
             }
-        return {
-            "action": "block", "mode": "tool", "reason": reason,
-            "profile_id": profile_id, "queue_id": queue.get("id"),
-        }
-
-    try:
-        preflight = _tool_preflight(execution, command, working_dir)
-    except RuntimeError as exc:
-        reason = str(exc)
-        if mode == "auto":
+        try:
+            preflight = _tool_preflight(execution, command, working_dir)
+        except _GitHubScanLeaseLost as exc:
+            return _budget_defer_route(
+                _lease_failure_decision(
+                    profile, str(exc),
+                    status_revision=_current_github_scan_status_revision()),
+                profile_id,
+                profile, queue)
+        except RuntimeError as exc:
+            reason = str(exc)
+            if mode == "auto":
+                return {
+                    "action": "prompt", "mode": "skill", "prompt": fallback_prompt,
+                    "fallback_reason": reason, "profile_id": profile_id,
+                    "queue_id": queue.get("id"),
+                }
             return {
-                "action": "prompt", "mode": "skill", "prompt": fallback_prompt,
-                "fallback_reason": reason, "profile_id": profile_id,
-                "queue_id": queue.get("id"),
+                "action": "block", "mode": "tool", "reason": reason,
+                "profile_id": profile_id, "queue_id": queue.get("id"),
             }
-        return {
-            "action": "block", "mode": "tool", "reason": reason,
-            "profile_id": profile_id, "queue_id": queue.get("id"),
-        }
 
     preflight_action = preflight["action"].lower()
     preflight_reason = str(
@@ -1112,12 +1570,14 @@ def _run_profile_health_check(profile: dict) -> dict | None:
         if gh_dir and gh_dir not in path_parts:
             env["PATH"] = gh_dir + os.pathsep + env.get("PATH", "")
     try:
+        _ensure_github_scan_lease(renew=True)
         run = subprocess.run(
             command, cwd=config.get("working_dir") or None, env=env,
             capture_output=True, text=True,
             timeout=max(1, min(int(config.get("timeout_seconds", 180)), 900)),
             encoding="utf-8", errors="replace",
         )
+        _ensure_github_scan_lease()
         payload = json.loads(run.stdout)
         if not isinstance(payload, dict) or payload.get("state") not in (
                 "green", "yellow", "red"):
@@ -1509,6 +1969,44 @@ def _empty_cached_result(profile_id: str, profile: dict) -> dict:
     }
 
 
+def _with_persisted_refresh_status(result: dict, profile_id: str,
+                                   profile: dict) -> dict:
+    """Overlay a still-actionable denial on a quota-free cached response."""
+    try:
+        if _github_budget_policy(profile) is None:
+            return result
+    except (TypeError, ValueError):
+        # Invalid opt-in configuration is itself an admission blocker and its
+        # persisted explanation remains useful until the profile is corrected.
+        pass
+    try:
+        event = db.get_pipeline_refresh_status(profile_id)
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        return result
+    if (not isinstance(event, dict)
+            or event.get("repository") != str(profile.get("repository", ""))):
+        return result
+    status = event.get("status")
+    if not isinstance(status, dict):
+        return result
+    raw_defer_until = status.get("refresh_deferred_until")
+    defer_until = _parse_time(raw_defer_until)
+    if defer_until is None or defer_until <= datetime.now(timezone.utc):
+        return result
+    data = copy.deepcopy(result)
+    cache = data.setdefault("cache", {})
+    cache["refresh_blocked"] = str(
+        status.get("refresh_blocked") or "github_budget")
+    cache["refresh_blocked_reason"] = str(
+        status.get("refresh_blocked_reason") or "GitHub scan запрещён")
+    cache["refresh_deferred_until"] = status.get("refresh_deferred_until")
+    if status.get("github_rate_limit") is not None:
+        data["github_rate_limit"] = copy.deepcopy(status["github_rate_limit"])
+    if isinstance(status.get("github_budget"), dict):
+        data["github_budget"] = copy.deepcopy(status["github_budget"])
+    return data
+
+
 def read_cached(profile_id: str, series: list[dict]) -> dict:
     """Return saved insights plus live local state without any GitHub request."""
     profiles = _profiles()
@@ -1527,11 +2025,11 @@ def read_cached(profile_id: str, series: list[dict]) -> dict:
         if snapshot_epoch == current_epoch:
             break
     if cached:
-        return _refresh_local_state(
+        return _with_persisted_refresh_status(_refresh_local_state(
             cached[1], profile, series, source=source or "memory",
             generated_at=float(cached[0]), entry_epoch=int(cached[2]),
             entry_revision=int(cached[4]), current_epoch=current_epoch,
-        )
+        ), profile_id, profile)
     # A full cache that no longer matches the complete profile fingerprint
     # proves that query semantics changed. Do not reinterpret its legacy raw
     # snapshot under the new profile; wait for an explicit successful refresh.
@@ -1547,16 +2045,16 @@ def read_cached(profile_id: str, series: list[dict]) -> dict:
         allow_legacy=not incompatible_full_cache)
     if fallback:
         result, generated_at = fallback
-        return _refresh_local_state(
+        return _with_persisted_refresh_status(_refresh_local_state(
             result, profile, series, source="snapshot",
             generated_at=generated_at, entry_epoch=None,
             entry_revision=None, current_epoch=current_epoch,
-        )
-    return _refresh_local_state(
+        ), profile_id, profile)
+    return _with_persisted_refresh_status(_refresh_local_state(
         _empty_cached_result(profile_id, profile), profile, series,
         source="none", generated_at=None, entry_epoch=None,
         entry_revision=None, current_epoch=current_epoch,
-    )
+    ), profile_id, profile)
 
 
 def _paused_cached(profile_id: str, series: list[dict]) -> dict:
@@ -1565,8 +2063,25 @@ def _paused_cached(profile_id: str, series: list[dict]) -> dict:
     return result
 
 
-def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True,
-            refresh_diagnostics: bool = False) -> dict:
+def _budget_blocked_cached(profile_id: str, profile: dict, series: list[dict],
+                           admission: dict) -> dict:
+    """Return last-good data and explain why no external refresh was started."""
+    _record_refresh_blocked(profile_id, profile, admission)
+    result = read_cached(profile_id, series)
+    if admission.get("github_rate_limit") is not None:
+        result["github_rate_limit"] = admission["github_rate_limit"]
+    result["github_budget"] = _public_budget_decision(admission)
+    cache = result.setdefault("cache", {})
+    cache["refresh_blocked"] = str(admission.get("state") or "github_budget")
+    cache["refresh_blocked_reason"] = str(
+        admission.get("reason") or "GitHub scan запрещён")
+    cache["refresh_deferred_until"] = admission.get("defer_until")
+    return result
+
+
+def _analyze_without_budget(profile_id: str, series: list[dict], *,
+                            use_cache: bool = True,
+                            refresh_diagnostics: bool = False) -> dict:
     profiles = _profiles()
     if profile_id not in profiles:
         raise KeyError(profile_id)
@@ -1755,6 +2270,7 @@ def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True,
             "bottleneck": bottleneck["id"] if bottleneck and bottleneck["backlog"] else None,
             "generated_at": now.timestamp(),
         }
+        _ensure_github_scan_lease()
         published = _publish_cache(
             profile_id, profile, cache_generation, cache_epoch,
             refresh_revision, result)
@@ -1762,13 +2278,59 @@ def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True,
             return read_cached(profile_id, series)
         # Raw trend history records only observations that won the same CAS as
         # the full cache. A rejected/stale writer must not poison later charts.
-        db.add_pipeline_snapshot(profile_id, profile["repository"], snapshot, now)
+        lease = getattr(_scan_lease_context, "lease", None)
+        saved_snapshot = db.add_pipeline_snapshot(
+            profile_id, profile["repository"], snapshot, now,
+            lease_guard=({"scope": lease.scope, "token": lease.token}
+                         if lease is not None else None),
+        )
+        if lease is not None and saved_snapshot is None:
+            raise _GitHubScanLeaseLost(
+                "SQLite lease/snapshot fence rejected GitHub scan publication")
         db.prune_pipeline_snapshots(now - timedelta(days=31))
         return _refresh_local_state(
             result, profile, series, source="live",
             generated_at=float(result["generated_at"]), entry_epoch=cache_epoch,
             entry_revision=refresh_revision, current_epoch=_cache_epoch(),
         )
+
+
+def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True,
+            refresh_diagnostics: bool = False) -> dict:
+    """Read cached insights or run one budgeted, cross-process live scan."""
+    if use_cache:
+        return read_cached(profile_id, series)
+    profiles = _profiles()
+    if profile_id not in profiles:
+        raise KeyError(profile_id)
+    if db.is_paused():
+        return _paused_cached(profile_id, series)
+    profile = profiles[profile_id]
+    with _github_scan_admission(
+            profile, f"pipeline insights {profile_id}",
+            profile_id=profile_id) as admission:
+        if not admission.get("allowed"):
+            return _budget_blocked_cached(
+                profile_id, profile, series, admission)
+        try:
+            result = _analyze_without_budget(
+                profile_id, series, use_cache=False,
+                refresh_diagnostics=refresh_diagnostics)
+            _ensure_github_scan_lease(renew=True)
+        except _GitHubScanLeaseLost as exc:
+            return _budget_blocked_cached(
+                profile_id, profile, series,
+                _lease_failure_decision(
+                    profile, str(exc),
+                    status_revision=_current_github_scan_status_revision()))
+    if admission.get("enabled"):
+        result["github_budget"] = _public_budget_decision(admission)
+    cache = result.get("cache")
+    if isinstance(cache, dict) and cache.get("refresh_blocked") != "worker_paused":
+        cache.pop("refresh_blocked", None)
+        cache.pop("refresh_blocked_reason", None)
+        cache.pop("refresh_deferred_until", None)
+    return result
 
 
 def sample_active_profiles(series: list[dict]) -> dict[str, str]:
@@ -1784,6 +2346,10 @@ def sample_active_profiles(series: list[dict]) -> dict[str, str]:
             if db.is_paused():
                 outcomes[profile_id] = "paused"
                 break
+            blocked = (data.get("cache") or {}).get("refresh_blocked")
+            if blocked:
+                outcomes[profile_id] = f"deferred: {blocked}"
+                continue
             current_profile = _profiles().get(profile_id)
             if current_profile is None:
                 outcomes[profile_id] = "profile removed"

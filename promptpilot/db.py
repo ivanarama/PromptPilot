@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import math
 import re
 import sqlite3
 import time
@@ -1164,7 +1165,8 @@ def get_stats() -> Stats:
 
 
 def add_pipeline_snapshot(profile_id: str, repository: str, payload: dict,
-                          captured_at: Optional[datetime] = None) -> dict:
+                          captured_at: Optional[datetime] = None, *,
+                          lease_guard: Optional[dict] = None) -> Optional[dict]:
     """Persist one deterministic observation of an external pipeline.
 
     Snapshots intentionally contain only public queue metadata (counts, issue/
@@ -1172,7 +1174,10 @@ def add_pipeline_snapshot(profile_id: str, repository: str, payload: dict,
     """
     captured = _to_utc_iso(captured_at or datetime.now(timezone.utc))
     encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-    with _connect() as conn:
+    with _connect(immediate=lease_guard is not None) as conn:
+        if (lease_guard is not None
+                and not _pipeline_scan_lease_guard_matches(conn, lease_guard)):
+            return None
         cur = conn.execute(
             """INSERT INTO pipeline_snapshots
                (profile_id, repository, captured_at, payload_json)
@@ -1411,9 +1416,13 @@ def increment_int_setting(key: str, default: int = 0) -> int:
 def set_setting_if_newer_revision(
         key: str, value: str, *, revision_key: str, revision: int,
         guard_key: str, expected_guard: str,
-        guard_default: Optional[str] = None) -> bool:
+        guard_default: Optional[str] = None,
+        lease_guard: Optional[dict] = None) -> bool:
     """Atomically publish a newer revision while a durable guard matches."""
     with _connect(immediate=True) as conn:
+        if (lease_guard is not None
+                and not _pipeline_scan_lease_guard_matches(conn, lease_guard)):
+            return False
         row = conn.execute(
             "SELECT value FROM settings WHERE key = ?", (guard_key,)
         ).fetchone()
@@ -1443,6 +1452,353 @@ def set_setting_if_newer_revision(
 def delete_setting(key: str):
     with _connect() as conn:
         conn.execute("DELETE FROM settings WHERE key = ?", (key,))
+
+
+def _valid_pipeline_scan_token(value) -> bool:
+    """Return whether a lease token has the exact durable wire type."""
+    return isinstance(value, str) and 1 <= len(value) <= 256
+
+
+def _pipeline_scan_lease_key(scope: str) -> str:
+    """Return a bounded settings key for one shared GitHub scan scope."""
+    value = str(scope).strip()
+    if not value:
+        raise ValueError("pipeline scan lease scope must not be empty")
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+    return f"pipeline_github_scan_lease:v1:{digest}"
+
+
+_PIPELINE_REFRESH_STATUS_PREFIX = "pipeline_github_refresh_status:v1:"
+_PIPELINE_REFRESH_REVISION_KEY = "pipeline_github_refresh_revision:v1"
+
+
+def _pipeline_refresh_status_key(profile_id: str) -> str:
+    """Return a bounded key for a profile's transient refresh status."""
+    value = str(profile_id).strip()
+    if not value:
+        raise ValueError("pipeline profile id must not be empty")
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+    return f"{_PIPELINE_REFRESH_STATUS_PREFIX}{digest}"
+
+
+def _pipeline_refresh_current_revision(conn) -> int:
+    """Read the durable global event clock and recover it from status rows."""
+    row = conn.execute(
+        "SELECT value FROM settings WHERE key = ?",
+        (_PIPELINE_REFRESH_REVISION_KEY,),
+    ).fetchone()
+    try:
+        counter = int(row["value"]) if row is not None else 0
+        if counter < 0:
+            raise ValueError("negative refresh revision")
+    except (TypeError, ValueError):
+        counter = 0
+    rows = conn.execute(
+        "SELECT value FROM settings WHERE substr(key, 1, ?) = ?",
+        (len(_PIPELINE_REFRESH_STATUS_PREFIX),
+         _PIPELINE_REFRESH_STATUS_PREFIX),
+    ).fetchall()
+    for status_row in rows:
+        try:
+            payload = json.loads(status_row["value"])
+            revision = payload["revision"]
+            if (not isinstance(payload, dict)
+                    or payload.get("version") != 1
+                    or isinstance(revision, bool)
+                    or not isinstance(revision, int)
+                    or revision <= 0):
+                continue
+            counter = max(counter, revision)
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+    return counter
+
+
+def _next_pipeline_refresh_revision(conn) -> int:
+    """Allocate one globally monotonic status revision in this transaction."""
+    revision = _pipeline_refresh_current_revision(conn) + 1
+    conn.execute(
+        "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+        (_PIPELINE_REFRESH_REVISION_KEY, str(revision)),
+    )
+    return revision
+
+
+def _write_pipeline_refresh_status(
+        conn, key: str, repository: str, status: Optional[dict],
+        revision: int) -> bool:
+    """Publish one already-allocated event if it is newer for this profile."""
+    row = conn.execute(
+        "SELECT value FROM settings WHERE key = ?", (key,)
+    ).fetchone()
+    existing_revision = 0
+    if row is not None:
+        try:
+            existing = json.loads(row["value"])
+            existing_revision = existing["revision"]
+            if (not isinstance(existing, dict)
+                    or existing.get("version") != 1
+                    or isinstance(existing_revision, bool)
+                    or not isinstance(existing_revision, int)
+                    or existing_revision <= 0):
+                raise ValueError("invalid refresh status payload")
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            existing_revision = 0
+    if existing_revision >= revision:
+        return False
+    conn.execute(
+        "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+        (key, json.dumps({
+            "version": 1,
+            "repository": str(repository),
+            "revision": revision,
+            "status": status,
+        }, ensure_ascii=False, separators=(",", ":"))),
+    )
+    return True
+
+
+def _pipeline_scan_lease_guard_matches(conn, guard: dict) -> bool:
+    """Fence a write against the exact live owner inside its transaction."""
+    try:
+        key = _pipeline_scan_lease_key(str(guard["scope"]))
+        token = guard["token"]
+    except (KeyError, TypeError, ValueError):
+        return False
+    if not _valid_pipeline_scan_token(token):
+        return False
+    row = conn.execute(
+        "SELECT value FROM settings WHERE key = ?", (key,)
+    ).fetchone()
+    if row is None:
+        return False
+    try:
+        payload = json.loads(row["value"])
+        if not isinstance(payload, dict):
+            raise ValueError("invalid lease payload")
+        expires_at = float(payload["expires_at"])
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+    return (
+        isinstance(payload, dict)
+        and payload.get("version") == 1
+        and _valid_pipeline_scan_token(payload.get("token"))
+        and payload.get("token") == token
+        and math.isfinite(expires_at)
+        and expires_at > time.time()
+    )
+
+
+def acquire_pipeline_scan_lease(
+        scope: str, token: str, ttl_seconds: float, *,
+        now: Optional[float] = None) -> dict:
+    """Atomically acquire a renewable cross-process GitHub scan lease.
+
+    The lease lives in the existing SQLite settings table, so the API server,
+    worker, bot and any additional PromptPilot processes sharing ``DB_PATH``
+    serialize expensive GitHub observations. A crashed owner is recoverable
+    after ``expires_at``; atomically committed malformed state is reclaimable.
+    """
+    key = _pipeline_scan_lease_key(scope)
+    owner = token
+    ttl = float(ttl_seconds)
+    current = time.time() if now is None else float(now)
+    if not _valid_pipeline_scan_token(owner):
+        raise ValueError("pipeline scan lease token must contain 1..256 characters")
+    if not math.isfinite(current):
+        raise ValueError("pipeline scan lease time must be finite")
+    if not math.isfinite(ttl) or not 0 < ttl <= 86400:
+        raise ValueError("pipeline scan lease ttl must be between 0 and 86400 seconds")
+
+    with _connect(immediate=True) as conn:
+        row = conn.execute(
+            "SELECT value FROM settings WHERE key = ?", (key,)
+        ).fetchone()
+        if row is not None:
+            try:
+                existing = json.loads(row["value"])
+                if existing.get("version") != 1:
+                    raise ValueError("unsupported lease payload")
+                existing_token = existing["token"]
+                existing_expires = float(existing["expires_at"])
+                if (not _valid_pipeline_scan_token(existing_token)
+                        or not math.isfinite(existing_expires)
+                        or not existing_expires > 0
+                        or existing_expires > current + 86400):
+                    raise ValueError("invalid lease payload")
+            except (AttributeError, KeyError, TypeError, ValueError,
+                    json.JSONDecodeError):
+                # SQLite commits the value atomically, so malformed JSON cannot
+                # be a partially written live lease. Reclaim it under this same
+                # BEGIN IMMEDIATE transaction instead of deadlocking forever.
+                existing_token = ""
+                existing_expires = 0
+            if existing_token != owner and existing_expires > current:
+                status_revision = _next_pipeline_refresh_revision(conn)
+                return {
+                    "acquired": False, "expires_at": existing_expires,
+                    "state": "busy", "status_revision": status_revision,
+                }
+
+        expires_at = current + ttl
+        status_revision = _next_pipeline_refresh_revision(conn)
+        payload = json.dumps(
+            {"version": 1, "token": owner, "expires_at": expires_at},
+            separators=(",", ":"),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+            (key, payload),
+        )
+    return {
+        "acquired": True, "expires_at": expires_at, "state": "owned",
+        "status_revision": status_revision,
+    }
+
+
+def renew_pipeline_scan_lease(
+        scope: str, token: str, ttl_seconds: float, *,
+        now: Optional[float] = None) -> Optional[float]:
+    """Extend a scan lease iff ``token`` still owns it."""
+    key = _pipeline_scan_lease_key(scope)
+    owner = token
+    ttl = float(ttl_seconds)
+    current = time.time() if now is None else float(now)
+    if (not _valid_pipeline_scan_token(owner) or not math.isfinite(current)
+            or not math.isfinite(ttl)
+            or not 0 < ttl <= 86400):
+        return None
+    with _connect(immediate=True) as conn:
+        row = conn.execute(
+            "SELECT value FROM settings WHERE key = ?", (key,)
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            payload = json.loads(row["value"])
+            if not isinstance(payload, dict):
+                raise ValueError("invalid lease payload")
+            existing_expires = float(payload["expires_at"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if (payload.get("version") != 1
+                or not _valid_pipeline_scan_token(payload.get("token"))
+                or payload.get("token") != owner
+                or not math.isfinite(existing_expires)
+                or existing_expires <= current):
+            return None
+        expires_at = current + ttl
+        conn.execute(
+            "UPDATE settings SET value = ? WHERE key = ?",
+            (json.dumps(
+                {"version": 1, "token": owner, "expires_at": expires_at},
+                separators=(",", ":")), key),
+        )
+    return expires_at
+
+
+def release_pipeline_scan_lease(
+        scope: str, token: str, *,
+        refresh_status: Optional[dict] = None) -> bool:
+    """Release a lease and optionally publish final refresh status atomically."""
+    key = _pipeline_scan_lease_key(scope)
+    owner = token
+    if not _valid_pipeline_scan_token(owner):
+        return False
+    status_key = None
+    status_repository = None
+    final_status = None
+    if refresh_status is not None:
+        if not isinstance(refresh_status, dict):
+            return False
+        try:
+            status_key = _pipeline_refresh_status_key(
+                refresh_status["profile_id"])
+            status_repository = str(refresh_status["repository"])
+            final_status = refresh_status["status"]
+        except (KeyError, TypeError, ValueError):
+            return False
+        if final_status is not None and not isinstance(final_status, dict):
+            return False
+    with _connect(immediate=True) as conn:
+        row = conn.execute(
+            "SELECT value FROM settings WHERE key = ?", (key,)
+        ).fetchone()
+        if row is None:
+            return False
+        try:
+            payload = json.loads(row["value"])
+            if not isinstance(payload, dict):
+                raise ValueError("invalid lease payload")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False
+        if (payload.get("version") != 1
+                or not _valid_pipeline_scan_token(payload.get("token"))
+                or payload.get("token") != owner):
+            return False
+        if status_key is not None:
+            # Final status and lease deletion share one SQLite linearization
+            # point. Its revision is newer than every busy observation that
+            # completed while this owner held the lease; a successor can only
+            # allocate a later revision after this transaction commits.
+            revision = _next_pipeline_refresh_revision(conn)
+            _write_pipeline_refresh_status(
+                conn, status_key, status_repository, final_status, revision)
+        conn.execute("DELETE FROM settings WHERE key = ?", (key,))
+    return True
+
+
+def publish_pipeline_refresh_status(
+        profile_id: str, repository: str, status: Optional[dict], *,
+        revision: Optional[int] = None,
+        lease_guard: Optional[dict] = None) -> bool:
+    """Publish a blocked event or clear tombstone on the global SQLite clock."""
+    key = _pipeline_refresh_status_key(profile_id)
+    if status is not None and not isinstance(status, dict):
+        raise ValueError("pipeline refresh status must be an object or null")
+    if (revision is not None
+            and (isinstance(revision, bool) or not isinstance(revision, int)
+                 or revision <= 0)):
+        raise ValueError("pipeline refresh status revision must be positive")
+    with _connect(immediate=True) as conn:
+        if (lease_guard is not None
+                and not _pipeline_scan_lease_guard_matches(conn, lease_guard)):
+            return False
+        if revision is None:
+            event_revision = _next_pipeline_refresh_revision(conn)
+        else:
+            # Caller revisions come only from acquire_pipeline_scan_lease().
+            # Reject a fabricated/unallocated future value that could poison
+            # the durable ordering. An allocated observation that is no longer
+            # the global tip is already superseded, even if its per-profile
+            # row has not yet been written by the newer contender/owner.
+            current_revision = _pipeline_refresh_current_revision(conn)
+            if revision > current_revision:
+                raise ValueError("pipeline refresh status revision was not allocated")
+            if revision < current_revision:
+                return False
+            event_revision = revision
+        return _write_pipeline_refresh_status(
+            conn, key, repository, status, event_revision)
+
+
+def get_pipeline_refresh_status(profile_id: str) -> Optional[dict]:
+    """Read one validated status event, including a clear tombstone."""
+    raw = get_setting(_pipeline_refresh_status_key(profile_id))
+    if raw is None:
+        return None
+    try:
+        payload = json.loads(raw)
+        revision = payload["revision"]
+        status = payload["status"]
+        if (not isinstance(payload, dict) or payload.get("version") != 1
+                or isinstance(revision, bool) or not isinstance(revision, int)
+                or revision <= 0
+                or status is not None and not isinstance(status, dict)):
+            raise ValueError("invalid refresh status payload")
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return payload
 
 
 def touch_worker_heartbeat(pid: int, now: Optional[datetime] = None):
