@@ -166,6 +166,70 @@ def test_health_exposes_configured_gh_to_nested_checker(monkeypatch):
     assert captured["env"]["PATH"].split(os.pathsep)[0] == os.path.dirname(gh)
 
 
+@pytest.mark.parametrize("stdout", ["", "not-json"])
+def test_health_preserves_wrapper_stderr_when_allowed_exit_has_no_json(
+        monkeypatch, stdout):
+    stderr = (
+        "GraphQL: API rate limit exceeded for user ID 12345. (HTTP 403)\n"
+        "exit status 2\n"
+    )
+    monkeypatch.setattr(
+        pp.subprocess, "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=1, stdout=stdout, stderr=stderr),
+    )
+
+    with pytest.raises(pp.PipelineError) as raised:
+        pp.run_health({"health_command": ["go", "run", "./tools/pipelinehealth", "--json"]})
+
+    assert str(raised.value) == stderr.strip()
+    assert "invalid JSON" not in str(raised.value)
+
+
+def test_health_keeps_valid_json_authoritative_on_allowed_exit(monkeypatch):
+    monkeypatch.setattr(
+        pp.subprocess, "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=1, stdout='{"state":"red"}', stderr="health is red"),
+    )
+
+    assert pp.run_health({"health_command": ["project-health", "--json"]}) == {
+        "state": "red",
+    }
+
+
+def test_health_success_with_invalid_json_remains_contract_error(monkeypatch):
+    monkeypatch.setattr(
+        pp.subprocess, "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0, stdout="not-json", stderr="non-fatal warning"),
+    )
+
+    with pytest.raises(pp.PipelineError, match="health command returned invalid JSON"):
+        pp.run_health({"health_command": ["project-health", "--json"]})
+
+
+def test_pipelinectl_reports_health_wrapper_stderr_in_error_payload(
+        tmp_path, monkeypatch, capsys):
+    config_path = tmp_path / "pipelinectl.json"
+    config_path.write_text(json.dumps({
+        "repository": "owner/repo", "trusted_account": "owner",
+        "health_command": ["go", "run", "./tools/pipelinehealth", "--json"],
+    }), encoding="utf-8")
+    stderr = "GitHub API rate limit exceeded; reset at 2026-09-14T01:00:00Z\nexit status 2\n"
+    monkeypatch.setattr(pp, "GitHub", lambda: object())
+    monkeypatch.setattr(
+        pp.subprocess, "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=1, stdout="", stderr=stderr),
+    )
+
+    assert pp.run(["--config", str(config_path), "next", "review"]) == 2
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {"action": "error", "error": stderr.strip()}
+
+
 def test_health_fast_forwards_clean_base_before_checker(monkeypatch):
     calls = []
     outputs = iter(["main\n", "", "", "", '{"state":"green"}'])
