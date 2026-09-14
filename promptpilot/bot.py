@@ -923,6 +923,11 @@ def _pipeline_text(data: dict) -> str:
         reset = core.get("reset_at") or "—"
         lines.insert(3, f"GitHub REST API: {core.get('remaining', 0)} / "
                         f"{core.get('limit', 0)}; сброс {reset}")
+    if cache.get("refresh_blocked") and cache.get("refresh_blocked") != "worker_paused":
+        retry = cache.get("refresh_deferred_until") or "—"
+        lines.insert(3, "GitHub scan отложен: "
+                        f"{cache.get('refresh_blocked_reason', cache['refresh_blocked'])}; "
+                        f"следующая попытка {retry}")
     diagnostics = data.get("diagnostics")
     if diagnostics:
         lines.insert(3, f"Инварианты: {diagnostics.get('state', '—')} — "

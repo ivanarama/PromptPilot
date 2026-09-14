@@ -70,6 +70,26 @@ def _notify_pipeline_completion(task, verdict: str | None) -> None:
         print(f"  !! pipeline wake-up unavailable for #{task.id}: {exc}", flush=True)
 
 
+def _pipeline_defer_time(decision: dict) -> Optional[datetime]:
+    """Resolve an exact budget reset before falling back to relative intervals."""
+    defer_until = decision.get("defer_until")
+    if defer_until:
+        try:
+            parsed = datetime.fromisoformat(
+                str(defer_until).replace("Z", "+00:00"))
+            if parsed.tzinfo is not None:
+                parsed = parsed.astimezone(timezone.utc)
+                now = datetime.now(timezone.utc)
+                return max(
+                    parsed,
+                    now + timedelta(seconds=max(1, POLL_INTERVAL)),
+                )
+        except (TypeError, ValueError):
+            pass
+    defer_for = decision.get("defer_for")
+    return db.parse_recurrence(str(defer_for)) if defer_for else None
+
+
 def retry_reason(text: str, exit_code: int) -> Optional[str]:
     """Why the run must be requeued: RETRY_RATE_LIMIT, RETRY_OVERLOAD or None.
 
@@ -639,12 +659,12 @@ def _execute_task_inner(task):
         if gate:
             reason = gate["reason"]
             if gate["action"] == "defer":
-                next_run = db.parse_recurrence(gate["defer_for"])
+                next_run = _pipeline_defer_time(gate)
                 if next_run:
                     db.defer_task(task.id, next_run, reason)
                     print(f"  -> Deferred without agent: {reason}")
                     return
-                print(f"  !! invalid pipeline defer interval: {gate['defer_for']}", flush=True)
+                print("  !! invalid pipeline defer time", flush=True)
             elif gate["action"] == "complete_empty":
                 db.set_verdict(task.id, "ПУСТО")
                 db.mark_completed(
@@ -680,7 +700,7 @@ def _execute_task_inner(task):
             return
         if route["action"] == "defer":
             reason = route["reason"]
-            next_run = db.parse_recurrence(route["defer_for"])
+            next_run = _pipeline_defer_time(route)
             if next_run:
                 db.defer_task(task.id, next_run, reason)
                 print(f"  -> Pipeline preflight deferred without agent: {reason}")
@@ -689,7 +709,7 @@ def _execute_task_inner(task):
             db.mark_completed(
                 task.id,
                 f"Pipeline preflight PromptPilot: {reason}\n"
-                f"Некорректный интервал повтора: {route['defer_for']}\n\n"
+                "Некорректное время повтора pipeline preflight\n\n"
                 f"ИТОГ: НУЖЕН ЧЕЛОВЕК ({reason})",
                 exit_code=0,
             )
