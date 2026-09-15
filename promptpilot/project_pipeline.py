@@ -1359,7 +1359,11 @@ def run(argv=None) -> int:
         print(json.dumps(value, ensure_ascii=False, indent=2))
         return 0
     except (PipelineError, OSError, ValueError, json.JSONDecodeError) as exc:
-        print(json.dumps({"action": "error", "error": str(exc)}, ensure_ascii=False, indent=2))
+        error = str(exc)
+        print(json.dumps({"action": "error", "error": error}, ensure_ascii=False, indent=2))
+        # Keep stdout machine-readable, but do not let a shell assignment hide
+        # the only copy of the diagnostic when it branches on the exit code.
+        print(f"pipelinectl {args.command}: {error}", file=sys.stderr)
         return 2
 
 
