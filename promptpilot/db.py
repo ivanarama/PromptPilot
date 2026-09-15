@@ -519,6 +519,27 @@ def create_task(task: TaskCreate) -> TaskInDB:
         return _insert_task(conn, task)
 
 
+def create_series_occurrence_if_idle(task: TaskCreate) -> Optional[TaskInDB]:
+    """Insert one recurrence only when its series has no live occurrence."""
+    if not task.series_id:
+        raise ValueError("series occurrence requires series_id")
+    with _connect(immediate=True) as conn:
+        series = conn.execute(
+            "SELECT ended_at FROM task_series WHERE id = ?",
+            (task.series_id,),
+        ).fetchone()
+        if not series or series["ended_at"]:
+            return None
+        existing = conn.execute(
+            """SELECT 1 FROM tasks WHERE series_id = ?
+               AND status IN ('pending', 'running', 'rate_limited') LIMIT 1""",
+            (task.series_id,),
+        ).fetchone()
+        if existing is not None:
+            return None
+        return _insert_task(conn, task)
+
+
 def get_task(task_id: int, *, conn=None) -> Optional[TaskInDB]:
     def _query(c):
         row = c.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
@@ -915,6 +936,179 @@ def update_series(series_id: int, fields: dict) -> bool:
         return True
 
 
+def _pipeline_series_wake_intent_key(series_id: int) -> str:
+    if isinstance(series_id, bool) or not isinstance(series_id, int) or series_id <= 0:
+        raise ValueError("pipeline series id must be a positive integer")
+    return f"pipeline_series_wake_intent:v1:{series_id}"
+
+
+def _recreate_series_occurrence(conn, series_id: int, series,
+                                scheduled_at: datetime) -> bool:
+    latest_row = conn.execute(
+        "SELECT * FROM tasks WHERE series_id = ? ORDER BY id DESC LIMIT 1",
+        (series_id,),
+    ).fetchone()
+    if not latest_row:
+        return False
+    latest = _row_to_task(latest_row)
+    _insert_task(conn, TaskCreate(
+        prompt=series["prompt"],
+        working_dir=series["working_dir"],
+        provider=series["provider"],
+        priority=series["priority"],
+        scheduled_at=scheduled_at,
+        max_retries=latest.max_retries,
+        skip_permissions=latest.skip_permissions,
+        model=series["model"],
+        effort=series["effort"],
+        tg_chat_id=latest.tg_chat_id,
+        recurrence=series["base_recurrence"],
+        task_timeout=series["task_timeout"],
+        detached=latest.detached,
+        keep_pane=latest.keep_pane,
+        herdr_target=latest.herdr_target,
+        machine=latest.machine,
+        worktree=latest.worktree,
+        series_id=series_id,
+    ))
+    return True
+
+
+def request_pipeline_series_wake(series_id: int) -> dict:
+    """Move a pending stage now or remember the wake across its running task."""
+    key = _pipeline_series_wake_intent_key(series_id)
+    with _connect(immediate=True) as conn:
+        series = conn.execute(
+            "SELECT * FROM task_series WHERE id = ?",
+            (series_id,),
+        ).fetchone()
+        if not series or series["paused"] or series["ended_at"]:
+            conn.execute("DELETE FROM settings WHERE key = ?", (key,))
+            return {"accepted": False, "state": "inactive"}
+        now = _now()
+        moved = conn.execute(
+            """UPDATE tasks SET scheduled_at = ?, next_run_at = NULL
+               WHERE series_id = ? AND status = 'pending'""",
+            (now, series_id),
+        )
+        if moved.rowcount:
+            conn.execute("DELETE FROM settings WHERE key = ?", (key,))
+            return {"accepted": True, "state": "scheduled"}
+        if conn.execute(
+                "SELECT 1 FROM tasks WHERE series_id = ? AND status = 'rate_limited'",
+                (series_id,),
+        ).fetchone():
+            # A provider/account backoff is stronger than an automatic wake.
+            # Do not shorten it, but remember that another occurrence became
+            # useful while this one is waiting. Once the deferred attempt
+            # finishes, its successor will be moved to now.
+            conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, '1')",
+                (key,),
+            )
+            return {"accepted": True, "state": "latched_rate_limited"}
+        if conn.execute(
+                "SELECT 1 FROM tasks WHERE series_id = ? AND status = 'running'",
+                (series_id,),
+        ).fetchone():
+            conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, '1')",
+                (key,),
+            )
+            return {"accepted": True, "state": "latched"}
+        if _recreate_series_occurrence(
+                conn, series_id, series, datetime.now(timezone.utc)):
+            conn.execute("DELETE FROM settings WHERE key = ?", (key,))
+            return {"accepted": True, "state": "recreated"}
+        return {"accepted": False, "state": "missing"}
+
+
+def repair_active_series_occurrences() -> list[int]:
+    """Recreate active series lost after a terminal commit and hard crash.
+
+    A worker can die after marking an occurrence completed/failed but before
+    its ``finally`` schedules the successor.  Repair only that narrow terminal
+    state: a cancelled latest occurrence remains an explicit human stop.
+    """
+    repaired = []
+    with _connect(immediate=True) as conn:
+        series_rows = conn.execute(
+            """SELECT * FROM task_series
+               WHERE paused = 0 AND ended_at IS NULL ORDER BY id"""
+        ).fetchall()
+        for series in series_rows:
+            series_id = int(series["id"])
+            if conn.execute(
+                    """SELECT 1 FROM tasks WHERE series_id = ?
+                       AND status IN ('pending', 'running', 'rate_limited')
+                       LIMIT 1""",
+                    (series_id,),
+            ).fetchone() is not None:
+                continue
+            latest = conn.execute(
+                """SELECT status, completed_at FROM tasks WHERE series_id = ?
+                   ORDER BY id DESC LIMIT 1""",
+                (series_id,),
+            ).fetchone()
+            if (latest is None
+                    or latest["status"] not in ("completed", "failed")):
+                continue
+            wake_key = _pipeline_series_wake_intent_key(series_id)
+            has_wake = conn.execute(
+                "SELECT 1 FROM settings WHERE key = ?", (wake_key,)
+            ).fetchone() is not None
+            anchor = _parse_dt(latest["completed_at"]) \
+                or datetime.now(timezone.utc)
+            recurrence = _effective_series_recurrence(dict(series), anchor)
+            scheduled_at = (datetime.now(timezone.utc) if has_wake
+                            else parse_recurrence(recurrence, now=anchor))
+            if (scheduled_at is not None and _recreate_series_occurrence(
+                    conn, series_id, series, scheduled_at)):
+                # The immediate repaired occurrence itself satisfies a wake
+                # latched before the crash. Keeping the bit would wake an
+                # unnecessary second successor after this one completes.
+                if has_wake:
+                    conn.execute(
+                        "DELETE FROM settings WHERE key = ?", (wake_key,))
+                repaired.append(series_id)
+    return repaired
+
+
+def consume_pipeline_series_wake(series_id: int) -> bool:
+    """Apply one durable wake after the running occurrence creates its next row."""
+    key = _pipeline_series_wake_intent_key(series_id)
+    with _connect(immediate=True) as conn:
+        if conn.execute(
+                "SELECT 1 FROM settings WHERE key = ?", (key,)
+        ).fetchone() is None:
+            return False
+        series = conn.execute(
+            "SELECT paused, ended_at FROM task_series WHERE id = ?",
+            (series_id,),
+        ).fetchone()
+        if not series or series["paused"] or series["ended_at"]:
+            conn.execute("DELETE FROM settings WHERE key = ?", (key,))
+            return False
+        moved = conn.execute(
+            """UPDATE tasks SET scheduled_at = ?, next_run_at = NULL
+               WHERE series_id = ? AND status = 'pending'""",
+            (_now(), series_id),
+        )
+        if not moved.rowcount:
+            return False
+        conn.execute("DELETE FROM settings WHERE key = ?", (key,))
+        return True
+
+
+def clear_pipeline_series_wake(series_id: int) -> bool:
+    key = _pipeline_series_wake_intent_key(series_id)
+    with _connect() as conn:
+        deleted = conn.execute(
+            "DELETE FROM settings WHERE key = ?", (key,)
+        )
+        return deleted.rowcount > 0
+
+
 def series_action(series_id: int, action: str) -> bool:
     with _connect() as conn:
         row = conn.execute("SELECT * FROM task_series WHERE id = ?", (series_id,)).fetchone()
@@ -924,6 +1118,10 @@ def series_action(series_id: int, action: str) -> bool:
         if action == "pause":
             conn.execute("UPDATE task_series SET paused = 1, updated_at = ? WHERE id = ?",
                          (now, series_id))
+            conn.execute(
+                "DELETE FROM settings WHERE key = ?",
+                (_pipeline_series_wake_intent_key(series_id),),
+            )
         elif action == "resume":
             conn.execute("UPDATE task_series SET paused = 0, updated_at = ? WHERE id = ? AND ended_at IS NULL",
                          (now, series_id))
@@ -934,6 +1132,10 @@ def series_action(series_id: int, action: str) -> bool:
                 (now, series_id),
             )
             if cur.rowcount > 0:
+                conn.execute(
+                    "DELETE FROM settings WHERE key = ?",
+                    (_pipeline_series_wake_intent_key(series_id),),
+                )
                 return True
             if row["ended_at"] or conn.execute(
                 "SELECT 1 FROM tasks WHERE series_id = ? AND status = 'running'",
@@ -947,40 +1149,24 @@ def series_action(series_id: int, action: str) -> bool:
             # occurrence from the durable series plus non-editable execution
             # settings of its latest run. The UPDATE above takes the SQLite
             # write lock first, so concurrent run_now calls cannot insert two.
-            latest_row = conn.execute(
-                "SELECT * FROM tasks WHERE series_id = ? ORDER BY id DESC LIMIT 1",
-                (series_id,),
-            ).fetchone()
-            if not latest_row:
-                return False
-            latest = _row_to_task(latest_row)
-            _insert_task(conn, TaskCreate(
-                prompt=row["prompt"],
-                working_dir=row["working_dir"],
-                provider=row["provider"],
-                priority=row["priority"],
-                scheduled_at=datetime.now(timezone.utc),
-                max_retries=latest.max_retries,
-                skip_permissions=latest.skip_permissions,
-                model=row["model"],
-                effort=row["effort"],
-                tg_chat_id=latest.tg_chat_id,
-                recurrence=row["base_recurrence"],
-                task_timeout=row["task_timeout"],
-                detached=latest.detached,
-                keep_pane=latest.keep_pane,
-                herdr_target=latest.herdr_target,
-                machine=latest.machine,
-                worktree=latest.worktree,
-                series_id=series_id,
-            ))
-            return True
+            recreated = _recreate_series_occurrence(
+                conn, series_id, row, datetime.now(timezone.utc))
+            if recreated:
+                conn.execute(
+                    "DELETE FROM settings WHERE key = ?",
+                    (_pipeline_series_wake_intent_key(series_id),),
+                )
+            return recreated
         elif action == "end":
             conn.execute("UPDATE task_series SET ended_at = ?, updated_at = ? WHERE id = ?",
                          (now, now, series_id))
             conn.execute("UPDATE tasks SET status = 'cancelled', completed_at = ? "
                          "WHERE series_id = ? AND status IN ('pending', 'rate_limited')",
                          (now, series_id))
+            conn.execute(
+                "DELETE FROM settings WHERE key = ?",
+                (_pipeline_series_wake_intent_key(series_id),),
+            )
         else:
             return False
         return True
@@ -1468,6 +1654,386 @@ def _pipeline_scan_lease_key(scope: str) -> str:
     return f"pipeline_github_scan_lease:v1:{digest}"
 
 
+_PIPELINE_GITHUB_BUDGET_RESERVATION_PREFIX = \
+    "pipeline_github_budget_reservations:v1:"
+_PIPELINE_GITHUB_RATE_SNAPSHOT_PREFIX = "pipeline_github_rate_snapshot:v1:"
+_PIPELINE_GITHUB_BUDGET_RESOURCES = ("core", "search", "graphql")
+
+
+def _pipeline_github_budget_reservation_key(scope: str) -> str:
+    value = str(scope).strip()
+    if not value:
+        raise ValueError("pipeline GitHub budget scope must not be empty")
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+    return f"{_PIPELINE_GITHUB_BUDGET_RESERVATION_PREFIX}{digest}"
+
+
+def _pipeline_github_rate_snapshot_key(scope: str) -> str:
+    value = str(scope).strip()
+    if not value:
+        raise ValueError("pipeline GitHub budget scope must not be empty")
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+    return f"{_PIPELINE_GITHUB_RATE_SNAPSHOT_PREFIX}{digest}"
+
+
+def _pipeline_budget_vector(value, name: str) -> dict:
+    if not isinstance(value, dict):
+        raise ValueError(f"{name} must be an object")
+    if set(value) != set(_PIPELINE_GITHUB_BUDGET_RESOURCES):
+        raise ValueError(
+            f"{name} must contain exactly "
+            + ", ".join(_PIPELINE_GITHUB_BUDGET_RESOURCES))
+    result = {}
+    for resource in _PIPELINE_GITHUB_BUDGET_RESOURCES:
+        amount = value.get(resource)
+        if (isinstance(amount, bool) or not isinstance(amount, int)
+                or amount < 0):
+            raise ValueError(f"{name}.{resource} must be a non-negative integer")
+        result[resource] = amount
+    return result
+
+
+def _load_pipeline_budget_reservations(conn, key: str) -> list[dict]:
+    row = conn.execute(
+        "SELECT value FROM settings WHERE key = ?", (key,)
+    ).fetchone()
+    if row is None:
+        return []
+    try:
+        payload = json.loads(row["value"])
+        values = payload["reservations"]
+        if (not isinstance(payload, dict) or payload.get("version") != 1
+                or not isinstance(values, list)):
+            raise ValueError("invalid reservation ledger envelope")
+        result = []
+        seen_tokens = set()
+        seen_attempts = set()
+        for item in values:
+            if not isinstance(item, dict):
+                raise ValueError("invalid reservation ledger item")
+            token = item.get("token")
+            task_id = item.get("task_id")
+            started_at = item.get("task_started_at")
+            if (not _valid_pipeline_scan_token(token)
+                    or isinstance(task_id, bool) or not isinstance(task_id, int)
+                    or task_id <= 0 or not isinstance(started_at, str)
+                    or not started_at or not isinstance(item.get("profile_id"), str)
+                    or not item.get("profile_id")
+                    or not isinstance(item.get("queue_id"), str)
+                    or not item.get("queue_id")
+                    or not isinstance(item.get("route"), str)
+                    or not item.get("route")
+                    or isinstance(item.get("created_at"), bool)
+                    or not isinstance(item.get("created_at"), (int, float))
+                    or not math.isfinite(float(item["created_at"]))):
+                raise ValueError("invalid reservation ledger item identity")
+            cost = _pipeline_budget_vector(item.get("cost"), "reservation cost")
+            attempt = (task_id, started_at)
+            if token in seen_tokens or attempt in seen_attempts:
+                raise ValueError("duplicate reservation ledger item")
+            seen_tokens.add(token)
+            seen_attempts.add(attempt)
+            result.append({
+                "token": token, "task_id": task_id,
+                "task_started_at": started_at,
+                "profile_id": item["profile_id"],
+                "queue_id": item["queue_id"], "route": item["route"],
+                "cost": cost, "created_at": float(item["created_at"]),
+            })
+        return result
+    except (KeyError, OverflowError, TypeError, ValueError,
+            json.JSONDecodeError) as exc:
+        # Unlike a mutex lease, reservations represent quota promised to live
+        # tasks. Silently discarding malformed state could admit two expensive
+        # providers, so corruption is a fail-closed operator condition.
+        raise ValueError("pipeline GitHub budget reservation ledger is corrupt") from exc
+
+
+def _load_or_recover_pipeline_budget_reservations(conn, key: str) -> list[dict]:
+    """Reclaim corrupt state only when no provider attempt can still own it."""
+    try:
+        return _load_pipeline_budget_reservations(conn, key)
+    except ValueError:
+        running = conn.execute(
+            "SELECT 1 FROM tasks WHERE status = 'running' LIMIT 1"
+        ).fetchone()
+        if running is not None:
+            raise
+        conn.execute("DELETE FROM settings WHERE key = ?", (key,))
+        return []
+
+
+def _active_pipeline_budget_reservations(conn, values: list[dict]) -> tuple[list[dict], bool]:
+    active = []
+    for item in values:
+        row = conn.execute(
+            "SELECT status, started_at FROM tasks WHERE id = ?",
+            (item["task_id"],),
+        ).fetchone()
+        if (row is not None and row["status"] == "running"
+                and row["started_at"] == item["task_started_at"]):
+            active.append(item)
+    return active, len(active) != len(values)
+
+
+def _write_pipeline_budget_reservations(conn, key: str, values: list[dict]) -> None:
+    if not values:
+        conn.execute("DELETE FROM settings WHERE key = ?", (key,))
+        return
+    conn.execute(
+        "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+        (key, json.dumps(
+            {"version": 1, "reservations": values},
+            ensure_ascii=False, separators=(",", ":"))),
+    )
+
+
+def pipeline_github_budget_reservations(scope: str) -> dict:
+    """Return live, task-fenced reservations and prune completed attempts."""
+    key = _pipeline_github_budget_reservation_key(scope)
+    with _connect(immediate=True) as conn:
+        values = _load_or_recover_pipeline_budget_reservations(conn, key)
+        active, changed = _active_pipeline_budget_reservations(conn, values)
+        if changed:
+            _write_pipeline_budget_reservations(conn, key, active)
+        totals = {resource: 0 for resource in _PIPELINE_GITHUB_BUDGET_RESOURCES}
+        for item in active:
+            for resource in totals:
+                totals[resource] += item["cost"][resource]
+        return {"count": len(active), "totals": totals, "items": active}
+
+
+def record_pipeline_github_rate_snapshot(
+        scope: str, limits: dict, *, observed_at: Optional[float] = None,
+        scan_lease_guard: Optional[dict] = None) -> bool:
+    """Persist a quota-free UI snapshot while the caller owns scan ordering."""
+    key = _pipeline_github_rate_snapshot_key(scope)
+    sanitized = {}
+    for resource in _PIPELINE_GITHUB_BUDGET_RESOURCES:
+        item = limits.get(resource) if isinstance(limits, dict) else None
+        if not isinstance(item, dict):
+            raise ValueError(f"invalid GitHub {resource} rate limit")
+        values = {}
+        for name in ("limit", "used", "remaining", "reset"):
+            value = item.get(name)
+            if type(value) is not int or value < 0:
+                raise ValueError(f"invalid GitHub {resource}.{name}")
+            values[name] = value
+        reset_at = item.get("reset_at")
+        if reset_at is not None and not isinstance(reset_at, str):
+            raise ValueError(f"invalid GitHub {resource}.reset_at")
+        values["reset_at"] = reset_at
+        sanitized[resource] = values
+    timestamp = time.time() if observed_at is None else float(observed_at)
+    if not math.isfinite(timestamp):
+        raise ValueError("GitHub rate snapshot time must be finite")
+    payload = {"version": 1, "observed_at": timestamp, "limits": sanitized}
+    with _connect(immediate=True) as conn:
+        if (scan_lease_guard is not None
+                and not _pipeline_scan_lease_guard_matches(
+                    conn, scan_lease_guard)):
+            return False
+        existing = conn.execute(
+            "SELECT value FROM settings WHERE key = ?", (key,)
+        ).fetchone()
+        if existing is not None:
+            try:
+                previous = json.loads(existing["value"])
+                previous_at = float(previous["observed_at"])
+            except (KeyError, OverflowError, TypeError, ValueError,
+                    json.JSONDecodeError):
+                previous_at = -1
+            if previous_at > timestamp:
+                return True
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+            (key, json.dumps(payload, ensure_ascii=False,
+                             separators=(",", ":"))),
+        )
+        return True
+
+
+def get_pipeline_github_rate_snapshot(scope: str) -> Optional[dict]:
+    """Return the last locally observed GitHub limits without network I/O."""
+    key = _pipeline_github_rate_snapshot_key(scope)
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT value FROM settings WHERE key = ?", (key,)
+        ).fetchone()
+    if row is None:
+        return None
+    try:
+        payload = json.loads(row["value"])
+        if (not isinstance(payload, dict) or payload.get("version") != 1
+                or not math.isfinite(float(payload["observed_at"]))):
+            raise ValueError("invalid GitHub rate snapshot")
+        # Reuse the strict writer validation without touching SQLite.
+        limits = payload["limits"]
+        for resource in _PIPELINE_GITHUB_BUDGET_RESOURCES:
+            item = limits[resource]
+            if (not isinstance(item, dict)
+                    or any(type(item.get(name)) is not int
+                           or item[name] < 0
+                           for name in ("limit", "used", "remaining", "reset"))
+                    or (item.get("reset_at") is not None
+                        and not isinstance(item.get("reset_at"), str))):
+                raise ValueError("invalid GitHub rate snapshot")
+        if set(limits) != set(_PIPELINE_GITHUB_BUDGET_RESOURCES):
+            raise ValueError("invalid GitHub rate snapshot")
+        return {"observed_at": float(payload["observed_at"]),
+                "limits": limits}
+    except (KeyError, OverflowError, TypeError, ValueError,
+            json.JSONDecodeError) as exc:
+        raise ValueError("pipeline GitHub rate snapshot is corrupt") from exc
+
+
+def reserve_pipeline_github_budget(
+        scope: str, *, token: str, task_id: int, task_started_at: str,
+        profile_id: str, queue_id: str, route: str, cost: dict,
+        limits: dict, minimum_remaining: dict,
+        now: Optional[float] = None,
+        scan_lease_guard: Optional[dict] = None) -> dict:
+    """Atomically reserve quota for one exact running task attempt."""
+    key = _pipeline_github_budget_reservation_key(scope)
+    if not _valid_pipeline_scan_token(token):
+        raise ValueError("pipeline budget token must contain 1..256 characters")
+    if isinstance(task_started_at, datetime):
+        task_started_at = _to_utc_iso(task_started_at)
+    if (isinstance(task_id, bool) or not isinstance(task_id, int) or task_id <= 0
+            or not isinstance(task_started_at, str) or not task_started_at
+            or not isinstance(profile_id, str) or not profile_id
+            or not isinstance(queue_id, str) or not queue_id
+            or not isinstance(route, str) or not route):
+        raise ValueError("invalid pipeline budget reservation identity")
+    requested = _pipeline_budget_vector(cost, "cost")
+    floor = _pipeline_budget_vector(minimum_remaining, "minimum_remaining")
+    reported = {}
+    resets = {}
+    for resource in _PIPELINE_GITHUB_BUDGET_RESOURCES:
+        item = limits.get(resource) if isinstance(limits, dict) else None
+        try:
+            raw_remaining = item["remaining"]
+            raw_reset = item["reset"]
+            if (isinstance(raw_remaining, bool) or isinstance(raw_reset, bool)
+                    or isinstance(raw_remaining, float)
+                    and not raw_remaining.is_integer()
+                    or isinstance(raw_reset, float) and not raw_reset.is_integer()):
+                raise ValueError("non-integral GitHub rate limit")
+            remaining = int(raw_remaining)
+            reset = int(raw_reset)
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"invalid GitHub {resource} rate limit") from exc
+        if remaining < 0 or reset <= 0:
+            raise ValueError(f"invalid GitHub {resource} rate limit")
+        reported[resource] = remaining
+        resets[resource] = reset
+    created_at = time.time() if now is None else float(now)
+    if not math.isfinite(created_at):
+        raise ValueError("pipeline budget reservation time must be finite")
+
+    with _connect(immediate=True) as conn:
+        if (scan_lease_guard is not None
+                and not _pipeline_scan_lease_guard_matches(
+                    conn, scan_lease_guard)):
+            return {"allowed": False, "state": "scan_lease_lost",
+                    "reason": "GitHub scan lease changed before budget reservation"}
+        task = conn.execute(
+            "SELECT status, started_at FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if (task is None or task["status"] != "running"
+                or task["started_at"] != task_started_at):
+            return {"allowed": False, "state": "task_fence_lost",
+                    "reason": "running task attempt changed before budget reservation"}
+        values = _load_or_recover_pipeline_budget_reservations(conn, key)
+        active, changed = _active_pipeline_budget_reservations(conn, values)
+        own = [item for item in active if item["token"] == token]
+        if own:
+            item = own[0]
+            if (item["task_id"] != task_id
+                    or item["task_started_at"] != task_started_at
+                    or item["cost"] != requested or item["route"] != route):
+                raise ValueError("pipeline budget token was reused inconsistently")
+            if changed:
+                _write_pipeline_budget_reservations(conn, key, active)
+            return {"allowed": True, "state": "reserved",
+                    "reported_remaining": reported,
+                    "reserved_other": {resource: sum(
+                        value["cost"][resource] for value in active
+                        if value["token"] != token) for resource in reported},
+                    "requested_cost": requested,
+                    "minimum_remaining": floor,
+                    "effective_after": {resource: reported[resource] - sum(
+                        value["cost"][resource] for value in active)
+                        for resource in reported},
+                    "blocked_resources": [],
+                    "active_reservations": len(active)}
+        if any(item["task_id"] == task_id
+               and item["task_started_at"] == task_started_at for item in active):
+            raise ValueError("running task attempt already owns another reservation")
+
+        reserved = {resource: sum(
+            item["cost"][resource] for item in active) for resource in reported}
+        after = {resource: reported[resource] - reserved[resource] - requested[resource]
+                 for resource in reported}
+        blocked = [{
+            "resource": resource,
+            "reported_remaining": reported[resource],
+            "reserved_other": reserved[resource],
+            "requested_cost": requested[resource],
+            "minimum_remaining": floor[resource],
+            "effective_after": after[resource],
+            "reset": resets[resource],
+            "blocked_by": (
+                "live" if reported[resource] - requested[resource]
+                < floor[resource] else "reservation"),
+        } for resource in reported if after[resource] < floor[resource]]
+        if blocked:
+            if changed:
+                _write_pipeline_budget_reservations(conn, key, active)
+            state = ("low" if any(item["blocked_by"] == "live"
+                                  for item in blocked)
+                     else "budget_in_flight")
+            return {"allowed": False, "state": state,
+                    "blocked_resources": blocked,
+                    "reported_remaining": reported, "reserved_other": reserved,
+                    "requested_cost": requested, "minimum_remaining": floor,
+                    "effective_after": after, "active_reservations": len(active)}
+
+        active.append({
+            "token": token, "task_id": task_id,
+            "task_started_at": task_started_at, "profile_id": profile_id,
+            "queue_id": queue_id, "route": route, "cost": requested,
+            "created_at": created_at,
+        })
+        _write_pipeline_budget_reservations(conn, key, active)
+        return {"allowed": True, "state": "reserved",
+                "reported_remaining": reported, "reserved_other": reserved,
+                "requested_cost": requested, "minimum_remaining": floor,
+                "effective_after": after,
+                "active_reservations": len(active)}
+
+
+def release_pipeline_github_budget(
+        scope: str, *, token: str, task_id: int, task_started_at: str) -> bool:
+    """Release only the exact reservation owned by this task attempt."""
+    key = _pipeline_github_budget_reservation_key(scope)
+    if not _valid_pipeline_scan_token(token):
+        return False
+    if isinstance(task_started_at, datetime):
+        task_started_at = _to_utc_iso(task_started_at)
+    with _connect(immediate=True) as conn:
+        values = _load_or_recover_pipeline_budget_reservations(conn, key)
+        kept = [item for item in values if not (
+            item["token"] == token and item["task_id"] == task_id
+            and item["task_started_at"] == task_started_at)]
+        removed = len(kept) != len(values)
+        active, changed = _active_pipeline_budget_reservations(conn, kept)
+        if not removed and not changed:
+            return False
+        _write_pipeline_budget_reservations(conn, key, active)
+        return removed
+
+
 _PIPELINE_REFRESH_STATUS_PREFIX = "pipeline_github_refresh_status:v1:"
 _PIPELINE_REFRESH_REVISION_KEY = "pipeline_github_refresh_revision:v1"
 
@@ -1847,7 +2413,8 @@ def is_paused() -> bool:
     return get_setting("worker_paused", "0") == "1"
 
 
-def parse_recurrence(recurrence: str) -> Optional[datetime]:
+def parse_recurrence(recurrence: str, *,
+                     now: Optional[datetime] = None) -> Optional[datetime]:
     """Parse recurrence string and return next run datetime (UTC).
 
     Supported formats:
@@ -1858,17 +2425,17 @@ def parse_recurrence(recurrence: str) -> Optional[datetime]:
     if not recurrence:
         return None
     s = recurrence.strip().lower()
+    now = now or datetime.now(timezone.utc)
     # Nh or Nm
     m = re.fullmatch(r"(\d+)([mh])", s)
     if m:
         n, unit = int(m.group(1)), m.group(2)
         delta = timedelta(minutes=n) if unit == "m" else timedelta(hours=n)
-        return datetime.now(timezone.utc) + delta
+        return now + delta
     # daily@HH:MM
     m = re.fullmatch(r"daily@(\d{1,2}):(\d{2})", s)
     if m:
         hour, minute = int(m.group(1)), int(m.group(2))
-        now = datetime.now(timezone.utc)
         candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
         if candidate <= now:
             candidate += timedelta(days=1)

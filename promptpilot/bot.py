@@ -921,8 +921,24 @@ def _pipeline_text(data: dict) -> str:
     core = limits.get("core")
     if core:
         reset = core.get("reset_at") or "—"
+        observed = data.get("github_rate_limit_observed_at")
         lines.insert(3, f"GitHub REST API: {core.get('remaining', 0)} / "
-                        f"{core.get('limit', 0)}; сброс {reset}")
+                        f"{core.get('limit', 0)}; сброс {reset}"
+                        + (f"; измерено {observed}" if observed else ""))
+    budget = data.get("github_budget") or {}
+    reserved = budget.get("reserved_in_flight") or {}
+    spendable = budget.get("spendable_before_route") or {}
+    if budget.get("enabled"):
+        problem = (budget.get("ledger_reason")
+                   if budget.get("ledger_state") == "unavailable" else
+                   budget.get("rate_snapshot_reason")
+                   if budget.get("rate_snapshot_state") == "unavailable" else
+                   budget.get("reason") if budget.get("allowed") is False else None)
+        lines.insert(4, "GitHub budget: "
+                     f"активных резервов {budget.get('active_reservations', 0)}; "
+                     f"REST зарезервировано {reserved.get('core', 0)}; "
+                     f"можно выдать до hard reserve {spendable.get('core', '—')}"
+                     + (f"; внимание: {problem}" if problem else ""))
     if cache.get("refresh_blocked") and cache.get("refresh_blocked") != "worker_paused":
         retry = cache.get("refresh_deferred_until") or "—"
         lines.insert(3, "GitHub scan отложен: "

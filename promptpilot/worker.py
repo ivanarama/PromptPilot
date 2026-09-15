@@ -461,8 +461,17 @@ def _recur_after_run(task):
         return
     fresh = db.get_task(task.id)
     if not fresh or fresh.status.value not in ("completed", "failed"):
+        # A pending/rate-limited retry is still the same occurrence. Preserve
+        # a wake that arrived while it was running so a second useful
+        # occurrence follows after the retry; only explicit cancellation
+        # abandons that intent.
+        if (fresh and fresh.series_id
+                and fresh.status.value == "cancelled"):
+            db.clear_pipeline_series_wake(fresh.series_id)
         return
     _maybe_recur(fresh, failed=fresh.status.value == "failed")
+    if fresh.series_id:
+        db.consume_pipeline_series_wake(fresh.series_id)
 
 
 def _maybe_recur(task, failed: bool = False):
@@ -480,7 +489,7 @@ def _maybe_recur(task, failed: bool = False):
     # The prompt as stored, never the one this run was handed: a one-off note
     # must not be baked into every future occurrence.
     stored = db.get_task(task.id)
-    db.create_task(TaskCreate(
+    db.create_series_occurrence_if_idle(TaskCreate(
         prompt=(stored.prompt if stored else task.prompt),
         working_dir=task.working_dir,
         provider=series["provider"] if series else task.provider,
@@ -644,7 +653,7 @@ def _wrap_ssh(remote, cmd, env_extra):
     return ssh_command(remote, argv, env_extra)
 
 
-def _execute_task_inner(task):
+def _execute_task_body(task):
     """Run CLI with the task's prompt."""
     if task.series_id:
         # Optional profile-owned gates are deterministic and token-free. They
@@ -682,9 +691,13 @@ def _execute_task_inner(task):
         try:
             from . import pipeline_insights
             route = pipeline_insights.execution_route(
-                task, agent_prompt, getattr(task, "working_dir", None))
+                task, agent_prompt, getattr(task, "working_dir", None),
+                retain_budget=True)
         except Exception as exc:
-            route = {"action": "prompt", "mode": "skill", "prompt": agent_prompt}
+            route = {
+                "action": "defer", "mode": "skill", "defer_for": "5m",
+                "reason": f"pipeline execution admission unavailable: {exc}",
+            }
             print(f"  !! pipeline execution route unavailable for #{task.id}: {exc}", flush=True)
         if route["action"] == "block":
             reason = route["reason"]
@@ -1006,6 +1019,20 @@ def _execute_task_inner(task):
             print(f"  -> Removed empty worktree {wt['path']}")
 
 
+def _execute_task_inner(task):
+    """Run one task and always release its exact GitHub budget reservation."""
+    try:
+        return _execute_task_body(task)
+    finally:
+        try:
+            from . import pipeline_insights
+            pipeline_insights.release_execution_admission()
+        except Exception as exc:
+            print(
+                f"  !! GitHub budget reservation cleanup #{task.id}: {exc}",
+                flush=True)
+
+
 def execute_task(task):
     """Execute a queue task and reconcile an optional W1 workflow link.
 
@@ -1177,6 +1204,13 @@ def run_worker():
     if alive:
         print(f"Живые прогоны найдены по метке в окружении, не трогаю: {sorted(alive)}")
     db.recover_running(keep_ids=alive)
+    repaired_series = db.repair_active_series_occurrences()
+    if repaired_series:
+        print(
+            "Восстановлены потерянные в аварийном окне серии: "
+            + ", ".join(str(value) for value in repaired_series),
+            flush=True,
+        )
     # A crash may happen after a queue task commits its final status but before
     # the W1 workflow projection observes it. Reconciliation is idempotent and
     # also maps reset running tasks back to pending runs.

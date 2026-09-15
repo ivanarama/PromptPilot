@@ -2651,6 +2651,7 @@ async function loadPipelineInsights(profile, refresh=false) {
       ? Number(runs.total_tokens || 0).toLocaleString()
       : 'нет данных';
     const githubLimits = data.github_rate_limit || {};
+    const githubBudgetState = data.github_budget || {};
     const cache = data.cache || {source:'unknown',available:false,stale:true,age_seconds:null};
     const cacheSources = {live:'новый',memory:'память',durable:'SQLite',snapshot:'история',none:'нет'};
     const cacheAge = cache.age_seconds == null ? 'возраст неизвестен'
@@ -2674,12 +2675,30 @@ async function loadPipelineInsights(profile, refresh=false) {
         : cache.stale
         ? `<div class="prov-cmd" style="color:var(--yellow);margin-top:8px">Данные GitHub устарели (${esc(cacheAge)}). Нажмите «Обновить» для явного запроса.</div>`
         : '';
-    const githubBudget = name => {
+    const githubLimitText = name => {
       const limit = githubLimits[name];
       if (!limit) return 'нет данных';
       const reset = limit.reset_at ? ` · сброс ${new Date(limit.reset_at).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}` : '';
       return `${Number(limit.remaining).toLocaleString()} / ${Number(limit.limit).toLocaleString()}${reset}`;
     };
+    const reservedBudget = githubBudgetState.reserved_in_flight || {};
+    const spendableBudget = githubBudgetState.spendable_before_route || {};
+    const budgetFloor = githubBudgetState.minimum_remaining || {};
+    const reservationCount = Number(githubBudgetState.active_reservations || 0);
+    const budgetNumber = (values, name) => values[name] == null ? '—' : Number(values[name]).toLocaleString();
+    const rateObserved = data.github_rate_limit_observed_at
+      ? `измерено ${timeAgo(data.github_rate_limit_observed_at)}`
+      : 'на момент снимка очереди';
+    const budgetProblem = githubBudgetState.ledger_state === 'unavailable'
+      ? githubBudgetState.ledger_reason
+      : githubBudgetState.rate_snapshot_state === 'unavailable'
+      ? githubBudgetState.rate_snapshot_reason
+      : githubBudgetState.allowed === false ? githubBudgetState.reason : '';
+    const budgetMetric = githubBudgetState.enabled ? `<div class="pipeline-metric">
+      <div class="pipeline-metric-label">GitHub budget в работе</div>
+      <div class="pipeline-metric-value">${reservationCount} · REST −${budgetNumber(reservedBudget, 'core')}</div>
+      <div class="pipeline-metric-note">можно выдать до hard reserve: REST ${budgetNumber(spendableBudget, 'core')} · Search ${budgetNumber(spendableBudget, 'search')} · GraphQL ${budgetNumber(spendableBudget, 'graphql')} · reserve REST ${budgetNumber(budgetFloor, 'core')}${budgetProblem ? ` · ${esc(budgetProblem)}` : ''}</div>
+    </div>` : '';
     const coreLimit = githubLimits.core;
     const coreShare = coreLimit && coreLimit.limit ? coreLimit.remaining / coreLimit.limit : null;
     const coreColor = coreShare == null ? 'var(--muted)' : coreShare <= 0.05 ? 'var(--red)' : coreShare <= 0.2 ? 'var(--yellow)' : '';
@@ -2757,7 +2776,8 @@ async function loadPipelineInsights(profile, refresh=false) {
         <div class="pipeline-metric"><div class="pipeline-metric-label">Δ backlog 30 дней</div><div class="pipeline-metric-value">${h30d.complete?signed(h30d.backlog_delta):'—'}</div><div class="pipeline-metric-note">покрытие ${h30d.coverage_hours} из 720 ч</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Цель очистки</div><div class="pipeline-metric-value">${data.target_clear_hours} ч</div><div class="pipeline-metric-note">без прогноза нового входа</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Worker</div><div class="pipeline-metric-value">${runtime.state==='online'?'online':'offline'}</div><div class="pipeline-metric-note">${runtime.age_seconds == null ? 'heartbeat отсутствует' : 'heartbeat '+runtime.age_seconds+' сек назад'}</div></div>
-        <div class="pipeline-metric"><div class="pipeline-metric-label">GitHub REST API</div><div class="pipeline-metric-value" style="${coreColor ? `color:${coreColor}` : ''}">${esc(githubBudget('core'))}</div><div class="pipeline-metric-note">на момент снимка · Search ${esc(githubBudget('search'))} · GraphQL ${esc(githubBudget('graphql'))}</div></div>
+        <div class="pipeline-metric"><div class="pipeline-metric-label">GitHub REST API</div><div class="pipeline-metric-value" style="${coreColor ? `color:${coreColor}` : ''}">${esc(githubLimitText('core'))}</div><div class="pipeline-metric-note">${esc(rateObserved)} · Search ${esc(githubLimitText('search'))} · GraphQL ${esc(githubLimitText('graphql'))}</div></div>
+        ${budgetMetric}
       </div>
       ${diagnosticHtml}
       <table class="insights-table"><colgroup><col class="insights-col-stage"><col class="insights-col-small"><col class="insights-col-small"><col class="insights-col-capacity"><col class="insights-col-capacity"><col class="insights-col-duration"><col class="insights-col-small"><col class="insights-col-oldest"><col class="insights-col-interval"><col class="insights-col-recommendation"></colgroup><thead><tr><th>Этап</th><th class="num">Очередь</th><th class="num">Δ 5 ч</th><th class="num">За прогон</th><th class="num">Прогонов</th><th>Средний запуск</th><th>ETA</th><th>Самый старый</th><th>Интервал</th><th>Рекомендация</th></tr></thead><tbody>${rows}</tbody></table>
