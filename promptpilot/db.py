@@ -1396,32 +1396,62 @@ def list_pipeline_snapshots(profile_id: str, since: Optional[datetime] = None,
              "payload": json.loads(row["payload_json"])} for row in rows]
 
 
+_PIPELINE_SNAPSHOT_LOOKUP_LIMIT = 64
+
+
+def _first_valid_pipeline_snapshot(rows, predicate) -> Optional[tuple]:
+    """Decode only a bounded SQL-prefiltered candidate set."""
+    for row in rows:
+        try:
+            payload = json.loads(row["payload_json"])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict) and predicate(payload):
+            return row, payload
+    return None
+
+
 def latest_pipeline_snapshot(
         profile_id: str, profile_hash: Optional[str] = None,
         allow_legacy: bool = True) -> Optional[dict]:
     """Return the newest matching durable queue observation for one profile."""
     selected = None
-    legacy = None
     with _connect() as conn:
-        rows = conn.execute(
-            """SELECT id, profile_id, repository, captured_at, payload_json
-               FROM pipeline_snapshots WHERE profile_id = ?
-               ORDER BY captured_at DESC, id DESC""",
-            (profile_id,),
-        )
-        for row in rows:
-            try:
-                payload = json.loads(row["payload_json"])
-            except (TypeError, ValueError, json.JSONDecodeError):
-                continue
-            snapshot_hash = payload.get("profile_hash") \
-                if isinstance(payload, dict) else None
-            if profile_hash is None or snapshot_hash == profile_hash:
-                selected = (row, payload)
-                break
-            if allow_legacy and snapshot_hash is None and legacy is None:
-                legacy = (row, payload)
-    selected = selected or legacy
+        select = """SELECT id, profile_id, repository, captured_at, payload_json
+                    FROM pipeline_snapshots WHERE profile_id = ?"""
+        order = " ORDER BY captured_at DESC, id DESC LIMIT ?"
+        if profile_hash is None:
+            rows = conn.execute(
+                select + order,
+                (profile_id, _PIPELINE_SNAPSHOT_LOOKUP_LIMIT),
+            ).fetchall()
+            selected = _first_valid_pipeline_snapshot(rows, lambda _payload: True)
+        else:
+            # add_pipeline_snapshot writes compact JSON, so SQL can discard an
+            # arbitrary number of newer snapshots for other profile revisions
+            # before Python decodes a small candidate set.  The bound protects
+            # cache-only UI reads from corrupt/hostile rows containing a false
+            # textual marker; parsed top-level equality remains authoritative.
+            marker = '"profile_hash":' + json.dumps(
+                profile_hash, ensure_ascii=False, separators=(",", ":"))
+            rows = conn.execute(
+                select + " AND instr(payload_json, ?) > 0" + order,
+                (profile_id, marker, _PIPELINE_SNAPSHOT_LOOKUP_LIMIT),
+            ).fetchall()
+            selected = _first_valid_pipeline_snapshot(
+                rows, lambda payload: payload.get("profile_hash") == profile_hash)
+
+            if selected is None and allow_legacy:
+                # Legacy snapshots predate profile_hash altogether. Query them
+                # separately so thousands of known-mismatching hashed rows do
+                # not re-enter the bounded Python validation path.
+                rows = conn.execute(
+                    select + " AND instr(payload_json, ?) = 0" + order,
+                    (profile_id, '"profile_hash"',
+                     _PIPELINE_SNAPSHOT_LOOKUP_LIMIT),
+                ).fetchall()
+                selected = _first_valid_pipeline_snapshot(
+                    rows, lambda payload: "profile_hash" not in payload)
     if selected is None:
         return None
     row, payload = selected

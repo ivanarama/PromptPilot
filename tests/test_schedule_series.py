@@ -903,6 +903,89 @@ def test_cache_only_read_uses_legacy_durable_snapshot_without_github(
     assert result["queues"][0]["runs_needed"] == 1.5
 
 
+def test_latest_snapshot_finds_old_exact_hash_behind_many_mismatches(
+        isolated_db, monkeypatch):
+    wanted_hash = "a" * 64
+    exact_payload = json.dumps({
+        "profile_hash": wanted_hash,
+        "queues": {"review": {"backlog": 1}},
+    }, separators=(",", ":"))
+    mismatch_payload = json.dumps({
+        "profile_hash": "b" * 64,
+        "queues": {"review": {"backlog": 999}},
+    }, separators=(",", ":"))
+    with isolated_db._connect() as conn:
+        target = conn.execute(
+            """INSERT INTO pipeline_snapshots
+               (profile_id, repository, captured_at, payload_json)
+               VALUES (?, ?, ?, ?)""",
+            ("deep-hash", "owner/example",
+             "2026-01-01T00:00:00+00:00", exact_payload),
+        ).lastrowid
+        conn.executemany(
+            """INSERT INTO pipeline_snapshots
+               (profile_id, repository, captured_at, payload_json)
+               VALUES (?, ?, ?, ?)""",
+            [("deep-hash", "owner/example",
+              "2026-01-02T00:00:00+00:00", mismatch_payload)] * 2500,
+        )
+
+    real_loads = isolated_db.json.loads
+    decoded = []
+
+    def counting_loads(value):
+        decoded.append(value)
+        return real_loads(value)
+
+    monkeypatch.setattr(isolated_db.json, "loads", counting_loads)
+    snapshot = isolated_db.latest_pipeline_snapshot(
+        "deep-hash", profile_hash=wanted_hash, allow_legacy=False)
+
+    assert snapshot["id"] == target
+    assert snapshot["payload"]["profile_hash"] == wanted_hash
+    assert len(decoded) == 1
+
+
+def test_latest_snapshot_uses_separately_prefiltered_legacy_row(isolated_db):
+    legacy = isolated_db.add_pipeline_snapshot(
+        "legacy-lookup", "owner/example", {"queues": {"review": {
+            "backlog": 3,
+        }}}, datetime(2026, 1, 1, tzinfo=timezone.utc))
+    isolated_db.add_pipeline_snapshot(
+        "legacy-lookup", "owner/example", {
+            "profile_hash": "newer-other-revision", "queues": {},
+        }, datetime(2026, 1, 2, tzinfo=timezone.utc))
+
+    snapshot = isolated_db.latest_pipeline_snapshot(
+        "legacy-lookup", profile_hash="missing-revision", allow_legacy=True)
+
+    assert snapshot["id"] == legacy["id"]
+    assert "profile_hash" not in snapshot["payload"]
+
+
+def test_latest_snapshot_skips_corrupt_exact_marker_candidate(isolated_db):
+    wanted_hash = "exact-revision"
+    valid = isolated_db.add_pipeline_snapshot(
+        "corrupt-candidate", "owner/example", {
+            "profile_hash": wanted_hash, "queues": {"review": {"backlog": 2}},
+        }, datetime(2026, 1, 1, tzinfo=timezone.utc))
+    marker = '"profile_hash":' + json.dumps(wanted_hash)
+    with isolated_db._connect() as conn:
+        conn.execute(
+            """INSERT INTO pipeline_snapshots
+               (profile_id, repository, captured_at, payload_json)
+               VALUES (?, ?, ?, ?)""",
+            ("corrupt-candidate", "owner/example",
+             "2026-01-02T00:00:00+00:00", "{" + marker + ",broken"),
+        )
+
+    snapshot = isolated_db.latest_pipeline_snapshot(
+        "corrupt-candidate", profile_hash=wanted_hash, allow_legacy=False)
+
+    assert snapshot["id"] == valid["id"]
+    assert snapshot["payload"]["queues"]["review"]["backlog"] == 2
+
+
 def test_old_full_cache_suppresses_ambiguous_legacy_snapshot_fallback(
         isolated_db, monkeypatch):
     profile = {
