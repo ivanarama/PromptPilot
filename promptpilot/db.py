@@ -628,7 +628,7 @@ def get_next_runnable(busy_keys=(), key_fn=None) -> Optional[TaskInDB]:
                  AND (series_id IS NULL OR EXISTS (
                        SELECT 1 FROM task_series s WHERE s.id = tasks.series_id
                          AND s.paused = 0 AND s.ended_at IS NULL))
-               ORDER BY priority ASC, created_at ASC{limit_clause}""",
+               ORDER BY priority ASC, created_at ASC, id ASC{limit_clause}""",
             (now, now),
         ).fetchall()
         for row in rows:

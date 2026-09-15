@@ -653,7 +653,13 @@ def _wrap_ssh(remote, cmd, env_extra):
     return ssh_command(remote, argv, env_extra)
 
 
-def _execute_task_body(task):
+def _signal_admission_complete(admission_complete):
+    """Open the next DB claim once this task has chosen its provider route."""
+    if admission_complete is not None:
+        admission_complete.set()
+
+
+def _execute_task_body(task, admission_complete=None):
     """Run CLI with the task's prompt."""
     if task.series_id:
         # Optional profile-owned gates are deterministic and token-free. They
@@ -749,6 +755,11 @@ def _execute_task_body(task):
                 print(f"  -> Pipeline tool unavailable, using skill: {route['fallback_reason']}")
         elif route.get("mode") == "tool":
             print(f"  -> Pipeline tool route: {route['queue_id']}")
+
+    # The GitHub scan lease is gone and a provider-spanning budget reservation,
+    # when needed, is already durable.  A lower-priority task may now run its
+    # own admission while this provider continues in parallel.
+    _signal_admission_complete(admission_complete)
 
     provider = task.provider or DEFAULT_CLI
 
@@ -1019,10 +1030,12 @@ def _execute_task_body(task):
             print(f"  -> Removed empty worktree {wt['path']}")
 
 
-def _execute_task_inner(task):
+def _execute_task_inner(task, admission_complete=None):
     """Run one task and always release its exact GitHub budget reservation."""
     try:
-        return _execute_task_body(task)
+        if admission_complete is None:
+            return _execute_task_body(task)
+        return _execute_task_body(task, admission_complete)
     finally:
         try:
             from . import pipeline_insights
@@ -1033,7 +1046,7 @@ def _execute_task_inner(task):
                 flush=True)
 
 
-def execute_task(task):
+def execute_task(task, admission_complete=None):
     """Execute a queue task and reconcile an optional W1 workflow link.
 
     Reconciliation is deliberately repeatable. If the process dies between the
@@ -1047,7 +1060,9 @@ def execute_task(task):
     except Exception as exc:
         print(f"  !! workflow start sync #{task.id}: {exc}", flush=True)
     try:
-        return _execute_task_inner(task)
+        if admission_complete is None:
+            return _execute_task_inner(task)
+        return _execute_task_inner(task, admission_complete)
     finally:
         try:
             _recur_after_run(task)
@@ -1064,6 +1079,18 @@ def execute_task(task):
             workflows.advance_linked_task(task.id)
         except Exception as exc:
             print(f"  !! workflow final sync #{task.id}: {exc}", flush=True)
+        # A dispatch/preflight path that did not launch a provider opens the
+        # fence only after its recurrence and workflow projections are durable.
+        # The pool wrapper remains the final backstop for failures above.
+        _signal_admission_complete(admission_complete)
+
+
+def _execute_task_with_admission_fence(task, admission_complete):
+    """Pool boundary that cannot strand a claim fence on an early crash."""
+    try:
+        return execute_task(task, admission_complete)
+    finally:
+        _signal_admission_complete(admission_complete)
 
 
 def _code_snapshot():
@@ -1165,6 +1192,26 @@ def lock_key(task) -> str:
     return f"{where}:dir:{path}"
 
 
+class _AdmissionFence:
+    """Serialize DB claims until the preceding task finishes admission.
+
+    Provider execution remains concurrent: the event opens as soon as routing
+    and its durable GitHub budget reservation are complete.
+    """
+
+    def __init__(self):
+        self._pending = None
+
+    def wait(self, timeout: float) -> bool:
+        return self._pending is None or self._pending.wait(timeout)
+
+    def begin(self):
+        if not self.wait(0):
+            raise RuntimeError("previous provider admission is still pending")
+        self._pending = threading.Event()
+        return self._pending
+
+
 def run_worker():
     """Main worker loop.
 
@@ -1229,6 +1276,7 @@ def run_worker():
 
     pool = None
     in_flight = {}  # Future -> lock key held while it runs
+    admission_fence = _AdmissionFence()
     short_on_memory = False
     if CONCURRENCY > 1:
         from concurrent.futures import ThreadPoolExecutor
@@ -1269,6 +1317,13 @@ def run_worker():
             continue
         short_on_memory = False
 
+        # Claim order is the DB priority order.  Do not claim a second task
+        # until the first has finished scan/preflight and durably reserved the
+        # selected provider route; pool thread scheduling is deliberately not
+        # used as an ordering mechanism.
+        if pool is not None and not admission_fence.wait(POLL_INTERVAL):
+            continue
+
         task = db.get_next_runnable(
             busy_keys=[lk for lk, _tid in in_flight.values() if lk], key_fn=lock_key)
         if task is None:
@@ -1285,7 +1340,10 @@ def run_worker():
                 print(f"  !! исполнение задачи #{task.id} упало: {type(exc).__name__}: {exc}", flush=True)
                 _fail_stuck(task.id, exc)
         else:
-            in_flight[pool.submit(execute_task, task)] = (lock_key(task), task.id)
+            admission_complete = admission_fence.begin()
+            in_flight[pool.submit(
+                _execute_task_with_admission_fence,
+                task, admission_complete)] = (lock_key(task), task.id)
 
     if pool is not None:
         if in_flight:
