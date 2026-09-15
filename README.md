@@ -773,9 +773,16 @@ Worker публикует heartbeat в общей SQLite БД. Активный 
       "target_clear_hours": 8,
       "github_budget": {
         "minimum_remaining": {
-          "core": 4000,
-          "search": 10,
-          "graphql": 500
+          "core": 250,
+          "search": 2,
+          "graphql": 100
+        },
+        "costs": {
+          "insights": {"core": 1200, "search": 10, "graphql": 500},
+          "skill": {"core": 3750, "search": 20, "graphql": 2000},
+          "tool_preflight": {"core": 1200, "search": 10, "graphql": 500},
+          "tool": {"core": 2000, "search": 10, "graphql": 1500},
+          "fallback_targeted": {"core": 3000, "search": 20, "graphql": 2000}
         },
         "reset_grace_seconds": 60,
         "lease_seconds": 900,
@@ -797,6 +804,7 @@ Worker публикует heartbeat в общей SQLite БД. Активный 
           "series_contains": "MyProject - PLAN",
           "backlog_diagnostic_field": "plan_candidates",
           "wake_when": {"field": "plan_candidates"},
+          "wake_after_success": ["review"],
           "dispatch_gate": {
             "skip_when_empty": true
           }
@@ -812,6 +820,7 @@ Worker публикует heartbeat в общей SQLite БД. Активный 
           "series_contains": "MyProject - FIX",
           "backlog_diagnostic_field": "fix_candidates",
           "wake_when": {"field": "fix_candidates"},
+          "wake_after_success": ["review"],
           "dispatch_gate": {
             "skip_when_empty": true
           }
@@ -823,7 +832,13 @@ Worker публикует heartbeat в общей SQLite БД. Активный 
           "capacity": 2,
           "series_contains": "MyProject - REVIEW",
           "backlog_diagnostic_field": "review_backlog",
-          "wake_when": {"field": "review_candidates"}
+          "wake_when": {"field": "review_candidates"},
+          "wake_after_success": ["merge"],
+          "execution": {
+            "mode": "auto",
+            "command": ["{python}", "-m", "promptpilot.project_pipeline", "--config", "pipelinectl.json", "next", "{stage}"],
+            "required_paths": ["pipelinectl.json"]
+          }
         },
         {
           "id": "merge",
@@ -833,6 +848,12 @@ Worker публикует heartbeat в общей SQLite БД. Активный 
           "series_contains": "MyProject - MERGE",
           "backlog_diagnostic_field": "merge_candidates",
           "wake_when": {"field": "merge_executable"},
+          "wake_after_success": ["review"],
+          "execution": {
+            "mode": "auto",
+            "command": ["{python}", "-m", "promptpilot.project_pipeline", "--config", "pipelinectl.json", "next", "{stage}"],
+            "required_paths": ["pipelinectl.json"]
+          },
           "dispatch_gate": {
             "skip_when_empty": true,
             "defer_when_diagnostics_match": [{
@@ -884,28 +905,48 @@ P2, question — P3. Каждые `aging_hours` ожидания эффекти�
 снимать и повторно ставить `ship` из-за гонки между UI и завершением REVIEW.
 
 `github_budget` необязателен и включается только присутствием в профиле. Перед
-GitHub-сканированием PromptPilot читает бесплатный для primary rate limit
-`GET /rate_limit` и начинает работу, только если REST Core, Search и GraphQL
-остались не ниже `minimum_remaining`. При низком лимите задача откладывается до
-самого позднего reset заблокированных ресурсов плюс `reset_grace_seconds`;
-недоступный или некорректный ответ запрещает сканирование на
-`unavailable_retry_seconds`. Значения по умолчанию показаны в примере. Это
-барьер допуска в начале работы, а не резервирование квоты: если на старте
-осталось ровно столько запросов, сканирование допускается и затем расходует
-этот остаток. Поэтому Core-порог для профиля OneBase рекомендуется держать не
-ниже `4000`: наблюдавшийся полный workflow расходовал около `3381` Core-запроса,
-а разница остаётся запасом на страницы, проверки и небольшое изменение очереди.
-Для другого проекта порог должен покрывать его худший полный workflow с таким
-же операционным запасом.
+GitHub-работой PromptPilot читает бесплатный для primary rate limit
+`GET /rate_limit`. Поле `minimum_remaining` задаёт аварийный остаток, который
+нельзя обещать ни одному запуску, а `costs` — консервативную верхнюю оценку
+расхода каждого маршрута. Допуск вычисляется как
+`remaining - резервы выполняющихся задач - cost маршрута >= minimum_remaining`.
+Резерв хранится в общей SQLite БД, привязан к точной попытке задачи и снимается
+в `finally`, поэтому два worker-потока могут безопасно выполнять дешёвые
+REVIEW/MERGE одновременно, не расходуя один и тот же остаток дважды. Полный
+skill остаётся дорогим: стартовые `3750 + 250` Core сохраняют прежний защитный
+порог около 4000, тогда как project tool не блокируется тем же blanket-порогом.
+Значения в примере намеренно консервативны. Для другой конфигурации измерьте
+расход каждого маршрута на самой большой штатной очереди и округлите верхнюю
+границу вверх; заниженная `cost` превращает резерв в ложную гарантию.
+
+При действительно низком живом лимите задача откладывается до reset ресурса
+плюс `reset_grace_seconds`. Если лимит достаточен, но временно обещан другой
+задаче, повтор происходит через `busy_retry_seconds`, без часовой дыры.
+Недоступный лимит, повреждённый ledger или некорректная конфигурация работают
+fail-closed на `unavailable_retry_seconds`. Для профилей с одним GitHub token и
+`PP_DATA_DIR` PromptPilot покомпонентно применяет самый большой настроенный hard
+reserve; одинаковые значения упрощают эксплуатацию, а оценки маршрутов могут
+различаться. Профиль без `costs` сохраняет прежнюю семантику: весь
+`minimum_remaining` служит единым стартовым порогом без provider-reservation.
 
 Одна SQLite lease на общий `PP_DATA_DIR` сериализует дорогие GitHub-сканы между
 worker, веб-сервером и ботом. Lease обновляется во время работы, автоматически
 перехватывается после истечения и проверяется в той же транзакции, что публикация
 снимка: потерявший владение процесс не может записать устаревший результат.
-Фоновый sampler, ручное обновление, preflight перед задачей и обновление после её
-завершения используют тот же барьер. Если бюджет мал, последний хороший снимок
+Фоновый sampler, ручное обновление и preflight перед задачей используют тот же
+барьер. `wake_after_success` задаёт локальный граф зависимостей: успешный этап
+помечает старый снимок устаревшим и ставит перечисленные серии на ближайший
+запуск без повторного полного GitHub-скана; их свежий project preflight остаётся
+обязательным барьером. Поэтому целью может быть только очередь с настроенным
+`execution`; пустой массив лишь инвалидирует снимок без немедленного запуска.
+Если целевая серия уже выполняется или ждёт retry после rate limit, wake-intent
+сохраняется в SQLite и применяется к её следующему recurrence; сам backoff при
+этом не сокращается, а событие не теряется в гонке.
+Если бюджет мал, последний хороший снимок
 остаётся доступен, но не будит серии; UI и бот показывают причину и точное время
-следующей попытки. Обычное чтение кэшированного дашборда не обращается к GitHub.
+следующей попытки, возраст последнего `/rate_limit`, живые резервы и остаток,
+который ещё можно выдать. Обычное чтение кэшированного дашборда берёт это из
+SQLite и не обращается к GitHub.
 Без `github_budget` сохраняется прежнее поведение профиля.
 
 `health_check` необязателен. Это проектная команда без shell, которая должна
@@ -1047,10 +1088,11 @@ review-depth, HEAD и два одинаковых полных GraphQL snapshot 
 `mutation_authorized=false`. Все GraphQL, ship, CI, base-sync и CAS-проверки
 остаются в полном скилле. Handoff обслуживает один PR и при отказе не переходит
 к другому. До первой мутации на доказанном handoff-пути выполняются ровно два
-полных health scan: election и свежий gate. После продуктивного completion
-PromptPilot отдельно делает ещё один свежий scan для wake-up следующих этапов.
-Поэтому полный продуктивный fallback расходует три scan вместо прежних четырёх
-(`4 → 3`), а не два за весь запуск. Cleanup-проверки и GraphQL по-прежнему
+полных health scan: election и свежий gate. С настроенным
+`wake_after_success` следующий этап будится локально, поэтому продуктивный
+fallback расходует два scan вместо прежних четырёх (`4 → 2`). Профиль без
+локального графа сохраняет совместимый третий scan после completion.
+Cleanup-проверки и GraphQL по-прежнему
 расходуют GitHub API. Для ручного запуска и legacy/recovery fallback без
 доказанной цели такой бюджет scan не обещается.
 

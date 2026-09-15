@@ -55,6 +55,42 @@ def _profile(*, execution=None, minimum=None):
     }
 
 
+def _budget_costs(*, core=500, search=0, graphql=0):
+    return {
+        route: {"core": core, "search": search, "graphql": graphql}
+        for route in pipeline_insights._GITHUB_BUDGET_ROUTES
+    }
+
+
+def _profile_with_costs(*, execution=None, core=500):
+    profile = _profile(
+        execution=execution,
+        minimum={"core": 100, "search": 0, "graphql": 0},
+    )
+    profile["github_budget"]["costs"] = _budget_costs(core=core)
+    return profile
+
+
+def _running_task(database, prompt):
+    database.create_task(TaskCreate(prompt=prompt, recurrence="4h"))
+    task = database.get_next_runnable()
+    assert task is not None
+    assert task.started_at is not None
+    return task
+
+
+def _reserve(database, task, token, *, core=500, remaining=1000,
+             reset=None):
+    return database.reserve_pipeline_github_budget(
+        "github-default", token=token, task_id=task.id,
+        task_started_at=task.started_at, profile_id="example",
+        queue_id="review", route="skill",
+        cost={"core": core, "search": 0, "graphql": 0},
+        limits=_limits(core=remaining, reset=reset),
+        minimum_remaining={"core": 100, "search": 0, "graphql": 0},
+    )
+
+
 def test_budget_decision_defers_to_exact_latest_reset_plus_grace():
     profile = _profile()
     policy = pipeline_insights._github_budget_policy(profile)
@@ -70,6 +106,87 @@ def test_budget_decision_defers_to_exact_latest_reset_plus_grace():
         datetime.fromtimestamp(1317, timezone.utc).isoformat()
     assert {item["resource"] for item in decision["blocked_resources"]} == {
         "core", "search",
+    }
+
+
+def test_cost_schema_requires_every_known_route_and_exact_integer_vectors():
+    profile = _profile_with_costs()
+
+    policy = pipeline_insights._github_budget_policy(profile)
+
+    assert set(policy["costs"]) == set(pipeline_insights._GITHUB_BUDGET_ROUTES)
+    assert policy["costs"]["skill"] == {
+        "core": 500, "search": 0, "graphql": 0,
+    }
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "costs_not_object", "missing_route", "unknown_route",
+        "route_not_object", "missing_resource", "unknown_resource",
+        "bool", "string", "fraction", "negative",
+    ],
+)
+def test_cost_schema_fails_closed_on_partial_or_non_integer_values(case):
+    profile = _profile_with_costs()
+    costs = profile["github_budget"]["costs"]
+    if case == "costs_not_object":
+        profile["github_budget"]["costs"] = []
+    elif case == "missing_route":
+        costs.pop("tool")
+    elif case == "unknown_route":
+        costs["other"] = {"core": 1, "search": 0, "graphql": 0}
+    elif case == "route_not_object":
+        costs["skill"] = []
+    elif case == "missing_resource":
+        costs["skill"].pop("search")
+    elif case == "unknown_resource":
+        costs["skill"]["other"] = 0
+    elif case == "bool":
+        costs["skill"]["core"] = True
+    elif case == "string":
+        costs["skill"]["core"] = "500"
+    elif case == "fraction":
+        costs["skill"]["core"] = 500.0
+    elif case == "negative":
+        costs["skill"]["core"] = -1
+
+    with pytest.raises(ValueError):
+        pipeline_insights._github_budget_policy(profile)
+
+
+def test_shared_github_scope_uses_strongest_profile_hard_reserve(
+        isolated_db, monkeypatch):
+    low = _profile_with_costs()
+    high = _profile_with_costs()
+    high["github_budget"]["minimum_remaining"] = {
+        "core": 900, "search": 3, "graphql": 700,
+    }
+    monkeypatch.setattr(
+        pipeline_insights, "_profiles",
+        lambda: {"low": low, "high": high})
+
+    policy = pipeline_insights._with_shared_budget_floor(
+        pipeline_insights._github_budget_policy(low))
+
+    assert policy["minimum_remaining"] == {
+        "core": 900, "search": 3, "graphql": 700,
+    }
+    monkeypatch.setattr(
+        pipeline_insights, "_github_rate_limits",
+        lambda: _limits(core=1000, search=30, graphql=5000))
+    with pipeline_insights._github_scan_admission(
+            low, "shared floor test", profile_id="low",
+            budget_route="skill") as admission:
+        assert admission["allowed"] is False
+        assert admission["state"] == "low"
+        assert admission["minimum_remaining"] == {
+            "core": 900, "search": 3, "graphql": 700,
+        }
+    cached = pipeline_insights.read_cached("low", [])
+    assert cached["github_budget"]["minimum_remaining"] == {
+        "core": 900, "search": 3, "graphql": 700,
     }
 
 
@@ -185,6 +302,500 @@ def test_legacy_or_disabled_budget_does_not_add_worker_admission_calls(
     assert route == {
         "action": "prompt", "mode": "skill", "prompt": task.prompt,
     }
+
+
+def test_legacy_budget_without_costs_keeps_floor_check_but_never_reserves(
+        isolated_db, monkeypatch):
+    profile = _profile()
+    monkeypatch.setattr(
+        pipeline_insights, "_profiles", lambda: {"example": profile})
+    monkeypatch.setattr(
+        pipeline_insights, "_github_rate_limits", lambda: _limits(core=500))
+    task = SimpleNamespace(
+        series_id=1, series_title="Example - REVIEW",
+        prompt="Example - REVIEW")
+
+    route = pipeline_insights.execution_route(
+        task, task.prompt, retain_budget=True)
+
+    assert route == {
+        "action": "prompt", "mode": "skill", "prompt": task.prompt,
+    }
+    assert isolated_db.pipeline_github_budget_reservations(
+        "github-default") == {
+            "count": 0,
+            "totals": {"core": 0, "search": 0, "graphql": 0},
+            "items": [],
+        }
+
+
+def test_two_running_tasks_atomically_compete_for_one_budget_reservation(
+        isolated_db):
+    first = _running_task(isolated_db, "Atomic first")
+    second = _running_task(isolated_db, "Atomic second")
+    barrier = threading.Barrier(2)
+
+    def reserve(task, token):
+        barrier.wait()
+        return token, _reserve(
+            isolated_db, task, token, core=600, remaining=1000)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(
+            lambda pair: reserve(*pair),
+            [(first, "first-owner"), (second, "second-owner")],
+        ))
+
+    winners = [(token, result) for token, result in results
+               if result["allowed"]]
+    denied = [result for _token, result in results if not result["allowed"]]
+    assert len(winners) == 1
+    assert len(denied) == 1
+    assert winners[0][1]["state"] == "reserved"
+    assert winners[0][1]["active_reservations"] == 1
+    assert denied[0]["state"] == "budget_in_flight"
+    assert denied[0]["active_reservations"] == 1
+    assert denied[0]["blocked_resources"][0]["blocked_by"] == "reservation"
+
+    ledger = isolated_db.pipeline_github_budget_reservations("github-default")
+    assert ledger["count"] == 1
+    assert ledger["totals"] == {"core": 600, "search": 0, "graphql": 0}
+    winner_token = winners[0][0]
+    winner_task = first if winner_token == "first-owner" else second
+    assert isolated_db.release_pipeline_github_budget(
+        "github-default", token=winner_token, task_id=winner_task.id,
+        task_started_at=winner_task.started_at) is True
+
+
+def test_reservation_is_fenced_to_exact_running_attempt_and_prunes_stale_rows(
+        isolated_db):
+    first_attempt = _running_task(isolated_db, "Attempt fencing")
+    wrong_started_at = first_attempt.started_at + timedelta(microseconds=1)
+
+    denied = isolated_db.reserve_pipeline_github_budget(
+        "github-default", token="wrong-attempt", task_id=first_attempt.id,
+        task_started_at=wrong_started_at, profile_id="example",
+        queue_id="review", route="skill",
+        cost={"core": 500, "search": 0, "graphql": 0},
+        limits=_limits(core=1000),
+        minimum_remaining={"core": 100, "search": 0, "graphql": 0},
+    )
+    assert denied["allowed"] is False
+    assert denied["state"] == "task_fence_lost"
+
+    reserved = _reserve(
+        isolated_db, first_attempt, "first-attempt", remaining=1000)
+    assert reserved["allowed"] is True
+    assert isolated_db.release_pipeline_github_budget(
+        "github-default", token="first-attempt", task_id=first_attempt.id,
+        task_started_at=wrong_started_at) is False
+    assert isolated_db.pipeline_github_budget_reservations(
+        "github-default")["count"] == 1
+
+    assert isolated_db.reset_task(first_attempt.id) is True
+    assert isolated_db.pipeline_github_budget_reservations(
+        "github-default")["count"] == 0
+    second_attempt = isolated_db.get_next_runnable()
+    assert second_attempt is not None
+    assert second_attempt.id == first_attempt.id
+    assert second_attempt.started_at != first_attempt.started_at
+    assert isolated_db.release_pipeline_github_budget(
+        "github-default", token="first-attempt", task_id=first_attempt.id,
+        task_started_at=first_attempt.started_at) is False
+
+    assert _reserve(
+        isolated_db, second_attempt, "second-attempt",
+        remaining=1000)["allowed"] is True
+    isolated_db.mark_completed(second_attempt.id, "done")
+    assert isolated_db.release_pipeline_github_budget(
+        "github-default", token="second-attempt", task_id=second_attempt.id,
+        task_started_at=second_attempt.started_at) is True
+    assert isolated_db.pipeline_github_budget_reservations(
+        "github-default")["count"] == 0
+
+
+def test_execution_route_retains_and_explicitly_releases_provider_budget(
+        isolated_db, monkeypatch):
+    profile = _profile_with_costs(core=200)
+    monkeypatch.setattr(
+        pipeline_insights, "_profiles", lambda: {"example": profile})
+    monkeypatch.setattr(
+        pipeline_insights, "_github_rate_limits", lambda: _limits(core=1000))
+    task = _running_task(isolated_db, "Example - REVIEW")
+    pipeline_insights.release_execution_admission()
+
+    try:
+        route = pipeline_insights.execution_route(
+            task, task.prompt, retain_budget=True)
+
+        assert route["action"] == "prompt"
+        assert route["mode"] == "skill"
+        ledger = isolated_db.pipeline_github_budget_reservations(
+            "github-default")
+        assert ledger["count"] == 1
+        assert ledger["totals"] == {
+            "core": 200, "search": 0, "graphql": 0,
+        }
+        assert ledger["items"][0]["task_id"] == task.id
+        assert ledger["items"][0]["route"] == "skill"
+        assert ledger["items"][0]["queue_id"] == "review"
+    finally:
+        pipeline_insights.release_execution_admission()
+
+    assert isolated_db.pipeline_github_budget_reservations(
+        "github-default")["count"] == 0
+    pipeline_insights.release_execution_admission()
+
+
+def test_reservation_contention_retries_quickly_but_live_low_waits_for_reset(
+        isolated_db, monkeypatch):
+    profile = _profile_with_costs(core=500)
+    monkeypatch.setattr(
+        pipeline_insights, "_profiles", lambda: {"example": profile})
+    owner = _running_task(isolated_db, "Budget owner")
+    contender = _running_task(isolated_db, "Example - REVIEW")
+    reset = int(time.time()) + 120
+    current_core = {"value": 1000}
+    monkeypatch.setattr(
+        pipeline_insights, "_github_rate_limits",
+        lambda: _limits(core=current_core["value"], reset=reset))
+    assert _reserve(
+        isolated_db, owner, "budget-owner", core=500,
+        remaining=1000, reset=reset)["allowed"] is True
+
+    before = datetime.now(timezone.utc)
+    contention = pipeline_insights.execution_route(
+        contender, contender.prompt, retain_budget=True)
+    contention_until = datetime.fromisoformat(contention["defer_until"])
+
+    assert contention["action"] == "defer"
+    assert contention["github_budget"]["state"] == "budget_in_flight"
+    assert contention["github_budget"]["active_reservations"] == 1
+    assert timedelta(0) < contention_until - before <= timedelta(seconds=10)
+
+    assert isolated_db.release_pipeline_github_budget(
+        "github-default", token="budget-owner", task_id=owner.id,
+        task_started_at=owner.started_at) is True
+    current_core["value"] = 500
+    genuinely_low = pipeline_insights.execution_route(
+        contender, contender.prompt, retain_budget=True)
+
+    assert genuinely_low["action"] == "defer"
+    assert genuinely_low["github_budget"]["state"] == "low"
+    assert genuinely_low["defer_until"] == datetime.fromtimestamp(
+        reset + 17, timezone.utc).isoformat()
+    assert isolated_db.pipeline_github_budget_reservations(
+        "github-default")["count"] == 0
+
+
+def test_cached_dashboard_overlays_latest_rate_snapshot_and_live_reservations(
+        isolated_db, monkeypatch):
+    profile = _profile_with_costs(core=200)
+    monkeypatch.setattr(
+        pipeline_insights, "_profiles", lambda: {"example": profile})
+    observed_at = time.time() - 3
+    assert isolated_db.record_pipeline_github_rate_snapshot(
+        "github-default", _limits(core=1000), observed_at=observed_at)
+    owner = _running_task(isolated_db, "Budget owner for dashboard")
+    assert _reserve(
+        isolated_db, owner, "dashboard-owner", core=200,
+        remaining=1000)["allowed"] is True
+
+    result = pipeline_insights.read_cached("example", [])
+
+    assert result["github_rate_limit"]["core"]["remaining"] == 1000
+    assert datetime.fromisoformat(
+        result["github_rate_limit_observed_at"]).timestamp() == pytest.approx(
+            observed_at)
+    assert result["github_budget"]["active_reservations"] == 1
+    assert result["github_budget"]["reserved_in_flight"]["core"] == 200
+    assert result["github_budget"]["spendable_before_route"]["core"] == 700
+
+
+def test_success_completion_uses_local_successor_graph_without_github_scan(
+        isolated_db, monkeypatch):
+    profile = _profile_with_costs()
+    profile["queues"][0]["wake_after_success"] = ["merge"]
+    profile["queues"].append({
+        "id": "merge", "title": "Merge", "query": "is:pr label:ship",
+        "series_contains": "Example - MERGE",
+        "execution": {
+            "mode": "auto", "command": ["pipelinectl", "next", "{stage}"],
+        },
+    })
+    monkeypatch.setattr(
+        pipeline_insights, "_profiles", lambda: {"example": profile})
+    monkeypatch.setattr(pipeline_insights.db, "is_paused", lambda: False)
+    monkeypatch.setattr(pipeline_insights.db, "list_series", lambda: [{
+        "id": 42, "title": "Example - MERGE", "paused": False,
+        "ended": False, "ended_at": None,
+    }])
+    actions = []
+    monkeypatch.setattr(
+        pipeline_insights.db, "request_pipeline_series_wake",
+        lambda series_id: actions.append(series_id) or {
+            "accepted": True, "state": "scheduled",
+        })
+    invalidations = []
+    monkeypatch.setattr(
+        pipeline_insights, "_discard_cache",
+        lambda profile_id: invalidations.append(profile_id))
+    monkeypatch.setattr(
+        pipeline_insights, "analyze",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("configured successor wake performed a GitHub scan")))
+    task = SimpleNamespace(
+        series_id=1, series_title="Example - REVIEW",
+        prompt="Example - REVIEW")
+
+    assert pipeline_insights.after_task_completed(task, "ГОТОВО") == ["merge"]
+    assert actions == [42]
+    assert invalidations == ["example"]
+
+
+def test_success_completion_durably_marks_pre_completion_cache_stale(
+        isolated_db, monkeypatch):
+    execution = {
+        "mode": "auto", "command": ["pipelinectl", "next", "{stage}"],
+    }
+    profile = _profile_with_costs(execution=execution)
+    profile["queues"][0]["wake_after_success"] = ["merge"]
+    profile["queues"].append({
+        "id": "merge", "title": "Merge", "capacity": 1,
+        "query": "is:pr label:ship", "series_contains": "Example - MERGE",
+        "execution": execution,
+    })
+    monkeypatch.setattr(
+        pipeline_insights, "_profiles", lambda: {"example": profile})
+    monkeypatch.setattr(
+        pipeline_insights, "_github_rate_limits", lambda: _limits())
+    monkeypatch.setattr(
+        pipeline_insights, "_run_profile_health_check",
+        lambda _profile: {"state": "green", "findings": []})
+    monkeypatch.setattr(
+        pipeline_insights, "_github_search",
+        lambda *_args: {"count": 0, "items": [],
+                        "membership_complete": True})
+    isolated_db.create_task(TaskCreate(
+        prompt="Example - MERGE", recurrence="4h",
+        scheduled_at=datetime.now(timezone.utc) + timedelta(hours=4)))
+    series = isolated_db.list_series()
+    fresh = pipeline_insights.analyze("example", series, use_cache=False)
+    assert fresh["cache"]["stale"] is False
+    task = SimpleNamespace(
+        series_id=999, series_title="Example - REVIEW",
+        prompt="Example - REVIEW")
+
+    assert pipeline_insights.after_task_completed(
+        task, "ГОТОВО") == ["merge"]
+    pipeline_insights._cache.clear()
+    cached = pipeline_insights.read_cached("example", isolated_db.list_series())
+
+    assert cached["cache"]["source"] == "durable"
+    assert cached["cache"]["invalidated"] is True
+    assert cached["cache"]["stale"] is True
+
+
+def test_successor_graph_rejects_queue_without_fresh_project_preflight(
+        isolated_db, monkeypatch):
+    profile = _profile_with_costs()
+    profile["queues"][0]["wake_after_success"] = ["fix"]
+    profile["queues"].append({
+        "id": "fix", "title": "Fix", "query": "is:issue label:approved",
+        "series_contains": "Example - FIX",
+    })
+    monkeypatch.setattr(
+        pipeline_insights, "_profiles", lambda: {"example": profile})
+    monkeypatch.setattr(pipeline_insights.db, "is_paused", lambda: False)
+    monkeypatch.setattr(pipeline_insights.db, "list_series", lambda: [{
+        "id": 42, "title": "Example - FIX", "paused": False,
+        "ended": False, "ended_at": None,
+    }])
+    invalidations = []
+    monkeypatch.setattr(
+        pipeline_insights, "_discard_cache",
+        lambda profile_id: invalidations.append(profile_id))
+    task = SimpleNamespace(
+        series_id=1, series_title="Example - REVIEW",
+        prompt="Example - REVIEW")
+
+    with pytest.raises(ValueError, match="project execution preflight"):
+        pipeline_insights.after_task_completed(task, "ГОТОВО")
+    assert invalidations == ["example"]
+
+
+def test_successor_graph_self_wake_moves_created_recurrence_to_now(
+        isolated_db, monkeypatch):
+    profile = _profile_with_costs(execution={
+        "mode": "auto", "command": ["pipelinectl", "next", "{stage}"],
+    })
+    profile["queues"][0]["wake_after_success"] = ["review"]
+    monkeypatch.setattr(
+        pipeline_insights, "_profiles", lambda: {"example": profile})
+    task = _running_task(isolated_db, "Example - REVIEW")
+    isolated_db.mark_completed(task.id, "ИТОГ: ГОТОВО (reviewed)")
+    worker._recur_after_run(task)
+    future = next(
+        item for item in isolated_db.list_tasks(limit=10)
+        if item.series_id == task.series_id and item.status.value == "pending")
+    assert future.scheduled_at > datetime.now(timezone.utc) + timedelta(hours=3)
+
+    woken = pipeline_insights.after_task_completed(task, "ГОТОВО")
+
+    moved = isolated_db.get_task(future.id)
+    assert woken == ["review"]
+    assert moved.scheduled_at <= datetime.now(timezone.utc)
+
+
+def test_successor_wake_is_durable_while_target_occurrence_is_running(
+        isolated_db):
+    task = _running_task(isolated_db, "Example - REVIEW")
+
+    requested = isolated_db.request_pipeline_series_wake(task.series_id)
+
+    assert requested == {"accepted": True, "state": "latched"}
+    isolated_db.mark_completed(task.id, "ИТОГ: ПУСТО (old snapshot raced)")
+    worker._recur_after_run(task)
+    pending = next(
+        item for item in isolated_db.list_tasks(limit=10)
+        if item.series_id == task.series_id and item.status.value == "pending")
+    assert pending.scheduled_at <= datetime.now(timezone.utc)
+    assert isolated_db.consume_pipeline_series_wake(task.series_id) is False
+
+
+def test_successor_wake_preserves_rate_limit_backoff_and_next_occurrence(
+        isolated_db):
+    task = _running_task(isolated_db, "Example - REVIEW")
+    retry_at = datetime.now(timezone.utc) + timedelta(hours=1)
+    isolated_db.mark_rate_limited(task.id, retry_at, "provider budget")
+
+    requested = isolated_db.request_pipeline_series_wake(task.series_id)
+
+    deferred = isolated_db.get_task(task.id)
+    assert requested == {"accepted": True, "state": "latched_rate_limited"}
+    assert deferred.status.value == "rate_limited"
+    assert deferred.next_run_at > datetime.now(timezone.utc) + timedelta(minutes=50)
+
+    isolated_db.mark_completed(task.id, "ИТОГ: ГОТОВО")
+    worker._recur_after_run(task)
+    pending = next(
+        item for item in isolated_db.list_tasks(limit=10)
+        if item.series_id == task.series_id and item.status.value == "pending")
+    assert pending.scheduled_at <= datetime.now(timezone.utc)
+
+
+def test_running_wake_survives_deterministic_pending_defer(isolated_db):
+    task = _running_task(isolated_db, "Example - REVIEW")
+    assert isolated_db.request_pipeline_series_wake(task.series_id) == {
+        "accepted": True, "state": "latched"}
+    retry_at = datetime.now(timezone.utc) + timedelta(hours=1)
+    isolated_db.defer_task(task.id, retry_at, "dependency")
+
+    worker._recur_after_run(task)
+
+    deferred = isolated_db.get_task(task.id)
+    assert deferred.status.value == "pending"
+    assert deferred.scheduled_at > datetime.now(timezone.utc) + timedelta(minutes=50)
+    assert isolated_db.consume_pipeline_series_wake(task.series_id) is True
+    assert isolated_db.get_task(task.id).scheduled_at <= datetime.now(timezone.utc)
+
+
+def test_successor_wake_repairs_active_series_without_an_occurrence(isolated_db):
+    task = _running_task(isolated_db, "Example - REVIEW")
+    isolated_db.mark_cancelled(task.id, "cancelled occurrence")
+
+    requested = isolated_db.request_pipeline_series_wake(task.series_id)
+
+    assert requested == {"accepted": True, "state": "recreated"}
+    pending = [item for item in isolated_db.list_tasks(limit=10)
+               if item.series_id == task.series_id
+               and item.status.value == "pending"]
+    assert len(pending) == 1
+    assert pending[0].scheduled_at <= datetime.now(timezone.utc)
+
+
+def test_successor_wake_and_recurrence_do_not_create_duplicate_occurrences(
+        isolated_db):
+    task = _running_task(isolated_db, "Example - REVIEW")
+    isolated_db.mark_completed(task.id, "ИТОГ: ГОТОВО")
+
+    requested = isolated_db.request_pipeline_series_wake(task.series_id)
+    worker._recur_after_run(task)
+
+    assert requested == {"accepted": True, "state": "recreated"}
+    pending = [item for item in isolated_db.list_tasks(limit=10)
+               if item.series_id == task.series_id
+               and item.status.value == "pending"]
+    assert len(pending) == 1
+    assert pending[0].scheduled_at <= datetime.now(timezone.utc)
+
+
+def test_startup_repairs_terminal_series_without_a_live_occurrence(isolated_db):
+    task = _running_task(isolated_db, "Example - REVIEW")
+    assert isolated_db.request_pipeline_series_wake(task.series_id) == {
+        "accepted": True, "state": "latched"}
+    isolated_db.mark_completed(task.id, "ИТОГ: ГОТОВО")
+
+    assert isolated_db.repair_active_series_occurrences() == [task.series_id]
+    assert isolated_db.repair_active_series_occurrences() == []
+    assert isolated_db.consume_pipeline_series_wake(task.series_id) is False
+    pending = [item for item in isolated_db.list_tasks(limit=10)
+               if item.series_id == task.series_id
+               and item.status.value == "pending"]
+    assert len(pending) == 1
+    assert pending[0].scheduled_at <= datetime.now(timezone.utc)
+
+
+def test_startup_repair_preserves_generic_recurrence_without_wake(isolated_db):
+    task = _running_task(isolated_db, "Generic recurring task")
+    isolated_db.mark_completed(task.id, "done")
+
+    assert isolated_db.repair_active_series_occurrences() == [task.series_id]
+    pending = next(
+        item for item in isolated_db.list_tasks(limit=10)
+        if item.series_id == task.series_id and item.status.value == "pending")
+    assert pending.scheduled_at > datetime.now(timezone.utc) + timedelta(hours=3)
+
+
+def test_startup_does_not_repair_explicitly_cancelled_occurrence(isolated_db):
+    task = _running_task(isolated_db, "Example - REVIEW")
+    isolated_db.mark_cancelled(task.id, "operator cancelled")
+
+    assert isolated_db.repair_active_series_occurrences() == []
+    assert not [item for item in isolated_db.list_tasks(limit=10)
+                if item.series_id == task.series_id
+                and item.status.value in {"pending", "running", "rate_limited"}]
+
+
+@pytest.mark.parametrize("body_raises", [False, True])
+def test_worker_inner_always_releases_durable_provider_reservation(
+        isolated_db, monkeypatch, body_raises):
+    task = _running_task(isolated_db, "Example - REVIEW")
+    assert _reserve(
+        isolated_db, task, "worker-finally", core=200,
+        remaining=1000)["allowed"] is True
+    pipeline_insights.release_execution_admission()
+    pipeline_insights._execution_budget_context.reservation = \
+        pipeline_insights._GitHubBudgetReservation(
+            "github-default", "worker-finally", task.id, task.started_at)
+
+    def body(_task):
+        if body_raises:
+            raise RuntimeError("provider crashed")
+        return "done"
+
+    monkeypatch.setattr(worker, "_execute_task_body", body)
+    if body_raises:
+        with pytest.raises(RuntimeError, match="provider crashed"):
+            worker._execute_task_inner(task)
+    else:
+        assert worker._execute_task_inner(task) == "done"
+
+    assert isolated_db.pipeline_github_budget_reservations(
+        "github-default")["count"] == 0
+    assert getattr(
+        pipeline_insights._execution_budget_context,
+        "reservation", None) is None
 
 
 def test_successful_budgeted_scan_publishes_under_lease(

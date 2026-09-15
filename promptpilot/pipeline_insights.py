@@ -48,8 +48,16 @@ _DEFAULT_GITHUB_BUDGET_MINIMUM = {
     "search": 10,
     "graphql": 500,
 }
+_GITHUB_BUDGET_ROUTES = (
+    "insights",
+    "skill",
+    "tool_preflight",
+    "tool",
+    "fallback_targeted",
+)
 _GITHUB_SCAN_LEASE_SCOPE = "github-default"
 _scan_lease_context = threading.local()
+_execution_budget_context = threading.local()
 
 
 class _GitHubScanPaused(RuntimeError):
@@ -73,6 +81,8 @@ class _GitHubScanLease:
         self._stop = threading.Event()
         self._lost = threading.Event()
         self._thread: threading.Thread | None = None
+        self._release_lock = threading.Lock()
+        self._released = False
 
     @property
     def lost(self) -> bool:
@@ -117,17 +127,20 @@ class _GitHubScanLease:
                 "межпроцессная lease GitHub-сканирования потеряна")
 
     def release(self, *, refresh_status: dict | None = None) -> None:
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=2)
-        try:
-            db.release_pipeline_scan_lease(
-                self.scope, self.token, refresh_status=refresh_status)
-        except Exception:
-            # A failed release stays fail-closed until the renewable lease
-            # expires; never let cleanup hide the scan's original outcome.
-            pass
-
+        with self._release_lock:
+            if self._released:
+                return
+            self._released = True
+            self._stop.set()
+            if self._thread is not None:
+                self._thread.join(timeout=2)
+            try:
+                db.release_pipeline_scan_lease(
+                    self.scope, self.token, refresh_status=refresh_status)
+            except Exception:
+                # A failed release stays fail-closed until the renewable lease
+                # expires; never let cleanup hide the scan's original outcome.
+                pass
 
 def _bounded_int(config: dict, name: str, default: int,
                  minimum: int, maximum: int) -> int:
@@ -146,6 +159,47 @@ def _bounded_int(config: dict, name: str, default: int,
     return parsed
 
 
+def _minimum_remaining(raw: dict, path: str, defaults: dict) -> dict:
+    if not isinstance(raw, dict):
+        raise ValueError(f"github_budget.{path} должен быть JSON-объектом")
+    result = {}
+    for resource, default in defaults.items():
+        value = raw.get(resource, default)
+        if (isinstance(value, bool)
+                or isinstance(value, float) and not value.is_integer()):
+            raise ValueError(
+                f"github_budget.{path}.{resource} должен быть целым числом")
+        try:
+            value = int(value)
+        except (OverflowError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"github_budget.{path}.{resource} должен быть целым числом"
+            ) from exc
+        if value < 0:
+            raise ValueError(
+                f"github_budget.{path}.{resource} не может быть отрицательным")
+        result[resource] = value
+    return result
+
+
+def _strict_budget_vector(raw: dict, path: str) -> dict:
+    """Parse a cost promise without accepting JSON strings or booleans."""
+    resources = set(_DEFAULT_GITHUB_BUDGET_MINIMUM)
+    if not isinstance(raw, dict) or set(raw) != resources:
+        raise ValueError(
+            f"github_budget.{path} должен содержать ровно "
+            + ", ".join(_DEFAULT_GITHUB_BUDGET_MINIMUM))
+    result = {}
+    for resource in _DEFAULT_GITHUB_BUDGET_MINIMUM:
+        value = raw[resource]
+        if type(value) is not int or value < 0:
+            raise ValueError(
+                f"github_budget.{path}.{resource} должен быть "
+                "неотрицательным целым числом")
+        result[resource] = value
+    return result
+
+
 def _github_budget_policy(profile: dict) -> dict | None:
     """Normalize the opt-in admission policy without changing legacy profiles."""
     raw = profile.get("github_budget")
@@ -159,29 +213,35 @@ def _github_budget_policy(profile: dict) -> dict | None:
     if not enabled:
         return None
 
-    configured_minimum = raw.get("minimum_remaining", {})
-    if not isinstance(configured_minimum, dict):
-        raise ValueError("github_budget.minimum_remaining должен быть JSON-объектом")
-    minimum_remaining = {}
-    for resource, default in _DEFAULT_GITHUB_BUDGET_MINIMUM.items():
-        value = configured_minimum.get(resource, default)
-        if (isinstance(value, bool)
-                or isinstance(value, float) and not value.is_integer()):
+    minimum_remaining = _minimum_remaining(
+        raw.get("minimum_remaining", {}), "minimum_remaining",
+        _DEFAULT_GITHUB_BUDGET_MINIMUM)
+    configured_costs = raw.get("costs")
+    costs = None
+    if configured_costs is not None:
+        if not isinstance(configured_costs, dict):
+            raise ValueError("github_budget.costs должен быть JSON-объектом")
+        unknown_routes = sorted(
+            set(configured_costs) - set(_GITHUB_BUDGET_ROUTES))
+        missing_routes = sorted(
+            set(_GITHUB_BUDGET_ROUTES) - set(configured_costs))
+        if unknown_routes:
             raise ValueError(
-                f"github_budget.minimum_remaining.{resource} должен быть целым числом")
-        try:
-            value = int(value)
-        except (OverflowError, TypeError, ValueError) as exc:
+                "github_budget.costs содержит неизвестные маршруты: "
+                + ", ".join(unknown_routes))
+        if missing_routes:
             raise ValueError(
-                f"github_budget.minimum_remaining.{resource} должен быть целым числом"
-            ) from exc
-        if value < 0:
-            raise ValueError(
-                f"github_budget.minimum_remaining.{resource} не может быть отрицательным")
-        minimum_remaining[resource] = value
+                "github_budget.costs не содержит маршруты: "
+                + ", ".join(missing_routes))
+        costs = {
+            route: _strict_budget_vector(
+                configured_costs[route], f"costs.{route}")
+            for route in _GITHUB_BUDGET_ROUTES
+        }
 
     return {
         "minimum_remaining": minimum_remaining,
+        "costs": costs,
         "reset_grace_seconds": _bounded_int(
             raw, "reset_grace_seconds", 60, 0, 3600),
         "lease_seconds": _bounded_int(raw, "lease_seconds", 900, 30, 3600),
@@ -196,6 +256,38 @@ def _github_budget_policy(profile: dict) -> dict | None:
     }
 
 
+def _with_shared_budget_floor(policy: dict) -> dict:
+    """Use the strongest hard reserve of every profile sharing this account."""
+    floor = dict(policy["minimum_remaining"])
+    for configured_profile in _profiles().values():
+        candidate = _github_budget_policy(configured_profile)
+        if candidate is None or candidate["lease_scope"] != policy["lease_scope"]:
+            continue
+        for resource, value in candidate["minimum_remaining"].items():
+            floor[resource] = max(floor[resource], value)
+    selected = dict(policy)
+    selected["minimum_remaining"] = floor
+    return selected
+
+
+def _budget_policy_for_route(policy: dict, route: str | None) -> dict:
+    """Attach an estimated route cost; profiles without costs stay legacy."""
+    if route is None or policy.get("costs") is None:
+        selected = dict(policy)
+        selected["budget_route"] = route
+        selected["requested_cost"] = {
+            resource: 0 for resource in policy["minimum_remaining"]}
+        selected["cost_accounting"] = False
+        return selected
+    if route not in _GITHUB_BUDGET_ROUTES:
+        raise ValueError(f"неизвестный GitHub budget route: {route}")
+    selected = dict(policy)
+    selected["budget_route"] = route
+    selected["requested_cost"] = dict(policy["costs"][route])
+    selected["cost_accounting"] = True
+    return selected
+
+
 def _defer_at(epoch: float) -> str:
     return datetime.fromtimestamp(epoch, timezone.utc).isoformat()
 
@@ -204,15 +296,23 @@ def _budget_denied(policy: dict, *, state: str, reason: str,
                    now: float, limits: dict | None = None,
                    defer_at: float | None = None,
                    blocked_resources: list[dict] | None = None,
-                   status_revision: int | None = None) -> dict:
+                   status_revision: int | None = None,
+                   reserved_other: dict | None = None,
+                   effective_after: dict | None = None,
+                   active_reservations: int = 0) -> dict:
     retry_at = defer_at or (now + policy["unavailable_retry_seconds"])
     return {
         "enabled": True, "allowed": False, "state": state,
         "reason": reason, "defer_until": _defer_at(retry_at),
         "github_rate_limit": limits,
         "minimum_remaining": dict(policy["minimum_remaining"]),
+        "requested_cost": dict(policy.get("requested_cost") or {}),
+        "reserved_other": dict(reserved_other or {}),
+        "effective_after": dict(effective_after or {}),
+        "active_reservations": int(active_reservations),
         "blocked_resources": blocked_resources or [],
         "lease_scope": policy["lease_scope"],
+        "budget_route": policy.get("budget_route"),
         "status_revision": status_revision,
     }
 
@@ -221,6 +321,8 @@ def _lease_failure_decision(profile: dict, reason: str, *,
                             status_revision: int | None = None) -> dict:
     try:
         policy = _github_budget_policy(profile)
+        if policy is not None:
+            policy = _with_shared_budget_floor(policy)
     except (TypeError, ValueError):
         policy = None
     policy = policy or {
@@ -235,27 +337,46 @@ def _lease_failure_decision(profile: dict, reason: str, *,
 
 def _evaluate_github_budget(policy: dict, limits: dict | None, *,
                             now: float,
-                            status_revision: int | None = None) -> dict:
+                            status_revision: int | None = None,
+                            reserved_other: dict | None = None,
+                            active_reservations: int = 0) -> dict:
     if not isinstance(limits, dict):
         return _budget_denied(
             policy, state="rate_limit_unavailable",
             reason="GitHub /rate_limit недоступен; сканирование запрещено",
             now=now, status_revision=status_revision,
         )
+    requested = dict(policy.get("requested_cost") or {
+        resource: 0 for resource in policy["minimum_remaining"]})
+    reserved = dict(reserved_other or {
+        resource: 0 for resource in policy["minimum_remaining"]})
     blocked = []
     malformed = []
+    effective_after = {}
     for resource, minimum in policy["minimum_remaining"].items():
         item = limits.get(resource)
         try:
             remaining = int(item["remaining"])
             reset = int(item["reset"])
+            promised = int(reserved.get(resource, 0))
+            cost = int(requested.get(resource, 0))
         except (KeyError, OverflowError, TypeError, ValueError):
             malformed.append(resource)
             continue
-        if remaining < minimum:
+        if promised < 0 or cost < 0:
+            malformed.append(resource)
+            continue
+        after = remaining - promised - cost
+        effective_after[resource] = after
+        if after < minimum:
             blocked.append({
                 "resource": resource, "remaining": remaining,
+                "reserved_other": promised, "requested_cost": cost,
+                "effective_after": after,
                 "minimum_remaining": minimum, "reset": reset,
+                "blocked_by": (
+                    "live" if remaining - cost < minimum
+                    else "reservation"),
             })
     if malformed:
         return _budget_denied(
@@ -265,36 +386,54 @@ def _evaluate_github_budget(policy: dict, limits: dict | None, *,
             now=now, limits=limits, status_revision=status_revision,
         )
     if blocked:
-        reset_at = max(item["reset"] for item in blocked) + \
-            policy["reset_grace_seconds"]
-        if reset_at <= now:
-            reset_at = now + policy["unavailable_retry_seconds"]
+        live_blocked = [item for item in blocked
+                        if item["blocked_by"] == "live"]
+        if live_blocked:
+            reset_at = max(item["reset"] for item in live_blocked) + \
+                policy["reset_grace_seconds"]
+            if reset_at <= now:
+                reset_at = now + policy["unavailable_retry_seconds"]
+            state = "low"
+            reason_prefix = "GitHub API-бюджет ниже безопасного остатка"
+        else:
+            reset_at = now + policy["busy_retry_seconds"]
+            state = "budget_in_flight"
+            reason_prefix = "GitHub API-бюджет временно занят выполняемой задачей"
         summary = ", ".join(
-            f"{item['resource']} {item['remaining']} < {item['minimum_remaining']}"
+            f"{item['resource']} {item['effective_after']} < {item['minimum_remaining']}"
             for item in blocked)
         return _budget_denied(
-            policy, state="low", reason=(
-                f"GitHub API-бюджет ниже порога сканирования: {summary}"),
+            policy, state=state, reason=f"{reason_prefix}: {summary}",
             now=now, limits=limits, defer_at=reset_at,
             blocked_resources=blocked, status_revision=status_revision,
+            reserved_other=reserved, effective_after=effective_after,
+            active_reservations=active_reservations,
         )
     return {
         "enabled": True, "allowed": True, "state": "ok",
         "reason": "GitHub API-бюджет достаточен",
         "defer_until": None, "github_rate_limit": limits,
         "minimum_remaining": dict(policy["minimum_remaining"]),
+        "requested_cost": requested, "reserved_other": reserved,
+        "effective_after": effective_after,
+        "active_reservations": int(active_reservations),
         "blocked_resources": [], "lease_scope": policy["lease_scope"],
+        "budget_route": policy.get("budget_route"),
         "status_revision": status_revision,
     }
 
 
 @contextmanager
 def _github_scan_admission(profile: dict, purpose: str,
-                           *, profile_id: str | None = None):
+                           *, profile_id: str | None = None,
+                           budget_route: str | None = None):
     """Admit one expensive scan and hold its cross-process reservation."""
     now = time.time()
     try:
         policy = _github_budget_policy(profile)
+        if policy is not None:
+            policy = _with_shared_budget_floor(policy)
+            policy = _budget_policy_for_route(policy, budget_route)
     except (TypeError, ValueError) as exc:
         fallback = {
             "minimum_remaining": dict(_DEFAULT_GITHUB_BUDGET_MINIMUM),
@@ -359,9 +498,22 @@ def _github_scan_admission(profile: dict, purpose: str,
                     profile, "SQLite lease потеряна во время GitHub /rate_limit",
                     status_revision=lease.status_revision)
             else:
-                decision = _evaluate_github_budget(
-                    policy, limits, now=time.time(),
-                    status_revision=lease.status_revision)
+                try:
+                    reservations = db.pipeline_github_budget_reservations(
+                        policy["lease_scope"])
+                except Exception as exc:
+                    decision = _budget_denied(
+                        policy, state="ledger_unavailable",
+                        reason=f"Журнал резервов GitHub API недоступен: {exc}",
+                        now=time.time(), limits=limits,
+                        status_revision=lease.status_revision)
+                else:
+                    decision = _evaluate_github_budget(
+                        policy, limits, now=time.time(),
+                        status_revision=lease.status_revision,
+                        reserved_other=reservations["totals"],
+                        active_reservations=reservations["count"])
+            decision["_lease"] = lease
         except Exception as exc:
             decision = _lease_failure_decision(
                 profile, f"GitHub budget admission не выполнен: {exc}",
@@ -389,11 +541,181 @@ def _current_github_scan_status_revision() -> int | None:
     return lease.status_revision if lease is not None else None
 
 
+class _GitHubBudgetReservation:
+    """A durable quota promise fenced to one exact running task attempt."""
+
+    def __init__(self, scope: str, token: str, task_id: int, started_at):
+        self.scope = scope
+        self.token = token
+        self.task_id = task_id
+        self.started_at = started_at
+        self._released = False
+        self._lock = threading.Lock()
+
+    def release(self) -> None:
+        with self._lock:
+            if self._released:
+                return
+            self._released = True
+            try:
+                db.release_pipeline_github_budget(
+                    self.scope, token=self.token, task_id=self.task_id,
+                    task_started_at=self.started_at)
+            except Exception:
+                # Terminal task status is also a fence. A later ledger read will
+                # prune this row even when explicit cleanup hit a locked DB.
+                pass
+
+
+def _reservation_denied(policy: dict, limits: dict | None, result: dict, *,
+                        status_revision: int | None) -> dict:
+    now = time.time()
+    blocked = result.get("blocked_resources") or []
+    if blocked:
+        live_blocked = [item for item in blocked
+                        if item.get("blocked_by") == "live"]
+        if live_blocked:
+            defer_at = max(int(item["reset"]) for item in live_blocked) + \
+                policy["reset_grace_seconds"]
+            if defer_at <= now:
+                defer_at = now + policy["unavailable_retry_seconds"]
+            state = "low"
+            reason_prefix = "GitHub API-бюджет недостаточен"
+        else:
+            defer_at = now + policy["busy_retry_seconds"]
+            state = "budget_in_flight"
+            reason_prefix = "GitHub API-бюджет временно занят выполняемой задачей"
+        summary = ", ".join(
+            f"{item['resource']} {item['effective_after']} < "
+            f"{item['minimum_remaining']}" for item in blocked)
+        reason = f"{reason_prefix}: {summary}"
+    else:
+        defer_at = now + policy["unavailable_retry_seconds"]
+        state = str(result.get("state") or "reservation_unavailable")
+        reason = str(result.get("reason") or
+                     "GitHub API reservation не создана")
+    return _budget_denied(
+        policy, state=state, reason=reason, now=now, limits=limits,
+        defer_at=defer_at, blocked_resources=blocked,
+        status_revision=status_revision,
+        reserved_other=result.get("reserved_other"),
+        effective_after=result.get("effective_after"),
+        active_reservations=int(result.get("active_reservations") or 0))
+
+
+def _reserve_execution_admission(
+        task, profile_id: str, profile: dict, queue: dict, admission: dict,
+        budget_route: str, *, retain_budget: bool) -> dict:
+    """Recheck the elected route and optionally reserve its in-flight cost."""
+    lease = admission.get("_lease")
+    try:
+        policy = _github_budget_policy(profile)
+        if policy is None:
+            return admission
+        policy = _with_shared_budget_floor(policy)
+        policy = _budget_policy_for_route(policy, budget_route)
+        if not policy.get("cost_accounting"):
+            # Profiles without route costs keep the original one-shot floor
+            # admission; they neither re-read limits nor create reservations.
+            return admission
+        if not isinstance(lease, _GitHubScanLease):
+            raise _GitHubScanLeaseLost(
+                "GitHub execution admission lost its scan lease")
+        lease.ensure_owned(renew=True)
+        try:
+            limits = _github_rate_limits()
+        except Exception:
+            limits = None
+        if not isinstance(limits, dict):
+            decision = _evaluate_github_budget(
+                policy, limits, now=time.time(),
+                status_revision=lease.status_revision)
+        elif not retain_budget:
+            reservations = db.pipeline_github_budget_reservations(
+                policy["lease_scope"])
+            decision = _evaluate_github_budget(
+                policy, limits, now=time.time(),
+                status_revision=lease.status_revision,
+                reserved_other=reservations["totals"],
+                active_reservations=reservations["count"])
+        else:
+            task_id = getattr(task, "id", None)
+            started_at = getattr(task, "started_at", None)
+            if task_id is None or started_at is None:
+                raise ValueError(
+                    "running task identity is unavailable for GitHub reservation")
+            token = uuid.uuid4().hex
+            reserved = db.reserve_pipeline_github_budget(
+                policy["lease_scope"], token=token, task_id=task_id,
+                task_started_at=started_at, profile_id=profile_id,
+                queue_id=str(queue.get("id") or ""), route=budget_route,
+                cost=policy["requested_cost"], limits=limits,
+                minimum_remaining=policy["minimum_remaining"],
+                scan_lease_guard=lease.guard)
+            if not reserved.get("allowed"):
+                decision = _reservation_denied(
+                    policy, limits, reserved,
+                    status_revision=lease.status_revision)
+            else:
+                decision = _evaluate_github_budget(
+                    policy, limits, now=time.time(),
+                    status_revision=lease.status_revision,
+                    reserved_other=reserved.get("reserved_other"),
+                    active_reservations=int(
+                        reserved.get("active_reservations") or 0))
+                if not decision.get("allowed"):
+                    db.release_pipeline_github_budget(
+                        policy["lease_scope"], token=token, task_id=task_id,
+                        task_started_at=started_at)
+                else:
+                    current = getattr(
+                        _execution_budget_context, "reservation", None)
+                    if current is not None:
+                        db.release_pipeline_github_budget(
+                            policy["lease_scope"], token=token,
+                            task_id=task_id, task_started_at=started_at)
+                        raise RuntimeError(
+                            "worker thread already owns a GitHub budget reservation")
+                    _execution_budget_context.reservation = \
+                        _GitHubBudgetReservation(
+                            policy["lease_scope"], token, task_id, started_at)
+    except (TypeError, ValueError, sqlite3.Error, _GitHubScanLeaseLost) as exc:
+        fallback_policy = {
+            "minimum_remaining": dict(_DEFAULT_GITHUB_BUDGET_MINIMUM),
+            "requested_cost": {
+                resource: 0 for resource in _DEFAULT_GITHUB_BUDGET_MINIMUM},
+            "costs": None, "lease_scope": _GITHUB_SCAN_LEASE_SCOPE,
+            "unavailable_retry_seconds": 300,
+            "reset_grace_seconds": 60,
+            "budget_route": budget_route,
+        }
+        decision = _budget_denied(
+            fallback_policy,
+            state="reservation_unavailable",
+            reason=f"GitHub API reservation не создана: {exc}",
+            now=time.time(),
+            status_revision=(lease.status_revision
+                             if isinstance(lease, _GitHubScanLease) else None))
+    decision["_lease"] = lease
+    admission.clear()
+    admission.update(decision)
+    return admission
+
+
+def release_execution_admission() -> None:
+    """Release a provider-spanning reservation; safe after every worker path."""
+    reservation = getattr(_execution_budget_context, "reservation", None)
+    _execution_budget_context.reservation = None
+    if isinstance(reservation, _GitHubBudgetReservation):
+        reservation.release()
+
+
 def _public_budget_decision(decision: dict) -> dict:
     """Strip internal ordering and duplicate rate-limit fields from the UI."""
     return {
         key: copy.deepcopy(value) for key, value in decision.items()
         if key not in {"github_rate_limit", "status_revision"}
+        and not key.startswith("_")
     }
 
 
@@ -781,9 +1103,19 @@ def _github_rate_limits() -> dict | None:
                     int(reset), timezone.utc).isoformat()
                 if reset is not None else None,
             }
+        if result:
+            lease = getattr(_scan_lease_context, "lease", None)
+            if isinstance(lease, _GitHubScanLease):
+                if not db.record_pipeline_github_rate_snapshot(
+                        lease.scope, result, observed_at=time.time(),
+                        scan_lease_guard=lease.guard):
+                    raise _GitHubScanLeaseLost(
+                        "SQLite lease rejected GitHub rate snapshot")
         return result or None
+    except _GitHubScanLeaseLost:
+        raise
     except (RuntimeError, OSError, OverflowError, TypeError, ValueError,
-            json.JSONDecodeError):
+            sqlite3.Error, json.JSONDecodeError):
         return None
 
 
@@ -1182,6 +1514,44 @@ def _wake_ready_queues(profile_id: str, profile: dict, data: dict,
     return woken
 
 
+def _wake_configured_successors(profile: dict, queue: dict,
+                                series: list[dict]) -> list[str] | None:
+    """Wake explicit successors locally; None preserves legacy scan-based wake."""
+    configured = queue.get("wake_after_success")
+    if configured is None:
+        return None
+    if (not isinstance(configured, list)
+            or any(not isinstance(item, str) or not item.strip()
+                   for item in configured)):
+        raise ValueError("wake_after_success должен быть массивом id очередей")
+    queue_by_id = {
+        str(item.get("id")): item for item in profile.get("queues", [])
+        if isinstance(item, dict) and item.get("id") is not None
+    }
+    woken = []
+    for queue_id in dict.fromkeys(item.strip() for item in configured):
+        target_queue = queue_by_id.get(queue_id)
+        if target_queue is None:
+            raise ValueError(
+                f"wake_after_success содержит неизвестную очередь: {queue_id}")
+        execution = target_queue.get("execution")
+        mode = (str(execution.get("mode", "auto")).lower()
+                if isinstance(execution, dict) else "")
+        if (mode not in {"auto", "tool"}
+                or _tool_command(execution, queue_id) is None):
+            raise ValueError(
+                "wake_after_success может будить только очередь с project "
+                f"execution preflight: {queue_id}")
+        target = _series_for_queue(target_queue, series)
+        if (not target or target.get("ended") or target.get("ended_at")
+                or target.get("paused")):
+            continue
+        wake = db.request_pipeline_series_wake(int(target["id"]))
+        if wake.get("accepted"):
+            woken.append(queue_id)
+    return woken
+
+
 def after_task_completed(task, verdict: str | None) -> list[str]:
     """Immediately advance ready pipeline stages after a productive run."""
     if str(verdict or "").upper() != "ГОТОВО":
@@ -1194,8 +1564,15 @@ def after_task_completed(task, verdict: str | None) -> list[str]:
     # expensive cross-repository analysis. Resume/sampler will refresh later.
     if db.is_paused():
         return []
-    profile_id, profile, _queue = matched
+    profile_id, profile, queue = matched
     series = db.list_series()
+    # The completed action changed external protocol state. Mark the old
+    # dashboard snapshot stale, then use an explicit local dependency graph to
+    # wake likely successors. Their own fresh project preflight remains the
+    # authority, so this path spends no GitHub quota and cannot mutate GitHub.
+    if queue.get("wake_after_success") is not None:
+        _discard_cache(profile_id)
+        return _wake_configured_successors(profile, queue, series) or []
     # A productive stage changes the GitHub protocol state. Refresh the project
     # checker once here so the next stage is woken immediately; routine sampler
     # and dispatch reads can then share that result.
@@ -1321,7 +1698,8 @@ def _budget_defer_route(admission: dict, profile_id: str, profile: dict,
     }
 
 
-def execution_route(task, fallback_prompt: str, working_dir: str | None = None) -> dict:
+def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
+                    *, retain_budget: bool = False) -> dict:
     """Choose the project tool or the original skill prompt without invoking an LLM.
 
     The profile owns this opt-in. PromptPilot only checks local availability and
@@ -1336,7 +1714,13 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None) 
     if not isinstance(execution, dict):
         with _github_scan_admission(
                 profile, f"pipeline task {profile_id}/{queue.get('id')}",
-                profile_id=profile_id) as admission:
+                profile_id=profile_id, budget_route="skill") as admission:
+            if not admission.get("allowed"):
+                return _budget_defer_route(
+                    admission, profile_id, profile, queue, mode="skill")
+            admission = _reserve_execution_admission(
+                task, profile_id, profile, queue, admission, "skill",
+                retain_budget=retain_budget)
             if not admission.get("allowed"):
                 return _budget_defer_route(
                     admission, profile_id, profile, queue, mode="skill")
@@ -1352,7 +1736,13 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None) 
     if mode == "skill":
         with _github_scan_admission(
                 profile, f"pipeline task {profile_id}/{queue.get('id')}",
-                profile_id=profile_id) as admission:
+                profile_id=profile_id, budget_route="skill") as admission:
+            if not admission.get("allowed"):
+                return _budget_defer_route(
+                    admission, profile_id, profile, queue, mode="skill")
+            admission = _reserve_execution_admission(
+                task, profile_id, profile, queue, admission, "skill",
+                retain_budget=retain_budget)
             if not admission.get("allowed"):
                 return _budget_defer_route(
                     admission, profile_id, profile, queue, mode="skill")
@@ -1362,7 +1752,7 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None) 
     command = _tool_command(execution, stage)
     with _github_scan_admission(
             profile, f"pipeline preflight {profile_id}/{stage}",
-            profile_id=profile_id) as admission:
+            profile_id=profile_id, budget_route="tool_preflight") as admission:
         if not admission.get("allowed"):
             return _budget_defer_route(
                 admission, profile_id, profile, queue)
@@ -1382,6 +1772,12 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None) 
                 profile, queue)
         if not available:
             if mode == "auto":
+                admission = _reserve_execution_admission(
+                    task, profile_id, profile, queue, admission, "skill",
+                    retain_budget=retain_budget)
+                if not admission.get("allowed"):
+                    return _budget_defer_route(
+                        admission, profile_id, profile, queue, mode="skill")
                 return {
                     "action": "prompt", "mode": "skill", "prompt": fallback_prompt,
                     "fallback_reason": reason, "profile_id": profile_id,
@@ -1403,6 +1799,12 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None) 
         except RuntimeError as exc:
             reason = str(exc)
             if mode == "auto":
+                admission = _reserve_execution_admission(
+                    task, profile_id, profile, queue, admission, "skill",
+                    retain_budget=retain_budget)
+                if not admission.get("allowed"):
+                    return _budget_defer_route(
+                        admission, profile_id, profile, queue, mode="skill")
                 return {
                     "action": "prompt", "mode": "skill", "prompt": fallback_prompt,
                     "fallback_reason": reason, "profile_id": profile_id,
@@ -1412,6 +1814,24 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None) 
                 "action": "block", "mode": "tool", "reason": reason,
                 "profile_id": profile_id, "queue_id": queue.get("id"),
             }
+
+        preflight_action = preflight["action"].lower()
+        provider_route = None
+        if preflight_action == "fallback" and mode == "auto":
+            provider_route = ("fallback_targeted" if "handoff" in preflight
+                              else "skill")
+        elif preflight_action in {"audit", "merge", "cleanup"}:
+            provider_route = "tool"
+        elif preflight_action not in {"empty", "wait", "error"} and mode == "auto":
+            provider_route = "skill"
+        if provider_route is not None:
+            admission = _reserve_execution_admission(
+                task, profile_id, profile, queue, admission, provider_route,
+                retain_budget=retain_budget)
+            if not admission.get("allowed"):
+                return _budget_defer_route(
+                    admission, profile_id, profile, queue,
+                    mode=("tool" if provider_route == "tool" else "skill"))
 
     preflight_action = preflight["action"].lower()
     preflight_reason = str(
@@ -2007,6 +2427,69 @@ def _with_persisted_refresh_status(result: dict, profile_id: str,
     return data
 
 
+def _with_live_github_budget_state(result: dict, profile: dict) -> dict:
+    """Overlay last-known limits and live reservations using SQLite only."""
+    try:
+        policy = _github_budget_policy(profile)
+        if policy is not None:
+            policy = _with_shared_budget_floor(policy)
+    except (TypeError, ValueError) as exc:
+        data = copy.deepcopy(result)
+        data["github_budget"] = {
+            "enabled": True, "state": "invalid_config", "allowed": False,
+            "reason": f"Некорректный github_budget: {exc}",
+        }
+        return data
+    if policy is None:
+        return result
+
+    data = copy.deepcopy(result)
+    budget = copy.deepcopy(data.get("github_budget") or {})
+    budget.setdefault("enabled", True)
+    budget.setdefault("lease_scope", policy["lease_scope"])
+    budget["minimum_remaining"] = dict(policy["minimum_remaining"])
+
+    snapshot = None
+    try:
+        snapshot = db.get_pipeline_github_rate_snapshot(policy["lease_scope"])
+    except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
+        budget["rate_snapshot_state"] = "unavailable"
+        budget["rate_snapshot_reason"] = str(exc)
+    if snapshot is not None:
+        data["github_rate_limit"] = copy.deepcopy(snapshot["limits"])
+        data["github_rate_limit_observed_at"] = _defer_at(
+            snapshot["observed_at"])
+        budget["rate_snapshot_age_seconds"] = max(
+            0, round(time.time() - snapshot["observed_at"]))
+
+    try:
+        reservations = db.pipeline_github_budget_reservations(
+            policy["lease_scope"])
+    except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
+        budget["ledger_state"] = "unavailable"
+        budget["ledger_reason"] = str(exc)
+    else:
+        totals = dict(reservations["totals"])
+        budget["ledger_state"] = "ok"
+        budget["active_reservations"] = int(reservations["count"])
+        budget["reserved_in_flight"] = totals
+        route_counts = {}
+        for item in reservations["items"]:
+            route = str(item.get("route") or "unknown")
+            route_counts[route] = route_counts.get(route, 0) + 1
+        budget["reservation_routes"] = route_counts
+        if snapshot is not None:
+            budget["spendable_before_route"] = {
+                resource: max(
+                    0, snapshot["limits"][resource]["remaining"]
+                    - totals[resource]
+                    - policy["minimum_remaining"][resource])
+                for resource in policy["minimum_remaining"]
+            }
+    data["github_budget"] = budget
+    return data
+
+
 def read_cached(profile_id: str, series: list[dict]) -> dict:
     """Return saved insights plus live local state without any GitHub request."""
     profiles = _profiles()
@@ -2025,11 +2508,12 @@ def read_cached(profile_id: str, series: list[dict]) -> dict:
         if snapshot_epoch == current_epoch:
             break
     if cached:
-        return _with_persisted_refresh_status(_refresh_local_state(
-            cached[1], profile, series, source=source or "memory",
-            generated_at=float(cached[0]), entry_epoch=int(cached[2]),
-            entry_revision=int(cached[4]), current_epoch=current_epoch,
-        ), profile_id, profile)
+        return _with_live_github_budget_state(
+            _with_persisted_refresh_status(_refresh_local_state(
+                cached[1], profile, series, source=source or "memory",
+                generated_at=float(cached[0]), entry_epoch=int(cached[2]),
+                entry_revision=int(cached[4]), current_epoch=current_epoch,
+            ), profile_id, profile), profile)
     # A full cache that no longer matches the complete profile fingerprint
     # proves that query semantics changed. Do not reinterpret its legacy raw
     # snapshot under the new profile; wait for an explicit successful refresh.
@@ -2045,16 +2529,18 @@ def read_cached(profile_id: str, series: list[dict]) -> dict:
         allow_legacy=not incompatible_full_cache)
     if fallback:
         result, generated_at = fallback
-        return _with_persisted_refresh_status(_refresh_local_state(
-            result, profile, series, source="snapshot",
-            generated_at=generated_at, entry_epoch=None,
+        return _with_live_github_budget_state(
+            _with_persisted_refresh_status(_refresh_local_state(
+                result, profile, series, source="snapshot",
+                generated_at=generated_at, entry_epoch=None,
+                entry_revision=None, current_epoch=current_epoch,
+            ), profile_id, profile), profile)
+    return _with_live_github_budget_state(
+        _with_persisted_refresh_status(_refresh_local_state(
+            _empty_cached_result(profile_id, profile), profile, series,
+            source="none", generated_at=None, entry_epoch=None,
             entry_revision=None, current_epoch=current_epoch,
-        ), profile_id, profile)
-    return _with_persisted_refresh_status(_refresh_local_state(
-        _empty_cached_result(profile_id, profile), profile, series,
-        source="none", generated_at=None, entry_epoch=None,
-        entry_revision=None, current_epoch=current_epoch,
-    ), profile_id, profile)
+        ), profile_id, profile), profile)
 
 
 def _paused_cached(profile_id: str, series: list[dict]) -> dict:
@@ -2070,7 +2556,9 @@ def _budget_blocked_cached(profile_id: str, profile: dict, series: list[dict],
     result = read_cached(profile_id, series)
     if admission.get("github_rate_limit") is not None:
         result["github_rate_limit"] = admission["github_rate_limit"]
-    result["github_budget"] = _public_budget_decision(admission)
+    runtime_budget = copy.deepcopy(result.get("github_budget") or {})
+    runtime_budget.update(_public_budget_decision(admission))
+    result["github_budget"] = runtime_budget
     cache = result.setdefault("cache", {})
     cache["refresh_blocked"] = str(admission.get("state") or "github_budget")
     cache["refresh_blocked_reason"] = str(
@@ -2308,7 +2796,7 @@ def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True,
     profile = profiles[profile_id]
     with _github_scan_admission(
             profile, f"pipeline insights {profile_id}",
-            profile_id=profile_id) as admission:
+            profile_id=profile_id, budget_route="insights") as admission:
         if not admission.get("allowed"):
             return _budget_blocked_cached(
                 profile_id, profile, series, admission)
@@ -2330,7 +2818,7 @@ def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True,
         cache.pop("refresh_blocked", None)
         cache.pop("refresh_blocked_reason", None)
         cache.pop("refresh_deferred_until", None)
-    return result
+    return _with_live_github_budget_state(result, profile)
 
 
 def sample_active_profiles(series: list[dict]) -> dict[str, str]:
