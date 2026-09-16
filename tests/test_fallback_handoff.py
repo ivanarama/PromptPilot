@@ -91,6 +91,11 @@ def test_cli_dispatch_handoff_runs_exactly_election_and_fresh_gate(config, monke
     assert route["command"] == command
     assert '"next_already_run": true' in route["prompt"]
     assert "Не запускай next повторно" in route["prompt"]
+    assert "gate_command ровно один раз" in route["prompt"]
+    assert "сохрани stdout и $LASTEXITCODE" in route["prompt"]
+    assert "запрещено бросать исключение только по exit code до разбора ответа" in route["prompt"]
+    assert "не повторяй gate_command и next" in route["prompt"]
+    assert "ИТОГ: НЕ СМОГ (gate-fallback: <точный error" in route["prompt"]
     assert "Один envelope — один PR" in route["prompt"]
     assert route["preflight"]["target"] == route["target"]
     assert len(scans) == 1
@@ -302,7 +307,7 @@ def test_fresh_ordinary_merge_priority_change_closes_target_gate(config):
         handoff.health_gate(source, "merge", target, election=False)
 
 
-def test_module_cli_helper_errors_are_json_not_tracebacks(config, tmp_path):
+def test_module_cli_helper_errors_are_json_and_visible_without_tracebacks(config, tmp_path):
     config_path = tmp_path / "pipelinectl.json"
     config_path.write_text(json.dumps(config), encoding="utf-8")
     result = subprocess.run([
@@ -310,5 +315,8 @@ def test_module_cli_helper_errors_are_json_not_tracebacks(config, tmp_path):
         "gate-fallback", "review", "--lease", "invalid",
     ], capture_output=True, text=True, encoding="utf-8")
     assert result.returncode == 2
-    assert json.loads(result.stdout)["action"] == "error"
-    assert not result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["action"] == "error"
+    assert payload["error"]
+    assert result.stderr.strip() == f"pipelinectl gate-fallback: {payload['error']}"
+    assert "Traceback" not in result.stderr

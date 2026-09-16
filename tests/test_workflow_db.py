@@ -1,4 +1,5 @@
 import sqlite3
+import time
 
 import pytest
 
@@ -143,6 +144,43 @@ def test_init_db_is_idempotent_and_preserves_existing_tasks(isolated_db):
     }.issubset(tables)
     assert migration["version"] == isolated_db.WORKFLOW_SCHEMA_VERSION
     assert stage_migration["version"] == isolated_db.WORKFLOW_STAGE_SCHEMA_VERSION
+
+
+def test_read_connection_does_not_reassert_wal_during_writer(isolated_db, monkeypatch):
+    task = isolated_db.create_task(TaskCreate(prompt="committed snapshot"))
+    statements = []
+    real_connect = sqlite3.connect
+
+    def traced_connect(*args, **kwargs):
+        # A short timeout makes an accidental lock-taking reader fail fast while
+        # the writer below owns its transaction; a real WAL read needs no wait.
+        kwargs["timeout"] = 0.05
+        conn = real_connect(*args, **kwargs)
+        conn.set_trace_callback(statements.append)
+        return conn
+
+    monkeypatch.setattr(isolated_db.sqlite3, "connect", traced_connect)
+
+    with isolated_db._connect(immediate=True) as writer:
+        writer.execute(
+            "UPDATE tasks SET prompt = 'uncommitted' WHERE id = ?", (task.id,)
+        )
+        statements.clear()
+        started = time.monotonic()
+        with isolated_db._connect() as reader:
+            journal_mode = reader.execute("PRAGMA journal_mode").fetchone()[0]
+            prompt = reader.execute(
+                "SELECT prompt FROM tasks WHERE id = ?", (task.id,)
+            ).fetchone()[0]
+        elapsed = time.monotonic() - started
+
+    assert journal_mode == "wal"
+    assert prompt == "committed snapshot"
+    assert elapsed < 0.5
+    assert not any(
+        statement.lower().startswith("pragma journal_mode=")
+        for statement in statements
+    )
 
 
 def test_create_get_list_workflow_and_creation_event(isolated_db):

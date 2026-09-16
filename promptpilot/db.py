@@ -389,7 +389,6 @@ def _connect(immediate: bool = False):
     DB_DIR.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(DB_PATH), timeout=10)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     if immediate:
         # Take the write lock before reading: a claim that decides on a stale
@@ -407,6 +406,12 @@ def _connect(immediate: bool = False):
 
 def init_db():
     with _connect() as conn:
+        # Journal mode is persistent database state, not a per-connection
+        # setting. Reasserting it on every connection needlessly turns an
+        # otherwise read-only open into a lock-taking operation and can make a
+        # reader fail while another connection owns the writer transaction.
+        # Bootstrap it once; foreign_keys remains per-connection in _connect.
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(SCHEMA)
         # Run migrations for existing databases
         for migration in MIGRATIONS:
@@ -732,6 +737,31 @@ def mark_failed(task_id: int, error: str, exit_code: int = 1):
         _drop_cancel_flag(conn, task_id)
 
 
+def fail_running_attempt(task_id: int, started_at, error: str,
+                         exit_code: int = 1) -> bool:
+    """Fail exactly one claimed attempt after an internal worker crash.
+
+    Recovery can be delayed by SQLite contention. The task may be reset and
+    claimed again before that delay clears, so task id alone is not a safe
+    fence: only the exact still-running ``started_at`` attempt may be changed.
+    """
+    if isinstance(started_at, datetime):
+        started_at = _to_utc_iso(started_at)
+    if not started_at:
+        return False
+    with _connect() as conn:
+        cur = conn.execute(
+            """UPDATE tasks
+               SET status = 'failed', error = ?, exit_code = ?,
+                   completed_at = ?, note = NULL
+               WHERE id = ? AND status = 'running' AND started_at = ?""",
+            (error, exit_code, _now(), task_id, started_at),
+        )
+        if cur.rowcount:
+            _drop_cancel_flag(conn, task_id)
+        return cur.rowcount > 0
+
+
 def mark_rate_limited(task_id: int, next_run_at: datetime, error: str = None):
     with _connect() as conn:
         conn.execute(
@@ -897,22 +927,43 @@ def update_series(series_id: int, fields: dict) -> bool:
         fields["temporary_empty_count"] = 0
     fields["updated_at"] = _now()
     sets = ", ".join(f"{k} = ?" for k in fields)
-    with _connect() as conn:
+    with _connect(immediate=True) as conn:
+        current = conn.execute(
+            "SELECT provider FROM task_series WHERE id = ? AND ended_at IS NULL",
+            (series_id,),
+        ).fetchone()
+        if not current:
+            return False
+        provider_changed = (
+            "provider" in fields and fields["provider"] != current["provider"]
+        )
         cur = conn.execute(f"UPDATE task_series SET {sets} WHERE id = ? AND ended_at IS NULL",
                            (*fields.values(), series_id))
         if not cur.rowcount:
             return False
-        task_fields = {"recurrence": fields.get("base_recurrence")}
+        task_fields = {}
+        if "base_recurrence" in fields:
+            task_fields["recurrence"] = fields["base_recurrence"]
         for name in ("provider", "model", "effort", "priority", "task_timeout"):
             if name in fields:
                 task_fields[name] = fields[name]
-        task_fields = {k: v for k, v in task_fields.items() if v is not None}
-        if task_fields:
-            task_sets = ", ".join(f"{k} = ?" for k in task_fields)
+        task_sets = [f"{k} = ?" for k in task_fields]
+        task_values = list(task_fields.values())
+        if provider_changed:
+            # Resume ids and retry budgets belong to the old provider. Carrying
+            # them across a switch can ask a new CLI to resume an incompatible
+            # session or fail it immediately on the old provider's last retry.
+            task_sets.extend([
+                "session_id = NULL", "retry_count = 0", "error = NULL",
+                "exit_code = NULL",
+                "status = CASE WHEN status = 'rate_limited' THEN 'pending' ELSE status END",
+                "next_run_at = CASE WHEN status = 'rate_limited' THEN NULL ELSE next_run_at END",
+            ])
+        if task_sets:
             conn.execute(
-                f"UPDATE tasks SET {task_sets} WHERE series_id = ? "
+                f"UPDATE tasks SET {', '.join(task_sets)} WHERE series_id = ? "
                 "AND status IN ('pending', 'rate_limited')",
-                (*task_fields.values(), series_id),
+                (*task_values, series_id),
             )
         if any(name in fields for name in (
                 "base_recurrence", "temporary_recurrence", "temporary_until")):

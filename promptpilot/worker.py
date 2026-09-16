@@ -1145,29 +1145,94 @@ def enough_memory() -> bool:
     return free is None or free >= MIN_FREE_MB
 
 
-def _fail_stuck(task_id, exc):
+def _fail_stuck(task, exc) -> bool:
     """An unexpected crash in execute_task left a task stranded in 'running'.
 
     execute_task reports task-level failures itself, so reaching here is a bug
     (a KeyError in parsing, a 'database is locked'); mark it failed so the queue
     keeps moving instead of a task stuck forever and — in the pool — its lock
-    key freed while a second task walks into the same directory. Only touch it
-    if it is still running: the crash may have happened after mark_completed.
+    key freed while a second task walks into the same directory. Only touch its
+    exact attempt: the crash may have happened after mark_completed, or a
+    delayed recovery may race a newer reclaimed attempt.
+
+    Return False only when the durable transition could not be attempted, so
+    the worker loop can retry it with backoff. A fenced no-op is terminal: the
+    task already moved on and must not be changed by this old recovery.
     """
     try:
-        t = db.get_task(task_id)
-        if t and t.status.value == "running":
-            db.mark_failed(task_id, f"Внутренняя ошибка воркера: {type(exc).__name__}: {exc}")
-            # execute_task's finally block could not extend the series while
-            # this row was still running.  Once recovery marks it failed, do
-            # the same recurrence handoff as the normal failure path so one
-            # unexpected exception cannot leave a durable schedule broken.
-            _recur_after_run(t)
-            from . import workflows
-            workflows.sync_task(task_id)
-            workflows.advance_linked_task(task_id)
+        changed = db.fail_running_attempt(
+            task.id,
+            task.started_at,
+            f"Внутренняя ошибка воркера: {type(exc).__name__}: {exc}",
+        )
     except Exception as e:  # never let recovery itself take down the loop
-        print(f"  !! не удалось пометить #{task_id} failed: {e}", flush=True)
+        print(f"  !! не удалось пометить #{task.id} failed: {e}", flush=True)
+        return False
+
+    if not changed:
+        return True
+
+    try:
+        # execute_task's finally block could not extend the series while this
+        # row was still running. Once recovery marks it failed, do the same
+        # recurrence handoff as the normal failure path so one unexpected
+        # exception cannot leave a durable schedule broken.
+        _recur_after_run(task)
+        from . import workflows
+        workflows.sync_task(task.id)
+        workflows.advance_linked_task(task.id)
+    except Exception as e:
+        # The failure row is already durable. Startup reconciliation repairs
+        # projections/series if this best-effort follow-up is interrupted.
+        print(f"  !! не удалось завершить восстановление #{task.id}: {e}", flush=True)
+    return True
+
+
+def _stuck_recovery_delay(failures: int) -> float:
+    """Bounded backoff for durable recovery, independent of provider retries."""
+    base = max(1, POLL_INTERVAL)
+    return min(base * (2 ** max(0, failures - 1)), MAX_DELAY)
+
+
+def _queue_stuck_recovery(recoveries: dict, task, lock: str, exc) -> None:
+    """Remember one failed execution attempt until its state is durable."""
+    key = (task.id, task.started_at)
+    recoveries.setdefault(key, {
+        "task": task,
+        "lock": lock,
+        "exc": exc,
+        "failures": 0,
+        "retry_at": 0.0,
+    })
+
+
+def _drain_stuck_recoveries(recoveries: dict, now: float | None = None) -> None:
+    """Run due recoveries and retain failed writes for a later loop pass."""
+    now = time.monotonic() if now is None else now
+    for key, item in list(recoveries.items()):
+        if item["retry_at"] > now:
+            continue
+        if _fail_stuck(item["task"], item["exc"]):
+            recoveries.pop(key, None)
+            continue
+        item["failures"] += 1
+        item["retry_at"] = now + _stuck_recovery_delay(item["failures"])
+
+
+def _reap_futures(in_flight: dict, recoveries: dict,
+                  now: float | None = None) -> None:
+    """Collect completed pool work and durably recover unhandled crashes."""
+    for fut in [candidate for candidate in in_flight if candidate.done()]:
+        lock, task = in_flight.pop(fut)
+        exc = fut.exception()
+        if exc:  # execute_task already reports task failures; this is a bug
+            print(
+                f"  !! исполнение задачи #{task.id} упало: "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            _queue_stuck_recovery(recoveries, task, lock, exc)
+    _drain_stuck_recoveries(recoveries, now=now)
 
 
 def lock_key(task) -> str:
@@ -1275,7 +1340,8 @@ def run_worker():
     print("Waiting for tasks...\n")
 
     pool = None
-    in_flight = {}  # Future -> lock key held while it runs
+    in_flight = {}  # Future -> (lock key, exact claimed task attempt)
+    stuck_recoveries = {}  # exact attempt -> retry state; keeps its lock key
     admission_fence = _AdmissionFence()
     short_on_memory = False
     if CONCURRENCY > 1:
@@ -1283,12 +1349,7 @@ def run_worker():
         pool = ThreadPoolExecutor(max_workers=CONCURRENCY, thread_name_prefix="pp-task")
 
     def reap():
-        for fut in [f for f in in_flight if f.done()]:
-            _lock, tid = in_flight.pop(fut)
-            exc = fut.exception()
-            if exc:  # execute_task already reports task failures; this is a bug
-                print(f"  !! исполнение задачи #{tid} упало: {type(exc).__name__}: {exc}", flush=True)
-                _fail_stuck(tid, exc)
+        _reap_futures(in_flight, stuck_recoveries)
 
     while running:
         reap()
@@ -1324,8 +1385,10 @@ def run_worker():
         if pool is not None and not admission_fence.wait(POLL_INTERVAL):
             continue
 
-        task = db.get_next_runnable(
-            busy_keys=[lk for lk, _tid in in_flight.values() if lk], key_fn=lock_key)
+        busy_keys = [lk for lk, _task in in_flight.values() if lk]
+        busy_keys.extend(
+            item["lock"] for item in stuck_recoveries.values() if item["lock"])
+        task = db.get_next_runnable(busy_keys=busy_keys, key_fn=lock_key)
         if task is None:
             time.sleep(POLL_INTERVAL)
             continue
@@ -1338,12 +1401,14 @@ def run_worker():
                 execute_task(task)
             except Exception as exc:  # an unhandled crash must not stop the loop
                 print(f"  !! исполнение задачи #{task.id} упало: {type(exc).__name__}: {exc}", flush=True)
-                _fail_stuck(task.id, exc)
+                _queue_stuck_recovery(
+                    stuck_recoveries, task, lock_key(task), exc)
+                _drain_stuck_recoveries(stuck_recoveries)
         else:
             admission_complete = admission_fence.begin()
             in_flight[pool.submit(
                 _execute_task_with_admission_fence,
-                task, admission_complete)] = (lock_key(task), task.id)
+                task, admission_complete)] = (lock_key(task), task)
 
     if pool is not None:
         if in_flight:
