@@ -1,5 +1,6 @@
 from concurrent.futures import Future
 from datetime import datetime, timezone
+import signal
 import sqlite3
 import threading
 from types import SimpleNamespace
@@ -25,6 +26,46 @@ def test_admission_fence_blocks_next_claim_until_current_admission_finishes():
     second = fence.begin()
     assert second is not first
     assert fence.wait(0) is False
+
+
+def test_worker_recovers_then_warms_pipeline_before_claiming(monkeypatch):
+    events = []
+    handlers = {}
+
+    monkeypatch.setattr(
+        worker.signal, "signal",
+        lambda signum, handler: handlers.__setitem__(signum, handler),
+    )
+    monkeypatch.setattr(
+        worker, "_warm_pipeline_runtime", lambda: events.append("warm"))
+    monkeypatch.setattr(
+        worker, "live_task_ids", lambda: events.append("live") or set())
+    monkeypatch.setattr(
+        worker.db, "recover_running", lambda **_kwargs: events.append("recover"))
+    monkeypatch.setattr(
+        worker.db, "repair_active_series_occurrences", lambda: [])
+    monkeypatch.setattr(worker.db, "touch_worker_heartbeat", lambda _pid: None)
+    monkeypatch.setattr(worker.db, "mark_worker_stopped", lambda _pid: None)
+    monkeypatch.setattr(worker, "_code_snapshot", lambda: None)
+    monkeypatch.setattr(worker, "CONCURRENCY", 1)
+    monkeypatch.setattr(worker.time, "sleep", lambda _delay: None)
+
+    from promptpilot import workflows
+    monkeypatch.setattr(workflows, "sync_all_tasks", lambda: None)
+
+    monkeypatch.setattr(worker.db, "is_paused", lambda: False)
+    monkeypatch.setattr(worker, "enough_memory", lambda: True)
+
+    def stop_on_first_claim(**_kwargs):
+        events.append("claim")
+        handlers[signal.SIGTERM](signal.SIGTERM, None)
+        return None
+
+    monkeypatch.setattr(worker.db, "get_next_runnable", stop_on_first_claim)
+
+    worker.run_worker()
+
+    assert events[:4] == ["live", "recover", "warm", "claim"]
 
 
 def test_task_opens_fence_only_after_herdr_provider_started(monkeypatch):

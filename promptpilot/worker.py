@@ -1394,6 +1394,18 @@ class _AdmissionFence:
         return self._pending
 
 
+def _warm_pipeline_runtime():
+    """Load pipeline routing code before a runnable task is claimed.
+
+    Frozen executables import this relatively large module lazily.  On a busy
+    disk Windows can spend minutes paging it in.  Doing that after the atomic
+    claim makes a healthy pending task look like a hung running task and holds
+    the admission fence even though no provider or mutation has started.
+    """
+    from . import pipeline_insights
+    return pipeline_insights
+
+
 def run_worker():
     """Main worker loop.
 
@@ -1448,6 +1460,11 @@ def run_worker():
         workflows.sync_all_tasks()
     except Exception as exc:
         print(f"Не удалось синхронизировать workflow после восстановления: {exc}")
+
+    # Import/page-in the routing stack after stale attempts have been recovered
+    # but before a new queue item can be claimed. A slow startup remains visible
+    # through the heartbeat without making any task look actively running.
+    _warm_pipeline_runtime()
 
     code_snapshot = _code_snapshot()
 
