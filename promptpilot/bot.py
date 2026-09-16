@@ -973,12 +973,16 @@ def _pipeline_text(data: dict) -> str:
     return "\n".join(lines)
 
 
+def _read_pipeline_snapshot(profile_id: str):
+    """Read series and its cached projection on the same background thread."""
+    return pipeline_insights.read_cached(profile_id, db.list_series())
+
+
 async def _send_pipeline_insights(message, profile_id: str):
     import asyncio
     status = await message.reply_text("📈 Читаю последний снимок очередей…")
     try:
-        data = await asyncio.to_thread(
-            pipeline_insights.read_cached, profile_id, db.list_series())
+        data = await asyncio.to_thread(_read_pipeline_snapshot, profile_id)
         await status.edit_text(_pipeline_text(data))
     except Exception as exc:
         await status.edit_text(f"Не удалось посчитать очередь: {exc}")

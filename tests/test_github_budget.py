@@ -1494,6 +1494,63 @@ def test_cached_api_and_bot_reads_do_not_touch_github(
     status.edit_text.assert_awaited_once()
 
 
+def test_pipeline_sampler_reads_database_off_event_loop(monkeypatch):
+    threads = {}
+
+    def list_series():
+        threads["database"] = threading.get_ident()
+        return [{"id": 1}]
+
+    def sample(series):
+        threads["sample"] = threading.get_ident()
+        assert series == [{"id": 1}]
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(api, "PIPELINE_SNAPSHOT_INTERVAL", 0)
+    monkeypatch.setattr(api.db, "list_series", list_series)
+    monkeypatch.setattr(
+        api.pipeline_insights, "sample_active_profiles", sample)
+
+    async def run_once():
+        threads["event_loop"] = threading.get_ident()
+        with pytest.raises(asyncio.CancelledError):
+            await api._pipeline_sampler()
+
+    asyncio.run(run_once())
+
+    assert threads["database"] == threads["sample"]
+    assert threads["database"] != threads["event_loop"]
+
+
+def test_bot_pipeline_snapshot_reads_database_off_event_loop(monkeypatch):
+    threads = {}
+    status = SimpleNamespace(edit_text=AsyncMock())
+    message = SimpleNamespace(reply_text=AsyncMock(return_value=status))
+
+    def list_series():
+        threads["database"] = threading.get_ident()
+        return [{"id": 2}]
+
+    def read_cached(profile_id, series):
+        threads["snapshot"] = threading.get_ident()
+        assert profile_id == "example"
+        assert series == [{"id": 2}]
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(bot.db, "list_series", list_series)
+    monkeypatch.setattr(bot.pipeline_insights, "read_cached", read_cached)
+
+    async def run_once():
+        threads["event_loop"] = threading.get_ident()
+        with pytest.raises(asyncio.CancelledError):
+            await bot._send_pipeline_insights(message, "example")
+
+    asyncio.run(run_once())
+
+    assert threads["database"] == threads["snapshot"]
+    assert threads["database"] != threads["event_loop"]
+
+
 def test_blocked_cache_can_never_wake_a_series(monkeypatch):
     calls = []
     monkeypatch.setattr(

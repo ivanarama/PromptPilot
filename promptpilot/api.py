@@ -59,12 +59,23 @@ from .models import (
 from .version import check_for_update
 
 
+def _sample_pipeline_profiles():
+    """Run the complete snapshot read outside the HTTP event loop.
+
+    ``asyncio.to_thread`` only moves evaluation of its callable and arguments.
+    Passing ``db.list_series()`` as an argument evaluated the SQLite read on
+    the event-loop thread first, so slow storage could freeze every API route
+    before the sampler even reached its worker thread.
+    """
+    return pipeline_insights.sample_active_profiles(db.list_series())
+
+
 async def _pipeline_sampler():
     """Collect profile-scoped queue history without invoking an LLM."""
     while True:
         await asyncio.sleep(PIPELINE_SNAPSHOT_INTERVAL)
         try:
-            await asyncio.to_thread(pipeline_insights.sample_active_profiles, db.list_series())
+            await asyncio.to_thread(_sample_pipeline_profiles)
         except Exception as exc:
             print(f"pipeline sampler: {exc}", file=sys.stderr)
 
