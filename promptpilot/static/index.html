@@ -2699,9 +2699,14 @@ async function loadPipelineInsights(profile, refresh=false) {
     };
     const reservedBudget = githubBudgetState.reserved_in_flight || {};
     const spendableBudget = githubBudgetState.spendable_before_route || {};
+    const projectedBudget = githubBudgetState.projected_post_reservation || {};
     const budgetFloor = githubBudgetState.minimum_remaining || {};
     const reservationCount = Number(githubBudgetState.active_reservations || 0);
     const budgetNumber = (values, name) => values[name] == null ? '—' : Number(values[name]).toLocaleString();
+    const projectedNumber = (name, field) => {
+      const value = projectedBudget[name] && projectedBudget[name][field];
+      return value == null ? '—' : Number(value).toLocaleString();
+    };
     const rateObserved = data.github_rate_limit_observed_at
       ? `измерено ${timeAgo(data.github_rate_limit_observed_at)}`
       : 'на момент снимка очереди';
@@ -2713,6 +2718,7 @@ async function loadPipelineInsights(profile, refresh=false) {
     const budgetMetric = githubBudgetState.enabled ? `<div class="pipeline-metric">
       <div class="pipeline-metric-label">GitHub budget в работе</div>
       <div class="pipeline-metric-value">${reservationCount} · REST −${budgetNumber(reservedBudget, 'core')}</div>
+      <div class="pipeline-metric-note">прогноз после активных резервов (не фактический GitHub remaining): REST доступно ${projectedNumber('core', 'available')}, дефицит ${projectedNumber('core', 'deficit')} · Search доступно ${projectedNumber('search', 'available')}, дефицит ${projectedNumber('search', 'deficit')} · GraphQL доступно ${projectedNumber('graphql', 'available')}, дефицит ${projectedNumber('graphql', 'deficit')}</div>
       <div class="pipeline-metric-note">можно выдать до hard reserve: REST ${budgetNumber(spendableBudget, 'core')} · Search ${budgetNumber(spendableBudget, 'search')} · GraphQL ${budgetNumber(spendableBudget, 'graphql')} · reserve REST ${budgetNumber(budgetFloor, 'core')}${budgetProblem ? ` · ${esc(budgetProblem)}` : ''}</div>
     </div>` : '';
     const coreLimit = githubLimits.core;
@@ -3043,13 +3049,25 @@ function timeAgo(iso) {
   return Math.floor(diff / 86400) + 'd';
 }
 
-function refresh() {
-  loadStats();
-  // Keep the list live even with a card expanded (a running task used to freeze
-  // once opened) — but don't re-render out from under an unsaved inline edit.
-  const ae = document.activeElement;
-  if (ae && ae.id && (ae.id.startsWith('note-') || ae.id.startsWith('ed-'))) return;
-  loadTasks();
+let refreshInFlight = false;
+async function refresh() {
+  // Slow storage used to let the five-second timer stack another stats/tasks
+  // pair on top of an unfinished one. Keep at most one ordinary dashboard
+  // refresh in flight; the next timer tick will observe the completed state.
+  if (refreshInFlight) return;
+  refreshInFlight = true;
+  try {
+    const requests = [loadStats()];
+    // Keep the list live even with a card expanded (a running task used to
+    // freeze once opened), but don't re-render under an unsaved inline edit.
+    const ae = document.activeElement;
+    if (!(ae && ae.id && (ae.id.startsWith('note-') || ae.id.startsWith('ed-')))) {
+      requests.push(loadTasks());
+    }
+    await Promise.allSettled(requests);
+  } finally {
+    refreshInFlight = false;
+  }
 }
 
 // --- Set default schedule to current datetime ---

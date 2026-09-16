@@ -8,6 +8,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -106,6 +107,26 @@ def test_budget_decision_defers_to_exact_latest_reset_plus_grace():
         datetime.fromtimestamp(1317, timezone.utc).isoformat()
     assert {item["resource"] for item in decision["blocked_resources"]} == {
         "core", "search",
+    }
+
+
+def test_projected_budget_clamps_display_but_keeps_signed_admission_value():
+    profile = _profile()
+    policy = pipeline_insights._github_budget_policy(profile)
+
+    decision = pipeline_insights._evaluate_github_budget(
+        policy, _limits(core=10), now=1000,
+        reserved_other={"core": 20, "search": 0, "graphql": 0})
+
+    assert decision["allowed"] is False
+    assert decision["state"] == "low"
+    assert decision["effective_after"]["core"] == -10
+    assert decision["projected_post_reservation"]["core"] == {
+        "available": 0,
+        "deficit": 10,
+        "hard_reserve": 500,
+        "headroom_above_hard_reserve": 0,
+        "shortfall_to_hard_reserve": 510,
     }
 
 
@@ -512,6 +533,26 @@ def test_cached_dashboard_overlays_latest_rate_snapshot_and_live_reservations(
     assert result["github_budget"]["active_reservations"] == 1
     assert result["github_budget"]["reserved_in_flight"]["core"] == 200
     assert result["github_budget"]["spendable_before_route"]["core"] == 700
+    assert result["github_budget"]["projected_post_reservation"]["core"] == {
+        "available": 800,
+        "deficit": 0,
+        "hard_reserve": 100,
+        "headroom_above_hard_reserve": 700,
+        "shortfall_to_hard_reserve": 0,
+    }
+    text = bot._pipeline_text(result)
+    assert "прогноз после резервирования (не GitHub remaining)" in text
+    assert "доступно 800, дефицит 0" in text
+
+
+def test_web_dashboard_labels_projection_as_non_actual_github_remaining():
+    html = (Path(__file__).parents[1] / "promptpilot" / "static" /
+            "index.html").read_text(encoding="utf-8")
+
+    assert "projected_post_reservation" in html
+    assert "прогноз после активных резервов (не фактический GitHub remaining)" \
+        in html
+    assert "дефицит ${projectedNumber('core', 'deficit')}" in html
 
 
 def test_success_completion_uses_local_successor_graph_without_github_scan(
@@ -960,6 +1001,73 @@ def test_low_budget_defer_survives_refresh_status_database_error(
         reset + 17, timezone.utc).isoformat()
 
 
+def test_transient_lease_failure_after_admission_keeps_durable_denial(
+        isolated_db, monkeypatch):
+    execution = {"mode": "tool", "command": ["pipeline-tool"]}
+    profile = _profile(execution=execution)
+    monkeypatch.setattr(
+        pipeline_insights, "_profiles", lambda: {"example": profile})
+    monkeypatch.setattr(
+        pipeline_insights, "_github_rate_limits", lambda: _limits())
+    monkeypatch.setattr(
+        pipeline_insights, "_tool_available",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            pipeline_insights._GitHubScanLeaseUnavailable(
+                "database is temporarily locked")))
+    task = SimpleNamespace(
+        series_id=1, series_title="Example - REVIEW",
+        prompt="Example - REVIEW")
+
+    route = pipeline_insights.execution_route(task, task.prompt)
+
+    assert route["action"] == "defer"
+    assert route["github_budget"]["state"] == "lease_unavailable"
+    event = isolated_db.get_pipeline_refresh_status("example")
+    assert event["status"]["refresh_blocked"] == "lease_unavailable"
+    assert pipeline_insights.read_cached(
+        "example", [])["cache"]["refresh_blocked"] == "lease_unavailable"
+
+
+@pytest.mark.parametrize(("failure", "expected_state"), [
+    (pipeline_insights._GitHubScanLeaseUnavailable(
+        "database is temporarily locked"), "lease_unavailable"),
+    (pipeline_insights._GitHubScanLeaseLost(
+        "scan lease ownership changed"), "lease_lost"),
+])
+def test_post_preflight_rate_recheck_preserves_exact_lease_failure(
+        isolated_db, monkeypatch, failure, expected_state):
+    execution = {"mode": "tool", "command": ["pipeline-tool"]}
+    profile = _profile_with_costs(execution=execution, core=100)
+    calls = []
+
+    def rate_limits():
+        calls.append(len(calls) + 1)
+        if len(calls) == 1:
+            return _limits()
+        raise failure
+
+    monkeypatch.setattr(
+        pipeline_insights, "_profiles", lambda: {"example": profile})
+    monkeypatch.setattr(
+        pipeline_insights, "_github_rate_limits", rate_limits)
+    monkeypatch.setattr(
+        pipeline_insights, "_tool_available", lambda *_args: (True, ""))
+    monkeypatch.setattr(
+        pipeline_insights, "_tool_preflight",
+        lambda *_args: {"action": "audit", "target": {"number": 42}})
+    task = SimpleNamespace(
+        series_id=1, series_title="Example - REVIEW",
+        prompt="Example - REVIEW")
+
+    route = pipeline_insights.execution_route(task, task.prompt)
+
+    assert calls == [1, 2]
+    assert route["action"] == "defer"
+    assert route["github_budget"]["state"] == expected_state
+    event = isolated_db.get_pipeline_refresh_status("example")
+    assert event["status"]["refresh_blocked"] == expected_state
+
+
 def test_post_preflight_budget_denial_keeps_sanitized_context(
         isolated_db, monkeypatch):
     execution = {"mode": "auto", "command": ["pipeline-tool"]}
@@ -1223,6 +1331,177 @@ def test_sqlite_scan_lease_serializes_concurrent_connections(isolated_db):
                if index != winner)
     assert isolated_db.release_pipeline_scan_lease(
         "github-default", f"owner-{winner}") is True
+
+
+def test_scan_lease_retries_transient_sqlite_failure_and_recovers(
+        monkeypatch):
+    lease = pipeline_insights._GitHubScanLease("github-default", "owner", 30)
+    calls = []
+
+    def renew(*_args):
+        calls.append(len(calls) + 1)
+        if len(calls) < 3:
+            raise sqlite3.OperationalError("database is locked")
+        return time.time() + 30
+
+    monkeypatch.setattr(
+        pipeline_insights, "_GITHUB_SCAN_LEASE_RENEW_RETRY_DELAYS", (0, 0))
+    monkeypatch.setattr(
+        pipeline_insights.db, "renew_pipeline_scan_lease", renew)
+
+    lease.ensure_owned(renew=True)
+
+    assert calls == [1, 2, 3]
+    assert lease.lost is False
+    assert lease.unavailable is False
+    assert lease.expires_at > time.time()
+
+
+def test_scan_lease_does_not_repeat_after_retry_deadline(monkeypatch):
+    lease = pipeline_insights._GitHubScanLease("github-default", "owner", 30)
+    calls = []
+    monotonic = iter([100.0, 102.0])
+
+    def renew(*_args):
+        calls.append("renew")
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(
+        pipeline_insights.time, "monotonic", lambda: next(monotonic))
+    monkeypatch.setattr(
+        pipeline_insights.db, "renew_pipeline_scan_lease", renew)
+
+    with pytest.raises(pipeline_insights._GitHubScanLeaseUnavailable):
+        lease.ensure_owned(renew=True)
+
+    assert calls == ["renew"]
+    assert lease.lost is False
+
+
+def test_scan_lease_foreground_does_not_wait_indefinitely_for_heartbeat(
+        monkeypatch):
+    lease = pipeline_insights._GitHubScanLease("github-default", "owner", 30)
+    assert lease._renew_lock.acquire(blocking=False)
+    monkeypatch.setattr(
+        pipeline_insights,
+        "_GITHUB_SCAN_LEASE_RENEW_LOCK_TIMEOUT_SECONDS", 0)
+    try:
+        with pytest.raises(
+                pipeline_insights._GitHubScanLeaseUnavailable,
+                match="не завершилась вовремя"):
+            lease.ensure_owned(renew=True)
+    finally:
+        lease._renew_lock.release()
+
+    assert lease.lost is False
+    assert lease.unavailable is True
+
+
+def test_scan_lease_transient_failure_is_fail_closed_but_not_sticky(
+        monkeypatch):
+    lease = pipeline_insights._GitHubScanLease("github-default", "owner", 30)
+    monkeypatch.setattr(
+        pipeline_insights, "_GITHUB_SCAN_LEASE_RENEW_RETRY_DELAYS", (0, 0))
+    monkeypatch.setattr(
+        pipeline_insights.db, "renew_pipeline_scan_lease",
+        lambda *_args: (_ for _ in ()).throw(
+            sqlite3.OperationalError("database is locked")))
+
+    with pytest.raises(
+            pipeline_insights._GitHubScanLeaseUnavailable,
+            match="временно недоступна"):
+        lease.ensure_owned(renew=True)
+
+    assert lease.lost is False
+    assert lease.unavailable is True
+    with pytest.raises(pipeline_insights._GitHubScanLeaseUnavailable):
+        lease.ensure_owned()
+
+    monkeypatch.setattr(
+        pipeline_insights.db, "renew_pipeline_scan_lease",
+        lambda *_args: time.time() + 30)
+    lease.ensure_owned(renew=True)
+
+    assert lease.lost is False
+    assert lease.unavailable is False
+
+
+def test_scan_lease_none_is_a_sticky_fenced_loss(monkeypatch):
+    lease = pipeline_insights._GitHubScanLease("github-default", "owner", 30)
+    calls = []
+    monkeypatch.setattr(
+        pipeline_insights.db, "renew_pipeline_scan_lease",
+        lambda *_args: calls.append("renew"))
+
+    with pytest.raises(pipeline_insights._GitHubScanLeaseLost):
+        lease.ensure_owned(renew=True)
+
+    assert lease.lost is True
+    assert lease.unavailable is False
+    monkeypatch.setattr(
+        pipeline_insights.db, "renew_pipeline_scan_lease",
+        lambda *_args: time.time() + 30)
+    with pytest.raises(pipeline_insights._GitHubScanLeaseLost):
+        lease.ensure_owned(renew=True)
+    assert calls == ["renew"]
+
+
+def test_transient_lease_becomes_sticky_loss_after_successor_takes_over(
+        isolated_db, monkeypatch):
+    acquired = isolated_db.acquire_pipeline_scan_lease(
+        "github-default", "old-owner", 30)
+    assert acquired["acquired"] is True
+    lease = pipeline_insights._GitHubScanLease(
+        "github-default", "old-owner", 30)
+    lease.expires_at = acquired["expires_at"]
+    real_renew = isolated_db.renew_pipeline_scan_lease
+    monkeypatch.setattr(
+        pipeline_insights, "_GITHUB_SCAN_LEASE_RENEW_RETRY_DELAYS", (0, 0))
+    monkeypatch.setattr(
+        isolated_db, "renew_pipeline_scan_lease",
+        lambda *_args: (_ for _ in ()).throw(
+            sqlite3.OperationalError("database is locked")))
+
+    with pytest.raises(pipeline_insights._GitHubScanLeaseUnavailable):
+        lease.ensure_owned(renew=True)
+    successor = isolated_db.acquire_pipeline_scan_lease(
+        "github-default", "new-owner", 30, now=time.time() + 31)
+    assert successor["acquired"] is True
+    monkeypatch.setattr(
+        isolated_db, "renew_pipeline_scan_lease", real_renew)
+
+    with pytest.raises(pipeline_insights._GitHubScanLeaseLost):
+        lease.ensure_owned(renew=True)
+
+    assert lease.lost is True
+    assert lease.unavailable is False
+    assert isolated_db.release_pipeline_scan_lease(
+        "github-default", "old-owner") is False
+    assert isolated_db.release_pipeline_scan_lease(
+        "github-default", "new-owner") is True
+
+
+def test_scan_admission_reports_transient_lease_unavailable(
+        isolated_db, monkeypatch):
+    profile = _profile()
+    monkeypatch.setattr(
+        pipeline_insights, "_profiles", lambda: {"example": profile})
+    monkeypatch.setattr(
+        pipeline_insights, "_GITHUB_SCAN_LEASE_RENEW_RETRY_DELAYS", (0, 0))
+    monkeypatch.setattr(
+        pipeline_insights, "_github_rate_limits", lambda: _limits())
+    monkeypatch.setattr(
+        pipeline_insights.db, "renew_pipeline_scan_lease",
+        lambda *_args: (_ for _ in ()).throw(
+            sqlite3.OperationalError("database is locked")))
+
+    with pipeline_insights._github_scan_admission(
+            profile, "test", profile_id="example",
+            budget_route="insights") as admission:
+        assert admission["allowed"] is False
+        assert admission["state"] == "lease_unavailable"
+        assert admission["_lease"].lost is False
+        assert admission["_lease"].unavailable is True
 
 
 def test_sqlite_scan_lease_is_visible_to_another_process(isolated_db):
