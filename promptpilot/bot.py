@@ -928,17 +928,23 @@ def _pipeline_text(data: dict) -> str:
     budget = data.get("github_budget") or {}
     reserved = budget.get("reserved_in_flight") or {}
     spendable = budget.get("spendable_before_route") or {}
+    projected = budget.get("projected_post_reservation") or {}
     if budget.get("enabled"):
         problem = (budget.get("ledger_reason")
                    if budget.get("ledger_state") == "unavailable" else
                    budget.get("rate_snapshot_reason")
                    if budget.get("rate_snapshot_state") == "unavailable" else
                    budget.get("reason") if budget.get("allowed") is False else None)
-        lines.insert(4, "GitHub budget: "
-                     f"активных резервов {budget.get('active_reservations', 0)}; "
-                     f"REST зарезервировано {reserved.get('core', 0)}; "
-                     f"можно выдать до hard reserve {spendable.get('core', '—')}"
-                     + (f"; внимание: {problem}" if problem else ""))
+        projected_core = projected.get("core") or {}
+        lines.insert(
+            4, "GitHub budget: "
+            f"активных резервов {budget.get('active_reservations', 0)}; "
+            f"REST зарезервировано {reserved.get('core', 0)}; "
+            "прогноз после резервирования (не GitHub remaining): "
+            f"доступно {projected_core.get('available', '—')}, "
+            f"дефицит {projected_core.get('deficit', '—')}; "
+            f"можно выдать до hard reserve {spendable.get('core', '—')}"
+            + (f"; внимание: {problem}" if problem else ""))
     if cache.get("refresh_blocked") and cache.get("refresh_blocked") != "worker_paused":
         retry = cache.get("refresh_deferred_until") or "—"
         lines.insert(3, "GitHub scan отложен: "

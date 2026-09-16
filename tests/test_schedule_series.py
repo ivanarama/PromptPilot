@@ -1,6 +1,8 @@
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import json
 import os
+import sqlite3
 import threading
 from types import SimpleNamespace
 
@@ -313,6 +315,120 @@ def test_recurring_task_creates_durable_series(isolated_db):
     assert series["title"] == "ExampleProject - FIX"
     assert series["recurrence"] == "4h"
     assert series["next_task_id"] == task.id
+
+
+def test_list_series_preserves_occurrence_and_health_semantics(isolated_db):
+    active = isolated_db.create_task(TaskCreate(
+        prompt="ExampleProject - REVIEW\nReview the next pull request",
+        working_dir=r"D:\Projects\example", provider="codex", model="gpt-test",
+        effort="high", priority=2, task_timeout=3600, recurrence="2h",
+        machine="active-machine",
+    ))
+    completed = isolated_db.create_task(TaskCreate(
+        prompt="completed", recurrence="2h", series_id=active.series_id,
+        machine="completed-machine",
+    ))
+    failed = isolated_db.create_task(TaskCreate(
+        prompt="failed", recurrence="2h", series_id=active.series_id,
+        machine="failed-machine",
+    ))
+    cancelled = isolated_db.create_task(TaskCreate(
+        prompt="cancelled", recurrence="2h", series_id=active.series_id,
+        machine="cancelled-machine",
+    ))
+    scheduled_at = "2026-09-16T15:00:00+00:00"
+    active_started = "2026-09-16T14:59:00+00:00"
+    cancelled_at = "2026-09-16T14:58:00+00:00"
+    with isolated_db._connect() as conn:
+        conn.execute(
+            """UPDATE tasks
+               SET status = 'pending', scheduled_at = ?, started_at = ?, error = ?
+               WHERE id = ?""",
+            (scheduled_at, active_started, "waiting for budget", active.id),
+        )
+        conn.execute(
+            """UPDATE tasks
+               SET status = 'completed', started_at = ?, completed_at = ?, verdict = ?
+               WHERE id = ?""",
+            ("2026-09-16T14:00:00+00:00", "2026-09-16T14:00:10+00:00",
+             "пусто", completed.id),
+        )
+        conn.execute(
+            """UPDATE tasks
+               SET status = 'failed', started_at = ?, completed_at = ?, verdict = ?
+               WHERE id = ?""",
+            ("2026-09-16T14:10:00+00:00", "2026-09-16T14:10:20+00:00",
+             "failed", failed.id),
+        )
+        conn.execute(
+            """UPDATE tasks
+               SET status = 'cancelled', completed_at = ?, verdict = ?
+               WHERE id = ?""",
+            (cancelled_at, "cancelled", cancelled.id),
+        )
+
+    series = isolated_db.get_series(active.series_id)
+
+    assert series["runs"] == 4
+    assert series["machine"] == "active-machine"
+    assert series["next_task_id"] == active.id
+    assert series["next_status"] == "pending"
+    assert series["next_run_at"] == scheduled_at
+    assert series["next_error"] == "waiting for budget"
+    assert series["next_started_at"] == active_started
+    assert series["last_task_id"] == cancelled.id
+    assert series["last_status"] == "cancelled"
+    assert series["last_at"] == cancelled_at
+    assert series["last_verdict"] == "cancelled"
+    assert series["failure_rate"] == 0.5
+    assert series["empty_rate"] == 0.5
+    assert series["avg_duration_seconds"] == 15
+    assert series["broken"] is False
+
+
+def test_list_series_uses_constant_lightweight_queries(
+        isolated_db, monkeypatch):
+    large_result = "x" * (1024 * 1024)
+    expected_ids = []
+    for index in range(6):
+        historical = isolated_db.create_task(TaskCreate(
+            prompt=f"Series {index}", recurrence="1h"))
+        isolated_db.mark_completed(
+            historical.id, large_result if index == 0 else "done")
+        active = isolated_db.create_task(TaskCreate(
+            prompt=f"Series {index}", recurrence="1h",
+            series_id=historical.series_id,
+        ))
+        expected_ids.append(active.series_id)
+
+    statements = []
+    prohibited_reads = []
+    real_connect = isolated_db._connect
+
+    @contextmanager
+    def traced_connect(*args, **kwargs):
+        with real_connect(*args, **kwargs) as conn:
+            def authorize(action, table, column, _database, _trigger):
+                if (action == sqlite3.SQLITE_READ and table == "tasks"
+                        and column in {"prompt", "result", "note"}):
+                    prohibited_reads.append((table, column))
+                    return sqlite3.SQLITE_DENY
+                return sqlite3.SQLITE_OK
+
+            conn.set_authorizer(authorize)
+            conn.set_trace_callback(statements.append)
+            yield conn
+
+    monkeypatch.setattr(isolated_db, "_connect", traced_connect)
+
+    listed = isolated_db.list_series()
+
+    selects = [statement for statement in statements
+               if statement.lstrip().upper().startswith(("SELECT", "WITH"))]
+    assert {item["id"] for item in listed} == set(expected_ids)
+    assert len(selects) == 3
+    assert prohibited_reads == []
+    assert all("SELECT *" not in statement.upper() for statement in selects)
 
 
 def test_series_settings_persist_and_update_pending_occurrence(isolated_db):

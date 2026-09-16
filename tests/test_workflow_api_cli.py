@@ -221,6 +221,9 @@ def test_schedule_ui_exposes_durable_series_controls():
     assert "provider: String(fd.get('provider') || '').trim()" in html
     assert "model: String(fd.get('model') || '').trim()" in html
     assert "ae.id.startsWith('ed-')" in html
+    assert "let refreshInFlight = false;" in html
+    assert "if (refreshInFlight) return;" in html
+    assert "await Promise.allSettled(requests);" in html
     assert "insights-table" in html
     assert "insights-stage-detail" in html
     assert 'colspan="10"' in html

@@ -57,6 +57,9 @@ _GITHUB_BUDGET_ROUTES = (
     "fallback_targeted",
 )
 _GITHUB_SCAN_LEASE_SCOPE = "github-default"
+_GITHUB_SCAN_LEASE_RENEW_RETRY_DELAYS = (0.05, 0.15)
+_GITHUB_SCAN_LEASE_RENEW_RETRY_WINDOW_SECONDS = 1.0
+_GITHUB_SCAN_LEASE_RENEW_LOCK_TIMEOUT_SECONDS = 1.0
 _scan_lease_context = threading.local()
 _execution_budget_context = threading.local()
 
@@ -65,8 +68,16 @@ class _GitHubScanPaused(RuntimeError):
     """A multi-request GitHub observation stopped at a page boundary."""
 
 
-class _GitHubScanLeaseLost(RuntimeError):
+class _GitHubScanLeaseFailure(RuntimeError):
+    """A scan must stop because its SQLite lease cannot be proved safe."""
+
+
+class _GitHubScanLeaseLost(_GitHubScanLeaseFailure):
     """The process can no longer prove exclusive ownership of a live scan."""
+
+
+class _GitHubScanLeaseUnavailable(_GitHubScanLeaseFailure):
+    """SQLite temporarily prevented verification of an otherwise owned lease."""
 
 
 class _GitHubScanLease:
@@ -81,7 +92,11 @@ class _GitHubScanLease:
         self.expires_at: float | None = None
         self._stop = threading.Event()
         self._lost = threading.Event()
+        self._unavailable = threading.Event()
+        self._unavailable_reason: str | None = None
         self._thread: threading.Thread | None = None
+        self._renew_lock = threading.Lock()
+        self._state_lock = threading.Lock()
         self._release_lock = threading.Lock()
         self._released = False
 
@@ -90,8 +105,90 @@ class _GitHubScanLease:
         return self._lost.is_set()
 
     @property
+    def unavailable(self) -> bool:
+        return self._unavailable.is_set()
+
+    @property
     def guard(self) -> dict:
         return {"scope": self.scope, "token": self.token}
+
+    def _mark_lost(self) -> None:
+        with self._state_lock:
+            self._lost.set()
+            self._unavailable.clear()
+            self._unavailable_reason = None
+
+    def _mark_unavailable(self, exc: BaseException) -> None:
+        with self._state_lock:
+            if self._lost.is_set():
+                return
+            self._unavailable_reason = str(exc) or type(exc).__name__
+            self._unavailable.set()
+
+    def _mark_renewed(self, expires_at) -> None:
+        if (isinstance(expires_at, bool)
+                or not isinstance(expires_at, (int, float))
+                or not math.isfinite(float(expires_at))):
+            raise ValueError("SQLite lease renewal returned an invalid expiry")
+        with self._state_lock:
+            if self._lost.is_set():
+                return
+            self.expires_at = float(expires_at)
+            self._unavailable.clear()
+            self._unavailable_reason = None
+
+    def _renew_with_retry(self) -> None:
+        """Renew once, retrying transient storage failures without losing fencing.
+
+        ``None`` is the durable compare-and-swap answer that our exact token no
+        longer owns the lease, so it is sticky. Exceptions only prove that the
+        database is currently unavailable: after bounded retries the caller is
+        stopped fail-closed, but a later successful heartbeat may recover.
+        """
+        if not self._renew_lock.acquire(
+                timeout=_GITHUB_SCAN_LEASE_RENEW_LOCK_TIMEOUT_SECONDS):
+            error = TimeoutError(
+                "другая проверка SQLite lease не завершилась вовремя")
+            self._mark_unavailable(error)
+            raise _GitHubScanLeaseUnavailable(
+                "SQLite lease GitHub-сканирования временно недоступна: "
+                f"{error}") from error
+        try:
+            if self.lost:
+                raise _GitHubScanLeaseLost(
+                    "межпроцессная lease GitHub-сканирования потеряна")
+            last_error: BaseException | None = None
+            attempts = len(_GITHUB_SCAN_LEASE_RENEW_RETRY_DELAYS) + 1
+            retry_deadline = time.monotonic() + \
+                _GITHUB_SCAN_LEASE_RENEW_RETRY_WINDOW_SECONDS
+            for attempt in range(attempts):
+                try:
+                    renewed = db.renew_pipeline_scan_lease(
+                        self.scope, self.token, self.ttl_seconds)
+                    if renewed is None:
+                        self._mark_lost()
+                        raise _GitHubScanLeaseLost(
+                            "межпроцессная lease GitHub-сканирования потеряна")
+                    self._mark_renewed(renewed)
+                    return
+                except _GitHubScanLeaseLost:
+                    raise
+                except Exception as exc:
+                    last_error = exc
+                    if attempt >= attempts - 1:
+                        break
+                    delay = _GITHUB_SCAN_LEASE_RENEW_RETRY_DELAYS[attempt]
+                    if time.monotonic() + delay > retry_deadline:
+                        break
+                    if self._stop.wait(delay):
+                        break
+            assert last_error is not None
+            self._mark_unavailable(last_error)
+            raise _GitHubScanLeaseUnavailable(
+                "SQLite lease GitHub-сканирования временно недоступна: "
+                f"{last_error}") from last_error
+        finally:
+            self._renew_lock.release()
 
     def start(self) -> None:
         interval = max(1.0, min(30.0, self.ttl_seconds / 3))
@@ -99,14 +196,13 @@ class _GitHubScanLease:
         def heartbeat() -> None:
             while not self._stop.wait(interval):
                 try:
-                    renewed = db.renew_pipeline_scan_lease(
-                        self.scope, self.token, self.ttl_seconds)
-                except Exception:
-                    renewed = None
-                if renewed is None:
-                    self._lost.set()
+                    self._renew_with_retry()
+                except _GitHubScanLeaseLost:
                     return
-                self.expires_at = renewed
+                except _GitHubScanLeaseUnavailable:
+                    # Keep retrying while the main scan fails closed at its next
+                    # boundary. A later successful renewal clears this state.
+                    continue
 
         self._thread = threading.Thread(
             target=heartbeat, name="promptpilot-github-scan-lease", daemon=True)
@@ -114,18 +210,16 @@ class _GitHubScanLease:
 
     def ensure_owned(self, *, renew: bool = False) -> None:
         if renew and not self.lost:
-            try:
-                renewed = db.renew_pipeline_scan_lease(
-                    self.scope, self.token, self.ttl_seconds)
-            except Exception:
-                renewed = None
-            if renewed is None:
-                self._lost.set()
-            else:
-                self.expires_at = renewed
+            self._renew_with_retry()
         if self.lost:
             raise _GitHubScanLeaseLost(
                 "межпроцессная lease GitHub-сканирования потеряна")
+        if self.unavailable:
+            with self._state_lock:
+                reason = self._unavailable_reason or "неизвестная ошибка SQLite"
+            raise _GitHubScanLeaseUnavailable(
+                "SQLite lease GitHub-сканирования временно недоступна: "
+                f"{reason}")
 
     def release(self, *, refresh_status: dict | None = None) -> None:
         with self._release_lock:
@@ -293,6 +387,31 @@ def _defer_at(epoch: float) -> str:
     return datetime.fromtimestamp(epoch, timezone.utc).isoformat()
 
 
+def _projected_post_reservation(
+        effective_after: dict | None, minimum_remaining: dict) -> dict:
+    """Render a non-negative projection without changing admission arithmetic.
+
+    ``effective_after`` remains the signed, authoritative value used by the
+    safety gate. The UI projection splits a negative result into a zero-clamped
+    available amount and an explicit deficit so operators never mistake a
+    display-only clamp for extra GitHub quota.
+    """
+    projected = {}
+    values = effective_after or {}
+    for resource, hard_reserve in minimum_remaining.items():
+        value = values.get(resource)
+        if type(value) is not int:
+            continue
+        projected[resource] = {
+            "available": max(0, value),
+            "deficit": max(0, -value),
+            "hard_reserve": int(hard_reserve),
+            "headroom_above_hard_reserve": max(0, value - hard_reserve),
+            "shortfall_to_hard_reserve": max(0, hard_reserve - value),
+        }
+    return projected
+
+
 def _budget_denied(policy: dict, *, state: str, reason: str,
                    now: float, limits: dict | None = None,
                    defer_at: float | None = None,
@@ -302,6 +421,7 @@ def _budget_denied(policy: dict, *, state: str, reason: str,
                    effective_after: dict | None = None,
                    active_reservations: int = 0) -> dict:
     retry_at = defer_at or (now + policy["unavailable_retry_seconds"])
+    effective = dict(effective_after or {})
     return {
         "enabled": True, "allowed": False, "state": state,
         "reason": reason, "defer_until": _defer_at(retry_at),
@@ -309,7 +429,9 @@ def _budget_denied(policy: dict, *, state: str, reason: str,
         "minimum_remaining": dict(policy["minimum_remaining"]),
         "requested_cost": dict(policy.get("requested_cost") or {}),
         "reserved_other": dict(reserved_other or {}),
-        "effective_after": dict(effective_after or {}),
+        "effective_after": effective,
+        "projected_post_reservation": _projected_post_reservation(
+            effective, policy["minimum_remaining"]),
         "active_reservations": int(active_reservations),
         "blocked_resources": blocked_resources or [],
         "lease_scope": policy["lease_scope"],
@@ -319,7 +441,8 @@ def _budget_denied(policy: dict, *, state: str, reason: str,
 
 
 def _lease_failure_decision(profile: dict, reason: str, *,
-                            status_revision: int | None = None) -> dict:
+                            status_revision: int | None = None,
+                            unavailable: bool = False) -> dict:
     try:
         policy = _github_budget_policy(profile)
         if policy is not None:
@@ -332,8 +455,31 @@ def _lease_failure_decision(profile: dict, reason: str, *,
         "lease_scope": _GITHUB_SCAN_LEASE_SCOPE,
     }
     return _budget_denied(
-        policy, state="lease_lost", reason=reason, now=time.time(),
+        policy, state=("lease_unavailable" if unavailable else "lease_lost"),
+        reason=reason, now=time.time(),
         status_revision=status_revision)
+
+
+def _lease_exception_decision(
+        profile: dict, exc: _GitHubScanLeaseFailure, *,
+        status_revision: int | None = None) -> dict:
+    return _lease_failure_decision(
+        profile, str(exc), status_revision=status_revision,
+        unavailable=isinstance(exc, _GitHubScanLeaseUnavailable))
+
+
+def _replace_admission_with_lease_failure(
+        admission: dict, profile: dict, exc: _GitHubScanLeaseFailure) -> dict:
+    """Keep the context manager's final durable status aligned with its caller."""
+    lease = admission.get("_lease")
+    denied = _lease_exception_decision(
+        profile, exc,
+        status_revision=_current_github_scan_status_revision())
+    if lease is not None:
+        denied["_lease"] = lease
+    admission.clear()
+    admission.update(denied)
+    return admission
 
 
 def _evaluate_github_budget(policy: dict, limits: dict | None, *,
@@ -417,6 +563,8 @@ def _evaluate_github_budget(policy: dict, limits: dict | None, *,
         "minimum_remaining": dict(policy["minimum_remaining"]),
         "requested_cost": requested, "reserved_other": reserved,
         "effective_after": effective_after,
+        "projected_post_reservation": _projected_post_reservation(
+            effective_after, policy["minimum_remaining"]),
         "active_reservations": int(active_reservations),
         "blocked_resources": [], "lease_scope": policy["lease_scope"],
         "budget_route": policy.get("budget_route"),
@@ -492,8 +640,11 @@ def _github_scan_admission(profile: dict, purpose: str,
             lease.start()
             try:
                 limits = _github_rate_limits()
+            except _GitHubScanLeaseFailure:
+                raise
             except Exception:
                 limits = None
+            lease.ensure_owned(renew=True)
             if lease.lost:
                 decision = _lease_failure_decision(
                     profile, "SQLite lease потеряна во время GitHub /rate_limit",
@@ -514,11 +665,14 @@ def _github_scan_admission(profile: dict, purpose: str,
                         status_revision=lease.status_revision,
                         reserved_other=reservations["totals"],
                         active_reservations=reservations["count"])
-            decision["_lease"] = lease
+        except _GitHubScanLeaseFailure as exc:
+            decision = _lease_exception_decision(
+                profile, exc, status_revision=lease.status_revision)
         except Exception as exc:
             decision = _lease_failure_decision(
                 profile, f"GitHub budget admission не выполнен: {exc}",
-                status_revision=lease.status_revision)
+                status_revision=lease.status_revision, unavailable=True)
+        decision["_lease"] = lease
         yield decision
     finally:
         _scan_lease_context.lease = previous
@@ -625,6 +779,8 @@ def _reserve_execution_admission(
         lease.ensure_owned(renew=True)
         try:
             limits = _github_rate_limits()
+        except _GitHubScanLeaseFailure:
+            raise
         except Exception:
             limits = None
         if not isinstance(limits, dict):
@@ -680,7 +836,12 @@ def _reserve_execution_admission(
                     _execution_budget_context.reservation = \
                         _GitHubBudgetReservation(
                             policy["lease_scope"], token, task_id, started_at)
-    except (TypeError, ValueError, sqlite3.Error, _GitHubScanLeaseLost) as exc:
+    except _GitHubScanLeaseFailure as exc:
+        decision = _lease_exception_decision(
+            profile, exc,
+            status_revision=(lease.status_revision
+                             if isinstance(lease, _GitHubScanLease) else None))
+    except (TypeError, ValueError, sqlite3.Error) as exc:
         fallback_policy = {
             "minimum_remaining": dict(_DEFAULT_GITHUB_BUDGET_MINIMUM),
             "requested_cost": {
@@ -1113,7 +1274,7 @@ def _github_rate_limits() -> dict | None:
                     raise _GitHubScanLeaseLost(
                         "SQLite lease rejected GitHub rate snapshot")
         return result or None
-    except _GitHubScanLeaseLost:
+    except _GitHubScanLeaseFailure:
         raise
     except (RuntimeError, OSError, OverflowError, TypeError, ValueError,
             sqlite3.Error, json.JSONDecodeError):
@@ -1838,11 +1999,10 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
             else:
                 available, reason = _tool_available(
                     execution, command, working_dir, stage)
-        except _GitHubScanLeaseLost as exc:
+        except _GitHubScanLeaseFailure as exc:
             return _budget_defer_route(
-                _lease_failure_decision(
-                    profile, str(exc),
-                    status_revision=_current_github_scan_status_revision()),
+                _replace_admission_with_lease_failure(
+                    admission, profile, exc),
                 profile_id,
                 profile, queue)
         if not available:
@@ -1864,11 +2024,10 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
             }
         try:
             preflight = _tool_preflight(execution, command, working_dir)
-        except _GitHubScanLeaseLost as exc:
+        except _GitHubScanLeaseFailure as exc:
             return _budget_defer_route(
-                _lease_failure_decision(
-                    profile, str(exc),
-                    status_revision=_current_github_scan_status_revision()),
+                _replace_admission_with_lease_failure(
+                    admission, profile, exc),
                 profile_id,
                 profile, queue)
         except RuntimeError as exc:
@@ -2533,6 +2692,10 @@ def _with_live_github_budget_state(result: dict, profile: dict) -> dict:
     budget.setdefault("enabled", True)
     budget.setdefault("lease_scope", policy["lease_scope"])
     budget["minimum_remaining"] = dict(policy["minimum_remaining"])
+    # These are live-ledger projections. Never retain a projection copied from
+    # an older cached response when either local source is currently unreadable.
+    budget.pop("projected_post_reservation", None)
+    budget.pop("spendable_before_route", None)
 
     snapshot = None
     try:
@@ -2564,10 +2727,17 @@ def _with_live_github_budget_state(result: dict, profile: dict) -> dict:
             route_counts[route] = route_counts.get(route, 0) + 1
         budget["reservation_routes"] = route_counts
         if snapshot is not None:
+            post_reservation = {
+                resource: snapshot["limits"][resource]["remaining"]
+                - totals[resource]
+                for resource in policy["minimum_remaining"]
+            }
+            budget["projected_post_reservation"] = \
+                _projected_post_reservation(
+                    post_reservation, policy["minimum_remaining"])
             budget["spendable_before_route"] = {
                 resource: max(
-                    0, snapshot["limits"][resource]["remaining"]
-                    - totals[resource]
+                    0, post_reservation[resource]
                     - policy["minimum_remaining"][resource])
                 for resource in policy["minimum_remaining"]
             }
@@ -2890,12 +3060,11 @@ def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True,
                 profile_id, series, use_cache=False,
                 refresh_diagnostics=refresh_diagnostics)
             _ensure_github_scan_lease(renew=True)
-        except _GitHubScanLeaseLost as exc:
+        except _GitHubScanLeaseFailure as exc:
             return _budget_blocked_cached(
                 profile_id, profile, series,
-                _lease_failure_decision(
-                    profile, str(exc),
-                    status_revision=_current_github_scan_status_revision()))
+                _replace_admission_with_lease_failure(
+                    admission, profile, exc))
     if admission.get("enabled"):
         result["github_budget"] = _public_budget_decision(admission)
     cache = result.get("cache")

@@ -891,16 +891,70 @@ def _effective_series_recurrence(row: dict, now: Optional[datetime] = None) -> s
 def list_series() -> list:
     """Durable recurring series with current occurrence and health counters."""
     with _connect() as conn:
+        # The summary and its sparse occurrence details must describe the same
+        # queue snapshot even if a worker completes a run between SELECTs.
+        conn.execute("BEGIN")
         series_rows = [dict(r) for r in conn.execute(
-            "SELECT * FROM task_series ORDER BY id DESC")]
+            """SELECT id, title, prompt, working_dir, base_recurrence,
+                      temporary_recurrence, temporary_until,
+                      temporary_empty_limit, temporary_empty_count,
+                      provider, model, effort, priority, task_timeout,
+                      paused, ended_at
+               FROM task_series
+               ORDER BY id DESC""")]
+        # Keep this read deliberately narrow.  Task result/prompt/note payloads
+        # can be very large and none of them contributes to series health.
+        # Fetching all series histories in one pass also avoids the old N+1
+        # SELECT pattern when the schedule page is refreshed.
+        task_rows_by_series = {}
+        for row in conn.execute(
+                """SELECT t.id, t.series_id, t.status, t.started_at,
+                          t.completed_at, t.verdict
+                   FROM tasks AS t
+                   INNER JOIN task_series AS s ON s.id = t.series_id
+                   ORDER BY t.series_id DESC, t.id DESC"""):
+            task_rows_by_series.setdefault(row["series_id"], []).append(dict(row))
+
+        # Only the current active occurrence exposes its error/schedule, and
+        # only the active or last occurrence supplies ``machine``.  Read those
+        # details for all series with one additional query instead of loading
+        # those potentially sizeable columns for every historical run.
+        task_details = {}
+        for row in conn.execute(
+                """WITH picked AS (
+                       SELECT series_id,
+                              MAX(CASE WHEN status IN
+                                  ('pending', 'rate_limited', 'running')
+                                  THEN id END) AS active_id,
+                              MAX(CASE WHEN status IN
+                                  ('completed', 'failed', 'cancelled')
+                                  THEN id END) AS last_id
+                       FROM tasks
+                       WHERE series_id IS NOT NULL
+                       GROUP BY series_id
+                   )
+                   SELECT 'active' AS kind, t.series_id, t.id, t.machine,
+                          t.scheduled_at, t.error
+                   FROM tasks AS t
+                   INNER JOIN picked ON picked.active_id = t.id
+                   INNER JOIN task_series AS s ON s.id = t.series_id
+                   UNION ALL
+                   SELECT 'last' AS kind, t.series_id, t.id, t.machine,
+                          NULL AS scheduled_at, NULL AS error
+                   FROM tasks AS t
+                   INNER JOIN picked ON picked.last_id = t.id
+                   INNER JOIN task_series AS s ON s.id = t.series_id"""):
+            task_details[(row["kind"], row["series_id"])] = dict(row)
+
         out = []
         for s in series_rows:
-            tasks = [dict(r) for r in conn.execute(
-                "SELECT * FROM tasks WHERE series_id = ? ORDER BY id DESC", (s["id"],))]
+            tasks = task_rows_by_series.get(s["id"], [])
             active = next((r for r in tasks
                            if r["status"] in ("pending", "rate_limited", "running")), None)
             last = next((r for r in tasks
                          if r["status"] in ("completed", "failed", "cancelled")), None)
+            active_detail = task_details.get(("active", s["id"]))
+            last_detail = task_details.get(("last", s["id"]))
             completed = [r for r in tasks if r["status"] in ("completed", "failed")]
             failures = sum(r["status"] == "failed" for r in completed)
             empties = sum((r["verdict"] or "").upper() == "ПУСТО" for r in completed)
@@ -920,12 +974,13 @@ def list_series() -> list:
                 "temporary_empty_count": s["temporary_empty_count"],
                 "provider": s["provider"], "model": s["model"], "effort": s["effort"],
                 "priority": s["priority"], "task_timeout": s["task_timeout"],
-                "machine": active["machine"] if active else (last["machine"] if last else None),
+                "machine": (active_detail["machine"] if active_detail else
+                            (last_detail["machine"] if last_detail else None)),
                 "paused": bool(s["paused"]), "ended": bool(s["ended_at"]),
                 "next_task_id": active["id"] if active else None,
                 "next_status": active["status"] if active else None,
-                "next_run_at": active["scheduled_at"] if active else None,
-                "next_error": active["error"] if active else None,
+                "next_run_at": active_detail["scheduled_at"] if active_detail else None,
+                "next_error": active_detail["error"] if active_detail else None,
                 "next_started_at": active["started_at"] if active else None,
                 "last_task_id": last["id"] if last else None,
                 "last_status": last["status"] if last else None,

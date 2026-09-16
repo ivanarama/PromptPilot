@@ -20,8 +20,10 @@ import shutil
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import quote
 
 from .pipeline_errors import PipelineError
 
@@ -51,6 +53,8 @@ MERGE_CLEANUP_DONE = re.compile(
     r"merge=([0-9a-f]{40}) -->$"
 )
 ISSUE_URL_NUMBER = re.compile(r"/issues/([1-9][0-9]*)$")
+MERGE_COMMENT_INDEX_VERSION = 1
+MERGE_COMMENT_SCAN_OVERLAP_SECONDS = 300
 
 TIMELINE_QUERY = r"""
 query($owner:String!,$name:String!,$number:Int!,$cursor:String){
@@ -215,7 +219,7 @@ def validate_review_lease(lease: dict, config: dict) -> None:
 
 
 class GitHub:
-    def __init__(self, executable: str | None = None):
+    def __init__(self, executable: str | None = None, *, timeout_seconds: int = 120):
         self.executable = executable or os.environ.get("GH_EXE") or os.environ.get("PP_GH_EXE")
         self.executable = self.executable or shutil.which("gh") or shutil.which("gh.exe")
         if not self.executable:
@@ -224,15 +228,23 @@ class GitHub:
                 self.executable = str(standard)
         if not self.executable:
             raise PipelineError("GitHub CLI not found")
+        self.timeout_seconds = timeout_seconds
 
-    def run(self, *args: str, input_value=None, allow=(0,)) -> str:
+    def run(self, *args: str, input_value=None, allow=(0,),
+            timeout_seconds: int | None = None) -> str:
         data = None
         if input_value is not None:
             data = json.dumps(input_value, ensure_ascii=False)
-        result = subprocess.run(
-            [self.executable, *args], input=data, capture_output=True, text=True,
-            encoding="utf-8", errors="strict",
-        )
+        timeout = self.timeout_seconds if timeout_seconds is None else timeout_seconds
+        try:
+            result = subprocess.run(
+                [self.executable, *args], input=data, capture_output=True, text=True,
+                encoding="utf-8", errors="strict", timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            operation = args[0] if args else "command"
+            raise PipelineError(
+                f"GitHub CLI {operation} timed out after {timeout}s") from exc
         if result.returncode not in allow:
             message = (result.stderr or result.stdout or f"gh exited {result.returncode}").strip()
             raise PipelineError(message)
@@ -275,6 +287,17 @@ def load_config(path: str) -> dict:
             or not 5 <= data["base_sync_timeout_seconds"] <= 300):
         raise PipelineError(
             "base_sync_timeout_seconds must be an integer from 5 to 300")
+    timeout_limits = {
+        "github_timeout_seconds": (120, 5, 600),
+        "health_timeout_seconds": (300, 5, 1800),
+        "merge_comment_backfill_timeout_seconds": (900, 60, 3600),
+    }
+    for key, (default, minimum, maximum) in timeout_limits.items():
+        data.setdefault(key, default)
+        if (not isinstance(data[key], int) or isinstance(data[key], bool)
+                or not minimum <= data[key] <= maximum):
+            raise PipelineError(
+                f"{key} must be an integer from {minimum} to {maximum}")
     if data["review_completion_gate"] not in {"health", "target-v1"}:
         raise PipelineError("review_completion_gate must be health or target-v1")
     if (not isinstance(data["review_lease_seconds"], int) or
@@ -363,7 +386,14 @@ def sync_base_before_health(config: dict) -> bool:
         raise PipelineError(
             f"cannot synchronize {base} before health: checkout has tracked changes"
         )
-    git("fetch", "origin", "--prune")
+    # The health contract only consumes the authoritative base branch. Fetching
+    # and pruning every remote branch turns each gate into a repository-wide
+    # ref scan, which is needlessly expensive on large/slow worktrees and can
+    # make an otherwise healthy queue time out before the checker starts.
+    git(
+        "fetch", "--no-tags", "origin",
+        f"+refs/heads/{base}:refs/remotes/origin/{base}",
+    )
     git("merge", "--ff-only", f"origin/{base}")
     return True
 
@@ -395,7 +425,15 @@ def run_health(config: dict, *, config_path: str | None = None) -> dict:
         path_parts = env.get("PATH", "").split(os.pathsep)
         if gh_dir and gh_dir not in path_parts:
             env["PATH"] = gh_dir + os.pathsep + env.get("PATH", "")
-    result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="strict", env=env)
+    timeout = int(config.get("health_timeout_seconds", 300))
+    try:
+        result = subprocess.run(
+            command, capture_output=True, text=True, encoding="utf-8",
+            errors="strict", env=env, timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise PipelineError(
+            f"health command timed out after {timeout}s") from exc
     if result.returncode not in (0, 1):
         raise PipelineError((result.stderr or result.stdout or "health command failed").strip())
     try:
@@ -658,12 +696,24 @@ def same_repo_closing_issues(body: str, repository: str) -> list[int]:
     return sorted(result)
 
 
-def repository_comments(gh: GitHub, config: dict) -> list[dict]:
-    raw = gh.run(
-        "api", "--paginate",
-        f"repos/{config['repository']}/issues/comments?per_page=100&sort=created&direction=asc",
-        "--jq", ".[]",
+def repository_comments(
+        gh: GitHub, config: dict, *, since: str | None = None) -> list[dict]:
+    order = "created" if since is None else "updated"
+    query = (
+        f"repos/{config['repository']}/issues/comments"
+        f"?per_page=100&sort={order}&direction=asc"
     )
+    if since is not None:
+        query += f"&since={quote(since, safe=':-TZ')}"
+    arguments = ("api", "--paginate", query, "--jq", ".[]")
+    if since is None:
+        raw = gh.run(
+            *arguments,
+            timeout_seconds=int(config.get(
+                "merge_comment_backfill_timeout_seconds", 900)),
+        )
+    else:
+        raw = gh.run(*arguments)
     return [json.loads(line) for line in raw.splitlines() if line.strip()]
 
 
@@ -697,25 +747,307 @@ def parse_merge_done(comment: dict, config: dict) -> dict | None:
     issue_match = ISSUE_URL_NUMBER.search(comment.get("issue_url") or "")
     if not match or not issue_match:
         return None
-    return {"intent": int(match.group(1)), "head": match.group(2),
-            "merge": match.group(3), "number": int(issue_match.group(1))}
+    return {"id": int(comment["id"]), "intent": int(match.group(1)),
+            "head": match.group(2), "merge": match.group(3),
+            "number": int(issue_match.group(1))}
+
+
+def _merge_comment_index_path(config: dict) -> Path:
+    configured = os.environ.get("PP_PIPELINE_STATE_DIR")
+    if configured:
+        directory = Path(configured)
+    else:
+        data_dir = Path(os.environ.get("PP_DATA_DIR", Path.home() / ".promptpilot"))
+        directory = data_dir / "pipelinectl-state"
+    identity = canonical({
+        "repository": config["repository"],
+        "trusted_account": config["trusted_account"],
+    })
+    name = hashlib.sha256(identity).hexdigest()
+    return directory / f"merge-comments-{name}.json"
+
+
+@contextmanager
+def _locked_merge_comment_index(config: dict):
+    """Serialize the repository comment mirror without touching scheduler DB.
+
+    The lock deliberately covers the authoritative GitHub read.  That makes
+    two local pipelinectl processes converge on one ordered marker stream and,
+    more importantly, prevents either one from publishing a second merge
+    intent while the other is refreshing the single-flight barrier.
+    """
+    state_path = _merge_comment_index_path(config)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = state_path.with_suffix(state_path.suffix + ".lock")
+    with lock_path.open("a+b") as handle:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield state_path
+            finally:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield state_path
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _parse_github_timestamp(value, *, field: str) -> datetime:
+    if not isinstance(value, str) or not value:
+        raise PipelineError(f"repository comment has invalid {field}")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise PipelineError(f"repository comment has invalid {field}") from exc
+    if parsed.tzinfo is None:
+        raise PipelineError(f"repository comment has invalid {field}")
+    return parsed.astimezone(timezone.utc)
+
+
+def _format_github_timestamp(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat(timespec="seconds").replace(
+        "+00:00", "Z")
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _new_merge_comment_index(config: dict) -> dict:
+    return {
+        "version": MERGE_COMMENT_INDEX_VERSION,
+        "repository": config["repository"],
+        "trusted_account": config["trusted_account"],
+        "initialized": False,
+        "checkpoint": None,
+        "intents": {},
+        "done": {},
+    }
+
+
+def _validate_cached_intent(value: dict, key: str) -> None:
+    if not isinstance(value, dict) or str(value.get("id")) != key:
+        raise PipelineError("merge comment index contains an invalid intent")
+    if (type(value.get("id")) is not int or type(value.get("number")) is not int
+            or value["id"] <= 0 or value["number"] <= 0
+            or not isinstance(value.get("body"), str)):
+        raise PipelineError("merge comment index contains an invalid intent")
+    match = MERGE_CLEANUP_INTENT.fullmatch(value["body"])
+    issues = value.get("issues")
+    if (not match or not isinstance(issues, list)
+            or any(type(item) is not int or item <= 0 for item in issues)):
+        raise PipelineError("merge comment index contains an invalid intent")
+    parsed_issues = ([] if match.group(4) == "none"
+                     else [int(item) for item in match.group(4).split(",")])
+    if (value.get("head") != match.group(1)
+            or value.get("proof_sha256") != match.group(2)
+            or value.get("body_sha256") != match.group(3)
+            or issues != parsed_issues):
+        raise PipelineError("merge comment index contains an invalid intent")
+
+
+def _validate_cached_done(value: dict, key: str) -> None:
+    if (not isinstance(value, dict) or str(value.get("id")) != key
+            or type(value.get("id")) is not int
+            or type(value.get("intent")) is not int
+            or type(value.get("number")) is not int
+            or value["id"] <= 0 or value["intent"] <= 0 or value["number"] <= 0
+            or not isinstance(value.get("head"), str)
+            or not re.fullmatch(r"[0-9a-f]{40}", value["head"])
+            or not isinstance(value.get("merge"), str)
+            or not re.fullmatch(r"[0-9a-f]{40}", value["merge"])):
+        raise PipelineError("merge comment index contains an invalid completion")
+
+
+def _load_merge_comment_index(path: Path, config: dict) -> dict:
+    if not path.exists():
+        return _new_merge_comment_index(config)
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise PipelineError(f"merge comment index is unreadable: {exc}") from exc
+    if (not isinstance(value, dict)
+            or value.get("version") != MERGE_COMMENT_INDEX_VERSION
+            or value.get("repository") != config["repository"]
+            or value.get("trusted_account") != config["trusted_account"]
+            or type(value.get("initialized")) is not bool
+            or not isinstance(value.get("intents"), dict)
+            or not isinstance(value.get("done"), dict)):
+        raise PipelineError("merge comment index has an invalid identity or schema")
+    checkpoint = value.get("checkpoint")
+    if checkpoint is not None:
+        _parse_github_timestamp(checkpoint, field="checkpoint")
+    for key, intent in value["intents"].items():
+        _validate_cached_intent(intent, key)
+    for key, done in value["done"].items():
+        _validate_cached_done(done, key)
+    return value
+
+
+def _write_merge_comment_index(path: Path, value: dict) -> None:
+    temporary = path.with_name(
+        f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    try:
+        descriptor = os.open(temporary, flags, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(value, handle, ensure_ascii=False, sort_keys=True,
+                      separators=(",", ":"))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _merge_comment_scan_since(state: dict) -> str | None:
+    checkpoint = state.get("checkpoint")
+    if not state.get("initialized") or checkpoint is None:
+        return None
+    parsed = _parse_github_timestamp(checkpoint, field="checkpoint")
+    return _format_github_timestamp(
+        parsed - timedelta(seconds=MERGE_COMMENT_SCAN_OVERLAP_SECONDS))
+
+
+def _apply_merge_comments(
+        state: dict, comments_value: list[dict], config: dict) -> None:
+    normalized = []
+    for comment in comments_value:
+        if not isinstance(comment, dict) or type(comment.get("id")) is not int:
+            raise PipelineError("repository comment response is malformed")
+        updated = _parse_github_timestamp(comment.get("updated_at"), field="updated_at")
+        _parse_github_timestamp(comment.get("created_at"), field="created_at")
+        normalized.append((updated, int(comment["id"]), comment))
+    # A comment can move between REST pages when it is edited during a scan.
+    # Sorting with an explicit scalar key keeps such duplicate IDs harmless;
+    # comparing the response dictionaries themselves would raise TypeError
+    # when both copies share the same second-resolution timestamp.
+    for updated, comment_id, comment in sorted(
+            normalized, key=lambda item: (item[0], item[1])):
+        key = str(comment_id)
+        # An edit is delivered again by the updated-time delta.  Remove the
+        # previous interpretation first so an edited service marker can never
+        # remain authoritative in the durable mirror.
+        state["intents"].pop(key, None)
+        state["done"].pop(key, None)
+        intent = parse_merge_intent(comment, config)
+        done = parse_merge_done(comment, config)
+        if intent is not None:
+            state["intents"][key] = intent
+        if done is not None:
+            state["done"][key] = done
+
+
+def _pending_from_merge_comment_index(state: dict) -> list[dict]:
+    completed = {
+        (done["intent"], done["number"], done["head"])
+        for done in state["done"].values()
+    }
+    return sorted(
+        (intent for intent in state["intents"].values()
+         if (intent["id"], intent["number"], intent["head"]) not in completed),
+        key=lambda item: item["id"],
+    )
+
+
+def _sync_merge_comment_index(gh: GitHub, config: dict, state: dict) -> None:
+    # Capture the watermark before issuing the first page.  A full backfill can
+    # take many minutes; advancing to max(updated_at) from its eventual result
+    # could skip a marker that appeared early in pagination but was not part of
+    # that page chain.  The next scan starts from this time minus the clock-skew
+    # overlap, independently of how long the completed scan took.
+    scan_started_at = _utc_now()
+    since = _merge_comment_scan_since(state)
+    comments_value = repository_comments(gh, config, since=since)
+    _apply_merge_comments(state, comments_value, config)
+    state["checkpoint"] = _format_github_timestamp(scan_started_at)
+    state["initialized"] = True
+
+
+def _record_merge_comment(gh: GitHub, config: dict, comment: dict) -> None:
+    """Record a directly returned GitHub marker without advancing scan truth.
+
+    A POST response is canonical for that one comment, but it does not prove
+    that the repository listing has exposed every concurrent comment yet.  The
+    checkpoint therefore advances only from a completed listing scan.
+    """
+    with _locked_merge_comment_index(config) as path:
+        state = _load_merge_comment_index(path, config)
+        _sync_merge_comment_index(gh, config, state)
+        _apply_merge_comments(state, [comment], config)
+        _write_merge_comment_index(path, state)
 
 
 def pending_merge_intents(gh: GitHub, config: dict) -> list[dict]:
-    comments_value = repository_comments(gh, config)
-    done_values = [done for comment in comments_value
-                   if (done := parse_merge_done(comment, config)) is not None]
-    intents = []
-    for comment in comments_value:
-        intent = parse_merge_intent(comment, config)
-        if intent is None:
-            continue
-        completed = any(done["intent"] == intent["id"] and
-                        done["number"] == intent["number"] and
-                        done["head"] == intent["head"] for done in done_values)
-        if not completed:
-            intents.append(intent)
-    return sorted(intents, key=lambda item: item["id"])
+    with _locked_merge_comment_index(config) as path:
+        state = _load_merge_comment_index(path, config)
+        _sync_merge_comment_index(gh, config, state)
+        _write_merge_comment_index(path, state)
+        return _pending_from_merge_comment_index(state)
+
+
+def reserve_merge_intent(gh: GitHub, config: dict, number: int,
+                         marker: str) -> tuple[dict | None, list[dict]]:
+    """Publish one intent under the same lock as the canonical delta scan.
+
+    Returning ``None`` means an earlier intent already owns the integration
+    lane.  Marker ordering is always the GitHub comment database id, matching
+    the former full-history implementation.
+    """
+    with _locked_merge_comment_index(config) as path:
+        state = _load_merge_comment_index(path, config)
+        _sync_merge_comment_index(gh, config, state)
+        pending = _pending_from_merge_comment_index(state)
+        if pending:
+            _write_merge_comment_index(path, state)
+            return None, pending
+
+        posted = post_comment(gh, config, number, marker)
+        intent = parse_merge_intent(posted, config)
+        if intent is None or intent["number"] != number:
+            raise PipelineError("posted merge cleanup intent is not canonical")
+        _apply_merge_comments(state, [posted], config)
+
+        # Refresh once more while still holding the local publisher lock.  The
+        # POST itself is inserted directly, while the unchanged checkpoint
+        # keeps any not-yet-visible concurrent GitHub marker discoverable on a
+        # later invocation instead of assuming eventual listing visibility.
+        _sync_merge_comment_index(gh, config, state)
+        pending = _pending_from_merge_comment_index(state)
+        _write_merge_comment_index(path, state)
+        if not pending or pending[0]["id"] != intent["id"]:
+            return None, pending
+        return intent, pending
+
+
+def exact_merge_intent_index(snapshot: dict, config: dict, intent: dict) -> int:
+    """Locate the immutable GitHub marker in a stable PR timeline."""
+    matches = []
+    for index, edge in enumerate(snapshot.get("edges") or []):
+        node = edge.get("node") or {}
+        if (node.get("__typename") == "IssueComment"
+                and comment_id(node) == intent.get("id")
+                and node.get("body") == intent.get("body")
+                and (node.get("author") or {}).get("login") == config["trusted_account"]
+                and node.get("lastEditedAt") is None):
+            matches.append(index)
+    if len(matches) != 1:
+        raise PipelineError(
+            "merge cleanup intent is missing or edited in GraphQL timeline")
+    return matches[0]
 
 
 def remove_in_work_from_closed_issue(gh: GitHub, config: dict, number: int) -> bool:
@@ -787,25 +1119,18 @@ def validate_merged_intent(gh: GitHub, config: dict, intent: dict) -> tuple[dict
     if (snapshot.get("state") != "MERGED" or snapshot.get("baseRefName") != config["base_branch"]
             or not snapshot.get("labelsComplete")):
         raise PipelineError("merged GraphQL snapshot does not match cleanup target")
-    intent_index = None
+    intent_index = exact_merge_intent_index(snapshot, config, intent)
     merged_events = []
     forbidden = {"PullRequestCommit", "HeadRefForcePushedEvent", "HeadRefRestoredEvent",
                  "BaseRefChangedEvent", "BaseRefForcePushedEvent", "BaseRefDeletedEvent",
                  "CommentDeletedEvent"}
     for index, edge in enumerate(snapshot["edges"]):
         node = edge.get("node") or {}
-        if (node.get("__typename") == "IssueComment" and
-                comment_id(node) == intent["id"] and node.get("body") == intent["body"] and
-                (node.get("author") or {}).get("login") == config["trusted_account"] and
-                node.get("lastEditedAt") is None):
-            intent_index = index
-        if intent_index is not None and index > intent_index:
+        if index > intent_index:
             if node.get("__typename") in forbidden:
                 raise PipelineError(f"unsupported event after merge cleanup intent: {node.get('__typename')}")
             if node.get("__typename") == "MergedEvent":
                 merged_events.append((index, (node.get("commit") or {}).get("oid")))
-    if intent_index is None:
-        raise PipelineError("merge cleanup intent is missing or edited in GraphQL timeline")
     matching = [value for index, value in merged_events if index > intent_index and value == merge_sha]
     if len(matching) != 1:
         raise PipelineError("cleanup intent is not followed by one matching merged event")
@@ -857,14 +1182,15 @@ def recover_merge_cleanup(gh: GitHub, config: dict, intent: dict) -> dict:
                  f"repos/{config['repository']}/issues/{intent['number']}/comments?per_page=100",
                  "--jq", ".[]")
     pr_comments = [json.loads(line) for line in raw.splitlines() if line.strip()]
-    done_exists = any(
-        (item.get("user") or {}).get("login") == config["trusted_account"]
+    done_comment = next((
+        item for item in pr_comments
+        if (item.get("user") or {}).get("login") == config["trusted_account"]
         and item.get("created_at") == item.get("updated_at")
         and (item.get("body") or "").strip() == done_body
-        for item in pr_comments
-    )
-    if not done_exists:
-        post_comment(gh, config, intent["number"], done_body)
+    ), None)
+    if done_comment is None:
+        done_comment = post_comment(gh, config, intent["number"], done_body)
+    _record_merge_comment(gh, config, done_comment)
     return {"action": "completed", "stage": "merge-cleanup", "number": intent["number"],
             "head": intent["head"], "merge_sha": merge_sha,
             "in_work_removed": removed, "plan_ready": plan_ready}
@@ -1174,6 +1500,10 @@ def pending_merge_action(gh: GitHub, config: dict, intent: dict) -> dict:
 
     snapshot = stable_timeline(gh, config, intent["number"])
     validate_common(snapshot, config, intent)
+    try:
+        exact_merge_intent_index(snapshot, config, intent)
+    except PipelineError as exc:
+        return {"action": "fallback", "reason": str(exc)}
     info = epoch(snapshot, config["trusted_account"])
     validate_epoch_safety(info, config["trusted_account"])
     established = proof(info, intent["head"], config["trusted_account"])
@@ -1282,20 +1612,17 @@ def complete_merge(gh: GitHub, config: dict, lease_value: str,
     if intent is None:
         issues = same_repo_closing_issues(body, config["repository"])
         marker = intent_body(lease["head"], established, body, issues)
-        posted = post_comment(gh, config, lease["number"], marker)
-        all_pending = pending_merge_intents(gh, config)
-        candidates = [item for item in all_pending
-                      if item["number"] == lease["number"] and item["head"] == lease["head"]]
-        if (not candidates or candidates[0]["id"] != int(posted["id"]) or
-                not all_pending or all_pending[0]["id"] != int(posted["id"])):
+        intent, _ = reserve_merge_intent(
+            gh, config, lease["number"], marker)
+        if intent is None:
             return {"action": "wait", "stage": "merge", "number": lease["number"],
                     "reason": "another merge cleanup intent won"}
-        intent = candidates[0]
     elif int(intent.get("number", 0)) != int(lease["number"]):
         raise PipelineError("merge intent belongs to another PR")
 
     snapshot = stable_timeline(gh, config, lease["number"])
     validate_common(snapshot, config, lease)
+    exact_merge_intent_index(snapshot, config, intent)
     labels = set(snapshot["labels"])
     if "ship" not in labels or labels & {"hold", "needs-decision"}:
         raise PipelineError("merge label gate closed after cleanup intent")
@@ -1347,6 +1674,8 @@ def run(argv=None) -> int:
             value = capabilities(config)
         else:
             gh = GitHub()
+            if hasattr(gh, "timeout_seconds"):
+                gh.timeout_seconds = int(config.get("github_timeout_seconds", 120))
             if args.command == "next":
                 value = (next_review(gh, config, config_path=args.config)
                          if args.stage == "review"
