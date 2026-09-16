@@ -1,3 +1,4 @@
+import json
 import os
 import sqlite3
 import subprocess
@@ -546,9 +547,10 @@ def test_headless_stream_pipeline_validates_verdict_before_stored_meta(
             "output_tokens": 30, "reasoning_output_tokens": 10,
         }},
     ]
+    encoded_events = json.dumps(events, ensure_ascii=True)
     script = (
-        "import json; events=" + repr(events)
-        + "; [print(json.dumps(event, ensure_ascii=False)) for event in events]"
+        "import json; events=json.loads(" + repr(encoded_events)
+        + "); [print(json.dumps(event)) for event in events]"
     )
     monkeypatch.setattr(pipeline_insights, "dispatch_gate", lambda _task: None)
     monkeypatch.setattr(
