@@ -796,7 +796,11 @@ def _execute_task_body(task, admission_complete=None):
             next_run = _pipeline_defer_time(route)
             if next_run:
                 _retry_sqlite_busy(
-                    lambda: db.defer_task(task.id, next_run, reason),
+                    lambda: db.defer_task(
+                        task.id, next_run, reason,
+                        hard_not_before=(
+                            route.get("defer_policy") == "hard_not_before"),
+                    ),
                     f"отложить pipeline-задачу #{task.id}",
                 )
                 print(f"  -> Pipeline preflight deferred without agent: {reason}")

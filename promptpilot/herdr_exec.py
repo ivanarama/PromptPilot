@@ -588,9 +588,14 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
     wt_copied = []
 
     try:
+        target = getattr(task, "herdr_target", None)
+        if not target and cancel_check and cancel_check():
+            outcome["cancelled"] = True
+            outcome["cancel_note"] = (
+                "Cancelled before the herdr session was created")
+            return outcome
         _ensure_server(host)
 
-        target = getattr(task, "herdr_target", None)
         if target:
             # Target mode: send the prompt into an EXISTING session. The pane
             # belongs to the user — never close or rename it.
@@ -621,6 +626,17 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
             # PP_TASK_ID marks the run in the pane's environment and is
             # inherited by the agent, so a live run can be found by process.
             env_args = ["--env", f"PP_TASK_ID={task.id}"]
+            # A local herdr pane is created by the long-lived server rather
+            # than as our child process, so it does not inherit PromptPilot's
+            # runtime paths. Forward only the non-secret paths required by the
+            # repository adapter. Remote paths must come from that machine's
+            # explicit provider env; local Windows paths would corrupt it.
+            if not host:
+                for key in (
+                        "PP_DATA_DIR", "PP_PIPELINE_LEASE_KEY_FILE",
+                        "PP_GH_EXE", "PP_GO_EXE"):
+                    if os.environ.get(key):
+                        env_args += ["--env", f"{key}={os.environ[key]}"]
             for k, v in (provider_cfg.get("env") or {}).items():
                 if v:
                     env_args += ["--env", f"{k}={v}"]
@@ -707,7 +723,8 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
             agent_args += ["--effort", eff]
         if task.session_id:
             agent_args += ["--resume", task.session_id]
-        if task.skip_permissions:
+        if (task.skip_permissions
+                and "--dangerously-skip-permissions" not in agent_args):
             agent_args.append("--dangerously-skip-permissions")
         if not host and guard_enabled(provider_cfg, task.skip_permissions):
             # Local only: the settings file with the hook lives on this machine.

@@ -926,6 +926,7 @@ def test_low_budget_defers_skill_and_tool_routes_without_preflight(
 
     assert route["action"] == "defer"
     assert route["mode"] == ("tool" if with_execution else "skill")
+    assert route["defer_policy"] == "hard_not_before"
     assert route["defer_until"] == datetime.fromtimestamp(
         reset + 17, timezone.utc).isoformat()
     assert "defer_for" not in route
@@ -959,6 +960,60 @@ def test_low_budget_defer_survives_refresh_status_database_error(
         reset + 17, timezone.utc).isoformat()
 
 
+def test_post_preflight_budget_denial_keeps_sanitized_context(
+        isolated_db, monkeypatch):
+    execution = {"mode": "auto", "command": ["pipeline-tool"]}
+    profile = _profile_with_costs(execution=execution, core=100)
+    profile["github_budget"]["costs"]["fallback_targeted"] = {
+        "core": 900, "search": 0, "graphql": 0,
+    }
+    preflight = {
+        "action": "fallback",
+        "reason": "complex\nstate",
+        "target": {
+            "number": 1414, "head": "a" * 40,
+            "stage": "integration-review",
+        },
+        "handoff": {"lease": "TOP-SECRET-SIGNED-LEASE"},
+        "extra": {"must_not": "persist"},
+    }
+    monkeypatch.setattr(
+        pipeline_insights, "_profiles", lambda: {"example": profile})
+    monkeypatch.setattr(
+        pipeline_insights, "_github_rate_limits",
+        lambda: _limits(core=950, search=30, graphql=5000))
+    monkeypatch.setattr(
+        pipeline_insights, "_tool_available", lambda *_args: (True, ""))
+    monkeypatch.setattr(
+        pipeline_insights, "_tool_preflight", lambda *_args: preflight)
+    task = SimpleNamespace(
+        series_id=1, series_title="Example - REVIEW",
+        prompt="Example - REVIEW")
+
+    route = pipeline_insights.execution_route(task, task.prompt)
+
+    assert route["action"] == "defer"
+    assert route["defer_policy"] == "hard_not_before"
+    assert route["defer_context"] == {
+        "phase": "post_preflight",
+        "budget_route": "fallback_targeted",
+        "preflight_action": "fallback",
+        "preflight_reason": "complex state",
+        "handoff_present": True,
+        "target": {
+            "number": 1414, "head": "a" * 40,
+            "stage": "integration-review",
+        },
+    }
+    assert "target=#1414" in route["reason"]
+    assert "stage=integration-review" in route["reason"]
+    assert f"head={'a' * 40}" in route["reason"]
+    assert "complex state" in route["reason"]
+    serialized = json.dumps(route, ensure_ascii=False)
+    assert "TOP-SECRET-SIGNED-LEASE" not in serialized
+    assert "must_not" not in serialized
+
+
 def test_cached_read_ignores_refresh_status_database_error(
         isolated_db, monkeypatch):
     profile = _profile()
@@ -981,11 +1036,16 @@ def test_worker_uses_exact_budget_defer_without_loading_provider(
         prompt="Example - REVIEW", recurrence="4h"))
     task = isolated_db.get_next_runnable()
     target = datetime.now(timezone.utc) + timedelta(minutes=7)
+    reason = (
+        "low budget; preflight: post_preflight, route=fallback_targeted, "
+        f"target=#1414, stage=review, head={'a' * 40}"
+    )
     monkeypatch.setattr(pipeline_insights, "dispatch_gate", lambda _task: None)
     monkeypatch.setattr(
         pipeline_insights, "execution_route", lambda *_args, **_kwargs: {
-            "action": "defer", "mode": "skill", "reason": "low budget",
+            "action": "defer", "mode": "skill", "reason": reason,
             "defer_until": target.isoformat(),
+            "defer_policy": "hard_not_before",
         })
     monkeypatch.setattr(
         worker, "load_providers",
@@ -997,7 +1057,8 @@ def test_worker_uses_exact_budget_defer_without_loading_provider(
     deferred = isolated_db.get_task(created.id)
     assert deferred.status.value == "pending"
     assert deferred.scheduled_at == target
-    assert deferred.error == "low budget"
+    assert deferred.next_run_at == target
+    assert deferred.error == reason
 
 
 def test_worker_low_budget_stays_deferred_when_status_database_is_locked(

@@ -401,6 +401,41 @@ def test_dependency_defer_returns_claimed_task_without_retry(isolated_db):
     assert deferred.retry_count == 0
     assert deferred.scheduled_at == next_run
     assert deferred.error == "waiting for review"
+    assert deferred.next_run_at is None
+
+
+def test_hard_defer_is_not_shortened_by_successor_wake(isolated_db):
+    task = isolated_db.create_task(TaskCreate(
+        prompt="Example - REVIEW", recurrence="4h"))
+    claimed = isolated_db.get_next_runnable()
+    deadline = datetime.now(timezone.utc) + timedelta(hours=1)
+
+    isolated_db.defer_task(
+        claimed.id, deadline, "GitHub budget", hard_not_before=True)
+    requested = isolated_db.request_pipeline_series_wake(task.series_id)
+
+    deferred = isolated_db.get_task(task.id)
+    assert requested == {"accepted": True, "state": "latched_deferred"}
+    assert deferred.scheduled_at == deadline
+    assert deferred.next_run_at == deadline
+    assert isolated_db.consume_pipeline_series_wake(task.series_id) is False
+    assert isolated_db.get_setting(
+        f"pipeline_series_wake_intent:v1:{task.series_id}") == "1"
+
+
+def test_manual_run_now_explicitly_bypasses_hard_defer(isolated_db):
+    task = isolated_db.create_task(TaskCreate(
+        prompt="Example - REVIEW", recurrence="4h"))
+    claimed = isolated_db.get_next_runnable()
+    deadline = datetime.now(timezone.utc) + timedelta(hours=1)
+    isolated_db.defer_task(
+        claimed.id, deadline, "GitHub budget", hard_not_before=True)
+
+    assert isolated_db.series_action(task.series_id, "run_now")
+
+    current = isolated_db.get_task(task.id)
+    assert current.scheduled_at <= datetime.now(timezone.utc)
+    assert current.next_run_at is None
 
 
 def test_series_exposes_active_occurrence_defer_reason(isolated_db):
@@ -1983,6 +2018,42 @@ def test_series_wake_latch_suppresses_unchanged_snapshot(isolated_db):
         series_id, "wake:test", "snapshot-a", cache_guard=guard)
     assert isolated_db.wake_series_once(
         series_id, "wake:test", "snapshot-b", cache_guard=guard)
+
+
+@pytest.mark.parametrize("status", ["pending", "rate_limited"])
+def test_diagnostic_wake_latches_future_hard_barrier(
+        isolated_db, status):
+    profile = {
+        "title": "Example", "repository": "owner/example",
+        "queues": [{
+            "id": "review", "title": "Review", "capacity": 1,
+            "query": "is:pr", "series_contains": "REVIEW",
+        }],
+    }
+    data = _fresh_cache_data("example", profile)
+    guard = pipeline_insights._wake_cache_guard(
+        "example", profile, data["cache"])
+    task = isolated_db.create_task(TaskCreate(
+        prompt="Example - REVIEW", recurrence="4h"))
+    claimed = isolated_db.get_next_runnable()
+    deadline = datetime.now(timezone.utc) + timedelta(hours=1)
+    if status == "pending":
+        isolated_db.defer_task(
+            claimed.id, deadline, "GitHub budget", hard_not_before=True)
+    else:
+        isolated_db.mark_rate_limited(claimed.id, deadline, "provider budget")
+
+    assert isolated_db.wake_series_once(
+        task.series_id, "wake:test", "snapshot-a", cache_guard=guard)
+    assert not isolated_db.wake_series_once(
+        task.series_id, "wake:test", "snapshot-a", cache_guard=guard)
+
+    deferred = isolated_db.get_task(task.id)
+    assert deferred.scheduled_at == (
+        deadline if status == "pending" else task.scheduled_at)
+    assert deferred.next_run_at == deadline
+    assert isolated_db.get_setting(
+        f"pipeline_series_wake_intent:v1:{task.series_id}") == "1"
 
 
 def test_pipeline_wake_checks_pause_atomically_at_mutation(

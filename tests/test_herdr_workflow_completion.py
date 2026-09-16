@@ -1,6 +1,8 @@
 from types import SimpleNamespace
+import json
+import subprocess
 
-from promptpilot import herdr_exec
+from promptpilot import api, herdr_exec
 from promptpilot.herdr_exec import (
     _closing_workflow_verdict,
     _has_running_background_task,
@@ -265,6 +267,169 @@ def test_pipeline_verdict_contract_rejects_detached_before_provider_start(
 
     assert outcome["ok"] is False
     assert "detached mode is incompatible" in outcome["error"]
+
+
+def test_cancel_before_herdr_creation_never_opens_a_tab(monkeypatch):
+    task = SimpleNamespace(id=606, detached=False)
+    monkeypatch.setattr(
+        herdr_exec, "_ensure_server",
+        lambda _host: pytest.fail("cancelled task started herdr"),
+    )
+
+    outcome = herdr_exec.run_in_herdr(
+        task, {"kind": "agy"}, cancel_check=lambda: True,
+        prompt_override="OneBase - REVIEW",
+    )
+
+    assert outcome["cancelled"] is True
+    assert "before the herdr session was created" in outcome["cancel_note"]
+
+
+def test_herdr_deduplicates_permission_flag_and_forwards_pipeline_paths(
+        monkeypatch, tmp_path):
+    calls = []
+
+    def fake_run(args, host=None, timeout=None):
+        calls.append(args)
+        if args[:2] == ["tab", "create"]:
+            return 0, {"result": {
+                "root_pane": {"pane_id": "pane-42"},
+                "tab": {"tab_id": "tab-42"},
+            }}, ""
+        if args[:2] == ["agent", "start"]:
+            return 0, {"result": {"agent": {"agent_status": "idle"}}}, ""
+        if args[:2] == ["agent", "prompt"]:
+            return 0, {"result": {"agent": {"agent_status": "done"}}}, ""
+        if args[:2] == ["agent", "read"]:
+            return 0, None, "done"
+        raise AssertionError(args)
+
+    task = SimpleNamespace(
+        id=42, herdr_target=None, model=None, effort=None, session_id=None,
+        skip_permissions=True, detached=False, working_dir=".", worktree=False,
+    )
+    monkeypatch.setenv("PP_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv(
+        "PP_PIPELINE_LEASE_KEY_FILE", str(tmp_path / "pipeline-lease.key"))
+    monkeypatch.setenv("PP_GH_EXE", str(tmp_path / "gh.exe"))
+    monkeypatch.setattr(herdr_exec, "_ensure_server", lambda _host: None)
+    monkeypatch.setattr(herdr_exec, "_close_stale_tabs", lambda *_args: None)
+    monkeypatch.setattr(herdr_exec, "_run", fake_run)
+    monkeypatch.setattr(herdr_exec, "guard_enabled", lambda *_args: False)
+    monkeypatch.setattr(
+        herdr_exec, "_stabilize_workflow_completion",
+        lambda *_args, **_kwargs: ("done", ""),
+    )
+    monkeypatch.setattr(
+        herdr_exec, "_close_owned_session", lambda *_args: "")
+
+    outcome = herdr_exec.run_in_herdr(
+        task,
+        {"kind": "agy", "args": ["--dangerously-skip-permissions"]},
+        prompt_override="test prompt",
+    )
+
+    start = next(call for call in calls if call[:2] == ["agent", "start"])
+    assert start.count("--dangerously-skip-permissions") == 1
+    tab = next(call for call in calls if call[:2] == ["tab", "create"])
+    assert f"PP_DATA_DIR={tmp_path}" in tab
+    assert (
+        f"PP_PIPELINE_LEASE_KEY_FILE={tmp_path / 'pipeline-lease.key'}" in tab
+    )
+    assert f"PP_GH_EXE={tmp_path / 'gh.exe'}" in tab
+    assert outcome["ok"] is True
+
+
+def test_remote_herdr_does_not_forward_local_pipeline_paths(
+        monkeypatch, tmp_path):
+    calls = []
+
+    def fake_run(args, host=None, timeout=None):
+        calls.append((args, host))
+        if args[:2] == ["tab", "create"]:
+            return 0, {"result": {
+                "root_pane": {"pane_id": "pane-remote"},
+                "tab": {"tab_id": "tab-remote"},
+            }}, ""
+        if args[:2] == ["agent", "start"]:
+            return 0, {"result": {"agent": {"agent_status": "idle"}}}, ""
+        if args[:2] == ["agent", "prompt"]:
+            return 0, {"result": {"agent": {"agent_status": "done"}}}, ""
+        if args[:2] == ["agent", "read"]:
+            return 0, None, "done"
+        raise AssertionError(args)
+
+    task = SimpleNamespace(
+        id=43, herdr_target=None, model=None, effort=None, session_id=None,
+        skip_permissions=False, detached=False,
+        working_dir="/srv/onebase", worktree=False,
+    )
+    monkeypatch.setenv("PP_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv(
+        "PP_PIPELINE_LEASE_KEY_FILE", str(tmp_path / "pipeline-lease.key"))
+    monkeypatch.setenv("PP_GH_EXE", str(tmp_path / "gh.exe"))
+    monkeypatch.setattr(herdr_exec, "_ensure_server", lambda _host: None)
+    monkeypatch.setattr(herdr_exec, "_close_stale_tabs", lambda *_args: None)
+    monkeypatch.setattr(herdr_exec, "_run", fake_run)
+    monkeypatch.setattr(herdr_exec, "guard_enabled", lambda *_args: False)
+    monkeypatch.setattr(
+        herdr_exec, "_stabilize_workflow_completion",
+        lambda *_args, **_kwargs: ("done", ""),
+    )
+    monkeypatch.setattr(
+        herdr_exec, "_close_owned_session", lambda *_args: "")
+
+    outcome = herdr_exec.run_in_herdr(
+        task, {"kind": "codex", "env": {"REMOTE_ONLY": "/srv/data"}},
+        host="remote.example", prompt_override="test prompt",
+    )
+
+    tab, tab_host = next(
+        call for call in calls if call[0][:2] == ["tab", "create"])
+    assert tab_host == "remote.example"
+    assert "REMOTE_ONLY=/srv/data" in tab
+    assert not any(value.startswith("PP_DATA_DIR=") for value in tab)
+    assert not any(
+        value.startswith("PP_PIPELINE_LEASE_KEY_FILE=") for value in tab)
+    assert not any(value.startswith("PP_GH_EXE=") for value in tab)
+    assert outcome["ok"] is True
+
+
+def test_herdr_agents_api_decodes_utf8_titles(monkeypatch):
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        if command[-2:] == ["agent", "list"]:
+            payload = {"result": {"agents": [{
+                "agent": "codex", "agent_status": "working",
+                "pane_id": "wD:p1", "workspace_id": "wD",
+                "terminal_title_stripped": "⠸ Проверка конвейера",
+            }]}}
+        elif command[-2:] == ["workspace", "list"]:
+            payload = {"result": {"workspaces": [{
+                "workspace_id": "wD", "label": "onebase",
+            }]}}
+        else:
+            raise AssertionError(command)
+        return SimpleNamespace(
+            returncode=0, stdout=json.dumps(payload, ensure_ascii=False),
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    agents = api.api_herdr_agents()
+
+    assert agents == [{
+        "target": "wD:p1", "pane_id": "wD:p1", "name": None,
+        "agent": "codex", "status": "working", "cwd": "",
+        "title": "⠸ Проверка конвейера", "workspace": "onebase",
+    }]
+    assert len(calls) == 2
+    for _command, kwargs in calls:
+        assert kwargs["encoding"] == "utf-8"
+        assert kwargs["errors"] == "replace"
 
 
 def test_trim_transcript_uses_agy_greater_than_prompt_marker():

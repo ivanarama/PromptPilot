@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -1684,18 +1685,86 @@ def _tool_preflight(execution: dict, command: list[str], working_dir: str | None
     return payload
 
 
+def _bounded_defer_text(value, limit: int = 240) -> str:
+    """Keep untrusted project/GitHub diagnostics compact and single-line."""
+    return " ".join(str(value or "").split())[:limit]
+
+
+def _budget_defer_context(admission: dict, phase: str,
+                          preflight: dict | None) -> dict:
+    """Return diagnostic-only preflight facts, never its authority/lease."""
+    context = {
+        "phase": phase,
+        "budget_route": _bounded_defer_text(
+            admission.get("budget_route"), 48),
+    }
+    if not isinstance(preflight, dict):
+        return context
+    context["preflight_action"] = _bounded_defer_text(
+        preflight.get("action"), 48)
+    context["preflight_reason"] = _bounded_defer_text(
+        preflight.get("reason") or preflight.get("error"))
+    context["handoff_present"] = "handoff" in preflight
+    target = preflight.get("target")
+    if isinstance(target, dict):
+        safe_target = {}
+        number = target.get("number")
+        if isinstance(number, int) and not isinstance(number, bool) and number > 0:
+            safe_target["number"] = number
+        head = str(target.get("head") or "")
+        if re.fullmatch(r"[0-9a-fA-F]{40}", head):
+            safe_target["head"] = head.lower()
+        stage = _bounded_defer_text(target.get("stage"), 48)
+        if stage:
+            safe_target["stage"] = stage
+        if safe_target:
+            context["target"] = safe_target
+    return context
+
+
+def _format_budget_defer_context(context: dict) -> str:
+    parts = [str(context.get("phase") or "admission")]
+    if context.get("budget_route"):
+        parts.append(f"route={context['budget_route']}")
+    if context.get("preflight_action"):
+        parts.append(f"action={context['preflight_action']}")
+    target = context.get("target") or {}
+    if target.get("number"):
+        parts.append(f"target=#{target['number']}")
+    if target.get("stage"):
+        parts.append(f"stage={target['stage']}")
+    if target.get("head"):
+        parts.append(f"head={target['head']}")
+    if "handoff_present" in context:
+        parts.append(
+            "handoff=" + ("present" if context["handoff_present"] else "absent"))
+    if context.get("preflight_reason"):
+        parts.append(f"reason={context['preflight_reason']}")
+    return ", ".join(parts)
+
+
 def _budget_defer_route(admission: dict, profile_id: str, profile: dict,
                         queue: dict,
-                        *, mode: str = "tool") -> dict:
+                        *, mode: str = "tool", phase: str | None = None,
+                        preflight: dict | None = None) -> dict:
     _record_refresh_blocked(profile_id, profile, admission)
-    return {
+    reason = str(admission.get("reason") or "GitHub scan отложен")
+    context = None
+    if phase:
+        context = _budget_defer_context(admission, phase, preflight)
+        reason = f"{reason}; preflight: {_format_budget_defer_context(context)}"
+    result = {
         "action": "defer", "mode": mode,
-        "reason": str(admission.get("reason") or "GitHub scan отложен"),
+        "reason": reason,
         "defer_until": admission.get("defer_until"),
+        "defer_policy": "hard_not_before",
         "profile_id": profile_id, "queue_id": queue.get("id"),
         "github_budget": _public_budget_decision(admission),
         "github_rate_limit": admission.get("github_rate_limit"),
     }
+    if context is not None:
+        result["defer_context"] = context
+    return result
 
 
 def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
@@ -1837,7 +1906,8 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
             if not admission.get("allowed"):
                 return _budget_defer_route(
                     admission, profile_id, profile, queue,
-                    mode=("tool" if provider_route == "tool" else "skill"))
+                    mode=("tool" if provider_route == "tool" else "skill"),
+                    phase="post_preflight", preflight=preflight)
 
     preflight_action = preflight["action"].lower()
     preflight_reason = str(
