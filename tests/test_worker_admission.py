@@ -1,5 +1,6 @@
 from concurrent.futures import Future
 from datetime import datetime, timezone
+import sqlite3
 import threading
 from types import SimpleNamespace
 
@@ -26,7 +27,7 @@ def test_admission_fence_blocks_next_claim_until_current_admission_finishes():
     assert fence.wait(0) is False
 
 
-def test_task_opens_fence_after_route_and_before_provider(monkeypatch):
+def test_task_opens_fence_only_after_herdr_provider_started(monkeypatch):
     admission_complete = threading.Event()
     calls = []
     task = SimpleNamespace(
@@ -45,7 +46,10 @@ def test_task_opens_fence_after_route_and_before_provider(monkeypatch):
     def route(*_args, **_kwargs):
         assert admission_complete.is_set() is False
         calls.append("route")
-        return {"action": "prompt", "mode": "skill", "prompt": "run"}
+        return {
+            "action": "prompt", "mode": "skill", "prompt": "run",
+            "profile_id": "onebase", "queue_id": "merge",
+        }
 
     monkeypatch.setattr(pipeline_insights, "execution_route", route)
     monkeypatch.setattr(
@@ -53,15 +57,129 @@ def test_task_opens_fence_after_route_and_before_provider(monkeypatch):
         lambda: {"test-provider": {"executor": "herdr"}},
     )
 
-    def provider(*_args, **_kwargs):
-        assert admission_complete.is_set() is True
+    def provider(*_args, **kwargs):
+        assert admission_complete.is_set() is False
+        assert kwargs["require_closing_verdict"] is True
         calls.append("provider")
+        worker._signal_admission_complete(kwargs["admission_complete"])
+        assert admission_complete.is_set() is True
 
     monkeypatch.setattr(worker, "_execute_herdr_task", provider)
 
     worker._execute_task_body(task, admission_complete)
 
     assert calls == ["route", "provider"]
+
+
+def test_sqlite_busy_control_write_is_retried(monkeypatch):
+    attempts = []
+    sleeps = []
+
+    def operation():
+        attempts.append(len(attempts) + 1)
+        if len(attempts) < 3:
+            raise sqlite3.OperationalError("database is locked")
+        return "saved"
+
+    monkeypatch.setattr(worker.time, "sleep", sleeps.append)
+
+    assert worker._retry_sqlite_busy(operation, "test write") == "saved"
+    assert attempts == [1, 2, 3]
+    assert sleeps == [0.1, 0.5]
+
+
+def test_sqlite_non_lock_error_is_not_retried(monkeypatch):
+    attempts = []
+
+    def operation():
+        attempts.append(1)
+        raise sqlite3.OperationalError("attempt to write a readonly database")
+
+    monkeypatch.setattr(
+        worker.time, "sleep",
+        lambda _delay: (_ for _ in ()).throw(AssertionError("unexpected retry")),
+    )
+
+    with pytest.raises(sqlite3.OperationalError, match="readonly"):
+        worker._retry_sqlite_busy(operation, "test write")
+    assert attempts == [1]
+
+
+def test_pipeline_success_without_closing_verdict_is_rejected(monkeypatch):
+    task = SimpleNamespace(
+        id=42, retry_count=0, max_retries=3, tg_chat_id=None,
+        keep_pane=False, machine=None,
+    )
+    failed = []
+    completed = []
+
+    monkeypatch.setattr(
+        "promptpilot.herdr_exec.run_in_herdr",
+        lambda *_args, **_kwargs: {
+            "ok": True, "rate_limited": False, "retry_reason": "",
+            "cancelled": False, "env_failure": "", "verdict": "",
+            "output": "Проверки ещё выполняются\n⢿  Running command...",
+            "error": "",
+        },
+    )
+    monkeypatch.setattr(worker, "_effective_timeout", lambda _task: None)
+    monkeypatch.setattr(worker.db, "is_cancel_requested", lambda _task_id: False)
+    monkeypatch.setattr(
+        worker.db, "mark_failed",
+        lambda task_id, error, exit_code=None: failed.append(
+            (task_id, error, exit_code)),
+    )
+    monkeypatch.setattr(
+        worker.db, "mark_completed",
+        lambda *_args, **_kwargs: completed.append((_args, _kwargs)),
+    )
+
+    worker._execute_herdr_task(
+        task, {"kind": "agy"}, prompt_override="OneBase - REVIEW",
+        require_closing_verdict=True,
+    )
+
+    assert failed == [(
+        42, "Pipeline provider returned success without a closing ИТОГ verdict", 1,
+    )]
+    assert completed == []
+
+
+def test_blocked_notification_failure_does_not_detach_running_agent(monkeypatch):
+    task = SimpleNamespace(
+        id=43, retry_count=0, max_retries=3, tg_chat_id=99,
+        keep_pane=False, machine=None,
+    )
+    notifications = []
+    failures = []
+
+    def provider(*_args, **kwargs):
+        kwargs["on_blocked"]("pane-43")
+        return {
+            "ok": False, "rate_limited": False, "retry_reason": "",
+            "cancelled": False, "env_failure": "", "verdict": "",
+            "output": "", "error": "provider stopped after approval wait",
+        }
+
+    def notification(*_args, **_kwargs):
+        notifications.append(1)
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr("promptpilot.herdr_exec.run_in_herdr", provider)
+    monkeypatch.setattr(worker, "_effective_timeout", lambda _task: None)
+    monkeypatch.setattr(worker.time, "sleep", lambda _delay: None)
+    monkeypatch.setattr(worker.db, "is_cancel_requested", lambda _task_id: False)
+    monkeypatch.setattr(worker.db, "add_notification", notification)
+    monkeypatch.setattr(
+        worker.db, "mark_failed",
+        lambda task_id, error, exit_code=None: failures.append(
+            (task_id, error, exit_code)),
+    )
+
+    worker._execute_herdr_task(task, {"kind": "agy"})
+
+    assert len(notifications) == 3
+    assert failures == [(43, "provider stopped after approval wait", 1)]
 
 
 def test_pool_boundary_opens_fence_after_early_crash(monkeypatch):

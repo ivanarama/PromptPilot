@@ -1724,7 +1724,10 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
             if not admission.get("allowed"):
                 return _budget_defer_route(
                     admission, profile_id, profile, queue, mode="skill")
-        return {"action": "prompt", "mode": "skill", "prompt": fallback_prompt}
+        return {
+            "action": "prompt", "mode": "skill", "prompt": fallback_prompt,
+            "profile_id": profile_id, "queue_id": queue.get("id"),
+        }
 
     mode = str(execution.get("mode", "auto")).lower()
     if mode not in {"auto", "tool", "skill"}:
@@ -1746,7 +1749,10 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
             if not admission.get("allowed"):
                 return _budget_defer_route(
                     admission, profile_id, profile, queue, mode="skill")
-        return {"action": "prompt", "mode": "skill", "prompt": fallback_prompt}
+        return {
+            "action": "prompt", "mode": "skill", "prompt": fallback_prompt,
+            "profile_id": profile_id, "queue_id": queue.get("id"),
+        }
 
     stage = str(execution.get("stage") or queue.get("id") or "").lower()
     command = _tool_command(execution, stage)

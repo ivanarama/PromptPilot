@@ -1,6 +1,10 @@
 import copy
 import json
 import os
+from pathlib import Path
+import sqlite3
+import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from datetime import datetime, timezone
@@ -137,6 +141,61 @@ def test_capabilities_is_executor_neutral(tmp_path):
     }), encoding="utf-8")
     config = pp.load_config(str(config_path))
     assert pp.capabilities(config)["protocol"] == "promptpilot-pipelinectl-v1"
+
+
+def test_pipelinectl_entrypoint_does_not_create_scheduler_database(tmp_path):
+    config_path = tmp_path / "pipelinectl.json"
+    config_path.write_text(json.dumps({
+        "repository": "owner/repo", "trusted_account": "owner",
+        "health_command": ["health", "--json"],
+    }), encoding="utf-8")
+    data_dir = tmp_path / "promptpilot-data"
+    env = os.environ.copy()
+    env["PP_DATA_DIR"] = str(data_dir)
+
+    completed = subprocess.run(
+        [sys.executable, "-m", "promptpilot", "pipelinectl", "--config",
+         str(config_path), "capabilities"],
+        cwd=Path(__file__).resolve().parents[1], env=env,
+        capture_output=True, text=True, timeout=5, encoding="utf-8",
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout)["protocol"] == "promptpilot-pipelinectl-v1"
+    assert not (data_dir / "promptpilot.db").exists()
+
+
+def test_pipelinectl_entrypoint_ignores_locked_scheduler_database(tmp_path):
+    config_path = tmp_path / "pipelinectl.json"
+    config_path.write_text(json.dumps({
+        "repository": "owner/repo", "trusted_account": "owner",
+        "health_command": ["health", "--json"],
+    }), encoding="utf-8")
+    data_dir = tmp_path / "promptpilot-data"
+    data_dir.mkdir()
+    database = data_dir / "promptpilot.db"
+    owner = sqlite3.connect(database)
+    owner.execute("CREATE TABLE sentinel (value INTEGER)")
+    owner.execute("INSERT INTO sentinel VALUES (1)")
+    owner.commit()
+    owner.execute("BEGIN IMMEDIATE")
+    owner.execute("UPDATE sentinel SET value = 2")
+    env = os.environ.copy()
+    env["PP_DATA_DIR"] = str(data_dir)
+
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-m", "promptpilot", "pipelinectl", "--config",
+             str(config_path), "capabilities"],
+            cwd=Path(__file__).resolve().parents[1], env=env,
+            capture_output=True, text=True, timeout=3, encoding="utf-8",
+        )
+    finally:
+        owner.rollback()
+        owner.close()
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout)["protocol"] == "promptpilot-pipelinectl-v1"
 
 
 def test_queue_priority_manual_auto_and_aging():

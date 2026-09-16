@@ -417,8 +417,12 @@ def init_db():
         for migration in MIGRATIONS:
             try:
                 conn.execute(migration)
-            except sqlite3.OperationalError:
-                pass  # Column already exists
+            except sqlite3.OperationalError as exc:
+                # ALTER ADD COLUMN is intentionally replayable for legacy
+                # databases.  Do not misclassify SQLITE_BUSY/LOCKED, I/O or
+                # corruption as an already-applied migration.
+                if "duplicate column name" not in str(exc).lower():
+                    raise
         # W0 is the first versioned schema addition. The tables themselves use
         # CREATE IF NOT EXISTS so this safely upgrades both fresh and legacy
         # databases; the marker gives future workflow migrations an explicit,
@@ -715,23 +719,26 @@ def _drop_cancel_flag(conn, task_id: int):
     conn.execute("DELETE FROM settings WHERE key = ?", (f"cancel_task:{task_id}",))
 
 
-def mark_completed(task_id: int, result: str, exit_code: int = 0, model_used: str = None, session_id: str = None):
-    clear_note(task_id)
+def mark_completed(task_id: int, result: str, exit_code: int = 0,
+                   model_used: str = None, session_id: str = None,
+                   verdict: str = None):
+    """Finalize a task, optionally committing its verdict atomically."""
     with _connect() as conn:
         conn.execute(
             "UPDATE tasks SET status = 'completed', result = ?, error = NULL, "
             "next_run_at = NULL, exit_code = ?, completed_at = ?, model_used = ?, "
-            "session_id = COALESCE(?, session_id) WHERE id = ?",
-            (result, exit_code, _now(), model_used, session_id, task_id),
+            "session_id = COALESCE(?, session_id), "
+            "verdict = COALESCE(?, verdict), note = NULL WHERE id = ?",
+            (result, exit_code, _now(), model_used, session_id, verdict, task_id),
         )
         _drop_cancel_flag(conn, task_id)
 
 
 def mark_failed(task_id: int, error: str, exit_code: int = 1):
-    clear_note(task_id)
     with _connect() as conn:
         conn.execute(
-            "UPDATE tasks SET status = 'failed', error = ?, exit_code = ?, completed_at = ? WHERE id = ?",
+            "UPDATE tasks SET status = 'failed', error = ?, exit_code = ?, "
+            "completed_at = ?, note = NULL WHERE id = ?",
             (error, exit_code, _now(), task_id),
         )
         _drop_cancel_flag(conn, task_id)

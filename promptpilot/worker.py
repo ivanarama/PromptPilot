@@ -6,6 +6,7 @@ import random
 import re
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -565,7 +566,8 @@ def _notify_requeued(task, next_run, reason: str):
         print(f"  -> notify requeue failed: {e}")
 
 
-def _execute_herdr_task(task, provider_cfg, host=None, machine=None, prompt_override=None):
+def _execute_herdr_task(task, provider_cfg, host=None, machine=None, prompt_override=None,
+                        admission_complete=None, require_closing_verdict=False):
     """Run the task in a live herdr session (providers with executor=herdr).
 
     host is the ssh target of the machine the session lives on (None = local).
@@ -581,30 +583,52 @@ def _execute_herdr_task(task, provider_cfg, host=None, machine=None, prompt_over
             # pane_id/machine ride along so the bot can attach confirm/screen/
             # reply buttons — approving one's OWN task from the phone used to
             # be impossible (the message only suggested ssh).
-            db.add_notification(
-                task.tg_chat_id,
-                f"⏸ Задача #{task.id} ждёт подтверждения в herdr{where} (панель {pane_id}).\n"
-                f"Подтверди кнопкой ниже, или подключись: {attach}",
-                task_id=task.id,
-                pane_id=pane_id,
-                machine=machine,
-            )
+            try:
+                _retry_sqlite_busy(
+                    lambda: db.add_notification(
+                        task.tg_chat_id,
+                        f"⏸ Задача #{task.id} ждёт подтверждения в herdr{where} "
+                        f"(панель {pane_id}).\nПодтверди кнопкой ниже, или "
+                        f"подключись: {attach}",
+                        task_id=task.id,
+                        pane_id=pane_id,
+                        machine=machine,
+                    ),
+                    f"уведомление о блокировке задачи #{task.id}",
+                )
+            except Exception as exc:
+                # A convenience notification is never allowed to detach the
+                # worker's bookkeeping from an already-running owned agent.
+                print(f"  !! blocked notification failed: {exc}", flush=True)
 
     def on_pane(pane_id):
-        db.set_task_pane(task.id, pane_id)
+        _retry_sqlite_busy(
+            lambda: db.set_task_pane(task.id, pane_id),
+            f"сохранение панели задачи #{task.id}",
+        )
 
     def on_worktree(path, branch):
         # Recorded the moment the checkout exists, not when the task ends: the
         # user watching a long run wants the branch name now.
-        db.set_worktree(task.id, path, branch)
+        _retry_sqlite_busy(
+            lambda: db.set_worktree(task.id, path, branch),
+            f"сохранение worktree задачи #{task.id}",
+        )
         print(f"  -> Worktree {path} ({branch})")
+
+    def on_started(_pane_id):
+        # Do not admit another pipeline subprocess while this run is between
+        # creating its owned tab and durably recording/starting the provider.
+        _signal_admission_complete(admission_complete)
 
     outcome = run_in_herdr(task, provider_cfg, on_blocked=on_blocked,
                            timeout=_effective_timeout(task),
                            cancel_check=lambda: db.is_cancel_requested(task.id),
                            keep_pane=task.keep_pane, host=host,
                            on_worktree=on_worktree, on_pane=on_pane,
-                           prompt_override=prompt_override)
+                           on_started=on_started,
+                           prompt_override=prompt_override,
+                           require_closing_verdict=require_closing_verdict)
 
     if outcome.get("cancelled"):
         db.clear_cancel_request(task.id)
@@ -633,14 +657,32 @@ def _execute_herdr_task(task, provider_cfg, host=None, machine=None, prompt_over
         return
 
     if not outcome["ok"]:
-        db.mark_failed(task.id, outcome["error"], exit_code=1)
+        _retry_sqlite_busy(
+            lambda: db.mark_failed(task.id, outcome["error"], exit_code=1),
+            f"завершение herdr-задачи #{task.id} с ошибкой",
+        )
         print("  -> Failed (herdr)")
         return
 
-    verdict = parse_verdict(outcome["output"])
-    if verdict:
-        db.set_verdict(task.id, verdict)
-    db.mark_completed(task.id, outcome["output"], exit_code=0)
+    verdict = outcome.get("verdict") or parse_verdict(outcome["output"])
+    if require_closing_verdict and not outcome.get("verdict"):
+        _retry_sqlite_busy(
+            lambda: db.mark_failed(
+                task.id,
+                "Pipeline provider returned success without a closing ИТОГ verdict",
+                exit_code=1,
+            ),
+            f"отклонение неполного результата herdr-задачи #{task.id}",
+        )
+        print("  -> Failed (pipeline result has no closing verdict)")
+        return
+    _retry_sqlite_busy(
+        lambda: db.mark_completed(
+            task.id, outcome["output"], exit_code=0,
+            verdict=verdict or None,
+        ),
+        f"завершение herdr-задачи #{task.id}",
+    )
     text_preview = outcome["output"][:80].replace("\n", " ").strip()
     print(f"  -> Completed: {text_preview}")
 
@@ -657,6 +699,30 @@ def _signal_admission_complete(admission_complete):
     """Open the next DB claim once this task has chosen its provider route."""
     if admission_complete is not None:
         admission_complete.set()
+
+
+def _retry_sqlite_busy(operation, label: str):
+    """Retry a short control-plane write after transient SQLite contention.
+
+    sqlite's own busy timeout covers ordinary overlap.  A frozen helper used to
+    run schema initialisation concurrently and could outlive that timeout.  The
+    helper no longer opens the DB, but bounded retries keep pane/final-state
+    bookkeeping durable under any remaining writer burst.  Non-lock failures
+    are never retried or hidden.
+    """
+    delays = (0.1, 0.5)
+    for attempt in range(len(delays) + 1):
+        try:
+            return operation()
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() or attempt == len(delays):
+                raise
+            delay = delays[attempt]
+            print(
+                f"  !! SQLite занят: {label}; повтор через {delay:g} с",
+                flush=True,
+            )
+            time.sleep(delay)
 
 
 def _execute_task_body(task, admission_complete=None):
@@ -676,23 +742,29 @@ def _execute_task_body(task, admission_complete=None):
             if gate["action"] == "defer":
                 next_run = _pipeline_defer_time(gate)
                 if next_run:
-                    db.defer_task(task.id, next_run, reason)
+                    _retry_sqlite_busy(
+                        lambda: db.defer_task(task.id, next_run, reason),
+                        f"отложить pipeline-задачу #{task.id}",
+                    )
                     print(f"  -> Deferred without agent: {reason}")
                     return
                 print("  !! invalid pipeline defer time", flush=True)
             elif gate["action"] == "complete_empty":
-                db.set_verdict(task.id, "ПУСТО")
-                db.mark_completed(
-                    task.id,
-                    f"Предварительная проверка PromptPilot: {reason}\n"
-                    "Провайдер не запускался, токены не потрачены.\n\n"
-                    f"ИТОГ: ПУСТО ({reason})",
-                    exit_code=0,
+                _retry_sqlite_busy(
+                    lambda: db.mark_completed(
+                        task.id,
+                        f"Предварительная проверка PromptPilot: {reason}\n"
+                        "Провайдер не запускался, токены не потрачены.\n\n"
+                        f"ИТОГ: ПУСТО ({reason})",
+                        exit_code=0, verdict="ПУСТО",
+                    ),
+                    f"завершение пустой pipeline-задачи #{task.id}",
                 )
                 print(f"  -> Completed without agent: {reason}")
                 return
 
     agent_prompt = effective_prompt(task)
+    require_closing_verdict = False
     if task.series_id:
         try:
             from . import pipeline_insights
@@ -707,13 +779,15 @@ def _execute_task_body(task, admission_complete=None):
             print(f"  !! pipeline execution route unavailable for #{task.id}: {exc}", flush=True)
         if route["action"] == "block":
             reason = route["reason"]
-            db.set_verdict(task.id, "НУЖЕН ЧЕЛОВЕК")
-            db.mark_completed(
-                task.id,
-                f"Предварительная проверка PromptPilot: {reason}\n"
-                "Провайдер не запускался, токены не потрачены.\n\n"
-                f"ИТОГ: НУЖЕН ЧЕЛОВЕК ({reason})",
-                exit_code=0,
+            _retry_sqlite_busy(
+                lambda: db.mark_completed(
+                    task.id,
+                    f"Предварительная проверка PromptPilot: {reason}\n"
+                    "Провайдер не запускался, токены не потрачены.\n\n"
+                    f"ИТОГ: НУЖЕН ЧЕЛОВЕК ({reason})",
+                    exit_code=0, verdict="НУЖЕН ЧЕЛОВЕК",
+                ),
+                f"завершение заблокированной pipeline-задачи #{task.id}",
             )
             print(f"  -> Blocked without agent: {reason}")
             return
@@ -721,32 +795,45 @@ def _execute_task_body(task, admission_complete=None):
             reason = route["reason"]
             next_run = _pipeline_defer_time(route)
             if next_run:
-                db.defer_task(task.id, next_run, reason)
+                _retry_sqlite_busy(
+                    lambda: db.defer_task(task.id, next_run, reason),
+                    f"отложить pipeline-задачу #{task.id}",
+                )
                 print(f"  -> Pipeline preflight deferred without agent: {reason}")
                 return
-            db.set_verdict(task.id, "НУЖЕН ЧЕЛОВЕК")
-            db.mark_completed(
-                task.id,
-                f"Pipeline preflight PromptPilot: {reason}\n"
-                "Некорректное время повтора pipeline preflight\n\n"
-                f"ИТОГ: НУЖЕН ЧЕЛОВЕК ({reason})",
-                exit_code=0,
+            _retry_sqlite_busy(
+                lambda: db.mark_completed(
+                    task.id,
+                    f"Pipeline preflight PromptPilot: {reason}\n"
+                    "Некорректное время повтора pipeline preflight\n\n"
+                    f"ИТОГ: НУЖЕН ЧЕЛОВЕК ({reason})",
+                    exit_code=0, verdict="НУЖЕН ЧЕЛОВЕК",
+                ),
+                f"завершение ошибочной pipeline-задачи #{task.id}",
             )
             return
         if route["action"] == "complete_empty":
             reason = route["reason"]
             verdict = route.get("verdict") or "ПУСТО"
-            db.set_verdict(task.id, verdict)
-            db.mark_completed(
-                task.id,
-                f"Pipeline preflight PromptPilot: {reason}\n"
-                "Провайдер не запускался, токены не потрачены.\n\n"
-                f"ИТОГ: {verdict} ({reason})",
-                exit_code=0,
+            _retry_sqlite_busy(
+                lambda: db.mark_completed(
+                    task.id,
+                    f"Pipeline preflight PromptPilot: {reason}\n"
+                    "Провайдер не запускался, токены не потрачены.\n\n"
+                    f"ИТОГ: {verdict} ({reason})",
+                    exit_code=0, verdict=verdict,
+                ),
+                f"завершение pipeline-задачи #{task.id} без провайдера",
             )
             print(f"  -> Pipeline preflight completed without agent: {reason}")
             return
         agent_prompt = route["prompt"]
+        require_closing_verdict = bool(
+            route.get("profile_id") and route.get("queue_id")
+        )
+        if require_closing_verdict:
+            from .herdr_exec import ensure_closing_verdict_contract
+            agent_prompt = ensure_closing_verdict_contract(agent_prompt)
         if route.get("fallback_reason"):
             if route.get("next_already_run"):
                 print("  -> Pipeline tool selected target; continuing full skill: "
@@ -755,11 +842,6 @@ def _execute_task_body(task, admission_complete=None):
                 print(f"  -> Pipeline tool unavailable, using skill: {route['fallback_reason']}")
         elif route.get("mode") == "tool":
             print(f"  -> Pipeline tool route: {route['queue_id']}")
-
-    # The GitHub scan lease is gone and a provider-spanning budget reservation,
-    # when needed, is already durable.  A lower-priority task may now run its
-    # own admission while this provider continues in parallel.
-    _signal_admission_complete(admission_complete)
 
     provider = task.provider or DEFAULT_CLI
 
@@ -778,9 +860,23 @@ def _execute_task_body(task, admission_complete=None):
     if provider_cfg.get("executor") == "herdr":
         # herdr sessions work the same way on any machine: the CLI calls go
         # over ssh, the pane lives there (attach with `herdr --remote <host>`).
-        _execute_herdr_task(task, provider_cfg, host=host, machine=machine,
-                            prompt_override=agent_prompt)
+        try:
+            _execute_herdr_task(
+                task, provider_cfg, host=host, machine=machine,
+                prompt_override=agent_prompt,
+                admission_complete=admission_complete,
+                require_closing_verdict=require_closing_verdict,
+            )
+        finally:
+            # Startup failures have no on_started callback.  Once their durable
+            # outcome is recorded they must not strand the admission fence.
+            _signal_admission_complete(admission_complete)
         return
+
+    # The GitHub scan lease is gone and a provider-spanning budget reservation,
+    # when needed, is already durable.  Non-herdr providers have no intermediate
+    # pane bookkeeping, so a lower-priority task may begin admission now.
+    _signal_admission_complete(admission_complete)
 
     # The task's own checkout, when it asked for one. Done before the CLI starts
     # so the agent only ever sees the isolated tree.
@@ -989,6 +1085,7 @@ def _execute_task_body(task, admission_complete=None):
     if is_stream_json(result.stdout):
         parsed = parse_stream_json(result.stdout)
         output = format_result(parsed)
+        verdict_source = parsed["text"]
         model_used = parsed["meta"].get("model")
         session_id = parsed["meta"].get("session_id")
         # Check for rate limit in stream events — only if no text was returned
@@ -1006,11 +1103,25 @@ def _execute_task_body(task, admission_complete=None):
     else:
         # Plain text output (non-Claude CLIs)
         output = result.stdout
+        verdict_source = output
 
-    verdict = parse_verdict(output)
-    if verdict:
-        db.set_verdict(task.id, verdict)
-
+    if require_closing_verdict:
+        from .herdr_exec import _closing_workflow_verdict
+        verdict = _closing_workflow_verdict(verdict_source)
+        if not verdict:
+            _retry_sqlite_busy(
+                lambda: db.mark_failed(
+                    task.id,
+                    "Pipeline provider returned success without a closing ИТОГ verdict\n"
+                    + output[-4000:],
+                    exit_code=1,
+                ),
+                f"отклонение неполного результата задачи #{task.id}",
+            )
+            print("  -> Failed (pipeline result has no closing verdict)")
+            return
+    else:
+        verdict = parse_verdict(output)
     changes = None
     if wt_note:
         output += wt_note
@@ -1018,7 +1129,13 @@ def _execute_task_body(task, admission_complete=None):
         if changes and changes != worktree.NO_CHANGES:
             output += f"\nИзменения: {changes}"
 
-    db.mark_completed(task.id, output, exit_code=0, model_used=model_used, session_id=session_id)
+    _retry_sqlite_busy(
+        lambda: db.mark_completed(
+            task.id, output, exit_code=0, model_used=model_used,
+            session_id=session_id, verdict=verdict or None,
+        ),
+        f"завершение задачи #{task.id}",
+    )
     text_preview = output[:80].replace("\n", " ").strip()
     print(f"  -> Completed: {text_preview}")
 
