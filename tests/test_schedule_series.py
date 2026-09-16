@@ -332,6 +332,33 @@ def test_series_settings_persist_and_update_pending_occurrence(isolated_db):
     assert occurrence.priority == 2
 
 
+def test_series_provider_switch_clears_pending_provider_runtime(isolated_db):
+    task = isolated_db.create_task(TaskCreate(
+        prompt="Review", recurrence="4h", provider="codex",
+        model="gpt-old", effort="max",
+    ))
+    claimed = isolated_db.get_next_runnable()
+    assert isolated_db.set_session_id(claimed.id, "old-provider-session") is True
+    isolated_db.mark_rate_limited(
+        claimed.id, datetime.now(timezone.utc) + timedelta(hours=1),
+        "old provider exhausted",
+    )
+
+    assert isolated_db.update_series(task.series_id, {
+        "provider": "agy", "model": None, "effort": None,
+    })
+
+    occurrence = isolated_db.get_task(task.id)
+    assert occurrence.status.value == "pending"
+    assert occurrence.provider == "agy"
+    assert occurrence.model is None
+    assert occurrence.effort is None
+    assert occurrence.session_id is None
+    assert occurrence.retry_count == 0
+    assert occurrence.error is None
+    assert occurrence.next_run_at is None
+
+
 def test_shorter_series_interval_reschedules_existing_future_occurrence(isolated_db):
     original = datetime.now(timezone.utc) + timedelta(hours=4)
     task = isolated_db.create_task(TaskCreate(
@@ -2070,7 +2097,7 @@ def test_worker_internal_failure_keeps_recurring_series_alive(isolated_db, monke
     monkeypatch.setattr(workflows, "sync_task", lambda _task_id: None)
     monkeypatch.setattr(workflows, "advance_linked_task", lambda _task_id: None)
 
-    worker._fail_stuck(running.id, RuntimeError("boom"))
+    assert worker._fail_stuck(running, RuntimeError("boom")) is True
 
     failed = isolated_db.get_task(running.id)
     series = next(item for item in isolated_db.list_series()

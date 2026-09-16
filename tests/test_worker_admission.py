@@ -1,3 +1,5 @@
+from concurrent.futures import Future
+from datetime import datetime, timezone
 import threading
 from types import SimpleNamespace
 
@@ -117,3 +119,65 @@ def test_equal_priority_and_creation_time_claim_by_id(isolated_db):
         )
 
     assert isolated_db.get_next_runnable().id == first.id
+
+
+def test_unhandled_future_recovery_retries_with_backoff(monkeypatch):
+    task = SimpleNamespace(
+        id=44,
+        started_at=datetime(2026, 9, 16, tzinfo=timezone.utc),
+    )
+    future = Future()
+    future.set_exception(RuntimeError("database is locked"))
+    in_flight = {future: ("local:repo", task)}
+    recoveries = {}
+    attempts = []
+
+    def recover(candidate, exc):
+        attempts.append((candidate, exc))
+        return len(attempts) > 2
+
+    monkeypatch.setattr(worker, "_fail_stuck", recover)
+    monkeypatch.setattr(worker, "POLL_INTERVAL", 2)
+    monkeypatch.setattr(worker, "MAX_DELAY", 30)
+
+    worker._reap_futures(in_flight, recoveries, now=100.0)
+
+    assert in_flight == {}
+    assert len(attempts) == 1
+    recovery = next(iter(recoveries.values()))
+    assert recovery["lock"] == "local:repo"
+    assert recovery["retry_at"] == 102.0
+
+    worker._reap_futures(in_flight, recoveries, now=101.9)
+    assert len(attempts) == 1
+    assert recoveries
+
+    worker._reap_futures(in_flight, recoveries, now=102.0)
+    assert len(attempts) == 2
+    recovery = next(iter(recoveries.values()))
+    assert recovery["retry_at"] == 106.0
+
+    worker._reap_futures(in_flight, recoveries, now=105.9)
+    assert len(attempts) == 2
+    assert recoveries
+
+    worker._reap_futures(in_flight, recoveries, now=106.0)
+    assert len(attempts) == 3
+    assert recoveries == {}
+
+
+def test_delayed_internal_recovery_cannot_fail_newer_attempt(isolated_db):
+    created = isolated_db.create_task(TaskCreate(prompt="attempt fenced"))
+    first = isolated_db.get_next_runnable()
+    assert first.id == created.id
+    assert isolated_db.reset_task(created.id) is True
+    second = isolated_db.get_next_runnable()
+    assert second.id == created.id
+    assert second.started_at != first.started_at
+
+    assert worker._fail_stuck(first, RuntimeError("old crash")) is True
+
+    current = isolated_db.get_task(created.id)
+    assert current.status.value == "running"
+    assert current.started_at == second.started_at
+    assert current.error is None
