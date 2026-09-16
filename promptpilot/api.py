@@ -952,10 +952,13 @@ def api_herdr_agents(machine: str = ""):
 
     def _cli_json(*args):
         try:
-            proc = _sp.run(herdr_argv(args, host), capture_output=True, text=True,
-                           timeout=20, stdin=_sp.DEVNULL)
-            return _json.loads(proc.stdout.strip() or "{}")
-        except (OSError, ValueError, _sp.TimeoutExpired):
+            proc = _sp.run(
+                herdr_argv(args, host), capture_output=True, text=True,
+                encoding="utf-8", errors="replace",
+                timeout=20, stdin=_sp.DEVNULL,
+            )
+            return _json.loads((proc.stdout or "").strip() or "{}")
+        except (OSError, TypeError, ValueError, _sp.TimeoutExpired):
             return {}
 
     data = _cli_json("agent", "list")

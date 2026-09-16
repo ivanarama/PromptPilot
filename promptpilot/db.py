@@ -805,20 +805,24 @@ def mark_rate_limited(task_id: int, next_run_at: datetime, error: str = None):
         _drop_cancel_flag(conn, task_id)
 
 
-def defer_task(task_id: int, next_run_at: datetime, reason: str = None):
+def defer_task(task_id: int, next_run_at: datetime, reason: str = None,
+               *, hard_not_before: bool = False):
     """Return a claimed task to pending without consuming a retry attempt.
 
     Used by deterministic pipeline dependency gates. This is waiting, not a
     provider failure and not a completed run, so retry and run metrics must not
-    move.
+    move.  A hard deadline is additionally stored in ``next_run_at`` so
+    automatic queue wake-ups cannot spend GitHub quota before the exact reset;
+    an explicit human ``run_now`` still clears that barrier intentionally.
     """
+    deadline = _to_utc_iso(next_run_at)
     with _connect() as conn:
         conn.execute(
             """UPDATE tasks SET status = 'pending', scheduled_at = ?,
-                      next_run_at = NULL, started_at = NULL,
+                      next_run_at = ?, started_at = NULL,
                       error = COALESCE(?, error)
                WHERE id = ? AND status = 'running'""",
-            (_to_utc_iso(next_run_at), reason, task_id),
+            (deadline, deadline if hard_not_before else None, reason, task_id),
         )
         _drop_cancel_flag(conn, task_id)
 
@@ -1069,12 +1073,26 @@ def request_pipeline_series_wake(series_id: int) -> dict:
         now = _now()
         moved = conn.execute(
             """UPDATE tasks SET scheduled_at = ?, next_run_at = NULL
-               WHERE series_id = ? AND status = 'pending'""",
-            (now, series_id),
+               WHERE series_id = ? AND status = 'pending'
+                 AND (next_run_at IS NULL OR next_run_at <= ?)""",
+            (now, series_id, now),
         )
         if moved.rowcount:
             conn.execute("DELETE FROM settings WHERE key = ?", (key,))
             return {"accepted": True, "state": "scheduled"}
+        if conn.execute(
+                """SELECT 1 FROM tasks
+                   WHERE series_id = ? AND status = 'pending'
+                     AND next_run_at > ?""",
+                (series_id, now),
+        ).fetchone():
+            # GitHub reset/budget deadlines are stronger than an automatic
+            # successor wake. Preserve the signal for the next occurrence.
+            conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, '1')",
+                (key,),
+            )
+            return {"accepted": True, "state": "latched_deferred"}
         if conn.execute(
                 "SELECT 1 FROM tasks WHERE series_id = ? AND status = 'rate_limited'",
                 (series_id,),
@@ -1170,10 +1188,12 @@ def consume_pipeline_series_wake(series_id: int) -> bool:
         if not series or series["paused"] or series["ended_at"]:
             conn.execute("DELETE FROM settings WHERE key = ?", (key,))
             return False
+        now = _now()
         moved = conn.execute(
             """UPDATE tasks SET scheduled_at = ?, next_run_at = NULL
-               WHERE series_id = ? AND status = 'pending'""",
-            (_now(), series_id),
+               WHERE series_id = ? AND status = 'pending'
+                 AND (next_run_at IS NULL OR next_run_at <= ?)""",
+            (now, series_id, now),
         )
         if not moved.rowcount:
             return False
@@ -1338,11 +1358,27 @@ def wake_series_once(series_id: Optional[int], latch_key: str,
         now = _now()
         task = conn.execute(
             """UPDATE tasks SET scheduled_at = ?, next_run_at = NULL
-               WHERE series_id = ? AND status IN ('pending', 'rate_limited')""",
-            (now, series_id),
+               WHERE series_id = ? AND status IN ('pending', 'rate_limited')
+                 AND (next_run_at IS NULL OR next_run_at <= ?)""",
+            (now, series_id, now),
         )
         if not task.rowcount:
-            return False
+            deferred = conn.execute(
+                """SELECT 1 FROM tasks
+                   WHERE series_id = ?
+                     AND status IN ('pending', 'rate_limited')
+                     AND next_run_at > ?""",
+                (series_id, now),
+            ).fetchone()
+            if deferred is None:
+                return False
+            # Accept this diagnostic snapshot exactly once, but retain both
+            # the hard deadline and a durable request for the successor.
+            wake_key = _pipeline_series_wake_intent_key(series_id)
+            conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, '1')",
+                (wake_key,),
+            )
         conn.execute(
             "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
             (latch_key, fingerprint),

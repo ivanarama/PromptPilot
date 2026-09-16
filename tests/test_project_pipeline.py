@@ -306,12 +306,36 @@ def test_health_fast_forwards_clean_base_before_checker(monkeypatch):
 
     assert result["state"] == "green"
     assert calls == [
-        ["git", "branch", "--show-current"],
-        ["git", "status", "--porcelain", "--untracked-files=no"],
-        ["git", "fetch", "origin", "--prune"],
-        ["git", "merge", "--ff-only", "origin/main"],
+        ["git", "-c", "maintenance.auto=false", "branch", "--show-current"],
+        ["git", "-c", "maintenance.auto=false", "status", "--porcelain", "--untracked-files=no"],
+        ["git", "-c", "maintenance.auto=false", "fetch", "origin", "--prune"],
+        ["git", "-c", "maintenance.auto=false", "merge", "--ff-only", "origin/main"],
         ["project-health", "-json"],
     ]
+
+
+def test_base_sync_disables_auto_maintenance_and_bounds_git(monkeypatch):
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        if command[-2:] == ["branch", "--show-current"]:
+            return SimpleNamespace(returncode=0, stdout="main\n", stderr="")
+        if command[-3:] == ["status", "--porcelain", "--untracked-files=no"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr(pp.subprocess, "run", fake_run)
+
+    with pytest.raises(pp.PipelineError, match="git fetch timed out after 7s"):
+        pp.sync_base_before_health({
+            "base_branch": "main", "sync_base_before_health": True,
+            "base_sync_timeout_seconds": 7,
+        })
+
+    assert all(call[:3] == ["git", "-c", "maintenance.auto=false"]
+               for call, _kwargs in calls)
+    assert all(kwargs["timeout"] == 7 for _call, kwargs in calls)
 
 
 def test_next_review_reloads_config_after_base_sync(tmp_path, monkeypatch, capsys):
@@ -342,13 +366,13 @@ def test_next_review_reloads_config_after_base_sync(tmp_path, monkeypatch, capsy
 
     def fake_run(command, **_kwargs):
         calls.append(command)
-        if command == ["git", "branch", "--show-current"]:
+        if command == ["git", "-c", "maintenance.auto=false", "branch", "--show-current"]:
             return SimpleNamespace(returncode=0, stdout="main\n", stderr="")
-        if command == ["git", "status", "--porcelain", "--untracked-files=no"]:
+        if command == ["git", "-c", "maintenance.auto=false", "status", "--porcelain", "--untracked-files=no"]:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
-        if command == ["git", "fetch", "origin", "--prune"]:
+        if command == ["git", "-c", "maintenance.auto=false", "fetch", "origin", "--prune"]:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
-        if command == ["git", "merge", "--ff-only", "origin/main"]:
+        if command == ["git", "-c", "maintenance.auto=false", "merge", "--ff-only", "origin/main"]:
             config_path.write_text(json.dumps(updated), encoding="utf-8")
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         if command in (["old-health", "-json"], ["new-health", "-json"]):
@@ -399,13 +423,13 @@ def test_complete_review_fails_closed_if_gate_changes_during_sync(
     }), encoding="utf-8")
 
     def fake_run(command, **_kwargs):
-        if command == ["git", "branch", "--show-current"]:
+        if command == ["git", "-c", "maintenance.auto=false", "branch", "--show-current"]:
             return SimpleNamespace(returncode=0, stdout="main\n", stderr="")
-        if command == ["git", "status", "--porcelain", "--untracked-files=no"]:
+        if command == ["git", "-c", "maintenance.auto=false", "status", "--porcelain", "--untracked-files=no"]:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
-        if command == ["git", "fetch", "origin", "--prune"]:
+        if command == ["git", "-c", "maintenance.auto=false", "fetch", "origin", "--prune"]:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
-        if command == ["git", "merge", "--ff-only", "origin/main"]:
+        if command == ["git", "-c", "maintenance.auto=false", "merge", "--ff-only", "origin/main"]:
             config_path.write_text(json.dumps(updated), encoding="utf-8")
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         if command == ["project-health", "-json"]:

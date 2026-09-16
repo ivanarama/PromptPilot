@@ -269,6 +269,12 @@ def load_config(path: str) -> dict:
         raise PipelineError("fallback_handoff must be legacy or target-v1")
     if not isinstance(data.get("sync_base_before_health", False), bool):
         raise PipelineError("sync_base_before_health must be a boolean")
+    data.setdefault("base_sync_timeout_seconds", 60)
+    if (not isinstance(data["base_sync_timeout_seconds"], int)
+            or isinstance(data["base_sync_timeout_seconds"], bool)
+            or not 5 <= data["base_sync_timeout_seconds"] <= 300):
+        raise PipelineError(
+            "base_sync_timeout_seconds must be an integer from 5 to 300")
     if data["review_completion_gate"] not in {"health", "target-v1"}:
         raise PipelineError("review_completion_gate must be health or target-v1")
     if (not isinstance(data["review_lease_seconds"], int) or
@@ -330,11 +336,19 @@ def sync_base_before_health(config: dict) -> bool:
         return False
 
     base = str(config.get("base_branch") or "main")
+    timeout = int(config.get("base_sync_timeout_seconds", 60))
+
     def git(*args: str):
-        result = subprocess.run(
-            ["git", *args], capture_output=True, text=True,
-            encoding="utf-8", errors="replace",
-        )
+        command = ["git", "-c", "maintenance.auto=false", *args]
+        try:
+            result = subprocess.run(
+                command, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise PipelineError(
+                f"cannot synchronize {base} before health: "
+                f"git {args[0]} timed out after {timeout}s") from exc
         if result.returncode:
             detail = (result.stderr or result.stdout or "git command failed").strip()
             raise PipelineError(f"cannot synchronize {base} before health: {detail}")
