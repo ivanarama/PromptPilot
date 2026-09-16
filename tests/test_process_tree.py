@@ -1,4 +1,6 @@
+import json
 import os
+import sqlite3
 import subprocess
 import sys
 import time
@@ -355,6 +357,47 @@ def test_rate_limit_is_not_requeued_when_owned_close_is_unverified(monkeypatch):
     assert "still running" in outcome["error"]
 
 
+def test_pane_bookkeeping_failure_closes_tab_before_agent_start(monkeypatch):
+    calls = []
+    closed = []
+
+    def fake_run(args, host=None, timeout=None):
+        calls.append(args)
+        if args[:2] == ["tab", "create"]:
+            return 0, {"result": {
+                "root_pane": {"pane_id": "pane-1"},
+                "tab": {"tab_id": "tab-1"},
+            }}, ""
+        raise AssertionError(args)
+
+    task = SimpleNamespace(
+        id=42, herdr_target=None, model=None, effort=None, session_id=None,
+        skip_permissions=False, detached=False, working_dir=".", worktree=False,
+    )
+    monkeypatch.setattr(herdr_exec, "_ensure_server", lambda _host: None)
+    monkeypatch.setattr(herdr_exec, "_close_stale_tabs", lambda *_args: None)
+    monkeypatch.setattr(herdr_exec, "_run", fake_run)
+    monkeypatch.setattr(
+        herdr_exec, "_close_owned_session",
+        lambda name, close_args, host: closed.append(
+            (name, close_args, host)) or "",
+    )
+
+    outcome = herdr_exec.run_in_herdr(
+        task, {"kind": "agy"},
+        on_pane=lambda _pane: (_ for _ in ()).throw(
+            sqlite3.OperationalError("database is locked")),
+        prompt_override="test prompt",
+    )
+
+    assert outcome["ok"] is False
+    assert "pane bookkeeping failed before agent start" in outcome["error"]
+    assert len(closed) == 1
+    assert closed[0][0].startswith("pp-t42-")
+    assert closed[0][1:] == (["tab", "close", "tab-1"], None)
+    assert not any(call[:2] == ["agent", "start"] for call in calls)
+
+
 def test_cancel_does_not_close_foreign_herdr_target(monkeypatch):
     calls = []
 
@@ -446,3 +489,88 @@ def test_worker_cancel_kills_provider_descendant(isolated_db, monkeypatch, tmp_p
     descendant_pid = int(child_pid_file.read_text())
     assert settled.status.value == "cancelled"
     assert _wait_not_running(descendant_pid)
+
+
+def test_headless_pipeline_success_without_closing_verdict_is_failed(
+        isolated_db, monkeypatch, tmp_path):
+    created = isolated_db.create_task(TaskCreate(
+        prompt="ExampleProject - REVIEW", recurrence="4h",
+        provider="process-tree-test", working_dir=str(tmp_path),
+    ))
+    task = isolated_db.get_next_runnable()
+    assert task.id == created.id
+
+    from promptpilot import pipeline_insights
+
+    monkeypatch.setattr(pipeline_insights, "dispatch_gate", lambda _task: None)
+    monkeypatch.setattr(
+        pipeline_insights, "execution_route",
+        lambda *_args, **_kwargs: {
+            "action": "prompt", "mode": "skill", "prompt": task.prompt,
+            "profile_id": "example", "queue_id": "review",
+        },
+    )
+    monkeypatch.setattr(worker, "load_providers", lambda: {"process-tree-test": {}})
+    monkeypatch.setattr(
+        worker, "build_cmd",
+        lambda *_args, **_kwargs: [
+            sys.executable, "-c", "print('work ended without verdict')",
+        ],
+    )
+    monkeypatch.setattr(worker, "get_provider_env", lambda _provider: os.environ.copy())
+
+    worker._execute_task_inner(task)
+
+    settled = isolated_db.get_task(task.id)
+    assert settled.status.value == "failed"
+    assert "without a closing ИТОГ verdict" in settled.error
+
+
+def test_headless_stream_pipeline_validates_verdict_before_stored_meta(
+        isolated_db, monkeypatch, tmp_path):
+    created = isolated_db.create_task(TaskCreate(
+        prompt="ExampleProject - REVIEW", recurrence="4h",
+        provider="process-tree-test", working_dir=str(tmp_path),
+    ))
+    task = isolated_db.get_next_runnable()
+    assert task.id == created.id
+
+    from promptpilot import pipeline_insights
+
+    events = [
+        {"type": "thread.started", "thread_id": "thread-603"},
+        {"type": "item.completed", "item": {
+            "type": "agent_message", "text": "ИТОГ: ГОТОВО (reviewed #1414)",
+        }},
+        {"type": "turn.completed", "usage": {
+            "input_tokens": 120, "cached_input_tokens": 80,
+            "output_tokens": 30, "reasoning_output_tokens": 10,
+        }},
+    ]
+    encoded_events = json.dumps(events, ensure_ascii=True)
+    script = (
+        "import json; events=json.loads(" + repr(encoded_events)
+        + "); [print(json.dumps(event)) for event in events]"
+    )
+    monkeypatch.setattr(pipeline_insights, "dispatch_gate", lambda _task: None)
+    monkeypatch.setattr(
+        pipeline_insights, "execution_route",
+        lambda *_args, **_kwargs: {
+            "action": "prompt", "mode": "skill", "prompt": task.prompt,
+            "profile_id": "example", "queue_id": "review",
+        },
+    )
+    monkeypatch.setattr(worker, "load_providers", lambda: {"process-tree-test": {}})
+    monkeypatch.setattr(
+        worker, "build_cmd", lambda *_args, **_kwargs: [sys.executable, "-c", script],
+    )
+    monkeypatch.setattr(worker, "get_provider_env", lambda _provider: os.environ.copy())
+
+    worker._execute_task_inner(task)
+
+    settled = isolated_db.get_task(task.id)
+    assert settled.status.value == "completed"
+    assert settled.verdict == "ГОТОВО"
+    assert settled.session_id == "thread-603"
+    assert "--- Meta ---" in settled.result
+    assert "Tokens: 120 in / 30 out" in settled.result

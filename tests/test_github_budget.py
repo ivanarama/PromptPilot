@@ -301,6 +301,7 @@ def test_legacy_or_disabled_budget_does_not_add_worker_admission_calls(
 
     assert route == {
         "action": "prompt", "mode": "skill", "prompt": task.prompt,
+        "profile_id": "example", "queue_id": "review",
     }
 
 
@@ -320,6 +321,7 @@ def test_legacy_budget_without_costs_keeps_floor_check_but_never_reserves(
 
     assert route == {
         "action": "prompt", "mode": "skill", "prompt": task.prompt,
+        "profile_id": "example", "queue_id": "review",
     }
     assert isolated_db.pipeline_github_budget_reservations(
         "github-default") == {

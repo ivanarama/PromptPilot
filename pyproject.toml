@@ -33,8 +33,8 @@ dev = [
 ]
 
 [project.scripts]
-pp = "promptpilot.cli:cli"
-promptpilot = "promptpilot.cli:cli"
+pp = "promptpilot.entrypoint:main"
+promptpilot = "promptpilot.entrypoint:main"
 
 [build-system]
 requires = ["setuptools>=68"]

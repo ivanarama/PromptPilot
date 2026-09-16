@@ -2108,6 +2108,20 @@ def test_worker_internal_failure_keeps_recurring_series_alive(isolated_db, monke
     assert series["next_status"] == "pending"
 
 
+def test_mark_completed_commits_verdict_and_clears_note_atomically(isolated_db):
+    created = isolated_db.create_task(TaskCreate(prompt="atomic completion"))
+    isolated_db.set_note(created.id, "late instruction")
+
+    isolated_db.mark_completed(
+        created.id, "ИТОГ: ГОТОВО (done)", verdict="ГОТОВО",
+    )
+
+    completed = isolated_db.get_task(created.id)
+    assert completed.status.value == "completed"
+    assert completed.verdict == "ГОТОВО"
+    assert completed.note is None
+
+
 def test_pipeline_execution_auto_uses_tool_when_available(isolated_db, monkeypatch, tmp_path):
     helper = tmp_path / "pipelinectl.py"
     helper.write_text(
@@ -2139,6 +2153,34 @@ def test_pipeline_execution_auto_uses_tool_when_available(isolated_db, monkeypat
     assert '"lease": "abc"' in route["prompt"]
     assert "Не запускай next повторно" in route["prompt"]
     assert "/review-queue" in route["prompt"]
+    assert route["profile_id"] == "example"
+    assert route["queue_id"] == "review"
+
+
+@pytest.mark.parametrize("execution", [None, {"mode": "skill"}])
+def test_pipeline_skill_routes_keep_matched_queue_identity(
+        isolated_db, monkeypatch, execution):
+    task = isolated_db.create_task(TaskCreate(
+        prompt="ExampleProject - REVIEW\n/review-queue", recurrence="4h",
+    ))
+    queue = {
+        "id": "review", "title": "Review", "query": "is:pr",
+        "series_contains": "ExampleProject - REVIEW",
+    }
+    if execution is not None:
+        queue["execution"] = execution
+    profile = {
+        "title": "Example", "repository": "owner/example",
+        "queues": [queue],
+    }
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"example": profile})
+
+    route = pipeline_insights.execution_route(task, task.prompt)
+
+    assert route == {
+        "action": "prompt", "mode": "skill", "prompt": task.prompt,
+        "profile_id": "example", "queue_id": "review",
+    }
 
 
 def test_pipeline_execution_auto_accepts_merge_cleanup_action(isolated_db, monkeypatch, tmp_path):
