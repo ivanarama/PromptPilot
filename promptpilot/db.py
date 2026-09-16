@@ -404,7 +404,10 @@ def _connect(immediate: bool = False):
         conn.close()
 
 
-def init_db():
+INIT_DB_BUSY_DELAYS = (0.1, 0.5, 1.0, 2.0, 4.0)
+
+
+def _init_db_once():
     with _connect() as conn:
         # Journal mode is persistent database state, not a per-connection
         # setting. Reasserting it on every connection needlessly turns an
@@ -438,6 +441,25 @@ def init_db():
             (WORKFLOW_STAGE_SCHEMA_VERSION, _now()),
         )
         _backfill_task_series(conn)
+
+
+def init_db():
+    """Initialize or migrate the database despite concurrent process startup.
+
+    The tray launches worker and server together.  Both import this module and
+    may reach the persistent ``journal_mode``/schema transaction at the same
+    time; some SQLite PRAGMAs report BUSY immediately instead of honoring the
+    connection timeout.  Retry the whole idempotent transaction, while still
+    surfacing I/O, corruption and every other OperationalError unchanged.
+    """
+    for attempt in range(len(INIT_DB_BUSY_DELAYS) + 1):
+        try:
+            return _init_db_once()
+        except sqlite3.OperationalError as exc:
+            busy = any(marker in str(exc).lower() for marker in ("locked", "busy"))
+            if not busy or attempt == len(INIT_DB_BUSY_DELAYS):
+                raise
+            time.sleep(INIT_DB_BUSY_DELAYS[attempt])
 
 
 def _series_title(prompt: str) -> str:
