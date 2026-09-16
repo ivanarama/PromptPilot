@@ -930,6 +930,10 @@ def _pipeline_text(data: dict) -> str:
     spendable = budget.get("spendable_before_route") or {}
     projected = budget.get("projected_post_reservation") or {}
     if budget.get("enabled"):
+        ledger_known = budget.get("ledger_state") != "unavailable"
+        reservation_count = (
+            budget.get("active_reservations", 0) if ledger_known else "—")
+        reserved_core = reserved.get("core", 0) if ledger_known else "—"
         problem = (budget.get("ledger_reason")
                    if budget.get("ledger_state") == "unavailable" else
                    budget.get("rate_snapshot_reason")
@@ -938,8 +942,8 @@ def _pipeline_text(data: dict) -> str:
         projected_core = projected.get("core") or {}
         lines.insert(
             4, "GitHub budget: "
-            f"активных резервов {budget.get('active_reservations', 0)}; "
-            f"REST зарезервировано {reserved.get('core', 0)}; "
+            f"активных резервов {reservation_count}; "
+            f"REST зарезервировано {reserved_core}; "
             "прогноз после резервирования (не GitHub remaining): "
             f"доступно {projected_core.get('available', '—')}, "
             f"дефицит {projected_core.get('deficit', '—')}; "
