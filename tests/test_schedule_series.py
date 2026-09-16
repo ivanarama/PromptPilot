@@ -403,6 +403,20 @@ def test_dependency_defer_returns_claimed_task_without_retry(isolated_db):
     assert deferred.error == "waiting for review"
 
 
+def test_series_exposes_active_occurrence_defer_reason(isolated_db):
+    task = isolated_db.create_task(TaskCreate(prompt="Review", recurrence="2h"))
+    claimed = isolated_db.get_next_runnable()
+    deferred_until = datetime.now(timezone.utc) + timedelta(minutes=10)
+    reason = "GitHub API-бюджет ниже безопасного остатка"
+
+    isolated_db.defer_task(claimed.id, deferred_until, reason)
+
+    series = isolated_db.get_series(task.series_id)
+    assert series["next_task_id"] == task.id
+    assert series["next_run_at"] == deferred_until.isoformat()
+    assert series["next_error"] == reason
+
+
 def test_reclaim_after_dependency_defer_clears_stale_error(isolated_db):
     task = isolated_db.create_task(TaskCreate(prompt="Merge"))
     claimed = isolated_db.get_next_runnable()

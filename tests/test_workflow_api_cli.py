@@ -233,6 +233,10 @@ def test_schedule_ui_exposes_durable_series_controls():
     assert "Читаю сохранённый снимок" in html
     assert "taskDisplayTitle(t)" in html
     assert "function taskStatusLabel(t)" in html
+    assert "function githubApiWait(t" in html
+    assert "return 'ждёт GitHub API'" in html
+    assert "ждёт GitHub API до ${when(githubWait.until)}" in html
+    assert "Причина: ${esc(githubWait.reason)}" in html
     assert "return 'scheduled'" in html
     assert "${taskStatusLabel(t)}" in html
     assert "if (t.series_paused)" in html

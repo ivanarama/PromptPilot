@@ -974,10 +974,22 @@ function renderResultMeta(parsed) {
 }
 
 // --- Schedule display ---
+function githubApiWait(t, now = new Date()) {
+  if (t.status !== 'pending' || !t.scheduled_at || new Date(t.scheduled_at) <= now) return null;
+  const reason = String(t.error || '');
+  if (!/github/i.test(reason) || !/(api|budget|бюджет|rate[ _-]*limit|лимит|reservation|scan|скан)/i.test(reason)) return null;
+  return {until: t.scheduled_at, reason};
+}
+
 function scheduleInfo(t) {
   if (t.status === 'completed' || t.status === 'failed' || t.status === 'cancelled') return '';
   if (t.status === 'running') return '<span class="task-schedule">running now</span>';
   if (t.series_paused) return '<span class="task-schedule paused" title="Recurring series is paused">PAUSED</span>';
+  const githubWait = githubApiWait(t);
+  if (githubWait) {
+    const until = new Date(githubWait.until).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
+    return `<span class="task-schedule" title="${escAttr(githubWait.reason)}">до ${until}</span>`;
+  }
   if (t.next_run_at) {
     return `<span class="task-schedule">retry ${formatTime(t.next_run_at)}</span>`;
   }
@@ -992,6 +1004,7 @@ function scheduleInfo(t) {
 function taskStatusLabel(t) {
   if (t.status !== 'pending') return t.status.replace('_', ' ');
   if (t.series_paused) return 'paused';
+  if (githubApiWait(t)) return 'ждёт GitHub API';
   if (t.scheduled_at && new Date(t.scheduled_at) > new Date()) return 'scheduled';
   return 'queued';
 }
@@ -2451,8 +2464,11 @@ async function openSchedule() {
       ? esc(`#${s.last_task_id} — ${STATUS_RU[s.last_status] || s.last_status}`
             + (s.last_verdict ? ` (${s.last_verdict})` : '') + `, ${when(s.last_at)}`)
       : 'ещё не запускалась';
+    const githubWait = githubApiWait({status: s.next_status, scheduled_at: s.next_run_at, error: s.next_error});
     const next = s.broken
       ? '<span style="color:var(--red)">серия оборвана — следующего запуска нет</span>'
+      : githubWait
+      ? `<span style="color:var(--yellow)" title="${escAttr(githubWait.reason)}">#${s.next_task_id} — ждёт GitHub API до ${when(githubWait.until)}</span><br><span title="${escAttr(githubWait.reason)}">Причина: ${esc(githubWait.reason)}</span>`
       : `#${s.next_task_id} — ${STATUS_RU[s.next_status] || s.next_status}, ${when(s.next_run_at)}`;
     const title = s.title || (s.prompt || '').split(/\r?\n/, 1)[0] || '(без названия)';
     const boost = s.temporary_recurrence

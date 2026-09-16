@@ -921,6 +921,7 @@ def list_series() -> list:
                 "next_task_id": active["id"] if active else None,
                 "next_status": active["status"] if active else None,
                 "next_run_at": active["scheduled_at"] if active else None,
+                "next_error": active["error"] if active else None,
                 "next_started_at": active["started_at"] if active else None,
                 "last_task_id": last["id"] if last else None,
                 "last_status": last["status"] if last else None,
