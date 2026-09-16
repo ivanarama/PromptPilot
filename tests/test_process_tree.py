@@ -117,6 +117,59 @@ def test_closing_after_root_exit_kills_lingering_descendant():
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows Job Object setup")
+def test_windows_close_terminates_job_with_retained_handle_not_unrelated_process():
+    """Normal completion must not depend on PromptPilot owning the last handle."""
+    import ctypes
+    from ctypes import wintypes
+
+    duplicate_same_access = 0x00000002
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetCurrentProcess.argtypes = []
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.DuplicateHandle.argtypes = [
+        wintypes.HANDLE, wintypes.HANDLE, wintypes.HANDLE,
+        ctypes.POINTER(wintypes.HANDLE), wintypes.DWORD, wintypes.BOOL,
+        wintypes.DWORD,
+    ]
+    kernel32.DuplicateHandle.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    spawn_and_exit = (
+        "import subprocess, sys; "
+        "child = subprocess.Popen([sys.executable, '-c', %r], "
+        "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); "
+        "print(child.pid, flush=True)"
+    ) % SLEEP_CODE
+    unrelated = subprocess.Popen([sys.executable, "-c", SLEEP_CODE])
+    tree = OwnedProcess.start(
+        [sys.executable, "-c", spawn_and_exit],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    retained_job = wintypes.HANDLE()
+    try:
+        current = kernel32.GetCurrentProcess()
+        assert kernel32.DuplicateHandle(
+            current, tree._job, current, ctypes.byref(retained_job),
+            0, False, duplicate_same_access,
+        )
+        descendant_pid = int(tree.process.stdout.readline().strip())
+        tree.process.stdout.close()
+        tree.process.wait(timeout=10)
+
+        tree.close()
+
+        assert _wait_not_running(descendant_pid)
+        assert unrelated.poll() is None
+    finally:
+        tree.close()
+        if retained_job:
+            kernel32.CloseHandle(retained_job)
+        _stop_unrelated(unrelated)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Job Object setup")
 @pytest.mark.parametrize("failure_point", ["assign", "resume"])
 def test_windows_boundary_setup_failure_kills_suspended_root(
         monkeypatch, failure_point):
@@ -489,6 +542,44 @@ def test_worker_cancel_kills_provider_descendant(isolated_db, monkeypatch, tmp_p
     descendant_pid = int(child_pid_file.read_text())
     assert settled.status.value == "cancelled"
     assert _wait_not_running(descendant_pid)
+
+
+def test_worker_success_kills_provider_descendant_not_unrelated(
+        isolated_db, monkeypatch, tmp_path):
+    child_pid_file = tmp_path / "completed-provider-child.pid"
+    spawn_record_and_exit = (
+        "import pathlib, subprocess, sys; "
+        "child = subprocess.Popen([sys.executable, '-c', %r], "
+        "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); "
+        "pathlib.Path(sys.argv[1]).write_text(str(child.pid)); "
+        "print('provider completed')"
+    ) % SLEEP_CODE
+    command = [
+        sys.executable, "-c", spawn_record_and_exit, str(child_pid_file),
+    ]
+    unrelated = subprocess.Popen([sys.executable, "-c", SLEEP_CODE])
+    created = isolated_db.create_task(TaskCreate(
+        prompt="test owned process normal completion",
+        provider="process-tree-test",
+        working_dir=str(tmp_path),
+    ))
+    task = isolated_db.get_next_runnable()
+    assert task.id == created.id
+
+    monkeypatch.setattr(worker, "load_providers", lambda: {"process-tree-test": {}})
+    monkeypatch.setattr(worker, "build_cmd", lambda *_args, **_kwargs: command.copy())
+    monkeypatch.setattr(worker, "get_provider_env", lambda _provider: os.environ.copy())
+
+    try:
+        worker._execute_task_inner(task)
+
+        settled = isolated_db.get_task(task.id)
+        descendant_pid = int(child_pid_file.read_text())
+        assert settled.status.value == "completed"
+        assert _wait_not_running(descendant_pid)
+        assert unrelated.poll() is None
+    finally:
+        _stop_unrelated(unrelated)
 
 
 def test_headless_pipeline_success_without_closing_verdict_is_failed(

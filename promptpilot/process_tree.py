@@ -261,7 +261,21 @@ class OwnedProcess:
         if os.name == "nt":
             job, self._job = self._job, None
             if job:
-                _CloseHandle(job)  # KILL_ON_JOB_CLOSE is the cleanup guarantee.
+                # Do not rely only on KILL_ON_JOB_CLOSE.  A provider or one of
+                # its native helpers can retain/duplicate a handle to the job,
+                # in which case closing our handle is not the last close and
+                # descendants would survive a normally completed wrapper.
+                #
+                # Terminate the private kernel job itself: unlike a PID/PPID
+                # walk this cannot race PID reuse and cannot select an
+                # unrelated process.  Detached tasks never enter this job.
+                error = None
+                if not _TerminateJobObject(job, 1):
+                    error = _windows_error("TerminateJobObject during close failed")
+                if not _CloseHandle(job) and error is None:
+                    error = _windows_error("CloseHandle(job) failed")
+                if error is not None:
+                    raise error
             return
         group_id, self._group_id = self._group_id, None
         if group_id is not None:
