@@ -2701,7 +2701,10 @@ async function loadPipelineInsights(profile, refresh=false) {
     const spendableBudget = githubBudgetState.spendable_before_route || {};
     const projectedBudget = githubBudgetState.projected_post_reservation || {};
     const budgetFloor = githubBudgetState.minimum_remaining || {};
-    const reservationCount = Number(githubBudgetState.active_reservations || 0);
+    const ledgerKnown = githubBudgetState.ledger_state !== 'unavailable';
+    const reservationCount = ledgerKnown
+      ? Number(githubBudgetState.active_reservations || 0).toLocaleString()
+      : '—';
     const budgetNumber = (values, name) => values[name] == null ? '—' : Number(values[name]).toLocaleString();
     const projectedNumber = (name, field) => {
       const value = projectedBudget[name] && projectedBudget[name][field];
@@ -2717,7 +2720,7 @@ async function loadPipelineInsights(profile, refresh=false) {
       : githubBudgetState.allowed === false ? githubBudgetState.reason : '';
     const budgetMetric = githubBudgetState.enabled ? `<div class="pipeline-metric">
       <div class="pipeline-metric-label">GitHub budget в работе</div>
-      <div class="pipeline-metric-value">${reservationCount} · REST −${budgetNumber(reservedBudget, 'core')}</div>
+      <div class="pipeline-metric-value">${reservationCount} · REST −${ledgerKnown ? budgetNumber(reservedBudget, 'core') : '—'}</div>
       <div class="pipeline-metric-note">прогноз после активных резервов (не фактический GitHub remaining): REST доступно ${projectedNumber('core', 'available')}, дефицит ${projectedNumber('core', 'deficit')} · Search доступно ${projectedNumber('search', 'available')}, дефицит ${projectedNumber('search', 'deficit')} · GraphQL доступно ${projectedNumber('graphql', 'available')}, дефицит ${projectedNumber('graphql', 'deficit')}</div>
       <div class="pipeline-metric-note">можно выдать до hard reserve: REST ${budgetNumber(spendableBudget, 'core')} · Search ${budgetNumber(spendableBudget, 'search')} · GraphQL ${budgetNumber(spendableBudget, 'graphql')} · reserve REST ${budgetNumber(budgetFloor, 'core')}${budgetProblem ? ` · ${esc(budgetProblem)}` : ''}</div>
     </div>` : '';

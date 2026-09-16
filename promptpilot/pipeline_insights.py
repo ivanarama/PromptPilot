@@ -2672,7 +2672,15 @@ def _with_persisted_refresh_status(result: dict, profile_id: str,
 
 
 def _with_live_github_budget_state(result: dict, profile: dict) -> dict:
-    """Overlay last-known limits and live reservations using SQLite only."""
+    """Rebuild the public budget decision from local live state only.
+
+    A persisted refresh denial describes the admission attempt that produced
+    it.  Its reservation ledger may already have changed by the time the
+    dashboard is read, so copying ``allowed``/``state``/``reason`` from that
+    denial while refreshing only the counters produces a contradictory view.
+    Re-evaluate the zero-cost, before-route decision from the latest locally
+    observed GitHub limits and the current reservation ledger instead.
+    """
     try:
         policy = _github_budget_policy(profile)
         if policy is not None:
@@ -2688,38 +2696,83 @@ def _with_live_github_budget_state(result: dict, profile: dict) -> dict:
         return result
 
     data = copy.deepcopy(result)
-    budget = copy.deepcopy(data.get("github_budget") or {})
-    budget.setdefault("enabled", True)
-    budget.setdefault("lease_scope", policy["lease_scope"])
-    budget["minimum_remaining"] = dict(policy["minimum_remaining"])
-    # These are live-ledger projections. Never retain a projection copied from
-    # an older cached response when either local source is currently unreadable.
-    budget.pop("projected_post_reservation", None)
-    budget.pop("spendable_before_route", None)
+    # A cached payload may carry an older rate-limit object.  It is useful only
+    # when the durable snapshot can also provide its observation time; without
+    # that source it must not be presented as the current actual GitHub value.
+    data["github_rate_limit"] = None
+    data["github_rate_limit_observed_at"] = None
 
+    # The dashboard describes shared capacity before a future execution route
+    # is elected. Route admission remains a separate, costed decision in
+    # ``_reserve_execution_admission``.
+    policy = _budget_policy_for_route(policy, None)
+    now = time.time()
     snapshot = None
+    snapshot_reason = None
     try:
         snapshot = db.get_pipeline_github_rate_snapshot(policy["lease_scope"])
     except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
-        budget["rate_snapshot_state"] = "unavailable"
-        budget["rate_snapshot_reason"] = str(exc)
+        snapshot_reason = str(exc)
+    if snapshot is None and snapshot_reason is None:
+        snapshot_reason = "Локальный снимок GitHub /rate_limit отсутствует"
     if snapshot is not None:
         data["github_rate_limit"] = copy.deepcopy(snapshot["limits"])
         data["github_rate_limit_observed_at"] = _defer_at(
             snapshot["observed_at"])
-        budget["rate_snapshot_age_seconds"] = max(
-            0, round(time.time() - snapshot["observed_at"]))
 
+    reservations = None
+    ledger_reason = None
     try:
         reservations = db.pipeline_github_budget_reservations(
             policy["lease_scope"])
     except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
+        ledger_reason = str(exc)
+
+    if ledger_reason is not None:
+        decision = _budget_denied(
+            policy, state="ledger_unavailable",
+            reason=f"Журнал резервов GitHub API недоступен: {ledger_reason}",
+            now=now,
+            limits=(snapshot["limits"] if snapshot is not None else None),
+        )
+    elif snapshot is None:
+        decision = _budget_denied(
+            policy, state="rate_limit_unavailable",
+            reason=f"GitHub /rate_limit недоступен: {snapshot_reason}",
+            now=now,
+            reserved_other=reservations["totals"],
+            active_reservations=reservations["count"],
+        )
+    else:
+        decision = _evaluate_github_budget(
+            policy, snapshot["limits"], now=now,
+            reserved_other=reservations["totals"],
+            active_reservations=reservations["count"],
+        )
+
+    budget = _public_budget_decision(decision)
+    if snapshot is None:
+        budget["rate_snapshot_state"] = "unavailable"
+        budget["rate_snapshot_reason"] = snapshot_reason
+        budget.pop("effective_after", None)
+        budget.pop("projected_post_reservation", None)
+    else:
+        budget["rate_snapshot_state"] = "ok"
+        budget["rate_snapshot_age_seconds"] = max(
+            0, round(now - snapshot["observed_at"]))
+
+    if reservations is None:
         budget["ledger_state"] = "unavailable"
-        budget["ledger_reason"] = str(exc)
+        budget["ledger_reason"] = ledger_reason
+        # The denial helper uses numeric defaults, but zero would incorrectly
+        # claim that an unreadable ledger contains no reservations.
+        for key in (
+                "active_reservations", "reserved_other", "effective_after",
+                "projected_post_reservation", "spendable_before_route"):
+            budget.pop(key, None)
     else:
         totals = dict(reservations["totals"])
         budget["ledger_state"] = "ok"
-        budget["active_reservations"] = int(reservations["count"])
         budget["reserved_in_flight"] = totals
         route_counts = {}
         for item in reservations["items"]:
@@ -2727,17 +2780,10 @@ def _with_live_github_budget_state(result: dict, profile: dict) -> dict:
             route_counts[route] = route_counts.get(route, 0) + 1
         budget["reservation_routes"] = route_counts
         if snapshot is not None:
-            post_reservation = {
-                resource: snapshot["limits"][resource]["remaining"]
-                - totals[resource]
-                for resource in policy["minimum_remaining"]
-            }
-            budget["projected_post_reservation"] = \
-                _projected_post_reservation(
-                    post_reservation, policy["minimum_remaining"])
+            effective_after = decision["effective_after"]
             budget["spendable_before_route"] = {
                 resource: max(
-                    0, post_reservation[resource]
+                    0, effective_after[resource]
                     - policy["minimum_remaining"][resource])
                 for resource in policy["minimum_remaining"]
             }

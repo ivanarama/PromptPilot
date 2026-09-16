@@ -223,6 +223,8 @@ def test_opt_in_default_core_floor_covers_onebase_full_workflow():
 def test_low_budget_blocks_live_analysis_before_health_or_search(
         isolated_db, monkeypatch):
     profile = _profile()
+    assert isolated_db.record_pipeline_github_rate_snapshot(
+        "github-default", _limits(core=1))
     monkeypatch.setattr(
         pipeline_insights, "_profiles", lambda: {"example": profile})
     monkeypatch.setattr(
@@ -545,6 +547,132 @@ def test_cached_dashboard_overlays_latest_rate_snapshot_and_live_reservations(
     assert "доступно 800, дефицит 0" in text
 
 
+@pytest.mark.parametrize("stale_state", ["budget_in_flight", "low"])
+def test_cached_dashboard_recomputes_stale_denial_from_current_local_state(
+        isolated_db, monkeypatch, stale_state):
+    profile = _profile_with_costs(core=200)
+    monkeypatch.setattr(
+        pipeline_insights, "_profiles", lambda: {"example": profile})
+    observed_at = time.time() - 2
+    assert isolated_db.record_pipeline_github_rate_snapshot(
+        "github-default", _limits(core=1000), observed_at=observed_at)
+    stale_budget = {
+        "enabled": True, "allowed": False, "state": stale_state,
+        "reason": "stale cached denial",
+        "defer_until": "2099-01-01T00:00:00+00:00",
+        "active_reservations": 7,
+        "reserved_in_flight": {"core": 999, "search": 0, "graphql": 0},
+        "projected_post_reservation": {
+            "core": {"available": 1, "deficit": 0},
+        },
+        "ledger_state": "unavailable", "ledger_reason": "stale ledger error",
+        "rate_snapshot_state": "unavailable",
+        "rate_snapshot_reason": "stale snapshot error",
+    }
+    assert isolated_db.publish_pipeline_refresh_status(
+        "example", "owner/example", {
+            "refresh_blocked": stale_state,
+            "refresh_blocked_reason": "stale cached denial",
+            "refresh_deferred_until": "2099-01-01T00:00:00+00:00",
+            "github_rate_limit": _limits(core=1),
+            "github_budget": stale_budget,
+        })
+
+    result = pipeline_insights.read_cached("example", [])
+    budget = result["github_budget"]
+
+    # The cache notice is historical (the last refresh was deferred), while
+    # the budget object is an explicitly zero-cost, before-route live summary.
+    assert result["cache"]["refresh_blocked"] == stale_state
+    assert budget["allowed"] is True
+    assert budget["state"] == "ok"
+    assert budget["reason"] != "stale cached denial"
+    assert budget["defer_until"] is None
+    assert budget["active_reservations"] == 0
+    assert budget["reserved_in_flight"] == {
+        "core": 0, "search": 0, "graphql": 0,
+    }
+    assert budget["requested_cost"] == {
+        "core": 0, "search": 0, "graphql": 0,
+    }
+    assert budget["budget_route"] is None
+    assert budget["effective_after"]["core"] == 1000
+    assert budget["ledger_state"] == "ok"
+    assert budget["rate_snapshot_state"] == "ok"
+    assert "ledger_reason" not in budget
+    assert "rate_snapshot_reason" not in budget
+    assert result["github_rate_limit"]["core"]["remaining"] == 1000
+    assert datetime.fromisoformat(
+        result["github_rate_limit_observed_at"]).timestamp() == pytest.approx(
+            observed_at)
+    assert budget["projected_post_reservation"]["core"]["available"] == 1000
+    assert budget["spendable_before_route"]["core"] == 900
+
+
+def test_cached_dashboard_fails_closed_when_rate_snapshot_is_unavailable(
+        isolated_db, monkeypatch):
+    profile = _profile_with_costs(core=200)
+    monkeypatch.setattr(
+        pipeline_insights, "_profiles", lambda: {"example": profile})
+    monkeypatch.setattr(
+        isolated_db, "get_pipeline_github_rate_snapshot",
+        lambda _scope: (_ for _ in ()).throw(
+            sqlite3.OperationalError("snapshot database is locked")))
+    cached = {
+        "github_rate_limit": _limits(core=1000),
+        "github_rate_limit_observed_at": "2000-01-01T00:00:00+00:00",
+        "github_budget": {
+            "enabled": True, "allowed": True, "state": "ok",
+            "reason": "stale success",
+            "projected_post_reservation": {"core": {"available": 1000}},
+            "spendable_before_route": {"core": 900},
+        },
+    }
+
+    result = pipeline_insights._with_live_github_budget_state(cached, profile)
+    budget = result["github_budget"]
+
+    assert budget["allowed"] is False
+    assert budget["state"] == "rate_limit_unavailable"
+    assert budget["rate_snapshot_state"] == "unavailable"
+    assert "snapshot database is locked" in budget["rate_snapshot_reason"]
+    assert budget["ledger_state"] == "ok"
+    assert result["github_rate_limit"] is None
+    assert result["github_rate_limit_observed_at"] is None
+    assert "projected_post_reservation" not in budget
+    assert "spendable_before_route" not in budget
+
+
+def test_cached_dashboard_fails_closed_when_reservation_ledger_is_unavailable(
+        isolated_db, monkeypatch):
+    profile = _profile_with_costs(core=200)
+    monkeypatch.setattr(
+        pipeline_insights, "_profiles", lambda: {"example": profile})
+    assert isolated_db.record_pipeline_github_rate_snapshot(
+        "github-default", _limits(core=1000))
+    monkeypatch.setattr(
+        isolated_db, "pipeline_github_budget_reservations",
+        lambda _scope: (_ for _ in ()).throw(
+            sqlite3.OperationalError("ledger database is locked")))
+
+    result = pipeline_insights.read_cached("example", [])
+    budget = result["github_budget"]
+
+    assert budget["allowed"] is False
+    assert budget["state"] == "ledger_unavailable"
+    assert budget["ledger_state"] == "unavailable"
+    assert "ledger database is locked" in budget["ledger_reason"]
+    assert budget["rate_snapshot_state"] == "ok"
+    assert result["github_rate_limit"]["core"]["remaining"] == 1000
+    assert "active_reservations" not in budget
+    assert "reserved_in_flight" not in budget
+    assert "projected_post_reservation" not in budget
+    assert "spendable_before_route" not in budget
+    text = bot._pipeline_text(result)
+    assert "активных резервов —" in text
+    assert "REST зарезервировано —" in text
+
+
 def test_web_dashboard_labels_projection_as_non_actual_github_remaining():
     html = (Path(__file__).parents[1] / "promptpilot" / "static" /
             "index.html").read_text(encoding="utf-8")
@@ -553,6 +681,9 @@ def test_web_dashboard_labels_projection_as_non_actual_github_remaining():
     assert "прогноз после активных резервов (не фактический GitHub remaining)" \
         in html
     assert "дефицит ${projectedNumber('core', 'deficit')}" in html
+    assert "const ledgerKnown = githubBudgetState.ledger_state !== 'unavailable'" \
+        in html
+    assert "ledgerKnown ? budgetNumber(reservedBudget, 'core') : '—'" in html
 
 
 def test_success_completion_uses_local_successor_graph_without_github_scan(
@@ -844,6 +975,8 @@ def test_worker_inner_always_releases_durable_provider_reservation(
 def test_successful_budgeted_scan_publishes_under_lease(
         isolated_db, monkeypatch):
     profile = _profile()
+    assert isolated_db.record_pipeline_github_rate_snapshot(
+        "github-default", _limits())
     monkeypatch.setattr(
         pipeline_insights, "_profiles", lambda: {"example": profile})
     monkeypatch.setattr(
