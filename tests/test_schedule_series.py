@@ -424,13 +424,35 @@ def test_health_check_failure_is_not_reported_as_broken_invariant(monkeypatch):
 
 
 def test_github_rate_limits_are_normalized(monkeypatch, no_live_github_rate_limit):
-    monkeypatch.setattr(pipeline_insights, "_gh_api_json", lambda _args: {
-        "resources": {
-            "core": {"limit": 5000, "used": 125, "remaining": 4875, "reset": 1},
-            "search": {"limit": 30, "used": 2, "remaining": 28, "reset": 2},
-            "graphql": {"limit": 5000, "used": 0, "remaining": 5000, "reset": 3},
-        },
-    })
+    calls = []
+
+    def fake_api(args, input_value=None):
+        calls.append((args, input_value))
+        if args == ["rate_limit"]:
+            return {
+                "resources": {
+                    "core": {"limit": 5000, "used": 125,
+                             "remaining": 4875, "reset": 1},
+                    "search": {"limit": 30, "used": 2,
+                               "remaining": 28, "reset": 2},
+                    # This endpoint can report a different GraphQL bucket.
+                    "graphql": {"limit": 5000, "used": 0,
+                                "remaining": 5000, "reset": 3},
+                },
+            }
+        assert args == ["graphql"]
+        return {
+            "data": {
+                "viewer": {"login": "owner"},
+                "rateLimit": {
+                    "limit": 5000, "used": 679, "remaining": 4321,
+                    "resetAt": "1970-01-01T00:00:04Z",
+                },
+            },
+        }
+
+    monkeypatch.setattr(pipeline_insights, "_gh_api_json", fake_api)
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {})
 
     limits = no_live_github_rate_limit()
 
@@ -438,6 +460,11 @@ def test_github_rate_limits_are_normalized(monkeypatch, no_live_github_rate_limi
     assert limits["core"]["reset_at"] == "1970-01-01T00:00:01+00:00"
     assert limits["search"]["used"] == 2
     assert limits["graphql"]["limit"] == 5000
+    assert limits["graphql"]["remaining"] == 4321
+    assert limits["graphql"]["reset"] == 4
+    assert calls[1][0] == ["graphql"]
+    assert "viewer" in calls[1][1]["query"]
+    assert "rateLimit" in calls[1][1]["query"]
 
 
 def test_project_health_attention_overrides_warming_history():

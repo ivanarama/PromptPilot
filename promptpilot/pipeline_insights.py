@@ -83,6 +83,10 @@ class _GitHubScanLeaseUnavailable(_GitHubScanLeaseFailure):
     """SQLite temporarily prevented verification of an otherwise owned lease."""
 
 
+class _GitHubRateLimitUnavailable(RuntimeError):
+    """The authenticated GitHub budget cannot be proved from valid responses."""
+
+
 class _GitHubScanLease:
     """Renew one SQLite-backed scan lease while external work is in flight."""
 
@@ -500,6 +504,41 @@ def _replace_admission_with_lease_failure(
     return admission
 
 
+def _rate_limit_failure_decision(
+        profile: dict, exc: _GitHubRateLimitUnavailable, *,
+        status_revision: int | None = None) -> dict:
+    try:
+        policy = _github_budget_policy(profile)
+        if policy is not None:
+            policy = _with_shared_budget_floor(policy)
+    except (TypeError, ValueError):
+        policy = None
+    policy = policy or {
+        "minimum_remaining": dict(_DEFAULT_GITHUB_BUDGET_MINIMUM),
+        "unavailable_retry_seconds": 300,
+        "lease_scope": _GITHUB_SCAN_LEASE_SCOPE,
+    }
+    return _budget_denied(
+        policy, state="rate_limit_unavailable",
+        reason=f"GitHub API budget unavailable: {exc}", now=time.time(),
+        status_revision=status_revision)
+
+
+def _replace_admission_with_rate_limit_failure(
+        admission: dict, profile: dict,
+        exc: _GitHubRateLimitUnavailable) -> dict:
+    """Keep the durable refresh denial aligned with a failed final sample."""
+    lease = admission.get("_lease")
+    denied = _rate_limit_failure_decision(
+        profile, exc,
+        status_revision=_current_github_scan_status_revision())
+    if lease is not None:
+        denied["_lease"] = lease
+    admission.clear()
+    admission.update(denied)
+    return admission
+
+
 def _evaluate_github_budget(policy: dict, limits: dict | None, *,
                             now: float,
                             status_revision: int | None = None,
@@ -660,8 +699,12 @@ def _github_scan_admission(profile: dict, purpose: str,
                 limits = _github_rate_limits()
             except _GitHubScanLeaseFailure:
                 raise
-            except Exception:
-                limits = None
+            except _GitHubRateLimitUnavailable as exc:
+                decision = _rate_limit_failure_decision(
+                    profile, exc, status_revision=lease.status_revision)
+                decision["_lease"] = lease
+                yield decision
+                return
             lease.ensure_owned(renew=True)
             if lease.lost:
                 decision = _lease_failure_decision(
@@ -800,8 +843,13 @@ def _reserve_execution_admission(
             limits = _github_rate_limits()
         except _GitHubScanLeaseFailure:
             raise
-        except Exception:
-            limits = None
+        except _GitHubRateLimitUnavailable as exc:
+            decision = _rate_limit_failure_decision(
+                profile, exc, status_revision=lease.status_revision)
+            decision["_lease"] = lease
+            admission.clear()
+            admission.update(decision)
+            return admission
         if not isinstance(limits, dict):
             decision = _evaluate_github_budget(
                 policy, limits, now=time.time(),
@@ -1277,40 +1325,181 @@ def _gh_api_json(args: list[str], input_value: dict | None = None):
     return json.loads(run.stdout) if run.stdout.strip() else None
 
 
-def _github_rate_limits() -> dict | None:
-    """Return the authenticated GitHub budgets without spending core quota."""
+_GITHUB_LOGIN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?")
+_GITHUB_RATE_LIMIT_QUERY = """query PromptPilotRateLimit {
+  viewer { login }
+  rateLimit { limit remaining resetAt used }
+}"""
+
+
+def _valid_github_login(value) -> bool:
+    return isinstance(value, str) and _GITHUB_LOGIN.fullmatch(value) is not None
+
+
+def _trusted_github_accounts() -> set[str]:
+    """Return safe identity contracts for budget-enabled shared profiles."""
     try:
-        payload = _gh_api_json(["rate_limit"])
-        resources = payload.get("resources", {}) if isinstance(payload, dict) else {}
-        result = {}
-        for name in ("core", "search", "graphql"):
-            item = resources.get(name)
-            if not isinstance(item, dict):
-                continue
-            reset = item.get("reset")
-            result[name] = {
-                "limit": int(item.get("limit") or 0),
-                "used": int(item.get("used") or 0),
-                "remaining": int(item.get("remaining") or 0),
-                "reset": int(reset) if reset is not None else None,
-                "reset_at": datetime.fromtimestamp(
-                    int(reset), timezone.utc).isoformat()
-                if reset is not None else None,
-            }
-        if result:
-            lease = getattr(_scan_lease_context, "lease", None)
-            if isinstance(lease, _GitHubScanLease):
-                if not db.record_pipeline_github_rate_snapshot(
-                        lease.scope, result, observed_at=time.time(),
-                        scan_lease_guard=lease.guard):
-                    raise _GitHubScanLeaseLost(
-                        "SQLite lease rejected GitHub rate snapshot")
-        return result or None
+        profiles = _profiles()
+    except Exception as exc:
+        raise _GitHubRateLimitUnavailable(
+            "pipeline profiles could not be read for identity validation") from exc
+    if not isinstance(profiles, dict):
+        raise _GitHubRateLimitUnavailable(
+            "pipeline profiles are invalid for identity validation")
+    accounts = set()
+    for profile in profiles.values():
+        if not isinstance(profile, dict):
+            continue
+        budget = profile.get("github_budget")
+        if budget is None or budget is False:
+            continue
+        if isinstance(budget, dict) and budget.get("enabled", True) is False:
+            continue
+        control = profile.get("priority_control")
+        trusted = control.get("trusted_account") \
+            if isinstance(control, dict) else None
+        if trusted is None:
+            continue
+        if not _valid_github_login(trusted):
+            raise _GitHubRateLimitUnavailable(
+                "configured trusted GitHub account is invalid")
+        accounts.add(trusted)
+    if len({account.casefold() for account in accounts}) > 1:
+        raise _GitHubRateLimitUnavailable(
+            "pipeline profiles configure different trusted GitHub accounts")
+    return accounts
+
+
+def _rate_limit_integer(item: dict, field: str, source: str) -> int:
+    value = item.get(field)
+    if type(value) is not int or value < 0:
+        raise _GitHubRateLimitUnavailable(
+            f"GitHub {source} rate limit response is invalid")
+    return value
+
+
+def _rest_rate_limit_resource(payload: dict, name: str) -> dict:
+    try:
+        item = payload["resources"][name]
+    except (KeyError, TypeError) as exc:
+        raise _GitHubRateLimitUnavailable(
+            f"GitHub REST /rate_limit response is invalid for {name}") from exc
+    if not isinstance(item, dict):
+        raise _GitHubRateLimitUnavailable(
+            f"GitHub REST /rate_limit response is invalid for {name}")
+    limit = _rate_limit_integer(item, "limit", f"REST {name}")
+    used = _rate_limit_integer(item, "used", f"REST {name}")
+    remaining = _rate_limit_integer(item, "remaining", f"REST {name}")
+    reset = _rate_limit_integer(item, "reset", f"REST {name}")
+    if used > limit or remaining > limit:
+        raise _GitHubRateLimitUnavailable(
+            f"GitHub REST /rate_limit response is invalid for {name}")
+    try:
+        reset_at = datetime.fromtimestamp(reset, timezone.utc).isoformat()
+    except (OverflowError, OSError, ValueError) as exc:
+        raise _GitHubRateLimitUnavailable(
+            f"GitHub REST /rate_limit response is invalid for {name}") from exc
+    return {
+        "limit": limit, "used": used, "remaining": remaining,
+        "reset": reset, "reset_at": reset_at,
+    }
+
+
+def _graphql_rate_limit_resource(payload: dict) -> dict:
+    if not isinstance(payload, dict) or payload.get("errors"):
+        raise _GitHubRateLimitUnavailable(
+            "GitHub GraphQL rateLimit response is invalid")
+    try:
+        data = payload["data"]
+        item = data["rateLimit"]
+        login = data["viewer"]["login"]
+    except (KeyError, TypeError) as exc:
+        raise _GitHubRateLimitUnavailable(
+            "GitHub GraphQL rateLimit or viewer response is invalid") from exc
+    if not isinstance(item, dict):
+        raise _GitHubRateLimitUnavailable(
+            "GitHub GraphQL rateLimit response is invalid")
+    if not _valid_github_login(login):
+        raise _GitHubRateLimitUnavailable(
+            "GitHub GraphQL viewer response is invalid")
+    trusted_accounts = _trusted_github_accounts()
+    if trusted_accounts:
+        expected = next(iter(trusted_accounts))
+        if login.casefold() != expected.casefold():
+            raise _GitHubRateLimitUnavailable(
+                f"GitHub identity mismatch: authenticated as {login}, "
+                f"expected {expected}")
+    limit = _rate_limit_integer(item, "limit", "GraphQL")
+    used = _rate_limit_integer(item, "used", "GraphQL")
+    remaining = _rate_limit_integer(item, "remaining", "GraphQL")
+    if used > limit or remaining > limit:
+        raise _GitHubRateLimitUnavailable(
+            "GitHub GraphQL rateLimit response is invalid")
+    reset_at = item.get("resetAt")
+    if not isinstance(reset_at, str):
+        raise _GitHubRateLimitUnavailable(
+            "GitHub GraphQL rateLimit resetAt is invalid")
+    try:
+        reset_time = datetime.fromisoformat(reset_at.replace("Z", "+00:00"))
+        if reset_time.tzinfo is None:
+            raise ValueError("timezone is missing")
+        reset = int(reset_time.timestamp())
+        normalized_reset = reset_time.astimezone(timezone.utc).isoformat()
+    except (OverflowError, OSError, TypeError, ValueError) as exc:
+        raise _GitHubRateLimitUnavailable(
+            "GitHub GraphQL rateLimit resetAt is invalid") from exc
+    if reset < 0:
+        raise _GitHubRateLimitUnavailable(
+            "GitHub GraphQL rateLimit resetAt is invalid")
+    return {
+        "limit": limit, "used": used, "remaining": remaining,
+        "reset": reset, "reset_at": normalized_reset,
+    }
+
+
+def _github_rate_limits() -> dict:
+    """Read REST core/search and the authenticated GraphQL budget/identity.
+
+    ``GET /rate_limit`` does not spend primary REST quota. The small GraphQL
+    query is necessary because the REST endpoint can report a stale/default
+    GraphQL bucket; its returned ``rateLimit`` includes that query's cost.
+    """
+    try:
+        rest_payload = _gh_api_json(["rate_limit"])
     except _GitHubScanLeaseFailure:
         raise
-    except (RuntimeError, OSError, OverflowError, TypeError, ValueError,
-            sqlite3.Error, json.JSONDecodeError):
-        return None
+    except Exception as exc:
+        raise _GitHubRateLimitUnavailable(
+            "GitHub REST /rate_limit request failed") from exc
+    core = _rest_rate_limit_resource(rest_payload, "core")
+    search = _rest_rate_limit_resource(rest_payload, "search")
+    try:
+        graphql_payload = _gh_api_json(
+            ["graphql"], {"query": _GITHUB_RATE_LIMIT_QUERY})
+    except _GitHubScanLeaseFailure:
+        raise
+    except Exception as exc:
+        raise _GitHubRateLimitUnavailable(
+            "GitHub GraphQL rateLimit request failed") from exc
+
+    result = {
+        "core": core,
+        "search": search,
+        "graphql": _graphql_rate_limit_resource(graphql_payload),
+    }
+    lease = getattr(_scan_lease_context, "lease", None)
+    if isinstance(lease, _GitHubScanLease):
+        try:
+            stored = db.record_pipeline_github_rate_snapshot(
+                lease.scope, result, observed_at=time.time(),
+                scan_lease_guard=lease.guard)
+        except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
+            raise _GitHubRateLimitUnavailable(
+                "GitHub rate limit snapshot could not be stored") from exc
+        if not stored:
+            raise _GitHubScanLeaseLost(
+                "SQLite lease rejected GitHub rate snapshot")
+    return result
 
 
 def set_item_priority(profile_id: str, queue_id: str, kind: str, number: int,
@@ -3464,6 +3653,11 @@ def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True,
             return _budget_blocked_cached(
                 profile_id, profile, series,
                 _replace_admission_with_lease_failure(
+                    admission, profile, exc))
+        except _GitHubRateLimitUnavailable as exc:
+            return _budget_blocked_cached(
+                profile_id, profile, series,
+                _replace_admission_with_rate_limit_failure(
                     admission, profile, exc))
     if admission.get("enabled"):
         result["github_budget"] = _public_budget_decision(admission)
