@@ -77,6 +77,10 @@ WORKFLOW_CLOSING_VERDICT_RE = re.compile(
     r"(?:\s*(?:[—-]\s*.*|\([^\r\n)]*\)))?$",
     re.IGNORECASE,
 )
+TARGETED_STALE_CLOSING_VERDICT_RE = re.compile(
+    r"^ИТОГ:\s*УСТАРЕЛО\s+\(gate-fallback:\s*(?=\S).+\)$",
+    re.IGNORECASE,
+)
 AGY_BACKGROUND_RUNNING_RE = re.compile(
     r"(?mi)^(?:\s*[●•]\s*\[[^\]]+\].*\brunning\s*"
     r"|\s*[\u2800-\u28ff]\s+Running command(?:\.\.\.)?\s*)$"
@@ -87,12 +91,20 @@ class HerdrError(Exception):
     pass
 
 
-def ensure_closing_verdict_contract(prompt: str) -> str:
+def ensure_closing_verdict_contract(
+        prompt: str, *, allow_targeted_stale: bool = False) -> str:
     """Add a trusted response boundary and closing-verdict contract once."""
     if (WORKFLOW_CONTRACT_MARKER in prompt
             and prompt.rstrip().endswith(WORKFLOW_CONTRACT_END)):
         return prompt
-    return f"{prompt.rstrip()}\n\n{WORKFLOW_CONTRACT_SUFFIX}"
+    suffix = WORKFLOW_CONTRACT_SUFFIX
+    if allow_targeted_stale:
+        suffix = suffix.replace(
+            "ИТОГ: ПУСТО (краткая причина)",
+            "ИТОГ: УСТАРЕЛО (gate-fallback: точная причина)\n"
+            "ИТОГ: ПУСТО (краткая причина)",
+        )
+    return f"{prompt.rstrip()}\n\n{suffix}"
 
 
 def herdr_argv(args, host=None) -> list:
@@ -411,7 +423,8 @@ def _looks_env_failure(cleaned: str) -> str:
     return env_failure(response_only)
 
 
-def _closing_workflow_verdict(cleaned: str) -> str:
+def _closing_workflow_verdict(
+        cleaned: str, *, allow_targeted_stale: bool = False) -> str:
     """Return a workflow verdict only when it is the final response line.
 
     The prompt itself can contain all allowed verdict examples. Searching the
@@ -435,9 +448,17 @@ def _closing_workflow_verdict(cleaned: str) -> str:
             ))
             break
     for candidate in candidates:
+        if (allow_targeted_stale
+                and TARGETED_STALE_CLOSING_VERDICT_RE.fullmatch(candidate)):
+            return "УСТАРЕЛО"
         match = WORKFLOW_CLOSING_VERDICT_RE.fullmatch(candidate)
         if match:
             return match.group(1).upper()
+        if re.match(r"^ИТОГ:\s*УСТАРЕЛО\b", candidate, re.IGNORECASE):
+            # Only a targeted fallback route may safely ask for re-election,
+            # and only with its exact gate-fallback evidence wrapper. Treat an
+            # invented or malformed stale result as a real execution failure.
+            return "НЕ СМОГ"
     return ""
 
 
@@ -448,7 +469,8 @@ def _has_running_background_task(text: str) -> bool:
 
 def _stabilize_workflow_completion(name, prompt, state, raw, deadline,
                                    cancel_check, on_blocked=None, host=None,
-                                   require_closing_verdict=False):
+                                   require_closing_verdict=False,
+                                   allow_targeted_stale=False):
     """Do not treat a transient idle between agy background tasks as done.
 
     Antigravity can briefly return to an idle prompt while a managed background
@@ -481,7 +503,8 @@ def _stabilize_workflow_completion(name, prompt, state, raw, deadline,
             background_running = _has_running_background_task(recent)
             if (state in {"idle", "done"} and not background_running
                     and _closing_workflow_verdict(
-                        _trim_transcript(recent, prompt))):
+                        _trim_transcript(recent, prompt),
+                        allow_targeted_stale=allow_targeted_stale)):
                 return state, raw
 
         rc, data, status_raw = _run(["agent", "get", name], host=host)
@@ -542,7 +565,8 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
                  cancel_check=None, keep_pane: bool = None, host: str = None,
                  on_worktree=None, on_pane=None, on_started=None,
                  prompt_override: str = None,
-                 require_closing_verdict: bool = False) -> dict:
+                 require_closing_verdict: bool = False,
+                 allow_targeted_stale: bool = False) -> dict:
     """Run a task in a herdr-managed agent session.
 
     on_blocked(pane_id) is called once when the agent first enters ``blocked``.
@@ -576,7 +600,8 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
         require_closing_verdict or WORKFLOW_CONTRACT_MARKER in prompt
     )
     if require_closing_verdict:
-        prompt = ensure_closing_verdict_contract(prompt)
+        prompt = ensure_closing_verdict_contract(
+            prompt, allow_targeted_stale=allow_targeted_stale)
     if requires_verdict and getattr(task, "detached", False):
         outcome["error"] = (
             "herdr detached mode is incompatible with a required closing "
@@ -825,6 +850,7 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
                 name, prompt, state, raw, deadline, cancel_check,
                 on_blocked=on_blocked, host=host,
                 require_closing_verdict=requires_verdict,
+                allow_targeted_stale=allow_targeted_stale,
             )
 
         if state == "__cancel__":
@@ -881,7 +907,8 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
             outcome["error"] = cleaned
             return outcome
 
-        closing_verdict = _closing_workflow_verdict(cleaned)
+        closing_verdict = _closing_workflow_verdict(
+            cleaned, allow_targeted_stale=allow_targeted_stale)
         if requires_verdict and not closing_verdict:
             return fail(
                 "herdr agent finished without the required closing ИТОГ verdict",

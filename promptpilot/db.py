@@ -632,7 +632,8 @@ def recent_working_dirs(limit: int = 8, machine: Optional[str] = None) -> list:
         return [r["working_dir"] for r in rows]
 
 
-def get_next_runnable(busy_keys=(), key_fn=None) -> Optional[TaskInDB]:
+def get_next_runnable(busy_keys=(), key_fn=None,
+                      order_key_fn=None) -> Optional[TaskInDB]:
     """Claim the highest-priority runnable task and mark it running.
 
     The whole select-then-claim runs under the write lock, so several workers
@@ -641,6 +642,10 @@ def get_next_runnable(busy_keys=(), key_fn=None) -> Optional[TaskInDB]:
     busy_keys/key_fn — when the caller already runs tasks, candidates whose
     key_fn(task) is in busy_keys are passed over: that is how two agents are
     kept out of one work tree while the queue keeps moving.
+
+    order_key_fn — optional policy rank evaluated while the same write
+    transaction owns the runnable snapshot. Returning ``None`` excludes a
+    candidate; otherwise the smallest key wins before the stable DB order.
     """
     now = _now()
     busy = set(busy_keys or ())
@@ -650,7 +655,7 @@ def get_next_runnable(busy_keys=(), key_fn=None) -> Optional[TaskInDB]:
         # task is found — a hard LIMIT could hide a free task behind a wall of
         # conflicting ones. Rows are materialised before any UPDATE so claiming
         # one doesn't disturb the iteration.
-        limit_clause = "" if busy else " LIMIT 1"
+        limit_clause = "" if busy or order_key_fn is not None else " LIMIT 1"
         rows = conn.execute(
             f"""SELECT * FROM tasks
                WHERE status IN ('pending', 'rate_limited')
@@ -662,10 +667,18 @@ def get_next_runnable(busy_keys=(), key_fn=None) -> Optional[TaskInDB]:
                ORDER BY priority ASC, created_at ASC, id ASC{limit_clause}""",
             (now, now),
         ).fetchall()
-        for row in rows:
+        candidates = []
+        for position, row in enumerate(rows):
             task = _row_to_task(row)
             if busy and key_fn and key_fn(task) in busy:
                 continue
+            rank = order_key_fn(task) if order_key_fn is not None else ()
+            if order_key_fn is not None and rank is None:
+                continue
+            candidates.append((rank, position, task))
+        if order_key_fn is not None:
+            candidates.sort(key=lambda item: (item[0], item[1]))
+        for _rank, _position, task in candidates:
             started_at = _now()
             cur = conn.execute(
                 """UPDATE tasks SET status = 'running', started_at = ?,
@@ -1076,6 +1089,136 @@ def update_series(series_id: int, fields: dict) -> bool:
         return True
 
 
+def apply_pipeline_series_cadence(
+        series_id: int, *, idle_recurrence: str,
+        busy_recurrence: Optional[str] = None, boost: bool = False,
+        empty_runs_before_idle: int = 0,
+        publication_guard: Optional[dict] = None) -> Optional[dict]:
+    """Idempotently reconcile one profile-owned adaptive cadence.
+
+    ``idle_recurrence`` is the durable safety interval.  ``busy_recurrence``
+    uses the existing temporary-boost fields, so completion and crash recovery
+    keep one source of truth.  When ``empty_runs_before_idle`` is non-zero, a
+    quiet snapshot does not switch cadence by itself: consecutive ``ПУСТО``
+    verdicts retire the boost in :func:`prepare_series_recurrence`.
+
+    A profile that opts into this API owns these recurrence fields.  The write
+    is one transaction and never postpones an occurrence already scheduled
+    earlier than the new effective cadence.
+    """
+    if (not idle_recurrence or parse_recurrence(idle_recurrence) is None
+            or (busy_recurrence is not None
+                and parse_recurrence(busy_recurrence) is None)):
+        raise ValueError("invalid adaptive pipeline recurrence")
+    if (isinstance(empty_runs_before_idle, bool)
+            or not isinstance(empty_runs_before_idle, int)
+            or not 0 <= empty_runs_before_idle <= 20):
+        raise ValueError("empty_runs_before_idle must be from 0 to 20")
+
+    if publication_guard is not None:
+        required = {
+            "epoch_key", "epoch", "epoch_default", "profile_key",
+            "profile_hash", "revision_key", "revision",
+        }
+        if (not isinstance(publication_guard, dict)
+                or set(publication_guard) != required
+                or any(not isinstance(publication_guard[name], str)
+                       for name in required)):
+            raise ValueError("invalid adaptive cadence publication guard")
+
+    with _connect(immediate=True) as conn:
+        if publication_guard is not None:
+            def setting(name: str, default: Optional[str] = None):
+                row = conn.execute(
+                    "SELECT value FROM settings WHERE key = ?",
+                    (publication_guard[name],),
+                ).fetchone()
+                return row["value"] if row else default
+
+            if (setting("epoch_key", publication_guard["epoch_default"])
+                    != publication_guard["epoch"]
+                    or setting("profile_key")
+                    != publication_guard["profile_hash"]
+                    or setting("revision_key")
+                    != publication_guard["revision"]):
+                return None
+        row = conn.execute(
+            "SELECT * FROM task_series WHERE id = ?", (series_id,)
+        ).fetchone()
+        if not row or row["ended_at"]:
+            return None
+        before = dict(row)
+        desired = dict(before)
+        desired["base_recurrence"] = idle_recurrence
+
+        if busy_recurrence is not None:
+            keep_until_empty = (
+                not boost and empty_runs_before_idle > 0
+                and before.get("temporary_recurrence") == busy_recurrence
+            )
+            if boost:
+                desired["temporary_recurrence"] = busy_recurrence
+                desired["temporary_until"] = None
+                desired["temporary_empty_limit"] = (
+                    empty_runs_before_idle or None)
+                # A live busy observation breaks an empty-run streak even if
+                # the effective interval itself was already boosted.
+                desired["temporary_empty_count"] = 0
+            elif not keep_until_empty:
+                desired["temporary_recurrence"] = None
+                desired["temporary_until"] = None
+                desired["temporary_empty_limit"] = None
+                desired["temporary_empty_count"] = 0
+        else:
+            # An adaptive policy owns the whole cadence. Event-only queues do
+            # not inherit an unrelated/manual temporary boost forever.
+            desired["temporary_recurrence"] = None
+            desired["temporary_until"] = None
+            desired["temporary_empty_limit"] = None
+            desired["temporary_empty_count"] = 0
+
+        changed_fields = [
+            name for name in (
+                "base_recurrence", "temporary_recurrence", "temporary_until",
+                "temporary_empty_limit", "temporary_empty_count",
+            )
+            if desired.get(name) != before.get(name)
+        ]
+        if changed_fields:
+            now = _now()
+            assignments = ", ".join(f"{name} = ?" for name in changed_fields)
+            conn.execute(
+                f"UPDATE task_series SET {assignments}, updated_at = ? WHERE id = ?",
+                (*[desired.get(name) for name in changed_fields], now, series_id),
+            )
+            if "base_recurrence" in changed_fields:
+                conn.execute(
+                    """UPDATE tasks SET recurrence = ? WHERE series_id = ?
+                       AND status IN ('pending', 'rate_limited')""",
+                    (idle_recurrence, series_id),
+                )
+
+            effective = _effective_series_recurrence(desired)
+            candidate = parse_recurrence(effective)
+            if candidate:
+                candidate_iso = _to_utc_iso(candidate)
+                conn.execute(
+                    """UPDATE tasks SET scheduled_at = ?
+                       WHERE series_id = ? AND status = 'pending'
+                         AND scheduled_at > ?""",
+                    (candidate_iso, series_id, candidate_iso),
+                )
+
+        return {
+            "changed": bool(changed_fields),
+            "effective_recurrence": _effective_series_recurrence(desired),
+            "base_recurrence": desired["base_recurrence"],
+            "temporary_recurrence": desired.get("temporary_recurrence"),
+            "temporary_empty_limit": desired.get("temporary_empty_limit"),
+            "temporary_empty_count": desired.get("temporary_empty_count") or 0,
+        }
+
+
 def _pipeline_series_wake_intent_key(series_id: int) -> str:
     if isinstance(series_id, bool) or not isinstance(series_id, int) or series_id <= 0:
         raise ValueError("pipeline series id must be a positive integer")
@@ -1441,13 +1584,35 @@ def wake_series_once(series_id: Optional[int], latch_key: str,
         return True
 
 
+def _pipeline_stale_reselect_guard_key(series_id: int) -> str:
+    return f"pipeline_stale_reselect_guard:v1:{int(series_id)}"
+
+
 def prepare_series_recurrence(series_id: int, verdict: Optional[str]) -> Optional[dict]:
     """Update temporary-boost counters and return settings for the next run."""
-    with _connect() as conn:
+    # BEGIN IMMEDIATE serializes the read/modify/write with a live cadence
+    # reconciliation. A deferred transaction could read the old empty counter
+    # and then overwrite a concurrent busy-observation reset.
+    with _connect(immediate=True) as conn:
         row = conn.execute("SELECT * FROM task_series WHERE id = ?", (series_id,)).fetchone()
         if not row or row["ended_at"]:
             return None
         s = dict(row)
+        stale_key = _pipeline_stale_reselect_guard_key(series_id)
+        stale = (verdict or "").upper() == "УСТАРЕЛО"
+        stale_reselect_immediate = False
+        if stale:
+            prior = conn.execute(
+                "SELECT value FROM settings WHERE key = ?", (stale_key,)
+            ).fetchone()
+            if prior is None:
+                conn.execute(
+                    "INSERT INTO settings (key, value) VALUES (?, '1')",
+                    (stale_key,),
+                )
+                stale_reselect_immediate = True
+        else:
+            conn.execute("DELETE FROM settings WHERE key = ?", (stale_key,))
         now = datetime.now(timezone.utc)
         until = _parse_dt(s["temporary_until"])
         expired = bool(until and until <= now)
@@ -1470,6 +1635,7 @@ def prepare_series_recurrence(series_id: int, verdict: Optional[str]) -> Optiona
                          (empty_count, _now(), series_id))
             s["temporary_empty_count"] = empty_count
         s["effective_recurrence"] = _effective_series_recurrence(s, now)
+        s["stale_reselect_immediate"] = stale_reselect_immediate
         return s
 
 
@@ -1646,7 +1812,8 @@ def pipeline_run_metrics(series_ids: list[int], since: datetime) -> dict:
     """Semantic outcomes of scheduled runs belonging to one pipeline profile."""
     ids = sorted({int(value) for value in series_ids if value is not None})
     empty = {"runs": 0, "ready": 0, "empty": 0, "human": 0,
-             "no_change": 0, "unable": 0, "failed": 0, "other": 0,
+             "no_change": 0, "stale": 0, "unable": 0, "failed": 0,
+             "other": 0,
              "unresolved_unable": 0, "unresolved_failed": 0,
              "recovered_unable": 0, "recovered_failed": 0,
              "tokens_known_runs": 0, "input_tokens": 0,
@@ -1695,6 +1862,11 @@ def pipeline_run_metrics(series_ids: list[int], since: datetime) -> dict:
             result["human"] += 1
             # The stage itself completed correctly even if the selected item
             # now waits for a person, so an older execution incident is over.
+            unresolved[int(row["series_id"])] = {"unable": 0, "failed": 0}
+        elif verdict == "УСТАРЕЛО":
+            # An exact target changed before the first mutation. This is a
+            # successful safety fence followed by re-election, not an error.
+            result["stale"] += 1
             unresolved[int(row["series_id"])] = {"unable": 0, "failed": 0}
         elif verdict == "НЕ СМОГ":
             result["unable"] += 1
@@ -1805,8 +1977,13 @@ def set_setting_if_newer_revision(
         key: str, value: str, *, revision_key: str, revision: int,
         guard_key: str, expected_guard: str,
         guard_default: Optional[str] = None,
-        lease_guard: Optional[dict] = None) -> bool:
+        lease_guard: Optional[dict] = None,
+        publication_revision_key: Optional[str] = None,
+        companion_key: Optional[str] = None,
+        companion_value: Optional[str] = None) -> bool:
     """Atomically publish a newer revision while a durable guard matches."""
+    if (companion_key is None) != (companion_value is None):
+        raise ValueError("companion_key and companion_value must be set together")
     with _connect(immediate=True) as conn:
         if (lease_guard is not None
                 and not _pipeline_scan_lease_guard_matches(conn, lease_guard)):
@@ -1826,6 +2003,17 @@ def set_setting_if_newer_revision(
             published_revision = 0
         if published_revision >= int(revision):
             return False
+        if publication_revision_key is not None:
+            row = conn.execute(
+                "SELECT value FROM settings WHERE key = ?",
+                (publication_revision_key,),
+            ).fetchone()
+            try:
+                active_revision = int(row["value"]) if row else 0
+            except (TypeError, ValueError):
+                active_revision = 0
+            if active_revision >= int(revision):
+                return False
         conn.execute(
             "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
             (key, value),
@@ -1834,6 +2022,16 @@ def set_setting_if_newer_revision(
             "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
             (revision_key, str(int(revision))),
         )
+        if companion_key is not None:
+            conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                (companion_key, companion_value),
+            )
+        if publication_revision_key is not None:
+            conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                (publication_revision_key, str(int(revision))),
+            )
     return True
 
 

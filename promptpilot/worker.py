@@ -135,7 +135,9 @@ ENV_FAILURE_RE = re.compile(
 
 # The agent is asked to end with this line so a finished task says WHAT
 # happened, not just that the process exited 0. Parsed whether or not we asked.
-VERDICTS = ("ГОТОВО", "УЖЕ СДЕЛАНО", "НУЖЕН ЧЕЛОВЕК", "НЕ СМОГ", "ПУСТО")
+VERDICTS = (
+    "ГОТОВО", "УЖЕ СДЕЛАНО", "НУЖЕН ЧЕЛОВЕК", "НЕ СМОГ", "ПУСТО",
+)
 VERDICT_RE = re.compile(r"^[ \t>*#-]*ИТОГ:\s*(" + "|".join(VERDICTS) + r")\b", re.M | re.I)
 
 VERDICT_INSTRUCTION = (
@@ -483,7 +485,12 @@ def _maybe_recur(task, failed: bool = False):
     recurrence = series["effective_recurrence"] if series else task.recurrence
     if task.series_id and series is None:  # series was explicitly ended
         return
-    next_dt = db.parse_recurrence(recurrence)
+    # The durable series latch allows one immediate re-election after a
+    # validated targeted gate-fallback. Consecutive stale results use the
+    # ordinary cadence, so a moving target cannot create an unbounded hot loop.
+    next_dt = (datetime.now(timezone.utc)
+               if series and series.get("stale_reselect_immediate")
+               else db.parse_recurrence(recurrence))
     if not next_dt:
         return
     from .models import TaskCreate
@@ -567,7 +574,8 @@ def _notify_requeued(task, next_run, reason: str):
 
 
 def _execute_herdr_task(task, provider_cfg, host=None, machine=None, prompt_override=None,
-                        admission_complete=None, require_closing_verdict=False):
+                        admission_complete=None, require_closing_verdict=False,
+                        allow_targeted_stale=False):
     """Run the task in a live herdr session (providers with executor=herdr).
 
     host is the ssh target of the machine the session lives on (None = local).
@@ -628,7 +636,8 @@ def _execute_herdr_task(task, provider_cfg, host=None, machine=None, prompt_over
                            on_worktree=on_worktree, on_pane=on_pane,
                            on_started=on_started,
                            prompt_override=prompt_override,
-                           require_closing_verdict=require_closing_verdict)
+                           require_closing_verdict=require_closing_verdict,
+                           allow_targeted_stale=allow_targeted_stale)
 
     if outcome.get("cancelled"):
         db.clear_cancel_request(task.id)
@@ -665,6 +674,8 @@ def _execute_herdr_task(task, provider_cfg, host=None, machine=None, prompt_over
         return
 
     verdict = outcome.get("verdict") or parse_verdict(outcome["output"])
+    if verdict == "УСТАРЕЛО" and not allow_targeted_stale:
+        verdict = "НЕ СМОГ"
     if require_closing_verdict and not outcome.get("verdict"):
         _retry_sqlite_busy(
             lambda: db.mark_failed(
@@ -765,6 +776,7 @@ def _execute_task_body(task, admission_complete=None):
 
     agent_prompt = effective_prompt(task)
     require_closing_verdict = False
+    allow_targeted_stale = False
     if task.series_id:
         try:
             from . import pipeline_insights
@@ -818,7 +830,12 @@ def _execute_task_body(task, admission_complete=None):
             return
         if route["action"] == "complete_empty":
             reason = route["reason"]
-            verdict = route.get("verdict") or "ПУСТО"
+            verdict = str(route.get("verdict") or "ПУСТО").strip() or "ПУСТО"
+            # Defence in depth: execution_route normally normalizes this, but
+            # persistence must not trust an injected/custom route.  УСТАРЕЛО is
+            # reserved for the validated targeted fallback provider path.
+            if verdict.upper() == "УСТАРЕЛО":
+                verdict = "НЕ СМОГ"
             _retry_sqlite_busy(
                 lambda: db.mark_completed(
                     task.id,
@@ -835,9 +852,18 @@ def _execute_task_body(task, admission_complete=None):
         require_closing_verdict = bool(
             route.get("profile_id") and route.get("queue_id")
         )
+        gate_command = route.get("gate_command")
+        allow_targeted_stale = bool(
+            require_closing_verdict
+            and route.get("next_already_run") is True
+            and isinstance(gate_command, list)
+            and gate_command
+            and all(isinstance(value, str) and value for value in gate_command)
+        )
         if require_closing_verdict:
             from .herdr_exec import ensure_closing_verdict_contract
-            agent_prompt = ensure_closing_verdict_contract(agent_prompt)
+            agent_prompt = ensure_closing_verdict_contract(
+                agent_prompt, allow_targeted_stale=allow_targeted_stale)
         if route.get("fallback_reason"):
             if route.get("next_already_run"):
                 print("  -> Pipeline tool selected target; continuing full skill: "
@@ -870,6 +896,7 @@ def _execute_task_body(task, admission_complete=None):
                 prompt_override=agent_prompt,
                 admission_complete=admission_complete,
                 require_closing_verdict=require_closing_verdict,
+                allow_targeted_stale=allow_targeted_stale,
             )
         finally:
             # Startup failures have no on_started callback.  Once their durable
@@ -1111,7 +1138,8 @@ def _execute_task_body(task, admission_complete=None):
 
     if require_closing_verdict:
         from .herdr_exec import _closing_workflow_verdict
-        verdict = _closing_workflow_verdict(verdict_source)
+        verdict = _closing_workflow_verdict(
+            verdict_source, allow_targeted_stale=allow_targeted_stale)
         if not verdict:
             _retry_sqlite_busy(
                 lambda: db.mark_failed(
@@ -1398,6 +1426,41 @@ class _AdmissionFence:
         return self._pending
 
 
+def _claim_next_task(busy_keys=(), busy_lane_ids=()):
+    """Atomically claim by configured lane preference, with safe fallback.
+
+    Invalid optional lane configuration must be visible but must not freeze the
+    legacy queue.  The project preflight still owns every external mutation;
+    this function only chooses which already-runnable local task gets a slot.
+    """
+    from . import pipeline_insights
+
+    try:
+        policy = pipeline_insights.worker_lane_policy()
+    except (AttributeError, OSError, TypeError, ValueError,
+            json.JSONDecodeError) as exc:
+        print(f"  !! pipeline lane scheduler unavailable: {exc}", flush=True)
+        policy = None
+    if policy is None:
+        return db.get_next_runnable(
+            busy_keys=busy_keys, key_fn=lock_key), None
+
+    assignments = {}
+
+    def rank(task):
+        candidate = pipeline_insights.worker_lane_rank(
+            task, policy, busy_lane_ids)
+        if candidate is None:
+            return None
+        score, lane_id = candidate
+        assignments[task.id] = lane_id
+        return score
+
+    task = db.get_next_runnable(
+        busy_keys=busy_keys, key_fn=lock_key, order_key_fn=rank)
+    return task, assignments.get(task.id) if task is not None else None
+
+
 def _warm_pipeline_runtime():
     """Load pipeline routing code before a runnable task is claimed.
 
@@ -1479,6 +1542,7 @@ def run_worker():
 
     pool = None
     in_flight = {}  # Future -> (lock key, exact claimed task attempt)
+    task_lanes = {}  # task id -> configured scheduler lane
     stuck_recoveries = {}  # exact attempt -> retry state; keeps its lock key
     admission_fence = _AdmissionFence()
     short_on_memory = False
@@ -1487,7 +1551,11 @@ def run_worker():
         pool = ThreadPoolExecutor(max_workers=CONCURRENCY, thread_name_prefix="pp-task")
 
     def reap():
+        before = {task.id for _lock, task in in_flight.values()}
         _reap_futures(in_flight, stuck_recoveries)
+        after = {task.id for _lock, task in in_flight.values()}
+        for task_id in before - after:
+            task_lanes.pop(task_id, None)
 
     while running:
         reap()
@@ -1526,7 +1594,10 @@ def run_worker():
         busy_keys = [lk for lk, _task in in_flight.values() if lk]
         busy_keys.extend(
             item["lock"] for item in stuck_recoveries.values() if item["lock"])
-        task = db.get_next_runnable(busy_keys=busy_keys, key_fn=lock_key)
+        task, lane_id = _claim_next_task(
+            busy_keys=busy_keys,
+            busy_lane_ids=task_lanes.values(),
+        )
         if task is None:
             time.sleep(POLL_INTERVAL)
             continue
@@ -1544,6 +1615,9 @@ def run_worker():
                 _drain_stuck_recoveries(stuck_recoveries)
         else:
             admission_complete = admission_fence.begin()
+            if lane_id is not None:
+                task_lanes[task.id] = lane_id
+                print(f"  -> Scheduler lane: {lane_id}", flush=True)
             in_flight[pool.submit(
                 _execute_task_with_admission_fence,
                 task, admission_complete)] = (lock_key(task), task)

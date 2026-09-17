@@ -889,7 +889,6 @@ def _pipeline_text(data: dict) -> str:
     health = data.get("health", {})
     coverage = ("5 ч" if recent.get("complete")
                 else f"{recent.get('coverage_hours', 0):g} из 5 ч")
-    delta = recent.get("backlog_delta") if recent.get("complete") else None
     week_trend = (f"{week.get('backlog_delta'):+d}" if week.get("complete")
                   else f"— (покрытие {week.get('coverage_hours', 0):g} ч)")
     month_trend = (f"{month.get('backlog_delta'):+d}" if month.get("complete")
@@ -903,14 +902,29 @@ def _pipeline_text(data: dict) -> str:
                       f"{cache_age} сек назад" if cache_age < 60 else
                       f"{round(cache_age / 60)} мин назад")
     backlog_total = data.get("backlog_total")
+    delta_rate = recent.get("backlog_delta_per_hour")
+    entered_rate = recent.get("entered_per_hour")
+    exited_rate = recent.get("exited_per_hour")
+    rate = lambda value: "—" if value is None else f"{value:+.2f}/ч"
+    bottleneck = next(
+        (queue for queue in data.get("queues", [])
+         if queue.get("id") == data.get("bottleneck")), None)
+    outcomes = data.get("outcomes") or {}
     lines = [f"📈 {data['title']}",
              f"Состояние: {health.get('label', '—')} — {health.get('reason', '—')}",
              f"Снимок GitHub: {cache_state}, {cache_age_text}; чтение без GitHub API",
              f"Backlog: {backlog_total if backlog_total is not None else '—'}"
-             + (f" (Δ 5 ч: {delta:+d})" if delta is not None else " (история копится)"),
-             f"Вход / выход / переходы: {recent.get('entered', 0)} / "
-             f"{recent.get('exited', 0)} / {recent.get('transitions', 0)}; покрытие {coverage}",
+             + (f" (Δ {rate(delta_rate)})" if delta_rate is not None else " (история копится)"),
+             f"Вход / выход: {rate(entered_rate)} / {rate(exited_rate)}; "
+             f"переходов {recent.get('transitions', 0)}; покрытие {coverage}",
              f"Тренд backlog: 7 дней {week_trend}; 30 дней {month_trend}",
+             f"Узкое место: " + (
+                 f"{bottleneck['title']} (ETA {bottleneck.get('eta_hours', '—')} ч)"
+                 if bottleneck else "нет"),
+             "Безопасные ожидания / ошибки: "
+             f"{outcomes.get('safe_deferrals_now', 0) + outcomes.get('stale_reselections_5h', 0)} / "
+             f"{outcomes.get('real_errors_5h', 0)} "
+             f"(stale-перевыборов {outcomes.get('stale_reselections_5h', 0)}).",
              f"Цель оценки: текущая очередь примерно за {data['target_clear_hours']:g} ч.", ""]
     runtime = data.get("runtime", {})
     if runtime:
@@ -969,16 +983,19 @@ def _pipeline_text(data: dict) -> str:
             route_text += f" → {route.get('effective')}"
         backlog = queue.get("backlog")
         runs_needed = queue.get("runs_needed")
+        cadence = queue.get("adaptive_cadence") or {}
+        cadence_text = (f"; adaptive {cadence.get('mode')}"
+                        if cadence else "")
         lines.append(f"{marker} {queue['title']}: {backlog if backlog is not None else '—'} / "
                      f"{queue['capacity']} за прогон = {runs_needed if runs_needed is not None else '—'} прогонов; "
-                     f"сейчас {queue['interval'] or 'не настроено'}; "
+                     f"сейчас {queue['interval'] or 'не настроено'}{cadence_text}; "
                      f"средний запуск {duration_text}; ETA {eta if eta is not None else '—'} ч\n"
                      f"   Маршрут: {route_text}\n"
                      f"   Рекомендация: {queue['recommendation']}")
     runs = recent.get("runs", {})
     lines.extend(["", f"Прогоны за окно: {runs.get('runs', 0)}; готово {runs.get('ready', 0)}, "
                   f"нужен человек {runs.get('human', 0)}, не смог {runs.get('unable', 0)}, "
-                  f"упало {runs.get('failed', 0)}.",
+                  f"устарело {runs.get('stale', 0)}, упало {runs.get('failed', 0)}.",
                   "⚠ — текущее узкое место по ETA с учётом интервала и средней длительности."])
     return "\n".join(lines)
 
@@ -3298,6 +3315,14 @@ async def cb_windows_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _silent_completion(task) -> bool:
+    """Whether a completed routine outcome should stay visible but not ping."""
+    return (
+        task.status.value == "completed"
+        and (task.verdict or "").upper() in {"ПУСТО", "УСТАРЕЛО"}
+    )
+
+
 async def _notify_loop(bot):
     """Background loop: send notifications for completed/failed tasks every 10s.
 
@@ -3343,10 +3368,11 @@ async def _notify_loop(bot):
             continue
         for task in pending:
             try:
-                # ПУСТО — «проснулся по расписанию, делать нечего»: рутина
-                # повторяющихся задач, ради которой будить человека не за чем.
-                # Итог остаётся в базе и виден в списке задач.
-                if task.status.value == "completed" and (task.verdict or "").upper() == "ПУСТО":
+                # ПУСТО and a validated targeted УСТАРЕЛО are routine queue
+                # outcomes. Both remain visible in history/metrics; only the
+                # Telegram success ping is suppressed. Invalid/generic stale
+                # text is normalized to НЕ СМОГ before it reaches this point.
+                if _silent_completion(task):
                     db.mark_notified(task.id)
                     continue
                 if task.status.value == "completed":

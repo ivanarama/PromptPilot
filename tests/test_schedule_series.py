@@ -70,6 +70,297 @@ def test_fresh_install_has_no_project_specific_pipeline_profiles(tmp_path, monke
     assert pipeline_insights.list_profiles() == []
 
 
+def test_first_valid_stale_verdict_reselects_immediately(isolated_db):
+    task = isolated_db.create_task(TaskCreate(
+        prompt="ExampleProject - REVIEW", recurrence="4h"))
+    claimed = isolated_db.get_next_runnable()
+    isolated_db.mark_completed(
+        claimed.id, "ИТОГ: УСТАРЕЛО (PR HEAD changed)", verdict="УСТАРЕЛО")
+
+    before = datetime.now(timezone.utc)
+    worker._recur_after_run(claimed)
+    series = isolated_db.get_series(task.series_id)
+
+    assert series["next_task_id"] != task.id
+    assert datetime.fromisoformat(series["next_run_at"]) <= \
+        before + timedelta(seconds=2)
+
+
+def test_second_consecutive_stale_uses_normal_cadence_and_non_stale_resets(
+        isolated_db):
+    task = isolated_db.create_task(TaskCreate(
+        prompt="ExampleProject - REVIEW", recurrence="4h"))
+    first = isolated_db.get_next_runnable()
+    isolated_db.mark_completed(
+        first.id, "ИТОГ: УСТАРЕЛО (gate-fallback: first)",
+        verdict="УСТАРЕЛО")
+    worker._recur_after_run(first)
+
+    second = isolated_db.get_next_runnable()
+    assert second is not None
+    isolated_db.mark_completed(
+        second.id, "ИТОГ: УСТАРЕЛО (gate-fallback: second)",
+        verdict="УСТАРЕЛО")
+
+    before = datetime.now(timezone.utc)
+    worker._recur_after_run(second)
+    series = isolated_db.get_series(task.series_id)
+
+    assert datetime.fromisoformat(series["next_run_at"]) >= \
+        before + timedelta(hours=3, minutes=59)
+
+    reset = isolated_db.prepare_series_recurrence(task.series_id, "ГОТОВО")
+    after_reset = isolated_db.prepare_series_recurrence(
+        task.series_id, "УСТАРЕЛО")
+    assert reset["stale_reselect_immediate"] is False
+    assert after_reset["stale_reselect_immediate"] is True
+
+
+def test_adaptive_cadence_uses_busy_interval_then_two_empty_runs(
+        isolated_db):
+    task = isolated_db.create_task(TaskCreate(
+        prompt="ExampleProject - TRIAGE", recurrence="30m",
+        scheduled_at=datetime.now(timezone.utc) + timedelta(hours=2)))
+
+    active = isolated_db.apply_pipeline_series_cadence(
+        task.series_id, idle_recurrence="30m", busy_recurrence="15m",
+        boost=True, empty_runs_before_idle=2)
+    first_empty = isolated_db.prepare_series_recurrence(task.series_id, "ПУСТО")
+    second_empty = isolated_db.prepare_series_recurrence(task.series_id, "ПУСТО")
+
+    assert active["effective_recurrence"] == "15m"
+    assert first_empty["effective_recurrence"] == "15m"
+    assert first_empty["temporary_empty_count"] == 1
+    assert second_empty["effective_recurrence"] == "30m"
+    assert second_empty["temporary_recurrence"] is None
+
+
+def test_adaptive_fix_cadence_returns_to_idle_at_threshold(isolated_db):
+    task = isolated_db.create_task(TaskCreate(
+        prompt="ExampleProject - FIX", recurrence="30m"))
+    matching = isolated_db.get_series(task.series_id)
+    queue = {
+        "adaptive_cadence": {
+            "idle_recurrence": "30m", "busy_recurrence": "15m",
+            "backlog_above": 3,
+        },
+    }
+
+    busy = pipeline_insights._reconcile_adaptive_cadence(queue, matching, 4)
+    idle = pipeline_insights._reconcile_adaptive_cadence(queue, matching, 3)
+
+    assert busy["mode"] == "busy"
+    assert busy["effective_recurrence"] == "15m"
+    assert idle["mode"] == "idle"
+    assert idle["effective_recurrence"] == "30m"
+
+
+def test_busy_observation_resets_temporary_empty_streak(isolated_db):
+    task = isolated_db.create_task(TaskCreate(
+        prompt="ExampleProject - TRIAGE", recurrence="30m"))
+    isolated_db.apply_pipeline_series_cadence(
+        task.series_id, idle_recurrence="30m", busy_recurrence="15m",
+        boost=True, empty_runs_before_idle=2)
+    empty = isolated_db.prepare_series_recurrence(task.series_id, "ПУСТО")
+
+    busy = isolated_db.apply_pipeline_series_cadence(
+        task.series_id, idle_recurrence="30m", busy_recurrence="15m",
+        boost=True, empty_runs_before_idle=2)
+
+    assert empty["temporary_empty_count"] == 1
+    assert busy["temporary_empty_count"] == 0
+    assert busy["effective_recurrence"] == "15m"
+
+
+def test_event_only_policy_clears_previous_temporary_boost(isolated_db):
+    task = isolated_db.create_task(TaskCreate(
+        prompt="ExampleProject - PLAN", recurrence="4h"))
+    assert isolated_db.update_series(task.series_id, {
+        "temporary_recurrence": "10m", "temporary_empty_limit": 3,
+    })
+
+    result = isolated_db.apply_pipeline_series_cadence(
+        task.series_id, idle_recurrence="4h", busy_recurrence=None)
+
+    assert result["effective_recurrence"] == "4h"
+    assert result["temporary_recurrence"] is None
+    assert result["temporary_empty_count"] == 0
+
+
+def test_adaptive_cadence_rejects_stale_profile_revision_guard(isolated_db):
+    task = isolated_db.create_task(TaskCreate(
+        prompt="ExampleProject - FIX", recurrence="30m"))
+    profile_key = "test:published-profile"
+    revision_key = "test:published-revision"
+    epoch_key = "test:cache-epoch"
+    isolated_db.set_setting(profile_key, "profile-a")
+    isolated_db.set_setting(revision_key, "7")
+    guard = {
+        "epoch_key": epoch_key, "epoch": "0", "epoch_default": "0",
+        "profile_key": profile_key, "profile_hash": "profile-a",
+        "revision_key": revision_key, "revision": "7",
+    }
+    accepted = isolated_db.apply_pipeline_series_cadence(
+        task.series_id, idle_recurrence="30m", busy_recurrence="15m",
+        boost=True, publication_guard=guard)
+    isolated_db.set_setting(revision_key, "8")
+
+    rejected = isolated_db.apply_pipeline_series_cadence(
+        task.series_id, idle_recurrence="30m", busy_recurrence="15m",
+        boost=False, publication_guard=guard)
+
+    assert accepted["effective_recurrence"] == "15m"
+    assert rejected is None
+    assert isolated_db.get_series(task.series_id)["effective_recurrence"] == "15m"
+
+
+def test_series_completion_and_live_cadence_write_are_serialized(
+        isolated_db, monkeypatch):
+    task = isolated_db.create_task(TaskCreate(
+        prompt="ExampleProject - TRIAGE", recurrence="30m"))
+    isolated_db.apply_pipeline_series_cadence(
+        task.series_id, idle_recurrence="30m", busy_recurrence="15m",
+        boost=True, empty_runs_before_idle=2)
+    real_connect = isolated_db._connect
+    prepare_locked = threading.Event()
+    release_prepare = threading.Event()
+    cadence_done = threading.Event()
+    errors = []
+
+    @contextmanager
+    def gated_connect(*args, **kwargs):
+        with real_connect(*args, **kwargs) as conn:
+            if threading.current_thread().name == "prepare-series":
+                assert kwargs.get("immediate") is True
+                prepare_locked.set()
+                if not release_prepare.wait(5):
+                    raise TimeoutError("test did not release series transaction")
+            yield conn
+
+    monkeypatch.setattr(isolated_db, "_connect", gated_connect)
+
+    def prepare():
+        try:
+            isolated_db.prepare_series_recurrence(task.series_id, "ПУСТО")
+        except BaseException as exc:
+            errors.append(exc)
+
+    def observe_busy():
+        try:
+            isolated_db.apply_pipeline_series_cadence(
+                task.series_id, idle_recurrence="30m",
+                busy_recurrence="15m", boost=True,
+                empty_runs_before_idle=2)
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            cadence_done.set()
+
+    preparing = threading.Thread(target=prepare, name="prepare-series")
+    observing = threading.Thread(target=observe_busy, name="observe-busy")
+    preparing.start()
+    assert prepare_locked.wait(5)
+    observing.start()
+    try:
+        assert cadence_done.wait(0.1) is False
+    finally:
+        release_prepare.set()
+        preparing.join(5)
+        observing.join(5)
+
+    assert not preparing.is_alive()
+    assert not observing.is_alive()
+    assert errors == []
+    assert isolated_db.get_series(task.series_id)["temporary_empty_count"] == 0
+
+
+def test_window_metrics_report_actual_hourly_rates(isolated_db, monkeypatch):
+    now = datetime.now(timezone.utc)
+    baseline = {
+        "queues": {"review": {
+            "backlog": 3,
+            "items": [{"key": "pr:1"}, {"key": "pr:2"}, {"key": "pr:3"}],
+            "membership_complete": True,
+        }},
+    }
+    current = {
+        "queues": {"review": {
+            "backlog": 2,
+            "items": [{"key": "pr:3"}, {"key": "pr:4"}],
+            "membership_complete": True,
+        }},
+    }
+    snapshots = [
+        {"captured_at": (now - timedelta(hours=5)).isoformat(),
+         "payload": baseline},
+        {"captured_at": now.isoformat(), "payload": current},
+    ]
+    monkeypatch.setattr(
+        isolated_db, "pipeline_run_metrics", lambda *_args, **_kwargs: {})
+
+    metrics = pipeline_insights._window_metrics(
+        snapshots, current, [], now, 5)
+
+    assert metrics["backlog_delta_per_hour"] == -0.2
+    assert metrics["entered_per_hour"] == 0.2
+    assert metrics["exited_per_hour"] == 0.4
+    assert metrics["queue_throughput_per_hour"]["review"] == 0.4
+
+
+def test_window_rates_use_actual_elapsed_baseline_gap(isolated_db, monkeypatch):
+    now = datetime.now(timezone.utc)
+    baseline = {"queues": {"review": {
+        "backlog": 3, "items": [{"key": "pr:1"}],
+        "membership_complete": True,
+    }}}
+    current = {"queues": {"review": {
+        "backlog": 2, "items": [], "membership_complete": True,
+    }}}
+    snapshots = [
+        {"captured_at": (now - timedelta(hours=10)).isoformat(),
+         "payload": baseline},
+        {"captured_at": now.isoformat(), "payload": current},
+    ]
+    monkeypatch.setattr(
+        isolated_db, "pipeline_run_metrics", lambda *_args, **_kwargs: {})
+
+    metrics = pipeline_insights._window_metrics(
+        snapshots, current, [], now, 5)
+
+    assert metrics["coverage_hours"] == 5
+    assert metrics["backlog_delta_per_hour"] == -0.1
+    assert metrics["queue_throughput_per_hour"]["review"] == 0.1
+
+
+def test_incomplete_membership_does_not_claim_set_based_throughput(
+        isolated_db, monkeypatch):
+    now = datetime.now(timezone.utc)
+    baseline = {"queues": {"review": {
+        "backlog": 3, "items": [{"key": "pr:1"}, {"key": "pr:2"}],
+        "membership_complete": False,
+    }}}
+    current = {"queues": {"review": {
+        "backlog": 2, "items": [{"key": "pr:2"}],
+        "membership_complete": True,
+    }}}
+    snapshots = [
+        {"captured_at": (now - timedelta(hours=5)).isoformat(),
+         "payload": baseline},
+        {"captured_at": now.isoformat(), "payload": current},
+    ]
+    monkeypatch.setattr(
+        isolated_db, "pipeline_run_metrics", lambda *_args, **_kwargs: {})
+
+    metrics = pipeline_insights._window_metrics(
+        snapshots, current, [], now, 5)
+
+    assert metrics["backlog_delta_per_hour"] == -0.2
+    assert metrics["entered_per_hour"] is None
+    assert metrics["exited_per_hour"] is None
+    assert metrics["queue_throughput"]["review"] is None
+    assert metrics["queue_throughput_per_hour"]["review"] is None
+
+
 def test_project_health_check_is_immediate_and_accepts_red_json(monkeypatch):
     calls = []
 
@@ -880,6 +1171,41 @@ def test_older_cross_process_refresh_cannot_overwrite_newer_cache(
     assert restored["backlog_total"] == 2
 
 
+def test_older_different_profile_hash_cannot_reclaim_active_publication(
+        isolated_db):
+    old_profile = {
+        "title": "Example", "repository": "owner/example",
+        "queues": [{
+            "id": "review", "title": "Review", "capacity": 1,
+            "query": "label:old", "series_contains": "REVIEW",
+        }],
+    }
+    new_profile = {
+        **old_profile,
+        "queues": [{**old_profile["queues"][0], "query": "label:new"}],
+    }
+    pipeline_insights._cache.clear()
+    _cached, generation = pipeline_insights._cache_snapshot("profile-race")
+    epoch = pipeline_insights._cache_epoch()
+    newer = pipeline_insights._empty_cached_result(
+        "profile-race", new_profile)
+    newer["generated_at"] = 200.0
+    older = pipeline_insights._empty_cached_result(
+        "profile-race", old_profile)
+    older["generated_at"] = 100.0
+
+    assert pipeline_insights._publish_cache(
+        "profile-race", new_profile, generation, epoch, 2, newer) is True
+    assert pipeline_insights._publish_cache(
+        "profile-race", old_profile, generation, epoch, 1, older) is False
+    assert isolated_db.get_setting(
+        pipeline_insights._published_profile_key("profile-race")
+    ) == pipeline_insights._profile_fingerprint(new_profile)
+    assert isolated_db.get_setting(
+        pipeline_insights._published_profile_revision_key("profile-race")
+    ) == "2"
+
+
 def test_stale_profile_analysis_uses_separate_durable_namespace(
         isolated_db, monkeypatch):
     old_profile = {
@@ -1445,11 +1771,19 @@ def test_invalidation_during_analysis_rejects_stale_full_cache_publish(isolated_
         "queues": [{
             "id": "review", "title": "Review", "capacity": 1,
             "query": "is:pr", "series_contains": "REVIEW",
+            "adaptive_cadence": {
+                "idle_recurrence": "30m", "busy_recurrence": "15m",
+                "backlog_above": 0,
+            },
         }],
     }
+    isolated_db.create_task(TaskCreate(
+        prompt="Example - REVIEW", recurrence="30m"))
+    series = isolated_db.list_series()
     entered_search = threading.Event()
     release_search = threading.Event()
     search_calls = []
+    cadence_calls = []
     errors = []
 
     def fake_search(repository, query):
@@ -1462,13 +1796,21 @@ def test_invalidation_during_analysis_rejects_stale_full_cache_publish(isolated_
 
     def run_analysis():
         try:
-            pipeline_insights.analyze("cache-race", [], use_cache=False)
+            pipeline_insights.analyze("cache-race", series, use_cache=False)
         except BaseException as exc:  # preserve the worker-thread failure for the assertion
             errors.append(exc)
+
+    real_reconcile = pipeline_insights._reconcile_adaptive_cadence
+
+    def track_reconcile(*args, **kwargs):
+        cadence_calls.append((args, kwargs))
+        return real_reconcile(*args, **kwargs)
 
     monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"cache-race": profile})
     monkeypatch.setattr(pipeline_insights, "_github_search", fake_search)
     monkeypatch.setattr(pipeline_insights, "_run_profile_health_check", lambda _profile: None)
+    monkeypatch.setattr(
+        pipeline_insights, "_reconcile_adaptive_cadence", track_reconcile)
     pipeline_insights._discard_cache()
     analysis = threading.Thread(target=run_analysis)
     analysis.start()
@@ -1483,12 +1825,61 @@ def test_invalidation_during_analysis_rejects_stale_full_cache_publish(isolated_
         assert isolated_db.get_setting(
             pipeline_insights._cache_key(
                 "cache-race", pipeline_insights._profile_fingerprint(profile))) is None
+        assert cadence_calls == []
 
-        pipeline_insights.analyze("cache-race", [], use_cache=False)
+        pipeline_insights.analyze("cache-race", series, use_cache=False)
         assert len(search_calls) == 2
+        assert len(cadence_calls) == 1
     finally:
         release_search.set()
         analysis.join(5)
+        pipeline_insights._discard_cache()
+
+
+def test_invalidation_after_snapshot_fences_cadence_write(
+        isolated_db, monkeypatch):
+    profile = {
+        "title": "Example", "repository": "owner/example",
+        "queues": [{
+            "id": "fix", "title": "Fix", "capacity": 1,
+            "query": "is:issue", "series_contains": "FIX",
+            "adaptive_cadence": {
+                "idle_recurrence": "30m", "busy_recurrence": "15m",
+                "backlog_above": 0,
+            },
+        }],
+    }
+    task = isolated_db.create_task(TaskCreate(
+        prompt="Example - FIX", recurrence="30m"))
+    series = isolated_db.list_series()
+    real_prune = isolated_db.prune_pipeline_snapshots
+    invalidated = []
+
+    def invalidate_before_cadence(cutoff):
+        real_prune(cutoff)
+        pipeline_insights._discard_cache()
+        invalidated.append(True)
+
+    monkeypatch.setattr(
+        pipeline_insights, "_profiles", lambda: {"cadence-race": profile})
+    monkeypatch.setattr(pipeline_insights, "_github_search", lambda *_args: {
+        "count": 1, "items": [], "membership_complete": True,
+    })
+    monkeypatch.setattr(
+        pipeline_insights, "_run_profile_health_check", lambda _profile: None)
+    monkeypatch.setattr(
+        isolated_db, "prune_pipeline_snapshots", invalidate_before_cadence)
+    pipeline_insights._discard_cache()
+
+    try:
+        result = pipeline_insights.analyze(
+            "cadence-race", series, use_cache=False)
+
+        assert invalidated == [True]
+        assert result["cache"]["invalidated"] is True
+        assert isolated_db.get_series(task.series_id)[
+            "effective_recurrence"] == "30m"
+    finally:
         pipeline_insights._discard_cache()
 
 
@@ -2460,6 +2851,39 @@ def test_pipeline_execution_empty_completes_without_provider(isolated_db, monkey
     assert route["reason"] == "queue is empty"
 
 
+@pytest.mark.parametrize("action", ["empty", "wait"])
+def test_pipeline_execution_empty_cannot_authorize_stale(
+        isolated_db, monkeypatch, tmp_path, action):
+    helper = tmp_path / "pipelinectl.py"
+    helper.write_text(
+        "import json; print(json.dumps({"
+        f"'action':'{action}','verdict':'УСТАРЕЛО','reason':'generic tool'"
+        "}))",
+        encoding="utf-8",
+    )
+    task = isolated_db.create_task(TaskCreate(
+        prompt="ExampleProject - REVIEW\n/review-queue", recurrence="4h",
+    ))
+    profile = {
+        "title": "Example", "repository": "owner/example",
+        "queues": [{
+            "id": "review", "title": "Review", "query": "is:pr",
+            "series_contains": "ExampleProject - REVIEW",
+            "execution": {
+                "mode": "auto", "stage": "review",
+                "command": ["{python}", "pipelinectl.py", "next", "{stage}"],
+                "required_paths": ["pipelinectl.py"],
+            },
+        }],
+    }
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"example": profile})
+
+    route = pipeline_insights.execution_route(task, task.prompt, str(tmp_path))
+
+    assert route["action"] == "complete_empty"
+    assert route["verdict"] == "НЕ СМОГ"
+
+
 def test_worker_settles_preflight_empty_without_loading_provider(isolated_db, monkeypatch):
     task = isolated_db.create_task(TaskCreate(
         prompt="ExampleProject - REVIEW", recurrence="4h",
@@ -2484,6 +2908,33 @@ def test_worker_settles_preflight_empty_without_loading_provider(isolated_db, mo
     assert settled.status.value == "completed"
     assert settled.verdict == "ПУСТО"
     assert "токены не потрачены" in settled.result
+
+
+def test_worker_never_persists_stale_from_complete_empty(isolated_db, monkeypatch):
+    task = isolated_db.create_task(TaskCreate(
+        prompt="ExampleProject - REVIEW", recurrence="4h",
+    ))
+    task = isolated_db.get_next_runnable()
+    monkeypatch.setattr(pipeline_insights, "dispatch_gate", lambda _task: None)
+    monkeypatch.setattr(
+        pipeline_insights, "execution_route",
+        lambda *_args, **_kwargs: {
+            "action": "complete_empty", "mode": "tool",
+            "reason": "generic tool", "verdict": "УСТАРЕЛО",
+        },
+    )
+    monkeypatch.setattr(
+        worker, "load_providers",
+        lambda: (_ for _ in ()).throw(AssertionError("provider must not be loaded")),
+    )
+
+    worker._execute_task_inner(task)
+
+    settled = isolated_db.get_task(task.id)
+    assert settled.status.value == "completed"
+    assert settled.verdict == "НЕ СМОГ"
+    assert "ИТОГ: НЕ СМОГ (generic tool)" in settled.result
+    assert "ИТОГ: УСТАРЕЛО" not in settled.result
 
 
 def test_pipeline_execution_tool_fallback_skips_preflight_prompt(isolated_db, monkeypatch, tmp_path):
@@ -2786,6 +3237,21 @@ def test_pipeline_run_metrics_distinguish_semantic_failure_from_process_failure(
     assert metrics["unresolved_failed"] == 1
     assert metrics["recovered_unable"] == 0
     assert metrics["recovered_failed"] == 0
+
+
+def test_pipeline_run_metrics_count_stale_reselection_as_safe(isolated_db):
+    task = isolated_db.create_task(TaskCreate(
+        prompt="Project - REVIEW", recurrence="1h"))
+    isolated_db.mark_completed(
+        task.id, "ИТОГ: УСТАРЕЛО", verdict="УСТАРЕЛО")
+
+    metrics = isolated_db.pipeline_run_metrics(
+        [task.series_id], datetime.now(timezone.utc) - timedelta(hours=1))
+
+    assert metrics["runs"] == 1
+    assert metrics["stale"] == 1
+    assert metrics["unable"] == 0
+    assert metrics["failed"] == 0
 
 
 def test_pipeline_run_metrics_clear_incident_after_later_success(isolated_db):
