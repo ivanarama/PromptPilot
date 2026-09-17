@@ -135,7 +135,10 @@ ENV_FAILURE_RE = re.compile(
 
 # The agent is asked to end with this line so a finished task says WHAT
 # happened, not just that the process exited 0. Parsed whether or not we asked.
-VERDICTS = ("ГОТОВО", "УЖЕ СДЕЛАНО", "НУЖЕН ЧЕЛОВЕК", "НЕ СМОГ", "ПУСТО")
+VERDICTS = (
+    "ГОТОВО", "УЖЕ СДЕЛАНО", "НУЖЕН ЧЕЛОВЕК", "НЕ СМОГ", "УСТАРЕЛО",
+    "ПУСТО",
+)
 VERDICT_RE = re.compile(r"^[ \t>*#-]*ИТОГ:\s*(" + "|".join(VERDICTS) + r")\b", re.M | re.I)
 
 VERDICT_INSTRUCTION = (
@@ -483,7 +486,21 @@ def _maybe_recur(task, failed: bool = False):
     recurrence = series["effective_recurrence"] if series else task.recurrence
     if task.series_id and series is None:  # series was explicitly ended
         return
-    next_dt = db.parse_recurrence(recurrence)
+    # A stale exact target is neither a failed run nor useful work. Re-elect it
+    # immediately instead of making a busy queue wait for its ordinary cadence.
+    # Only the explicit closing verdict enables this path: generic failures and
+    # ambiguous gate errors keep their normal bounded schedule.
+    stale_pipeline_target = False
+    if (task.verdict or "").upper() == "УСТАРЕЛО":
+        try:
+            from . import pipeline_insights
+            stale_pipeline_target = pipeline_insights._matching_queue(task) is not None
+        except (AttributeError, OSError, TypeError, ValueError):
+            # A broken/temporarily unreadable optional profile must not turn
+            # an ordinary recurring task into an unbounded immediate loop.
+            stale_pipeline_target = False
+    next_dt = (datetime.now(timezone.utc) if stale_pipeline_target
+               else db.parse_recurrence(recurrence))
     if not next_dt:
         return
     from .models import TaskCreate
@@ -1398,6 +1415,40 @@ class _AdmissionFence:
         return self._pending
 
 
+def _claim_next_task(busy_keys=(), busy_lane_ids=()):
+    """Atomically claim by configured lane preference, with safe fallback.
+
+    Invalid optional lane configuration must be visible but must not freeze the
+    legacy queue.  The project preflight still owns every external mutation;
+    this function only chooses which already-runnable local task gets a slot.
+    """
+    from . import pipeline_insights
+
+    try:
+        policy = pipeline_insights.worker_lane_policy()
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        print(f"  !! pipeline lane scheduler unavailable: {exc}", flush=True)
+        policy = None
+    if policy is None:
+        return db.get_next_runnable(
+            busy_keys=busy_keys, key_fn=lock_key), None
+
+    assignments = {}
+
+    def rank(task):
+        candidate = pipeline_insights.worker_lane_rank(
+            task, policy, busy_lane_ids)
+        if candidate is None:
+            return None
+        score, lane_id = candidate
+        assignments[task.id] = lane_id
+        return score
+
+    task = db.get_next_runnable(
+        busy_keys=busy_keys, key_fn=lock_key, order_key_fn=rank)
+    return task, assignments.get(task.id) if task is not None else None
+
+
 def _warm_pipeline_runtime():
     """Load pipeline routing code before a runnable task is claimed.
 
@@ -1479,6 +1530,7 @@ def run_worker():
 
     pool = None
     in_flight = {}  # Future -> (lock key, exact claimed task attempt)
+    task_lanes = {}  # task id -> configured scheduler lane
     stuck_recoveries = {}  # exact attempt -> retry state; keeps its lock key
     admission_fence = _AdmissionFence()
     short_on_memory = False
@@ -1487,7 +1539,11 @@ def run_worker():
         pool = ThreadPoolExecutor(max_workers=CONCURRENCY, thread_name_prefix="pp-task")
 
     def reap():
+        before = {task.id for _lock, task in in_flight.values()}
         _reap_futures(in_flight, stuck_recoveries)
+        after = {task.id for _lock, task in in_flight.values()}
+        for task_id in before - after:
+            task_lanes.pop(task_id, None)
 
     while running:
         reap()
@@ -1526,7 +1582,10 @@ def run_worker():
         busy_keys = [lk for lk, _task in in_flight.values() if lk]
         busy_keys.extend(
             item["lock"] for item in stuck_recoveries.values() if item["lock"])
-        task = db.get_next_runnable(busy_keys=busy_keys, key_fn=lock_key)
+        task, lane_id = _claim_next_task(
+            busy_keys=busy_keys,
+            busy_lane_ids=task_lanes.values(),
+        )
         if task is None:
             time.sleep(POLL_INTERVAL)
             continue
@@ -1544,6 +1603,9 @@ def run_worker():
                 _drain_stuck_recoveries(stuck_recoveries)
         else:
             admission_complete = admission_fence.begin()
+            if lane_id is not None:
+                task_lanes[task.id] = lane_id
+                print(f"  -> Scheduler lane: {lane_id}", flush=True)
             in_flight[pool.submit(
                 _execute_task_with_admission_fence,
                 task, admission_complete)] = (lock_key(task), task)

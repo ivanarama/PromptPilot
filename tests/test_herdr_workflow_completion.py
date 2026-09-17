@@ -35,6 +35,13 @@ def test_closing_workflow_verdict_accepts_only_final_line():
         "  ИТОГ: ГОТОВО — задача выполнена, изменения и\n"
         "  проверки перечислены выше"
     ) == "ГОТОВО"
+
+
+def test_closing_workflow_verdict_accepts_stale_reselection_outcome():
+    assert _closing_workflow_verdict(
+        "Gate proved that the exact HEAD changed.\n"
+        "ИТОГ: УСТАРЕЛО (PR HEAD changed before mutation)"
+    ) == "УСТАРЕЛО"
     assert _closing_workflow_verdict(
         "Проверять нечего.\nИТОГ: ПУСТО (очередь пуста)"
     ) == "ПУСТО"

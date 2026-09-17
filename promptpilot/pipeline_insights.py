@@ -1355,6 +1355,107 @@ def _interval_hours(value: str | None) -> float | None:
     return None
 
 
+def _adaptive_cadence_policy(queue: dict) -> dict | None:
+    """Validate the generic queue-owned cadence policy, if configured."""
+    raw = queue.get("adaptive_cadence")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("adaptive_cadence должен быть JSON-объектом")
+    allowed = {
+        "idle_recurrence", "busy_recurrence", "backlog_above",
+        "empty_runs_before_idle", "event_wake",
+    }
+    unknown = sorted(set(raw) - allowed)
+    if unknown:
+        raise ValueError(
+            "adaptive_cadence содержит неизвестные поля: " + ", ".join(unknown))
+    idle = raw.get("idle_recurrence")
+    busy = raw.get("busy_recurrence")
+    if not isinstance(idle, str) or db.parse_recurrence(idle) is None:
+        raise ValueError("adaptive_cadence.idle_recurrence не разобран")
+    if busy is not None and (
+            not isinstance(busy, str) or db.parse_recurrence(busy) is None):
+        raise ValueError("adaptive_cadence.busy_recurrence не разобран")
+    threshold = raw.get("backlog_above", 0)
+    empty_runs = raw.get("empty_runs_before_idle", 0)
+    event_wake = raw.get("event_wake", False)
+    if isinstance(threshold, bool) or not isinstance(threshold, int) or threshold < 0:
+        raise ValueError("adaptive_cadence.backlog_above должен быть >= 0")
+    if (isinstance(empty_runs, bool) or not isinstance(empty_runs, int)
+            or not 0 <= empty_runs <= 20):
+        raise ValueError(
+            "adaptive_cadence.empty_runs_before_idle должен быть от 0 до 20")
+    if not isinstance(event_wake, bool):
+        raise ValueError("adaptive_cadence.event_wake должен быть true или false")
+    if busy is None and (threshold or empty_runs):
+        raise ValueError(
+            "adaptive_cadence.backlog_above/empty_runs_before_idle требуют "
+            "busy_recurrence")
+    return {
+        "idle_recurrence": idle,
+        "busy_recurrence": busy,
+        "backlog_above": threshold,
+        "empty_runs_before_idle": empty_runs,
+        "event_wake": event_wake,
+    }
+
+
+def _adaptive_cadence_status(queue: dict, matching: dict | None,
+                             backlog: int | None) -> dict | None:
+    policy = _adaptive_cadence_policy(queue)
+    if policy is None:
+        return None
+    busy = bool(
+        policy["busy_recurrence"] is not None
+        and isinstance(backlog, int)
+        and backlog > policy["backlog_above"]
+    )
+    temporary = matching.get("temporary_recurrence") if matching else None
+    empty_count = int(matching.get("temporary_empty_count") or 0) if matching else 0
+    draining = bool(
+        not busy and policy["empty_runs_before_idle"]
+        and temporary == policy["busy_recurrence"]
+    )
+    mode = "busy" if busy else "draining" if draining else (
+        "event" if policy["event_wake"] else "idle")
+    return {
+        **policy,
+        "mode": mode,
+        "effective_recurrence": (
+            matching.get("effective_recurrence") if matching else None),
+        "empty_runs": empty_count,
+        "series_present": matching is not None,
+    }
+
+
+def _reconcile_adaptive_cadence(queue: dict, matching: dict | None,
+                                backlog: int | None) -> dict | None:
+    """Apply cadence only during a successful live queue observation."""
+    policy = _adaptive_cadence_policy(queue)
+    if policy is None or matching is None or not isinstance(backlog, int):
+        return _adaptive_cadence_status(queue, matching, backlog)
+    boost = bool(
+        policy["busy_recurrence"] is not None
+        and backlog > policy["backlog_above"])
+    result = db.apply_pipeline_series_cadence(
+        int(matching["id"]),
+        idle_recurrence=policy["idle_recurrence"],
+        busy_recurrence=policy["busy_recurrence"],
+        boost=boost,
+        empty_runs_before_idle=policy["empty_runs_before_idle"],
+    )
+    if result is not None:
+        matching.update({
+            "recurrence": result["base_recurrence"],
+            "effective_recurrence": result["effective_recurrence"],
+            "temporary_recurrence": result["temporary_recurrence"],
+            "temporary_empty_limit": result["temporary_empty_limit"],
+            "temporary_empty_count": result["temporary_empty_count"],
+        })
+    return _adaptive_cadence_status(queue, matching, backlog)
+
+
 def _recommendation(item: dict, backlog: int, capacity: int,
                     current_interval: str | None, target_hours: float,
                     avg_duration_seconds: int | None = None) -> dict:
@@ -1461,18 +1562,37 @@ def _window_metrics(snapshots: list[dict], current: dict, series_ids: list[int],
     churn_items = sum(1 for seq in sequences.values() if len(seq) >= 3)
 
     queue_deltas = {}
+    queue_throughput = {}
     for queue_id, queue in current.get("queues", {}).items():
-        old = baseline.get("queues", {}).get(queue_id, {}).get("backlog", 0)
+        old_queue = baseline.get("queues", {}).get(queue_id, {})
+        old = old_queue.get("backlog", 0)
         queue_deltas[queue_id] = int(queue.get("backlog", 0)) - int(old)
+        old_keys = {item.get("key") for item in old_queue.get("items", [])
+                    if isinstance(item, dict) and item.get("key")}
+        new_keys = {item.get("key") for item in queue.get("items", [])
+                    if isinstance(item, dict) and item.get("key")}
+        queue_throughput[queue_id] = len(old_keys - new_keys)
     current_total = sum(q.get("backlog", 0) for q in current.get("queues", {}).values())
     baseline_total = sum(q.get("backlog", 0) for q in baseline.get("queues", {}).values())
+    measured_hours = min(coverage, hours)
+
+    def hourly(value: int) -> float | None:
+        return round(value / measured_hours, 2) if measured_hours > 0 else None
 
     return {
         "hours": hours, "coverage_hours": round(min(coverage, hours), 1),
         "complete": complete, "backlog_delta": current_total - baseline_total,
+        "backlog_delta_per_hour": hourly(current_total - baseline_total),
         "entered": len(entered), "exited": len(exited), "moved": len(moved),
+        "entered_per_hour": hourly(len(entered)),
+        "exited_per_hour": hourly(len(exited)),
         "transitions": transitions, "churn_items": churn_items,
         "queue_deltas": queue_deltas,
+        "queue_deltas_per_hour": {
+            queue_id: hourly(delta) for queue_id, delta in queue_deltas.items()},
+        "queue_throughput": queue_throughput,
+        "queue_throughput_per_hour": {
+            queue_id: hourly(count) for queue_id, count in queue_throughput.items()},
         "runs": db.pipeline_run_metrics(series_ids, now - timedelta(hours=hours)),
     }
 
@@ -1559,6 +1679,111 @@ def _matching_queue(task) -> tuple[str, dict, dict] | None:
             if marker and marker in title:
                 return profile_id, profile, queue
     return None
+
+
+def worker_lane_policy() -> dict | None:
+    """Load generic, profile-owned worker lanes.
+
+    A lane is one concurrency slot with an ordered list of preferred queues.
+    ``borrow`` lets its idle slot execute work from another lane.  Profiles
+    without this opt-in retain the historical global priority/FIFO scheduler.
+    """
+    profiles = _profiles()
+    lanes = []
+    seen = set()
+    for profile_id, profile in profiles.items():
+        scheduler = profile.get("scheduler")
+        if scheduler is None:
+            continue
+        if not isinstance(scheduler, dict) or set(scheduler) != {"lanes"}:
+            raise ValueError("scheduler должен содержать только массив lanes")
+        configured = scheduler.get("lanes")
+        if not isinstance(configured, list) or not configured:
+            raise ValueError("scheduler.lanes должен быть непустым массивом")
+        queue_ids = {
+            str(queue.get("id")) for queue in profile.get("queues", [])
+            if isinstance(queue, dict) and queue.get("id") is not None
+        }
+        for raw in configured:
+            if not isinstance(raw, dict) or set(raw) - {"id", "queues", "borrow"}:
+                raise ValueError(
+                    "каждая scheduler lane допускает только id, queues и borrow")
+            lane_id = raw.get("id")
+            queues = raw.get("queues")
+            borrow = raw.get("borrow", True)
+            if (not isinstance(lane_id, str) or not lane_id.strip()
+                    or not re.fullmatch(r"[A-Za-z0-9._-]+", lane_id)):
+                raise ValueError("scheduler lane id должен быть непустым safe-id")
+            qualified = f"{profile_id}:{lane_id}"
+            if qualified in seen:
+                raise ValueError(f"повтор scheduler lane id: {qualified}")
+            seen.add(qualified)
+            if (not isinstance(queues, list) or not queues
+                    or any(not isinstance(value, str) or not value.strip()
+                           for value in queues)
+                    or len(set(queues)) != len(queues)):
+                raise ValueError(
+                    f"scheduler lane {qualified}.queues должен быть "
+                    "непустым массивом уникальных id")
+            unknown = sorted(set(queues) - queue_ids)
+            if unknown:
+                raise ValueError(
+                    f"scheduler lane {qualified} ссылается на неизвестные "
+                    f"очереди: {', '.join(unknown)}")
+            if not isinstance(borrow, bool):
+                raise ValueError(f"scheduler lane {qualified}.borrow должен быть boolean")
+            lanes.append({
+                "id": qualified, "profile_id": profile_id,
+                "queues": list(queues), "borrow": borrow,
+                "order": len(lanes),
+            })
+    return {"profiles": profiles, "lanes": lanes} if lanes else None
+
+
+def worker_lane_rank(task, policy: dict, busy_lane_ids=()) -> tuple[tuple, str] | None:
+    """Return the best free lane and deterministic rank for one task.
+
+    Preferred work always beats borrowed work in a free slot.  Within a lane,
+    the configured queue order is authoritative; ordinary task priority and
+    FIFO order break ties.  ``None`` means no configured slot can claim now.
+    """
+    busy = set(busy_lane_ids or ())
+    free = [lane for lane in policy.get("lanes", []) if lane["id"] not in busy]
+    if not free:
+        return None
+    title = (getattr(task, "series_title", None)
+             or str(getattr(task, "prompt", "")).splitlines()[0]).lower()
+    matched = None
+    if getattr(task, "series_id", None):
+        for profile_id, profile in policy.get("profiles", {}).items():
+            for queue in profile.get("queues", []):
+                marker = str(queue.get("series_contains") or "").lower()
+                if marker and marker in title:
+                    matched = (profile_id, str(queue.get("id")))
+                    break
+            if matched:
+                break
+    priority = int(getattr(task, "priority", 5))
+    created = str(getattr(task, "created_at", ""))
+    task_id = int(getattr(task, "id", 0))
+    preferred = []
+    if matched:
+        profile_id, queue_id = matched
+        for lane in free:
+            if lane["profile_id"] != profile_id or queue_id not in lane["queues"]:
+                continue
+            preferred.append((
+                (0, lane["queues"].index(queue_id), lane["order"],
+                 priority, created, task_id),
+                lane["id"],
+            ))
+    if preferred:
+        return min(preferred, key=lambda item: item[0])
+    borrowing = [lane for lane in free if lane["borrow"]]
+    if not borrowing:
+        return None
+    lane = min(borrowing, key=lambda item: item["order"])
+    return ((1, priority, created, task_id, lane["order"]), lane["id"])
 
 
 def _diagnostic_match_count(diagnostics: dict, condition: dict) -> int:
@@ -2121,8 +2346,12 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                     "разбери и выведи JSON; запрещено бросать исключение только по exit code "
                     "до разбора ответа. При ненулевом коде, неверном JSON, action не равном "
                     "validated или несовпадении цели остановись, не повторяй gate_command и "
-                    "next, и закончи строкой ИТОГ: НЕ СМОГ (gate-fallback: <точный error, "
-                    "reason или сырой ответ>). "
+                    "next. Если структурированный ответ доказывает только смену exact target, "
+                    "HEAD, executable-позиции или истечение lease до первой мутации, закончи "
+                    "строкой ИТОГ: УСТАРЕЛО (gate-fallback: <точный error/reason>): "
+                    "PromptPilot немедленно и безопасно перевыберет цель. При любой другой "
+                    "причине закончи ИТОГ: НЕ СМОГ (gate-fallback: <точный error, reason "
+                    "или сырой ответ>). "
                     "Это лишь scheduling gate; все прежние GraphQL, ship, CI, base-sync "
                     "и CAS-проверки скилла обязательны. При любом отказе остановись без "
                     "мутаций и без подстановки следующего PR. Один envelope — один PR.\n\n"
@@ -2449,6 +2678,8 @@ def _refresh_local_state(result: dict, profile: dict, series: list[dict], *,
             }
         queue["wake"] = (_wake_status(data["profile_id"], config, diagnostics)
                          if isinstance(diagnostics, dict) else None)
+        queue["adaptive_cadence"] = _adaptive_cadence_status(
+            config, matching, backlog if isinstance(backlog, int) else None)
 
     bottleneck = max(
         (queue for queue in data.get("queues", [])
@@ -2487,13 +2718,31 @@ def _refresh_local_state(result: dict, profile: dict, series: list[dict], *,
             window = {
                 "hours": hours, "coverage_hours": 0, "complete": False,
                 "backlog_delta": 0, "entered": 0, "exited": 0, "moved": 0,
+                "backlog_delta_per_hour": None,
+                "entered_per_hour": None, "exited_per_hour": None,
                 "transitions": 0, "churn_items": 0, "queue_deltas": {},
+                "queue_deltas_per_hour": {}, "queue_throughput": {},
+                "queue_throughput_per_hour": {},
             }
             history[key] = window
         if hours == 5:
             window["runs"] = aggregate_runs
         elif not isinstance(window.get("runs"), dict):
             window["runs"] = dict(empty_runs)
+
+    safe_deferrals = sum(
+        1 for item in matching_series
+        if item.get("next_status") in {"pending", "rate_limited"}
+        and bool(item.get("next_error"))
+    )
+    data["outcomes"] = {
+        "safe_deferrals_now": safe_deferrals,
+        "stale_reselections_5h": aggregate_runs.get("stale", 0),
+        "real_errors_5h": (
+            aggregate_runs.get("unresolved_unable", aggregate_runs.get("unable", 0))
+            + aggregate_runs.get("unresolved_failed", aggregate_runs.get("failed", 0))
+        ),
+    }
 
     runtime = _pipeline_runtime(matching_series, now)
     backlog_total = data.get("backlog_total")
@@ -2923,6 +3172,7 @@ def _analyze_without_budget(profile_id: str, series: list[dict], *,
         paused_series = 0
         matching_series = []
         all_items = {}
+        cadence_reconciliations = []
 
         for item in profile["queues"]:
             queries = item.get("queries") or [item["query"]]
@@ -2965,6 +3215,8 @@ def _analyze_without_budget(profile_id: str, series: list[dict], *,
                 series_ids.append(matching["id"])
                 broken_series += int(bool(matching.get("broken")))
                 paused_series += int(bool(matching.get("paused")))
+            cadence = _adaptive_cadence_status(item, matching, backlog)
+            cadence_reconciliations.append((item, matching, backlog))
             runs_needed = round(backlog / capacity, 1)
             recommendation = _recommendation(
                 item, backlog, capacity,
@@ -2996,6 +3248,7 @@ def _analyze_without_budget(profile_id: str, series: list[dict], *,
                 if priority_settings else [],
                 "execution": _execution_status(item, matching.get("working_dir") if matching else None),
                 "wake": _wake_status(profile_id, item, diagnostics),
+                "adaptive_cadence": cadence,
                 **recommendation,
             })
             snapshot_queues[item["id"]] = {
@@ -3077,6 +3330,12 @@ def _analyze_without_budget(profile_id: str, series: list[dict], *,
             raise _GitHubScanLeaseLost(
                 "SQLite lease/snapshot fence rejected GitHub scan publication")
         db.prune_pipeline_snapshots(now - timedelta(days=31))
+        # Cadence changes are local mutations derived from this observation.
+        # Apply them only after both the full-cache CAS and the fenced history
+        # snapshot accepted the observation; a stale/losing scan must never
+        # retime a live series.
+        for item, matching, backlog in cadence_reconciliations:
+            _reconcile_adaptive_cadence(item, matching, backlog)
         return _refresh_local_state(
             result, profile, series, source="live",
             generated_at=float(result["generated_at"]), entry_epoch=cache_epoch,

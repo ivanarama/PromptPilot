@@ -2650,10 +2650,12 @@ async function loadPipelineInsights(profile, refresh=false) {
     const h7d = data.history['168h'] || {complete:false, coverage_hours:0};
     const h30d = data.history['720h'] || {complete:false, coverage_hours:0};
     const signed = n => n > 0 ? `+${n}` : String(n);
+    const perHour = n => n == null ? '—' : `${signed(Number(n).toFixed(2))}/ч`;
     const age = value => value == null ? '—' : value < 24 ? `${Math.round(value)} ч` : `${(value/24).toFixed(1)} д`;
     const duration = seconds => seconds == null ? '—' : seconds < 3600 ? `${Math.round(seconds/60)} мин` : `${(seconds/3600).toFixed(1)} ч`;
     const historyNote = h5.complete ? 'за последние 5 часов' : `история ${h5.coverage_hours} из 5 ч`;
     const runs = h5.runs;
+    const outcomes = data.outcomes || {safe_deferrals_now:0, stale_reselections_5h:0, real_errors_5h:0};
     const activeUnable = runs.unresolved_unable ?? runs.unable;
     const activeFailed = runs.unresolved_failed ?? runs.failed;
     const recoveredRuns = (runs.recovered_unable || 0) + (runs.recovered_failed || 0);
@@ -2727,7 +2729,9 @@ async function loadPipelineInsights(profile, refresh=false) {
     const coreLimit = githubLimits.core;
     const coreShare = coreLimit && coreLimit.limit ? coreLimit.remaining / coreLimit.limit : null;
     const coreColor = coreShare == null ? 'var(--muted)' : coreShare <= 0.05 ? 'var(--red)' : coreShare <= 0.2 ? 'var(--yellow)' : '';
-    const deltaByQueue = h5.queue_deltas || {};
+    const deltaRateByQueue = h5.queue_deltas_per_hour || {};
+    const throughputRateByQueue = h5.queue_throughput_per_hour || {};
+    const bottleneckQueue = (data.queues || []).find(q => q.id === data.bottleneck);
     const diagnostics = data.diagnostics;
     const runtime = data.runtime || {};
     const healthLabel = data.health.label === 'нужна проверка' ? 'есть ожидания' : data.health.label;
@@ -2746,16 +2750,20 @@ async function loadPipelineInsights(profile, refresh=false) {
       const lastLine = last && last.at
         ? `последний #${last.task_id}: ${timeAgo(last.at)} · ${last.verdict || last.status}${lastTokens}`
         : 'завершённых запусков нет';
-      const stageLine = `5 ч: ${stageRuns.runs || 0} запусков · действий ${stageRuns.ready || 0} · холостых ${stageRuns.no_change || 0}`;
+      const stageLine = `5 ч: ${stageRuns.runs || 0} запусков · действий ${stageRuns.ready || 0} · холостых ${stageRuns.no_change || 0} · фактический выход ${perHour(throughputRateByQueue[q.id])}`;
       const route = q.execution || {configured:'skill',effective:'skill'};
       const routeLine = `маршрут: ${route.configured}${route.configured!==route.effective ? ` → ${route.effective}` : ''}${route.reason && route.effective!=='tool' ? ` · ${route.reason}` : ''}`;
       const wake = q.wake;
       const wakeLine = wake ? (wake.suppressed
         ? `автозапуск: ждёт изменения состояния · снимок ${wake.fingerprint}`
         : wake.ready ? `автозапуск: готов · ${wake.matches}` : 'автозапуск: работы нет') : null;
+      const cadence = q.adaptive_cadence;
+      const cadenceLine = cadence
+        ? `интервал: ${cadence.mode} · ${cadence.effective_recurrence || 'нет серии'}${cadence.empty_runs_before_idle ? ` · ПУСТО ${cadence.empty_runs}/${cadence.empty_runs_before_idle}` : ''}${cadence.event_wake ? ' · event wake' : ''}`
+        : null;
       const bottleneck = data.bottleneck===q.id ? 'bottleneck' : '';
-      return `<tr class="${bottleneck}"><td class="insights-stage-title">${data.bottleneck===q.id?'⚠ ':''}${esc(q.title)}</td><td class="num">${q.backlog == null ? '—' : q.backlog}</td><td class="num">${h5.complete?signed(deltaByQueue[q.id]||0):'—'}</td><td class="num">${q.capacity}</td><td class="num">${q.runs_needed == null ? '—' : q.runs_needed}</td><td>${duration(q.avg_duration_seconds)}</td><td>${q.eta_hours == null ? '—' : q.eta_hours+' ч'}</td><td>${age(q.age.oldest_hours)}</td><td>${esc(q.interval || 'нет серии')}</td><td class="insights-recommendation">${esc(q.recommendation || '—')}</td></tr>
-        <tr class="insights-stage-detail ${bottleneck}"><td colspan="10"><div class="insights-stage-meta"><span class="prov-cmd" title="${escAttr(last?.summary || '')}">${esc(lastLine)}</span><span class="prov-cmd">${esc(stageLine)}</span><span class="prov-cmd">${esc(routeLine)}</span>${wakeLine?`<span class="prov-cmd">${esc(wakeLine)}</span>`:''}</div></td></tr>`;
+      return `<tr class="${bottleneck}"><td class="insights-stage-title">${data.bottleneck===q.id?'⚠ ':''}${esc(q.title)}</td><td class="num">${q.backlog == null ? '—' : q.backlog}</td><td class="num">${h5.complete?perHour(deltaRateByQueue[q.id] ?? 0):'—'}</td><td class="num">${q.capacity}</td><td class="num">${q.runs_needed == null ? '—' : q.runs_needed}</td><td>${duration(q.avg_duration_seconds)}</td><td>${q.eta_hours == null ? '—' : q.eta_hours+' ч'}</td><td>${age(q.age.oldest_hours)}</td><td>${esc(q.interval || 'нет серии')}</td><td class="insights-recommendation">${esc(q.recommendation || '—')}</td></tr>
+        <tr class="insights-stage-detail ${bottleneck}"><td colspan="10"><div class="insights-stage-meta"><span class="prov-cmd" title="${escAttr(last?.summary || '')}">${esc(lastLine)}</span><span class="prov-cmd">${esc(stageLine)}</span><span class="prov-cmd">${esc(routeLine)}</span>${wakeLine?`<span class="prov-cmd">${esc(wakeLine)}</span>`:''}${cadenceLine?`<span class="prov-cmd">${esc(cadenceLine)}</span>`:''}</div></td></tr>`;
     }).join('');
     const priorityHtml = data.priority_control ? `<details style="margin-top:12px" open>
       <summary style="cursor:pointer"><b>Приоритет элементов очереди</b> · P0 выполняется первым, старые задачи повышаются каждые ${data.priority_control.aging_hours} ч до P1</summary>
@@ -2788,11 +2796,13 @@ async function loadPipelineInsights(profile, refresh=false) {
       ${cacheNotice}
       <div class="pipeline-summary">
         <div class="pipeline-metric"><div class="pipeline-metric-label">Снимок GitHub</div><div class="pipeline-metric-value" style="${cacheColor ? `color:${cacheColor}` : ''}">${esc(cacheValue)}</div><div class="pipeline-metric-note">${esc(cacheNote)}</div></div>
-        <div class="pipeline-metric"><div class="pipeline-metric-label">Backlog сейчас</div><div class="pipeline-metric-value">${data.backlog_total == null ? '—' : data.backlog_total}</div><div class="pipeline-metric-note">Δ 5 ч: ${h5.complete?signed(h5.backlog_delta):'копится история'}</div></div>
-        <div class="pipeline-metric"><div class="pipeline-metric-label">Вход / выход</div><div class="pipeline-metric-value">${h5.complete?`${h5.entered} / ${h5.exited}`:'—'}</div><div class="pipeline-metric-note">${historyNote}</div></div>
+        <div class="pipeline-metric"><div class="pipeline-metric-label">Backlog сейчас</div><div class="pipeline-metric-value">${data.backlog_total == null ? '—' : data.backlog_total}</div><div class="pipeline-metric-note">Δ/ч: ${h5.complete?perHour(h5.backlog_delta_per_hour):'копится история'}</div></div>
+        <div class="pipeline-metric"><div class="pipeline-metric-label">Вход / выход</div><div class="pipeline-metric-value">${h5.complete?`${perHour(h5.entered_per_hour)} / ${perHour(h5.exited_per_hour)}`:'—'}</div><div class="pipeline-metric-note">фактическая скорость · ${historyNote}</div></div>
+        <div class="pipeline-metric"><div class="pipeline-metric-label">Узкое место</div><div class="pipeline-metric-value">${bottleneckQueue?esc(bottleneckQueue.title):'нет'}</div><div class="pipeline-metric-note">${bottleneckQueue&&bottleneckQueue.eta_hours!=null?`ETA ${bottleneckQueue.eta_hours} ч · очередь ${bottleneckQueue.backlog}`:'активной очереди нет'}</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Переходы / churn</div><div class="pipeline-metric-value">${h5.complete?`${h5.transitions} / ${h5.churn_items}`:'—'}</div><div class="pipeline-metric-note">между очередями / 3+ состояний</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Возраст p90 / max</div><div class="pipeline-metric-value">${age(data.age.p90_hours)} / ${age(data.age.oldest_hours)}</div><div class="pipeline-metric-note">текущие элементы</div></div>
-        <div class="pipeline-metric"><div class="pipeline-metric-label">Прогоны 5 ч</div><div class="pipeline-metric-value">${runs.runs}</div><div class="pipeline-metric-note">с действием ${runs.ready} · без действий ${runs.no_change || 0} · пусто ${runs.empty}</div></div>
+        <div class="pipeline-metric"><div class="pipeline-metric-label">Прогоны 5 ч</div><div class="pipeline-metric-value">${runs.runs}</div><div class="pipeline-metric-note">с действием ${runs.ready} · без действий ${runs.no_change || 0} · пусто ${runs.empty} · перевыбор ${runs.stale || 0}</div></div>
+        <div class="pipeline-metric"><div class="pipeline-metric-label">Безопасные ожидания / ошибки</div><div class="pipeline-metric-value">${outcomes.safe_deferrals_now + outcomes.stale_reselections_5h} / ${outcomes.real_errors_5h}</div><div class="pipeline-metric-note">ожидают сейчас ${outcomes.safe_deferrals_now} · stale-перевыборов 5 ч ${outcomes.stale_reselections_5h} · активных ошибок ${outcomes.real_errors_5h}</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Требуют внимания</div><div class="pipeline-metric-value">${runs.human + activeUnable + activeFailed}</div><div class="pipeline-metric-note">человек ${runs.human} · не смог ${activeUnable} · упало ${activeFailed}${recoveredRuns ? ` · восстановлено ${recoveredRuns}` : ''}</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Последнее REVIEW</div><div class="pipeline-metric-value">${esc(lastReviewValue)}</div><div class="pipeline-metric-note">${esc(lastReviewNote)}</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Токены 5 ч</div><div class="pipeline-metric-value">${esc(tokenValue)}</div><div class="pipeline-metric-note">измерено запусков: ${runs.tokens_known_runs || 0} из ${runs.runs}</div></div>
@@ -2805,7 +2815,7 @@ async function loadPipelineInsights(profile, refresh=false) {
         ${budgetMetric}
       </div>
       ${diagnosticHtml}
-      <table class="insights-table"><colgroup><col class="insights-col-stage"><col class="insights-col-small"><col class="insights-col-small"><col class="insights-col-capacity"><col class="insights-col-capacity"><col class="insights-col-duration"><col class="insights-col-small"><col class="insights-col-oldest"><col class="insights-col-interval"><col class="insights-col-recommendation"></colgroup><thead><tr><th>Этап</th><th class="num">Очередь</th><th class="num">Δ 5 ч</th><th class="num">За прогон</th><th class="num">Прогонов</th><th>Средний запуск</th><th>ETA</th><th>Самый старый</th><th>Интервал</th><th>Рекомендация</th></tr></thead><tbody>${rows}</tbody></table>
+      <table class="insights-table"><colgroup><col class="insights-col-stage"><col class="insights-col-small"><col class="insights-col-small"><col class="insights-col-capacity"><col class="insights-col-capacity"><col class="insights-col-duration"><col class="insights-col-small"><col class="insights-col-oldest"><col class="insights-col-interval"><col class="insights-col-recommendation"></colgroup><thead><tr><th>Этап</th><th class="num">Очередь</th><th class="num">Δ/ч</th><th class="num">За прогон</th><th class="num">Прогонов</th><th>Средний запуск</th><th>ETA</th><th>Самый старый</th><th>Интервал</th><th>Рекомендация</th></tr></thead><tbody>${rows}</tbody></table>
       ${priorityHtml}
     </div>`;
   } catch(e) { box.innerHTML = `<div style="color:var(--red);margin-bottom:10px">Анализ очереди недоступен: ${esc(e.message)}</div>`; }

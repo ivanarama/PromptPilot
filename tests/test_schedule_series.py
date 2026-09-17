@@ -70,6 +70,111 @@ def test_fresh_install_has_no_project_specific_pipeline_profiles(tmp_path, monke
     assert pipeline_insights.list_profiles() == []
 
 
+def test_stale_pipeline_verdict_reselects_immediately(isolated_db, monkeypatch):
+    monkeypatch.setattr(
+        pipeline_insights, "_profiles", lambda: {"example": PIPELINE_PROFILE})
+    task = isolated_db.create_task(TaskCreate(
+        prompt="ExampleProject - REVIEW", recurrence="4h"))
+    claimed = isolated_db.get_next_runnable()
+    isolated_db.mark_completed(
+        claimed.id, "ИТОГ: УСТАРЕЛО (PR HEAD changed)", verdict="УСТАРЕЛО")
+
+    before = datetime.now(timezone.utc)
+    worker._recur_after_run(claimed)
+    series = isolated_db.get_series(task.series_id)
+
+    assert series["next_task_id"] != task.id
+    assert datetime.fromisoformat(series["next_run_at"]) <= \
+        before + timedelta(seconds=2)
+
+
+def test_stale_verdict_keeps_normal_cadence_outside_pipeline(
+        isolated_db, monkeypatch):
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {})
+    task = isolated_db.create_task(TaskCreate(
+        prompt="Ordinary recurring task", recurrence="4h"))
+    claimed = isolated_db.get_next_runnable()
+    isolated_db.mark_completed(
+        claimed.id, "ИТОГ: УСТАРЕЛО", verdict="УСТАРЕЛО")
+
+    before = datetime.now(timezone.utc)
+    worker._recur_after_run(claimed)
+    series = isolated_db.get_series(task.series_id)
+
+    assert datetime.fromisoformat(series["next_run_at"]) >= \
+        before + timedelta(hours=3, minutes=59)
+
+
+def test_adaptive_cadence_uses_busy_interval_then_two_empty_runs(
+        isolated_db):
+    task = isolated_db.create_task(TaskCreate(
+        prompt="ExampleProject - TRIAGE", recurrence="30m",
+        scheduled_at=datetime.now(timezone.utc) + timedelta(hours=2)))
+
+    active = isolated_db.apply_pipeline_series_cadence(
+        task.series_id, idle_recurrence="30m", busy_recurrence="15m",
+        boost=True, empty_runs_before_idle=2)
+    first_empty = isolated_db.prepare_series_recurrence(task.series_id, "ПУСТО")
+    second_empty = isolated_db.prepare_series_recurrence(task.series_id, "ПУСТО")
+
+    assert active["effective_recurrence"] == "15m"
+    assert first_empty["effective_recurrence"] == "15m"
+    assert first_empty["temporary_empty_count"] == 1
+    assert second_empty["effective_recurrence"] == "30m"
+    assert second_empty["temporary_recurrence"] is None
+
+
+def test_adaptive_fix_cadence_returns_to_idle_at_threshold(isolated_db):
+    task = isolated_db.create_task(TaskCreate(
+        prompt="ExampleProject - FIX", recurrence="30m"))
+    matching = isolated_db.get_series(task.series_id)
+    queue = {
+        "adaptive_cadence": {
+            "idle_recurrence": "30m", "busy_recurrence": "15m",
+            "backlog_above": 3,
+        },
+    }
+
+    busy = pipeline_insights._reconcile_adaptive_cadence(queue, matching, 4)
+    idle = pipeline_insights._reconcile_adaptive_cadence(queue, matching, 3)
+
+    assert busy["mode"] == "busy"
+    assert busy["effective_recurrence"] == "15m"
+    assert idle["mode"] == "idle"
+    assert idle["effective_recurrence"] == "30m"
+
+
+def test_window_metrics_report_actual_hourly_rates(isolated_db, monkeypatch):
+    now = datetime.now(timezone.utc)
+    baseline = {
+        "queues": {"review": {
+            "backlog": 3,
+            "items": [{"key": "pr:1"}, {"key": "pr:2"}, {"key": "pr:3"}],
+        }},
+    }
+    current = {
+        "queues": {"review": {
+            "backlog": 2,
+            "items": [{"key": "pr:3"}, {"key": "pr:4"}],
+        }},
+    }
+    snapshots = [
+        {"captured_at": (now - timedelta(hours=5)).isoformat(),
+         "payload": baseline},
+        {"captured_at": now.isoformat(), "payload": current},
+    ]
+    monkeypatch.setattr(
+        isolated_db, "pipeline_run_metrics", lambda *_args, **_kwargs: {})
+
+    metrics = pipeline_insights._window_metrics(
+        snapshots, current, [], now, 5)
+
+    assert metrics["backlog_delta_per_hour"] == -0.2
+    assert metrics["entered_per_hour"] == 0.2
+    assert metrics["exited_per_hour"] == 0.4
+    assert metrics["queue_throughput_per_hour"]["review"] == 0.4
+
+
 def test_project_health_check_is_immediate_and_accepts_red_json(monkeypatch):
     calls = []
 
@@ -1445,11 +1550,19 @@ def test_invalidation_during_analysis_rejects_stale_full_cache_publish(isolated_
         "queues": [{
             "id": "review", "title": "Review", "capacity": 1,
             "query": "is:pr", "series_contains": "REVIEW",
+            "adaptive_cadence": {
+                "idle_recurrence": "30m", "busy_recurrence": "15m",
+                "backlog_above": 0,
+            },
         }],
     }
+    isolated_db.create_task(TaskCreate(
+        prompt="Example - REVIEW", recurrence="30m"))
+    series = isolated_db.list_series()
     entered_search = threading.Event()
     release_search = threading.Event()
     search_calls = []
+    cadence_calls = []
     errors = []
 
     def fake_search(repository, query):
@@ -1462,13 +1575,21 @@ def test_invalidation_during_analysis_rejects_stale_full_cache_publish(isolated_
 
     def run_analysis():
         try:
-            pipeline_insights.analyze("cache-race", [], use_cache=False)
+            pipeline_insights.analyze("cache-race", series, use_cache=False)
         except BaseException as exc:  # preserve the worker-thread failure for the assertion
             errors.append(exc)
+
+    real_reconcile = pipeline_insights._reconcile_adaptive_cadence
+
+    def track_reconcile(*args):
+        cadence_calls.append(args)
+        return real_reconcile(*args)
 
     monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"cache-race": profile})
     monkeypatch.setattr(pipeline_insights, "_github_search", fake_search)
     monkeypatch.setattr(pipeline_insights, "_run_profile_health_check", lambda _profile: None)
+    monkeypatch.setattr(
+        pipeline_insights, "_reconcile_adaptive_cadence", track_reconcile)
     pipeline_insights._discard_cache()
     analysis = threading.Thread(target=run_analysis)
     analysis.start()
@@ -1483,9 +1604,11 @@ def test_invalidation_during_analysis_rejects_stale_full_cache_publish(isolated_
         assert isolated_db.get_setting(
             pipeline_insights._cache_key(
                 "cache-race", pipeline_insights._profile_fingerprint(profile))) is None
+        assert cadence_calls == []
 
-        pipeline_insights.analyze("cache-race", [], use_cache=False)
+        pipeline_insights.analyze("cache-race", series, use_cache=False)
         assert len(search_calls) == 2
+        assert len(cadence_calls) == 1
     finally:
         release_search.set()
         analysis.join(5)
@@ -2786,6 +2909,21 @@ def test_pipeline_run_metrics_distinguish_semantic_failure_from_process_failure(
     assert metrics["unresolved_failed"] == 1
     assert metrics["recovered_unable"] == 0
     assert metrics["recovered_failed"] == 0
+
+
+def test_pipeline_run_metrics_count_stale_reselection_as_safe(isolated_db):
+    task = isolated_db.create_task(TaskCreate(
+        prompt="Project - REVIEW", recurrence="1h"))
+    isolated_db.mark_completed(
+        task.id, "ИТОГ: УСТАРЕЛО", verdict="УСТАРЕЛО")
+
+    metrics = isolated_db.pipeline_run_metrics(
+        [task.series_id], datetime.now(timezone.utc) - timedelta(hours=1))
+
+    assert metrics["runs"] == 1
+    assert metrics["stale"] == 1
+    assert metrics["unable"] == 0
+    assert metrics["failed"] == 0
 
 
 def test_pipeline_run_metrics_clear_incident_after_later_success(isolated_db):
