@@ -2704,6 +2704,7 @@ async function loadPipelineInsights(profile, refresh=false) {
     const spendableBudget = githubBudgetState.spendable_before_route || {};
     const projectedBudget = githubBudgetState.projected_post_reservation || {};
     const budgetFloor = githubBudgetState.minimum_remaining || {};
+    const priorityHeadroom = githubBudgetState.priority_one_headroom || {};
     const ledgerKnown = githubBudgetState.ledger_state !== 'unavailable';
     const reservationCount = ledgerKnown
       ? Number(githubBudgetState.active_reservations || 0).toLocaleString()
@@ -2713,6 +2714,11 @@ async function loadPipelineInsights(profile, refresh=false) {
       const value = projectedBudget[name] && projectedBudget[name][field];
       return value == null ? '—' : Number(value).toLocaleString();
     };
+    const hasPriorityHeadroom = ['core', 'search', 'graphql']
+      .some(name => Number(priorityHeadroom[name] || 0) > 0);
+    const priorityHeadroomNote = hasPriorityHeadroom
+      ? `<div class="pipeline-metric-note">Резерв для приоритета PromptPilot 1: REST ${budgetNumber(priorityHeadroom, 'core')} · Search ${budgetNumber(priorityHeadroom, 'search')} · GraphQL ${budgetNumber(priorityHeadroom, 'graphql')} · задачи приоритетов 2–10 и полное обновление статистики оставляют этот запас</div>`
+      : '';
     const rateObserved = data.github_rate_limit_observed_at
       ? `измерено ${timeAgo(data.github_rate_limit_observed_at)}`
       : 'на момент снимка очереди';
@@ -2726,6 +2732,7 @@ async function loadPipelineInsights(profile, refresh=false) {
       <div class="pipeline-metric-value">${reservationCount} · REST −${ledgerKnown ? budgetNumber(reservedBudget, 'core') : '—'}</div>
       <div class="pipeline-metric-note">прогноз после активных резервов (не фактический GitHub remaining): REST доступно ${projectedNumber('core', 'available')}, дефицит ${projectedNumber('core', 'deficit')} · Search доступно ${projectedNumber('search', 'available')}, дефицит ${projectedNumber('search', 'deficit')} · GraphQL доступно ${projectedNumber('graphql', 'available')}, дефицит ${projectedNumber('graphql', 'deficit')}</div>
       <div class="pipeline-metric-note">можно выдать до hard reserve: REST ${budgetNumber(spendableBudget, 'core')} · Search ${budgetNumber(spendableBudget, 'search')} · GraphQL ${budgetNumber(spendableBudget, 'graphql')} · reserve REST ${budgetNumber(budgetFloor, 'core')}${budgetProblem ? ` · ${esc(budgetProblem)}` : ''}</div>
+      ${priorityHeadroomNote}
     </div>` : '';
     const coreLimit = githubLimits.core;
     const coreShare = coreLimit && coreLimit.limit ? coreLimit.remaining / coreLimit.limit : null;

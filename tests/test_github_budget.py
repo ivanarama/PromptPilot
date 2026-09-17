@@ -180,6 +180,51 @@ def test_cost_schema_requires_every_known_route_and_exact_integer_vectors():
     }
 
 
+def test_priority_one_headroom_defaults_to_zero_and_accepts_exact_vector():
+    legacy_policy = pipeline_insights._github_budget_policy(
+        _profile_with_costs())
+    configured = _profile_with_costs()
+    configured["github_budget"]["priority_one_headroom"] = {
+        "core": 1200, "search": 12, "graphql": 1000,
+    }
+
+    policy = pipeline_insights._github_budget_policy(configured)
+
+    assert legacy_policy["priority_one_headroom"] == {
+        "core": 0, "search": 0, "graphql": 0,
+    }
+    assert policy["priority_one_headroom"] == {
+        "core": 1200, "search": 12, "graphql": 1000,
+    }
+
+
+@pytest.mark.parametrize("invalid", [
+    [],
+    {"core": 1200, "search": 12},
+    {"core": 1200, "search": 12, "graphql": 1000, "other": 0},
+    {"core": True, "search": 12, "graphql": 1000},
+    {"core": "1200", "search": 12, "graphql": 1000},
+    {"core": 1200.0, "search": 12, "graphql": 1000},
+    {"core": -1, "search": 12, "graphql": 1000},
+])
+def test_priority_one_headroom_fails_closed_on_invalid_vector(invalid):
+    profile = _profile_with_costs()
+    profile["github_budget"]["priority_one_headroom"] = invalid
+
+    with pytest.raises(ValueError):
+        pipeline_insights._github_budget_policy(profile)
+
+
+def test_nonzero_priority_one_headroom_requires_route_costs():
+    profile = _profile()
+    profile["github_budget"]["priority_one_headroom"] = {
+        "core": 1, "search": 0, "graphql": 0,
+    }
+
+    with pytest.raises(ValueError, match="priority_one_headroom"):
+        pipeline_insights._github_budget_policy(profile)
+
+
 @pytest.mark.parametrize(
     "case",
     [
@@ -220,8 +265,14 @@ def test_shared_github_scope_uses_strongest_profile_hard_reserve(
         isolated_db, monkeypatch):
     low = _profile_with_costs()
     high = _profile_with_costs()
+    low["github_budget"]["priority_one_headroom"] = {
+        "core": 1200, "search": 3, "graphql": 400,
+    }
     high["github_budget"]["minimum_remaining"] = {
         "core": 900, "search": 3, "graphql": 700,
+    }
+    high["github_budget"]["priority_one_headroom"] = {
+        "core": 800, "search": 12, "graphql": 1000,
     }
     monkeypatch.setattr(
         pipeline_insights, "_profiles",
@@ -232,6 +283,9 @@ def test_shared_github_scope_uses_strongest_profile_hard_reserve(
 
     assert policy["minimum_remaining"] == {
         "core": 900, "search": 3, "graphql": 700,
+    }
+    assert policy["priority_one_headroom"] == {
+        "core": 1200, "search": 12, "graphql": 1000,
     }
     monkeypatch.setattr(
         pipeline_insights, "_github_rate_limits",
@@ -248,6 +302,107 @@ def test_shared_github_scope_uses_strongest_profile_hard_reserve(
     assert cached["github_budget"]["minimum_remaining"] == {
         "core": 900, "search": 3, "graphql": 700,
     }
+
+
+def test_shared_headroom_fails_closed_for_profile_without_route_costs(
+        monkeypatch):
+    protected = _profile_with_costs()
+    protected["github_budget"]["priority_one_headroom"] = {
+        "core": 1200, "search": 12, "graphql": 1000,
+    }
+    legacy = _profile()
+    monkeypatch.setattr(
+        pipeline_insights, "_profiles",
+        lambda: {"protected": protected, "legacy": legacy})
+
+    with pytest.raises(ValueError, match="каждом профиле"):
+        pipeline_insights._with_shared_budget_floor(
+            pipeline_insights._github_budget_policy(legacy))
+
+
+def test_priority_one_can_use_headroom_while_lower_priority_is_deferred():
+    profile = _profile_with_costs(core=500)
+    profile["github_budget"]["priority_one_headroom"] = {
+        "core": 600, "search": 0, "graphql": 0,
+    }
+    base = pipeline_insights._budget_policy_for_route(
+        pipeline_insights._github_budget_policy(profile), "skill")
+
+    priority_one = pipeline_insights._budget_policy_for_admission_priority(
+        base, 1)
+    lower_priority = pipeline_insights._budget_policy_for_admission_priority(
+        base, 2)
+    p1_decision = pipeline_insights._evaluate_github_budget(
+        priority_one, _limits(core=1100), now=1000)
+    lower_decision = pipeline_insights._evaluate_github_budget(
+        lower_priority, _limits(core=1100), now=1000)
+
+    assert p1_decision["allowed"] is True
+    assert p1_decision["minimum_remaining"]["core"] == 100
+    assert p1_decision["base_minimum_remaining"]["core"] == 100
+    assert p1_decision["priority_one_headroom"]["core"] == 600
+    assert p1_decision["priority_headroom_applied"] is False
+    assert p1_decision["admission_priority"] == 1
+
+    assert lower_decision["allowed"] is False
+    assert lower_decision["state"] == "low"
+    assert lower_decision["minimum_remaining"]["core"] == 700
+    assert lower_decision["base_minimum_remaining"]["core"] == 100
+    assert lower_decision["priority_one_headroom"]["core"] == 600
+    assert lower_decision["priority_headroom_applied"] is True
+    assert lower_decision["admission_priority"] == 2
+
+
+def test_execution_route_applies_priority_one_headroom_before_dispatch(
+        isolated_db, monkeypatch):
+    profile = _profile_with_costs(core=500)
+    profile["github_budget"]["priority_one_headroom"] = {
+        "core": 600, "search": 0, "graphql": 0,
+    }
+    monkeypatch.setattr(
+        pipeline_insights, "_profiles", lambda: {"example": profile})
+    monkeypatch.setattr(
+        pipeline_insights, "_github_rate_limits",
+        lambda: _limits(core=1100))
+
+    def task(priority):
+        return SimpleNamespace(
+            series_id=1, series_title="Example - REVIEW",
+            prompt="Example - REVIEW", priority=priority)
+
+    priority_one = pipeline_insights.execution_route(
+        task(1), "Example - REVIEW")
+    lower_priority = pipeline_insights.execution_route(
+        task(2), "Example - REVIEW")
+
+    assert priority_one["action"] == "prompt"
+    assert lower_priority["action"] == "defer"
+    assert lower_priority["github_budget"]["minimum_remaining"]["core"] == 700
+    assert lower_priority["github_budget"]["base_minimum_remaining"]["core"] == 100
+    assert lower_priority["github_budget"]["priority_one_headroom"]["core"] == 600
+    assert lower_priority["github_budget"]["priority_headroom_applied"] is True
+    assert lower_priority["github_budget"]["admission_priority"] == 2
+    assert isolated_db.pipeline_github_budget_reservations(
+        "github-default")["count"] == 0
+
+
+def test_legacy_zero_headroom_keeps_admission_unchanged_without_priority():
+    profile = _profile_with_costs(core=500)
+    base = pipeline_insights._budget_policy_for_route(
+        pipeline_insights._github_budget_policy(profile), "skill")
+
+    selected = pipeline_insights._budget_policy_for_admission_priority(
+        base, None)
+    decision = pipeline_insights._evaluate_github_budget(
+        selected, _limits(core=600), now=1000)
+
+    assert selected["minimum_remaining"] == base["minimum_remaining"]
+    assert decision["allowed"] is True
+    assert decision["priority_one_headroom"] == {
+        "core": 0, "search": 0, "graphql": 0,
+    }
+    assert decision["priority_headroom_applied"] is False
+    assert decision["admission_priority"] is None
 
 
 def test_opt_in_default_core_floor_covers_onebase_full_workflow():
@@ -291,6 +446,35 @@ def test_low_budget_blocks_live_analysis_before_health_or_search(
     assert cached["cache"]["refresh_deferred_until"] == \
         result["cache"]["refresh_deferred_until"]
     assert cached["github_rate_limit"]["core"]["remaining"] == 1
+
+
+def test_insights_refresh_preserves_priority_one_headroom(
+        isolated_db, monkeypatch):
+    profile = _profile_with_costs(core=500)
+    profile["github_budget"]["priority_one_headroom"] = {
+        "core": 600, "search": 0, "graphql": 0,
+    }
+    monkeypatch.setattr(
+        pipeline_insights, "_profiles", lambda: {"example": profile})
+    monkeypatch.setattr(
+        pipeline_insights, "_github_rate_limits",
+        lambda: _limits(core=1100))
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("headroom-protected insights scan started")
+
+    monkeypatch.setattr(pipeline_insights, "_run_profile_health_check", forbidden)
+    monkeypatch.setattr(pipeline_insights, "_github_search", forbidden)
+    pipeline_insights._cache.clear()
+
+    result = pipeline_insights.analyze("example", [], use_cache=False)
+
+    assert result["cache"]["refresh_blocked"] == "low"
+    assert result["github_budget"]["minimum_remaining"]["core"] == 700
+    assert result["github_budget"]["base_minimum_remaining"]["core"] == 100
+    assert result["github_budget"]["priority_headroom_applied"] is True
+    assert result["github_budget"]["admission_priority"] == 10
+    assert isolated_db.list_pipeline_snapshots("example") == []
 
 
 def test_unavailable_rate_limit_fails_closed_without_scan(
@@ -723,6 +907,14 @@ def test_web_dashboard_labels_projection_as_non_actual_github_remaining():
     assert "const ledgerKnown = githubBudgetState.ledger_state !== 'unavailable'" \
         in html
     assert "ledgerKnown ? budgetNumber(reservedBudget, 'core') : '—'" in html
+    assert "const priorityHeadroom = githubBudgetState.priority_one_headroom || {}" \
+        in html
+    assert "const hasPriorityHeadroom = ['core', 'search', 'graphql']" in html
+    assert "Резерв для приоритета PromptPilot 1: REST " \
+        "${budgetNumber(priorityHeadroom, 'core')}" in html
+    assert "задачи приоритетов 2–10 и полное обновление статистики " \
+        "оставляют этот запас" in html
+    assert "${priorityHeadroomNote}" in html
 
 
 def test_web_task_detail_labels_only_pending_github_wait_as_wait_reason():
