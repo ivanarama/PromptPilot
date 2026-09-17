@@ -972,8 +972,10 @@ P2, question — P3. Каждые `aging_hours` ожидания эффекти�
 снимать и повторно ставить `ship` из-за гонки между UI и завершением REVIEW.
 
 `github_budget` необязателен и включается только присутствием в профиле. Перед
-GitHub-работой PromptPilot читает бесплатный для primary rate limit
-`GET /rate_limit`. Поле `minimum_remaining` задаёт аварийный остаток, который
+GitHub-работой PromptPilot читает бесплатный для primary REST rate limit
+`GET /rate_limit`, а GraphQL-остаток и текущий `viewer` — коротким
+GraphQL-запросом, обычно стоимостью в один GraphQL point. Поле
+`minimum_remaining` задаёт аварийный остаток, который
 нельзя обещать ни одному запуску, а `costs` — консервативную верхнюю оценку
 расхода каждого маршрута. Допуск вычисляется как
 `remaining - резервы выполняющихся задач - cost маршрута >= minimum_remaining`.

@@ -1949,7 +1949,152 @@ def test_malformed_rate_limit_response_is_treated_as_unavailable(monkeypatch):
         },
     })
 
-    assert pipeline_insights._github_rate_limits() is None
+    with pytest.raises(
+            pipeline_insights._GitHubRateLimitUnavailable,
+            match="GitHub REST core rate limit response is invalid"):
+        pipeline_insights._github_rate_limits()
+
+
+def test_graphql_rate_limit_errors_fail_closed_without_leaking_response(
+        monkeypatch):
+    secret = "ghp_not-for-diagnostics"
+
+    def fake_api(args, _input_value=None):
+        if args == ["rate_limit"]:
+            return {
+                "resources": {
+                    "core": {"limit": 5000, "used": 1,
+                             "remaining": 4999, "reset": 2000},
+                    "search": {"limit": 30, "used": 0,
+                               "remaining": 30, "reset": 2000},
+                },
+            }
+        return {"errors": [{"message": f"authorization failed: {secret}"}]}
+
+    monkeypatch.setattr(pipeline_insights, "_gh_api_json", fake_api)
+
+    with pytest.raises(
+            pipeline_insights._GitHubRateLimitUnavailable) as caught:
+        pipeline_insights._github_rate_limits()
+
+    assert str(caught.value) == \
+        "GitHub GraphQL rateLimit response is invalid"
+    assert secret not in str(caught.value)
+
+
+def test_graphql_rate_limit_rejects_invalid_reset_at(monkeypatch):
+    def fake_api(args, _input_value=None):
+        if args == ["rate_limit"]:
+            return {
+                "resources": {
+                    "core": {"limit": 5000, "used": 1,
+                             "remaining": 4999, "reset": 2000},
+                    "search": {"limit": 30, "used": 0,
+                               "remaining": 30, "reset": 2000},
+                },
+            }
+        return {
+            "data": {
+                "viewer": {"login": "owner"},
+                "rateLimit": {
+                    "limit": 5000, "used": 1, "remaining": 4999,
+                    "resetAt": "not-a-timestamp",
+                },
+            },
+        }
+
+    monkeypatch.setattr(pipeline_insights, "_gh_api_json", fake_api)
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {})
+
+    with pytest.raises(
+            pipeline_insights._GitHubRateLimitUnavailable,
+            match="GitHub GraphQL rateLimit resetAt is invalid"):
+        pipeline_insights._github_rate_limits()
+
+
+@pytest.mark.parametrize("inconsistent_source", ["rest", "graphql"])
+def test_rate_limit_rejects_overlapping_used_and_remaining(
+        monkeypatch, inconsistent_source):
+    def fake_api(args, _input_value=None):
+        if args == ["rate_limit"]:
+            core = {
+                "limit": 5000, "used": 100, "remaining": 4900,
+                "reset": 2000,
+            }
+            if inconsistent_source == "rest":
+                core.update({"used": 4900, "remaining": 4900})
+            return {
+                "resources": {
+                    "core": core,
+                    "search": {"limit": 30, "used": 0,
+                               "remaining": 30, "reset": 2000},
+                },
+            }
+        graphql = {
+            "limit": 5000, "used": 100, "remaining": 4900,
+            "resetAt": "2030-01-01T00:00:00Z",
+        }
+        if inconsistent_source == "graphql":
+            graphql.update({"used": 4900, "remaining": 4900})
+        return {
+            "data": {
+                "viewer": {"login": "owner"},
+                "rateLimit": graphql,
+            },
+        }
+
+    monkeypatch.setattr(pipeline_insights, "_gh_api_json", fake_api)
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {})
+
+    with pytest.raises(
+            pipeline_insights._GitHubRateLimitUnavailable,
+            match=("GitHub REST /rate_limit response is invalid for core"
+                   if inconsistent_source == "rest"
+                   else "GitHub GraphQL rateLimit response is invalid")):
+        pipeline_insights._github_rate_limits()
+
+
+def test_graphql_viewer_mismatch_blocks_scan_with_clear_diagnostic(
+        isolated_db, monkeypatch):
+    profile = _profile()
+    profile["priority_control"] = {"trusted_account": "expected-owner"}
+    monkeypatch.setattr(
+        pipeline_insights, "_profiles", lambda: {"example": profile})
+
+    def fake_api(args, _input_value=None):
+        if args == ["rate_limit"]:
+            return {
+                "resources": {
+                    "core": {"limit": 5000, "used": 1,
+                             "remaining": 4999, "reset": 2000},
+                    "search": {"limit": 30, "used": 0,
+                               "remaining": 30, "reset": 2000},
+                },
+            }
+        return {
+            "data": {
+                "viewer": {"login": "other-owner"},
+                "rateLimit": {
+                    "limit": 5000, "used": 1, "remaining": 4999,
+                    "resetAt": "2030-01-01T00:00:00Z",
+                },
+            },
+        }
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("identity mismatch started a GitHub scan")
+
+    monkeypatch.setattr(pipeline_insights, "_gh_api_json", fake_api)
+    monkeypatch.setattr(pipeline_insights, "_run_profile_health_check", forbidden)
+    monkeypatch.setattr(pipeline_insights, "_github_search", forbidden)
+
+    result = pipeline_insights.analyze("example", [], use_cache=False)
+
+    assert result["cache"]["refresh_blocked"] == "rate_limit_unavailable"
+    assert result["cache"]["refresh_blocked_reason"] == (
+        "GitHub API budget unavailable: GitHub identity mismatch: "
+        "authenticated as other-owner, expected expected-owner")
+    assert result["generated_at"] is None
 
 
 def test_scan_exception_releases_lease(isolated_db, monkeypatch):
