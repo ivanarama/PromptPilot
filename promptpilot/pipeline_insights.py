@@ -696,6 +696,77 @@ def _evaluate_github_budget(policy: dict, limits: dict | None, *,
     }
 
 
+def _priority_waiter_decision(
+        policy: dict, limits: dict | None, reservations: dict, *,
+        priority: int | None, status_revision: int | None) -> dict | None:
+    """Yield to an already waiting or just-woken higher-priority task."""
+    woken = reservations.get("woken_waiters") or {}
+    waiting = reservations.get("waiting_waiters") or {}
+    priorities = [
+        value for value in (
+            woken.get("min_priority"), waiting.get("min_priority"))
+        if type(value) is int
+    ]
+    waiter_priority = min(priorities) if priorities else None
+    if (type(priority) is not int or not 1 <= priority <= 10
+            or type(waiter_priority) is not int
+            or waiter_priority >= priority):
+        return None
+    now = time.time()
+    decision = _budget_denied(
+        policy, state="priority_waiter",
+        reason=(
+            "GitHub API-бюджет освобождён; сначала разбужена задача "
+            f"с более высоким приоритетом {waiter_priority}"),
+        now=now, limits=limits,
+        defer_at=now + policy["busy_retry_seconds"],
+        status_revision=status_revision,
+        reserved_other=reservations.get("totals"),
+        active_reservations=int(reservations.get("count") or 0),
+    )
+    revision = reservations.get("revision")
+    if type(revision) is int and revision >= 0:
+        decision["_budget_reservation_revision"] = revision
+    return decision
+
+
+def _arm_budget_waiter(task, decision: dict) -> dict:
+    """Persist a budget handoff before the serial admission lease is released."""
+    state = decision.get("state")
+    if state not in {
+            "budget_in_flight", "ledger_changed", "priority_waiter",
+            "scan_in_progress"}:
+        return decision
+    scope = decision.get("lease_scope")
+    revision = decision.get("_budget_reservation_revision")
+    task_id = getattr(task, "id", None)
+    started_at = getattr(task, "started_at", None)
+    revision_valid = type(revision) is int and revision >= 0
+    if (not isinstance(scope, str) or not scope
+            or (state != "scan_in_progress" and not revision_valid)
+            or type(task_id) is not int or task_id <= 0
+            or started_at is None):
+        raise ValueError(
+            "running task identity or reservation revision is unavailable "
+            "for GitHub budget wait")
+    armed = db.arm_pipeline_github_budget_waiter(
+        scope, task_id=task_id, task_started_at=started_at,
+        expected_revision=(revision if revision_valid else None))
+    if not armed.get("armed"):
+        raise ValueError(
+            "running task attempt changed before GitHub budget wait was armed")
+    current_revision = armed.get("revision")
+    if type(current_revision) is not int or current_revision < 0:
+        raise ValueError("GitHub budget waiter returned an invalid revision")
+    decision["_budget_reservation_revision"] = current_revision
+    if armed.get("revision_changed"):
+        # A release may race the budget observation, but cannot race a lower
+        # admission while this scan lease is held. Keep the priority marker and
+        # make this exact task runnable immediately after it is deferred.
+        decision["defer_until"] = _defer_at(time.time())
+    return decision
+
+
 @contextmanager
 def _github_scan_admission(profile: dict, purpose: str,
                            *, profile_id: str | None = None,
@@ -751,11 +822,23 @@ def _github_scan_admission(profile: dict, purpose: str,
             retry_at = now + policy["unavailable_retry_seconds"]
             reason = "SQLite lease GitHub-сканирования повреждена; scan запрещён"
             blocked_state = "lease_unavailable"
-        yield _budget_denied(
+        decision = _budget_denied(
             policy, state=blocked_state, reason=reason, now=now,
             defer_at=retry_at,
             status_revision=(status_revision
                              if isinstance(status_revision, int) else None))
+        if task is not None:
+            try:
+                decision = _arm_budget_waiter(task, decision)
+            except (TypeError, ValueError, sqlite3.Error) as exc:
+                decision = _budget_denied(
+                    policy, state="lease_unavailable",
+                    reason=f"GitHub budget handoff недоступен: {exc}",
+                    now=now, defer_at=now + policy["unavailable_retry_seconds"],
+                    status_revision=(
+                        status_revision
+                        if isinstance(status_revision, int) else None))
+        yield decision
         return
 
     status_revision = acquired.get("status_revision")
@@ -795,11 +878,23 @@ def _github_scan_admission(profile: dict, purpose: str,
                         now=time.time(), limits=limits,
                         status_revision=lease.status_revision)
                 else:
-                    decision = _evaluate_github_budget(
-                        policy, limits, now=time.time(),
-                        status_revision=lease.status_revision,
-                        reserved_other=reservations["totals"],
-                        active_reservations=reservations["count"])
+                    admission_priority = getattr(
+                        task, "priority",
+                        10 if budget_route == "insights" else None)
+                    decision = _priority_waiter_decision(
+                        policy, limits, reservations,
+                        priority=admission_priority,
+                        status_revision=lease.status_revision)
+                    if decision is None:
+                        decision = _evaluate_github_budget(
+                            policy, limits, now=time.time(),
+                            status_revision=lease.status_revision,
+                            reserved_other=reservations["totals"],
+                            active_reservations=reservations["count"])
+                        decision["_budget_reservation_revision"] = \
+                            reservations["revision"]
+                    if task is not None:
+                        decision = _arm_budget_waiter(task, decision)
         except _GitHubScanLeaseFailure as exc:
             decision = _lease_exception_decision(
                 profile, exc, status_revision=lease.status_revision)
@@ -862,7 +957,17 @@ def _reservation_denied(policy: dict, limits: dict | None, result: dict, *,
     now = time.time()
     blocked = result.get("blocked_resources") or []
     active_reservations = int(result.get("active_reservations") or 0)
-    if blocked:
+    if result.get("state") == "ledger_changed":
+        defer_at = now + 1
+        state = "ledger_changed"
+        reason = str(result.get("reason") or
+                     "GitHub budget changed during pipeline admission")
+    elif result.get("state") == "priority_waiter":
+        defer_at = now + policy["busy_retry_seconds"]
+        state = "priority_waiter"
+        reason = str(result.get("reason") or
+                     "GitHub budget yielded to a higher-priority waiter")
+    elif blocked:
         live_blocked = [item for item in blocked
                         if item.get("blocked_by") == "live"]
         if live_blocked:
@@ -885,13 +990,17 @@ def _reservation_denied(policy: dict, limits: dict | None, result: dict, *,
         state = str(result.get("state") or "reservation_unavailable")
         reason = str(result.get("reason") or
                      "GitHub API reservation не создана")
-    return _budget_denied(
+    decision = _budget_denied(
         policy, state=state, reason=reason, now=now, limits=limits,
         defer_at=defer_at, blocked_resources=blocked,
         status_revision=status_revision,
         reserved_other=result.get("reserved_other"),
         effective_after=result.get("effective_after"),
         active_reservations=active_reservations)
+    revision = result.get("revision")
+    if type(revision) is int and revision >= 0:
+        decision["_budget_reservation_revision"] = revision
+    return decision
 
 
 def _reserve_execution_admission(
@@ -899,6 +1008,9 @@ def _reserve_execution_admission(
         budget_route: str, *, retain_budget: bool) -> dict:
     """Recheck the elected route and optionally reserve its in-flight cost."""
     lease = admission.get("_lease")
+    expected_revision = admission.get("_budget_reservation_revision")
+    if type(expected_revision) is not int or expected_revision < 0:
+        expected_revision = None
     try:
         policy = _github_budget_policy(profile)
         if policy is None:
@@ -933,11 +1045,18 @@ def _reserve_execution_admission(
         elif not retain_budget:
             reservations = db.pipeline_github_budget_reservations(
                 policy["lease_scope"])
-            decision = _evaluate_github_budget(
-                policy, limits, now=time.time(),
-                status_revision=lease.status_revision,
-                reserved_other=reservations["totals"],
-                active_reservations=reservations["count"])
+            decision = _priority_waiter_decision(
+                policy, limits, reservations,
+                priority=getattr(task, "priority", None),
+                status_revision=lease.status_revision)
+            if decision is None:
+                decision = _evaluate_github_budget(
+                    policy, limits, now=time.time(),
+                    status_revision=lease.status_revision,
+                    reserved_other=reservations["totals"],
+                    active_reservations=reservations["count"])
+                decision["_budget_reservation_revision"] = \
+                    reservations["revision"]
         else:
             task_id = getattr(task, "id", None)
             started_at = getattr(task, "started_at", None)
@@ -951,7 +1070,8 @@ def _reserve_execution_admission(
                 queue_id=str(queue.get("id") or ""), route=budget_route,
                 cost=policy["requested_cost"], limits=limits,
                 minimum_remaining=policy["minimum_remaining"],
-                scan_lease_guard=lease.guard)
+                scan_lease_guard=lease.guard,
+                expected_revision=expected_revision)
             if not reserved.get("allowed"):
                 decision = _reservation_denied(
                     policy, limits, reserved,
@@ -963,6 +1083,8 @@ def _reserve_execution_admission(
                     reserved_other=reserved.get("reserved_other"),
                     active_reservations=int(
                         reserved.get("active_reservations") or 0))
+                decision["_budget_reservation_revision"] = \
+                    reserved.get("revision")
                 if not decision.get("allowed"):
                     db.release_pipeline_github_budget(
                         policy["lease_scope"], token=token, task_id=task_id,
@@ -979,6 +1101,7 @@ def _reserve_execution_admission(
                     _execution_budget_context.reservation = \
                         _GitHubBudgetReservation(
                             policy["lease_scope"], token, task_id, started_at)
+        decision = _arm_budget_waiter(task, decision)
     except _GitHubScanLeaseFailure as exc:
         decision = _lease_exception_decision(
             profile, exc,
@@ -2513,15 +2636,34 @@ def _budget_defer_route(admission: dict, profile_id: str, profile: dict,
     if phase:
         context = _budget_defer_context(admission, phase, preflight)
         reason = f"{reason}; preflight: {_format_budget_defer_context(context)}"
+    reservation_revision = admission.get("_budget_reservation_revision")
+    reservation_handoff = (
+        admission.get("state") in {
+            "budget_in_flight", "ledger_changed", "priority_waiter",
+            "scan_in_progress"}
+        and type(reservation_revision) is int
+        and reservation_revision >= 0
+        and isinstance(admission.get("lease_scope"), str)
+        and bool(admission.get("lease_scope")))
+    defer_policy = (
+        "reservation_release" if (
+            reservation_handoff
+            and admission.get("state") == "budget_in_flight")
+        else "retry" if admission.get("state") in {
+            "ledger_changed", "priority_waiter", "scan_in_progress"}
+        else "hard_not_before")
     result = {
         "action": "defer", "mode": mode,
         "reason": reason,
         "defer_until": admission.get("defer_until"),
-        "defer_policy": "hard_not_before",
+        "defer_policy": defer_policy,
         "profile_id": profile_id, "queue_id": queue.get("id"),
         "github_budget": _public_budget_decision(admission),
         "github_rate_limit": admission.get("github_rate_limit"),
     }
+    if reservation_handoff:
+        result["budget_wait_scope"] = admission.get("lease_scope")
+        result["budget_wait_revision"] = reservation_revision
     if context is not None:
         result["defer_context"] = context
     return result

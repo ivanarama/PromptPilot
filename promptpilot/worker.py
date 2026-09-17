@@ -1414,6 +1414,8 @@ def _execute_task_body(task, admission_complete=None):
                         task, next_run, reason,
                         hard_not_before=(
                             route.get("defer_policy") == "hard_not_before"),
+                        budget_wait_scope=route.get("budget_wait_scope"),
+                        budget_wait_revision=route.get("budget_wait_revision"),
                     ),
                     f"отложить pipeline-задачу #{task.id}",
                 )
