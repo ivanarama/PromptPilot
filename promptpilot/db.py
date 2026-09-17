@@ -137,11 +137,37 @@ CREATE TABLE IF NOT EXISTS pipeline_snapshots (
     payload_json TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS pipeline_target_reservations (
+    repository TEXT NOT NULL,
+    stage TEXT NOT NULL,
+    number INTEGER NOT NULL,
+    head TEXT NOT NULL,
+    task_id INTEGER NOT NULL,
+    task_started_at TEXT NOT NULL DEFAULT '',
+    ownership_kind TEXT NOT NULL DEFAULT '',
+    herdr_session_state TEXT NOT NULL DEFAULT '',
+    herdr_pane_id TEXT NOT NULL DEFAULT '',
+    herdr_tab_id TEXT NOT NULL DEFAULT '',
+    herdr_workspace_id TEXT NOT NULL DEFAULT '',
+    token TEXT NOT NULL,
+    reserved_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    PRIMARY KEY (repository, stage, number, head)
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_runnable ON tasks(status, priority, next_run_at);
 CREATE INDEX IF NOT EXISTS idx_prompt_log_project ON prompt_log(project);
 CREATE INDEX IF NOT EXISTS idx_pipeline_snapshots_profile_time
     ON pipeline_snapshots(profile_id, captured_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pipeline_target_reservations_task
+    ON pipeline_target_reservations(repository, task_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pipeline_target_reservations_task_global
+    ON pipeline_target_reservations(task_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pipeline_target_reservations_pr
+    ON pipeline_target_reservations(repository, number);
+CREATE INDEX IF NOT EXISTS idx_pipeline_target_reservations_expiry
+    ON pipeline_target_reservations(expires_at);
 
 CREATE TABLE IF NOT EXISTS workflows (
     id TEXT PRIMARY KEY,
@@ -348,10 +374,30 @@ MIGRATIONS = [
         captured_at TEXT NOT NULL, payload_json TEXT NOT NULL
     )""",
     "CREATE INDEX IF NOT EXISTS idx_pipeline_snapshots_profile_time ON pipeline_snapshots(profile_id, captured_at)",
+    """CREATE TABLE IF NOT EXISTS pipeline_target_reservations (
+        repository TEXT NOT NULL, stage TEXT NOT NULL, number INTEGER NOT NULL,
+        head TEXT NOT NULL, task_id INTEGER NOT NULL, token TEXT NOT NULL,
+        reserved_at TEXT NOT NULL, expires_at TEXT NOT NULL,
+        PRIMARY KEY (repository, stage, number, head)
+    )""",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_pipeline_target_reservations_task ON pipeline_target_reservations(repository, task_id)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_pipeline_target_reservations_task_global ON pipeline_target_reservations(task_id)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_pipeline_target_reservations_pr ON pipeline_target_reservations(repository, number)",
+    "CREATE INDEX IF NOT EXISTS idx_pipeline_target_reservations_expiry ON pipeline_target_reservations(expires_at)",
+    "ALTER TABLE pipeline_target_reservations ADD COLUMN task_started_at TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE pipeline_target_reservations ADD COLUMN ownership_kind TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE pipeline_target_reservations ADD COLUMN herdr_session_state TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE pipeline_target_reservations ADD COLUMN herdr_pane_id TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE pipeline_target_reservations ADD COLUMN herdr_tab_id TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE pipeline_target_reservations ADD COLUMN herdr_workspace_id TEXT NOT NULL DEFAULT ''",
 ]
 
 WORKFLOW_SCHEMA_VERSION = "workflow_orchestrator_w0_v1"
 WORKFLOW_STAGE_SCHEMA_VERSION = "workflow_stage_planner_w3_v1"
+PIPELINE_TARGET_RESERVATION_SCHEMA_VERSION = "pipeline_target_reservations_v1"
+PIPELINE_TARGET_ATTEMPT_SCHEMA_VERSION = "pipeline_target_reservations_attempt_v2"
+PIPELINE_TARGET_OWNERSHIP_SCHEMA_VERSION = "pipeline_target_reservations_ownership_v3"
+PIPELINE_TARGET_HERDR_SCHEMA_VERSION = "pipeline_target_reservations_herdr_v4"
 
 
 def _now() -> str:
@@ -440,6 +486,26 @@ def _init_db_once():
                VALUES (?, ?)""",
             (WORKFLOW_STAGE_SCHEMA_VERSION, _now()),
         )
+        conn.execute(
+            """INSERT OR IGNORE INTO schema_migrations (version, applied_at)
+               VALUES (?, ?)""",
+            (PIPELINE_TARGET_RESERVATION_SCHEMA_VERSION, _now()),
+        )
+        conn.execute(
+            """INSERT OR IGNORE INTO schema_migrations (version, applied_at)
+               VALUES (?, ?)""",
+            (PIPELINE_TARGET_ATTEMPT_SCHEMA_VERSION, _now()),
+        )
+        conn.execute(
+            """INSERT OR IGNORE INTO schema_migrations (version, applied_at)
+               VALUES (?, ?)""",
+            (PIPELINE_TARGET_OWNERSHIP_SCHEMA_VERSION, _now()),
+        )
+        conn.execute(
+            """INSERT OR IGNORE INTO schema_migrations (version, applied_at)
+               VALUES (?, ?)""",
+            (PIPELINE_TARGET_HERDR_SCHEMA_VERSION, _now()),
+        )
         _backfill_task_series(conn)
 
 
@@ -460,6 +526,416 @@ def init_db():
             if not busy or attempt == len(INIT_DB_BUSY_DELAYS):
                 raise
             time.sleep(INIT_DB_BUSY_DELAYS[attempt])
+
+
+def _pipeline_target_identity(repository: str, stage: str, number: int,
+                              head: str, task_id: int) -> tuple[str, str, int, str, int]:
+    repository = str(repository or "").strip().lower()
+    stage = str(stage or "").strip().lower()
+    head = str(head or "").strip().lower()
+    if (not repository or "/" not in repository or not stage
+            or isinstance(number, bool) or not isinstance(number, int) or number <= 0
+            or not re.fullmatch(r"[0-9a-f]{40}", head)
+            or isinstance(task_id, bool) or not isinstance(task_id, int) or task_id <= 0):
+        raise ValueError("invalid pipeline target reservation identity")
+    return repository, stage, number, head, task_id
+
+
+def _pipeline_reservation_ttl(ttl_seconds: int) -> int:
+    if (isinstance(ttl_seconds, bool) or not isinstance(ttl_seconds, int)
+            or not 60 <= ttl_seconds <= 86400):
+        raise ValueError("pipeline target reservation TTL must be 60..86400 seconds")
+    return ttl_seconds
+
+
+def _reservation_dict(row: sqlite3.Row) -> dict:
+    return {
+        "repository": row["repository"], "stage": row["stage"],
+        "number": int(row["number"]), "head": row["head"],
+        "task_id": int(row["task_id"]),
+        "task_started_at": row["task_started_at"],
+        "ownership_kind": row["ownership_kind"],
+        "herdr_session_state": row["herdr_session_state"],
+        "herdr_pane_id": row["herdr_pane_id"],
+        "herdr_tab_id": row["herdr_tab_id"],
+        "herdr_workspace_id": row["herdr_workspace_id"],
+        "token": row["token"],
+        "reserved_at": row["reserved_at"], "expires_at": row["expires_at"],
+    }
+
+
+def reserve_pipeline_target(repository: str, stage: str, number: int,
+                            head: str, task_id: int, ttl_seconds: int,
+                            *, task_started_at: str | None = None,
+                            ownership_kind: str | None = None,
+                            now: Optional[datetime] = None) -> Optional[dict]:
+    """Atomically reserve one exact project-pipeline target for a task.
+
+    A task owns at most one target per repository. Repeating election for
+    the same task is idempotent and renews its existing token; another task
+    never steals a live target. Expired rows are crash-recovery leases.
+    """
+    repository, stage, number, head, task_id = _pipeline_target_identity(
+        repository, stage, number, head, task_id)
+    ttl_seconds = _pipeline_reservation_ttl(ttl_seconds)
+    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    now_value = current.isoformat()
+    expires_at = (current + timedelta(seconds=ttl_seconds)).isoformat()
+    ownership_kind = str(ownership_kind or "").strip().lower()
+    if ownership_kind not in {"", "headless", "herdr"}:
+        raise ValueError("invalid pipeline provider ownership kind")
+    with _connect(immediate=True) as conn:
+        attempt = ""
+        if task_started_at is not None:
+            attempt = str(task_started_at).strip()
+            try:
+                parsed_attempt = datetime.fromisoformat(attempt)
+            except (TypeError, ValueError):
+                raise ValueError("invalid pipeline task attempt timestamp")
+            if parsed_attempt.tzinfo is None:
+                raise ValueError("pipeline task attempt timestamp must include timezone")
+            task_row = conn.execute(
+                "SELECT status, started_at FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            if (task_row is None or task_row["status"] != "running"
+                    or task_row["started_at"] != attempt):
+                return None
+        conn.execute(
+            """DELETE FROM pipeline_target_reservations
+               WHERE expires_at <= ?
+                 AND NOT EXISTS (
+                     SELECT 1 FROM tasks
+                     WHERE tasks.id = pipeline_target_reservations.task_id
+                       AND tasks.status = 'running'
+                       AND (pipeline_target_reservations.task_started_at = ''
+                            OR tasks.started_at = pipeline_target_reservations.task_started_at)
+                 )""",
+            (now_value,),
+        )
+        # A PR is the mutation boundary. Stage and head belong to its immutable
+        # election envelope, but a transition between them must not admit a
+        # second provider while the first exact attempt is still live.
+        existing = conn.execute(
+            """SELECT * FROM pipeline_target_reservations
+               WHERE repository = ? AND number = ?""",
+            (repository, number),
+        ).fetchone()
+        if existing is not None:
+            if (existing["stage"] != stage or existing["head"] != head
+                    or int(existing["task_id"]) != task_id
+                    or (attempt and existing["task_started_at"] != attempt)
+                    or (ownership_kind and existing["ownership_kind"] != ownership_kind)):
+                return None
+            conn.execute(
+                """UPDATE pipeline_target_reservations SET expires_at = ?
+                   WHERE repository = ? AND stage = ? AND number = ? AND head = ?
+                     AND task_id = ? AND token = ?""",
+                (expires_at, repository, stage, number, head, task_id,
+                 existing["token"]),
+            )
+            existing = conn.execute(
+                """SELECT * FROM pipeline_target_reservations
+                   WHERE repository = ? AND stage = ? AND number = ? AND head = ?""",
+                (repository, stage, number, head),
+            ).fetchone()
+            return _reservation_dict(existing)
+
+        owned = conn.execute(
+            """SELECT * FROM pipeline_target_reservations
+               WHERE task_id = ?""",
+            (task_id,),
+        ).fetchone()
+        if owned is not None:
+            # A live task may call election more than once (or two injected
+            # calls may race). Never swap its immutable target envelope. A
+            # terminal transition releases the old row before a real retry.
+            return None
+        token = uuid.uuid4().hex
+        conn.execute(
+            """INSERT INTO pipeline_target_reservations
+               (repository, stage, number, head, task_id, task_started_at,
+                ownership_kind, herdr_session_state, token, reserved_at, expires_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (repository, stage, number, head, task_id, attempt, ownership_kind,
+             "reserved" if ownership_kind == "herdr" else "", token,
+             now_value, expires_at),
+        )
+        row = conn.execute(
+            """SELECT * FROM pipeline_target_reservations
+               WHERE repository = ? AND stage = ? AND number = ? AND head = ?""",
+            (repository, stage, number, head),
+        ).fetchone()
+        return _reservation_dict(row)
+
+
+def _exact_pipeline_reservation_parts(reservation: dict):
+    if not isinstance(reservation, dict):
+        raise ValueError("invalid pipeline target reservation")
+    repository, stage, number, head, task_id = _pipeline_target_identity(
+        reservation.get("repository"), reservation.get("stage"),
+        reservation.get("number"), reservation.get("head"),
+        reservation.get("task_id"),
+    )
+    token = reservation.get("token")
+    attempt = reservation.get("task_started_at")
+    if (not isinstance(token, str) or not re.fullmatch(r"[0-9a-f]{32}", token)
+            or not isinstance(attempt, str) or not attempt):
+        raise ValueError("invalid exact pipeline target reservation")
+    return repository, stage, number, head, task_id, token, attempt
+
+
+def begin_pipeline_target_herdr_session(reservation: dict) -> Optional[dict]:
+    """Persist the crash-safe pre-start state for one exact Herdr attempt."""
+    parts = _exact_pipeline_reservation_parts(reservation)
+    repository, stage, number, head, task_id, token, attempt = parts
+    with _connect(immediate=True) as conn:
+        row = conn.execute(
+            """SELECT * FROM pipeline_target_reservations
+               WHERE repository = ? AND stage = ? AND number = ? AND head = ?
+                 AND task_id = ? AND token = ? AND task_started_at = ?
+                 AND ownership_kind = 'herdr'
+                 AND EXISTS (
+                     SELECT 1 FROM tasks
+                     WHERE tasks.id = pipeline_target_reservations.task_id
+                       AND tasks.status = 'running'
+                       AND tasks.started_at = pipeline_target_reservations.task_started_at
+                 )""",
+            (repository, stage, number, head, task_id, token, attempt),
+        ).fetchone()
+        if row is None:
+            return None
+        state = row["herdr_session_state"]
+        if state == "creating":
+            if row["herdr_pane_id"] or row["herdr_tab_id"] or row["herdr_workspace_id"]:
+                return None
+            return _reservation_dict(row)
+        if state != "reserved":
+            return None
+        conn.execute(
+            """UPDATE pipeline_target_reservations
+               SET herdr_session_state = 'creating'
+               WHERE repository = ? AND stage = ? AND number = ? AND head = ?
+                 AND task_id = ? AND token = ? AND task_started_at = ?
+                 AND herdr_session_state = 'reserved'""",
+            (repository, stage, number, head, task_id, token, attempt),
+        )
+        row = conn.execute(
+            """SELECT * FROM pipeline_target_reservations
+               WHERE repository = ? AND stage = ? AND number = ? AND head = ?""",
+            (repository, stage, number, head),
+        ).fetchone()
+        return _reservation_dict(row) if row is not None else None
+
+
+def bind_pipeline_target_herdr_session(
+        reservation: dict, pane_id: str, tab_id: str,
+        workspace_id: str = "") -> Optional[dict]:
+    """Durably bind immutable Herdr IDs before its agent may be started."""
+    parts = _exact_pipeline_reservation_parts(reservation)
+    repository, stage, number, head, task_id, token, attempt = parts
+    values = (pane_id, tab_id, workspace_id)
+    if any(not isinstance(value, str) or len(value) > 512 for value in values):
+        raise ValueError("invalid Herdr ownership descriptor")
+    if not pane_id or not tab_id:
+        raise ValueError("Herdr ownership descriptor requires pane and tab ids")
+    with _connect(immediate=True) as conn:
+        row = conn.execute(
+            """SELECT * FROM pipeline_target_reservations
+               WHERE repository = ? AND stage = ? AND number = ? AND head = ?
+                 AND task_id = ? AND token = ? AND task_started_at = ?
+                 AND ownership_kind = 'herdr'
+                 AND EXISTS (
+                     SELECT 1 FROM tasks
+                     WHERE tasks.id = pipeline_target_reservations.task_id
+                       AND tasks.status = 'running'
+                       AND tasks.started_at = pipeline_target_reservations.task_started_at
+                 )""",
+            (repository, stage, number, head, task_id, token, attempt),
+        ).fetchone()
+        if row is None:
+            return None
+        state = row["herdr_session_state"]
+        descriptor = (
+            row["herdr_pane_id"], row["herdr_tab_id"],
+            row["herdr_workspace_id"],
+        )
+        if state == "owned":
+            return _reservation_dict(row) if descriptor == values else None
+        if state != "creating" or any(descriptor):
+            return None
+        conn.execute(
+            """UPDATE pipeline_target_reservations
+               SET herdr_session_state = 'owned', herdr_pane_id = ?,
+                   herdr_tab_id = ?, herdr_workspace_id = ?
+               WHERE repository = ? AND stage = ? AND number = ? AND head = ?
+                 AND task_id = ? AND token = ? AND task_started_at = ?
+                 AND herdr_session_state = 'creating'""",
+            (pane_id, tab_id, workspace_id, repository, stage, number, head,
+             task_id, token, attempt),
+        )
+        row = conn.execute(
+            """SELECT * FROM pipeline_target_reservations
+               WHERE repository = ? AND stage = ? AND number = ? AND head = ?""",
+            (repository, stage, number, head),
+        ).fetchone()
+        return _reservation_dict(row) if row is not None else None
+
+
+def renew_pipeline_target_reservation(reservation: dict, ttl_seconds: int,
+                                      *, now: Optional[datetime] = None) -> Optional[dict]:
+    """Renew only the still-live exact lease represented by ``reservation``."""
+    if not isinstance(reservation, dict) or not isinstance(reservation.get("token"), str):
+        raise ValueError("invalid pipeline target reservation")
+    identity = _pipeline_target_identity(
+        reservation.get("repository"), reservation.get("stage"),
+        reservation.get("number"), reservation.get("head"),
+        reservation.get("task_id"),
+    )
+    repository, stage, number, head, task_id = identity
+    token = reservation["token"]
+    task_started_at = reservation.get("task_started_at", "")
+    if not isinstance(task_started_at, str):
+        raise ValueError("invalid pipeline target reservation attempt")
+    if not re.fullmatch(r"[0-9a-f]{32}", token):
+        raise ValueError("invalid pipeline target reservation token")
+    ttl_seconds = _pipeline_reservation_ttl(ttl_seconds)
+    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    now_value = current.isoformat()
+    expires_at = (current + timedelta(seconds=ttl_seconds)).isoformat()
+    with _connect(immediate=True) as conn:
+        updated = conn.execute(
+            """UPDATE pipeline_target_reservations
+               SET expires_at = CASE WHEN expires_at < ? THEN ? ELSE expires_at END
+               WHERE repository = ? AND stage = ? AND number = ? AND head = ?
+                 AND task_id = ? AND token = ?
+                 AND (expires_at > ? OR EXISTS (
+                     SELECT 1 FROM tasks
+                     WHERE tasks.id = pipeline_target_reservations.task_id
+                       AND tasks.status = 'running'
+                       AND (pipeline_target_reservations.task_started_at = ''
+                            OR tasks.started_at = pipeline_target_reservations.task_started_at)
+                 ))
+                 AND pipeline_target_reservations.task_started_at = ?
+                 AND (pipeline_target_reservations.task_started_at = '' OR EXISTS (
+                     SELECT 1 FROM tasks
+                     WHERE tasks.id = pipeline_target_reservations.task_id
+                       AND tasks.status = 'running'
+                       AND tasks.started_at = pipeline_target_reservations.task_started_at
+                 ))""",
+            (expires_at, expires_at, repository, stage, number, head, task_id, token,
+             now_value, task_started_at),
+        )
+        if not updated.rowcount:
+            conn.execute(
+                """DELETE FROM pipeline_target_reservations
+                   WHERE expires_at <= ?
+                     AND NOT EXISTS (
+                         SELECT 1 FROM tasks
+                         WHERE tasks.id = pipeline_target_reservations.task_id
+                           AND tasks.status = 'running'
+                           AND (pipeline_target_reservations.task_started_at = ''
+                                OR tasks.started_at = pipeline_target_reservations.task_started_at)
+                     )""",
+                (now_value,),
+            )
+            return None
+        row = conn.execute(
+            """SELECT * FROM pipeline_target_reservations
+               WHERE repository = ? AND stage = ? AND number = ? AND head = ?""",
+            (repository, stage, number, head),
+        ).fetchone()
+        return _reservation_dict(row)
+
+
+def renew_task_pipeline_target_reservations(
+        task_id: int, ttl_seconds: int = 600,
+        *, now: Optional[datetime] = None) -> int:
+    """Heartbeat every still-live target owned by one running task.
+
+    Expired rows are never resurrected, and a shorter heartbeat never reduces
+    an operator-configured longer TTL. This keeps a live/uncertain provider's
+    target fenced while preserving TTL recovery after a hard process crash.
+    """
+    if isinstance(task_id, bool) or not isinstance(task_id, int) or task_id <= 0:
+        return 0
+    ttl_seconds = _pipeline_reservation_ttl(ttl_seconds)
+    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    now_value = current.isoformat()
+    heartbeat_expiry = (current + timedelta(seconds=ttl_seconds)).isoformat()
+    with _connect(immediate=True) as conn:
+        updated = conn.execute(
+            """UPDATE pipeline_target_reservations
+               SET expires_at = CASE WHEN expires_at < ? THEN ? ELSE expires_at END
+               WHERE task_id = ?
+                 AND (expires_at > ? OR EXISTS (
+                     SELECT 1 FROM tasks
+                     WHERE tasks.id = pipeline_target_reservations.task_id
+                       AND tasks.status = 'running'
+                       AND (pipeline_target_reservations.task_started_at = ''
+                            OR tasks.started_at = pipeline_target_reservations.task_started_at)
+                 ))
+                 AND (task_started_at = '' OR EXISTS (
+                     SELECT 1 FROM tasks
+                     WHERE tasks.id = pipeline_target_reservations.task_id
+                       AND tasks.status = 'running'
+                       AND tasks.started_at = pipeline_target_reservations.task_started_at
+                 ))""",
+            (heartbeat_expiry, heartbeat_expiry, task_id, now_value),
+        )
+        conn.execute(
+            """DELETE FROM pipeline_target_reservations
+               WHERE expires_at <= ?
+                 AND NOT EXISTS (
+                     SELECT 1 FROM tasks
+                     WHERE tasks.id = pipeline_target_reservations.task_id
+                       AND tasks.status = 'running'
+                       AND (pipeline_target_reservations.task_started_at = ''
+                            OR tasks.started_at = pipeline_target_reservations.task_started_at)
+                 )""",
+            (now_value,),
+        )
+        return updated.rowcount
+
+
+def release_pipeline_target_reservations(task_id: int) -> int:
+    """Release every target owned by one completed/aborted task attempt."""
+    if isinstance(task_id, bool) or not isinstance(task_id, int) or task_id <= 0:
+        return 0
+    with _connect(immediate=True) as conn:
+        deleted = conn.execute(
+            "DELETE FROM pipeline_target_reservations WHERE task_id = ?",
+            (task_id,),
+        )
+        return deleted.rowcount
+
+
+def list_pipeline_target_reservations(*, repository: str | None = None,
+                                      stage: str | None = None,
+                                      now: Optional[datetime] = None) -> list[dict]:
+    """Return live reservations for diagnostics without extending their TTL."""
+    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat()
+    clauses = ["(expires_at > ? OR EXISTS ("
+               "SELECT 1 FROM tasks "
+               "WHERE tasks.id = pipeline_target_reservations.task_id "
+               "AND tasks.status = 'running' "
+               "AND (pipeline_target_reservations.task_started_at = '' "
+               "OR tasks.started_at = pipeline_target_reservations.task_started_at)))"]
+    values: list[object] = [current]
+    if repository is not None:
+        clauses.append("repository = ?")
+        values.append(str(repository).strip().lower())
+    if stage is not None:
+        clauses.append("stage = ?")
+        values.append(str(stage).strip().lower())
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM pipeline_target_reservations WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY repository, stage, number, head",
+            values,
+        ).fetchall()
+        return [_reservation_dict(row) for row in rows]
 
 
 def _series_title(prompt: str) -> str:
@@ -754,29 +1230,70 @@ def _drop_cancel_flag(conn, task_id: int):
     conn.execute("DELETE FROM settings WHERE key = ?", (f"cancel_task:{task_id}",))
 
 
+def _attempt_iso(started_at) -> str | None:
+    if isinstance(started_at, datetime):
+        return _to_utc_iso(started_at)
+    return str(started_at) if started_at else None
+
+
+def _release_task_pipeline_targets(conn, task_id: int, started_at=None):
+    attempt = _attempt_iso(started_at)
+    if attempt is None:
+        conn.execute(
+            "DELETE FROM pipeline_target_reservations WHERE task_id = ?",
+            (task_id,),
+        )
+    else:
+        conn.execute(
+            """DELETE FROM pipeline_target_reservations
+               WHERE task_id = ?
+                 AND (task_started_at = '' OR task_started_at = ?)""",
+            (task_id, attempt),
+        )
+
+
 def mark_completed(task_id: int, result: str, exit_code: int = 0,
                    model_used: str = None, session_id: str = None,
-                   verdict: str = None):
+                   verdict: str = None, *, expected_started_at=None) -> bool:
     """Finalize a task, optionally committing its verdict atomically."""
     with _connect() as conn:
-        conn.execute(
+        attempt = _attempt_iso(expected_started_at)
+        where = "id = ?"
+        values = [result, exit_code, _now(), model_used, session_id, verdict, task_id]
+        if attempt is not None:
+            where += " AND status = 'running' AND started_at = ?"
+            values.append(attempt)
+        cur = conn.execute(
             "UPDATE tasks SET status = 'completed', result = ?, error = NULL, "
             "next_run_at = NULL, exit_code = ?, completed_at = ?, model_used = ?, "
             "session_id = COALESCE(?, session_id), "
-            "verdict = COALESCE(?, verdict), note = NULL WHERE id = ?",
-            (result, exit_code, _now(), model_used, session_id, verdict, task_id),
+            f"verdict = COALESCE(?, verdict), note = NULL WHERE {where}",
+            values,
         )
-        _drop_cancel_flag(conn, task_id)
+        if cur.rowcount:
+            _drop_cancel_flag(conn, task_id)
+            _release_task_pipeline_targets(conn, task_id, attempt)
+        return cur.rowcount > 0
 
 
-def mark_failed(task_id: int, error: str, exit_code: int = 1):
+def mark_failed(task_id: int, error: str, exit_code: int = 1,
+                *, expected_started_at=None) -> bool:
     with _connect() as conn:
-        conn.execute(
+        attempt = _attempt_iso(expected_started_at)
+        where = "id = ?"
+        values = [error, exit_code, _now(), task_id]
+        if attempt is not None:
+            where += " AND status = 'running' AND started_at = ?"
+            values.append(attempt)
+        cur = conn.execute(
             "UPDATE tasks SET status = 'failed', error = ?, exit_code = ?, "
-            "completed_at = ?, note = NULL WHERE id = ?",
-            (error, exit_code, _now(), task_id),
+            f"completed_at = ?, note = NULL WHERE {where}",
+            values,
         )
-        _drop_cancel_flag(conn, task_id)
+        if cur.rowcount:
+            _drop_cancel_flag(conn, task_id)
+            _release_task_pipeline_targets(conn, task_id, attempt)
+        return cur.rowcount > 0
 
 
 def fail_running_attempt(task_id: int, started_at, error: str,
@@ -801,25 +1318,37 @@ def fail_running_attempt(task_id: int, started_at, error: str,
         )
         if cur.rowcount:
             _drop_cancel_flag(conn, task_id)
+            _release_task_pipeline_targets(conn, task_id, started_at)
         return cur.rowcount > 0
 
 
-def mark_rate_limited(task_id: int, next_run_at: datetime, error: str = None):
+def mark_rate_limited(task_id: int, next_run_at: datetime, error: str = None,
+                      *, expected_started_at=None) -> bool:
     with _connect() as conn:
-        conn.execute(
+        attempt = _attempt_iso(expected_started_at)
+        where = "id = ?"
+        values = [_to_utc_iso(next_run_at), error, task_id]
+        if attempt is not None:
+            where += " AND status = 'running' AND started_at = ?"
+            values.append(attempt)
+        cur = conn.execute(
             """UPDATE tasks
                SET status = 'rate_limited',
                    next_run_at = ?,
                    retry_count = retry_count + 1,
                    error = COALESCE(?, error)
-               WHERE id = ?""",
-            (_to_utc_iso(next_run_at), error, task_id),
+                WHERE """ + where,
+            values,
         )
-        _drop_cancel_flag(conn, task_id)
+        if cur.rowcount:
+            _drop_cancel_flag(conn, task_id)
+            _release_task_pipeline_targets(conn, task_id, attempt)
+        return cur.rowcount > 0
 
 
 def defer_task(task_id: int, next_run_at: datetime, reason: str = None,
-               *, hard_not_before: bool = False):
+               *, hard_not_before: bool = False,
+               expected_started_at=None) -> bool:
     """Return a claimed task to pending without consuming a retry attempt.
 
     Used by deterministic pipeline dependency gates. This is waiting, not a
@@ -830,14 +1359,23 @@ def defer_task(task_id: int, next_run_at: datetime, reason: str = None,
     """
     deadline = _to_utc_iso(next_run_at)
     with _connect() as conn:
-        conn.execute(
+        attempt = _attempt_iso(expected_started_at)
+        where = "id = ? AND status = 'running'"
+        values = [deadline, deadline if hard_not_before else None, reason, task_id]
+        if attempt is not None:
+            where += " AND started_at = ?"
+            values.append(attempt)
+        cur = conn.execute(
             """UPDATE tasks SET status = 'pending', scheduled_at = ?,
                       next_run_at = ?, started_at = NULL,
                       error = COALESCE(?, error)
-               WHERE id = ? AND status = 'running'""",
-            (deadline, deadline if hard_not_before else None, reason, task_id),
+               WHERE """ + where,
+            values,
         )
-        _drop_cancel_flag(conn, task_id)
+        if cur.rowcount:
+            _drop_cancel_flag(conn, task_id)
+            _release_task_pipeline_targets(conn, task_id, attempt)
+        return cur.rowcount > 0
 
 
 def request_cancel(task_id: int) -> bool:
@@ -864,14 +1402,24 @@ def clear_cancel_request(task_id: int):
         conn.execute("DELETE FROM settings WHERE key = ?", (f"cancel_task:{task_id}",))
 
 
-def mark_cancelled(task_id: int, note: str = None):
-    clear_note(task_id)
+def mark_cancelled(task_id: int, note: str = None,
+                   *, expected_started_at=None) -> bool:
     with _connect() as conn:
-        conn.execute(
-            "UPDATE tasks SET status = 'cancelled', completed_at = ?, error = COALESCE(?, error) WHERE id = ?",
-            (_now(), note, task_id),
+        attempt = _attempt_iso(expected_started_at)
+        where = "id = ?"
+        values = [_now(), note, task_id]
+        if attempt is not None:
+            where += " AND status = 'running' AND started_at = ?"
+            values.append(attempt)
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'cancelled', completed_at = ?, "
+            f"error = COALESCE(?, error), note = NULL WHERE {where}",
+            values,
         )
-        _drop_cancel_flag(conn, task_id)
+        if cur.rowcount:
+            _drop_cancel_flag(conn, task_id)
+            _release_task_pipeline_targets(conn, task_id, attempt)
+        return cur.rowcount > 0
 
 
 def cancel_task(task_id: int) -> bool:
@@ -880,6 +1428,8 @@ def cancel_task(task_id: int) -> bool:
             "UPDATE tasks SET status = 'cancelled', completed_at = ? WHERE id = ? AND status IN ('pending', 'rate_limited')",
             (_now(), task_id),
         )
+        if cur.rowcount:
+            _release_task_pipeline_targets(conn, task_id)
         return cur.rowcount > 0
 
 
@@ -947,13 +1497,16 @@ def list_series() -> list:
                        GROUP BY series_id
                    )
                    SELECT 'active' AS kind, t.series_id, t.id, t.machine,
-                          t.scheduled_at, t.error
+                          t.scheduled_at, t.error, t.worktree, t.detached,
+                          t.herdr_target
                    FROM tasks AS t
                    INNER JOIN picked ON picked.active_id = t.id
                    INNER JOIN task_series AS s ON s.id = t.series_id
                    UNION ALL
                    SELECT 'last' AS kind, t.series_id, t.id, t.machine,
-                          NULL AS scheduled_at, NULL AS error
+                          NULL AS scheduled_at, NULL AS error,
+                          NULL AS worktree, NULL AS detached,
+                          NULL AS herdr_target
                    FROM tasks AS t
                    INNER JOIN picked ON picked.last_id = t.id
                    INNER JOIN task_series AS s ON s.id = t.series_id"""):
@@ -989,6 +1542,9 @@ def list_series() -> list:
                 "priority": s["priority"], "task_timeout": s["task_timeout"],
                 "machine": (active_detail["machine"] if active_detail else
                             (last_detail["machine"] if last_detail else None)),
+                "worktree": bool(active_detail["worktree"]) if active_detail else False,
+                "detached": bool(active_detail["detached"]) if active_detail else False,
+                "herdr_target": active_detail["herdr_target"] if active_detail else None,
                 "paused": bool(s["paused"]), "ended": bool(s["ended_at"]),
                 "next_task_id": active["id"] if active else None,
                 "next_status": active["status"] if active else None,
@@ -1587,6 +2143,91 @@ def wake_series_once(series_id: Optional[int], latch_key: str,
         return True
 
 
+def wake_series_group_once(series_ids: list[int], latch_key: str,
+                           fingerprint: Optional[str], *, cache_guard: dict) -> list[int]:
+    """Atomically apply one diagnostic wake to every configured replica."""
+    normalized = []
+    for value in series_ids:
+        if type(value) is int and value > 0 and value not in normalized:
+            normalized.append(value)
+    with _connect(immediate=True) as conn:
+        paused = conn.execute(
+            "SELECT value FROM settings WHERE key = 'worker_paused'"
+        ).fetchone()
+        if paused and paused["value"] == "1":
+            return []
+        if not _pipeline_cache_guard_matches(conn, cache_guard):
+            return []
+        if fingerprint is None:
+            conn.execute("DELETE FROM settings WHERE key = ?", (latch_key,))
+            return []
+        previous = conn.execute(
+            "SELECT value FROM settings WHERE key = ?", (latch_key,),
+        ).fetchone()
+        if previous and previous["value"] == fingerprint:
+            return []
+        now = _now()
+        woken = []
+        for series_id in normalized:
+            series = conn.execute(
+                "SELECT * FROM task_series WHERE id = ?",
+                (series_id,),
+            ).fetchone()
+            if not series or series["paused"] or series["ended_at"]:
+                continue
+            task = conn.execute(
+                """UPDATE tasks SET scheduled_at = ?, next_run_at = NULL
+                   WHERE series_id = ? AND status IN ('pending', 'rate_limited')
+                     AND (next_run_at IS NULL OR next_run_at <= ?)""",
+                (now, series_id, now),
+            )
+            if not task.rowcount:
+                deferred = conn.execute(
+                    """SELECT 1 FROM tasks
+                       WHERE series_id = ?
+                         AND status IN ('pending', 'rate_limited')
+                         AND next_run_at > ?""",
+                    (series_id, now),
+                ).fetchone()
+                running = conn.execute(
+                    """SELECT 1 FROM tasks
+                       WHERE series_id = ? AND status = 'running'""",
+                    (series_id,),
+                ).fetchone()
+                if deferred is None and running is None:
+                    # A recurring worker commits its terminal result before
+                    # ``_recur_after_run`` creates the successor.  Do not let
+                    # the shared diagnostic latch make this replica miss the
+                    # wake permanently when the group wake lands in that
+                    # narrow gap.  Cancellation is an intentional human stop,
+                    # so only repair the same terminal states as
+                    # ``repair_active_series_occurrences``.
+                    latest = conn.execute(
+                        """SELECT status FROM tasks WHERE series_id = ?
+                           ORDER BY id DESC LIMIT 1""",
+                        (series_id,),
+                    ).fetchone()
+                    if (latest is None
+                            or latest["status"] not in ("completed", "failed")):
+                        continue
+                    if not _recreate_series_occurrence(
+                            conn, series_id, series, datetime.now(timezone.utc)):
+                        continue
+                    woken.append(series_id)
+                    continue
+                conn.execute(
+                    "INSERT OR REPLACE INTO settings (key, value) VALUES (?, '1')",
+                    (_pipeline_series_wake_intent_key(series_id),),
+                )
+            woken.append(series_id)
+        if woken:
+            conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                (latch_key, fingerprint),
+            )
+        return woken
+
+
 def _pipeline_stale_reselect_guard_key(series_id: int) -> str:
     return f"pipeline_stale_reselect_guard:v1:{int(series_id)}"
 
@@ -1669,7 +2310,16 @@ def update_task_fields(task_id: int, fields: dict) -> bool:
 
 def delete_task(task_id: int) -> bool:
     with _connect() as conn:
-        cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+        # A running provider may still own a checkout and an exact pipeline
+        # target. Deletion must follow cancel + confirmed terminal cleanup;
+        # otherwise removing the row would also free the reservation while the
+        # old agent can still mutate that PR.
+        cur = conn.execute(
+            "DELETE FROM tasks WHERE id = ? AND status != 'running'",
+            (task_id,),
+        )
+        if cur.rowcount:
+            _release_task_pipeline_targets(conn, task_id)
         return cur.rowcount > 0
 
 
@@ -2982,14 +3632,66 @@ def recover_running(keep_ids=()):
         conn.execute(sql, keep)
 
 
+def recover_running_attempt(task_id: int, started_at) -> bool:
+    """Settle one exact orphan after its provider was proven stopped.
+
+    A cancellation requested before the crash remains cancellation; every
+    other orphan is requeued. The status change, flag consumption and exact
+    reservation release share one transaction.
+    """
+    attempt = _attempt_iso(started_at)
+    if attempt is None:
+        return False
+    with _connect(immediate=True) as conn:
+        cancelled = conn.execute(
+            "SELECT 1 FROM settings WHERE key = ?",
+            (f"cancel_task:{task_id}",),
+        ).fetchone() is not None
+        if cancelled:
+            cur = conn.execute(
+                """UPDATE tasks
+                   SET status = 'cancelled', completed_at = ?,
+                       error = COALESCE(error, ?), note = NULL
+                   WHERE id = ? AND status = 'running' AND started_at = ?""",
+                (_now(), "Отменена пользователем до перезапуска worker",
+                 task_id, attempt),
+            )
+        else:
+            cur = conn.execute(
+                """UPDATE tasks SET status = 'pending', started_at = NULL
+                   WHERE id = ? AND status = 'running' AND started_at = ?""",
+                (task_id, attempt),
+            )
+        if cur.rowcount:
+            _drop_cancel_flag(conn, task_id)
+            _release_task_pipeline_targets(conn, task_id, attempt)
+        return cur.rowcount > 0
+
+
 def reset_task(task_id: int) -> bool:
     """Reset a single stuck 'running' task back to 'pending'."""
     with _connect() as conn:
         cur = conn.execute(
-            "UPDATE tasks SET status = 'pending', started_at = NULL WHERE id = ? AND status = 'running'",
+            """UPDATE tasks SET status = 'pending', started_at = NULL
+               WHERE id = ? AND status = 'running'
+                 AND NOT EXISTS (
+                     SELECT 1 FROM pipeline_target_reservations AS r
+                     WHERE r.task_id = tasks.id
+                 )""",
             (task_id,),
         )
         return cur.rowcount > 0
+
+
+def task_has_live_pipeline_target_reservation(task_id: int) -> bool:
+    """Whether reset must wait for an owned provider to stop safely."""
+    with _connect() as conn:
+        row = conn.execute(
+            """SELECT 1 FROM pipeline_target_reservations
+               WHERE task_id = ? LIMIT 1""",
+            (task_id,),
+        ).fetchone()
+        return row is not None
 
 
 def purge_old(before_days: int = 7) -> int:

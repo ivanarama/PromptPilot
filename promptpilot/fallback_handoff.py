@@ -198,20 +198,36 @@ def config_digest(config: dict) -> str:
     return digest(config)
 
 
-def create(config: dict, health: dict, stage: str, target: dict, reason: str) -> dict:
-    from .project_pipeline import encode_signed_lease
+def create(config: dict, health: dict, stage: str, target: dict, reason: str,
+           *, target_reservation: dict | None = None) -> dict:
+    from . import project_pipeline as pp
 
     health_gate(health, stage, target, election=True)
     target = identity(target)
     issued = int(time.time())
+    replicas = pp._configured_replica_count()
+    if replicas > 1 and target_reservation is None:
+        raise pp.PipelineError(
+            "replicated REVIEW fallback has no target reservation")
     lease = {"version": 1, "purpose": PROTOCOL, "stage": stage,
              "repository": config["repository"], "target": target,
              "config_sha256": config_digest(config), "issued_at": issued,
              "expires_at": issued + TTL}
+    if target_reservation is not None:
+        repository, target_stage, number, head, task_id, _token = \
+            pp._reservation_identity(target_reservation)
+        if (repository != str(config["repository"]).lower()
+                or target_stage != target["stage"] or number != target["number"]
+                or head != target["head"]
+                or pp._pipeline_task_id(required=True) != task_id):
+            raise pp.PipelineError(
+                "pipeline target reservation contradicts fallback target")
+        lease["target_reservation"] = target_reservation
+        lease["pipeline_replicas"] = replicas
     return {"action": "fallback", "reason": reason, "target": target,
             "handoff": {"protocol": PROTOCOL, "stage": stage,
                         "repository": config["repository"], "target": target,
-                        "lease": encode_signed_lease(lease)}}
+                        "lease": pp.encode_signed_lease(lease)}}
 
 
 def validate(preflight: dict, stage: str) -> dict:
@@ -233,6 +249,7 @@ def validate(preflight: dict, stage: str) -> dict:
 
 
 def validate_lease(lease: dict, stage: str) -> None:
+    from . import project_pipeline as pp
     from .project_pipeline import PipelineError
 
     if (lease.get("purpose") != PROTOCOL or lease.get("stage") != stage
@@ -250,6 +267,21 @@ def validate_lease(lease: dict, stage: str) -> None:
     if (type(issued) is not int or type(expires) is not int or issued > now + 60
             or expires <= now or not 0 < expires - issued <= TTL):
         raise PipelineError("fallback lease is expired or has an invalid validity window")
+    reservation = lease.get("target_reservation")
+    replicas = lease.get("pipeline_replicas", 1)
+    if type(replicas) is not int or not 1 <= replicas <= 16:
+        raise PipelineError("fallback lease has an invalid replica count")
+    if replicas > 1 and reservation is None:
+        raise PipelineError(
+            "replicated REVIEW fallback lease has no target reservation")
+    if reservation is not None:
+        repository, target_stage, number, head, _task_id, _token = \
+            pp._reservation_identity(reservation)
+        if (repository != str(lease["repository"]).lower()
+                or target_stage != target["stage"] or number != target["number"]
+                or head != target["head"]):
+            raise PipelineError(
+                "pipeline target reservation contradicts fallback lease")
 
 
 def gate(gh, config: dict, stage: str, lease_value: str, *, config_path=None) -> dict:
@@ -274,6 +306,16 @@ def gate(gh, config: dict, stage: str, lease_value: str, *, config_path=None) ->
         raise pp.PipelineError("pending merge cleanup takes precedence; start a new task")
     health_gate(health, stage, lease["target"], election=False)
     validate_lease(lease, stage)
+    if lease.get("target_reservation") is not None:
+        pp.renew_lease_target_reservation({
+            "stage": stage,
+            "target_stage": lease["target"]["stage"],
+            "repository": lease["repository"],
+            "number": lease["target"]["number"],
+            "head": lease["target"]["head"],
+            "target_reservation": lease["target_reservation"],
+            "pipeline_replicas": lease.get("pipeline_replicas", 1),
+        }, config)
     return {"action": "validated", "stage": stage, "repository": lease["repository"],
             "target": lease["target"], "mutation_authorized": False,
             "reason": "fresh scheduling gate passed; full repository mutation gates still required"}

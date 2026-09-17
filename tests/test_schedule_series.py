@@ -1031,7 +1031,16 @@ def test_pipeline_insights_finds_capacity_bottleneck(isolated_db, monkeypatch):
                         lambda: {"example": PIPELINE_PROFILE})
     pipeline_insights._cache.clear()
 
-    result = pipeline_insights.analyze("example", [], use_cache=False)
+    active_series = [
+        {
+            "id": index, "title": f"ExampleProject - {queue['series_contains']}",
+            "ended": False, "paused": False, "broken": False,
+            "next_task_id": index + 100, "next_status": "pending",
+        }
+        for index, queue in enumerate(PIPELINE_PROFILE["queues"], start=1)
+    ]
+    result = pipeline_insights.analyze(
+        "example", active_series, use_cache=False)
 
     assert result["bottleneck"] == "review"
     review = next(q for q in result["queues"] if q["id"] == "review")
@@ -1455,7 +1464,11 @@ def test_cache_only_read_uses_legacy_durable_snapshot_without_github(
     monkeypatch.setattr(pipeline_insights, "_run_profile_health_check", forbidden)
     pipeline_insights._cache.clear()
 
-    result = pipeline_insights.read_cached("legacy", [])
+    result = pipeline_insights.read_cached("legacy", [{
+        "id": 1, "title": "Example - REVIEW", "ended": False,
+        "paused": False, "broken": False,
+        "next_task_id": 101, "next_status": "pending",
+    }])
 
     assert result["cache"]["source"] == "snapshot"
     assert result["cache"]["complete"] is False

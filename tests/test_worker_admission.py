@@ -308,8 +308,8 @@ def test_pipeline_success_without_closing_verdict_is_rejected(monkeypatch):
     monkeypatch.setattr(worker.db, "is_cancel_requested", lambda _task_id: False)
     monkeypatch.setattr(
         worker.db, "mark_failed",
-        lambda task_id, error, exit_code=None: failed.append(
-            (task_id, error, exit_code)),
+        lambda task_id, error, exit_code=None, **_kwargs: failed.append(
+            (task_id, error, exit_code)) or True,
     )
     monkeypatch.setattr(
         worker.db, "mark_completed",
@@ -354,8 +354,8 @@ def test_blocked_notification_failure_does_not_detach_running_agent(monkeypatch)
     monkeypatch.setattr(worker.db, "add_notification", notification)
     monkeypatch.setattr(
         worker.db, "mark_failed",
-        lambda task_id, error, exit_code=None: failures.append(
-            (task_id, error, exit_code)),
+        lambda task_id, error, exit_code=None, **_kwargs: failures.append(
+            (task_id, error, exit_code)) or True,
     )
 
     worker._execute_herdr_task(task, {"kind": "agy"})

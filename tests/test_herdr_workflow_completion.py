@@ -262,7 +262,9 @@ def test_run_in_herdr_requires_pipeline_verdict_end_to_end(monkeypatch):
     monkeypatch.setattr(herdr_exec, "_close_stale_tabs", lambda *_args: None)
     monkeypatch.setattr(herdr_exec, "_run", fake_run)
     monkeypatch.setattr(herdr_exec.time, "sleep", lambda _seconds: None)
-    monkeypatch.setattr(herdr_exec, "_close_owned_session", lambda *_args: "")
+    monkeypatch.setattr(
+        herdr_exec, "_close_owned_session",
+        lambda *_args, **_kwargs: "")
 
     outcome = herdr_exec.run_in_herdr(
         task, {"kind": "agy"}, prompt_override="OneBase - REVIEW",
@@ -346,7 +348,7 @@ def test_herdr_deduplicates_permission_flag_and_forwards_pipeline_paths(
         lambda *_args, **_kwargs: ("done", ""),
     )
     monkeypatch.setattr(
-        herdr_exec, "_close_owned_session", lambda *_args: "")
+        herdr_exec, "_close_owned_session", lambda *_args, **_kwargs: "")
 
     outcome = herdr_exec.run_in_herdr(
         task,
@@ -402,7 +404,7 @@ def test_remote_herdr_does_not_forward_local_pipeline_paths(
         lambda *_args, **_kwargs: ("done", ""),
     )
     monkeypatch.setattr(
-        herdr_exec, "_close_owned_session", lambda *_args: "")
+        herdr_exec, "_close_owned_session", lambda *_args, **_kwargs: "")
 
     outcome = herdr_exec.run_in_herdr(
         task, {"kind": "codex", "env": {"REMOTE_ONLY": "/srv/data"}},
@@ -566,7 +568,8 @@ def test_required_completion_without_verdict_fails_and_closes_owned_tab(
     monkeypatch.setattr(herdr_exec.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(
         herdr_exec, "_close_owned_session",
-        lambda name, args, host: closed.append((name, args, host)) or "",
+        lambda name, args, host, **_kwargs:
+        closed.append((name, args, host)) or "",
     )
 
     outcome = herdr_exec.run_in_herdr(

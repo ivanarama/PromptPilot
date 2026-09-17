@@ -116,6 +116,48 @@ def test_closing_after_root_exit_kills_lingering_descendant():
         tree.close()
 
 
+def test_failed_boundary_close_can_be_retried_without_losing_ownership(monkeypatch):
+    process = SimpleNamespace(kill=lambda: None)
+    if os.name == "nt":
+        calls = []
+
+        def terminate(job, code):
+            calls.append((job, code))
+            return len(calls) > 1
+
+        monkeypatch.setattr(process_tree, "_TerminateJobObject", terminate)
+        monkeypatch.setattr(
+            process_tree, "_windows_error",
+            lambda message: process_tree.ProcessTreeError(message),
+        )
+        monkeypatch.setattr(process_tree, "_CloseHandle", lambda _job: True)
+        tree = OwnedProcess(process, job=99)
+
+        with pytest.raises(process_tree.ProcessTreeError):
+            tree.close()
+        assert tree._job == 99
+        tree.close()
+        assert tree._job is None
+        assert calls == [(99, 1), (99, 1)]
+    else:
+        calls = []
+
+        def killpg(group_id, sig):
+            calls.append((group_id, sig))
+            if len(calls) == 1:
+                raise OSError("temporary kill failure")
+
+        monkeypatch.setattr(process_tree.os, "killpg", killpg)
+        tree = OwnedProcess(process, group_id=4242)
+
+        with pytest.raises(OSError, match="temporary"):
+            tree.close()
+        assert tree._group_id == 4242
+        tree.close()
+        assert tree._group_id is None
+        assert calls == [(4242, process_tree.signal.SIGKILL)] * 2
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows Job Object setup")
 def test_windows_close_terminates_job_with_retained_handle_not_unrelated_process():
     """Normal completion must not depend on PromptPilot owning the last handle."""
@@ -338,15 +380,18 @@ def test_owned_herdr_close_failure_is_not_silently_accepted(monkeypatch):
     ]
 
 
-def test_owned_herdr_close_accepts_verified_missing_agent(monkeypatch):
+def test_owned_herdr_close_accepts_verified_missing_exact_ids_after_rename(
+        monkeypatch):
     responses = iter([
         (0, {"result": {}}, "closed"),
-        (1, {"error": {"code": "agent_not_found"}}, "not found"),
+        (0, {"result": {"tabs": []}}, "absent"),
+        (0, {"result": {"agents": []}}, "absent"),
     ])
     monkeypatch.setattr(herdr_exec, "_run", lambda *_args, **_kwargs: next(responses))
 
     assert herdr_exec._close_owned_session(
-        "pp-t42", ["tab", "close", "owned-tab"], host=None,
+        "renamed-agent", ["tab", "close", "owned-tab"], host=None,
+        pane_id="owned-pane",
     ) == ""
 
 
@@ -432,7 +477,7 @@ def test_pane_bookkeeping_failure_closes_tab_before_agent_start(monkeypatch):
     monkeypatch.setattr(herdr_exec, "_run", fake_run)
     monkeypatch.setattr(
         herdr_exec, "_close_owned_session",
-        lambda name, close_args, host: closed.append(
+        lambda name, close_args, host, **_kwargs: closed.append(
             (name, close_args, host)) or "",
     )
 

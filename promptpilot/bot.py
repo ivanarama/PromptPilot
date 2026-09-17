@@ -199,8 +199,11 @@ def _task_detail_keyboard(task) -> InlineKeyboardMarkup:
         rows.append(action_row)
     if task.result and len(task.result) > 800:
         rows.append([InlineKeyboardButton("📄 Полный вывод", callback_data=f"full_result:{task.id}")])
-    rows.append([InlineKeyboardButton("← К списку", callback_data="tasklist"),
-                 InlineKeyboardButton("🗑 Удалить", callback_data=f"delete_task:{task.id}")])
+    final_row = [InlineKeyboardButton("← К списку", callback_data="tasklist")]
+    if status != "running":
+        final_row.append(InlineKeyboardButton(
+            "🗑 Удалить", callback_data=f"delete_task:{task.id}"))
+    rows.append(final_row)
     return InlineKeyboardMarkup(rows)
 
 
@@ -657,7 +660,13 @@ async def cb_reset_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"Задача #{task_id} возвращена в очередь.",
                                       reply_markup=_after_action_keyboard(task_id))
     else:
-        await query.answer("Задача не в статусе running.", show_alert=True)
+        if db.task_has_live_pipeline_target_reservation(task_id):
+            await query.answer(
+                "Сначала останови задачу и дождись завершения очистки провайдера.",
+                show_alert=True,
+            )
+        else:
+            await query.answer("Задача не в статусе running.", show_alert=True)
 
 
 @require_auth
@@ -666,8 +675,13 @@ async def cb_delete_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     the button sits next to the frequently-used ones and a stray tap would
     destroy the task together with its result."""
     query = update.callback_query
-    await query.answer()
     task_id = int(query.data.split(":")[1])
+    task = db.get_task(task_id)
+    if task and task.status.value == "running":
+        await query.answer(
+            "Сначала отмените задачу и дождитесь её остановки.", show_alert=True)
+        return
+    await query.answer()
     await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([[
         InlineKeyboardButton("🗑 Точно удалить", callback_data=f"del_yes:{task_id}"),
         InlineKeyboardButton("↩ Отмена", callback_data=f"task:{task_id}"),
@@ -685,7 +699,11 @@ async def cb_delete_task_confirm(update: Update, context: ContextTypes.DEFAULT_T
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("← К списку", callback_data="tasklist")]]))
     else:
-        await query.answer("Задача не найдена.", show_alert=True)
+        task = db.get_task(task_id)
+        reason = ("Сначала отмените задачу и дождитесь её остановки."
+                  if task and task.status.value == "running"
+                  else "Задача не найдена.")
+        await query.answer(reason, show_alert=True)
 
 
 @require_auth
@@ -986,12 +1004,30 @@ def _pipeline_text(data: dict) -> str:
         cadence = queue.get("adaptive_cadence") or {}
         cadence_text = (f"; adaptive {cadence.get('mode')}"
                         if cadence else "")
+        replica_count = int(queue.get("replica_count") or 1)
+        replicas_active = int(queue.get("replicas_active") or 0)
+        parallel_capacity = queue.get("parallel_capacity")
+        parallel_capacity = int(queue["capacity"] if parallel_capacity is None
+                                else parallel_capacity)
+        capacity_text = (
+            f"{queue['capacity']} × {replicas_active} = {parallel_capacity}")
+        replica_status = queue.get("replica_status") or {}
+        replica_details = ""
+        if replica_count > 1:
+            issues = replica_status.get("issues") or []
+            replica_details = (
+                f"\n   Реплики: {replicas_active}/{replica_count} активны, "
+                f"найдено {replica_status.get('present', 0)}"
+                + (f"; ошибка: {'; '.join(issues)}" if issues else "")
+            )
         lines.append(f"{marker} {queue['title']}: {backlog if backlog is not None else '—'} / "
-                     f"{queue['capacity']} за прогон = {runs_needed if runs_needed is not None else '—'} прогонов; "
+                     f"{capacity_text} за параллельный прогон = "
+                     f"{runs_needed if runs_needed is not None else '—'} прогонов; "
                      f"сейчас {queue['interval'] or 'не настроено'}{cadence_text}; "
                      f"средний запуск {duration_text}; ETA {eta if eta is not None else '—'} ч\n"
                      f"   Маршрут: {route_text}\n"
-                     f"   Рекомендация: {queue['recommendation']}")
+                     f"   Рекомендация: {queue['recommendation']}"
+                     f"{replica_details}")
     runs = recent.get("runs", {})
     lines.extend(["", f"Прогоны за окно: {runs.get('runs', 0)}; готово {runs.get('ready', 0)}, "
                   f"нужен человек {runs.get('human', 0)}, не смог {runs.get('unable', 0)}, "
