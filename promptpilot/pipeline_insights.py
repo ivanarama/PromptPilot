@@ -2359,7 +2359,7 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
             from .project_pipeline import PipelineError
 
             try:
-                validate(preflight, stage)
+                fallback_lease = validate(preflight, stage)
                 if command[-2:] != ["next", stage]:
                     raise PipelineError("fallback handoff command must end with next and the exact stage")
             except (PipelineError, TypeError, ValueError) as exc:
@@ -2374,10 +2374,27 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                 envelope = {"protocol": "promptpilot-fallback-target-v1",
                             "next_already_run": True, "command": command,
                             "gate_command": gate_command, "preflight": preflight}
+                pre_review_guard = ""
+                if fallback_lease["target"]["stage"] == "pre-review-validation":
+                    pre_review_guard = (
+                        "Это специальный content-lane этап pre-review-validation, а не "
+                        "integration review. Подписанный envelope только фиксирует все "
+                        "восемь полей pre_review_sync и HEAD; он не доказывает provenance "
+                        "и не разрешает быстрый результат. До gate_command, оставаясь полностью "
+                        "read-only, сначала выполни предусмотренную скиллом полную стабильную "
+                        "GraphQL-проверку происхождения sync-коммита. Только после её успеха "
+                        "проверь весь diff PR как обычное содержательное ревью и выполни все "
+                        "уместные полные тесты. Этот target нельзя завершать через быстрый "
+                        "action=audit или `complete review`. Лишь когда provenance и аудит "
+                        "полностью завершены и ты готов к первой мутации, переходи к описанному "
+                        "ниже одноразовому gate_command непосредственно перед этой мутацией. "
+                        "При любой ошибке provenance остановись без gate и без мутаций.\n\n"
+                    )
                 prompt = (
                     "PromptPilot уже выполнил election next. Не запускай next повторно "
                     "и не выбирай другую цель. Полностью прочитай канонический скилл "
                     "и его legacy-протокол. Используй только exact target из envelope. "
+                    f"{pre_review_guard}"
                     "Непосредственно перед первой мутацией выполни gate_command ровно один "
                     "раз: он заново "
                     "запускает полный pipelinehealth и проверяет ту же цель. Требуется "

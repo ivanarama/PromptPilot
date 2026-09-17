@@ -1247,6 +1247,14 @@ def next_review(gh: GitHub, config: dict, *, config_path: str | None = None) -> 
     if not candidates:
         return {"action": "empty", "verdict": "ПУСТО", "reason": review_empty_reason(health)}
     item = candidates[0]
+    if item.get("stage") == "pre-review-validation":
+        if config.get("fallback_handoff") != "target-v1":
+            raise PipelineError(
+                "pre-review validation requires the exact-target fallback protocol")
+        return fallback_target(
+            config, health, "review", item,
+            "pre-review sync provenance requires validation and a full content review",
+        )
     if item.get("stage") != "review":
         return fallback_target(config, health, "review", item,
                                "integration/base-sync state requires the full skill")

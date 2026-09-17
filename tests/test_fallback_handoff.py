@@ -19,6 +19,21 @@ from promptpilot import pipeline_insights, project_pipeline as pp
 HEAD = "a" * 40
 
 
+def pre_review_sync(**changes):
+    value = {
+        "intent_comment_id": 101,
+        "done_comment_id": 102,
+        "from": "b" * 40,
+        "to": HEAD,
+        "base": "c" * 40,
+        "identity_sha256": "d" * 64,
+        "intent_created_at": "2026-09-17T08:00:00Z",
+        "done_created_at": "2026-09-17T08:02:00Z",
+    }
+    value.update(changes)
+    return value
+
+
 @pytest.fixture
 def config(monkeypatch, tmp_path):
     monkeypatch.setenv("PP_PIPELINE_LEASE_KEY_FILE", str(tmp_path / "lease.key"))
@@ -29,14 +44,18 @@ def config(monkeypatch, tmp_path):
 
 def health(target_stage="integration-review"):
     target = {"number": 42, "head": HEAD, "stage": target_stage, "review_depth": 2}
-    integration = target_stage not in {"review", "merge"}
+    if target_stage == handoff.PRE_REVIEW_VALIDATION_STAGE:
+        target["pre_review_sync"] = pre_review_sync()
+    integration = target_stage in handoff.INTEGRATION_STAGES
     reviewing = target_stage in handoff.REVIEW_STAGES
     return {"state": "yellow" if integration else "green",
             "findings": ([{"code": "single_flight_barrier", "severity": "yellow", "pr": 42}]
                          if integration else []),
             "integration_owner": target if integration else None,
             "review_candidates": [target] if reviewing else [],
-            "content_review_candidates": [target] if target_stage == "review" else [],
+            "content_review_candidates": ([target]
+                                          if target_stage in handoff.CONTENT_REVIEW_STAGES
+                                          else []),
             "merge_executable": [] if reviewing else [target]}
 
 
@@ -55,7 +74,7 @@ class ReadOnlyGitHub:
 
 
 @pytest.mark.parametrize("target_stage", [
-    "review", "integration-review", "legacy-integration-review",
+    "review", "pre-review-validation", "integration-review", "legacy-integration-review",
     "integration-merge-ready", "legacy-integration-merge-ready", "integration-merge-recovery",
 ])
 def test_cli_dispatch_handoff_runs_exactly_election_and_fresh_gate(config, monkeypatch, target_stage):
@@ -97,6 +116,17 @@ def test_cli_dispatch_handoff_runs_exactly_election_and_fresh_gate(config, monke
     assert "не повторяй gate_command и next" in route["prompt"]
     assert "ИТОГ: НЕ СМОГ (gate-fallback: <точный error" in route["prompt"]
     assert "Один envelope — один PR" in route["prompt"]
+    if target_stage == handoff.PRE_REVIEW_VALIDATION_STAGE:
+        assert "все восемь полей pre_review_sync" in route["prompt"]
+        assert "полную стабильную GraphQL-проверку" in route["prompt"]
+        assert "проверь весь diff" in route["prompt"]
+        assert "нельзя завершать через быстрый action=audit" in route["prompt"]
+        assert "До gate_command, оставаясь полностью read-only" in route["prompt"]
+        assert "После gate_command сначала" not in route["prompt"]
+        assert route["prompt"].index("До gate_command") < route["prompt"].index(
+            "Непосредственно перед первой мутацией")
+    else:
+        assert "все восемь полей pre_review_sync" not in route["prompt"]
     assert route["preflight"]["target"] == route["target"]
     assert len(scans) == 1
     code, gated = invoke(route["gate_command"][1:])
@@ -229,6 +259,108 @@ def test_content_fallback_keeps_target_lease_across_unrelated_owner(config):
         handoff.health_gate(fresh, "review", target, election=True)
 
 
+def test_pre_review_fallback_keeps_metadata_bound_across_unrelated_owner(config):
+    source = health(handoff.PRE_REVIEW_VALIDATION_STAGE)
+    target = source["review_candidates"][0]
+    preflight = handoff.create(config, source, "review", target, "provenance")
+    lease = handoff.validate(preflight, "review")
+    assert lease["target"] == handoff.identity(target)
+    assert lease["target"]["pre_review_sync"] == pre_review_sync()
+
+    fresh = health("integration-review")
+    fresh["integration_owner"]["number"] = 90
+    fresh["findings"][0]["pr"] = 90
+    fresh["content_review_candidates"] = [target]
+    handoff.health_gate(fresh, "review", lease["target"], election=False)
+    with pytest.raises(pp.PipelineError):
+        handoff.health_gate(fresh, "review", lease["target"], election=True)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("intent_comment_id", 201),
+    ("done_comment_id", 202),
+    ("from", "e" * 40),
+    ("to", "e" * 40),
+    ("base", "e" * 40),
+    ("identity_sha256", "e" * 64),
+    ("intent_created_at", "2026-09-17T08:00:01Z"),
+    ("done_created_at", "2026-09-17T08:02:01Z"),
+])
+def test_pre_review_fresh_gate_compares_every_metadata_field(config, field, value):
+    source = health(handoff.PRE_REVIEW_VALIDATION_STAGE)
+    target = source["review_candidates"][0]
+    preflight = handoff.create(config, source, "review", target, "provenance")
+    expected = handoff.validate(preflight, "review")["target"]
+    fresh = copy.deepcopy(source)
+    for candidate in fresh["review_candidates"] + fresh["content_review_candidates"]:
+        candidate["pre_review_sync"][field] = value
+        if field == "to":
+            candidate["head"] = value
+    with pytest.raises(pp.PipelineError, match="exact executable"):
+        handoff.health_gate(fresh, "review", expected, election=False)
+
+
+@pytest.mark.parametrize("mutation", [
+    lambda target: target.pop("pre_review_sync"),
+    lambda target: target["pre_review_sync"].pop("base"),
+    lambda target: target["pre_review_sync"].update(extra="x"),
+    lambda target: target["pre_review_sync"].update(intent_comment_id=True),
+    lambda target: target["pre_review_sync"].update(done_comment_id=0),
+    lambda target: target["pre_review_sync"].update(done_comment_id=2**63),
+    lambda target: target["pre_review_sync"].update(**{"from": "B" * 40}),
+    lambda target: target["pre_review_sync"].update(identity_sha256="d" * 63),
+    lambda target: target["pre_review_sync"].update(intent_created_at="not-a-time"),
+    lambda target: target["pre_review_sync"].update(done_created_at="2026-09-17 08:02:00Z"),
+    lambda target: target["pre_review_sync"].update(
+        done_created_at="2026-09-17T07:59:59Z"),
+    lambda target: target["pre_review_sync"].update(to="e" * 40),
+])
+def test_pre_review_target_schema_fails_closed(mutation):
+    target = health(handoff.PRE_REVIEW_VALIDATION_STAGE)["review_candidates"][0]
+    mutation(target)
+    with pytest.raises(pp.PipelineError):
+        handoff.identity(target)
+
+
+def test_pre_review_stage_cannot_be_integration_owner_or_merge_executable():
+    source = health(handoff.PRE_REVIEW_VALIDATION_STAGE)
+    target = source["review_candidates"][0]
+    as_owner = copy.deepcopy(source)
+    as_owner["integration_owner"] = target
+    as_owner["findings"] = [
+        {"code": "single_flight_barrier", "severity": "yellow", "pr": 42},
+    ]
+    with pytest.raises(pp.PipelineError, match="owner"):
+        handoff.validate_health(as_owner)
+
+    in_merge = copy.deepcopy(source)
+    in_merge["merge_executable"] = [target]
+    with pytest.raises(pp.PipelineError, match="merge_executable"):
+        handoff.validate_health(in_merge)
+
+
+def test_next_review_forces_targeted_full_skill_for_pre_review(config, monkeypatch):
+    source = health(handoff.PRE_REVIEW_VALIDATION_STAGE)
+    monkeypatch.setattr(pp, "run_health", lambda *_, **__: source)
+    monkeypatch.setattr(
+        pp, "stable_timeline",
+        lambda *_: pytest.fail("pre-review validation must not enter fast audit"),
+    )
+
+    result = pp.next_review(object(), config)
+
+    assert result["action"] == "fallback"
+    assert result["target"] == handoff.identity(source["review_candidates"][0])
+    assert result["handoff"]["protocol"] == handoff.PROTOCOL
+
+
+def test_next_review_pre_review_fails_closed_without_target_protocol(monkeypatch):
+    source = health(handoff.PRE_REVIEW_VALIDATION_STAGE)
+    monkeypatch.setattr(pp, "run_health", lambda *_, **__: source)
+    with pytest.raises(pp.PipelineError, match="exact-target"):
+        pp.next_review(object(), {})
+
+
 def test_legacy_config_does_not_silently_opt_in(monkeypatch):
     monkeypatch.setattr(pp, "run_health", lambda *_, **__: health())
     assert pp.next_review(object(), {}) == {
@@ -253,7 +385,7 @@ def test_opted_in_red_health_never_routes_to_manual_mutations(config, monkeypatc
 
 def test_onebase_producer_parity_fixture(config):
     corpus = json.loads((Path(__file__).parent / "fixtures" / "fallback-handoff-v1.json").read_text(encoding="utf-8"))
-    assert corpus["protocol"] == handoff.PROTOCOL and len(corpus["cases"]) == 7
+    assert corpus["protocol"] == handoff.PROTOCOL and len(corpus["cases"]) == 8
     for case in corpus["cases"]:
         result = handoff.create(config, case["health"], case["stage"], case["target"], "parity")
         assert handoff.validate(result, case["stage"])["target"] == case["target"]
