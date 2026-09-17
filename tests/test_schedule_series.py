@@ -852,6 +852,8 @@ def test_hard_defer_is_not_shortened_by_successor_wake(isolated_db):
     assert requested == {"accepted": True, "state": "latched_deferred"}
     assert deferred.scheduled_at == deadline
     assert deferred.next_run_at == deadline
+    assert isolated_db.get_series(task.series_id)["next_not_before"] == \
+        deadline.isoformat()
     assert isolated_db.consume_pipeline_series_wake(task.series_id) is False
     assert isolated_db.get_setting(
         f"pipeline_series_wake_intent:v1:{task.series_id}") == "1"
@@ -2376,6 +2378,154 @@ def test_dispatch_gate_defers_only_matching_diagnostic_stages(isolated_db, monke
         {"number": 44, "stage": "integration-merge-recovery"},
     ]
     assert pipeline_insights.dispatch_gate(task) is None
+
+
+def _local_dependency_profile():
+    execution = {
+        "mode": "auto", "command": ["pipelinectl", "next", "{stage}"],
+    }
+    return {
+        "title": "Example", "repository": "owner/example",
+        "queues": [
+            {
+                "id": "review", "title": "Review", "query": "is:pr",
+                "series_contains": "Example - REVIEW", "execution": execution,
+                "wake_after_success": ["merge"],
+            },
+            {
+                "id": "merge", "title": "Merge",
+                "query": "is:pr label:ship",
+                "series_contains": "Example - MERGE", "execution": execution,
+                "wake_after_success": ["merge", "review"],
+                "dispatch_gate": {
+                    "defer_while_queues_active": ["review"],
+                    "defer_for": "7m",
+                },
+            },
+        ],
+    }
+
+
+@pytest.mark.parametrize(("review_state", "reason"), [
+    ("running", "выполняется"),
+    ("due", "готова к запуску"),
+    ("budget-deferred", "отложена бюджетом"),
+])
+def test_local_dependency_precedes_invalidated_diagnostics_cache(
+        isolated_db, monkeypatch, review_state, reason):
+    review = isolated_db.create_task(TaskCreate(
+        prompt="Example - REVIEW", recurrence="4h"))
+    if review_state in {"running", "budget-deferred"}:
+        claimed = isolated_db.get_next_runnable()
+        assert claimed.id == review.id
+        if review_state == "budget-deferred":
+            isolated_db.defer_task(
+                claimed.id, datetime.now(timezone.utc) + timedelta(hours=1),
+                "GitHub budget", hard_not_before=True)
+    merge = isolated_db.create_task(TaskCreate(
+        prompt="Example - MERGE", recurrence="4h"))
+    profile = _local_dependency_profile()
+    monkeypatch.setattr(
+        pipeline_insights, "_profiles", lambda: {"example": profile})
+    monkeypatch.setattr(
+        pipeline_insights, "read_cached",
+        lambda *_args, **_kwargs: pytest.fail(
+            "local dependency must run before the invalidated diagnostics cache"),
+    )
+
+    gate = pipeline_insights.dispatch_gate(merge)
+
+    assert gate["action"] == "defer"
+    assert gate["defer_for"] == "7m"
+    assert "review" in gate["reason"]
+    assert reason in gate["reason"]
+
+
+def test_local_dependency_ignores_normal_future_recurrence(
+        isolated_db, monkeypatch):
+    isolated_db.create_task(TaskCreate(
+        prompt="Example - REVIEW", recurrence="4h",
+        scheduled_at=datetime.now(timezone.utc) + timedelta(hours=4)))
+    merge = isolated_db.create_task(TaskCreate(
+        prompt="Example - MERGE", recurrence="4h"))
+    profile = _local_dependency_profile()
+    reads = []
+    monkeypatch.setattr(
+        pipeline_insights, "_profiles", lambda: {"example": profile})
+    monkeypatch.setattr(
+        pipeline_insights, "read_cached", lambda *_args, **_kwargs: (
+            reads.append(True) or {
+                "queues": [{"id": "merge", "title": "Merge", "backlog": 1}],
+                "diagnostics": {"review_candidates": [{"number": 42}]},
+                "cache": {"stale": True, "complete": False},
+            }))
+
+    assert pipeline_insights.dispatch_gate(merge) is None
+    assert reads == [True]
+
+
+def test_local_dependency_defers_before_execution_admission(
+        isolated_db, monkeypatch):
+    isolated_db.create_task(TaskCreate(
+        prompt="Example - REVIEW", recurrence="4h", priority=5))
+    merge = isolated_db.create_task(TaskCreate(
+        prompt="Example - MERGE", recurrence="4h", priority=1))
+    claimed = isolated_db.get_next_runnable()
+    assert claimed.id == merge.id
+    profile = _local_dependency_profile()
+    monkeypatch.setattr(
+        pipeline_insights, "_profiles", lambda: {"example": profile})
+    monkeypatch.setattr(
+        pipeline_insights, "execution_route",
+        lambda *_args, **_kwargs: pytest.fail(
+            "local dependency must precede GitHub admission/reservation"),
+    )
+
+    worker._execute_task_inner(claimed)
+
+    deferred = isolated_db.get_task(merge.id)
+    assert deferred.status.value == "pending"
+    assert deferred.retry_count == 0
+    assert "локальной очереди" in deferred.error
+
+
+def test_completion_invalidates_then_wakes_local_dependency_first(
+        monkeypatch):
+    profile = _local_dependency_profile()
+    series = [
+        {"id": 7, "title": "Example - REVIEW", "paused": False,
+         "ended": False, "ended_at": None},
+        {"id": 8, "title": "Example - MERGE", "paused": False,
+         "ended": False, "ended_at": None},
+    ]
+    monkeypatch.setattr(
+        pipeline_insights, "_profiles", lambda: {"example": profile})
+    monkeypatch.setattr(pipeline_insights.db, "is_paused", lambda: False)
+    monkeypatch.setattr(pipeline_insights.db, "list_series", lambda: series)
+    events = []
+    monkeypatch.setattr(
+        pipeline_insights, "_discard_cache",
+        lambda profile_id: events.append(("invalidate", profile_id)))
+    monkeypatch.setattr(
+        pipeline_insights.db, "request_pipeline_series_wake",
+        lambda series_id: events.append(("wake", series_id)) or {
+            "accepted": True, "state": "scheduled",
+        })
+    merge_task = SimpleNamespace(
+        series_id=8, series_title="Example - MERGE", prompt="Example - MERGE")
+
+    assert pipeline_insights.after_task_completed(
+        merge_task, "ГОТОВО") == ["review", "merge"]
+    assert events == [
+        ("invalidate", "example"), ("wake", 7), ("wake", 8),
+    ]
+
+    events.clear()
+    review_task = SimpleNamespace(
+        series_id=7, series_title="Example - REVIEW", prompt="Example - REVIEW")
+    assert pipeline_insights.after_task_completed(
+        review_task, "ГОТОВО") == ["merge"]
+    assert events == [("invalidate", "example"), ("wake", 8)]
 
 
 def test_productive_completion_wakes_every_ready_stage(isolated_db, monkeypatch):

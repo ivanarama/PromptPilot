@@ -1853,11 +1853,16 @@ def dispatch_gate(task) -> dict | None:
             config = queue_config.get("dispatch_gate")
             if not marker or marker not in title or not isinstance(config, dict):
                 continue
+            series = db.list_series()
+            dependency = _local_dependency_gate(
+                profile_id, profile, queue_config, config, series)
+            if dependency is not None:
+                return dependency
             # Dispatch only decides whether starting an agent is useful; every
             # mutation is still protected by the project's own fresh gate.
             # Reuse the five-minute snapshot so several due stages cannot each
             # spend hundreds of GitHub requests on the same queue state.
-            data = read_cached(profile_id, db.list_series())
+            data = read_cached(profile_id, series)
             cache = data.get("cache") or {}
             # A stale/partial empty snapshot must never complete a live stage as
             # empty, and stale diagnostics must not defer it. The project-owned
@@ -1906,6 +1911,79 @@ def dispatch_gate(task) -> dict | None:
                         "profile_id": profile_id, "queue_id": queue_config["id"],
                     }
             return None
+    return None
+
+
+def _local_dependency_gate(profile_id: str, profile: dict, queue: dict,
+                           config: dict, series: list[dict],
+                           *, now: datetime | None = None) -> dict | None:
+    """Defer one queue while an opted-in local predecessor still owns work.
+
+    This check intentionally precedes and does not depend on the diagnostics
+    cache.  It is only a scheduling guard: the project preflight remains the
+    authority for target selection, fallback and cleanup recovery.
+    """
+    configured = _configured_local_dependencies(config)
+    if configured is None:
+        return None
+    queue_by_id = {
+        str(item.get("id")): item for item in profile.get("queues", [])
+        if isinstance(item, dict) and item.get("id") is not None
+    }
+    now = now or datetime.now(timezone.utc)
+    blockers = []
+    for dependency_id in configured:
+        dependency_queue = queue_by_id.get(dependency_id)
+        if dependency_queue is None:
+            raise ValueError(
+                "dispatch_gate.defer_while_queues_active содержит неизвестную "
+                f"очередь: {dependency_id}")
+        dependency_series = _series_for_queue(dependency_queue, series)
+        state = _local_dependency_state(dependency_series, now)
+        if state is not None:
+            blockers.append((dependency_id, state))
+    if not blockers:
+        return None
+    details = ", ".join(f"{queue_id} ({state})" for queue_id, state in blockers)
+    return {
+        "action": "defer",
+        "defer_for": config.get("defer_for", "10m"),
+        "reason": f"ожидание локальной очереди: {details}",
+        "profile_id": profile_id,
+        "queue_id": str(queue.get("id")),
+    }
+
+
+def _configured_local_dependencies(config: object) -> list[str] | None:
+    if not isinstance(config, dict):
+        return None
+    configured = config.get("defer_while_queues_active")
+    if configured is None:
+        return None
+    if (not isinstance(configured, list)
+            or any(not isinstance(item, str) or not item.strip()
+                   for item in configured)):
+        raise ValueError(
+            "dispatch_gate.defer_while_queues_active должен быть массивом id очередей")
+    return list(dict.fromkeys(item.strip() for item in configured))
+
+
+def _local_dependency_state(series: dict | None,
+                            now: datetime) -> str | None:
+    """Classify only states that should keep a local successor deferred."""
+    if not series or series.get("ended") or series.get("paused"):
+        return None
+    status = series.get("next_status")
+    if status == "running":
+        return "выполняется"
+    if status != "pending":
+        return None
+    not_before = _parse_time(series.get("next_not_before"))
+    if not_before is not None and not_before > now:
+        return "отложена бюджетом"
+    scheduled = _parse_time(series.get("next_run_at"))
+    if scheduled is None or scheduled <= now:
+        return "готова к запуску"
     return None
 
 
@@ -2158,8 +2236,9 @@ def _wake_configured_successors(profile: dict, queue: dict,
         str(item.get("id")): item for item in profile.get("queues", [])
         if isinstance(item, dict) and item.get("id") is not None
     }
+    configured_ids = list(dict.fromkeys(item.strip() for item in configured))
     woken = []
-    for queue_id in dict.fromkeys(item.strip() for item in configured):
+    for queue_id in _ordered_successor_ids(configured_ids, queue_by_id):
         target_queue = queue_by_id.get(queue_id)
         if target_queue is None:
             raise ValueError(
@@ -2180,6 +2259,38 @@ def _wake_configured_successors(profile: dict, queue: dict,
         if wake.get("accepted"):
             woken.append(queue_id)
     return woken
+
+
+def _ordered_successor_ids(configured: list[str],
+                           queue_by_id: dict[str, dict]) -> list[str]:
+    """Publish local predecessors before successors made ready together."""
+    configured_set = set(configured)
+    ordered = []
+    visiting = set()
+    visited = set()
+
+    def visit(queue_id: str) -> None:
+        if queue_id in visited:
+            return
+        if queue_id in visiting:
+            raise ValueError(
+                "dispatch_gate.defer_while_queues_active образует цикл "
+                f"для wake_after_success: {queue_id}")
+        visiting.add(queue_id)
+        target = queue_by_id.get(queue_id)
+        if target is not None:
+            dependencies = _configured_local_dependencies(
+                target.get("dispatch_gate")) or []
+            for dependency_id in dependencies:
+                if dependency_id in configured_set:
+                    visit(dependency_id)
+        visiting.remove(queue_id)
+        visited.add(queue_id)
+        ordered.append(queue_id)
+
+    for queue_id in configured:
+        visit(queue_id)
+    return ordered
 
 
 def after_task_completed(task, verdict: str | None) -> list[str]:

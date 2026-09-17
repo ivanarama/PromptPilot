@@ -947,13 +947,14 @@ def list_series() -> list:
                        GROUP BY series_id
                    )
                    SELECT 'active' AS kind, t.series_id, t.id, t.machine,
-                          t.scheduled_at, t.error
+                          t.scheduled_at, t.next_run_at, t.error
                    FROM tasks AS t
                    INNER JOIN picked ON picked.active_id = t.id
                    INNER JOIN task_series AS s ON s.id = t.series_id
                    UNION ALL
                    SELECT 'last' AS kind, t.series_id, t.id, t.machine,
-                          NULL AS scheduled_at, NULL AS error
+                          NULL AS scheduled_at, NULL AS next_run_at,
+                          NULL AS error
                    FROM tasks AS t
                    INNER JOIN picked ON picked.last_id = t.id
                    INNER JOIN task_series AS s ON s.id = t.series_id"""):
@@ -993,6 +994,7 @@ def list_series() -> list:
                 "next_task_id": active["id"] if active else None,
                 "next_status": active["status"] if active else None,
                 "next_run_at": active_detail["scheduled_at"] if active_detail else None,
+                "next_not_before": active_detail["next_run_at"] if active_detail else None,
                 "next_error": active_detail["error"] if active_detail else None,
                 "next_started_at": active["started_at"] if active else None,
                 "last_task_id": last["id"] if last else None,
