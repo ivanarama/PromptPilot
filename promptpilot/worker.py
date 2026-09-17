@@ -2310,9 +2310,21 @@ def _claim_next_task(busy_keys=(), busy_lane_ids=()):
             json.JSONDecodeError) as exc:
         print(f"  !! pipeline lane scheduler unavailable: {exc}", flush=True)
         policy = None
+    try:
+        budget_fairness = pipeline_insights.worker_budget_fairness_policy()
+    except (AttributeError, OSError, TypeError, ValueError,
+            json.JSONDecodeError) as exc:
+        print(f"  !! pipeline budget fairness unavailable: {exc}", flush=True)
+        budget_fairness = None
+    fairness_kwargs = ({
+        "budget_wait_scope": budget_fairness["scope"],
+        "budget_starvation_timeout_seconds": (
+            budget_fairness["starvation_timeout_seconds"]),
+    } if budget_fairness is not None else {})
     if policy is None:
         return db.get_next_runnable(
-            busy_keys=busy_keys, key_fn=lock_key), None
+            busy_keys=busy_keys, key_fn=lock_key,
+            **fairness_kwargs), None
 
     assignments = {}
 
@@ -2326,7 +2338,8 @@ def _claim_next_task(busy_keys=(), busy_lane_ids=()):
         return score
 
     task = db.get_next_runnable(
-        busy_keys=busy_keys, key_fn=lock_key, order_key_fn=rank)
+        busy_keys=busy_keys, key_fn=lock_key, order_key_fn=rank,
+        **fairness_kwargs)
     return task, assignments.get(task.id) if task is not None else None
 
 

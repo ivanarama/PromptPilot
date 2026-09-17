@@ -362,6 +362,12 @@ def _github_budget_policy(profile: dict) -> dict | None:
             raw, "busy_retry_seconds", 30, 5, 300),
         "unavailable_retry_seconds": _bounded_int(
             raw, "unavailable_retry_seconds", 300, 30, 3600),
+        # Opt in explicitly: once this deadline expires the oldest durable
+        # reservation waiter temporarily outranks new admissions, including
+        # priority 1.  Its own priority floor still applies, so fairness drains
+        # competing reservations without borrowing urgent-task headroom.
+        "starvation_timeout_seconds": _bounded_int(
+            raw, "starvation_timeout_seconds", 0, 0, 86400),
         # GitHub primary budgets belong to the authenticated account, not to a
         # repository/profile. Keep one scope per shared PromptPilot database so
         # profiles cannot accidentally opt out of each other's reservation.
@@ -373,6 +379,9 @@ def _with_shared_budget_floor(policy: dict) -> dict:
     """Use the strongest hard reserve of every profile sharing this account."""
     floor = dict(policy["minimum_remaining"])
     priority_one_headroom = dict(policy["priority_one_headroom"])
+    starvation_timeouts = []
+    if policy.get("starvation_timeout_seconds", 0) > 0:
+        starvation_timeouts.append(policy["starvation_timeout_seconds"])
     for configured_profile in _profiles().values():
         candidate = _github_budget_policy(configured_profile)
         if candidate is None or candidate["lease_scope"] != policy["lease_scope"]:
@@ -382,9 +391,16 @@ def _with_shared_budget_floor(policy: dict) -> dict:
         for resource, value in candidate["priority_one_headroom"].items():
             priority_one_headroom[resource] = max(
                 priority_one_headroom[resource], value)
+        if candidate.get("starvation_timeout_seconds", 0) > 0:
+            starvation_timeouts.append(
+                candidate["starvation_timeout_seconds"])
     selected = dict(policy)
     selected["minimum_remaining"] = floor
     selected["priority_one_headroom"] = priority_one_headroom
+    # The reservation ledger is account-wide. Every caller must therefore use
+    # one deterministic deadline; the tightest explicit bound wins.
+    selected["starvation_timeout_seconds"] = (
+        min(starvation_timeouts) if starvation_timeouts else 0)
     if any(priority_one_headroom.values()) and selected.get("costs") is None:
         raise ValueError(
             "общий github_budget.priority_one_headroom требует "
@@ -736,12 +752,49 @@ def _evaluate_github_budget(policy: dict, limits: dict | None, *,
     }
 
 
+def _budget_reservation_ledger(policy: dict, *, now: float | None = None) -> dict:
+    """Read the shared ledger, adding fairness options only when enabled."""
+    timeout = int(policy.get("starvation_timeout_seconds") or 0)
+    if not timeout:
+        return db.pipeline_github_budget_reservations(policy["lease_scope"])
+    return db.pipeline_github_budget_reservations(
+        policy["lease_scope"], starvation_timeout_seconds=timeout, now=now)
+
+
 def _priority_waiter_decision(
         policy: dict, limits: dict | None, reservations: dict, *,
-        priority: int | None, status_revision: int | None) -> dict | None:
-    """Yield to an already waiting or just-woken higher-priority task."""
+        priority: int | None, task_id: int | None,
+        status_revision: int | None) -> dict | None:
+    """Yield to priority normally, then to an aged oldest-waiter baton."""
     woken = reservations.get("woken_waiters") or {}
     waiting = reservations.get("waiting_waiters") or {}
+    fairness_waiter = (
+        reservations.get("fairness_waiter")
+        or waiting.get("fairness_waiter"))
+    if isinstance(fairness_waiter, dict):
+        fair_task_id = fairness_waiter.get("task_id")
+        if type(fair_task_id) is int and fair_task_id == task_id:
+            # Aging affects ordering only. The selected task proceeds with its
+            # unchanged admission priority and hard/headroom floor.
+            return None
+        now = time.time()
+        decision = _budget_denied(
+            policy, state="fairness_waiter",
+            reason=(
+                "GitHub API-бюджет передан самой старой ожидающей задаче "
+                f"#{fair_task_id} после {fairness_waiter.get('wait_seconds', 0)} с "
+                "ожидания; новые резервы временно приостановлены"),
+            now=now, limits=limits,
+            defer_at=now + policy["busy_retry_seconds"],
+            status_revision=status_revision,
+            reserved_other=reservations.get("totals"),
+            active_reservations=int(reservations.get("count") or 0),
+        )
+        decision["fairness_waiter"] = copy.deepcopy(fairness_waiter)
+        revision = reservations.get("revision")
+        if type(revision) is int and revision >= 0:
+            decision["_budget_reservation_revision"] = revision
+        return decision
     priorities = [
         value for value in (
             woken.get("min_priority"), waiting.get("min_priority"))
@@ -775,7 +828,7 @@ def _arm_budget_waiter(task, decision: dict) -> dict:
     state = decision.get("state")
     if state not in {
             "budget_in_flight", "ledger_changed", "priority_waiter",
-            "scan_in_progress"}:
+            "fairness_waiter", "scan_in_progress"}:
         return decision
     scope = decision.get("lease_scope")
     revision = decision.get("_budget_reservation_revision")
@@ -831,11 +884,14 @@ def _github_scan_admission(profile: dict, purpose: str,
             "unavailable_retry_seconds": 300,
             "lease_scope": _GITHUB_SCAN_LEASE_SCOPE,
         }
-        yield _budget_denied(
+        decision = _budget_denied(
             fallback, state="invalid_config",
             reason=f"Некорректный github_budget: {exc}", now=now)
+        _clear_budget_waiter_after_denial(task)
+        yield decision
         return
     if policy is None:
+        _clear_budget_waiter_after_denial(task)
         yield {"enabled": False, "allowed": True, "state": "legacy"}
         return
 
@@ -844,9 +900,11 @@ def _github_scan_admission(profile: dict, purpose: str,
         acquired = db.acquire_pipeline_scan_lease(
             policy["lease_scope"], token, policy["lease_seconds"], now=now)
     except Exception as exc:
-        yield _budget_denied(
+        decision = _budget_denied(
             policy, state="lease_unavailable",
             reason=f"SQLite lease GitHub-сканирования недоступна: {exc}", now=now)
+        _clear_budget_waiter_after_denial(task)
+        yield decision
         return
     if not acquired.get("acquired"):
         status_revision = acquired.get("status_revision")
@@ -878,6 +936,10 @@ def _github_scan_admission(profile: dict, purpose: str,
                     status_revision=(
                         status_revision
                         if isinstance(status_revision, int) else None))
+        if decision.get("state") not in {
+                "budget_in_flight", "ledger_changed", "priority_waiter",
+                "fairness_waiter", "scan_in_progress"}:
+            _clear_budget_waiter_after_denial(task)
         yield decision
         return
 
@@ -899,6 +961,8 @@ def _github_scan_admission(profile: dict, purpose: str,
             except _GitHubRateLimitUnavailable as exc:
                 decision = _rate_limit_failure_decision(
                     profile, exc, status_revision=lease.status_revision)
+                if task is not None:
+                    _clear_budget_waiter_after_denial(task)
                 decision["_lease"] = lease
                 yield decision
                 return
@@ -909,8 +973,7 @@ def _github_scan_admission(profile: dict, purpose: str,
                     status_revision=lease.status_revision)
             else:
                 try:
-                    reservations = db.pipeline_github_budget_reservations(
-                        policy["lease_scope"])
+                    reservations = _budget_reservation_ledger(policy)
                 except Exception as exc:
                     decision = _budget_denied(
                         policy, state="ledger_unavailable",
@@ -924,6 +987,7 @@ def _github_scan_admission(profile: dict, purpose: str,
                     decision = _priority_waiter_decision(
                         policy, limits, reservations,
                         priority=admission_priority,
+                        task_id=getattr(task, "id", None),
                         status_revision=lease.status_revision)
                     if decision is None:
                         decision = _evaluate_github_budget(
@@ -942,6 +1006,11 @@ def _github_scan_admission(profile: dict, purpose: str,
             decision = _lease_failure_decision(
                 profile, f"GitHub budget admission не выполнен: {exc}",
                 status_revision=lease.status_revision, unavailable=True)
+        if (task is not None and not decision.get("allowed")
+                and decision.get("state") not in {
+                    "budget_in_flight", "ledger_changed", "priority_waiter",
+                    "fairness_waiter", "scan_in_progress"}):
+            _clear_budget_waiter_after_admission(task)
         decision["_lease"] = lease
         yield decision
     finally:
@@ -1007,6 +1076,11 @@ def _reservation_denied(policy: dict, limits: dict | None, result: dict, *,
         state = "priority_waiter"
         reason = str(result.get("reason") or
                      "GitHub budget yielded to a higher-priority waiter")
+    elif result.get("state") == "fairness_waiter":
+        defer_at = now + policy["busy_retry_seconds"]
+        state = "fairness_waiter"
+        reason = str(result.get("reason") or
+                     "GitHub budget yielded to the oldest aged waiter")
     elif blocked:
         live_blocked = [item for item in blocked
                         if item.get("blocked_by") == "live"]
@@ -1040,7 +1114,34 @@ def _reservation_denied(policy: dict, limits: dict | None, result: dict, *,
     revision = result.get("revision")
     if type(revision) is int and revision >= 0:
         decision["_budget_reservation_revision"] = revision
+    if isinstance(result.get("fairness_waiter"), dict):
+        decision["fairness_waiter"] = copy.deepcopy(
+            result["fairness_waiter"])
     return decision
+
+
+def _clear_budget_waiter_after_admission(task) -> None:
+    """Settle a durable handoff when no in-flight reservation will do it."""
+    task_id = getattr(task, "id", None)
+    started_at = getattr(task, "started_at", None)
+    # Synthetic/read-only callers cannot own a durable marker. Real worker
+    # attempts always carry both values and are fenced before provider launch.
+    if type(task_id) is not int or task_id <= 0 or started_at is None:
+        return
+    if not db.clear_pipeline_github_budget_waiter(
+            task_id=task_id, task_started_at=started_at):
+        raise ValueError(
+            "running task attempt changed before GitHub budget waiter clear")
+
+
+def _clear_budget_waiter_after_denial(task) -> None:
+    """Best-effort cleanup for a denial that will not preserve a handoff."""
+    try:
+        _clear_budget_waiter_after_admission(task)
+    except (sqlite3.Error, TypeError, ValueError):
+        # The denial remains fail-closed. If SQLite itself is unavailable the
+        # worker defer/terminal path will retry cleanup once storage recovers.
+        pass
 
 
 def _reserve_execution_admission(
@@ -1058,6 +1159,7 @@ def _reserve_execution_admission(
     try:
         policy = _github_budget_policy(profile)
         if policy is None:
+            _clear_budget_waiter_after_admission(task)
             return admission
         policy = _with_shared_budget_floor(policy)
         policy = _budget_policy_for_route(policy, budget_route)
@@ -1066,6 +1168,7 @@ def _reserve_execution_admission(
         if not policy.get("cost_accounting"):
             # Profiles without route costs keep the original one-shot floor
             # admission; they neither re-read limits nor create reservations.
+            _clear_budget_waiter_after_admission(task)
             return admission
         if not isinstance(lease, _GitHubScanLease):
             raise _GitHubScanLeaseLost(
@@ -1087,11 +1190,11 @@ def _reserve_execution_admission(
                 policy, limits, now=time.time(),
                 status_revision=lease.status_revision)
         elif not retain_budget:
-            reservations = db.pipeline_github_budget_reservations(
-                policy["lease_scope"])
+            reservations = _budget_reservation_ledger(policy)
             decision = _priority_waiter_decision(
                 policy, limits, reservations,
                 priority=effective_priority,
+                task_id=getattr(task, "id", None),
                 status_revision=lease.status_revision)
             if decision is None:
                 decision = _evaluate_github_budget(
@@ -1114,6 +1217,8 @@ def _reserve_execution_admission(
                 queue_id=str(queue.get("id") or ""), route=budget_route,
                 cost=policy["requested_cost"], limits=limits,
                 minimum_remaining=policy["minimum_remaining"],
+                starvation_timeout_seconds=policy.get(
+                    "starvation_timeout_seconds", 0),
                 scan_lease_guard=lease.guard,
                 expected_revision=expected_revision)
             if not reserved.get("allowed"):
@@ -1146,6 +1251,8 @@ def _reserve_execution_admission(
                         _GitHubBudgetReservation(
                             policy["lease_scope"], token, task_id, started_at)
         decision = _arm_budget_waiter(task, decision)
+        if decision.get("allowed") and not retain_budget:
+            _clear_budget_waiter_after_admission(task)
     except _GitHubScanLeaseFailure as exc:
         decision = _lease_exception_decision(
             profile, exc,
@@ -1168,6 +1275,10 @@ def _reserve_execution_admission(
             now=time.time(),
             status_revision=(lease.status_revision
                              if isinstance(lease, _GitHubScanLease) else None))
+    if (not decision.get("allowed") and decision.get("state") not in {
+            "budget_in_flight", "ledger_changed", "priority_waiter",
+            "fairness_waiter", "scan_in_progress"}):
+        _clear_budget_waiter_after_denial(task)
     decision["_lease"] = lease
     admission.clear()
     admission.update(decision)
@@ -2254,7 +2365,43 @@ def worker_lane_policy() -> dict | None:
                 raise ValueError(
                     f"очередь {profile_id}/{queue_id} настроена на {replicas} "
                     f"реплики, но доступна только в {eligible} scheduler lanes")
+    if lanes:
+        fairness_enabled = any(
+            (budget := _github_budget_policy(profile)) is not None
+            and budget.get("starvation_timeout_seconds", 0) > 0
+            for profile in profiles.values()
+        )
+        if fairness_enabled and not any(lane["borrow"] for lane in lanes):
+            raise ValueError(
+                "scheduler with GitHub budget fairness requires at least one "
+                "borrow:true recovery lane")
     return {"profiles": profiles, "lanes": lanes} if lanes else None
+
+
+def worker_budget_fairness_policy() -> dict | None:
+    """Return the shared opt-in claim policy without touching GitHub.
+
+    Admission fairness is ineffective if the selected task cannot win a local
+    worker slot.  Every profile shares the authenticated account's ledger, so
+    the shortest positive configured timeout is also used by the scheduler.
+    """
+    timeouts = []
+    scope = None
+    for profile in _profiles().values():
+        policy = _github_budget_policy(profile)
+        if policy is None or policy.get("starvation_timeout_seconds", 0) <= 0:
+            continue
+        timeouts.append(policy["starvation_timeout_seconds"])
+        scope = policy["lease_scope"] if scope is None else scope
+        if scope != policy["lease_scope"]:
+            raise ValueError(
+                "GitHub budget fairness profiles must share one lease scope")
+    if not timeouts:
+        return None
+    return {
+        "scope": scope,
+        "starvation_timeout_seconds": min(timeouts),
+    }
 
 
 def worker_lane_rank(task, policy: dict, busy_lane_ids=()) -> tuple[tuple, str] | None:
@@ -2684,6 +2831,7 @@ def _budget_defer_route(admission: dict, profile_id: str, profile: dict,
     reservation_handoff = (
         admission.get("state") in {
             "budget_in_flight", "ledger_changed", "priority_waiter",
+            "fairness_waiter",
             "scan_in_progress"}
         and type(reservation_revision) is int
         and reservation_revision >= 0
@@ -2694,7 +2842,8 @@ def _budget_defer_route(admission: dict, profile_id: str, profile: dict,
             reservation_handoff
             and admission.get("state") == "budget_in_flight")
         else "retry" if admission.get("state") in {
-            "ledger_changed", "priority_waiter", "scan_in_progress"}
+            "ledger_changed", "priority_waiter", "fairness_waiter",
+            "scan_in_progress"}
         else "hard_not_before")
     result = {
         "action": "defer", "mode": mode,
@@ -2723,6 +2872,10 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
     """
     matched = _matching_queue(task)
     if matched is None:
+        # A profile/series marker may have been renamed while this exact
+        # attempt was waiting. It is now a legacy prompt path with no final
+        # budget reservation to settle the old shared-scope baton.
+        _clear_budget_waiter_after_admission(task)
         return {"action": "prompt", "mode": "skill", "prompt": fallback_prompt}
     profile_id, profile, queue = matched
     try:
@@ -4001,8 +4154,7 @@ def _with_live_github_budget_state(result: dict, profile: dict) -> dict:
     reservations = None
     ledger_reason = None
     try:
-        reservations = db.pipeline_github_budget_reservations(
-            policy["lease_scope"])
+        reservations = _budget_reservation_ledger(policy, now=now)
     except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
         ledger_reason = str(exc)
 
@@ -4057,6 +4209,10 @@ def _with_live_github_budget_state(result: dict, profile: dict) -> dict:
             route = str(item.get("route") or "unknown")
             route_counts[route] = route_counts.get(route, 0) + 1
         budget["reservation_routes"] = route_counts
+        budget["waiting_waiters"] = copy.deepcopy(
+            reservations.get("waiting_waiters") or {})
+        budget["fairness_waiter"] = copy.deepcopy(
+            reservations.get("fairness_waiter"))
         if snapshot is not None:
             effective_after = decision["effective_after"]
             budget["spendable_before_route"] = {
