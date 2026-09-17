@@ -319,6 +319,12 @@ def _github_budget_policy(profile: dict) -> dict | None:
     minimum_remaining = _minimum_remaining(
         raw.get("minimum_remaining", {}), "minimum_remaining",
         _DEFAULT_GITHUB_BUDGET_MINIMUM)
+    priority_one_headroom_raw = raw.get("priority_one_headroom")
+    priority_one_headroom = (
+        {resource: 0 for resource in _DEFAULT_GITHUB_BUDGET_MINIMUM}
+        if priority_one_headroom_raw is None else
+        _strict_budget_vector(
+            priority_one_headroom_raw, "priority_one_headroom"))
     configured_costs = raw.get("costs")
     costs = None
     if configured_costs is not None:
@@ -341,9 +347,13 @@ def _github_budget_policy(profile: dict) -> dict | None:
                 configured_costs[route], f"costs.{route}")
             for route in _GITHUB_BUDGET_ROUTES
         }
+    if any(priority_one_headroom.values()) and costs is None:
+        raise ValueError(
+            "github_budget.priority_one_headroom требует github_budget.costs")
 
     return {
         "minimum_remaining": minimum_remaining,
+        "priority_one_headroom": priority_one_headroom,
         "costs": costs,
         "reset_grace_seconds": _bounded_int(
             raw, "reset_grace_seconds", 60, 0, 3600),
@@ -362,14 +372,54 @@ def _github_budget_policy(profile: dict) -> dict | None:
 def _with_shared_budget_floor(policy: dict) -> dict:
     """Use the strongest hard reserve of every profile sharing this account."""
     floor = dict(policy["minimum_remaining"])
+    priority_one_headroom = dict(policy["priority_one_headroom"])
     for configured_profile in _profiles().values():
         candidate = _github_budget_policy(configured_profile)
         if candidate is None or candidate["lease_scope"] != policy["lease_scope"]:
             continue
         for resource, value in candidate["minimum_remaining"].items():
             floor[resource] = max(floor[resource], value)
+        for resource, value in candidate["priority_one_headroom"].items():
+            priority_one_headroom[resource] = max(
+                priority_one_headroom[resource], value)
     selected = dict(policy)
     selected["minimum_remaining"] = floor
+    selected["priority_one_headroom"] = priority_one_headroom
+    if any(priority_one_headroom.values()) and selected.get("costs") is None:
+        raise ValueError(
+            "общий github_budget.priority_one_headroom требует "
+            "github_budget.costs в каждом профиле с тем же GitHub token")
+    return selected
+
+
+def _budget_policy_for_admission_priority(policy: dict,
+                                          priority: int | None) -> dict:
+    """Keep configured quota headroom available to priority-1 work.
+
+    The headroom is added to the ordinary hard floor only for lower-priority
+    attempts. Priority 1 can consume it, while every other priority leaves it
+    available for a MERGE or another urgent wake-up that appears later.
+    """
+    selected = dict(policy)
+    headroom = dict(policy.get("priority_one_headroom") or {
+        resource: 0 for resource in policy["minimum_remaining"]})
+    selected["priority_one_headroom"] = headroom
+    selected["base_minimum_remaining"] = dict(policy["minimum_remaining"])
+    selected["priority_headroom_applied"] = False
+    selected["admission_priority"] = None
+    if not any(headroom.values()):
+        return selected
+    if type(priority) is not int or not 1 <= priority <= 10:
+        raise ValueError(
+            "admission priority is unavailable for GitHub priority headroom")
+    selected["admission_priority"] = priority
+    if priority == 1:
+        return selected
+    selected["minimum_remaining"] = {
+        resource: policy["minimum_remaining"][resource] + headroom[resource]
+        for resource in policy["minimum_remaining"]
+    }
+    selected["priority_headroom_applied"] = True
     return selected
 
 
@@ -420,6 +470,20 @@ def _projected_post_reservation(
     return projected
 
 
+def _priority_budget_metadata(policy: dict) -> dict:
+    resources = policy["minimum_remaining"]
+    base = policy.get("base_minimum_remaining") or resources
+    headroom = policy.get("priority_one_headroom") or {
+        resource: 0 for resource in resources}
+    return {
+        "base_minimum_remaining": dict(base),
+        "priority_one_headroom": dict(headroom),
+        "priority_headroom_applied": bool(
+            policy.get("priority_headroom_applied")),
+        "admission_priority": policy.get("admission_priority"),
+    }
+
+
 def _budget_blocked_summary(item: dict, active_reservations: int) -> str:
     """Explain signed admission arithmetic without implying a GitHub value."""
     actual_remaining = item.get(
@@ -460,6 +524,7 @@ def _budget_denied(policy: dict, *, state: str, reason: str,
         "lease_scope": policy["lease_scope"],
         "budget_route": policy.get("budget_route"),
         "status_revision": status_revision,
+        **_priority_budget_metadata(policy),
     }
 
 
@@ -627,13 +692,14 @@ def _evaluate_github_budget(policy: dict, limits: dict | None, *,
         "blocked_resources": [], "lease_scope": policy["lease_scope"],
         "budget_route": policy.get("budget_route"),
         "status_revision": status_revision,
+        **_priority_budget_metadata(policy),
     }
 
 
 @contextmanager
 def _github_scan_admission(profile: dict, purpose: str,
                            *, profile_id: str | None = None,
-                           budget_route: str | None = None):
+                           budget_route: str | None = None, task=None):
     """Admit one expensive scan and hold its cross-process reservation."""
     now = time.time()
     try:
@@ -641,6 +707,13 @@ def _github_scan_admission(profile: dict, purpose: str,
         if policy is not None:
             policy = _with_shared_budget_floor(policy)
             policy = _budget_policy_for_route(policy, budget_route)
+            if task is not None:
+                policy = _budget_policy_for_admission_priority(
+                    policy, getattr(task, "priority", None))
+            elif budget_route == "insights":
+                # Full queue refreshes are useful but never more urgent than
+                # an already queued P1 integration task.
+                policy = _budget_policy_for_admission_priority(policy, 10)
     except (TypeError, ValueError) as exc:
         fallback = {
             "minimum_remaining": dict(_DEFAULT_GITHUB_BUDGET_MINIMUM),
@@ -832,6 +905,8 @@ def _reserve_execution_admission(
             return admission
         policy = _with_shared_budget_floor(policy)
         policy = _budget_policy_for_route(policy, budget_route)
+        policy = _budget_policy_for_admission_priority(
+            policy, getattr(task, "priority", None))
         if not policy.get("cost_accounting"):
             # Profiles without route costs keep the original one-shot floor
             # admission; they neither re-read limits nor create reservations.
@@ -2522,7 +2597,8 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
             }
         with _github_scan_admission(
                 profile, f"pipeline task {profile_id}/{queue.get('id')}",
-                profile_id=profile_id, budget_route="skill") as admission:
+                profile_id=profile_id, budget_route="skill",
+                task=task) as admission:
             if not admission.get("allowed"):
                 return _budget_defer_route(
                     admission, profile_id, profile, queue, mode="skill")
@@ -2553,7 +2629,8 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
             }
         with _github_scan_admission(
                 profile, f"pipeline task {profile_id}/{queue.get('id')}",
-                profile_id=profile_id, budget_route="skill") as admission:
+                profile_id=profile_id, budget_route="skill",
+                task=task) as admission:
             if not admission.get("allowed"):
                 return _budget_defer_route(
                     admission, profile_id, profile, queue, mode="skill")
@@ -2572,7 +2649,8 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
     command = _tool_command(execution, stage)
     with _github_scan_admission(
             profile, f"pipeline preflight {profile_id}/{stage}",
-            profile_id=profile_id, budget_route="tool_preflight") as admission:
+            profile_id=profile_id, budget_route="tool_preflight",
+            task=task) as admission:
         if not admission.get("allowed"):
             return _budget_defer_route(
                 admission, profile_id, profile, queue)
