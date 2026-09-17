@@ -574,6 +574,9 @@ def test_legacy_budget_without_costs_keeps_floor_check_but_never_reserves(
             "count": 0,
             "totals": {"core": 0, "search": 0, "graphql": 0},
             "items": [],
+            "revision": 0,
+            "woken_waiters": {"count": 0, "min_priority": None},
+            "waiting_waiters": {"count": 0, "min_priority": None},
         }
 
 
@@ -719,6 +722,9 @@ def test_reservation_contention_retries_quickly_but_live_low_waits_for_reset(
     assert contention["action"] == "defer"
     assert contention["github_budget"]["state"] == "budget_in_flight"
     assert contention["github_budget"]["active_reservations"] == 1
+    assert contention["defer_policy"] == "reservation_release"
+    assert contention["budget_wait_scope"] == "github-default"
+    assert type(contention["budget_wait_revision"]) is int
     assert timedelta(0) < contention_until - before <= timedelta(seconds=10)
 
     assert isolated_db.release_pipeline_github_budget(
@@ -730,6 +736,8 @@ def test_reservation_contention_retries_quickly_but_live_low_waits_for_reset(
 
     assert genuinely_low["action"] == "defer"
     assert genuinely_low["github_budget"]["state"] == "low"
+    assert genuinely_low["defer_policy"] == "hard_not_before"
+    assert "budget_wait_scope" not in genuinely_low
     assert genuinely_low["defer_until"] == datetime.fromtimestamp(
         reset + 17, timezone.utc).isoformat()
     assert isolated_db.pipeline_github_budget_reservations(
@@ -1543,6 +1551,664 @@ def test_worker_uses_exact_budget_defer_without_loading_provider(
     assert deferred.scheduled_at == target
     assert deferred.next_run_at == target
     assert deferred.error == reason
+
+
+def test_budget_reservation_release_wakes_deferred_worker_immediately(
+        isolated_db, monkeypatch):
+    owner = _running_task(isolated_db, "Budget owner")
+    assert _reserve(
+        isolated_db, owner, "wake-owner", core=500,
+        remaining=1000)["allowed"] is True
+    created = isolated_db.create_task(TaskCreate(
+        prompt="Example - REVIEW", recurrence="4h", priority=2))
+    waiter = isolated_db.get_next_runnable()
+    assert waiter is not None and waiter.id == created.id
+    revision = isolated_db.pipeline_github_budget_reservations(
+        "github-default")["revision"]
+    target = datetime.now(timezone.utc) + timedelta(minutes=7)
+    reason = "GitHub API budget is temporarily reserved by another task"
+    monkeypatch.setattr(pipeline_insights, "dispatch_gate", lambda _task: None)
+    monkeypatch.setattr(
+        pipeline_insights, "execution_route", lambda *_args, **_kwargs: {
+            "action": "defer", "mode": "skill", "reason": reason,
+            "defer_until": target.isoformat(),
+            "defer_policy": "reservation_release",
+            "budget_wait_scope": "github-default",
+            "budget_wait_revision": revision,
+        })
+    monkeypatch.setattr(
+        worker, "load_providers",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("deferred task loaded a provider")))
+
+    worker._execute_task_inner(waiter)
+
+    deferred = isolated_db.get_task(created.id)
+    assert deferred.status.value == "pending"
+    assert deferred.scheduled_at == target
+    assert deferred.next_run_at is None
+    with isolated_db._connect() as conn:
+        stored = conn.execute(
+            "SELECT budget_wait_scope FROM tasks WHERE id = ?",
+            (created.id,),
+        ).fetchone()
+    assert stored["budget_wait_scope"] == "github-default"
+
+    released_at = datetime.now(timezone.utc)
+    assert isolated_db.release_pipeline_github_budget(
+        "github-default", token="wake-owner", task_id=owner.id,
+        task_started_at=owner.started_at) is True
+
+    woken = isolated_db.get_task(created.id)
+    assert woken.scheduled_at >= released_at
+    assert woken.scheduled_at <= datetime.now(timezone.utc)
+    assert woken.next_run_at is None
+    with isolated_db._connect() as conn:
+        stored = conn.execute(
+            "SELECT budget_wait_scope FROM tasks WHERE id = ?",
+            (created.id,),
+        ).fetchone()
+    assert stored["budget_wait_scope"] == "github-default"
+
+
+def test_worker_preserves_budget_handoff_for_soft_retry(
+        isolated_db, monkeypatch):
+    created = isolated_db.create_task(TaskCreate(
+        prompt="Example - REVIEW", recurrence="4h", priority=2))
+    task = isolated_db.get_next_runnable()
+    revision = isolated_db.pipeline_github_budget_reservations(
+        "github-default")["revision"]
+    target = datetime.now(timezone.utc) + timedelta(seconds=5)
+    monkeypatch.setattr(pipeline_insights, "dispatch_gate", lambda _task: None)
+    monkeypatch.setattr(
+        pipeline_insights, "execution_route", lambda *_args, **_kwargs: {
+            "action": "defer", "mode": "skill", "reason": "ordered retry",
+            "defer_until": target.isoformat(), "defer_policy": "retry",
+            "budget_wait_scope": "github-default",
+            "budget_wait_revision": revision,
+        })
+    monkeypatch.setattr(
+        worker, "load_providers",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("deferred task loaded a provider")))
+
+    worker._execute_task_inner(task)
+
+    deferred = isolated_db.get_task(created.id)
+    assert deferred.status.value == "pending"
+    assert target <= deferred.scheduled_at <= target + timedelta(seconds=1)
+    with isolated_db._connect() as conn:
+        stored = conn.execute(
+            "SELECT budget_wait_scope FROM tasks WHERE id = ?",
+            (created.id,),
+        ).fetchone()
+    assert stored["budget_wait_scope"] == "github-default"
+
+
+def test_release_before_defer_cannot_lose_the_only_budget_wake(
+        isolated_db, monkeypatch):
+    owner = _running_task(isolated_db, "Budget owner")
+    assert _reserve(
+        isolated_db, owner, "racing-owner", core=500,
+        remaining=1000)["allowed"] is True
+    observed_revision = isolated_db.pipeline_github_budget_reservations(
+        "github-default")["revision"]
+    created = isolated_db.create_task(TaskCreate(
+        prompt="Example - REVIEW", recurrence="4h", priority=2))
+    waiter = isolated_db.get_next_runnable()
+    assert waiter is not None and waiter.id == created.id
+
+    # The owner finishes after admission observed contention but before the
+    # worker persists its defer. No waiter existed at release time.
+    assert isolated_db.release_pipeline_github_budget(
+        "github-default", token="racing-owner", task_id=owner.id,
+        task_started_at=owner.started_at) is True
+    target = datetime.now(timezone.utc) + timedelta(minutes=7)
+    monkeypatch.setattr(pipeline_insights, "dispatch_gate", lambda _task: None)
+    monkeypatch.setattr(
+        pipeline_insights, "execution_route", lambda *_args, **_kwargs: {
+            "action": "defer", "mode": "skill", "reason": "contention",
+            "defer_until": target.isoformat(),
+            "defer_policy": "reservation_release",
+            "budget_wait_scope": "github-default",
+            "budget_wait_revision": observed_revision,
+        })
+    monkeypatch.setattr(
+        worker, "load_providers",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("deferred task loaded a provider")))
+
+    before = datetime.now(timezone.utc)
+    worker._execute_task_inner(waiter)
+
+    woken = isolated_db.get_task(created.id)
+    assert woken.status.value == "pending"
+    assert before <= woken.scheduled_at <= datetime.now(timezone.utc)
+    assert woken.next_run_at is None
+    with isolated_db._connect() as conn:
+        stored = conn.execute(
+            "SELECT budget_wait_scope FROM tasks WHERE id = ?",
+            (created.id,),
+        ).fetchone()
+    assert stored["budget_wait_scope"] == "github-default"
+
+
+def test_budget_wait_revision_closes_release_and_reacquire_aba(isolated_db):
+    owner_a = _running_task(isolated_db, "Budget owner A")
+    owner_b = _running_task(isolated_db, "Budget owner B")
+    waiter = _running_task(isolated_db, "Example - REVIEW")
+    first = _reserve(
+        isolated_db, owner_a, "aba-owner-a", core=200, remaining=1000)
+    assert first["allowed"] is True
+    assert first["revision"] == 1
+
+    assert isolated_db.release_pipeline_github_budget(
+        "github-default", token="aba-owner-a", task_id=owner_a.id,
+        task_started_at=owner_a.started_at) is True
+    assert isolated_db.pipeline_github_budget_reservations(
+        "github-default")["revision"] == 2
+    second = _reserve(
+        isolated_db, owner_b, "aba-owner-b", core=200, remaining=1000)
+    assert second["allowed"] is True
+    assert second["revision"] == 3
+
+    before = datetime.now(timezone.utc)
+    assert isolated_db.defer_task(
+        waiter.id, before + timedelta(minutes=7), "stale contention",
+        budget_wait_scope="github-default",
+        budget_wait_revision=first["revision"],
+        expected_started_at=waiter.started_at) is True
+
+    retried = isolated_db.get_task(waiter.id)
+    assert before <= retried.scheduled_at <= datetime.now(timezone.utc)
+    with isolated_db._connect() as conn:
+        stored = conn.execute(
+            "SELECT budget_wait_scope FROM tasks WHERE id = ?",
+            (waiter.id,),
+        ).fetchone()
+    assert stored["budget_wait_scope"] == "github-default"
+
+
+def test_released_budget_handoff_survives_claim_until_waiter_reserves(
+        isolated_db):
+    owner = _running_task(isolated_db, "Budget owner")
+    reserved = _reserve(
+        isolated_db, owner, "handoff-owner", core=500, remaining=1000)
+    assert reserved["allowed"] is True
+    isolated_db.create_task(TaskCreate(
+        prompt="Example - REVIEW", recurrence="4h", priority=2))
+    waiter = isolated_db.get_next_runnable()
+    assert isolated_db.defer_task(
+        waiter.id, datetime.now(timezone.utc) + timedelta(minutes=7),
+        "waiting for owner", budget_wait_scope="github-default",
+        budget_wait_revision=reserved["revision"],
+        expected_started_at=waiter.started_at) is True
+    low_created = isolated_db.create_task(TaskCreate(
+        prompt="Example - TAIL", recurrence="4h", priority=5))
+    low = isolated_db.get_next_runnable()
+    assert low is not None and low.id == low_created.id
+
+    assert isolated_db.release_pipeline_github_budget(
+        "github-default", token="handoff-owner", task_id=owner.id,
+        task_started_at=owner.started_at) is True
+    claimed_waiter = isolated_db.get_next_runnable()
+    assert claimed_waiter is not None and claimed_waiter.id == waiter.id
+
+    denied = _reserve(
+        isolated_db, low, "lower-after-release", core=200, remaining=1000)
+    assert denied["allowed"] is False
+    assert denied["state"] == "priority_waiter"
+
+    admitted = _reserve(
+        isolated_db, claimed_waiter, "waiter-after-release",
+        core=200, remaining=1000)
+    assert admitted["allowed"] is True
+    with isolated_db._connect() as conn:
+        stored = conn.execute(
+            "SELECT budget_wait_scope FROM tasks WHERE id = ?",
+            (waiter.id,),
+        ).fetchone()
+    assert stored["budget_wait_scope"] is None
+
+
+def test_initial_budget_denial_arms_handoff_before_worker_defer(
+        isolated_db, monkeypatch):
+    execution = {"mode": "auto", "command": ["pipeline-tool"]}
+    profile = _profile_with_costs(execution=execution, core=200)
+    monkeypatch.setattr(
+        pipeline_insights, "_profiles", lambda: {"example": profile})
+    monkeypatch.setattr(
+        pipeline_insights, "_github_rate_limits", lambda: _limits(core=1000))
+    monkeypatch.setattr(
+        pipeline_insights, "_tool_available",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("budget-denied task reached project preflight")))
+
+    owner = _running_task(isolated_db, "Budget owner")
+    assert _reserve(
+        isolated_db, owner, "arm-owner", core=800,
+        remaining=1000)["allowed"] is True
+    isolated_db.create_task(TaskCreate(
+        prompt="Example - REVIEW", recurrence="4h", priority=2))
+    waiter = isolated_db.get_next_runnable()
+
+    route = pipeline_insights.execution_route(
+        waiter, waiter.prompt, retain_budget=True)
+
+    assert route["action"] == "defer"
+    assert route["defer_policy"] == "reservation_release"
+    with isolated_db._connect() as conn:
+        stored = conn.execute(
+            "SELECT budget_wait_scope FROM tasks WHERE id = ?",
+            (waiter.id,),
+        ).fetchone()
+    assert stored["budget_wait_scope"] == "github-default"
+
+    low = _running_task(isolated_db, "Example - TAIL")
+    assert isolated_db.release_pipeline_github_budget(
+        "github-default", token="arm-owner", task_id=owner.id,
+        task_started_at=owner.started_at) is True
+    denied = _reserve(
+        isolated_db, low, "lower-before-waiter-defer",
+        core=200, remaining=1000)
+    assert denied["allowed"] is False
+    assert denied["state"] == "priority_waiter"
+
+
+def test_explicit_reschedule_releases_budget_priority_handoff(isolated_db):
+    waiter = _running_task(isolated_db, "Example - REVIEW")
+    revision = isolated_db.pipeline_github_budget_reservations(
+        "github-default")["revision"]
+    assert isolated_db.defer_task(
+        waiter.id, datetime.now(timezone.utc) + timedelta(minutes=7),
+        "waiting for owner", budget_wait_scope="github-default",
+        budget_wait_revision=revision,
+        expected_started_at=waiter.started_at) is True
+
+    assert isolated_db.update_task_fields(
+        waiter.id,
+        {"scheduled_at": datetime.now(timezone.utc) + timedelta(hours=3)}) is True
+
+    with isolated_db._connect() as conn:
+        stored = conn.execute(
+            "SELECT budget_wait_scope FROM tasks WHERE id = ?",
+            (waiter.id,),
+        ).fetchone()
+    assert stored["budget_wait_scope"] is None
+
+
+def test_stale_prune_yields_to_woken_higher_priority_waiter(isolated_db):
+    owner = _running_task(isolated_db, "Crashed budget owner")
+    reserved = _reserve(
+        isolated_db, owner, "stale-owner", core=500, remaining=1000)
+    assert reserved["allowed"] is True
+    isolated_db.create_task(TaskCreate(
+        prompt="Example - REVIEW", recurrence="4h", priority=2))
+    waiter = isolated_db.get_next_runnable()
+    assert isolated_db.defer_task(
+        waiter.id, datetime.now(timezone.utc) + timedelta(minutes=7),
+        "waiting for stale owner", budget_wait_scope="github-default",
+        budget_wait_revision=reserved["revision"],
+        expected_started_at=waiter.started_at) is True
+    low_created = isolated_db.create_task(TaskCreate(
+        prompt="Example - TAIL", recurrence="4h", priority=5))
+    low = isolated_db.get_next_runnable()
+    assert low is not None and low.id == low_created.id
+
+    # Simulate terminal state committed before explicit reservation cleanup.
+    assert isolated_db.mark_completed(
+        owner.id, "done", expected_started_at=owner.started_at) is True
+    denied = _reserve(
+        isolated_db, low, "lower-priority", core=200, remaining=1000)
+
+    assert denied["allowed"] is False
+    assert denied["state"] == "priority_waiter"
+    assert isolated_db.pipeline_github_budget_reservations(
+        "github-default")["count"] == 0
+    woken = isolated_db.get_task(waiter.id)
+    assert woken.scheduled_at <= datetime.now(timezone.utc)
+    assert woken.next_run_at is None
+
+
+def test_execution_route_yields_when_initial_scan_wakes_priority_waiter(
+        isolated_db, monkeypatch):
+    execution = {"mode": "auto", "command": ["pipeline-tool"]}
+    profile = _profile_with_costs(execution=execution, core=200)
+    monkeypatch.setattr(
+        pipeline_insights, "_profiles", lambda: {"example": profile})
+    monkeypatch.setattr(
+        pipeline_insights, "_github_rate_limits", lambda: _limits(core=1000))
+    monkeypatch.setattr(
+        pipeline_insights, "_tool_available",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("lower-priority task reached project preflight")))
+
+    owner = _running_task(isolated_db, "Crashed budget owner")
+    reserved = _reserve(
+        isolated_db, owner, "scan-stale-owner", core=500, remaining=1000)
+    isolated_db.create_task(TaskCreate(
+        prompt="Example - REVIEW", recurrence="4h", priority=2))
+    waiter = isolated_db.get_next_runnable()
+    assert isolated_db.defer_task(
+        waiter.id, datetime.now(timezone.utc) + timedelta(minutes=7),
+        "waiting for stale owner", budget_wait_scope="github-default",
+        budget_wait_revision=reserved["revision"],
+        expected_started_at=waiter.started_at) is True
+    isolated_db.create_task(TaskCreate(
+        prompt="Example - REVIEW", recurrence="4h", priority=5))
+    lower = isolated_db.get_next_runnable()
+    assert isolated_db.mark_completed(
+        owner.id, "done", expected_started_at=owner.started_at) is True
+
+    route = pipeline_insights.execution_route(
+        lower, lower.prompt, retain_budget=True)
+
+    assert route["action"] == "defer"
+    assert route["defer_policy"] == "retry"
+    assert route["github_budget"]["state"] == "priority_waiter"
+    assert isolated_db.pipeline_github_budget_reservations(
+        "github-default")["count"] == 0
+    woken = isolated_db.get_task(waiter.id)
+    assert woken.scheduled_at <= datetime.now(timezone.utc)
+    assert woken.next_run_at is None
+
+
+def test_execution_route_skips_preflight_for_existing_priority_waiter(
+        isolated_db, monkeypatch):
+    execution = {"mode": "auto", "command": ["pipeline-tool"]}
+    profile = _profile_with_costs(execution=execution, core=200)
+    monkeypatch.setattr(
+        pipeline_insights, "_profiles", lambda: {"example": profile})
+    monkeypatch.setattr(
+        pipeline_insights, "_github_rate_limits", lambda: _limits(core=1000))
+    monkeypatch.setattr(
+        pipeline_insights, "_tool_available",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("lower-priority task reached project preflight")))
+
+    owner = _running_task(isolated_db, "Budget owner")
+    reserved = _reserve(
+        isolated_db, owner, "live-owner", core=200, remaining=1000)
+    isolated_db.create_task(TaskCreate(
+        prompt="Example - REVIEW", recurrence="4h", priority=2))
+    waiter = isolated_db.get_next_runnable()
+    assert isolated_db.defer_task(
+        waiter.id, datetime.now(timezone.utc) + timedelta(minutes=7),
+        "waiting for live owner", budget_wait_scope="github-default",
+        budget_wait_revision=reserved["revision"],
+        expected_started_at=waiter.started_at) is True
+    isolated_db.create_task(TaskCreate(
+        prompt="Example - REVIEW", recurrence="4h", priority=5))
+    lower = isolated_db.get_next_runnable()
+
+    route = pipeline_insights.execution_route(
+        lower, lower.prompt, retain_budget=True)
+
+    assert route["action"] == "defer"
+    assert route["defer_policy"] == "retry"
+    assert route["github_budget"]["state"] == "priority_waiter"
+    ledger = isolated_db.pipeline_github_budget_reservations(
+        "github-default")
+    assert ledger["count"] == 1
+    assert ledger["items"][0]["token"] == "live-owner"
+
+
+def test_final_reserve_cas_retries_when_release_happens_during_preflight(
+        isolated_db, monkeypatch):
+    execution = {"mode": "auto", "command": ["pipeline-tool"]}
+    profile = _profile_with_costs(execution=execution, core=200)
+    monkeypatch.setattr(
+        pipeline_insights, "_profiles", lambda: {"example": profile})
+    monkeypatch.setattr(
+        pipeline_insights, "_github_rate_limits", lambda: _limits(core=1000))
+    monkeypatch.setattr(
+        pipeline_insights, "_tool_available", lambda *_args: (True, ""))
+
+    owner = _running_task(isolated_db, "Budget owner")
+    reserved = _reserve(
+        isolated_db, owner, "preflight-owner", core=200, remaining=1000)
+    isolated_db.create_task(TaskCreate(
+        prompt="Example - REVIEW", recurrence="4h", priority=2))
+    waiter = isolated_db.get_next_runnable()
+    isolated_db.create_task(TaskCreate(
+        prompt="Example - REVIEW", recurrence="4h", priority=5))
+    lower = isolated_db.get_next_runnable()
+
+    def release_during_preflight(*_args, **_kwargs):
+        assert isolated_db.defer_task(
+            waiter.id, datetime.now(timezone.utc) + timedelta(minutes=7),
+            "waiting for owner", budget_wait_scope="github-default",
+            budget_wait_revision=reserved["revision"],
+            expected_started_at=waiter.started_at) is True
+        assert isolated_db.release_pipeline_github_budget(
+            "github-default", token="preflight-owner", task_id=owner.id,
+            task_started_at=owner.started_at) is True
+        return {"action": "fallback", "reason": "full review required"}
+
+    monkeypatch.setattr(
+        pipeline_insights, "_tool_preflight", release_during_preflight)
+
+    route = pipeline_insights.execution_route(
+        lower, lower.prompt, retain_budget=True)
+
+    assert route["action"] == "defer"
+    assert route["defer_policy"] == "retry"
+    assert route["github_budget"]["state"] == "ledger_changed"
+    assert isolated_db.pipeline_github_budget_reservations(
+        "github-default")["count"] == 0
+    woken = isolated_db.get_task(waiter.id)
+    assert woken.scheduled_at <= datetime.now(timezone.utc)
+    assert woken.next_run_at is None
+
+
+def test_ledger_changed_retry_preserves_handoff_until_reservation(
+        isolated_db, monkeypatch):
+    execution = {"mode": "auto", "command": ["pipeline-tool"]}
+    profile = _profile_with_costs(execution=execution, core=200)
+    monkeypatch.setattr(
+        pipeline_insights, "_profiles", lambda: {"example": profile})
+    monkeypatch.setattr(
+        pipeline_insights, "_github_rate_limits", lambda: _limits(core=1000))
+    monkeypatch.setattr(
+        pipeline_insights, "_tool_available", lambda *_args: (True, ""))
+
+    owner = _running_task(isolated_db, "Budget owner")
+    reserved = _reserve(
+        isolated_db, owner, "cas-handoff-owner", core=200, remaining=1000)
+    isolated_db.create_task(TaskCreate(
+        prompt="Example - REVIEW", recurrence="4h", priority=2))
+    waiter = isolated_db.get_next_runnable()
+    armed = isolated_db.arm_pipeline_github_budget_waiter(
+        "github-default", task_id=waiter.id,
+        task_started_at=waiter.started_at,
+        expected_revision=reserved["revision"])
+    assert armed["armed"] is True
+    low_created = isolated_db.create_task(TaskCreate(
+        prompt="Example - TAIL", recurrence="4h", priority=5))
+    low = isolated_db.get_next_runnable()
+    assert low is not None and low.id == low_created.id
+
+    def release_during_preflight(*_args, **_kwargs):
+        assert isolated_db.release_pipeline_github_budget(
+            "github-default", token="cas-handoff-owner", task_id=owner.id,
+            task_started_at=owner.started_at) is True
+        return {"action": "fallback", "reason": "full review required"}
+
+    monkeypatch.setattr(
+        pipeline_insights, "_tool_preflight", release_during_preflight)
+
+    route = pipeline_insights.execution_route(
+        waiter, waiter.prompt, retain_budget=True)
+
+    assert route["action"] == "defer"
+    assert route["defer_policy"] == "retry"
+    assert route["github_budget"]["state"] == "ledger_changed"
+    assert route["budget_wait_scope"] == "github-default"
+    assert type(route["budget_wait_revision"]) is int
+    assert isolated_db.defer_task(
+        waiter.id, datetime.fromisoformat(route["defer_until"]),
+        route["reason"], budget_wait_scope=route["budget_wait_scope"],
+        budget_wait_revision=route["budget_wait_revision"],
+        expected_started_at=waiter.started_at) is True
+
+    denied = _reserve(
+        isolated_db, low, "lower-after-cas-retry",
+        core=200, remaining=1000)
+    assert denied["allowed"] is False
+    assert denied["state"] == "priority_waiter"
+
+
+def test_priority_waiter_retry_preserves_order_behind_higher_waiter(
+        isolated_db, monkeypatch):
+    execution = {"mode": "auto", "command": ["pipeline-tool"]}
+    profile = _profile_with_costs(execution=execution, core=200)
+    monkeypatch.setattr(
+        pipeline_insights, "_profiles", lambda: {"example": profile})
+    monkeypatch.setattr(
+        pipeline_insights, "_github_rate_limits", lambda: _limits(core=1000))
+    monkeypatch.setattr(
+        pipeline_insights, "_tool_available",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("priority waiter reached project preflight")))
+
+    isolated_db.create_task(TaskCreate(
+        prompt="Example - MERGE", recurrence="4h", priority=1))
+    first = isolated_db.get_next_runnable()
+    revision = isolated_db.pipeline_github_budget_reservations(
+        "github-default")["revision"]
+    assert isolated_db.defer_task(
+        first.id, datetime.now(timezone.utc) + timedelta(minutes=7),
+        "first waiter", budget_wait_scope="github-default",
+        budget_wait_revision=revision,
+        expected_started_at=first.started_at) is True
+    isolated_db.create_task(TaskCreate(
+        prompt="Example - REVIEW", recurrence="4h", priority=2))
+    second = isolated_db.get_next_runnable()
+
+    route = pipeline_insights.execution_route(
+        second, second.prompt, retain_budget=True)
+
+    assert route["action"] == "defer"
+    assert route["defer_policy"] == "retry"
+    assert route["github_budget"]["state"] == "priority_waiter"
+    assert route["budget_wait_scope"] == "github-default"
+    assert isolated_db.defer_task(
+        second.id, datetime.fromisoformat(route["defer_until"]),
+        route["reason"], budget_wait_scope=route["budget_wait_scope"],
+        budget_wait_revision=route["budget_wait_revision"],
+        expected_started_at=second.started_at) is True
+    assert isolated_db.cancel_task(first.id) is True
+
+    isolated_db.create_task(TaskCreate(
+        prompt="Example - FIX", recurrence="4h", priority=3))
+    third = isolated_db.get_next_runnable()
+    denied = _reserve(
+        isolated_db, third, "third-behind-second", core=200, remaining=1000)
+    assert denied["allowed"] is False
+    assert denied["state"] == "priority_waiter"
+
+
+def test_scan_lease_busy_retry_preserves_existing_priority_handoff(
+        isolated_db, monkeypatch):
+    execution = {"mode": "auto", "command": ["pipeline-tool"]}
+    profile = _profile_with_costs(execution=execution, core=200)
+    monkeypatch.setattr(
+        pipeline_insights, "_profiles", lambda: {"example": profile})
+    monkeypatch.setattr(
+        pipeline_insights, "_github_rate_limits", lambda: _limits(core=1000))
+    monkeypatch.setattr(
+        pipeline_insights, "_tool_available",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("lower-priority task reached project preflight")))
+
+    isolated_db.create_task(TaskCreate(
+        prompt="Example - REVIEW", recurrence="4h", priority=2))
+    waiter = isolated_db.get_next_runnable()
+    armed = isolated_db.arm_pipeline_github_budget_waiter(
+        "github-default", task_id=waiter.id,
+        task_started_at=waiter.started_at)
+    assert armed["armed"] is True
+    isolated_db.create_task(TaskCreate(
+        prompt="Example - REVIEW", recurrence="4h", priority=5))
+    lower = isolated_db.get_next_runnable()
+
+    held = isolated_db.acquire_pipeline_scan_lease(
+        "github-default", "lower-held-scan", 30)
+    assert held["acquired"] is True
+
+    route = pipeline_insights.execution_route(
+        waiter, waiter.prompt, retain_budget=True)
+
+    assert route["action"] == "defer"
+    assert route["defer_policy"] == "retry"
+    assert route["github_budget"]["state"] == "scan_in_progress"
+    assert route["budget_wait_scope"] == "github-default"
+    assert isolated_db.defer_task(
+        waiter.id, datetime.fromisoformat(route["defer_until"]),
+        route["reason"], budget_wait_scope=route["budget_wait_scope"],
+        budget_wait_revision=route["budget_wait_revision"],
+        expected_started_at=waiter.started_at) is True
+    assert isolated_db.release_pipeline_scan_lease(
+        "github-default", "lower-held-scan") is True
+
+    lower_route = pipeline_insights.execution_route(
+        lower, lower.prompt, retain_budget=True)
+    assert lower_route["action"] == "defer"
+    assert lower_route["github_budget"]["state"] == "priority_waiter"
+
+
+def test_safe_corrupt_ledger_recovery_advances_revision_and_wakes_waiter(
+        isolated_db):
+    owner = _running_task(isolated_db, "Budget owner")
+    reserved = _reserve(
+        isolated_db, owner, "corrupt-owner", core=200, remaining=1000)
+    waiter = _running_task(isolated_db, "Example - REVIEW")
+    target = datetime.now(timezone.utc) + timedelta(minutes=7)
+    assert isolated_db.defer_task(
+        waiter.id, target, "waiting for owner",
+        budget_wait_scope="github-default",
+        budget_wait_revision=reserved["revision"],
+        expected_started_at=waiter.started_at) is True
+    assert isolated_db.mark_completed(
+        owner.id, "done", expected_started_at=owner.started_at) is True
+    with isolated_db._connect() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+            (isolated_db._pipeline_github_budget_reservation_key(
+                "github-default"), "not-json"),
+        )
+
+    ledger = isolated_db.pipeline_github_budget_reservations(
+        "github-default")
+
+    assert ledger["count"] == 0
+    assert ledger["revision"] == reserved["revision"] + 1
+    woken = isolated_db.get_task(waiter.id)
+    assert woken.scheduled_at <= datetime.now(timezone.utc)
+    assert woken.next_run_at is None
+
+
+def test_live_rate_reset_deadline_is_not_woken_by_reservation_release(
+        isolated_db):
+    owner = _running_task(isolated_db, "Budget owner")
+    assert _reserve(
+        isolated_db, owner, "hard-deadline-owner", core=200,
+        remaining=1000)["allowed"] is True
+    created = isolated_db.create_task(TaskCreate(
+        prompt="Example - REVIEW", recurrence="4h", priority=2))
+    waiter = isolated_db.get_next_runnable()
+    target = datetime.now(timezone.utc) + timedelta(minutes=7)
+    assert isolated_db.defer_task(
+        waiter.id, target, "live rate limit", hard_not_before=True,
+        expected_started_at=waiter.started_at) is True
+
+    assert isolated_db.release_pipeline_github_budget(
+        "github-default", token="hard-deadline-owner", task_id=owner.id,
+        task_started_at=owner.started_at) is True
+
+    deferred = isolated_db.get_task(created.id)
+    assert deferred.scheduled_at == target
+    assert deferred.next_run_at == target
 
 
 def test_worker_low_budget_stays_deferred_when_status_database_is_locked(

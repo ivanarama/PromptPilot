@@ -71,6 +71,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     worktree_path TEXT,
     worktree_branch TEXT,
     note TEXT,
+    budget_wait_scope TEXT,
     verdict TEXT
     ,series_id INTEGER REFERENCES task_series(id)
 );
@@ -390,6 +391,8 @@ MIGRATIONS = [
     "ALTER TABLE pipeline_target_reservations ADD COLUMN herdr_pane_id TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE pipeline_target_reservations ADD COLUMN herdr_tab_id TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE pipeline_target_reservations ADD COLUMN herdr_workspace_id TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE tasks ADD COLUMN budget_wait_scope TEXT",
+    "CREATE INDEX IF NOT EXISTS idx_tasks_budget_wait ON tasks(budget_wait_scope, status, priority)",
 ]
 
 WORKFLOW_SCHEMA_VERSION = "workflow_orchestrator_w0_v1"
@@ -425,6 +428,10 @@ def _parse_dt(val: Optional[str]) -> Optional[datetime]:
 
 def _row_to_task(row: sqlite3.Row) -> TaskInDB:
     d = dict(row)
+    # Internal scheduler metadata is deliberately not part of the public task
+    # model/API. It only identifies interruptible waits on another task's
+    # GitHub budget reservation.
+    d.pop("budget_wait_scope", None)
     for field in ("scheduled_at", "next_run_at", "created_at", "started_at", "completed_at"):
         d[field] = _parse_dt(d[field])
     return TaskInDB(**d)
@@ -1267,7 +1274,8 @@ def mark_completed(task_id: int, result: str, exit_code: int = 0,
             "UPDATE tasks SET status = 'completed', result = ?, error = NULL, "
             "next_run_at = NULL, exit_code = ?, completed_at = ?, model_used = ?, "
             "session_id = COALESCE(?, session_id), "
-            f"verdict = COALESCE(?, verdict), note = NULL WHERE {where}",
+            f"verdict = COALESCE(?, verdict), note = NULL, "
+            f"budget_wait_scope = NULL WHERE {where}",
             values,
         )
         if cur.rowcount:
@@ -1287,7 +1295,8 @@ def mark_failed(task_id: int, error: str, exit_code: int = 1,
             values.append(attempt)
         cur = conn.execute(
             "UPDATE tasks SET status = 'failed', error = ?, exit_code = ?, "
-            f"completed_at = ?, note = NULL WHERE {where}",
+            f"completed_at = ?, note = NULL, budget_wait_scope = NULL "
+            f"WHERE {where}",
             values,
         )
         if cur.rowcount:
@@ -1312,7 +1321,7 @@ def fail_running_attempt(task_id: int, started_at, error: str,
         cur = conn.execute(
             """UPDATE tasks
                SET status = 'failed', error = ?, exit_code = ?,
-                   completed_at = ?, note = NULL
+                   completed_at = ?, note = NULL, budget_wait_scope = NULL
                WHERE id = ? AND status = 'running' AND started_at = ?""",
             (error, exit_code, _now(), task_id, started_at),
         )
@@ -1336,7 +1345,7 @@ def mark_rate_limited(task_id: int, next_run_at: datetime, error: str = None,
                SET status = 'rate_limited',
                    next_run_at = ?,
                    retry_count = retry_count + 1,
-                   error = COALESCE(?, error)
+                   error = COALESCE(?, error), budget_wait_scope = NULL
                 WHERE """ + where,
             values,
         )
@@ -1348,6 +1357,8 @@ def mark_rate_limited(task_id: int, next_run_at: datetime, error: str = None,
 
 def defer_task(task_id: int, next_run_at: datetime, reason: str = None,
                *, hard_not_before: bool = False,
+               budget_wait_scope: str | None = None,
+               budget_wait_revision: int | None = None,
                expected_started_at=None) -> bool:
     """Return a claimed task to pending without consuming a retry attempt.
 
@@ -1356,19 +1367,48 @@ def defer_task(task_id: int, next_run_at: datetime, reason: str = None,
     move.  A hard deadline is additionally stored in ``next_run_at`` so
     automatic queue wake-ups cannot spend GitHub quota before the exact reset;
     an explicit human ``run_now`` still clears that barrier intentionally.
+
+    ``budget_wait_scope`` marks the distinct, interruptible case where live
+    quota is sufficient but another task temporarily owns a reservation. The
+    ledger release wakes that waiter immediately instead of leaving a
+    high-priority task asleep for the whole busy-retry interval.
     """
+    if budget_wait_scope is not None:
+        if (not isinstance(budget_wait_scope, str)
+                or not budget_wait_scope.strip()
+                or len(budget_wait_scope) > 256):
+            raise ValueError("budget wait scope must contain 1..256 characters")
+        if (isinstance(budget_wait_revision, bool)
+                or not isinstance(budget_wait_revision, int)
+                or budget_wait_revision < 0):
+            raise ValueError(
+                "budget wait revision must be a non-negative integer")
+        if hard_not_before:
+            raise ValueError(
+                "budget reservation wait cannot also be a hard deadline")
+    elif budget_wait_revision is not None:
+        raise ValueError("budget wait revision requires a scope")
     deadline = _to_utc_iso(next_run_at)
-    with _connect() as conn:
+    with _connect(immediate=budget_wait_scope is not None) as conn:
+        # Close the release-before-defer race. If the reservation ledger moved
+        # after admission observed contention, the sole wake may already have
+        # happened. Requeue immediately, but preserve the durable priority
+        # handoff until this task actually reserves budget.
+        if (budget_wait_scope is not None
+                and _pipeline_github_budget_revision(
+                    conn, budget_wait_scope) != budget_wait_revision):
+            deadline = _now()
         attempt = _attempt_iso(expected_started_at)
         where = "id = ? AND status = 'running'"
-        values = [deadline, deadline if hard_not_before else None, reason, task_id]
+        values = [deadline, deadline if hard_not_before else None, reason,
+                  budget_wait_scope, task_id]
         if attempt is not None:
             where += " AND started_at = ?"
             values.append(attempt)
         cur = conn.execute(
             """UPDATE tasks SET status = 'pending', scheduled_at = ?,
                       next_run_at = ?, started_at = NULL,
-                      error = COALESCE(?, error)
+                      error = COALESCE(?, error), budget_wait_scope = ?
                WHERE """ + where,
             values,
         )
@@ -1413,7 +1453,8 @@ def mark_cancelled(task_id: int, note: str = None,
             values.append(attempt)
         cur = conn.execute(
             "UPDATE tasks SET status = 'cancelled', completed_at = ?, "
-            f"error = COALESCE(?, error), note = NULL WHERE {where}",
+            f"error = COALESCE(?, error), note = NULL, "
+            f"budget_wait_scope = NULL WHERE {where}",
             values,
         )
         if cur.rowcount:
@@ -1425,7 +1466,9 @@ def mark_cancelled(task_id: int, note: str = None,
 def cancel_task(task_id: int) -> bool:
     with _connect() as conn:
         cur = conn.execute(
-            "UPDATE tasks SET status = 'cancelled', completed_at = ? WHERE id = ? AND status IN ('pending', 'rate_limited')",
+            "UPDATE tasks SET status = 'cancelled', completed_at = ?, "
+            "budget_wait_scope = NULL WHERE id = ? "
+            "AND status IN ('pending', 'rate_limited')",
             (_now(), task_id),
         )
         if cur.rowcount:
@@ -2018,7 +2061,8 @@ def series_action(series_id: int, action: str) -> bool:
         elif action == "end":
             conn.execute("UPDATE task_series SET ended_at = ?, updated_at = ? WHERE id = ?",
                          (now, now, series_id))
-            conn.execute("UPDATE tasks SET status = 'cancelled', completed_at = ? "
+            conn.execute("UPDATE tasks SET status = 'cancelled', completed_at = ?, "
+                         "budget_wait_scope = NULL "
                          "WHERE series_id = ? AND status IN ('pending', 'rate_limited')",
                          (now, series_id))
             conn.execute(
@@ -2299,6 +2343,10 @@ def update_task_fields(task_id: int, fields: dict) -> bool:
         return False
     if "scheduled_at" in fields:
         fields["scheduled_at"] = _to_utc_iso(fields["scheduled_at"])
+        # An explicit operator reschedule supersedes an automatic soft wait.
+        # Without this, a task intentionally moved far into the future would
+        # keep lower-priority work from reserving GitHub budget indefinitely.
+        fields["budget_wait_scope"] = None
     sets = ", ".join(f"{k} = ?" for k in fields)
     with _connect() as conn:
         cur = conn.execute(
@@ -2709,6 +2757,8 @@ def _pipeline_scan_lease_key(scope: str) -> str:
 
 _PIPELINE_GITHUB_BUDGET_RESERVATION_PREFIX = \
     "pipeline_github_budget_reservations:v1:"
+_PIPELINE_GITHUB_BUDGET_REVISION_PREFIX = \
+    "pipeline_github_budget_revision:v1:"
 _PIPELINE_GITHUB_RATE_SNAPSHOT_PREFIX = "pipeline_github_rate_snapshot:v1:"
 _PIPELINE_GITHUB_BUDGET_RESOURCES = ("core", "search", "graphql")
 
@@ -2719,6 +2769,40 @@ def _pipeline_github_budget_reservation_key(scope: str) -> str:
         raise ValueError("pipeline GitHub budget scope must not be empty")
     digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
     return f"{_PIPELINE_GITHUB_BUDGET_RESERVATION_PREFIX}{digest}"
+
+
+def _pipeline_github_budget_revision_key(scope: str) -> str:
+    value = str(scope).strip()
+    if not value:
+        raise ValueError("pipeline GitHub budget scope must not be empty")
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+    return f"{_PIPELINE_GITHUB_BUDGET_REVISION_PREFIX}{digest}"
+
+
+def _pipeline_github_budget_revision(conn, scope: str) -> int:
+    key = _pipeline_github_budget_revision_key(scope)
+    row = conn.execute(
+        "SELECT value FROM settings WHERE key = ?", (key,)
+    ).fetchone()
+    if row is None:
+        return 0
+    try:
+        revision = int(row["value"])
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            "pipeline GitHub budget revision is corrupt") from exc
+    if revision < 0:
+        raise ValueError("pipeline GitHub budget revision is corrupt")
+    return revision
+
+
+def _advance_pipeline_github_budget_revision(conn, scope: str) -> int:
+    revision = _pipeline_github_budget_revision(conn, scope) + 1
+    conn.execute(
+        "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+        (_pipeline_github_budget_revision_key(scope), str(revision)),
+    )
+    return revision
 
 
 def _pipeline_github_rate_snapshot_key(scope: str) -> str:
@@ -2802,10 +2886,11 @@ def _load_pipeline_budget_reservations(conn, key: str) -> list[dict]:
         raise ValueError("pipeline GitHub budget reservation ledger is corrupt") from exc
 
 
-def _load_or_recover_pipeline_budget_reservations(conn, key: str) -> list[dict]:
+def _load_or_recover_pipeline_budget_reservations(
+        conn, key: str, scope: str) -> tuple[list[dict], dict | None]:
     """Reclaim corrupt state only when no provider attempt can still own it."""
     try:
-        return _load_pipeline_budget_reservations(conn, key)
+        return _load_pipeline_budget_reservations(conn, key), None
     except ValueError:
         running = conn.execute(
             "SELECT 1 FROM tasks WHERE status = 'running' LIMIT 1"
@@ -2813,7 +2898,9 @@ def _load_or_recover_pipeline_budget_reservations(conn, key: str) -> list[dict]:
         if running is not None:
             raise
         conn.execute("DELETE FROM settings WHERE key = ?", (key,))
-        return []
+        _advance_pipeline_github_budget_revision(conn, scope)
+        woken = _wake_pipeline_github_budget_waiters(conn, scope)
+        return [], woken
 
 
 def _active_pipeline_budget_reservations(conn, values: list[dict]) -> tuple[list[dict], bool]:
@@ -2841,19 +2928,110 @@ def _write_pipeline_budget_reservations(conn, key: str, values: list[dict]) -> N
     )
 
 
+def _pipeline_github_budget_waiter_summary(conn, scope: str) -> dict:
+    row = conn.execute(
+        """SELECT COUNT(*) AS count, MIN(priority) AS min_priority
+           FROM tasks
+           WHERE budget_wait_scope = ? AND (
+                 status = 'running' OR (
+                   status = 'pending'
+                   AND (series_id IS NULL OR EXISTS (
+                     SELECT 1 FROM task_series s WHERE s.id = tasks.series_id
+                       AND s.paused = 0 AND s.ended_at IS NULL))))""",
+        (scope,),
+    ).fetchone()
+    return {
+        "count": int(row["count"] or 0) if row is not None else 0,
+        "min_priority": row["min_priority"] if row is not None else None,
+    }
+
+
+def _wake_pipeline_github_budget_waiters(conn, scope: str) -> dict:
+    """Wake soft waits while preserving their priority handoff marker."""
+    summary = _pipeline_github_budget_waiter_summary(conn, scope)
+    cur = conn.execute(
+        """UPDATE tasks
+           SET scheduled_at = ?, next_run_at = NULL
+           WHERE status = 'pending' AND budget_wait_scope = ?""",
+        (_now(), scope),
+    )
+    return {
+        "count": cur.rowcount,
+        "min_priority": summary["min_priority"],
+    }
+
+
+def arm_pipeline_github_budget_waiter(
+        scope: str, *, task_id: int, task_started_at,
+        expected_revision: int | None = None) -> dict:
+    """Persist a priority handoff before releasing the admission scan lease.
+
+    New reservations are serialized by that lease, while reservation release
+    is intentionally independent. Recording the exact running attempt before
+    the lease is released closes both release-before-defer and
+    release-before-lower-admission windows. The marker survives wake and claim;
+    it is cleared only by successful reservation, terminal settlement, a
+    different defer reason, or an explicit operator reschedule.
+    """
+    if not isinstance(scope, str) or not scope.strip() or len(scope) > 256:
+        raise ValueError("pipeline GitHub budget scope must contain 1..256 characters")
+    if (expected_revision is not None
+            and (isinstance(expected_revision, bool)
+                 or not isinstance(expected_revision, int)
+                 or expected_revision < 0)):
+        raise ValueError(
+            "expected pipeline budget revision must be a non-negative integer")
+    attempt = _attempt_iso(task_started_at)
+    if attempt is None:
+        raise ValueError("running task attempt is required for budget waiter")
+    with _connect(immediate=True) as conn:
+        revision = _pipeline_github_budget_revision(conn, scope)
+        cur = conn.execute(
+            """UPDATE tasks SET budget_wait_scope = ?
+               WHERE id = ? AND status = 'running' AND started_at = ?""",
+            (scope, task_id, attempt),
+        )
+        return {
+            "armed": cur.rowcount > 0,
+            "revision": revision,
+            "revision_changed": (
+                expected_revision is not None
+                and revision != expected_revision),
+        }
+
+
 def pipeline_github_budget_reservations(scope: str) -> dict:
     """Return live, task-fenced reservations and prune completed attempts."""
     key = _pipeline_github_budget_reservation_key(scope)
     with _connect(immediate=True) as conn:
-        values = _load_or_recover_pipeline_budget_reservations(conn, key)
+        values, recovered = _load_or_recover_pipeline_budget_reservations(
+            conn, key, scope)
         active, changed = _active_pipeline_budget_reservations(conn, values)
+        revision = _pipeline_github_budget_revision(conn, scope)
+        woken = recovered or {"count": 0, "min_priority": None}
         if changed:
             _write_pipeline_budget_reservations(conn, key, active)
+            revision = _advance_pipeline_github_budget_revision(conn, scope)
+            stale_woken = _wake_pipeline_github_budget_waiters(conn, scope)
+            priorities = [
+                value for value in (
+                    woken.get("min_priority"),
+                    stale_woken.get("min_priority"))
+                if type(value) is int
+            ]
+            woken = {
+                "count": int(woken.get("count") or 0)
+                         + int(stale_woken.get("count") or 0),
+                "min_priority": min(priorities) if priorities else None,
+            }
         totals = {resource: 0 for resource in _PIPELINE_GITHUB_BUDGET_RESOURCES}
         for item in active:
             for resource in totals:
                 totals[resource] += item["cost"][resource]
-        return {"count": len(active), "totals": totals, "items": active}
+        waiting = _pipeline_github_budget_waiter_summary(conn, scope)
+        return {"count": len(active), "totals": totals, "items": active,
+                "revision": revision, "woken_waiters": woken,
+                "waiting_waiters": waiting}
 
 
 def record_pipeline_github_rate_snapshot(
@@ -2945,7 +3123,8 @@ def reserve_pipeline_github_budget(
         profile_id: str, queue_id: str, route: str, cost: dict,
         limits: dict, minimum_remaining: dict,
         now: Optional[float] = None,
-        scan_lease_guard: Optional[dict] = None) -> dict:
+        scan_lease_guard: Optional[dict] = None,
+        expected_revision: Optional[int] = None) -> dict:
     """Atomically reserve quota for one exact running task attempt."""
     key = _pipeline_github_budget_reservation_key(scope)
     if not _valid_pipeline_scan_token(token):
@@ -2958,6 +3137,12 @@ def reserve_pipeline_github_budget(
             or not isinstance(queue_id, str) or not queue_id
             or not isinstance(route, str) or not route):
         raise ValueError("invalid pipeline budget reservation identity")
+    if (expected_revision is not None
+            and (isinstance(expected_revision, bool)
+                 or not isinstance(expected_revision, int)
+                 or expected_revision < 0)):
+        raise ValueError(
+            "expected pipeline budget revision must be a non-negative integer")
     requested = _pipeline_budget_vector(cost, "cost")
     floor = _pipeline_budget_vector(minimum_remaining, "minimum_remaining")
     reported = {}
@@ -2991,14 +3176,33 @@ def reserve_pipeline_github_budget(
             return {"allowed": False, "state": "scan_lease_lost",
                     "reason": "GitHub scan lease changed before budget reservation"}
         task = conn.execute(
-            "SELECT status, started_at FROM tasks WHERE id = ?", (task_id,)
+            "SELECT status, started_at, priority FROM tasks WHERE id = ?",
+            (task_id,)
         ).fetchone()
         if (task is None or task["status"] != "running"
                 or task["started_at"] != task_started_at):
             return {"allowed": False, "state": "task_fence_lost",
                     "reason": "running task attempt changed before budget reservation"}
-        values = _load_or_recover_pipeline_budget_reservations(conn, key)
+        values, recovered = _load_or_recover_pipeline_budget_reservations(
+            conn, key, scope)
         active, changed = _active_pipeline_budget_reservations(conn, values)
+        revision = _pipeline_github_budget_revision(conn, scope)
+        woken = recovered or {"count": 0, "min_priority": None}
+        if changed:
+            _write_pipeline_budget_reservations(conn, key, active)
+            revision = _advance_pipeline_github_budget_revision(conn, scope)
+            stale_woken = _wake_pipeline_github_budget_waiters(conn, scope)
+            priorities = [
+                value for value in (
+                    woken.get("min_priority"),
+                    stale_woken.get("min_priority"))
+                if type(value) is int
+            ]
+            woken = {
+                "count": int(woken.get("count") or 0)
+                         + int(stale_woken.get("count") or 0),
+                "min_priority": min(priorities) if priorities else None,
+            }
         own = [item for item in active if item["token"] == token]
         if own:
             item = own[0]
@@ -3006,8 +3210,12 @@ def reserve_pipeline_github_budget(
                     or item["task_started_at"] != task_started_at
                     or item["cost"] != requested or item["route"] != route):
                 raise ValueError("pipeline budget token was reused inconsistently")
-            if changed:
-                _write_pipeline_budget_reservations(conn, key, active)
+            conn.execute(
+                """UPDATE tasks SET budget_wait_scope = NULL
+                   WHERE id = ? AND status = 'running' AND started_at = ?
+                     AND budget_wait_scope = ?""",
+                (task_id, task_started_at, scope),
+            )
             return {"allowed": True, "state": "reserved",
                     "reported_remaining": reported,
                     "reserved_other": {resource: sum(
@@ -3019,7 +3227,8 @@ def reserve_pipeline_github_budget(
                         value["cost"][resource] for value in active)
                         for resource in reported},
                     "blocked_resources": [],
-                    "active_reservations": len(active)}
+                    "active_reservations": len(active),
+                    "revision": revision}
         if any(item["task_id"] == task_id
                and item["task_started_at"] == task_started_at for item in active):
             raise ValueError("running task attempt already owns another reservation")
@@ -3028,6 +3237,57 @@ def reserve_pipeline_github_budget(
             item["cost"][resource] for item in active) for resource in reported}
         after = {resource: reported[resource] - reserved[resource] - requested[resource]
                  for resource in reported}
+        if expected_revision is not None and revision != expected_revision:
+            return {
+                "allowed": False, "state": "ledger_changed",
+                "reason": (
+                    "GitHub budget reservations changed between admission "
+                    "and final reservation"),
+                "blocked_resources": [],
+                "reported_remaining": reported, "reserved_other": reserved,
+                "requested_cost": requested, "minimum_remaining": floor,
+                "effective_after": after, "active_reservations": len(active),
+                "revision": revision,
+            }
+
+        waiting = _pipeline_github_budget_waiter_summary(conn, scope)
+        waiting_priority = waiting.get("min_priority")
+        if (type(waiting_priority) is int
+                and waiting_priority < int(task["priority"])):
+            return {
+                "allowed": False, "state": "priority_waiter",
+                "reason": (
+                    "a higher-priority task is waiting for this GitHub "
+                    "budget reservation"),
+                "blocked_resources": [],
+                "reported_remaining": reported, "reserved_other": reserved,
+                "requested_cost": requested, "minimum_remaining": floor,
+                "effective_after": after, "active_reservations": len(active),
+                "revision": revision,
+            }
+
+        # Crash recovery may discover and prune a stale owner while a lower-
+        # priority task is trying to reserve. Yield once to a waiter that the
+        # same transaction just woke, otherwise the lower-priority task can
+        # immediately consume the released budget and recreate the inversion.
+        woken_priority = woken.get("min_priority")
+        if ((changed or recovered is not None)
+                and type(woken_priority) is int
+                and woken_priority < int(task["priority"])):
+            return {
+                "allowed": False, "state": "priority_waiter",
+                "reason": (
+                    "a higher-priority GitHub budget waiter was woken after "
+                    "stale reservation recovery"),
+                "blocked_resources": [],
+                "reported_remaining": reported,
+                "reserved_other": {resource: sum(
+                    item["cost"][resource] for item in active)
+                    for resource in reported},
+                "requested_cost": requested, "minimum_remaining": floor,
+                "effective_after": {}, "active_reservations": len(active),
+                "revision": revision,
+            }
         blocked = [{
             "resource": resource,
             "reported_remaining": reported[resource],
@@ -3041,8 +3301,6 @@ def reserve_pipeline_github_budget(
                 < floor[resource] else "reservation"),
         } for resource in reported if after[resource] < floor[resource]]
         if blocked:
-            if changed:
-                _write_pipeline_budget_reservations(conn, key, active)
             state = ("low" if any(item["blocked_by"] == "live"
                                   for item in blocked)
                      else "budget_in_flight")
@@ -3050,7 +3308,8 @@ def reserve_pipeline_github_budget(
                     "blocked_resources": blocked,
                     "reported_remaining": reported, "reserved_other": reserved,
                     "requested_cost": requested, "minimum_remaining": floor,
-                    "effective_after": after, "active_reservations": len(active)}
+                    "effective_after": after, "active_reservations": len(active),
+                    "revision": revision}
 
         active.append({
             "token": token, "task_id": task_id,
@@ -3059,11 +3318,19 @@ def reserve_pipeline_github_budget(
             "created_at": created_at,
         })
         _write_pipeline_budget_reservations(conn, key, active)
+        revision = _advance_pipeline_github_budget_revision(conn, scope)
+        conn.execute(
+            """UPDATE tasks SET budget_wait_scope = NULL
+               WHERE id = ? AND status = 'running' AND started_at = ?
+                 AND budget_wait_scope = ?""",
+            (task_id, task_started_at, scope),
+        )
         return {"allowed": True, "state": "reserved",
                 "reported_remaining": reported, "reserved_other": reserved,
                 "requested_cost": requested, "minimum_remaining": floor,
                 "effective_after": after,
-                "active_reservations": len(active)}
+                "active_reservations": len(active),
+                "revision": revision}
 
 
 def release_pipeline_github_budget(
@@ -3075,7 +3342,8 @@ def release_pipeline_github_budget(
     if isinstance(task_started_at, datetime):
         task_started_at = _to_utc_iso(task_started_at)
     with _connect(immediate=True) as conn:
-        values = _load_or_recover_pipeline_budget_reservations(conn, key)
+        values, _recovered = _load_or_recover_pipeline_budget_reservations(
+            conn, key, scope)
         kept = [item for item in values if not (
             item["token"] == token and item["task_id"] == task_id
             and item["task_started_at"] == task_started_at)]
@@ -3084,6 +3352,8 @@ def release_pipeline_github_budget(
         if not removed and not changed:
             return False
         _write_pipeline_budget_reservations(conn, key, active)
+        _advance_pipeline_github_budget_revision(conn, scope)
+        _wake_pipeline_github_budget_waiters(conn, scope)
         return removed
 
 
@@ -3651,7 +3921,8 @@ def recover_running_attempt(task_id: int, started_at) -> bool:
             cur = conn.execute(
                 """UPDATE tasks
                    SET status = 'cancelled', completed_at = ?,
-                       error = COALESCE(error, ?), note = NULL
+                       error = COALESCE(error, ?), note = NULL,
+                       budget_wait_scope = NULL
                    WHERE id = ? AND status = 'running' AND started_at = ?""",
                 (_now(), "Отменена пользователем до перезапуска worker",
                  task_id, attempt),
