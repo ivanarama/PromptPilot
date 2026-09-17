@@ -248,18 +248,19 @@ class OwnedProcess:
                     pass
                 raise error
             return
-        group_id, self._group_id = self._group_id, None
+        group_id = self._group_id
         if group_id is None:
             return
         try:
             os.killpg(group_id, signal.SIGKILL)
         except ProcessLookupError:
             pass
+        self._group_id = None
 
     def close(self) -> None:
         """Release the boundary, killing descendants still inside it."""
         if os.name == "nt":
-            job, self._job = self._job, None
+            job = self._job
             if job:
                 # Do not rely only on KILL_ON_JOB_CLOSE.  A provider or one of
                 # its native helpers can retain/duplicate a handle to the job,
@@ -269,20 +270,15 @@ class OwnedProcess:
                 # Terminate the private kernel job itself: unlike a PID/PPID
                 # walk this cannot race PID reuse and cannot select an
                 # unrelated process.  Detached tasks never enter this job.
-                error = None
                 if not _TerminateJobObject(job, 1):
-                    error = _windows_error("TerminateJobObject during close failed")
-                if not _CloseHandle(job) and error is None:
-                    error = _windows_error("CloseHandle(job) failed")
-                if error is not None:
-                    raise error
+                    # Keep the live handle: a later cleanup retry must not see
+                    # a consumed boundary and falsely report success.
+                    raise _windows_error("TerminateJobObject during close failed")
+                if not _CloseHandle(job):
+                    raise _windows_error("CloseHandle(job) failed")
+                self._job = None
             return
-        group_id, self._group_id = self._group_id, None
-        if group_id is not None:
-            try:
-                os.killpg(group_id, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+        self.terminate()
 
     def __enter__(self) -> "OwnedProcess":
         return self

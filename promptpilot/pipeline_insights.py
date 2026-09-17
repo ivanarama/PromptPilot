@@ -19,7 +19,8 @@ from pathlib import Path
 from urllib.parse import quote
 
 from . import db
-from .config import DB_DIR, POLL_INTERVAL, TASK_TIMEOUT
+from .config import (CONCURRENCY, DB_DIR, DEFAULT_CLI, POLL_INTERVAL,
+                     TASK_TIMEOUT, load_providers)
 
 
 DEFAULT_PROFILES: dict = {}
@@ -1548,20 +1549,21 @@ def set_item_priority(profile_id: str, queue_id: str, kind: str, number: int,
 
     woke = False
     paused = False
+    woken_series = []
     if run_now:
-        marker = str(queue.get("series_contains") or "").lower()
-        target = next((entry for entry in series
-                       if marker and marker in str(entry.get("title", "")).lower()
-                       and not entry.get("ended")), None)
-        if target:
-            woke = db.series_action(int(target["id"]), "run_now")
-            paused = bool(target.get("paused"))
+        targets = _series_replicas_for_queue(queue, series)
+        for target in targets:
+            if db.series_action(int(target["id"]), "run_now"):
+                woken_series.append(int(target["id"]))
+        woke = bool(woken_series)
+        paused = any(bool(target.get("paused")) for target in targets)
     _discard_cache(profile_id)
     return {
         "ok": True, "profile_id": profile_id, "queue_id": queue_id,
         "kind": kind, "number": number, "level": level,
         "label": selected, "run_now": run_now, "series_woken": woke,
-        "series_paused": paused,
+        "series_woken_count": len(woken_series),
+        "series_woken_ids": woken_series, "series_paused": paused,
     }
 
 
@@ -1625,60 +1627,77 @@ def _adaptive_cadence_policy(queue: dict) -> dict | None:
     }
 
 
-def _adaptive_cadence_status(queue: dict, matching: dict | None,
+def _matching_series_list(matching) -> list[dict]:
+    if isinstance(matching, dict):
+        return [matching]
+    if isinstance(matching, list):
+        return [item for item in matching if isinstance(item, dict)]
+    return []
+
+
+def _adaptive_cadence_status(queue: dict, matching,
                              backlog: int | None) -> dict | None:
     policy = _adaptive_cadence_policy(queue)
     if policy is None:
         return None
+    matches = _matching_series_list(matching)
     busy = bool(
         policy["busy_recurrence"] is not None
         and isinstance(backlog, int)
         and backlog > policy["backlog_above"]
     )
-    temporary = matching.get("temporary_recurrence") if matching else None
-    empty_count = int(matching.get("temporary_empty_count") or 0) if matching else 0
+    temporary = [item.get("temporary_recurrence") for item in matches]
+    empty_counts = [int(item.get("temporary_empty_count") or 0)
+                    for item in matches]
     draining = bool(
         not busy and policy["empty_runs_before_idle"]
-        and temporary == policy["busy_recurrence"]
+        and any(value == policy["busy_recurrence"] for value in temporary)
     )
     mode = "busy" if busy else "draining" if draining else (
         "event" if policy["event_wake"] else "idle")
+    recurrences = list(dict.fromkeys(
+        item.get("effective_recurrence") for item in matches
+        if item.get("effective_recurrence")))
     return {
         **policy,
         "mode": mode,
         "effective_recurrence": (
-            matching.get("effective_recurrence") if matching else None),
-        "empty_runs": empty_count,
-        "series_present": matching is not None,
+            recurrences[0] if len(recurrences) == 1 else
+            ", ".join(recurrences) if recurrences else None),
+        "empty_runs": min(empty_counts) if empty_counts else 0,
+        "series_present": bool(matches),
+        "series_count": len(matches),
     }
 
 
 def _reconcile_adaptive_cadence(
-        queue: dict, matching: dict | None, backlog: int | None,
+        queue: dict, matching, backlog: int | None,
         publication_guard: dict | None = None) -> dict | None:
     """Apply cadence only during a successful live queue observation."""
     policy = _adaptive_cadence_policy(queue)
-    if policy is None or matching is None or not isinstance(backlog, int):
+    matches = _matching_series_list(matching)
+    if policy is None or not matches or not isinstance(backlog, int):
         return _adaptive_cadence_status(queue, matching, backlog)
     boost = bool(
         policy["busy_recurrence"] is not None
         and backlog > policy["backlog_above"])
-    result = db.apply_pipeline_series_cadence(
-        int(matching["id"]),
-        idle_recurrence=policy["idle_recurrence"],
-        busy_recurrence=policy["busy_recurrence"],
-        boost=boost,
-        empty_runs_before_idle=policy["empty_runs_before_idle"],
-        publication_guard=publication_guard,
-    )
-    if result is not None:
-        matching.update({
-            "recurrence": result["base_recurrence"],
-            "effective_recurrence": result["effective_recurrence"],
-            "temporary_recurrence": result["temporary_recurrence"],
-            "temporary_empty_limit": result["temporary_empty_limit"],
-            "temporary_empty_count": result["temporary_empty_count"],
-        })
+    for item in matches:
+        result = db.apply_pipeline_series_cadence(
+            int(item["id"]),
+            idle_recurrence=policy["idle_recurrence"],
+            busy_recurrence=policy["busy_recurrence"],
+            boost=boost,
+            empty_runs_before_idle=policy["empty_runs_before_idle"],
+            publication_guard=publication_guard,
+        )
+        if result is not None:
+            item.update({
+                "recurrence": result["base_recurrence"],
+                "effective_recurrence": result["effective_recurrence"],
+                "temporary_recurrence": result["temporary_recurrence"],
+                "temporary_empty_limit": result["temporary_empty_limit"],
+                "temporary_empty_count": result["temporary_empty_count"],
+            })
     return _adaptive_cadence_status(queue, matching, backlog)
 
 
@@ -1980,6 +1999,19 @@ def worker_lane_policy() -> dict | None:
                 "queues": list(queues), "borrow": borrow,
                 "order": len(lanes),
             })
+        for queue in profile.get("queues", []):
+            replicas = _queue_replica_count(queue)
+            if replicas <= 1:
+                continue
+            queue_id = str(queue.get("id"))
+            eligible = sum(
+                lane["profile_id"] == profile_id and queue_id in lane["queues"]
+                for lane in lanes
+            )
+            if eligible < replicas:
+                raise ValueError(
+                    f"очередь {profile_id}/{queue_id} настроена на {replicas} "
+                    f"реплики, но доступна только в {eligible} scheduler lanes")
     return {"profiles": profiles, "lanes": lanes} if lanes else None
 
 
@@ -2130,16 +2162,27 @@ def _wake_ready_queues(profile_id: str, profile: dict, data: dict,
             continue
         latch_key = _wake_latch_key(profile_id, str(queue.get("id")))
         fingerprint = _wake_fingerprint(diagnostics, condition)
+        targets = [item for item in _series_replicas_for_queue(queue, series)
+                   if not item.get("paused")]
+        replicated = _queue_replica_count(queue) > 1
         if fingerprint is None:
-            db.wake_series_once(
-                None, latch_key, None, cache_guard=cache_guard)
+            if replicated:
+                db.wake_series_group_once(
+                    [], latch_key, None, cache_guard=cache_guard)
+            else:
+                db.wake_series_once(
+                    None, latch_key, None, cache_guard=cache_guard)
             continue
-        target = next((item for item in series
-                       if marker in str(item.get("title", "")).lower()
-                       and not item.get("ended") and not item.get("paused")), None)
-        if target and db.wake_series_once(
+        if replicated:
+            woke = db.wake_series_group_once(
+                [int(item["id"]) for item in targets], latch_key, fingerprint,
+                cache_guard=cache_guard)
+        else:
+            target = targets[0] if targets else None
+            woke = bool(target and db.wake_series_once(
                 int(target["id"]), latch_key, fingerprint,
-                cache_guard=cache_guard):
+                cache_guard=cache_guard))
+        if woke:
             woken.append(str(queue.get("id")))
     return woken
 
@@ -2172,12 +2215,13 @@ def _wake_configured_successors(profile: dict, queue: dict,
             raise ValueError(
                 "wake_after_success может будить только очередь с project "
                 f"execution preflight: {queue_id}")
-        target = _series_for_queue(target_queue, series)
-        if (not target or target.get("ended") or target.get("ended_at")
-                or target.get("paused")):
-            continue
-        wake = db.request_pipeline_series_wake(int(target["id"]))
-        if wake.get("accepted"):
+        targets = [item for item in _series_replicas_for_queue(target_queue, series)
+                   if not item.get("paused")]
+        accepted = False
+        for target in targets:
+            wake = db.request_pipeline_series_wake(int(target["id"]))
+            accepted = accepted or bool(wake.get("accepted"))
+        if accepted:
             woken.append(queue_id)
     return woken
 
@@ -2283,14 +2327,26 @@ def _tool_available(execution: dict, command: list[str], working_dir: str | None
     return True, "инструмент доступен"
 
 
-def _tool_preflight(execution: dict, command: list[str], working_dir: str | None) -> dict:
+def _tool_preflight(execution: dict, command: list[str], working_dir: str | None,
+                    *, env_extra: dict[str, str] | None = None) -> dict:
     root = Path(working_dir or os.getcwd())
+    environment = os.environ.copy()
+    # Replica identity is per claimed task, never process-global operator
+    # configuration. A stale shell variable must not opt a legacy queue into
+    # replicated election without the scheduler's reservation contract.
+    environment.pop("PP_TASK_ID", None)
+    environment.pop("PP_TASK_STARTED_AT", None)
+    environment.pop("PP_PIPELINE_REPLICAS", None)
+    environment.pop("PP_PROVIDER_OWNERSHIP_KIND", None)
+    environment.pop("PP_PIPELINE_TARGET_TOKEN", None)
+    if env_extra:
+        environment.update(env_extra)
     try:
         _ensure_github_scan_lease(renew=True)
         result = subprocess.run(
             command, cwd=str(root), capture_output=True, text=True,
             timeout=max(1, min(int(execution.get("timeout_seconds", 180)), 900)),
-            encoding="utf-8", errors="replace",
+            encoding="utf-8", errors="replace", env=environment,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise RuntimeError(f"pipeline preflight не выполнен: {exc}") from exc
@@ -2408,8 +2464,62 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
     if matched is None:
         return {"action": "prompt", "mode": "skill", "prompt": fallback_prompt}
     profile_id, profile, queue = matched
+    try:
+        replica_count = _queue_replica_count(queue)
+    except ValueError as exc:
+        return {
+            "action": "block", "mode": "tool", "reason": str(exc),
+            "profile_id": profile_id, "queue_id": queue.get("id"),
+        }
+    replicated = replica_count > 1
+    if replicated:
+        replica_status = _queue_replica_status(queue, db.list_series())
+        stage_name = str((queue.get("execution") or {}).get("stage")
+                         or queue.get("id") or "").lower()
+        issues = list(replica_status["issues"])
+        if stage_name != "review":
+            issues.append("replicas > 1 сейчас поддерживаются только для REVIEW")
+        if getattr(task, "machine", None):
+            issues.append("реплицированная REVIEW-задача должна выполняться локально")
+        if getattr(task, "worktree", False):
+            issues.append(
+                "реплицированная REVIEW-задача требует постоянный отдельный working_dir, "
+                "а не динамический worktree")
+        if getattr(task, "detached", False):
+            issues.append(
+                "реплицированная REVIEW-задача не может запускаться detached")
+        if getattr(task, "herdr_target", None):
+            issues.append(
+                "реплицированная REVIEW-задача не может использовать пользовательский herdr_target")
+        current_replica = next((
+            item for item in replica_status["matching"]
+            if int(item.get("id")) == int(task.series_id)
+        ), None)
+        if current_replica is None:
+            issues.append("текущая серия не входит в настроенный набор реплик")
+        elif os.path.normcase(os.path.realpath(str(working_dir or ""))) != \
+                os.path.normcase(os.path.realpath(
+                    str(current_replica.get("working_dir") or ""))):
+            issues.append("working_dir текущей задачи не совпадает с её replica series")
+        if issues:
+            return {
+                "action": "block", "mode": "tool",
+                "reason": "небезопасная конфигурация pipeline replicas: "
+                          + "; ".join(dict.fromkeys(issues)),
+                "profile_id": profile_id, "queue_id": queue.get("id"),
+                "replica_status": {
+                    key: value for key, value in replica_status.items()
+                    if key != "matching"
+                },
+            }
     execution = queue.get("execution")
     if not isinstance(execution, dict):
+        if replicated:
+            return {
+                "action": "block", "mode": "tool",
+                "reason": "replicas > 1 требуют project execution preflight",
+                "profile_id": profile_id, "queue_id": queue.get("id"),
+            }
         with _github_scan_admission(
                 profile, f"pipeline task {profile_id}/{queue.get('id')}",
                 profile_id=profile_id, budget_route="skill") as admission:
@@ -2435,6 +2545,12 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
             "profile_id": profile_id, "queue_id": queue.get("id"),
         }
     if mode == "skill":
+        if replicated:
+            return {
+                "action": "block", "mode": "skill",
+                "reason": "replicas > 1 несовместимы с execution.mode=skill",
+                "profile_id": profile_id, "queue_id": queue.get("id"),
+            }
         with _github_scan_admission(
                 profile, f"pipeline task {profile_id}/{queue.get('id')}",
                 profile_id=profile_id, budget_route="skill") as admission:
@@ -2474,7 +2590,7 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                 profile_id,
                 profile, queue)
         if not available:
-            if mode == "auto":
+            if mode == "auto" and not replicated:
                 admission = _reserve_execution_admission(
                     task, profile_id, profile, queue, admission, "skill",
                     retain_budget=retain_budget)
@@ -2491,7 +2607,41 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                 "profile_id": profile_id, "queue_id": queue.get("id"),
             }
         try:
-            preflight = _tool_preflight(execution, command, working_dir)
+            if replicated:
+                # Both worktrees must reserve in the scheduler's actual DB.
+                # Do not let a project-local .env silently select one DB per
+                # checkout and destroy cross-replica atomicity.
+                scheduler_data_dir = str(Path(db.DB_PATH).resolve().parent)
+                configured_key = os.environ.get("PP_PIPELINE_LEASE_KEY_FILE")
+                scheduler_lease_key = str(
+                    (Path(configured_key) if configured_key else
+                     Path(scheduler_data_dir) / "pipeline-lease.key").resolve())
+                task_started_at = getattr(task, "started_at", None)
+                if not isinstance(task_started_at, datetime):
+                    raise RuntimeError(
+                        "replicated pipeline task has no claimed attempt timestamp")
+                if task_started_at.tzinfo is None:
+                    task_started_at = task_started_at.astimezone()
+                scheduler_task_started_at = task_started_at.astimezone(
+                    timezone.utc).isoformat()
+                provider_cfg = load_providers().get(
+                    getattr(task, "provider", None) or DEFAULT_CLI, {})
+                provider_ownership_kind = (
+                    "herdr" if provider_cfg.get("executor") == "herdr"
+                    else "headless")
+                preflight = _tool_preflight(
+                    execution, command, working_dir,
+                    env_extra={
+                        "PP_TASK_ID": str(task.id),
+                        "PP_TASK_STARTED_AT": scheduler_task_started_at,
+                        "PP_PIPELINE_REPLICAS": str(replica_count),
+                        "PP_PROVIDER_OWNERSHIP_KIND": provider_ownership_kind,
+                        "PP_DATA_DIR": scheduler_data_dir,
+                        "PP_PIPELINE_LEASE_KEY_FILE": scheduler_lease_key,
+                    },
+                )
+            else:
+                preflight = _tool_preflight(execution, command, working_dir)
         except _GitHubScanLeaseFailure as exc:
             return _budget_defer_route(
                 _replace_admission_with_lease_failure(
@@ -2500,7 +2650,7 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                 profile, queue)
         except RuntimeError as exc:
             reason = str(exc)
-            if mode == "auto":
+            if mode == "auto" and not replicated:
                 admission = _reserve_execution_admission(
                     task, profile_id, profile, queue, admission, "skill",
                     retain_budget=retain_budget)
@@ -2518,6 +2668,50 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
             }
 
         preflight_action = preflight["action"].lower()
+        target_reservation = None
+        if replicated and preflight_action in {"audit", "fallback"}:
+            try:
+                from . import project_pipeline
+
+                if preflight_action == "audit":
+                    lease = project_pipeline.decode_signed_lease(
+                        str(preflight.get("lease") or ""))
+                else:
+                    handoff = preflight.get("handoff") or {}
+                    lease = project_pipeline.decode_signed_lease(
+                        str(handoff.get("lease") or ""))
+                reservation = lease.get("target_reservation")
+                repository, target_stage, number, head, owner_task, _token = \
+                    project_pipeline._reservation_identity(reservation)
+                target = (lease.get("target") if preflight_action == "fallback"
+                          else {
+                              "stage": lease.get("target_stage") or lease.get("stage"),
+                              "number": lease.get("number"), "head": lease.get("head"),
+                          })
+                preflight_target = preflight.get("target") or {}
+                if (owner_task != int(task.id)
+                        or reservation.get("task_started_at") != scheduler_task_started_at
+                        or reservation.get("ownership_kind") != provider_ownership_kind
+                        or lease.get("pipeline_replicas") != replica_count
+                        or repository != str(profile.get("repository") or "").lower()
+                        or repository != str(lease.get("repository") or "").lower()
+                        or (target_stage, number, head) != (
+                            str(target.get("stage") or "").lower(),
+                            target.get("number"), str(target.get("head") or "").lower())
+                        or (target_stage, number, head) != (
+                            str(preflight_target.get("stage") or "").lower(),
+                            preflight_target.get("number"),
+                            str(preflight_target.get("head") or "").lower())):
+                    raise project_pipeline.PipelineError(
+                        "pipeline target reservation contradicts task, repository, or target")
+                target_reservation = reservation
+            except (project_pipeline.PipelineError, TypeError, ValueError) as exc:
+                return {
+                    "action": "block", "mode": "tool",
+                    "reason": f"replicated REVIEW preflight has no valid reservation: {exc}",
+                    "profile_id": profile_id, "queue_id": queue.get("id"),
+                    "preflight": preflight,
+                }
         provider_route = None
         if preflight_action == "fallback" and mode == "auto":
             provider_route = ("fallback_targeted" if "handoff" in preflight
@@ -2632,8 +2826,18 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                     "gate_command": gate_command, "target": preflight["target"],
                     "fallback_reason": preflight_reason, "profile_id": profile_id,
                     "queue_id": queue.get("id"), "preflight": preflight,
+                    **({"pipeline_replicas": replica_count} if replicated else {}),
+                    **({"pipeline_data_dir": scheduler_data_dir} if replicated else {}),
+                    **({"pipeline_lease_key_file": scheduler_lease_key}
+                       if replicated else {}),
+                    **({"pipeline_target_reservation": target_reservation}
+                       if replicated else {}),
+                    **({"pipeline_task_started_at": scheduler_task_started_at}
+                       if replicated else {}),
+                    **({"pipeline_provider_ownership_kind": provider_ownership_kind}
+                       if replicated else {}),
                 }
-        if mode == "auto":
+        if mode == "auto" and not replicated:
             return {
                 "action": "prompt", "mode": "skill", "prompt": fallback_prompt,
                 "fallback_reason": preflight_reason, "profile_id": profile_id,
@@ -2646,7 +2850,7 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
         }
     if preflight_action not in {"audit", "merge", "cleanup"}:
         reason = f"pipeline preflight вернул неподдерживаемое action={preflight_action}"
-        if mode == "auto":
+        if mode == "auto" and not replicated:
             return {
                 "action": "prompt", "mode": "skill", "prompt": fallback_prompt,
                 "fallback_reason": reason, "profile_id": profile_id,
@@ -2684,6 +2888,16 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
         "action": "prompt", "mode": "tool", "prompt": prompt,
         "command": command, "preflight": preflight,
         "profile_id": profile_id, "queue_id": queue.get("id"),
+        **({"pipeline_replicas": replica_count} if replicated else {}),
+        **({"pipeline_data_dir": scheduler_data_dir} if replicated else {}),
+        **({"pipeline_lease_key_file": scheduler_lease_key}
+           if replicated else {}),
+        **({"pipeline_target_reservation": target_reservation}
+           if replicated else {}),
+        **({"pipeline_task_started_at": scheduler_task_started_at}
+           if replicated else {}),
+        **({"pipeline_provider_ownership_kind": provider_ownership_kind}
+           if replicated else {}),
     }
 
 
@@ -2781,7 +2995,8 @@ def _pipeline_runtime(matching_series: list[dict], now: datetime) -> dict:
 
 
 def _health(backlog: int, windows: dict, broken_series: int, paused_series: int = 0,
-            diagnostics: dict | None = None, runtime: dict | None = None) -> dict:
+            diagnostics: dict | None = None, runtime: dict | None = None,
+            invalid_replica_queues: list[dict] | None = None) -> dict:
     if runtime and runtime.get("required") and runtime.get("state") != "online":
         age = runtime.get("age_seconds")
         detail = f"; последний heartbeat {age} сек назад" if age is not None else ""
@@ -2791,6 +3006,17 @@ def _health(backlog: int, windows: dict, broken_series: int, paused_series: int 
         tasks = ", ".join(f"#{item['task_id']}" for item in runtime["stalled"])
         return {"state": "red", "label": "зависший запуск",
                 "reason": f"превышен task timeout: {tasks}"}
+    if invalid_replica_queues:
+        details = []
+        for queue in invalid_replica_queues:
+            issues = (queue.get("replica_status") or {}).get("issues") or []
+            suffix = f": {'; '.join(str(issue) for issue in issues)}" if issues else ""
+            details.append(f"{queue.get('id') or '?'}{suffix}")
+        return {
+            "state": "red", "label": "невалидная конфигурация реплик",
+            "reason": "очереди без безопасной исполнимой ёмкости — "
+                      + " | ".join(details),
+        }
     if broken_series:
         return {"state": "red", "label": "требует внимания",
                 "reason": f"оборванных серий: {broken_series}"}
@@ -2848,12 +3074,196 @@ def _profile_active(profile: dict, series: list[dict]) -> bool:
                if queue.get("series_contains"))
 
 
-def _series_for_queue(queue: dict, series: list[dict]) -> dict | None:
+def _queue_replica_count(queue: dict) -> int:
+    value = queue.get("replicas", 1)
+    if (isinstance(value, bool) or not isinstance(value, int)
+            or not 1 <= value <= 16):
+        raise ValueError("replicas должен быть целым числом от 1 до 16")
+    return value
+
+
+def _series_replicas_for_queue(queue: dict, series: list[dict]) -> list[dict]:
     marker = str(queue.get("series_contains") or "").lower()
     if not marker:
-        return None
-    return next((item for item in series
-                 if marker in str(item.get("title") or "").lower()), None)
+        return []
+    matching = [item for item in series
+                if marker in str(item.get("title") or "").lower()
+                and not item.get("ended") and not item.get("ended_at")]
+    # Preserve the historical first-match behavior unless the operator opted
+    # into replicas explicitly. A broad legacy marker must not wake multiple
+    # unreserved tasks merely because an accidental duplicate series exists.
+    return matching if _queue_replica_count(queue) > 1 else matching[:1]
+
+
+def _local_directory_identity(path: Path) -> tuple[int, int]:
+    """Filesystem identity, including case-insensitive and symlink aliases."""
+    stat_result = os.stat(path)
+    return int(stat_result.st_dev), int(stat_result.st_ino)
+
+
+def _queue_replica_status(queue: dict, series: list[dict]) -> dict:
+    """Validate an opt-in local replica set and expose every matched series."""
+    configured = _queue_replica_count(queue)
+    matching = _series_replicas_for_queue(queue, series)
+    issues = []
+    if configured > 1 and len(matching) != configured:
+        issues.append(
+            f"ожидалось реплик: {configured}, найдено активных серий: {len(matching)}")
+    if configured > 1 and CONCURRENCY < configured:
+        issues.append(
+            f"PP_CONCURRENCY={CONCURRENCY} меньше числа реплик {configured}")
+    seen_paths = {}
+    rendered = []
+    for item in matching:
+        working_dir = str(item.get("working_dir") or "").strip()
+        normalized = None
+        if configured > 1:
+            if item.get("machine"):
+                issues.append(
+                    f"серия #{item.get('id')} удалённая; реплики требуют общий локальный SQLite")
+            if item.get("worktree"):
+                issues.append(
+                    f"серия #{item.get('id')} использует динамический worktree; "
+                    "репликам нужен постоянный отдельный working_dir")
+            if item.get("detached"):
+                issues.append(
+                    f"серия #{item.get('id')} запускается detached; "
+                    "репликам требуется управляемый lifetime провайдера")
+            if item.get("herdr_target"):
+                issues.append(
+                    f"серия #{item.get('id')} использует пользовательский herdr_target")
+            if not working_dir:
+                issues.append(f"у серии #{item.get('id')} не задан working_dir")
+            else:
+                path = Path(working_dir).expanduser()
+                if not path.is_absolute():
+                    issues.append(
+                        f"working_dir серии #{item.get('id')} должен быть абсолютным")
+                else:
+                    if not path.is_dir():
+                        issues.append(
+                            f"working_dir серии #{item.get('id')} не существует: {working_dir}")
+                    else:
+                        try:
+                            normalized = _local_directory_identity(path)
+                        except OSError as exc:
+                            issues.append(
+                                f"working_dir серии #{item.get('id')} недоступен: {exc}")
+                        if normalized is not None:
+                            previous = seen_paths.get(normalized)
+                            if previous is not None:
+                                issues.append(
+                                    f"серии #{previous} и #{item.get('id')} "
+                                    "используют один working_dir")
+                            else:
+                                seen_paths[normalized] = item.get("id")
+        rendered.append({
+            "series_id": item.get("id"), "title": item.get("title"),
+            "working_dir": working_dir or None,
+            "task_id": item.get("next_task_id"),
+            "task_status": item.get("next_status"),
+            "interval": item.get("effective_recurrence"),
+            "paused": bool(item.get("paused")),
+            "broken": bool(item.get("broken")),
+            "worktree": bool(item.get("worktree")),
+            "detached": bool(item.get("detached")),
+            "herdr_target": item.get("herdr_target"),
+            "failure_rate": item.get("failure_rate"),
+            "empty_rate": item.get("empty_rate"),
+            "avg_duration_seconds": item.get("avg_duration_seconds"),
+        })
+    return {
+        "configured": configured,
+        "present": len(matching),
+        "active": sum(not item.get("paused") and not item.get("broken")
+                      for item in matching),
+        "valid": not issues,
+        "issues": issues,
+        "series": rendered,
+        "matching": matching,
+    }
+
+
+def _queue_replica_projection(queue: dict, series: list[dict],
+                              capacity: int) -> dict:
+    status = _queue_replica_status(queue, series)
+    matching = status["matching"]
+    primary = matching[0] if matching else None
+    active = int(status["active"])
+    replicated = int(status["configured"]) > 1
+    effective_replicas = active if (not replicated or status["valid"]) else 0
+    recurrences = list(dict.fromkeys(
+        item.get("effective_recurrence") for item in matching
+        if item.get("effective_recurrence")))
+    parseable = [(value, _interval_hours(value)) for value in recurrences]
+    parseable = [(value, hours) for value, hours in parseable if hours is not None]
+    interval = (max(parseable, key=lambda pair: pair[1])[0] if parseable
+                else recurrences[0] if recurrences else None)
+    durations = [int(item["avg_duration_seconds"]) for item in matching
+                 if item.get("avg_duration_seconds") is not None]
+    failures = [float(item.get("failure_rate") or 0) for item in matching]
+    empties = [float(item.get("empty_rate") or 0) for item in matching]
+    public_status = {key: value for key, value in status.items()
+                     if key != "matching"}
+    return {
+        "matching": matching,
+        "primary": primary,
+        "replica_count": status["configured"],
+        "replicas_present": status["present"],
+        "replicas_active": active,
+        "replica_status": public_status,
+        "series_replicas": public_status["series"],
+        "parallel_capacity": capacity * effective_replicas,
+        "interval": interval,
+        "avg_duration_seconds": (
+            round(sum(durations) / len(durations)) if durations else None),
+        "failure_rate": (
+            round(sum(failures) / len(failures), 3) if failures else None),
+        "empty_rate": round(sum(empties) / len(empties), 3) if empties else None,
+    }
+
+
+def _replica_recommendation(queue: dict, backlog: int, projection: dict,
+                            target_hours: float) -> dict:
+    capacity = int(projection["parallel_capacity"])
+    if capacity > 0:
+        return _recommendation(
+            queue, backlog, capacity, projection["interval"], target_hours,
+            projection["avg_duration_seconds"],
+        )
+    invalid = not bool(projection["replica_status"].get("valid", True))
+    return {
+        "recommended_interval": None, "eta_hours": None,
+        "recommendation": (
+            "невалидная конфигурация реплик — исправьте series/working_dir"
+            if invalid else
+            "нет активных реплик — восстановите или возобновите серию"
+        ),
+        "avg_duration_seconds": projection["avg_duration_seconds"],
+        "cycle_hours": None, "throughput_per_hour": 0,
+    }
+
+
+def _replica_runs_needed(backlog: int, projection: dict) -> float | None:
+    capacity = int(projection["parallel_capacity"])
+    return round(backlog / capacity, 1) if capacity > 0 else None
+
+
+def _bottleneck_rank(queue: dict) -> float:
+    """Rank a positive backlog with no executable capacity as a hard stall."""
+    backlog = queue.get("backlog")
+    if not isinstance(backlog, int) or backlog <= 0:
+        return 0
+    if queue.get("eta_hours") is not None:
+        return float(queue["eta_hours"])
+    if queue.get("runs_needed") is not None:
+        return float(queue["runs_needed"])
+    return math.inf
+
+
+def _series_for_queue(queue: dict, series: list[dict]) -> dict | None:
+    matching = _series_replicas_for_queue(queue, series)
+    return matching[0] if matching else None
 
 
 def _unknown_recommendation() -> dict:
@@ -2912,28 +3322,27 @@ def _refresh_local_state(result: dict, profile: dict, series: list[dict], *,
 
     for queue in data.get("queues", []):
         config = queue_configs.get(str(queue.get("id")), {})
-        matching = _series_for_queue(config, series)
-        if matching:
-            matching_series.append(matching)
-            series_ids.append(int(matching["id"]))
-            broken_series += int(bool(matching.get("broken")))
-            paused_series += int(bool(matching.get("paused")))
+        capacity = max(1, int(config.get("capacity", queue.get("capacity", 1))))
+        projection = _queue_replica_projection(config, series, capacity)
+        matches = projection.pop("matching")
+        matching = projection.pop("primary")
+        if matches:
+            matching_series.extend(matches)
+            series_ids.extend(int(item["id"]) for item in matches)
+            broken_series += sum(int(bool(item.get("broken"))) for item in matches)
+            paused_series += sum(int(bool(item.get("paused"))) for item in matches)
         queue.update({
-            "capacity": max(1, int(config.get("capacity", queue.get("capacity", 1)))),
+            "capacity": capacity,
             "series_id": matching["id"] if matching else None,
             "task_id": matching.get("next_task_id") if matching else None,
             "task_status": matching.get("next_status") if matching else None,
-            "interval": matching.get("effective_recurrence") if matching else None,
-            "failure_rate": matching.get("failure_rate") if matching else None,
-            "empty_rate": matching.get("empty_rate") if matching else None,
+            **projection,
         })
         backlog = queue.get("backlog")
         if isinstance(backlog, int):
-            queue["runs_needed"] = round(backlog / queue["capacity"], 1)
-            queue.update(_recommendation(
-                config, backlog, queue["capacity"], queue["interval"], target_hours,
-                matching.get("avg_duration_seconds") if matching else None,
-            ))
+            queue["runs_needed"] = _replica_runs_needed(backlog, queue)
+            queue.update(_replica_recommendation(
+                config, backlog, queue, target_hours))
         else:
             queue["runs_needed"] = None
             queue.update(_unknown_recommendation())
@@ -2946,14 +3355,12 @@ def _refresh_local_state(result: dict, profile: dict, series: list[dict], *,
         queue["wake"] = (_wake_status(data["profile_id"], config, diagnostics)
                          if isinstance(diagnostics, dict) else None)
         queue["adaptive_cadence"] = _adaptive_cadence_status(
-            config, matching, backlog if isinstance(backlog, int) else None)
+            config, matches, backlog if isinstance(backlog, int) else None)
 
     bottleneck = max(
         (queue for queue in data.get("queues", [])
          if isinstance(queue.get("backlog"), int)),
-        key=lambda queue: (queue["eta_hours"]
-                           if queue.get("eta_hours") is not None
-                           else queue["runs_needed"]),
+        key=_bottleneck_rank,
         default=None,
     )
     data["bottleneck"] = (
@@ -2961,18 +3368,22 @@ def _refresh_local_state(result: dict, profile: dict, series: list[dict], *,
 
     activity = db.pipeline_series_activity(series_ids)
     empty_runs = db.pipeline_run_metrics([], now - timedelta(hours=5))
-    metrics_by_series = {}
     aggregate_runs = dict(empty_runs)
     for queue in data.get("queues", []):
-        queue["last_run"] = activity.get(queue.get("series_id"))
-        series_id = queue.get("series_id")
-        if series_id is not None and series_id not in metrics_by_series:
-            metrics = db.pipeline_run_metrics(
-                [series_id], now - timedelta(hours=5))
-            metrics_by_series[series_id] = metrics
-            for key, value in metrics.items():
-                aggregate_runs[key] = aggregate_runs.get(key, 0) + value
-        queue["runs_5h"] = metrics_by_series.get(series_id, dict(empty_runs))
+        queue_series_ids = [int(item["series_id"])
+                            for item in queue.get("series_replicas", [])
+                            if item.get("series_id") is not None]
+        last_runs = [activity[value] for value in queue_series_ids
+                     if value in activity]
+        queue["last_run"] = max(
+            last_runs, key=lambda value: value.get("at") or "", default=None)
+        metrics = db.pipeline_run_metrics(
+            queue_series_ids, now - timedelta(hours=5))
+        queue["runs_5h"] = metrics
+        for replica in queue.get("series_replicas", []):
+            replica["last_run"] = activity.get(replica.get("series_id"))
+        for key, value in metrics.items():
+            aggregate_runs[key] = aggregate_runs.get(key, 0) + value
 
     history = data.get("history")
     if not isinstance(history, dict):
@@ -3013,9 +3424,16 @@ def _refresh_local_state(result: dict, profile: dict, series: list[dict], *,
 
     runtime = _pipeline_runtime(matching_series, now)
     backlog_total = data.get("backlog_total")
+    invalid_replica_queues = [
+        queue for queue in data.get("queues", [])
+        if isinstance(queue.get("backlog"), int) and queue["backlog"] > 0
+        and isinstance(queue.get("replica_status"), dict)
+        and not queue["replica_status"].get("valid", True)
+    ]
     health = _health(
         backlog_total if isinstance(backlog_total, int) else 0,
         history, broken_series, paused_series, diagnostics, runtime,
+        invalid_replica_queues,
     )
     if source == "none" and health.get("state") in {"green", "warming"}:
         health = {
@@ -3068,14 +3486,13 @@ def _snapshot_fallback(profile_id: str, profile: dict,
         for member in members:
             if member.get("key"):
                 all_items[member["key"]] = member
-        matching = _series_for_queue(config, series)
         capacity = max(1, int(config.get("capacity", 1)))
-        recommendation = (_recommendation(
-            config, backlog, capacity,
-            matching.get("effective_recurrence") if matching else None,
-            target_hours,
-            matching.get("avg_duration_seconds") if matching else None,
-        ) if isinstance(backlog, int) else _unknown_recommendation())
+        projection = _queue_replica_projection(config, series, capacity)
+        projection.pop("matching")
+        projection.pop("primary")
+        recommendation = (_replica_recommendation(
+            config, backlog, projection, target_hours)
+            if isinstance(backlog, int) else _unknown_recommendation())
         ordered_members = copy.deepcopy(members)
         if priority_settings:
             for member in ordered_members:
@@ -3087,12 +3504,13 @@ def _snapshot_fallback(profile_id: str, profile: dict,
         queues.append({
             "id": config["id"], "title": config["title"], "backlog": backlog,
             "capacity": capacity,
-            "runs_needed": round(backlog / capacity, 1)
+            "runs_needed": _replica_runs_needed(backlog, projection)
             if isinstance(backlog, int) else None,
             "membership_complete": bool(saved.get("membership_complete")),
             "age": _age_stats(members, now),
             "items": ordered_members[:priority_settings["max_items"]]
             if priority_settings else [],
+            **projection,
             **recommendation,
         })
 
@@ -3120,8 +3538,7 @@ def _snapshot_fallback(profile_id: str, profile: dict,
     if complete_backlog:
         bottleneck = max(
             queues,
-            key=lambda queue: queue["eta_hours"] if queue.get("eta_hours") is not None
-            else queue["runs_needed"],
+            key=_bottleneck_rank,
             default=None,
         )
         result["bottleneck"] = (
@@ -3475,20 +3892,21 @@ def _analyze_without_budget(profile_id: str, series: list[dict], *,
                            and int(member["number"]) in allowed_numbers}
             all_items.update(members)
             capacity = max(1, int(item.get("capacity", 1)))
-            matching = next((s for s in series
-                             if item.get("series_contains", "").lower() in s["title"].lower()), None)
-            if matching:
-                matching_series.append(matching)
-                series_ids.append(matching["id"])
-                broken_series += int(bool(matching.get("broken")))
-                paused_series += int(bool(matching.get("paused")))
-            cadence = _adaptive_cadence_status(item, matching, backlog)
-            cadence_reconciliations.append((item, matching, backlog))
-            runs_needed = round(backlog / capacity, 1)
-            recommendation = _recommendation(
-                item, backlog, capacity,
-                matching["effective_recurrence"] if matching else None, target_hours,
-                matching.get("avg_duration_seconds") if matching else None)
+            projection = _queue_replica_projection(item, series, capacity)
+            matches = projection.pop("matching")
+            matching = projection.pop("primary")
+            if matches:
+                matching_series.extend(matches)
+                series_ids.extend(int(value["id"]) for value in matches)
+                broken_series += sum(int(bool(value.get("broken")))
+                                     for value in matches)
+                paused_series += sum(int(bool(value.get("paused")))
+                                     for value in matches)
+            cadence = _adaptive_cadence_status(item, matches, backlog)
+            cadence_reconciliations.append((item, matches, backlog))
+            runs_needed = _replica_runs_needed(backlog, projection)
+            recommendation = _replica_recommendation(
+                item, backlog, projection, target_hours)
             age = _age_stats(list(members.values()), now)
             membership_complete = all(search["membership_complete"] for search in searches)
             ordered_members = list(members.values())
@@ -3507,9 +3925,7 @@ def _analyze_without_budget(profile_id: str, series: list[dict], *,
                 "series_id": matching["id"] if matching else None,
                 "task_id": matching.get("next_task_id") if matching else None,
                 "task_status": matching.get("next_status") if matching else None,
-                "interval": matching["effective_recurrence"] if matching else None,
-                "failure_rate": matching["failure_rate"] if matching else None,
-                "empty_rate": matching["empty_rate"] if matching else None,
+                **projection,
                 "membership_complete": membership_complete, "age": age,
                 "items": ordered_members[:priority_settings["max_items"]]
                 if priority_settings else [],
@@ -3541,19 +3957,32 @@ def _analyze_without_budget(profile_id: str, series: list[dict], *,
 
         bottleneck = max(
             queues,
-            key=lambda q: q["eta_hours"] if q.get("eta_hours") is not None
-            else q["runs_needed"],
+            key=_bottleneck_rank,
             default=None,
         )
         backlog_total = sum(queue["backlog"] for queue in queues)
         activity = db.pipeline_series_activity(series_ids)
         for queue in queues:
-            queue["last_run"] = activity.get(queue.get("series_id"))
+            queue_series_ids = [int(item["series_id"])
+                                for item in queue.get("series_replicas", [])
+                                if item.get("series_id") is not None]
+            last_runs = [activity[value] for value in queue_series_ids
+                         if value in activity]
+            queue["last_run"] = max(
+                last_runs, key=lambda value: value.get("at") or "", default=None)
             queue["runs_5h"] = db.pipeline_run_metrics(
-                [queue["series_id"]] if queue.get("series_id") else [],
+                queue_series_ids,
                 now - timedelta(hours=5),
             )
+            for replica in queue.get("series_replicas", []):
+                replica["last_run"] = activity.get(replica.get("series_id"))
         runtime = _pipeline_runtime(matching_series, now)
+        invalid_replica_queues = [
+            queue for queue in queues
+            if queue.get("backlog", 0) > 0
+            and isinstance(queue.get("replica_status"), dict)
+            and not queue["replica_status"].get("valid", True)
+        ]
         if db.is_paused():
             github_rate_limit = (cached[1].get("github_rate_limit")
                                  if cached else None)
@@ -3574,7 +4003,8 @@ def _analyze_without_budget(profile_id: str, series: list[dict], *,
             "age": _age_stats(list(all_items.values()), now),
             "history": windows,
             "health": _health(
-                backlog_total, windows, broken_series, paused_series, diagnostics, runtime),
+                backlog_total, windows, broken_series, paused_series,
+                diagnostics, runtime, invalid_replica_queues),
             "diagnostics": diagnostics,
             "diagnostics_generated_at": diagnostics_generated_at,
             "github_rate_limit": github_rate_limit,

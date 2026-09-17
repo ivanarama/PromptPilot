@@ -338,6 +338,9 @@ def api_pipeline_item_priority(profile_id: str, queue_id: str, kind: str, number
 
 @app.delete("/api/tasks/{task_id}", response_model=dict)
 def api_delete_task(task_id: int):
+    task = db.get_task(task_id)
+    if task and task.status.value == "running":
+        raise HTTPException(409, "Cancel the running task and wait for it to stop first")
     if not db.delete_task(task_id):
         raise HTTPException(404, "Task not found")
     return {"ok": True}
@@ -346,6 +349,14 @@ def api_delete_task(task_id: int):
 @app.post("/api/tasks/{task_id}/reset", response_model=dict)
 def api_reset_task(task_id: int):
     if not db.reset_task(task_id):
+        task = db.get_task(task_id)
+        if (task and task.status.value == "running"
+                and db.task_has_live_pipeline_target_reservation(task_id)):
+            raise HTTPException(
+                409,
+                "This pipeline task still owns a live provider/target; cancel it "
+                "and wait for cleanup before resetting",
+            )
         raise HTTPException(400, "Task not found or not in running state")
     return {"ok": True}
 

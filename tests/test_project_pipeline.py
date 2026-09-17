@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 import pytest
 
 from promptpilot import project_pipeline as pp
+from promptpilot.models import TaskCreate
 
 
 HEAD = "a" * 40
@@ -733,6 +734,47 @@ def test_complete_review_rechecks_expiry_before_first_mutation(tmp_path, monkeyp
 
     with pytest.raises(pp.PipelineError, match="expired"):
         pp.complete_review(object(), config, pp.encode_signed_lease(lease), str(report))
+
+
+def test_complete_review_requires_live_replica_reservation_before_mutation(
+        isolated_db, tmp_path, monkeypatch):
+    config = {
+        "repository": "owner/repo", "trusted_account": "owner",
+        "base_branch": "main", "review_completion_gate": "target-v1",
+        "target_reservation_ttl_seconds": 300,
+    }
+    current = snapshot()
+    isolated_db.create_task(TaskCreate(prompt="complete review"))
+    owner = isolated_db.get_next_runnable()
+    started_at = owner.started_at.astimezone(timezone.utc).isoformat()
+    reservation = isolated_db.reserve_pipeline_target(
+        "owner/repo", "review", 42, HEAD, owner.id, 300,
+        task_started_at=started_at, ownership_kind="headless")
+    lease = target_review_lease(current)
+    lease.update({
+        "target_stage": "review", "target_reservation": reservation,
+    })
+    report = tmp_path / "report.json"
+    report.write_text(json.dumps({
+        "change": "safe change", "checks": ["pytest"],
+        "blocking": [], "tail": [],
+    }), encoding="utf-8")
+    monkeypatch.setenv("PP_TASK_ID", str(owner.id))
+    monkeypatch.setenv("PP_TASK_STARTED_AT", started_at)
+    monkeypatch.setenv("PP_PROVIDER_OWNERSHIP_KIND", "headless")
+    monkeypatch.setenv("PP_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setattr(pp, "ensure_identity", lambda _gh, _config: None)
+    monkeypatch.setattr(
+        pp, "stable_timeline",
+        lambda _gh, _config, _number: copy.deepcopy(current),
+    )
+    monkeypatch.setattr(
+        pp, "post_comment", lambda *_args: pytest.fail("mutation started"))
+    encoded = pp.encode_signed_lease(lease)
+    isolated_db.release_pipeline_target_reservations(owner.id)
+
+    with pytest.raises(pp.PipelineError, match="expired or was released"):
+        pp.complete_review(object(), config, encoded, str(report))
 
 
 @pytest.mark.parametrize("label", ["hold", "needs-decision", "changes-requested"])

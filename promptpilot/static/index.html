@@ -1149,7 +1149,7 @@ async function loadTasks() {
         <div class="detail-actions">
           ${['pending','rate_limited','running'].includes(t.status) ? `<button class="btn btn-sm btn-ghost" onclick="cancelTask(event,${t.id})">Cancel</button>` : ''}
           ${t.status === 'running' ? `<button class="btn btn-sm btn-ghost" onclick="resetTask(event,${t.id})">Reset to pending</button>` : ''}
-          <button class="btn btn-sm btn-danger" onclick="deleteTask(event,${t.id})">Delete</button>
+          ${t.status !== 'running' ? `<button class="btn btn-sm btn-danger" onclick="deleteTask(event,${t.id})">Delete</button>` : ''}
         </div>
       </div>
     </div>`;
@@ -2762,9 +2762,17 @@ async function loadPipelineInsights(profile, refresh=false) {
       const cadenceLine = cadence
         ? `интервал: ${cadence.mode} · ${cadence.effective_recurrence || 'нет серии'}${cadence.empty_runs_before_idle ? ` · ПУСТО ${cadence.empty_runs}/${cadence.empty_runs_before_idle}` : ''}${cadence.event_wake ? ' · event wake' : ''}`
         : null;
+      const replicaStatus = q.replica_status || {configured:1,present:q.series_id?1:0,active:q.series_id?1:0,valid:true,issues:[],series:[]};
+      const replicaSummary = `реплики: ${replicaStatus.active}/${replicaStatus.configured} активны · найдено ${replicaStatus.present}`;
+      const replicaIssues = replicaStatus.valid ? '' : ` · ошибка: ${(replicaStatus.issues || []).join('; ')}`;
+      const replicaLines = (q.series_replicas || []).map(replica =>
+        `#${replica.series_id} ${replica.task_status || (replica.paused ? 'paused' : replica.broken ? 'broken' : 'idle')} · ${replica.interval || 'без интервала'} · ${replica.working_dir || 'working_dir не задан'}`
+      );
+      const replicaLine = `${replicaSummary}${replicaIssues}${replicaLines.length ? ` · ${replicaLines.join(' | ')}` : ''}`;
       const bottleneck = data.bottleneck===q.id ? 'bottleneck' : '';
-      return `<tr class="${bottleneck}"><td class="insights-stage-title">${data.bottleneck===q.id?'⚠ ':''}${esc(q.title)}</td><td class="num">${q.backlog == null ? '—' : q.backlog}</td><td class="num">${h5.complete?perHour(deltaRateByQueue[q.id] ?? 0):'—'}</td><td class="num">${q.capacity}</td><td class="num">${q.runs_needed == null ? '—' : q.runs_needed}</td><td>${duration(q.avg_duration_seconds)}</td><td>${q.eta_hours == null ? '—' : q.eta_hours+' ч'}</td><td>${age(q.age.oldest_hours)}</td><td>${esc(q.interval || 'нет серии')}</td><td class="insights-recommendation">${esc(q.recommendation || '—')}</td></tr>
-        <tr class="insights-stage-detail ${bottleneck}"><td colspan="10"><div class="insights-stage-meta"><span class="prov-cmd" title="${escAttr(last?.summary || '')}">${esc(lastLine)}</span><span class="prov-cmd">${esc(stageLine)}</span><span class="prov-cmd">${esc(routeLine)}</span>${wakeLine?`<span class="prov-cmd">${esc(wakeLine)}</span>`:''}${cadenceLine?`<span class="prov-cmd">${esc(cadenceLine)}</span>`:''}</div></td></tr>`;
+      const capacity = `${q.capacity} × ${q.replicas_active || 0} = ${q.parallel_capacity}`;
+      return `<tr class="${bottleneck}"><td class="insights-stage-title">${data.bottleneck===q.id?'⚠ ':''}${esc(q.title)}${q.replica_count>1?` ×${q.replica_count}`:''}</td><td class="num">${q.backlog == null ? '—' : q.backlog}</td><td class="num">${h5.complete?perHour(deltaRateByQueue[q.id] ?? 0):'—'}</td><td class="num">${capacity}</td><td class="num">${q.runs_needed == null ? '—' : q.runs_needed}</td><td>${duration(q.avg_duration_seconds)}</td><td>${q.eta_hours == null ? '—' : q.eta_hours+' ч'}</td><td>${age(q.age.oldest_hours)}</td><td>${esc(q.interval || 'нет серии')}</td><td class="insights-recommendation">${esc(q.recommendation || '—')}</td></tr>
+        <tr class="insights-stage-detail ${bottleneck}"><td colspan="10"><div class="insights-stage-meta"><span class="prov-cmd" title="${escAttr(last?.summary || '')}">${esc(lastLine)}</span><span class="prov-cmd">${esc(stageLine)}</span><span class="prov-cmd">${esc(routeLine)}</span><span class="prov-cmd" style="${replicaStatus.valid?'':'color:var(--red)'}">${esc(replicaLine)}</span>${wakeLine?`<span class="prov-cmd">${esc(wakeLine)}</span>`:''}${cadenceLine?`<span class="prov-cmd">${esc(cadenceLine)}</span>`:''}</div></td></tr>`;
     }).join('');
     const priorityHtml = data.priority_control ? `<details style="margin-top:12px" open>
       <summary style="cursor:pointer"><b>Приоритет элементов очереди</b> · P0 выполняется первым, старые задачи повышаются каждые ${data.priority_control.aging_hours} ч до P1</summary>
@@ -2816,7 +2824,7 @@ async function loadPipelineInsights(profile, refresh=false) {
         ${budgetMetric}
       </div>
       ${diagnosticHtml}
-      <table class="insights-table"><colgroup><col class="insights-col-stage"><col class="insights-col-small"><col class="insights-col-small"><col class="insights-col-capacity"><col class="insights-col-capacity"><col class="insights-col-duration"><col class="insights-col-small"><col class="insights-col-oldest"><col class="insights-col-interval"><col class="insights-col-recommendation"></colgroup><thead><tr><th>Этап</th><th class="num">Очередь</th><th class="num">Δ/ч</th><th class="num">За прогон</th><th class="num">Прогонов</th><th>Средний запуск</th><th>ETA</th><th>Самый старый</th><th>Интервал</th><th>Рекомендация</th></tr></thead><tbody>${rows}</tbody></table>
+      <table class="insights-table"><colgroup><col class="insights-col-stage"><col class="insights-col-small"><col class="insights-col-small"><col class="insights-col-capacity"><col class="insights-col-capacity"><col class="insights-col-duration"><col class="insights-col-small"><col class="insights-col-oldest"><col class="insights-col-interval"><col class="insights-col-recommendation"></colgroup><thead><tr><th>Этап</th><th class="num">Очередь</th><th class="num">Δ/ч</th><th class="num">За реплику × активные</th><th class="num">Прогонов</th><th>Средний запуск</th><th>ETA</th><th>Самый старый</th><th>Интервал</th><th>Рекомендация</th></tr></thead><tbody>${rows}</tbody></table>
       ${priorityHtml}
     </div>`;
   } catch(e) { box.innerHTML = `<div style="color:var(--red);margin-bottom:10px">Анализ очереди недоступен: ${esc(e.message)}</div>`; }
@@ -2826,7 +2834,7 @@ async function setPipelineItemPriority(profile, queue, kind, number, level, runN
   try {
     const path = `${API}/pipeline-insights/${encodeURIComponent(profile)}/queues/${encodeURIComponent(queue)}/items/${encodeURIComponent(kind)}/${number}/priority`;
     const result = await fetchJSON(path, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({level,run_now:runNow})});
-    const wake = runNow ? (result.series_woken ? ' Серия поставлена на ближайший запуск.' : result.series_paused ? ' Серия на паузе.' : '') : '';
+    const wake = runNow ? (result.series_woken ? ` Серии поставлены на ближайший запуск: ${result.series_woken_count || 1}.` : result.series_paused ? ' Серии на паузе.' : '') : '';
     toast(level === 'auto' ? `#${number}: автоматический приоритет.${wake}` : `#${number}: ${level.toUpperCase()}.${wake}`, false);
     await loadPipelineInsights(profile, true);
   } catch(e) { toast('Не удалось изменить приоритет: ' + e.message); }

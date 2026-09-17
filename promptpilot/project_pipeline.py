@@ -216,6 +216,7 @@ def validate_review_lease(lease: dict, config: dict) -> None:
             raise PipelineError("signed review lease validity exceeds configured limit")
         if not isinstance(nonce, str) or not re.fullmatch(r"[0-9a-f]{32}", nonce):
             raise PipelineError("signed review lease has an invalid nonce")
+    _validate_lease_reservation(lease, config)
 
 
 class GitHub:
@@ -276,6 +277,7 @@ def load_config(path: str) -> dict:
     data.setdefault("merge_method", "merge")
     data.setdefault("review_completion_gate", "health")
     data.setdefault("review_lease_seconds", 7200)
+    data.setdefault("target_reservation_ttl_seconds", data["review_lease_seconds"])
     data.setdefault("fallback_handoff", "legacy")
     if not isinstance(data["fallback_handoff"], str) or data["fallback_handoff"] not in {"legacy", "target-v1"}:
         raise PipelineError("fallback_handoff must be legacy or target-v1")
@@ -304,6 +306,11 @@ def load_config(path: str) -> dict:
             isinstance(data["review_lease_seconds"], bool) or
             not 300 <= data["review_lease_seconds"] <= 28800):
         raise PipelineError("review_lease_seconds must be an integer from 300 to 28800")
+    if (not isinstance(data["target_reservation_ttl_seconds"], int) or
+            isinstance(data["target_reservation_ttl_seconds"], bool) or
+            not 300 <= data["target_reservation_ttl_seconds"] <= 28800):
+        raise PipelineError(
+            "target_reservation_ttl_seconds must be an integer from 300 to 28800")
     return data
 
 
@@ -1208,10 +1215,233 @@ def capabilities(config: dict) -> dict:
                        "merge": "clean-ordinary-with-cleanup-recovery"},
             "review_completion_gate": config.get("review_completion_gate", "health"),
             "fallback_handoff": config.get("fallback_handoff", "legacy"),
+            "target_reservations": "sqlite-task-lease-v1",
             "fallback": "repository skill"}
 
 
-def fallback_target(config: dict, health: dict, stage: str, target: dict, reason: str) -> dict:
+def _configured_replica_count() -> int:
+    raw = os.environ.get("PP_PIPELINE_REPLICAS", "1")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise PipelineError("PP_PIPELINE_REPLICAS must be an integer") from exc
+    if str(value) != str(raw).strip() or not 1 <= value <= 16:
+        raise PipelineError("PP_PIPELINE_REPLICAS must be an integer from 1 to 16")
+    return value
+
+
+def _pipeline_task_id(*, required: bool) -> int | None:
+    raw = os.environ.get("PP_TASK_ID")
+    if raw is None and not required:
+        return None
+    try:
+        value = int(raw or "")
+    except (TypeError, ValueError) as exc:
+        raise PipelineError("replicated pipeline election requires PP_TASK_ID") from exc
+    if value <= 0 or str(value) != str(raw).strip():
+        raise PipelineError("replicated pipeline election requires a positive PP_TASK_ID")
+    return value
+
+
+def _pipeline_task_started_at(*, required: bool) -> str | None:
+    raw = os.environ.get("PP_TASK_STARTED_AT")
+    if raw is None and not required:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(raw or "").strip())
+    except (TypeError, ValueError) as exc:
+        raise PipelineError(
+            "replicated pipeline election requires PP_TASK_STARTED_AT") from exc
+    if parsed.tzinfo is None:
+        raise PipelineError(
+            "replicated pipeline election requires an aware PP_TASK_STARTED_AT")
+    return str(raw).strip()
+
+
+def _provider_ownership_kind(*, required: bool) -> str | None:
+    value = str(os.environ.get("PP_PROVIDER_OWNERSHIP_KIND") or "").strip().lower()
+    if not value and not required:
+        return None
+    if value not in {"headless", "herdr"}:
+        raise PipelineError(
+            "replicated pipeline election requires "
+            "PP_PROVIDER_OWNERSHIP_KIND=headless|herdr")
+    return value
+
+
+def _reservation_identity(value: dict) -> tuple[str, str, int, str, int, str]:
+    if not isinstance(value, dict):
+        raise PipelineError("pipeline target reservation is missing")
+    repository = str(value.get("repository") or "").strip().lower()
+    stage = str(value.get("stage") or "").strip().lower()
+    number = value.get("number")
+    head = str(value.get("head") or "").strip().lower()
+    task_id = value.get("task_id")
+    token = str(value.get("token") or "")
+    if (not repository or "/" not in repository or not stage
+            or type(number) is not int or number <= 0
+            or not re.fullmatch(r"[0-9a-f]{40}", head)
+            or type(task_id) is not int or task_id <= 0
+            or not re.fullmatch(r"[0-9a-f]{32}", token)):
+        raise PipelineError("pipeline target reservation is invalid")
+    return repository, stage, number, head, task_id, token
+
+
+def _validate_lease_reservation(lease: dict, config: dict) -> dict | None:
+    lease_replicas = lease.get("pipeline_replicas", 1)
+    if (type(lease_replicas) is not int or not 1 <= lease_replicas <= 16):
+        raise PipelineError("pipeline lease has an invalid replica count")
+    configured_replicas = _configured_replica_count()
+    if configured_replicas > 1 and lease_replicas != configured_replicas:
+        raise PipelineError("pipeline lease replica count changed; rerun next review")
+    reservation = lease.get("target_reservation")
+    if reservation is None:
+        if lease_replicas > 1 or configured_replicas > 1:
+            raise PipelineError(
+                "replicated REVIEW lease has no target reservation")
+        return None
+    repository, stage, number, head, task_id, _token = _reservation_identity(
+        reservation)
+    if (repository != str(config["repository"]).lower()
+            or stage != str(lease.get("target_stage") or lease.get("stage") or "").lower()
+            or number != lease.get("number") or head != lease.get("head")):
+        raise PipelineError("pipeline target reservation contradicts its lease")
+    current_task_id = _pipeline_task_id(required=True)
+    if current_task_id != task_id:
+        raise PipelineError("pipeline target reservation belongs to another task")
+    current_attempt = _pipeline_task_started_at(required=True)
+    if reservation.get("task_started_at") != current_attempt:
+        raise PipelineError("pipeline target reservation belongs to another task attempt")
+    if reservation.get("ownership_kind") != _provider_ownership_kind(required=True):
+        raise PipelineError("pipeline target reservation ownership kind changed")
+    return reservation
+
+
+def renew_lease_target_reservation(lease: dict, config: dict) -> dict | None:
+    """Fence the first mutation with the still-live exact target lease."""
+    reservation = _validate_lease_reservation(lease, config)
+    if reservation is None:
+        return None
+    # Keep the scheduler DB a lazy dependency. Plain pipelinectl capabilities,
+    # health and merge operations historically work without opening it.
+    from . import db as scheduler_db
+
+    renewed = scheduler_db.renew_pipeline_target_reservation(
+        reservation, int(config.get(
+            "target_reservation_ttl_seconds",
+            config.get("review_lease_seconds", 7200),
+        )))
+    if renewed is None:
+        raise PipelineError(
+            "pipeline target reservation expired or was released; rerun next review")
+    return renewed
+
+
+def _target_key(value: dict) -> tuple[str, int, str]:
+    try:
+        stage = str(value["stage"]).lower()
+        raw_number = value["number"]
+        if type(raw_number) is not int:
+            raise ValueError("number must be an integer")
+        number = raw_number
+        head = str(value["head"]).lower()
+    except (KeyError, TypeError, ValueError) as exc:
+        raise PipelineError("pipeline health returned an invalid review candidate") from exc
+    if (not stage or number <= 0 or not re.fullmatch(r"[0-9a-f]{40}", head)):
+        raise PipelineError("pipeline health returned an invalid review candidate")
+    return stage, number, head
+
+
+def _review_health_without_targets(health: dict, unavailable: set[tuple]) -> dict:
+    filtered = dict(health)
+    for field in ("review_candidates", "content_review_candidates"):
+        values = health.get(field)
+        if isinstance(values, list):
+            filtered[field] = [value for value in values
+                               if _target_key(value) not in unavailable]
+    return filtered
+
+
+def _elect_review_candidate(config: dict, health: dict,
+                            candidates: list[dict]) -> tuple[dict | None, dict | None, dict]:
+    """Reserve the first free candidate and preserve queue order atomically."""
+    replicas = _configured_replica_count()
+    if replicas == 1:
+        return candidates[0], None, health
+    if (config.get("review_completion_gate") != "target-v1"
+            or config.get("fallback_handoff") != "target-v1"):
+        raise PipelineError(
+            "replicated REVIEW requires review_completion_gate and "
+            "fallback_handoff to be target-v1")
+    task_id = _pipeline_task_id(required=True)
+    task_started_at = _pipeline_task_started_at(required=True)
+    ownership_kind = _provider_ownership_kind(required=True)
+    from . import db as scheduler_db
+
+    unavailable = set()
+    selected = None
+    reservation = None
+    candidate_keys = [_target_key(candidate) for candidate in candidates]
+    own = next((item for item in scheduler_db.list_pipeline_target_reservations(
+        repository=config["repository"])
+                if int(item["task_id"]) == task_id), None)
+    if own is not None:
+        own_key = (own["stage"], int(own["number"]), own["head"])
+        if own_key not in candidate_keys:
+            # One task means one immutable election envelope. A repeated next
+            # after HEAD/eligibility changed must not delete the old fence and
+            # silently start reviewing a different PR.
+            raise PipelineError(
+                "existing pipeline target reservation is no longer eligible; "
+                "start a new task")
+        selected_index = candidate_keys.index(own_key)
+        selected = candidates[selected_index]
+        unavailable.update(candidate_keys[:selected_index])
+        reservation = scheduler_db.reserve_pipeline_target(
+            config["repository"], own["stage"], int(own["number"]), own["head"],
+            task_id, int(config.get(
+                "target_reservation_ttl_seconds",
+                config.get("review_lease_seconds", 7200),
+            )),
+            task_started_at=task_started_at,
+            ownership_kind=ownership_kind,
+        )
+        if reservation is not None:
+            return selected, reservation, _review_health_without_targets(
+                health, unavailable)
+        # The listed lease may have expired and been taken between the read
+        # and the renewal transaction. This task already observed an exact
+        # target, so it must not silently retarget within the same envelope.
+        raise PipelineError(
+            "existing pipeline target reservation was lost; start a new task")
+    for candidate in candidates:
+        target_stage, number, head = _target_key(candidate)
+        reservation = scheduler_db.reserve_pipeline_target(
+            config["repository"], target_stage, number, head, task_id,
+            int(config.get(
+                "target_reservation_ttl_seconds",
+                config.get("review_lease_seconds", 7200),
+            )),
+            task_started_at=task_started_at,
+            ownership_kind=ownership_kind,
+        )
+        if reservation is not None:
+            selected = candidate
+            break
+        unavailable.add((target_stage, number, head))
+    if selected is None:
+        return None, None, health
+
+    # fallback_target's election proof expects its target at the head of the
+    # executable queue. Targets skipped solely because another local replica
+    # owns them are removed from this immutable health view. The later fallback
+    # gate uses the fresh global allowlist in membership mode, not this filter.
+    return selected, reservation, _review_health_without_targets(
+        health, unavailable)
+
+
+def fallback_target(config: dict, health: dict, stage: str, target: dict, reason: str,
+                    *, reservation: dict | None = None) -> dict:
     if config.get("fallback_handoff") != "target-v1":
         return {"action": "fallback", "reason": reason}
     from .fallback_handoff import MERGE_STAGES, REVIEW_STAGES, create
@@ -1220,7 +1450,8 @@ def fallback_target(config: dict, health: dict, stage: str, target: dict, reason
     if not isinstance(target, dict) or target.get("stage") not in allowed:
         return {"action": "fallback", "reason": reason}
 
-    return create(config, health, stage, target, reason)
+    return create(config, health, stage, target, reason,
+                  target_reservation=reservation)
 
 
 def review_empty_reason(health: dict) -> str:
@@ -1246,26 +1477,43 @@ def next_review(gh: GitHub, config: dict, *, config_path: str | None = None) -> 
     candidates = health.get("review_candidates") or []
     if not candidates:
         return {"action": "empty", "verdict": "ПУСТО", "reason": review_empty_reason(health)}
-    item = candidates[0]
+    item, reservation, election_health = _elect_review_candidate(
+        config, health, candidates)
+    if item is None:
+        return {
+            "action": "wait", "verdict": "ПУСТО",
+            "reason": "all current REVIEW targets are reserved by other replicas",
+        }
+    replica_count = _configured_replica_count()
+    if replica_count > 1 and reservation is None:
+        raise PipelineError("replicated REVIEW election did not reserve its target")
     if item.get("stage") == "pre-review-validation":
         if config.get("fallback_handoff") != "target-v1":
             raise PipelineError(
                 "pre-review validation requires the exact-target fallback protocol")
         return fallback_target(
-            config, health, "review", item,
+            config, election_health, "review", item,
             "pre-review sync provenance requires validation and a full content review",
+            reservation=reservation,
         )
     if item.get("stage") != "review":
-        return fallback_target(config, health, "review", item,
-                               "integration/base-sync state requires the full skill")
+        return fallback_target(
+            config, election_health, "review", item,
+            "integration/base-sync state requires the full skill",
+            reservation=reservation,
+        )
     completion_gate = config.get("review_completion_gate", "health")
-    if completion_gate == "target-v1" and not content_review_elected(health, item):
+    if completion_gate == "target-v1" and not content_review_elected(
+            election_health, item):
         if config.get("fallback_handoff") == "target-v1":
             raise PipelineError("health election did not prove the exact content target")
         return {"action": "fallback", "reason": "health election did not prove the exact content target"}
     if int(item.get("review_depth", 0)) >= 2:
-        return fallback_target(config, health, "review", item,
-                               "third review round requires human-escalation rules")
+        return fallback_target(
+            config, election_health, "review", item,
+            "third review round requires human-escalation rules",
+            reservation=reservation,
+        )
     snapshot = stable_timeline(gh, config, int(item["number"]))
     validate_common(snapshot, config, item)
     info = epoch(snapshot, config["trusted_account"])
@@ -1279,6 +1527,10 @@ def next_review(gh: GitHub, config: dict, *, config_path: str | None = None) -> 
              "snapshot": content_review_digest(snapshot), "epoch": info["hash"],
              "anchor": info["anchor_id"], "depth": depth,
              "completion_gate": completion_gate}
+    if reservation is not None:
+        lease["target_stage"] = item["stage"]
+        lease["target_reservation"] = reservation
+        lease["pipeline_replicas"] = replica_count
     if completion_gate == "target-v1":
         issued_at = int(time.time())
         lease.update({
@@ -1290,7 +1542,10 @@ def next_review(gh: GitHub, config: dict, *, config_path: str | None = None) -> 
         content_review_target_gate(snapshot, config, lease)
     except PipelineError as exc:
         if config.get("fallback_handoff") == "target-v1":
-            return fallback_target(config, health, "review", item, str(exc))
+            return fallback_target(
+                config, election_health, "review", item, str(exc),
+                reservation=reservation,
+            )
         return {"action": "fallback", "reason": str(exc), "target": item}
     lease_value = (encode_signed_lease(lease) if completion_gate == "target-v1"
                    else encode_lease(lease))
@@ -1408,6 +1663,11 @@ def complete_review(gh: GitHub, config: dict, lease_value: str, report_path: str
         # Stable GraphQL reads can be slow.  A lease that expired during them
         # must not authorize the first externally visible mutation.
         validate_review_lease(lease, config)
+    # The local election lease is independent from GitHub's state proof. It is
+    # renewed only after all read-only gates and immediately before the first
+    # comment/label mutation, preventing an expired replica from publishing a
+    # second review after another task took over the same HEAD.
+    renew_lease_target_reservation(lease, config)
     review = post_comment(gh, config, lease["number"], body)
 
     snapshot = stable_timeline(gh, config, lease["number"])
