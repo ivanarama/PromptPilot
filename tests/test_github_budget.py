@@ -130,6 +130,45 @@ def test_projected_budget_clamps_display_but_keeps_signed_admission_value():
     }
 
 
+def test_budget_denial_reason_explains_signed_projection_in_both_paths():
+    profile = _profile_with_costs(core=600)
+    profile["github_budget"]["minimum_remaining"] = {
+        "core": 250, "search": 0, "graphql": 0,
+    }
+    policy = pipeline_insights._budget_policy_for_route(
+        pipeline_insights._github_budget_policy(profile), "tool_preflight")
+    limits = _limits(core=1437)
+    reserved_other = {"core": 1400, "search": 0, "graphql": 0}
+    expected = (
+        "GitHub API-бюджет временно занят выполняемой задачей: "
+        "core: прогноз после резервов и оценки запуска -563 < безопасный "
+        "остаток 250 (фактический остаток GitHub 1437; активных резервов 1; "
+        "другими задачами зарезервировано 1400; оценка этого запуска 600)"
+    )
+
+    evaluated = pipeline_insights._evaluate_github_budget(
+        policy, limits, now=1000, reserved_other=reserved_other,
+        active_reservations=1)
+    reserved = pipeline_insights._reservation_denied(
+        policy, limits, {
+            "blocked_resources": [{
+                "resource": "core", "reported_remaining": 1437,
+                "reserved_other": 1400, "requested_cost": 600,
+                "effective_after": -563, "minimum_remaining": 250,
+                "reset": limits["core"]["reset"],
+                "blocked_by": "reservation",
+            }],
+            "reserved_other": reserved_other,
+            "effective_after": {
+                "core": -563, "search": 30, "graphql": 5000,
+            },
+            "active_reservations": 1,
+        }, status_revision=1)
+
+    assert evaluated["reason"] == expected
+    assert reserved["reason"] == expected
+
+
 def test_cost_schema_requires_every_known_route_and_exact_integer_vectors():
     profile = _profile_with_costs()
 
@@ -684,6 +723,18 @@ def test_web_dashboard_labels_projection_as_non_actual_github_remaining():
     assert "const ledgerKnown = githubBudgetState.ledger_state !== 'unavailable'" \
         in html
     assert "ledgerKnown ? budgetNumber(reservedBudget, 'core') : '—'" in html
+
+
+def test_web_task_detail_labels_only_pending_github_wait_as_wait_reason():
+    html = (Path(__file__).parents[1] / "promptpilot" / "static" /
+            "index.html").read_text(encoding="utf-8")
+
+    assert "const taskErrorLabel = githubApiWait(t) ? " \
+        "'Причина ожидания' : 'Error';" in html
+    assert "if (t.status !== 'pending'" in html
+    assert '<div class="detail-label">${taskErrorLabel}</div>' in html
+    assert '<pre>${esc(t.error)}</pre>' in html
+    assert 'data-copy="${escAttr(t.error)}"' in html
 
 
 def test_success_completion_uses_local_successor_graph_without_github_scan(
