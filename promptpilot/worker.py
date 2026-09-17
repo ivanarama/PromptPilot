@@ -830,7 +830,12 @@ def _execute_task_body(task, admission_complete=None):
             return
         if route["action"] == "complete_empty":
             reason = route["reason"]
-            verdict = route.get("verdict") or "ПУСТО"
+            verdict = str(route.get("verdict") or "ПУСТО").strip() or "ПУСТО"
+            # Defence in depth: execution_route normally normalizes this, but
+            # persistence must not trust an injected/custom route.  УСТАРЕЛО is
+            # reserved for the validated targeted fallback provider path.
+            if verdict.upper() == "УСТАРЕЛО":
+                verdict = "НЕ СМОГ"
             _retry_sqlite_busy(
                 lambda: db.mark_completed(
                     task.id,

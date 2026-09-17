@@ -2851,6 +2851,39 @@ def test_pipeline_execution_empty_completes_without_provider(isolated_db, monkey
     assert route["reason"] == "queue is empty"
 
 
+@pytest.mark.parametrize("action", ["empty", "wait"])
+def test_pipeline_execution_empty_cannot_authorize_stale(
+        isolated_db, monkeypatch, tmp_path, action):
+    helper = tmp_path / "pipelinectl.py"
+    helper.write_text(
+        "import json; print(json.dumps({"
+        f"'action':'{action}','verdict':'УСТАРЕЛО','reason':'generic tool'"
+        "}))",
+        encoding="utf-8",
+    )
+    task = isolated_db.create_task(TaskCreate(
+        prompt="ExampleProject - REVIEW\n/review-queue", recurrence="4h",
+    ))
+    profile = {
+        "title": "Example", "repository": "owner/example",
+        "queues": [{
+            "id": "review", "title": "Review", "query": "is:pr",
+            "series_contains": "ExampleProject - REVIEW",
+            "execution": {
+                "mode": "auto", "stage": "review",
+                "command": ["{python}", "pipelinectl.py", "next", "{stage}"],
+                "required_paths": ["pipelinectl.py"],
+            },
+        }],
+    }
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"example": profile})
+
+    route = pipeline_insights.execution_route(task, task.prompt, str(tmp_path))
+
+    assert route["action"] == "complete_empty"
+    assert route["verdict"] == "НЕ СМОГ"
+
+
 def test_worker_settles_preflight_empty_without_loading_provider(isolated_db, monkeypatch):
     task = isolated_db.create_task(TaskCreate(
         prompt="ExampleProject - REVIEW", recurrence="4h",
@@ -2875,6 +2908,33 @@ def test_worker_settles_preflight_empty_without_loading_provider(isolated_db, mo
     assert settled.status.value == "completed"
     assert settled.verdict == "ПУСТО"
     assert "токены не потрачены" in settled.result
+
+
+def test_worker_never_persists_stale_from_complete_empty(isolated_db, monkeypatch):
+    task = isolated_db.create_task(TaskCreate(
+        prompt="ExampleProject - REVIEW", recurrence="4h",
+    ))
+    task = isolated_db.get_next_runnable()
+    monkeypatch.setattr(pipeline_insights, "dispatch_gate", lambda _task: None)
+    monkeypatch.setattr(
+        pipeline_insights, "execution_route",
+        lambda *_args, **_kwargs: {
+            "action": "complete_empty", "mode": "tool",
+            "reason": "generic tool", "verdict": "УСТАРЕЛО",
+        },
+    )
+    monkeypatch.setattr(
+        worker, "load_providers",
+        lambda: (_ for _ in ()).throw(AssertionError("provider must not be loaded")),
+    )
+
+    worker._execute_task_inner(task)
+
+    settled = isolated_db.get_task(task.id)
+    assert settled.status.value == "completed"
+    assert settled.verdict == "НЕ СМОГ"
+    assert "ИТОГ: НЕ СМОГ (generic tool)" in settled.result
+    assert "ИТОГ: УСТАРЕЛО" not in settled.result
 
 
 def test_pipeline_execution_tool_fallback_skips_preflight_prompt(isolated_db, monkeypatch, tmp_path):

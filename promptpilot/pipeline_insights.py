@@ -2333,9 +2333,16 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
         preflight.get("reason") or preflight.get("error") or preflight_action
     )
     if preflight_action in {"empty", "wait"}:
+        preflight_verdict = str(preflight.get("verdict") or "ПУСТО").strip() or "ПУСТО"
+        # Only a validated targeted fallback route can authorize the silent,
+        # immediate stale outcome.  An ordinary project tool returning
+        # empty/wait must never mint that capability through an arbitrary JSON
+        # field.
+        if preflight_verdict.upper() == "УСТАРЕЛО":
+            preflight_verdict = "НЕ СМОГ"
         return {
             "action": "complete_empty", "mode": "tool", "reason": preflight_reason,
-            "verdict": str(preflight.get("verdict") or "ПУСТО"),
+            "verdict": preflight_verdict,
             "profile_id": profile_id, "queue_id": queue.get("id"),
             "preflight": preflight,
         }
