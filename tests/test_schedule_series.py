@@ -187,6 +187,22 @@ def test_event_only_policy_clears_previous_temporary_boost(isolated_db):
     assert result["temporary_empty_count"] == 0
 
 
+def test_unrelated_series_update_preserves_temporary_boost(isolated_db):
+    task = isolated_db.create_task(TaskCreate(
+        prompt="ExampleProject - TRIAGE", recurrence="30m"))
+    assert isolated_db.update_series(task.series_id, {
+        "temporary_recurrence": "15m", "temporary_empty_limit": 2,
+    })
+
+    assert isolated_db.update_series(task.series_id, {"priority": 4})
+
+    result = isolated_db.get_series(task.series_id)
+    assert result["priority"] == 4
+    assert result["temporary_recurrence"] == "15m"
+    assert result["temporary_empty_limit"] == 2
+    assert result["temporary_empty_count"] == 0
+
+
 def test_adaptive_cadence_rejects_stale_profile_revision_guard(isolated_db):
     task = isolated_db.create_task(TaskCreate(
         prompt="ExampleProject - FIX", recurrence="30m"))
