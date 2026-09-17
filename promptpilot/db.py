@@ -1023,7 +1023,10 @@ def update_series(series_id: int, fields: dict) -> bool:
         return False
     if "temporary_until" in fields and isinstance(fields["temporary_until"], datetime):
         fields["temporary_until"] = _to_utc_iso(fields["temporary_until"])
-    if fields.get("temporary_recurrence") is None:
+    # Only an explicit clear ends a temporary cadence. Partial PATCHes such as
+    # a priority change must leave the active boost and its empty-run limit intact.
+    if ("temporary_recurrence" in fields
+            and fields["temporary_recurrence"] is None):
         fields.setdefault("temporary_until", None)
         fields.setdefault("temporary_empty_limit", None)
         fields["temporary_empty_count"] = 0
