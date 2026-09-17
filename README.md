@@ -1151,6 +1151,19 @@ review-depth, HEAD и два одинаковых полных GraphQL snapshot 
 сохранении точной цели в content allowlist. Pending MERGE cleanup закрывает gate
 и возвращается в recovery следующим запуском.
 
+Для cross-repo sync проект может выдать content-кандидат со stage
+`pre-review-validation` и объектом `pre_review_sync`: положительные int64
+`intent_comment_id`/`done_comment_id`, lowercase SHA-1 `from`/`to`/`base`,
+lowercase SHA-256 `identity_sha256` и RFC3339 `intent_created_at`/
+`done_created_at`. Набор из восьми полей точный, `head == to`, а done должен
+быть позже intent. Такой кандидат никогда не бывает `integration_owner` или
+`merge_executable` и требует `fallback_handoff: "target-v1"`: HMAC lease
+связывает все поля, но не заменяет проверку происхождения. До gate полный скилл,
+оставаясь read-only, обязан сначала доказать provenance стабильными GraphQL-
+снимками, затем провести обычное полное ревью всего diff и тестов. Свежий gate
+выполняется ровно один раз, когда аудит закончен и агент готов к первой мутации;
+быстрый `action=audit`/`complete review` для этого stage запрещён.
+
 `action=validated` — только read-only scheduling proof; ответ явно содержит
 `mutation_authorized=false`. Все GraphQL, ship, CI, base-sync и CAS-проверки
 остаются в полном скилле. Handoff обслуживает один PR и при отказе не переходит

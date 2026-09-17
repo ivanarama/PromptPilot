@@ -210,6 +210,64 @@
           }
         ]
       }
+    },
+    {
+      "stage": "review",
+      "target": {
+        "number": 84,
+        "head": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "stage": "pre-review-validation",
+        "pre_review_sync": {
+          "intent_comment_id": 1001,
+          "done_comment_id": 1002,
+          "from": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "to": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "base": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "identity_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "intent_created_at": "2026-09-17T08:00:00Z",
+          "done_created_at": "2026-09-17T08:02:00Z"
+        }
+      },
+      "health": {
+        "state": "green",
+        "findings": [],
+        "integration_owner": null,
+        "review_candidates": [
+          {
+            "number": 84,
+            "head": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "stage": "pre-review-validation",
+            "pre_review_sync": {
+              "intent_comment_id": 1001,
+              "done_comment_id": 1002,
+              "from": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "to": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+              "base": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "identity_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+              "intent_created_at": "2026-09-17T08:00:00Z",
+              "done_created_at": "2026-09-17T08:02:00Z"
+            }
+          }
+        ],
+        "content_review_candidates": [
+          {
+            "number": 84,
+            "head": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "stage": "pre-review-validation",
+            "pre_review_sync": {
+              "intent_comment_id": 1001,
+              "done_comment_id": 1002,
+              "from": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "to": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+              "base": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "identity_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+              "intent_created_at": "2026-09-17T08:00:00Z",
+              "done_created_at": "2026-09-17T08:02:00Z"
+            }
+          }
+        ],
+        "merge_executable": []
+      }
     }
   ]
 }
