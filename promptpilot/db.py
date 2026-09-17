@@ -72,6 +72,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     worktree_branch TEXT,
     note TEXT,
     budget_wait_scope TEXT,
+    pipeline_priority_restore INTEGER,
     verdict TEXT
     ,series_id INTEGER REFERENCES task_series(id)
 );
@@ -393,6 +394,7 @@ MIGRATIONS = [
     "ALTER TABLE pipeline_target_reservations ADD COLUMN herdr_workspace_id TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE tasks ADD COLUMN budget_wait_scope TEXT",
     "CREATE INDEX IF NOT EXISTS idx_tasks_budget_wait ON tasks(budget_wait_scope, status, priority)",
+    "ALTER TABLE tasks ADD COLUMN pipeline_priority_restore INTEGER",
 ]
 
 WORKFLOW_SCHEMA_VERSION = "workflow_orchestrator_w0_v1"
@@ -429,9 +431,10 @@ def _parse_dt(val: Optional[str]) -> Optional[datetime]:
 def _row_to_task(row: sqlite3.Row) -> TaskInDB:
     d = dict(row)
     # Internal scheduler metadata is deliberately not part of the public task
-    # model/API. It only identifies interruptible waits on another task's
-    # GitHub budget reservation.
+    # model/API. It identifies interruptible budget waits and a temporary
+    # route-derived priority that must not leak into recurring successors.
     d.pop("budget_wait_scope", None)
+    d.pop("pipeline_priority_restore", None)
     for field in ("scheduled_at", "next_run_at", "created_at", "started_at", "completed_at"):
         d[field] = _parse_dt(d[field])
     return TaskInDB(**d)
@@ -1479,10 +1482,82 @@ def cancel_task(task_id: int) -> bool:
 def update_priority(task_id: int, priority: int) -> bool:
     with _connect() as conn:
         cur = conn.execute(
-            "UPDATE tasks SET priority = ? WHERE id = ? AND status IN ('pending', 'rate_limited')",
+            """UPDATE tasks SET priority = ?, pipeline_priority_restore = NULL
+               WHERE id = ? AND status IN ('pending', 'rate_limited')""",
             (priority, task_id),
         )
         return cur.rowcount > 0
+
+
+def promote_running_attempt_priority(task_id: int, started_at,
+                                     priority: int) -> int | None:
+    """Promote one exact running attempt without changing its series.
+
+    A routed pipeline occurrence can become more urgent only after its signed
+    target has been inspected.  Keep that temporary promotion on the task row
+    so budget-wait ordering observes it, while the recurring successor still
+    inherits the configured series priority.
+    """
+    if (isinstance(task_id, bool) or not isinstance(task_id, int) or task_id <= 0
+            or isinstance(priority, bool) or not isinstance(priority, int)
+            or not 1 <= priority <= 10):
+        raise ValueError("invalid running task priority promotion")
+    attempt = _attempt_iso(started_at)
+    if attempt is None:
+        raise ValueError("running task attempt is required for priority promotion")
+    with _connect(immediate=True) as conn:
+        row = conn.execute(
+            """SELECT priority, pipeline_priority_restore FROM tasks
+               WHERE id = ? AND status = 'running' AND started_at = ?""",
+            (task_id, attempt),
+        ).fetchone()
+        if row is None:
+            return None
+        current = int(row["priority"])
+        restore = row["pipeline_priority_restore"]
+        if restore is not None and not 1 <= int(restore) <= 10:
+            raise ValueError("stored pipeline priority restore value is invalid")
+        if current > priority:
+            conn.execute(
+                """UPDATE tasks
+                   SET priority = ?, pipeline_priority_restore = COALESCE(
+                       pipeline_priority_restore, priority)
+                   WHERE id = ? AND status = 'running' AND started_at = ?
+                     AND priority > ?""",
+                (priority, task_id, attempt, priority),
+            )
+            return priority
+        return current
+
+
+def restore_running_attempt_priority(task_id: int, started_at) -> int | None:
+    """Drop a temporary routed promotion after fresh preflight disproves it."""
+    if isinstance(task_id, bool) or not isinstance(task_id, int) or task_id <= 0:
+        raise ValueError("invalid running task priority restoration")
+    attempt = _attempt_iso(started_at)
+    if attempt is None:
+        raise ValueError("running task attempt is required for priority restoration")
+    with _connect(immediate=True) as conn:
+        row = conn.execute(
+            """SELECT priority, pipeline_priority_restore FROM tasks
+               WHERE id = ? AND status = 'running' AND started_at = ?""",
+            (task_id, attempt),
+        ).fetchone()
+        if row is None:
+            return None
+        restore = row["pipeline_priority_restore"]
+        if restore is None:
+            return int(row["priority"])
+        restored = int(restore)
+        if not 1 <= restored <= 10:
+            raise ValueError("stored pipeline priority restore value is invalid")
+        conn.execute(
+            """UPDATE tasks
+               SET priority = ?, pipeline_priority_restore = NULL
+               WHERE id = ? AND status = 'running' AND started_at = ?""",
+            (restored, task_id, attempt),
+        )
+        return restored
 
 
 def _effective_series_recurrence(row: dict, now: Optional[datetime] = None) -> str:
@@ -1653,6 +1728,10 @@ def update_series(series_id: int, fields: dict) -> bool:
                 task_fields[name] = fields[name]
         task_sets = [f"{k} = ?" for k in task_fields]
         task_values = list(task_fields.values())
+        if "priority" in fields:
+            # An explicit series edit supersedes a temporary route-derived
+            # promotion on the waiting occurrence.
+            task_sets.append("pipeline_priority_restore = NULL")
         if provider_changed:
             # Resume ids and retry budgets belong to the old provider. Carrying
             # them across a switch can ask a new CLI to resume an incompatible
@@ -2347,6 +2426,10 @@ def update_task_fields(task_id: int, fields: dict) -> bool:
         # Without this, a task intentionally moved far into the future would
         # keep lower-priority work from reserving GitHub budget indefinitely.
         fields["budget_wait_scope"] = None
+    if "priority" in fields:
+        # Do not let a later route restoration undo the operator's explicit
+        # priority choice for a temporarily promoted waiting occurrence.
+        fields["pipeline_priority_restore"] = None
     sets = ", ".join(f"{k} = ?" for k in fields)
     with _connect() as conn:
         cur = conn.execute(

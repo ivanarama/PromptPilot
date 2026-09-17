@@ -1004,6 +1004,253 @@ def test_execution_route_passes_replica_identity_to_preflight(
     }
 
 
+def test_signed_integration_review_inherits_merge_budget_priority(
+        isolated_db, monkeypatch, tmp_path):
+    first_dir = tmp_path / "review-1"
+    second_dir = tmp_path / "review-2"
+    merge_dir = tmp_path / "merge"
+    for directory in (first_dir, second_dir, merge_dir):
+        directory.mkdir()
+    first = isolated_db.create_task(TaskCreate(
+        prompt="Project - REVIEW 1", working_dir=str(first_dir),
+        recurrence="15m", priority=2))
+    isolated_db.create_task(TaskCreate(
+        prompt="Project - REVIEW 2", working_dir=str(second_dir),
+        recurrence="15m", priority=2))
+    task = isolated_db.get_next_runnable()
+    assert task.id == first.id
+    merge = isolated_db.create_task(TaskCreate(
+        prompt="Project - MERGE", working_dir=str(merge_dir), recurrence="10m",
+        priority=1, scheduled_at=datetime.now(timezone.utc) + timedelta(hours=1)))
+    reservation = isolated_db.reserve_pipeline_target(
+        "owner/repo", "integration-review", 10, HEAD_A, task.id, 300,
+        task_started_at=task.started_at.astimezone(timezone.utc).isoformat(),
+        ownership_kind="headless")
+    review_queue = {
+        "id": "review", "series_contains": "Project - REVIEW", "replicas": 2,
+        "execution": {
+            "mode": "auto", "stage": "review",
+            "command": ["pipelinectl", "next", "review"],
+        },
+    }
+    merge_queue = {
+        "id": "merge", "series_contains": "Project - MERGE",
+        "execution": {"mode": "auto", "stage": "merge"},
+    }
+    profile = {
+        "repository": "owner/repo", "queues": [review_queue, merge_queue],
+        "github_budget": {
+            "minimum_remaining": {"core": 250, "search": 0, "graphql": 0},
+            "priority_one_headroom": {
+                "core": 1200, "search": 0, "graphql": 0,
+            },
+            "costs": {
+                "insights": {"core": 0, "search": 0, "graphql": 0},
+                "skill": {"core": 1000, "search": 0, "graphql": 0},
+                "tool_preflight": {"core": 600, "search": 0, "graphql": 0},
+                "tool": {"core": 900, "search": 0, "graphql": 0},
+                "fallback_targeted": {
+                    "core": 1000, "search": 0, "graphql": 0,
+                },
+            },
+        },
+    }
+    target = {"number": 10, "head": HEAD_A, "stage": "integration-review"}
+    lease = {
+        "repository": "owner/repo", "target": target,
+        "target_reservation": reservation, "pipeline_replicas": 2,
+    }
+    preflight = {
+        "action": "fallback", "reason": "integration owner", "target": target,
+        "handoff": {"lease": "signed-integration-lease"},
+    }
+    reset = int(time.time()) + 3600
+    # First election passes as P2 at 2399, but a live drop makes the final P1
+    # reservation wait. After defer/reclaim, 1250 is enough only because the
+    # proven integration occurrence retained P1 for its new attempt.
+    core_remaining = iter((2399, 1100, 1250, 1250))
+
+    def limits():
+        core = next(core_remaining)
+        return {
+            "core": {"limit": 5000, "used": 5000 - core, "remaining": core,
+                     "reset": reset, "reset_at": None},
+            "search": {"limit": 30, "used": 0, "remaining": 30,
+                       "reset": reset, "reset_at": None},
+            "graphql": {"limit": 5000, "used": 0, "remaining": 5000,
+                        "reset": reset, "reset_at": None},
+        }
+    monkeypatch.setattr(
+        pipeline_insights, "_matching_queue",
+        lambda _task: ("p", profile, review_queue))
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"p": profile})
+    monkeypatch.setattr(
+        pipeline_insights, "_github_rate_limits", limits)
+    monkeypatch.setattr(
+        pipeline_insights, "_tool_available", lambda *_args: (True, ""))
+    monkeypatch.setattr(
+        pipeline_insights, "_tool_preflight", lambda *_args, **_kwargs: preflight)
+    monkeypatch.setattr(pipeline_insights, "load_providers", lambda: {})
+    monkeypatch.setattr(pipelinectl, "decode_signed_lease", lambda _value: lease)
+    monkeypatch.setattr(fallback_handoff, "validate", lambda *_args: lease)
+    pipeline_insights.release_execution_admission()
+
+    first_route = pipeline_insights.execution_route(
+        task, "skill", str(first_dir), retain_budget=True)
+    assert first_route["action"] == "defer"
+    assert isolated_db.get_task(task.id).priority == 1
+    with isolated_db._connect() as conn:
+        stored = conn.execute(
+            "SELECT pipeline_priority_restore FROM tasks WHERE id = ?",
+            (task.id,),
+        ).fetchone()
+    assert stored["pipeline_priority_restore"] == 2
+    pipeline_insights.release_execution_admission()
+
+    assert isolated_db.defer_task(
+        task.id, datetime.now(timezone.utc) - timedelta(seconds=1),
+        first_route["reason"], expected_started_at=task.started_at)
+    reclaimed = isolated_db.get_next_runnable()
+    assert reclaimed.id == task.id
+    assert reclaimed.started_at != task.started_at
+    assert reclaimed.priority == 1
+    lease["target_reservation"] = isolated_db.reserve_pipeline_target(
+        "owner/repo", "integration-review", 10, HEAD_A, reclaimed.id, 300,
+        task_started_at=reclaimed.started_at.astimezone(timezone.utc).isoformat(),
+        ownership_kind="headless")
+
+    try:
+        route = pipeline_insights.execution_route(
+            reclaimed, "skill", str(first_dir), retain_budget=True)
+
+        assert route["action"] == "prompt"
+        assert route["mode"] == "skill"
+        assert isolated_db.get_task(task.id).priority == 1
+        with isolated_db._connect() as conn:
+            stored = conn.execute(
+                "SELECT pipeline_priority_restore FROM tasks WHERE id = ?",
+                (task.id,),
+            ).fetchone()
+        assert stored["pipeline_priority_restore"] == 2
+        ledger = isolated_db.pipeline_github_budget_reservations("github-default")
+        assert ledger["count"] == 1
+        assert ledger["items"][0]["route"] == "fallback_targeted"
+    finally:
+        pipeline_insights.release_execution_admission()
+
+    isolated_db.mark_completed(reclaimed.id, "done")
+    worker._recur_after_run(reclaimed)
+    successor = isolated_db.get_task(
+        isolated_db.get_series(task.series_id)["next_task_id"])
+    assert successor.priority == 2
+    assert isolated_db.get_series(merge.series_id)["priority"] == 1
+
+
+def test_route_priority_inheritance_is_limited_to_integration_fallback(tmp_path):
+    review_dir = tmp_path / "review"
+    merge_dir = tmp_path / "merge"
+    review_dir.mkdir()
+    merge_dir.mkdir()
+    review_queue = {
+        "id": "review", "series_contains": "Project - REVIEW", "replicas": 2,
+    }
+    merge_queue = {
+        "id": "merge", "series_contains": "Project - MERGE",
+        "execution": {"stage": "merge"},
+    }
+    profile = {
+        "queues": [review_queue, merge_queue],
+        "github_budget": {
+            "priority_one_headroom": {
+                "core": 1200, "search": 0, "graphql": 0,
+            },
+        },
+    }
+    review_series = _replica_series(
+        1, review_dir, title="Project - REVIEW 1")
+    merge_series = _replica_series(
+        2, merge_dir, title="Project - MERGE")
+    review_series["priority"] = 2
+    merge_series["priority"] = 1
+    series = [review_series, merge_series]
+
+    inherit = pipeline_insights._post_preflight_admission_priority
+    assert inherit(
+        profile, series, "review", "fallback_targeted",
+        "integration-review", {"core": 1200}) == 1
+    assert inherit(
+        profile, series, "review", "fallback_targeted", "review",
+        {"core": 1200}) is None
+    assert inherit(
+        profile, series, "review", "tool", "integration-review",
+        {"core": 1200}) is None
+    assert inherit(
+        profile, series, "merge", "fallback_targeted",
+        "integration-review", {"core": 1200}) is None
+
+    # The effective vector is shared across all profiles using the same GitHub
+    # account; this profile need not own the strongest configured reserve.
+    profile["github_budget"]["priority_one_headroom"] = {
+        "core": 0, "search": 0, "graphql": 0,
+    }
+    assert inherit(
+        profile, series, "review", "fallback_targeted",
+        "integration-review", {"core": 1200}) == 1
+    assert inherit(
+        profile, series, "review", "fallback_targeted",
+        "integration-review", {"core": 0}) is None
+    merge_series["priority"] = 2
+    assert inherit(
+        profile, series, "review", "fallback_targeted",
+        "integration-review", {"core": 1200}) is None
+
+
+def test_stale_integration_priority_is_restored_before_empty_replica_result(
+        isolated_db, monkeypatch, tmp_path):
+    first_dir = tmp_path / "review-1"
+    second_dir = tmp_path / "review-2"
+    first_dir.mkdir()
+    second_dir.mkdir()
+    first = isolated_db.create_task(TaskCreate(
+        prompt="Project - REVIEW 1", working_dir=str(first_dir),
+        recurrence="15m", priority=2))
+    isolated_db.create_task(TaskCreate(
+        prompt="Project - REVIEW 2", working_dir=str(second_dir),
+        recurrence="15m", priority=2))
+    task = isolated_db.get_next_runnable()
+    assert task.id == first.id
+    assert isolated_db.promote_running_attempt_priority(
+        task.id, task.started_at, 1) == 1
+    task = isolated_db.get_task(task.id)
+    queue = {
+        "id": "review", "series_contains": "Project - REVIEW", "replicas": 2,
+        "execution": {
+            "mode": "auto", "stage": "review",
+            "command": ["pipelinectl", "next", "review"],
+        },
+    }
+    profile = {"repository": "owner/repo", "queues": [queue]}
+    monkeypatch.setattr(
+        pipeline_insights, "_matching_queue", lambda _task: ("p", profile, queue))
+    monkeypatch.setattr(
+        pipeline_insights, "_tool_available", lambda *_args: (True, ""))
+    monkeypatch.setattr(
+        pipeline_insights, "_tool_preflight",
+        lambda *_args, **_kwargs: {"action": "wait", "reason": "owner changed"})
+    monkeypatch.setattr(pipeline_insights, "load_providers", lambda: {})
+
+    route = pipeline_insights.execution_route(task, "skill", str(first_dir))
+
+    assert route["action"] == "complete_empty"
+    assert isolated_db.get_task(task.id).priority == 2
+    with isolated_db._connect() as conn:
+        stored = conn.execute(
+            "SELECT pipeline_priority_restore FROM tasks WHERE id = ?",
+            (task.id,),
+        ).fetchone()
+    assert stored["pipeline_priority_restore"] is None
+
+
 def test_worker_propagates_replica_mode_into_herdr_provider(monkeypatch, tmp_path):
     data_dir = tmp_path / "scheduler-data"
     started_at = datetime(2026, 9, 17, 12, 0, tzinfo=timezone.utc)
