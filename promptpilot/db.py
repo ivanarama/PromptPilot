@@ -72,6 +72,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     worktree_branch TEXT,
     note TEXT,
     budget_wait_scope TEXT,
+    budget_wait_started_at TEXT,
     pipeline_priority_restore INTEGER,
     verdict TEXT
     ,series_id INTEGER REFERENCES task_series(id)
@@ -395,6 +396,8 @@ MIGRATIONS = [
     "ALTER TABLE tasks ADD COLUMN budget_wait_scope TEXT",
     "CREATE INDEX IF NOT EXISTS idx_tasks_budget_wait ON tasks(budget_wait_scope, status, priority)",
     "ALTER TABLE tasks ADD COLUMN pipeline_priority_restore INTEGER",
+    "ALTER TABLE tasks ADD COLUMN budget_wait_started_at TEXT",
+    "CREATE INDEX IF NOT EXISTS idx_tasks_budget_wait_fairness ON tasks(budget_wait_scope, status, budget_wait_started_at, priority, id)",
 ]
 
 WORKFLOW_SCHEMA_VERSION = "workflow_orchestrator_w0_v1"
@@ -403,6 +406,8 @@ PIPELINE_TARGET_RESERVATION_SCHEMA_VERSION = "pipeline_target_reservations_v1"
 PIPELINE_TARGET_ATTEMPT_SCHEMA_VERSION = "pipeline_target_reservations_attempt_v2"
 PIPELINE_TARGET_OWNERSHIP_SCHEMA_VERSION = "pipeline_target_reservations_ownership_v3"
 PIPELINE_TARGET_HERDR_SCHEMA_VERSION = "pipeline_target_reservations_herdr_v4"
+PIPELINE_BUDGET_WAITER_FAIRNESS_SCHEMA_VERSION = \
+    "pipeline_github_budget_waiter_fairness_v1"
 
 
 def _now() -> str:
@@ -434,6 +439,7 @@ def _row_to_task(row: sqlite3.Row) -> TaskInDB:
     # model/API. It identifies interruptible budget waits and a temporary
     # route-derived priority that must not leak into recurring successors.
     d.pop("budget_wait_scope", None)
+    d.pop("budget_wait_started_at", None)
     d.pop("pipeline_priority_restore", None)
     for field in ("scheduled_at", "next_run_at", "created_at", "started_at", "completed_at"):
         d[field] = _parse_dt(d[field])
@@ -516,6 +522,28 @@ def _init_db_once():
                VALUES (?, ?)""",
             (PIPELINE_TARGET_HERDR_SCHEMA_VERSION, _now()),
         )
+        fairness_migrated = conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE version = ?",
+            (PIPELINE_BUDGET_WAITER_FAIRNESS_SCHEMA_VERSION,),
+        ).fetchone()
+        if fairness_migrated is None:
+            migration_now = _now()
+            # Existing durable reservation handoffs predate the age column.
+            # Give active legacy waiters one common baseline instead of
+            # leaving them permanently ineligible for the fairness baton.
+            conn.execute(
+                """UPDATE tasks SET budget_wait_started_at = ?
+                   WHERE budget_wait_scope IS NOT NULL
+                     AND budget_wait_started_at IS NULL
+                     AND status IN ('pending', 'running')""",
+                (migration_now,),
+            )
+            conn.execute(
+                """INSERT INTO schema_migrations (version, applied_at)
+                   VALUES (?, ?)""",
+                (PIPELINE_BUDGET_WAITER_FAIRNESS_SCHEMA_VERSION,
+                 migration_now),
+            )
         _backfill_task_series(conn)
 
 
@@ -1118,8 +1146,11 @@ def recent_working_dirs(limit: int = 8, machine: Optional[str] = None) -> list:
         return [r["working_dir"] for r in rows]
 
 
-def get_next_runnable(busy_keys=(), key_fn=None,
-                      order_key_fn=None) -> Optional[TaskInDB]:
+def get_next_runnable(
+        busy_keys=(), key_fn=None, order_key_fn=None, *,
+        budget_wait_scope: str | None = None,
+        budget_starvation_timeout_seconds: int = 0,
+        budget_fairness_now: float | None = None) -> Optional[TaskInDB]:
     """Claim the highest-priority runnable task and mark it running.
 
     The whole select-then-claim runs under the write lock, so several workers
@@ -1136,12 +1167,39 @@ def get_next_runnable(busy_keys=(), key_fn=None,
     now = _now()
     busy = set(busy_keys or ())
     with _connect(immediate=True) as conn:
+        # The admission baton must reach a worker slot too. Otherwise an
+        # endless stream of higher-priority runnable tasks can repeatedly be
+        # claimed and denied while the selected waiter never reaches preflight.
+        fairness_task_id = None
+        if budget_starvation_timeout_seconds:
+            if (not isinstance(budget_wait_scope, str)
+                    or not budget_wait_scope.strip()):
+                raise ValueError(
+                    "budget wait scope is required for scheduler fairness")
+            fairness = _pipeline_github_budget_waiter_summary(
+                conn, budget_wait_scope,
+                starvation_timeout_seconds=(
+                    budget_starvation_timeout_seconds),
+                now=budget_fairness_now).get("fairness_waiter")
+            if isinstance(fairness, dict):
+                fairness_task_id = fairness.get("task_id")
+                # A reservation wait normally carries a short retry deadline.
+                # Once its baton matures, make the selected pending attempt
+                # runnable in this same claim transaction; otherwise it could
+                # block new admissions while sleeping until that deadline.
+                conn.execute(
+                    """UPDATE tasks SET scheduled_at = ?, next_run_at = NULL
+                       WHERE id = ? AND status = 'pending'
+                         AND budget_wait_scope = ?""",
+                    (now, fairness_task_id, budget_wait_scope),
+                )
         # Sequential worker takes just the top task. When some keys are busy we
         # walk the whole runnable queue in priority order until a non-colliding
         # task is found — a hard LIMIT could hide a free task behind a wall of
         # conflicting ones. Rows are materialised before any UPDATE so claiming
         # one doesn't disturb the iteration.
-        limit_clause = "" if busy or order_key_fn is not None else " LIMIT 1"
+        limit_clause = "" if (busy or order_key_fn is not None
+                              or fairness_task_id is not None) else " LIMIT 1"
         rows = conn.execute(
             f"""SELECT * FROM tasks
                WHERE status IN ('pending', 'rate_limited')
@@ -1158,11 +1216,12 @@ def get_next_runnable(busy_keys=(), key_fn=None,
             task = _row_to_task(row)
             if busy and key_fn and key_fn(task) in busy:
                 continue
-            rank = order_key_fn(task) if order_key_fn is not None else ()
-            if order_key_fn is not None and rank is None:
+            policy_rank = order_key_fn(task) if order_key_fn is not None else ()
+            if order_key_fn is not None and policy_rank is None:
                 continue
-            candidates.append((rank, position, task))
-        if order_key_fn is not None:
+            fairness_rank = 0 if task.id == fairness_task_id else 1
+            candidates.append(((fairness_rank, policy_rank), position, task))
+        if order_key_fn is not None or fairness_task_id is not None:
             candidates.sort(key=lambda item: (item[0], item[1]))
         for _rank, _position, task in candidates:
             started_at = _now()
@@ -1278,7 +1337,8 @@ def mark_completed(task_id: int, result: str, exit_code: int = 0,
             "next_run_at = NULL, exit_code = ?, completed_at = ?, model_used = ?, "
             "session_id = COALESCE(?, session_id), "
             f"verdict = COALESCE(?, verdict), note = NULL, "
-            f"budget_wait_scope = NULL WHERE {where}",
+            f"budget_wait_scope = NULL, budget_wait_started_at = NULL "
+            f"WHERE {where}",
             values,
         )
         if cur.rowcount:
@@ -1298,7 +1358,8 @@ def mark_failed(task_id: int, error: str, exit_code: int = 1,
             values.append(attempt)
         cur = conn.execute(
             "UPDATE tasks SET status = 'failed', error = ?, exit_code = ?, "
-            f"completed_at = ?, note = NULL, budget_wait_scope = NULL "
+            f"completed_at = ?, note = NULL, budget_wait_scope = NULL, "
+            f"budget_wait_started_at = NULL "
             f"WHERE {where}",
             values,
         )
@@ -1324,7 +1385,8 @@ def fail_running_attempt(task_id: int, started_at, error: str,
         cur = conn.execute(
             """UPDATE tasks
                SET status = 'failed', error = ?, exit_code = ?,
-                   completed_at = ?, note = NULL, budget_wait_scope = NULL
+                   completed_at = ?, note = NULL, budget_wait_scope = NULL,
+                   budget_wait_started_at = NULL
                WHERE id = ? AND status = 'running' AND started_at = ?""",
             (error, exit_code, _now(), task_id, started_at),
         )
@@ -1348,7 +1410,8 @@ def mark_rate_limited(task_id: int, next_run_at: datetime, error: str = None,
                SET status = 'rate_limited',
                    next_run_at = ?,
                    retry_count = retry_count + 1,
-                   error = COALESCE(?, error), budget_wait_scope = NULL
+                   error = COALESCE(?, error), budget_wait_scope = NULL,
+                   budget_wait_started_at = NULL
                 WHERE """ + where,
             values,
         )
@@ -1404,6 +1467,7 @@ def defer_task(task_id: int, next_run_at: datetime, reason: str = None,
         attempt = _attempt_iso(expected_started_at)
         where = "id = ? AND status = 'running'"
         values = [deadline, deadline if hard_not_before else None, reason,
+                  budget_wait_scope, budget_wait_scope, _now(),
                   budget_wait_scope, task_id]
         if attempt is not None:
             where += " AND started_at = ?"
@@ -1411,7 +1475,15 @@ def defer_task(task_id: int, next_run_at: datetime, reason: str = None,
         cur = conn.execute(
             """UPDATE tasks SET status = 'pending', scheduled_at = ?,
                       next_run_at = ?, started_at = NULL,
-                      error = COALESCE(?, error), budget_wait_scope = ?
+                      error = COALESCE(?, error),
+                      budget_wait_started_at = CASE
+                        WHEN ? IS NULL THEN NULL
+                        WHEN budget_wait_scope = ?
+                          AND budget_wait_started_at IS NOT NULL
+                        THEN budget_wait_started_at
+                        ELSE ?
+                      END,
+                      budget_wait_scope = ?
                WHERE """ + where,
             values,
         )
@@ -1457,7 +1529,8 @@ def mark_cancelled(task_id: int, note: str = None,
         cur = conn.execute(
             "UPDATE tasks SET status = 'cancelled', completed_at = ?, "
             f"error = COALESCE(?, error), note = NULL, "
-            f"budget_wait_scope = NULL WHERE {where}",
+            f"budget_wait_scope = NULL, budget_wait_started_at = NULL "
+            f"WHERE {where}",
             values,
         )
         if cur.rowcount:
@@ -1470,7 +1543,8 @@ def cancel_task(task_id: int) -> bool:
     with _connect() as conn:
         cur = conn.execute(
             "UPDATE tasks SET status = 'cancelled', completed_at = ?, "
-            "budget_wait_scope = NULL WHERE id = ? "
+            "budget_wait_scope = NULL, budget_wait_started_at = NULL "
+            "WHERE id = ? "
             "AND status IN ('pending', 'rate_limited')",
             (_now(), task_id),
         )
@@ -1482,9 +1556,13 @@ def cancel_task(task_id: int) -> bool:
 def update_priority(task_id: int, priority: int) -> bool:
     with _connect() as conn:
         cur = conn.execute(
-            """UPDATE tasks SET priority = ?, pipeline_priority_restore = NULL
+            """UPDATE tasks SET priority = ?, pipeline_priority_restore = NULL,
+                                  budget_wait_started_at = CASE
+                                    WHEN budget_wait_scope IS NOT NULL THEN ?
+                                    ELSE NULL
+                                  END
                WHERE id = ? AND status IN ('pending', 'rate_limited')""",
-            (priority, task_id),
+            (priority, _now(), task_id),
         )
         return cur.rowcount > 0
 
@@ -1730,8 +1808,14 @@ def update_series(series_id: int, fields: dict) -> bool:
         task_values = list(task_fields.values())
         if "priority" in fields:
             # An explicit series edit supersedes a temporary route-derived
-            # promotion on the waiting occurrence.
-            task_sets.append("pipeline_priority_restore = NULL")
+            # promotion and restarts any admission-wait ordering for the
+            # edited occurrence.
+            task_sets.extend([
+                "pipeline_priority_restore = NULL",
+                "budget_wait_started_at = CASE "
+                "WHEN budget_wait_scope IS NOT NULL THEN ? ELSE NULL END",
+            ])
+            task_values.append(_now())
         if provider_changed:
             # Resume ids and retry budgets belong to the old provider. Carrying
             # them across a switch can ask a new CLI to resume an incompatible
@@ -2099,6 +2183,14 @@ def series_action(series_id: int, action: str) -> bool:
             conn.execute("UPDATE task_series SET paused = 1, updated_at = ? WHERE id = ?",
                          (now, series_id))
             conn.execute(
+                """UPDATE tasks
+                   SET budget_wait_scope = NULL,
+                       budget_wait_started_at = NULL
+                   WHERE series_id = ?
+                     AND status IN ('pending', 'rate_limited')""",
+                (series_id,),
+            )
+            conn.execute(
                 "DELETE FROM settings WHERE key = ?",
                 (_pipeline_series_wake_intent_key(series_id),),
             )
@@ -2107,7 +2199,10 @@ def series_action(series_id: int, action: str) -> bool:
                          (now, series_id))
         elif action == "run_now":
             cur = conn.execute(
-                """UPDATE tasks SET scheduled_at = ?, next_run_at = NULL
+                """UPDATE tasks
+                   SET scheduled_at = ?, next_run_at = NULL,
+                       budget_wait_scope = NULL,
+                       budget_wait_started_at = NULL
                    WHERE series_id = ? AND status IN ('pending', 'rate_limited')""",
                 (now, series_id),
             )
@@ -2141,7 +2236,8 @@ def series_action(series_id: int, action: str) -> bool:
             conn.execute("UPDATE task_series SET ended_at = ?, updated_at = ? WHERE id = ?",
                          (now, now, series_id))
             conn.execute("UPDATE tasks SET status = 'cancelled', completed_at = ?, "
-                         "budget_wait_scope = NULL "
+                         "budget_wait_scope = NULL, "
+                         "budget_wait_started_at = NULL "
                          "WHERE series_id = ? AND status IN ('pending', 'rate_limited')",
                          (now, series_id))
             conn.execute(
@@ -2420,21 +2516,31 @@ def update_task_fields(task_id: int, fields: dict) -> bool:
     fields = {k: v for k, v in fields.items() if k in EDITABLE_FIELDS}
     if not fields:
         return False
-    if "scheduled_at" in fields:
+    explicit_reschedule = "scheduled_at" in fields
+    if explicit_reschedule:
         fields["scheduled_at"] = _to_utc_iso(fields["scheduled_at"])
         # An explicit operator reschedule supersedes an automatic soft wait.
         # Without this, a task intentionally moved far into the future would
         # keep lower-priority work from reserving GitHub budget indefinitely.
         fields["budget_wait_scope"] = None
+        fields["budget_wait_started_at"] = None
     if "priority" in fields:
         # Do not let a later route restoration undo the operator's explicit
-        # priority choice for a temporarily promoted waiting occurrence.
+        # priority choice for a temporarily promoted waiting occurrence. The
+        # edit also starts a fresh fairness history for the new priority.
         fields["pipeline_priority_restore"] = None
-    sets = ", ".join(f"{k} = ?" for k in fields)
+    sets = [f"{k} = ?" for k in fields]
+    values = list(fields.values())
+    if "priority" in fields and not explicit_reschedule:
+        sets.append(
+            "budget_wait_started_at = CASE "
+            "WHEN budget_wait_scope IS NOT NULL THEN ? ELSE NULL END")
+        values.append(_now())
     with _connect() as conn:
         cur = conn.execute(
-            f"UPDATE tasks SET {sets} WHERE id = ? AND status IN ('pending', 'rate_limited')",
-            (*fields.values(), task_id),
+            f"UPDATE tasks SET {', '.join(sets)} "
+            "WHERE id = ? AND status IN ('pending', 'rate_limited')",
+            (*values, task_id),
         )
         return cur.rowcount > 0
 
@@ -3011,7 +3117,19 @@ def _write_pipeline_budget_reservations(conn, key: str, values: list[dict]) -> N
     )
 
 
-def _pipeline_github_budget_waiter_summary(conn, scope: str) -> dict:
+def _pipeline_budget_starvation_timeout(value: int) -> int:
+    if (isinstance(value, bool) or not isinstance(value, int)
+            or not 0 <= value <= 86400):
+        raise ValueError(
+            "pipeline budget starvation timeout must be 0..86400 seconds")
+    return value
+
+
+def _pipeline_github_budget_waiter_summary(
+        conn, scope: str, *, starvation_timeout_seconds: int = 0,
+        now: Optional[float] = None) -> dict:
+    starvation_timeout_seconds = _pipeline_budget_starvation_timeout(
+        starvation_timeout_seconds)
     row = conn.execute(
         """SELECT COUNT(*) AS count, MIN(priority) AS min_priority
            FROM tasks
@@ -3023,9 +3141,50 @@ def _pipeline_github_budget_waiter_summary(conn, scope: str) -> dict:
                        AND s.paused = 0 AND s.ended_at IS NULL))))""",
         (scope,),
     ).fetchone()
+    fairness_waiter = None
+    if starvation_timeout_seconds:
+        oldest = conn.execute(
+            """SELECT id, priority, budget_wait_started_at
+               FROM tasks
+               WHERE budget_wait_scope = ?
+                 AND budget_wait_started_at IS NOT NULL
+                 AND (status = 'running' OR (
+                   status = 'pending'
+                   AND (series_id IS NULL OR EXISTS (
+                     SELECT 1 FROM task_series s WHERE s.id = tasks.series_id
+                       AND s.paused = 0 AND s.ended_at IS NULL))))
+               ORDER BY budget_wait_started_at ASC, priority ASC, id ASC
+               LIMIT 1""",
+            (scope,),
+        ).fetchone()
+        if oldest is not None:
+            try:
+                wait_started = datetime.fromisoformat(
+                    oldest["budget_wait_started_at"])
+                if wait_started.tzinfo is None:
+                    raise ValueError("missing timezone")
+                wait_started = wait_started.astimezone(timezone.utc)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "pipeline budget waiter timestamp is invalid") from exc
+            current = (time.time() if now is None else float(now))
+            if not math.isfinite(current):
+                raise ValueError("pipeline budget fairness time must be finite")
+            eligible_at = wait_started.timestamp() + starvation_timeout_seconds
+            if current >= eligible_at:
+                fairness_waiter = {
+                    "task_id": int(oldest["id"]),
+                    "priority": int(oldest["priority"]),
+                    "wait_started_at": wait_started.isoformat(),
+                    "eligible_at": datetime.fromtimestamp(
+                        eligible_at, timezone.utc).isoformat(),
+                    "wait_seconds": max(
+                        0, int(current - wait_started.timestamp())),
+                }
     return {
         "count": int(row["count"] or 0) if row is not None else 0,
         "min_priority": row["min_priority"] if row is not None else None,
+        "fairness_waiter": fairness_waiter,
     }
 
 
@@ -3046,7 +3205,8 @@ def _wake_pipeline_github_budget_waiters(conn, scope: str) -> dict:
 
 def arm_pipeline_github_budget_waiter(
         scope: str, *, task_id: int, task_started_at,
-        expected_revision: int | None = None) -> dict:
+        expected_revision: int | None = None,
+        now: Optional[float] = None) -> dict:
     """Persist a priority handoff before releasing the admission scan lease.
 
     New reservations are serialized by that lease, while reservation release
@@ -3067,12 +3227,23 @@ def arm_pipeline_github_budget_waiter(
     attempt = _attempt_iso(task_started_at)
     if attempt is None:
         raise ValueError("running task attempt is required for budget waiter")
+    current = time.time() if now is None else float(now)
+    if not math.isfinite(current):
+        raise ValueError("pipeline budget waiter time must be finite")
+    wait_started_at = datetime.fromtimestamp(current, timezone.utc).isoformat()
     with _connect(immediate=True) as conn:
         revision = _pipeline_github_budget_revision(conn, scope)
         cur = conn.execute(
-            """UPDATE tasks SET budget_wait_scope = ?
+            """UPDATE tasks
+               SET budget_wait_started_at = CASE
+                     WHEN budget_wait_scope = ?
+                       AND budget_wait_started_at IS NOT NULL
+                     THEN budget_wait_started_at
+                     ELSE ?
+                   END,
+                   budget_wait_scope = ?
                WHERE id = ? AND status = 'running' AND started_at = ?""",
-            (scope, task_id, attempt),
+            (scope, wait_started_at, scope, task_id, attempt),
         )
         return {
             "armed": cur.rowcount > 0,
@@ -3083,7 +3254,27 @@ def arm_pipeline_github_budget_waiter(
         }
 
 
-def pipeline_github_budget_reservations(scope: str) -> dict:
+def clear_pipeline_github_budget_waiter(
+        *, task_id: int, task_started_at) -> bool:
+    """Clear one successful attempt's handoff without touching a successor."""
+    if isinstance(task_id, bool) or not isinstance(task_id, int) or task_id <= 0:
+        raise ValueError("running task id is required for budget waiter clear")
+    attempt = _attempt_iso(task_started_at)
+    if attempt is None:
+        raise ValueError("running task attempt is required for budget waiter clear")
+    with _connect() as conn:
+        cur = conn.execute(
+            """UPDATE tasks
+               SET budget_wait_scope = NULL, budget_wait_started_at = NULL
+               WHERE id = ? AND status = 'running' AND started_at = ?""",
+            (task_id, attempt),
+        )
+        return cur.rowcount > 0
+
+
+def pipeline_github_budget_reservations(
+        scope: str, *, starvation_timeout_seconds: int = 0,
+        now: Optional[float] = None) -> dict:
     """Return live, task-fenced reservations and prune completed attempts."""
     key = _pipeline_github_budget_reservation_key(scope)
     with _connect(immediate=True) as conn:
@@ -3111,10 +3302,17 @@ def pipeline_github_budget_reservations(scope: str) -> dict:
         for item in active:
             for resource in totals:
                 totals[resource] += item["cost"][resource]
-        waiting = _pipeline_github_budget_waiter_summary(conn, scope)
-        return {"count": len(active), "totals": totals, "items": active,
-                "revision": revision, "woken_waiters": woken,
-                "waiting_waiters": waiting}
+        waiting = _pipeline_github_budget_waiter_summary(
+            conn, scope,
+            starvation_timeout_seconds=starvation_timeout_seconds,
+            now=now)
+        fairness_waiter = waiting.pop("fairness_waiter", None)
+        result = {"count": len(active), "totals": totals, "items": active,
+                  "revision": revision, "woken_waiters": woken,
+                  "waiting_waiters": waiting}
+        if fairness_waiter is not None:
+            result["fairness_waiter"] = fairness_waiter
+        return result
 
 
 def record_pipeline_github_rate_snapshot(
@@ -3205,6 +3403,7 @@ def reserve_pipeline_github_budget(
         scope: str, *, token: str, task_id: int, task_started_at: str,
         profile_id: str, queue_id: str, route: str, cost: dict,
         limits: dict, minimum_remaining: dict,
+        starvation_timeout_seconds: int = 0,
         now: Optional[float] = None,
         scan_lease_guard: Optional[dict] = None,
         expected_revision: Optional[int] = None) -> dict:
@@ -3228,6 +3427,8 @@ def reserve_pipeline_github_budget(
             "expected pipeline budget revision must be a non-negative integer")
     requested = _pipeline_budget_vector(cost, "cost")
     floor = _pipeline_budget_vector(minimum_remaining, "minimum_remaining")
+    starvation_timeout_seconds = _pipeline_budget_starvation_timeout(
+        starvation_timeout_seconds)
     reported = {}
     resets = {}
     for resource in _PIPELINE_GITHUB_BUDGET_RESOURCES:
@@ -3294,7 +3495,9 @@ def reserve_pipeline_github_budget(
                     or item["cost"] != requested or item["route"] != route):
                 raise ValueError("pipeline budget token was reused inconsistently")
             conn.execute(
-                """UPDATE tasks SET budget_wait_scope = NULL
+                """UPDATE tasks
+                   SET budget_wait_scope = NULL,
+                       budget_wait_started_at = NULL
                    WHERE id = ? AND status = 'running' AND started_at = ?
                      AND budget_wait_scope = ?""",
                 (task_id, task_started_at, scope),
@@ -3333,9 +3536,27 @@ def reserve_pipeline_github_budget(
                 "revision": revision,
             }
 
-        waiting = _pipeline_github_budget_waiter_summary(conn, scope)
+        waiting = _pipeline_github_budget_waiter_summary(
+            conn, scope,
+            starvation_timeout_seconds=starvation_timeout_seconds,
+            now=created_at)
+        fairness_waiter = waiting.get("fairness_waiter")
+        if (isinstance(fairness_waiter, dict)
+                and fairness_waiter.get("task_id") != task_id):
+            return {
+                "allowed": False, "state": "fairness_waiter",
+                "reason": (
+                    "the oldest GitHub budget waiter owns the admission baton"),
+                "fairness_waiter": fairness_waiter,
+                "blocked_resources": [],
+                "reported_remaining": reported, "reserved_other": reserved,
+                "requested_cost": requested, "minimum_remaining": floor,
+                "effective_after": after, "active_reservations": len(active),
+                "revision": revision,
+            }
         waiting_priority = waiting.get("min_priority")
-        if (type(waiting_priority) is int
+        if (fairness_waiter is None
+                and type(waiting_priority) is int
                 and waiting_priority < int(task["priority"])):
             return {
                 "allowed": False, "state": "priority_waiter",
@@ -3387,6 +3608,19 @@ def reserve_pipeline_github_budget(
             state = ("low" if any(item["blocked_by"] == "live"
                                   for item in blocked)
                      else "budget_in_flight")
+            if state == "low":
+                # A waiter that cannot fit under its unchanged quota floor
+                # must relinquish the baton atomically with this decision. A
+                # worker crash before defer must not freeze new reservations
+                # until GitHub resets.
+                conn.execute(
+                    """UPDATE tasks
+                       SET budget_wait_scope = NULL,
+                           budget_wait_started_at = NULL
+                       WHERE id = ? AND status = 'running'
+                         AND started_at = ? AND budget_wait_scope = ?""",
+                    (task_id, task_started_at, scope),
+                )
             return {"allowed": False, "state": state,
                     "blocked_resources": blocked,
                     "reported_remaining": reported, "reserved_other": reserved,
@@ -3403,7 +3637,9 @@ def reserve_pipeline_github_budget(
         _write_pipeline_budget_reservations(conn, key, active)
         revision = _advance_pipeline_github_budget_revision(conn, scope)
         conn.execute(
-            """UPDATE tasks SET budget_wait_scope = NULL
+            """UPDATE tasks
+               SET budget_wait_scope = NULL,
+                   budget_wait_started_at = NULL
                WHERE id = ? AND status = 'running' AND started_at = ?
                  AND budget_wait_scope = ?""",
             (task_id, task_started_at, scope),
@@ -4005,7 +4241,8 @@ def recover_running_attempt(task_id: int, started_at) -> bool:
                 """UPDATE tasks
                    SET status = 'cancelled', completed_at = ?,
                        error = COALESCE(error, ?), note = NULL,
-                       budget_wait_scope = NULL
+                       budget_wait_scope = NULL,
+                       budget_wait_started_at = NULL
                    WHERE id = ? AND status = 'running' AND started_at = ?""",
                 (_now(), "Отменена пользователем до перезапуска worker",
                  task_id, attempt),

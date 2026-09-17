@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from promptpilot import api, bot, pipeline_insights, worker
+from promptpilot import api, bot, db as database, pipeline_insights, worker
 from promptpilot.models import TaskCreate
 
 
@@ -81,15 +81,46 @@ def _running_task(database, prompt):
 
 
 def _reserve(database, task, token, *, core=500, remaining=1000,
-             reset=None):
+             minimum=100, reset=None, starvation_timeout_seconds=0,
+             now=None):
     return database.reserve_pipeline_github_budget(
         "github-default", token=token, task_id=task.id,
         task_started_at=task.started_at, profile_id="example",
         queue_id="review", route="skill",
         cost={"core": core, "search": 0, "graphql": 0},
         limits=_limits(core=remaining, reset=reset),
-        minimum_remaining={"core": 100, "search": 0, "graphql": 0},
+        minimum_remaining={"core": minimum, "search": 0, "graphql": 0},
+        starvation_timeout_seconds=starvation_timeout_seconds,
+        now=now,
     )
+
+
+def _budget_wait_row(database, task_id):
+    with database._connect() as conn:
+        return dict(conn.execute(
+            """SELECT budget_wait_scope, budget_wait_started_at
+               FROM tasks WHERE id = ?""",
+            (task_id,),
+        ).fetchone())
+
+
+def _arm_and_defer_budget_waiter(
+        database, task, *, wait_started_at, scope="github-default",
+        defer_until=None):
+    revision = database.pipeline_github_budget_reservations(scope)["revision"]
+    armed = database.arm_pipeline_github_budget_waiter(
+        scope, task_id=task.id, task_started_at=task.started_at,
+        expected_revision=revision, now=wait_started_at)
+    assert armed == {
+        "armed": True, "revision": revision, "revision_changed": False,
+    }
+    assert database.defer_task(
+        task.id, defer_until or (
+            datetime.now(timezone.utc) - timedelta(seconds=1)),
+        "waiting for a GitHub reservation", budget_wait_scope=scope,
+        budget_wait_revision=revision,
+        expected_started_at=task.started_at)
+    return database.get_task(task.id)
 
 
 def test_budget_decision_defers_to_exact_latest_reset_plus_grace():
@@ -196,6 +227,22 @@ def test_priority_one_headroom_defaults_to_zero_and_accepts_exact_vector():
     assert policy["priority_one_headroom"] == {
         "core": 1200, "search": 12, "graphql": 1000,
     }
+
+
+def test_starvation_timeout_is_opt_in_and_strictly_bounded():
+    assert pipeline_insights._github_budget_policy(
+        _profile())["starvation_timeout_seconds"] == 0
+    configured = _profile()
+    configured["github_budget"]["starvation_timeout_seconds"] = 900
+    assert pipeline_insights._github_budget_policy(
+        configured)["starvation_timeout_seconds"] == 900
+
+    for invalid in (True, -1, 86401, 1.5):
+        invalid_profile = _profile()
+        invalid_profile["github_budget"][
+            "starvation_timeout_seconds"] = invalid
+        with pytest.raises(ValueError):
+            pipeline_insights._github_budget_policy(invalid_profile)
 
 
 def test_route_priority_promotion_is_attempt_fenced_internal_and_reversible(
@@ -345,6 +392,8 @@ def test_shared_github_scope_uses_strongest_profile_hard_reserve(
     high["github_budget"]["priority_one_headroom"] = {
         "core": 800, "search": 12, "graphql": 1000,
     }
+    low["github_budget"]["starvation_timeout_seconds"] = 900
+    high["github_budget"]["starvation_timeout_seconds"] = 600
     monkeypatch.setattr(
         pipeline_insights, "_profiles",
         lambda: {"low": low, "high": high})
@@ -358,6 +407,7 @@ def test_shared_github_scope_uses_strongest_profile_hard_reserve(
     assert policy["priority_one_headroom"] == {
         "core": 1200, "search": 12, "graphql": 1000,
     }
+    assert policy["starvation_timeout_seconds"] == 600
     monkeypatch.setattr(
         pipeline_insights, "_github_rate_limits",
         lambda: _limits(core=1000, search=30, graphql=5000))
@@ -1902,10 +1952,440 @@ def test_explicit_reschedule_releases_budget_priority_handoff(isolated_db):
 
     with isolated_db._connect() as conn:
         stored = conn.execute(
-            "SELECT budget_wait_scope FROM tasks WHERE id = ?",
+            """SELECT budget_wait_scope, budget_wait_started_at
+               FROM tasks WHERE id = ?""",
             (waiter.id,),
         ).fetchone()
     assert stored["budget_wait_scope"] is None
+    assert stored["budget_wait_started_at"] is None
+
+
+def test_budget_waiter_fairness_activates_at_exact_timeout(isolated_db):
+    created = isolated_db.create_task(TaskCreate(
+        prompt="Example - FIX", recurrence="4h", priority=3))
+    waiter = isolated_db.get_next_runnable()
+    assert waiter.id == created.id
+    _arm_and_defer_budget_waiter(
+        isolated_db, waiter, wait_started_at=1000,
+        defer_until=datetime.now(timezone.utc) + timedelta(hours=1))
+
+    before = isolated_db.pipeline_github_budget_reservations(
+        "github-default", starvation_timeout_seconds=600, now=1599)
+    boundary = isolated_db.pipeline_github_budget_reservations(
+        "github-default", starvation_timeout_seconds=600, now=1600)
+
+    assert "fairness_waiter" not in before
+    assert boundary["fairness_waiter"] == {
+        "task_id": waiter.id,
+        "priority": 3,
+        "wait_started_at": datetime.fromtimestamp(
+            1000, timezone.utc).isoformat(),
+        "eligible_at": datetime.fromtimestamp(
+            1600, timezone.utc).isoformat(),
+        "wait_seconds": 600,
+    }
+    urgent = isolated_db.create_task(TaskCreate(
+        prompt="Example - MERGE", recurrence="4h", priority=1))
+    claimed = isolated_db.get_next_runnable(
+        budget_wait_scope="github-default",
+        budget_starvation_timeout_seconds=600,
+        budget_fairness_now=1600)
+    assert claimed.id == waiter.id
+    assert claimed.id != urgent.id
+    assert claimed.next_run_at is None
+
+
+def test_worker_lane_claim_gives_aged_waiter_a_slot(
+        isolated_db, monkeypatch):
+    profile = _profile_with_costs(core=200)
+    profile["github_budget"]["starvation_timeout_seconds"] = 600
+    profile["queues"] = [
+        {"id": "merge", "series_contains": " - MERGE"},
+        {"id": "plan", "series_contains": " - PLAN"},
+    ]
+    profile["scheduler"] = {"lanes": [
+        {"id": "integration", "queues": ["merge"]},
+        {"id": "intake", "queues": ["plan"]},
+    ]}
+    monkeypatch.setattr(
+        pipeline_insights, "_profiles", lambda: {"example": profile})
+
+    waiter_created = isolated_db.create_task(TaskCreate(
+        prompt="Example - PLAN", recurrence="4h", priority=4))
+    waiter = isolated_db.get_next_runnable()
+    assert waiter.id == waiter_created.id
+    _arm_and_defer_budget_waiter(
+        isolated_db, waiter, wait_started_at=time.time() - 601)
+    urgent = isolated_db.create_task(TaskCreate(
+        prompt="Example - MERGE", recurrence="4h", priority=1))
+
+    claimed, lane_id = worker._claim_next_task()
+
+    assert claimed.id == waiter.id
+    assert claimed.id != urgent.id
+    assert lane_id == "example:intake"
+
+
+def test_fairness_rejects_closed_lanes_and_falls_back_to_claim_renamed_waiter(
+        isolated_db, monkeypatch):
+    profile = _profile_with_costs(core=200)
+    profile["github_budget"]["starvation_timeout_seconds"] = 600
+    profile["queues"] = [
+        {"id": "merge", "series_contains": " - MERGE"},
+    ]
+    profile["scheduler"] = {"lanes": [
+        {"id": "integration", "queues": ["merge"], "borrow": False},
+    ]}
+    monkeypatch.setattr(
+        pipeline_insights, "_profiles", lambda: {"example": profile})
+
+    waiter_created = isolated_db.create_task(TaskCreate(
+        prompt="Removed queue - FIX", recurrence="4h", priority=4))
+    waiter = isolated_db.get_next_runnable()
+    assert waiter.id == waiter_created.id
+    _arm_and_defer_budget_waiter(
+        isolated_db, waiter, wait_started_at=time.time() - 601)
+    urgent = isolated_db.create_task(TaskCreate(
+        prompt="Example - MERGE", recurrence="4h", priority=1))
+
+    with pytest.raises(ValueError, match="borrow:true recovery lane"):
+        pipeline_insights.worker_lane_policy()
+    claimed, lane_id = worker._claim_next_task()
+
+    assert claimed.id == waiter.id
+    assert claimed.id != urgent.id
+    assert lane_id is None
+
+
+def test_budget_waiter_fairness_is_oldest_first_then_advances(
+        isolated_db):
+    first_created = isolated_db.create_task(TaskCreate(
+        prompt="Example - PLAN", recurrence="4h", priority=4))
+    first = isolated_db.get_next_runnable()
+    assert first.id == first_created.id
+    _arm_and_defer_budget_waiter(
+        isolated_db, first, wait_started_at=1000)
+
+    second_created = isolated_db.create_task(TaskCreate(
+        prompt="Example - FIX", recurrence="4h", priority=3))
+    second = isolated_db.get_next_runnable()
+    assert second.id == second_created.id
+    _arm_and_defer_budget_waiter(
+        isolated_db, second, wait_started_at=1001)
+
+    ledger = isolated_db.pipeline_github_budget_reservations(
+        "github-default", starvation_timeout_seconds=600, now=2000)
+    assert ledger["fairness_waiter"]["task_id"] == first.id
+    assert ledger["fairness_waiter"]["priority"] == 4
+
+    assert isolated_db.update_task_fields(
+        first.id, {"scheduled_at": datetime.now(timezone.utc)})
+    advanced = isolated_db.pipeline_github_budget_reservations(
+        "github-default", starvation_timeout_seconds=600, now=2000)
+    assert advanced["fairness_waiter"]["task_id"] == second.id
+
+
+def test_starved_waiter_baton_blocks_early_and_atomic_new_reservations(
+        isolated_db):
+    owner = _running_task(isolated_db, "Existing GitHub owner")
+    assert _reserve(
+        isolated_db, owner, "existing-owner", core=500,
+        remaining=2000)["allowed"] is True
+
+    waiter_created = isolated_db.create_task(TaskCreate(
+        prompt="Example - FIX", recurrence="4h", priority=3))
+    waiter = isolated_db.get_next_runnable()
+    assert waiter.id == waiter_created.id
+    _arm_and_defer_budget_waiter(
+        isolated_db, waiter, wait_started_at=1000)
+
+    urgent_created = isolated_db.create_task(TaskCreate(
+        prompt="Example - MERGE", recurrence="4h", priority=1))
+    urgent = isolated_db.get_next_runnable()
+    assert urgent.id == urgent_created.id
+    ledger = isolated_db.pipeline_github_budget_reservations(
+        "github-default", starvation_timeout_seconds=600, now=1600)
+    profile = _profile_with_costs(core=200)
+    profile["github_budget"]["starvation_timeout_seconds"] = 600
+    policy = pipeline_insights._github_budget_policy(profile)
+
+    early = pipeline_insights._priority_waiter_decision(
+        policy, _limits(core=2000), ledger, priority=urgent.priority,
+        task_id=urgent.id, status_revision=7)
+    assert early["state"] == "fairness_waiter"
+    assert early["fairness_waiter"]["task_id"] == waiter.id
+    assert pipeline_insights._priority_waiter_decision(
+        policy, _limits(core=2000), ledger, priority=3,
+        task_id=waiter.id, status_revision=7) is None
+
+    atomic = _reserve(
+        isolated_db, urgent, "urgent-after-timeout", core=200,
+        remaining=2000, minimum=100, starvation_timeout_seconds=600,
+        now=1600)
+    assert atomic["allowed"] is False
+    assert atomic["state"] == "fairness_waiter"
+    assert atomic["fairness_waiter"]["task_id"] == waiter.id
+
+    assert isolated_db.mark_cancelled(
+        urgent.id, expected_started_at=urgent.started_at)
+    assert isolated_db.release_pipeline_github_budget(
+        "github-default", token="existing-owner", task_id=owner.id,
+        task_started_at=owner.started_at)
+    selected = isolated_db.get_next_runnable()
+    assert selected.id == waiter.id
+    admitted = _reserve(
+        isolated_db, selected, "selected-starved-waiter", core=500,
+        remaining=1300, minimum=700, starvation_timeout_seconds=600,
+        now=1601)
+    assert admitted["allowed"] is True
+    assert admitted["minimum_remaining"]["core"] == 700
+    assert admitted["effective_after"]["core"] == 800
+    assert _budget_wait_row(isolated_db, waiter.id) == {
+        "budget_wait_scope": None, "budget_wait_started_at": None,
+    }
+
+
+def test_starved_baton_keeps_floor_and_low_wait_releases_baton(isolated_db):
+    created = isolated_db.create_task(TaskCreate(
+        prompt="Example - PLAN", recurrence="4h", priority=4))
+    waiter = isolated_db.get_next_runnable()
+    assert waiter.id == created.id
+    _arm_and_defer_budget_waiter(
+        isolated_db, waiter, wait_started_at=1000)
+    claimed = isolated_db.get_next_runnable()
+    assert claimed.id == waiter.id
+
+    denied = _reserve(
+        isolated_db, claimed, "starved-but-low", core=500,
+        remaining=1100, minimum=700, starvation_timeout_seconds=600,
+        now=1600)
+    assert denied["allowed"] is False
+    assert denied["state"] == "low"
+    assert denied["minimum_remaining"]["core"] == 700
+    assert _budget_wait_row(isolated_db, waiter.id) == {
+        "budget_wait_scope": None, "budget_wait_started_at": None,
+    }
+
+    assert isolated_db.defer_task(
+        claimed.id, datetime.now(timezone.utc) + timedelta(minutes=5),
+        "live GitHub quota is low", expected_started_at=claimed.started_at)
+    assert _budget_wait_row(isolated_db, waiter.id) == {
+        "budget_wait_scope": None, "budget_wait_started_at": None,
+    }
+
+
+def test_budget_waiter_clear_is_exact_attempt_fenced(isolated_db):
+    task = _running_task(isolated_db, "Example - FIX")
+    revision = isolated_db.pipeline_github_budget_reservations(
+        "github-default")["revision"]
+    assert isolated_db.arm_pipeline_github_budget_waiter(
+        "github-default", task_id=task.id, task_started_at=task.started_at,
+        expected_revision=revision, now=1000)["armed"]
+
+    assert not isolated_db.clear_pipeline_github_budget_waiter(
+        task_id=task.id,
+        task_started_at=task.started_at + timedelta(microseconds=1))
+    assert _budget_wait_row(
+        isolated_db, task.id)["budget_wait_scope"] == "github-default"
+    assert isolated_db.clear_pipeline_github_budget_waiter(
+        task_id=task.id,
+        task_started_at=task.started_at)
+    assert _budget_wait_row(isolated_db, task.id) == {
+        "budget_wait_scope": None, "budget_wait_started_at": None,
+    }
+
+
+@pytest.mark.parametrize(("with_costs", "retain_budget"), [
+    (False, True),
+    (True, False),
+])
+def test_success_without_reservation_clears_aged_waiter(
+        isolated_db, monkeypatch, with_costs, retain_budget):
+    profile = (_profile_with_costs(core=100)
+               if with_costs else _profile())
+    profile["github_budget"]["starvation_timeout_seconds"] = 600
+    monkeypatch.setattr(
+        pipeline_insights, "_profiles", lambda: {"example": profile})
+    monkeypatch.setattr(
+        pipeline_insights, "_github_rate_limits", lambda: _limits())
+    pipeline_insights.release_execution_admission()
+    task = _running_task(isolated_db, "Example - REVIEW")
+    revision = isolated_db.pipeline_github_budget_reservations(
+        "github-default")["revision"]
+    assert isolated_db.arm_pipeline_github_budget_waiter(
+        "github-default", task_id=task.id, task_started_at=task.started_at,
+        expected_revision=revision, now=time.time() - 601)["armed"]
+
+    route = pipeline_insights.execution_route(
+        task, task.prompt, retain_budget=retain_budget)
+
+    assert route["action"] == "prompt"
+    assert _budget_wait_row(isolated_db, task.id) == {
+        "budget_wait_scope": None, "budget_wait_started_at": None,
+    }
+    assert isolated_db.pipeline_github_budget_reservations(
+        "github-default")["count"] == 0
+    pipeline_insights.release_execution_admission()
+
+
+def test_unmatched_route_clears_stale_waiter_from_renamed_profile(
+        isolated_db, monkeypatch):
+    task = _running_task(isolated_db, "Renamed pipeline series")
+    revision = isolated_db.pipeline_github_budget_reservations(
+        "github-default")["revision"]
+    assert isolated_db.arm_pipeline_github_budget_waiter(
+        "github-default", task_id=task.id, task_started_at=task.started_at,
+        expected_revision=revision, now=time.time() - 601)["armed"]
+    monkeypatch.setattr(pipeline_insights, "_matching_queue", lambda _task: None)
+
+    route = pipeline_insights.execution_route(task, task.prompt)
+
+    assert route == {
+        "action": "prompt", "mode": "skill", "prompt": task.prompt,
+    }
+    assert _budget_wait_row(isolated_db, task.id) == {
+        "budget_wait_scope": None, "budget_wait_started_at": None,
+    }
+
+
+@pytest.mark.parametrize("case", [
+    "policy_none", "invalid_config", "acquire_error", "lease_unavailable",
+])
+def test_early_non_handoff_paths_clear_stale_waiter(
+        isolated_db, monkeypatch, case):
+    profile = _profile()
+    profile["github_budget"]["starvation_timeout_seconds"] = 600
+    if case == "policy_none":
+        profile.pop("github_budget")
+    elif case == "invalid_config":
+        profile["github_budget"]["starvation_timeout_seconds"] = True
+    elif case == "acquire_error":
+        monkeypatch.setattr(
+            isolated_db, "acquire_pipeline_scan_lease",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                sqlite3.OperationalError("database is locked")))
+    else:
+        monkeypatch.setattr(
+            isolated_db, "acquire_pipeline_scan_lease",
+            lambda *_args, **_kwargs: {
+                "acquired": False, "state": "unavailable",
+                "status_revision": 0,
+            })
+    monkeypatch.setattr(
+        pipeline_insights, "_profiles", lambda: {"example": profile})
+    monkeypatch.setattr(
+        pipeline_insights, "_github_rate_limits", lambda: _limits())
+    task = _running_task(isolated_db, "Example - REVIEW")
+    revision = isolated_db.pipeline_github_budget_reservations(
+        "github-default")["revision"]
+    assert isolated_db.arm_pipeline_github_budget_waiter(
+        "github-default", task_id=task.id, task_started_at=task.started_at,
+        expected_revision=revision, now=time.time() - 601)["armed"]
+
+    route = pipeline_insights.execution_route(task, task.prompt)
+
+    assert route["action"] == ("prompt" if case == "policy_none" else "defer")
+    assert _budget_wait_row(isolated_db, task.id) == {
+        "budget_wait_scope": None, "budget_wait_started_at": None,
+    }
+
+
+def test_budget_wait_timestamp_survives_rearm_and_crash_recovery_but_not_edit(
+        isolated_db):
+    task = _running_task(isolated_db, "Example - FIX")
+    revision = isolated_db.pipeline_github_budget_reservations(
+        "github-default")["revision"]
+    assert isolated_db.arm_pipeline_github_budget_waiter(
+        "github-default", task_id=task.id, task_started_at=task.started_at,
+        expected_revision=revision, now=1000)["armed"]
+    assert isolated_db.arm_pipeline_github_budget_waiter(
+        "github-default", task_id=task.id, task_started_at=task.started_at,
+        expected_revision=revision, now=1200)["armed"]
+    expected_timestamp = datetime.fromtimestamp(
+        1000, timezone.utc).isoformat()
+    assert _budget_wait_row(isolated_db, task.id) == {
+        "budget_wait_scope": "github-default",
+        "budget_wait_started_at": expected_timestamp,
+    }
+
+    assert isolated_db.recover_running_attempt(task.id, task.started_at)
+    assert _budget_wait_row(isolated_db, task.id) == {
+        "budget_wait_scope": "github-default",
+        "budget_wait_started_at": expected_timestamp,
+    }
+    edited_after = datetime.now(timezone.utc)
+    assert isolated_db.update_task_fields(task.id, {"priority": 4})
+    edited = _budget_wait_row(isolated_db, task.id)
+    assert edited["budget_wait_scope"] == "github-default"
+    restarted_at = datetime.fromisoformat(edited["budget_wait_started_at"])
+    assert edited_after <= restarted_at <= datetime.now(timezone.utc)
+
+
+@pytest.mark.parametrize("editor", ["task_priority", "series_priority"])
+def test_all_priority_edit_paths_restart_budget_wait_age(
+        isolated_db, editor):
+    created = isolated_db.create_task(TaskCreate(
+        prompt="Example - FIX", recurrence="4h", priority=3))
+    task = isolated_db.get_next_runnable()
+    assert task.id == created.id
+    _arm_and_defer_budget_waiter(
+        isolated_db, task, wait_started_at=1000,
+        defer_until=datetime.now(timezone.utc) + timedelta(minutes=5))
+    edited_after = datetime.now(timezone.utc)
+
+    if editor == "task_priority":
+        assert isolated_db.update_priority(task.id, 4)
+    else:
+        assert isolated_db.update_series(task.series_id, {"priority": 4})
+
+    edited = _budget_wait_row(isolated_db, task.id)
+    assert edited["budget_wait_scope"] == "github-default"
+    restarted_at = datetime.fromisoformat(edited["budget_wait_started_at"])
+    assert edited_after <= restarted_at <= datetime.now(timezone.utc)
+
+
+def test_budget_waiter_fairness_migrates_legacy_database(
+        tmp_path, monkeypatch):
+    db_path = tmp_path / "legacy-promptpilot.db"
+    monkeypatch.setattr(database, "DB_DIR", tmp_path)
+    monkeypatch.setattr(database, "DB_PATH", db_path)
+    legacy_schema = database.SCHEMA.replace(
+        "    budget_wait_started_at TEXT,\n", "")
+    assert legacy_schema != database.SCHEMA
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(legacy_schema)
+        conn.execute(
+            """INSERT INTO tasks
+               (prompt, status, priority, created_at, budget_wait_scope)
+               VALUES (?, 'pending', 3, ?, ?)""",
+            ("legacy waiter", datetime.now(timezone.utc).isoformat(),
+             "github-default"),
+        )
+
+    database.init_db()
+    database.init_db()
+
+    with sqlite3.connect(db_path) as conn:
+        columns = {row[1] for row in conn.execute(
+            "PRAGMA table_info(tasks)").fetchall()}
+        indexes = {row[1] for row in conn.execute(
+            "PRAGMA index_list(tasks)").fetchall()}
+        migrated = conn.execute(
+            """SELECT budget_wait_scope, budget_wait_started_at
+               FROM tasks WHERE prompt = 'legacy waiter'""").fetchone()
+        marker = conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE version = ?",
+            (database.PIPELINE_BUDGET_WAITER_FAIRNESS_SCHEMA_VERSION,),
+        ).fetchone()
+        integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+
+    assert "budget_wait_started_at" in columns
+    assert "idx_tasks_budget_wait_fairness" in indexes
+    assert migrated[0] == "github-default"
+    migrated_at = datetime.fromisoformat(migrated[1])
+    assert migrated_at.tzinfo is not None
+    assert marker == (1,)
+    assert integrity == "ok"
 
 
 def test_stale_prune_yields_to_woken_higher_priority_waiter(isolated_db):
