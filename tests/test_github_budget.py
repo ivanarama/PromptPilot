@@ -198,6 +198,77 @@ def test_priority_one_headroom_defaults_to_zero_and_accepts_exact_vector():
     }
 
 
+def test_route_priority_promotion_is_attempt_fenced_internal_and_reversible(
+        isolated_db):
+    created = isolated_db.create_task(TaskCreate(
+        prompt="Example - REVIEW", recurrence="15m", priority=2))
+    task = isolated_db.get_next_runnable()
+    assert task.id == created.id
+    wrong_attempt = task.started_at + timedelta(microseconds=1)
+
+    assert isolated_db.promote_running_attempt_priority(
+        task.id, wrong_attempt, 1) is None
+    assert isolated_db.get_task(task.id).priority == 2
+    assert isolated_db.promote_running_attempt_priority(
+        task.id, task.started_at, 1) == 1
+    assert isolated_db.promote_running_attempt_priority(
+        task.id, task.started_at, 1) == 1
+    promoted = isolated_db.get_task(task.id)
+    assert promoted.priority == 1
+    assert "pipeline_priority_restore" not in promoted.model_dump()
+    with isolated_db._connect() as conn:
+        row = conn.execute(
+            "SELECT pipeline_priority_restore FROM tasks WHERE id = ?",
+            (task.id,),
+        ).fetchone()
+        columns = {item["name"] for item in conn.execute(
+            "PRAGMA table_info(tasks)").fetchall()}
+    assert row["pipeline_priority_restore"] == 2
+    assert "pipeline_priority_restore" in columns
+
+    assert isolated_db.restore_running_attempt_priority(
+        task.id, wrong_attempt) is None
+    assert isolated_db.restore_running_attempt_priority(
+        task.id, task.started_at) == 2
+    restored = isolated_db.get_task(task.id)
+    assert restored.priority == 2
+    with isolated_db._connect() as conn:
+        row = conn.execute(
+            "SELECT pipeline_priority_restore FROM tasks WHERE id = ?",
+            (task.id,),
+        ).fetchone()
+    assert row["pipeline_priority_restore"] is None
+
+
+@pytest.mark.parametrize("edit_scope", ["task", "series"])
+def test_explicit_priority_edit_supersedes_temporary_route_promotion(
+        isolated_db, edit_scope):
+    created = isolated_db.create_task(TaskCreate(
+        prompt="Example - REVIEW", recurrence="15m", priority=2))
+    task = isolated_db.get_next_runnable()
+    assert task.id == created.id
+    assert isolated_db.promote_running_attempt_priority(
+        task.id, task.started_at, 1) == 1
+    assert isolated_db.defer_task(
+        task.id, datetime.now(timezone.utc) + timedelta(minutes=5),
+        "budget wait", expected_started_at=task.started_at)
+
+    if edit_scope == "task":
+        assert isolated_db.update_task_fields(task.id, {"priority": 3})
+        expected_priority = 3
+    else:
+        assert isolated_db.update_series(task.series_id, {"priority": 4})
+        expected_priority = 4
+
+    assert isolated_db.get_task(task.id).priority == expected_priority
+    with isolated_db._connect() as conn:
+        row = conn.execute(
+            "SELECT pipeline_priority_restore FROM tasks WHERE id = ?",
+            (task.id,),
+        ).fetchone()
+    assert row["pipeline_priority_restore"] is None
+
+
 @pytest.mark.parametrize("invalid", [
     [],
     {"core": 1200, "search": 12},

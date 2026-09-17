@@ -423,6 +423,46 @@ def _budget_policy_for_admission_priority(policy: dict,
     return selected
 
 
+def _post_preflight_admission_priority(
+        profile: dict, series: list[dict], stage: str,
+        provider_route: str | None,
+        validated_target_stage: str | None,
+        effective_priority_headroom: dict | None) -> int | None:
+    """Let the exact integration REVIEW use the MERGE headroom it unlocks.
+
+    ``validated_target_stage`` is populated only from the signed, task-fenced
+    replica lease.  Ordinary content review remains at the configured series
+    priority and therefore continues to preserve priority-1 capacity.
+    """
+    from .fallback_handoff import INTEGRATION_REVIEW_STAGES
+
+    if (stage != "review" or provider_route != "fallback_targeted"
+            or validated_target_stage not in INTEGRATION_REVIEW_STAGES):
+        return None
+    # Admission has already combined every profile that shares this GitHub
+    # account. Looking only at the current profile would reintroduce the cycle
+    # whenever another repository owns the strongest shared headroom.
+    headroom = effective_priority_headroom or {}
+    if (not isinstance(headroom, dict)
+            or not any(type(value) is int and value > 0
+                       for value in headroom.values())):
+        return None
+    priorities = []
+    for queue in profile.get("queues", []):
+        execution = queue.get("execution") or {}
+        queue_stage = str(execution.get("stage") or queue.get("id") or "").lower()
+        if queue_stage != "merge":
+            continue
+        for item in _series_replicas_for_queue(queue, series):
+            priority = item.get("priority")
+            if (not item.get("paused") and not item.get("broken")
+                    and type(priority) is int and 1 <= priority <= 10):
+                priorities.append(priority)
+    # This reserve is specifically consumable by priority 1. A lower-urgency
+    # MERGE series does not justify leaving the REVIEW occurrence promoted.
+    return 1 if 1 in priorities else None
+
+
 def _budget_policy_for_route(policy: dict, route: str | None) -> dict:
     """Attach an estimated route cost; profiles without costs stay legacy."""
     if route is None or policy.get("costs") is None:
@@ -1005,10 +1045,14 @@ def _reservation_denied(policy: dict, limits: dict | None, result: dict, *,
 
 def _reserve_execution_admission(
         task, profile_id: str, profile: dict, queue: dict, admission: dict,
-        budget_route: str, *, retain_budget: bool) -> dict:
+        budget_route: str, *, retain_budget: bool,
+        admission_priority: int | None = None) -> dict:
     """Recheck the elected route and optionally reserve its in-flight cost."""
     lease = admission.get("_lease")
     expected_revision = admission.get("_budget_reservation_revision")
+    effective_priority = (
+        getattr(task, "priority", None)
+        if admission_priority is None else admission_priority)
     if type(expected_revision) is not int or expected_revision < 0:
         expected_revision = None
     try:
@@ -1018,7 +1062,7 @@ def _reserve_execution_admission(
         policy = _with_shared_budget_floor(policy)
         policy = _budget_policy_for_route(policy, budget_route)
         policy = _budget_policy_for_admission_priority(
-            policy, getattr(task, "priority", None))
+            policy, effective_priority)
         if not policy.get("cost_accounting"):
             # Profiles without route costs keep the original one-shot floor
             # admission; they neither re-read limits nor create reservations.
@@ -1047,7 +1091,7 @@ def _reserve_execution_admission(
                 policy["lease_scope"])
             decision = _priority_waiter_decision(
                 policy, limits, reservations,
-                priority=getattr(task, "priority", None),
+                priority=effective_priority,
                 status_revision=lease.status_revision)
             if decision is None:
                 decision = _evaluate_github_budget(
@@ -2689,8 +2733,9 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
             "profile_id": profile_id, "queue_id": queue.get("id"),
         }
     replicated = replica_count > 1
+    profile_series = db.list_series() if replicated else []
     if replicated:
-        replica_status = _queue_replica_status(queue, db.list_series())
+        replica_status = _queue_replica_status(queue, profile_series)
         stage_name = str((queue.get("execution") or {}).get("stage")
                          or queue.get("id") or "").lower()
         issues = list(replica_status["issues"])
@@ -2889,6 +2934,8 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
 
         preflight_action = preflight["action"].lower()
         target_reservation = None
+        validated_target_stage = None
+        fallback_lease = None
         if replicated and preflight_action in {"audit", "fallback"}:
             try:
                 from . import project_pipeline
@@ -2925,6 +2972,7 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                     raise project_pipeline.PipelineError(
                         "pipeline target reservation contradicts task, repository, or target")
                 target_reservation = reservation
+                validated_target_stage = target_stage
             except (project_pipeline.PipelineError, TypeError, ValueError) as exc:
                 return {
                     "action": "block", "mode": "tool",
@@ -2932,6 +2980,37 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                     "profile_id": profile_id, "queue_id": queue.get("id"),
                     "preflight": preflight,
                 }
+        if (preflight_action == "fallback" and "handoff" in preflight
+                and target_reservation is not None):
+            from .fallback_handoff import validate
+            from .project_pipeline import PipelineError
+
+            try:
+                fallback_lease = validate(preflight, stage)
+                if command[-2:] != ["next", stage]:
+                    raise PipelineError(
+                        "fallback handoff command must end with next and the exact stage")
+            except (PipelineError, TypeError, ValueError) as exc:
+                try:
+                    task_id = getattr(task, "id", None)
+                    started_at = getattr(task, "started_at", None)
+                    if type(task_id) is int and task_id > 0 and started_at is not None:
+                        db.restore_running_attempt_priority(task_id, started_at)
+                except (sqlite3.Error, TypeError, ValueError) as restore_exc:
+                    denied = _replace_admission_with_lease_failure(
+                        admission, profile, _GitHubScanLeaseUnavailable(
+                            "pipeline admission priority restoration is unavailable "
+                            f"after invalid fallback handoff: {restore_exc}"))
+                    return _budget_defer_route(
+                        denied, profile_id, profile, queue, mode="skill",
+                        phase="post_preflight", preflight=preflight)
+                return {
+                    "action": "block", "mode": "tool", "reason": str(exc),
+                    "profile_id": profile_id, "queue_id": queue.get("id"),
+                    "preflight": preflight,
+                }
+            validated_target_stage = str(
+                (fallback_lease.get("target") or {}).get("stage") or "").lower()
         provider_route = None
         if preflight_action == "fallback" and mode == "auto":
             provider_route = ("fallback_targeted" if "handoff" in preflight
@@ -2940,10 +3019,54 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
             provider_route = "tool"
         elif preflight_action not in {"empty", "wait", "error"} and mode == "auto":
             provider_route = "skill"
+        routed_priority = _post_preflight_admission_priority(
+            profile, profile_series, stage, provider_route,
+            validated_target_stage, admission.get("priority_one_headroom"))
+        # Only a signed target that is also fenced to this exact replica task
+        # may borrow the priority-1 integration headroom.
+        if routed_priority is not None and target_reservation is None:
+            routed_priority = None
+        task_id = getattr(task, "id", None)
+        task_started_at = getattr(task, "started_at", None)
+        admission_priority = getattr(task, "priority", None)
+        if type(task_id) is int and task_id > 0 and task_started_at is not None:
+            try:
+                if routed_priority is None:
+                    admission_priority = db.restore_running_attempt_priority(
+                        task_id, task_started_at)
+                else:
+                    admission_priority = db.promote_running_attempt_priority(
+                        task_id, task_started_at, routed_priority)
+            except (sqlite3.Error, TypeError, ValueError) as exc:
+                denied = _replace_admission_with_lease_failure(
+                    admission, profile, _GitHubScanLeaseUnavailable(
+                        f"pipeline admission priority transition is unavailable: {exc}"))
+                return _budget_defer_route(
+                    denied, profile_id, profile, queue,
+                    mode=("tool" if provider_route == "tool" else "skill"),
+                    phase="post_preflight", preflight=preflight)
+            if admission_priority is None:
+                return {
+                    "action": "block", "mode": "tool",
+                    "reason": (
+                        "running task attempt changed before pipeline admission "
+                        "priority transition"),
+                    "profile_id": profile_id, "queue_id": queue.get("id"),
+                    "preflight": preflight,
+                }
+        elif routed_priority is not None:
+            return {
+                "action": "block", "mode": "tool",
+                "reason": (
+                    "integration REVIEW admission has no exact running task attempt"),
+                "profile_id": profile_id, "queue_id": queue.get("id"),
+                "preflight": preflight,
+            }
         if provider_route is not None:
             admission = _reserve_execution_admission(
                 task, profile_id, profile, queue, admission, provider_route,
-                retain_budget=retain_budget)
+                retain_budget=retain_budget,
+                admission_priority=admission_priority)
             if not admission.get("allowed"):
                 return _budget_defer_route(
                     admission, profile_id, profile, queue,
@@ -2977,19 +3100,21 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
         }
     if preflight_action == "fallback":
         if "handoff" in preflight:
-            from .fallback_handoff import validate
-            from .project_pipeline import PipelineError
+            if fallback_lease is None:
+                from .fallback_handoff import validate
+                from .project_pipeline import PipelineError
 
-            try:
-                fallback_lease = validate(preflight, stage)
-                if command[-2:] != ["next", stage]:
-                    raise PipelineError("fallback handoff command must end with next and the exact stage")
-            except (PipelineError, TypeError, ValueError) as exc:
-                return {
-                    "action": "block", "mode": "tool", "reason": str(exc),
-                    "profile_id": profile_id, "queue_id": queue.get("id"),
-                    "preflight": preflight,
-                }
+                try:
+                    fallback_lease = validate(preflight, stage)
+                    if command[-2:] != ["next", stage]:
+                        raise PipelineError(
+                            "fallback handoff command must end with next and the exact stage")
+                except (PipelineError, TypeError, ValueError) as exc:
+                    return {
+                        "action": "block", "mode": "tool", "reason": str(exc),
+                        "profile_id": profile_id, "queue_id": queue.get("id"),
+                        "preflight": preflight,
+                    }
             if mode == "auto":
                 gate_command = [*command[:-2], "gate-fallback", stage,
                                 "--lease", preflight["handoff"]["lease"]]
