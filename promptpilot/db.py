@@ -1092,7 +1092,8 @@ def update_series(series_id: int, fields: dict) -> bool:
 def apply_pipeline_series_cadence(
         series_id: int, *, idle_recurrence: str,
         busy_recurrence: Optional[str] = None, boost: bool = False,
-        empty_runs_before_idle: int = 0) -> Optional[dict]:
+        empty_runs_before_idle: int = 0,
+        publication_guard: Optional[dict] = None) -> Optional[dict]:
     """Idempotently reconcile one profile-owned adaptive cadence.
 
     ``idle_recurrence`` is the durable safety interval.  ``busy_recurrence``
@@ -1114,7 +1115,33 @@ def apply_pipeline_series_cadence(
             or not 0 <= empty_runs_before_idle <= 20):
         raise ValueError("empty_runs_before_idle must be from 0 to 20")
 
+    if publication_guard is not None:
+        required = {
+            "epoch_key", "epoch", "epoch_default", "profile_key",
+            "profile_hash", "revision_key", "revision",
+        }
+        if (not isinstance(publication_guard, dict)
+                or set(publication_guard) != required
+                or any(not isinstance(publication_guard[name], str)
+                       for name in required)):
+            raise ValueError("invalid adaptive cadence publication guard")
+
     with _connect(immediate=True) as conn:
+        if publication_guard is not None:
+            def setting(name: str, default: Optional[str] = None):
+                row = conn.execute(
+                    "SELECT value FROM settings WHERE key = ?",
+                    (publication_guard[name],),
+                ).fetchone()
+                return row["value"] if row else default
+
+            if (setting("epoch_key", publication_guard["epoch_default"])
+                    != publication_guard["epoch"]
+                    or setting("profile_key")
+                    != publication_guard["profile_hash"]
+                    or setting("revision_key")
+                    != publication_guard["revision"]):
+                return None
         row = conn.execute(
             "SELECT * FROM task_series WHERE id = ?", (series_id,)
         ).fetchone()
@@ -1130,23 +1157,25 @@ def apply_pipeline_series_cadence(
                 and before.get("temporary_recurrence") == busy_recurrence
             )
             if boost:
-                reset_counter = (
-                    before.get("temporary_recurrence") != busy_recurrence
-                    or before.get("temporary_until") is not None
-                    or before.get("temporary_empty_limit")
-                    != (empty_runs_before_idle or None)
-                )
                 desired["temporary_recurrence"] = busy_recurrence
                 desired["temporary_until"] = None
                 desired["temporary_empty_limit"] = (
                     empty_runs_before_idle or None)
-                if reset_counter:
-                    desired["temporary_empty_count"] = 0
+                # A live busy observation breaks an empty-run streak even if
+                # the effective interval itself was already boosted.
+                desired["temporary_empty_count"] = 0
             elif not keep_until_empty:
                 desired["temporary_recurrence"] = None
                 desired["temporary_until"] = None
                 desired["temporary_empty_limit"] = None
                 desired["temporary_empty_count"] = 0
+        else:
+            # An adaptive policy owns the whole cadence. Event-only queues do
+            # not inherit an unrelated/manual temporary boost forever.
+            desired["temporary_recurrence"] = None
+            desired["temporary_until"] = None
+            desired["temporary_empty_limit"] = None
+            desired["temporary_empty_count"] = 0
 
         changed_fields = [
             name for name in (
@@ -1555,13 +1584,35 @@ def wake_series_once(series_id: Optional[int], latch_key: str,
         return True
 
 
+def _pipeline_stale_reselect_guard_key(series_id: int) -> str:
+    return f"pipeline_stale_reselect_guard:v1:{int(series_id)}"
+
+
 def prepare_series_recurrence(series_id: int, verdict: Optional[str]) -> Optional[dict]:
     """Update temporary-boost counters and return settings for the next run."""
-    with _connect() as conn:
+    # BEGIN IMMEDIATE serializes the read/modify/write with a live cadence
+    # reconciliation. A deferred transaction could read the old empty counter
+    # and then overwrite a concurrent busy-observation reset.
+    with _connect(immediate=True) as conn:
         row = conn.execute("SELECT * FROM task_series WHERE id = ?", (series_id,)).fetchone()
         if not row or row["ended_at"]:
             return None
         s = dict(row)
+        stale_key = _pipeline_stale_reselect_guard_key(series_id)
+        stale = (verdict or "").upper() == "УСТАРЕЛО"
+        stale_reselect_immediate = False
+        if stale:
+            prior = conn.execute(
+                "SELECT value FROM settings WHERE key = ?", (stale_key,)
+            ).fetchone()
+            if prior is None:
+                conn.execute(
+                    "INSERT INTO settings (key, value) VALUES (?, '1')",
+                    (stale_key,),
+                )
+                stale_reselect_immediate = True
+        else:
+            conn.execute("DELETE FROM settings WHERE key = ?", (stale_key,))
         now = datetime.now(timezone.utc)
         until = _parse_dt(s["temporary_until"])
         expired = bool(until and until <= now)
@@ -1584,6 +1635,7 @@ def prepare_series_recurrence(series_id: int, verdict: Optional[str]) -> Optiona
                          (empty_count, _now(), series_id))
             s["temporary_empty_count"] = empty_count
         s["effective_recurrence"] = _effective_series_recurrence(s, now)
+        s["stale_reselect_immediate"] = stale_reselect_immediate
         return s
 
 
@@ -1925,8 +1977,13 @@ def set_setting_if_newer_revision(
         key: str, value: str, *, revision_key: str, revision: int,
         guard_key: str, expected_guard: str,
         guard_default: Optional[str] = None,
-        lease_guard: Optional[dict] = None) -> bool:
+        lease_guard: Optional[dict] = None,
+        publication_revision_key: Optional[str] = None,
+        companion_key: Optional[str] = None,
+        companion_value: Optional[str] = None) -> bool:
     """Atomically publish a newer revision while a durable guard matches."""
+    if (companion_key is None) != (companion_value is None):
+        raise ValueError("companion_key and companion_value must be set together")
     with _connect(immediate=True) as conn:
         if (lease_guard is not None
                 and not _pipeline_scan_lease_guard_matches(conn, lease_guard)):
@@ -1946,6 +2003,17 @@ def set_setting_if_newer_revision(
             published_revision = 0
         if published_revision >= int(revision):
             return False
+        if publication_revision_key is not None:
+            row = conn.execute(
+                "SELECT value FROM settings WHERE key = ?",
+                (publication_revision_key,),
+            ).fetchone()
+            try:
+                active_revision = int(row["value"]) if row else 0
+            except (TypeError, ValueError):
+                active_revision = 0
+            if active_revision >= int(revision):
+                return False
         conn.execute(
             "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
             (key, value),
@@ -1954,6 +2022,16 @@ def set_setting_if_newer_revision(
             "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
             (revision_key, str(int(revision))),
         )
+        if companion_key is not None:
+            conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                (companion_key, companion_value),
+            )
+        if publication_revision_key is not None:
+            conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                (publication_revision_key, str(int(revision))),
+            )
     return True
 
 

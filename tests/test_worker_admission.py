@@ -99,6 +99,22 @@ def test_lane_claim_is_atomic_and_queue_order_beats_fifo(
     assert lane == "repo:integration"
 
 
+def test_malformed_optional_profile_falls_back_to_legacy_fifo(
+        isolated_db, monkeypatch, capsys):
+    from promptpilot import pipeline_insights
+
+    first = isolated_db.create_task(TaskCreate(prompt="first", priority=3))
+    isolated_db.create_task(TaskCreate(prompt="second", priority=3))
+    monkeypatch.setattr(
+        pipeline_insights, "_profiles", lambda: {"broken": []})
+
+    claimed, lane = worker._claim_next_task()
+
+    assert claimed.id == first.id
+    assert lane is None
+    assert "pipeline lane scheduler unavailable" in capsys.readouterr().out
+
+
 def test_worker_recovers_then_warms_pipeline_before_claiming(monkeypatch):
     events = []
     handlers = {}
@@ -172,6 +188,7 @@ def test_task_opens_fence_only_after_herdr_provider_started(monkeypatch):
     def provider(*_args, **kwargs):
         assert admission_complete.is_set() is False
         assert kwargs["require_closing_verdict"] is True
+        assert kwargs["allow_targeted_stale"] is False
         calls.append("provider")
         worker._signal_admission_complete(kwargs["admission_complete"])
         assert admission_complete.is_set() is True
@@ -181,6 +198,59 @@ def test_task_opens_fence_only_after_herdr_provider_started(monkeypatch):
     worker._execute_task_body(task, admission_complete)
 
     assert calls == ["route", "provider"]
+
+
+def test_only_targeted_fallback_route_enables_stale_reselection(monkeypatch):
+    admission_complete = threading.Event()
+    task = SimpleNamespace(
+        id=42, series_id=8, prompt="Example - REVIEW",
+        provider="test-provider", working_dir=None, machine=None,
+    )
+    from promptpilot import pipeline_insights
+
+    monkeypatch.setattr(pipeline_insights, "dispatch_gate", lambda _task: None)
+    monkeypatch.setattr(
+        pipeline_insights, "execution_route",
+        lambda *_args, **_kwargs: {
+            "action": "prompt", "mode": "skill", "prompt": "run",
+            "profile_id": "example", "queue_id": "review",
+            "next_already_run": True,
+            "gate_command": ["python", "pipelinectl.py", "gate-fallback"],
+        },
+    )
+    monkeypatch.setattr(
+        worker, "load_providers",
+        lambda: {"test-provider": {"executor": "herdr"}},
+    )
+    captured = {}
+
+    def provider(*_args, **kwargs):
+        captured.update(kwargs)
+        worker._signal_admission_complete(kwargs["admission_complete"])
+
+    monkeypatch.setattr(worker, "_execute_herdr_task", provider)
+
+    worker._execute_task_body(task, admission_complete)
+
+    assert captured["require_closing_verdict"] is True
+    assert captured["allow_targeted_stale"] is True
+    assert "ИТОГ: УСТАРЕЛО (gate-fallback: точная причина)" in captured["prompt_override"]
+    assert worker.parse_verdict("ИТОГ: УСТАРЕЛО (gate-fallback: changed)") == ""
+
+
+def test_only_valid_routine_completion_verdicts_are_silent_in_telegram():
+    from promptpilot.bot import _silent_completion
+
+    completed = {"status": SimpleNamespace(value="completed")}
+
+    assert _silent_completion(SimpleNamespace(
+        **completed, verdict="ПУСТО")) is True
+    assert _silent_completion(SimpleNamespace(
+        **completed, verdict="УСТАРЕЛО")) is True
+    assert _silent_completion(SimpleNamespace(
+        **completed, verdict="НЕ СМОГ")) is False
+    assert _silent_completion(SimpleNamespace(
+        status=SimpleNamespace(value="failed"), verdict="УСТАРЕЛО")) is False
 
 
 def test_sqlite_busy_control_write_is_retried(monkeypatch):

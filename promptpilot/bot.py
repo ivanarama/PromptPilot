@@ -3315,6 +3315,14 @@ async def cb_windows_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _silent_completion(task) -> bool:
+    """Whether a completed routine outcome should stay visible but not ping."""
+    return (
+        task.status.value == "completed"
+        and (task.verdict or "").upper() in {"ПУСТО", "УСТАРЕЛО"}
+    )
+
+
 async def _notify_loop(bot):
     """Background loop: send notifications for completed/failed tasks every 10s.
 
@@ -3360,10 +3368,11 @@ async def _notify_loop(bot):
             continue
         for task in pending:
             try:
-                # ПУСТО — «проснулся по расписанию, делать нечего»: рутина
-                # повторяющихся задач, ради которой будить человека не за чем.
-                # Итог остаётся в базе и виден в списке задач.
-                if task.status.value == "completed" and (task.verdict or "").upper() == "ПУСТО":
+                # ПУСТО and a validated targeted УСТАРЕЛО are routine queue
+                # outcomes. Both remain visible in history/metrics; only the
+                # Telegram success ping is suppressed. Invalid/generic stale
+                # text is normalized to НЕ СМОГ before it reaches this point.
+                if _silent_completion(task):
                     db.mark_notified(task.id)
                     continue
                 if task.status.value == "completed":

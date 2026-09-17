@@ -34,6 +34,9 @@ _CACHE_EPOCH_KEY = "pipeline_insights_cache_epoch:v1"
 _CACHE_KEY_PREFIX = "pipeline_insights_cache:v1:"
 _CACHE_REFRESH_REVISION_PREFIX = "pipeline_insights_refresh_revision:v1:"
 _CACHE_PUBLISHED_REVISION_PREFIX = "pipeline_insights_published_revision:v1:"
+_CACHE_PUBLISHED_PROFILE_PREFIX = "pipeline_insights_published_profile:v1:"
+_CACHE_PUBLISHED_PROFILE_REVISION_PREFIX = \
+    "pipeline_insights_published_profile_revision:v1:"
 _INTERVAL_PRESETS = ((0.25, "15m"), (0.5, "30m"), (1, "1h"), (2, "2h"),
                      (4, "4h"), (8, "8h"), (12, "12h"), (24, "24h"))
 _HISTORY_WINDOWS = (5, 24, 24 * 7, 24 * 30)
@@ -955,6 +958,15 @@ def _published_revision_key(profile_id: str, profile_hash: str) -> str:
             f"{quote(profile_id, safe='')}:{profile_hash}")
 
 
+def _published_profile_key(profile_id: str) -> str:
+    return f"{_CACHE_PUBLISHED_PROFILE_PREFIX}{quote(profile_id, safe='')}"
+
+
+def _published_profile_revision_key(profile_id: str) -> str:
+    return (f"{_CACHE_PUBLISHED_PROFILE_REVISION_PREFIX}"
+            f"{quote(profile_id, safe='')}")
+
+
 def _profile_fingerprint(profile: dict) -> str:
     # Admission tuning changes when a scan may run, not what the observation
     # means. Keep last-good data readable when an operator enables/tunes the
@@ -1075,7 +1087,11 @@ def _publish_cache(profile_id: str, profile: dict, generation: int, epoch: int,
                 revision=revision,
                 guard_key=_CACHE_EPOCH_KEY, expected_guard=str(epoch),
                 guard_default="0",
-                lease_guard=lease.guard if lease is not None else None):
+                lease_guard=lease.guard if lease is not None else None,
+                publication_revision_key=(
+                    _published_profile_revision_key(profile_id)),
+                companion_key=_published_profile_key(profile_id),
+                companion_value=profile_hash):
             if lease is not None:
                 # The CAS can also lose to an ordinary cache invalidation or a
                 # newer refresh. Distinguish that benign race from a rejected
@@ -1429,8 +1445,9 @@ def _adaptive_cadence_status(queue: dict, matching: dict | None,
     }
 
 
-def _reconcile_adaptive_cadence(queue: dict, matching: dict | None,
-                                backlog: int | None) -> dict | None:
+def _reconcile_adaptive_cadence(
+        queue: dict, matching: dict | None, backlog: int | None,
+        publication_guard: dict | None = None) -> dict | None:
     """Apply cadence only during a successful live queue observation."""
     policy = _adaptive_cadence_policy(queue)
     if policy is None or matching is None or not isinstance(backlog, int):
@@ -1444,6 +1461,7 @@ def _reconcile_adaptive_cadence(queue: dict, matching: dict | None,
         busy_recurrence=policy["busy_recurrence"],
         boost=boost,
         empty_runs_before_idle=policy["empty_runs_before_idle"],
+        publication_guard=publication_guard,
     )
     if result is not None:
         matching.update({
@@ -1571,10 +1589,24 @@ def _window_metrics(snapshots: list[dict], current: dict, series_ids: list[int],
                     if isinstance(item, dict) and item.get("key")}
         new_keys = {item.get("key") for item in queue.get("items", [])
                     if isinstance(item, dict) and item.get("key")}
-        queue_throughput[queue_id] = len(old_keys - new_keys)
+        queue_throughput[queue_id] = (
+            len(old_keys - new_keys)
+            if (bool(old_queue.get("membership_complete"))
+                and bool(queue.get("membership_complete")))
+            else None
+        )
     current_total = sum(q.get("backlog", 0) for q in current.get("queues", {}).values())
     baseline_total = sum(q.get("backlog", 0) for q in baseline.get("queues", {}).values())
-    measured_hours = min(coverage, hours)
+    # Rates describe the observations we actually have. If the closest
+    # baseline is ten hours old, dividing its delta by a five-hour display
+    # window would overstate throughput by 2x.
+    measured_hours = coverage
+    complete_membership = all(
+        bool(queue.get("membership_complete"))
+        and bool(baseline.get("queues", {}).get(queue_id, {}).get(
+            "membership_complete"))
+        for queue_id, queue in current.get("queues", {}).items()
+    )
 
     def hourly(value: int) -> float | None:
         return round(value / measured_hours, 2) if measured_hours > 0 else None
@@ -1584,15 +1616,16 @@ def _window_metrics(snapshots: list[dict], current: dict, series_ids: list[int],
         "complete": complete, "backlog_delta": current_total - baseline_total,
         "backlog_delta_per_hour": hourly(current_total - baseline_total),
         "entered": len(entered), "exited": len(exited), "moved": len(moved),
-        "entered_per_hour": hourly(len(entered)),
-        "exited_per_hour": hourly(len(exited)),
+        "entered_per_hour": hourly(len(entered)) if complete_membership else None,
+        "exited_per_hour": hourly(len(exited)) if complete_membership else None,
         "transitions": transitions, "churn_items": churn_items,
         "queue_deltas": queue_deltas,
         "queue_deltas_per_hour": {
             queue_id: hourly(delta) for queue_id, delta in queue_deltas.items()},
         "queue_throughput": queue_throughput,
         "queue_throughput_per_hour": {
-            queue_id: hourly(count) for queue_id, count in queue_throughput.items()},
+            queue_id: hourly(count) if count is not None else None
+            for queue_id, count in queue_throughput.items()},
         "runs": db.pipeline_run_metrics(series_ids, now - timedelta(hours=hours)),
     }
 
@@ -1692,6 +1725,8 @@ def worker_lane_policy() -> dict | None:
     lanes = []
     seen = set()
     for profile_id, profile in profiles.items():
+        if not isinstance(profile, dict):
+            raise ValueError(f"pipeline profile {profile_id} должен быть JSON-объектом")
         scheduler = profile.get("scheduler")
         if scheduler is None:
             continue
@@ -3334,8 +3369,28 @@ def _analyze_without_budget(profile_id: str, series: list[dict], *,
         # Apply them only after both the full-cache CAS and the fenced history
         # snapshot accepted the observation; a stale/losing scan must never
         # retime a live series.
-        for item, matching, backlog in cadence_reconciliations:
-            _reconcile_adaptive_cadence(item, matching, backlog)
+        publication_guard = {
+            "epoch_key": _CACHE_EPOCH_KEY,
+            "epoch": str(cache_epoch),
+            "epoch_default": "0",
+            "profile_key": _published_profile_key(profile_id),
+            "profile_hash": profile_hash,
+            "revision_key": _published_profile_revision_key(profile_id),
+            "revision": str(refresh_revision),
+        }
+        try:
+            current_profile = _profiles().get(profile_id)
+            profile_still_current = (
+                isinstance(current_profile, dict)
+                and _profile_fingerprint(current_profile) == profile_hash
+            )
+        except (AttributeError, OSError, TypeError, ValueError, json.JSONDecodeError):
+            profile_still_current = False
+        if profile_still_current:
+            for item, matching, backlog in cadence_reconciliations:
+                _reconcile_adaptive_cadence(
+                    item, matching, backlog,
+                    publication_guard=publication_guard)
         return _refresh_local_state(
             result, profile, series, source="live",
             generated_at=float(result["generated_at"]), entry_epoch=cache_epoch,

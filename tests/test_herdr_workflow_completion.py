@@ -37,11 +37,20 @@ def test_closing_workflow_verdict_accepts_only_final_line():
     ) == "ГОТОВО"
 
 
-def test_closing_workflow_verdict_accepts_stale_reselection_outcome():
+def test_stale_reselection_requires_targeted_exact_gate_fallback_form():
     assert _closing_workflow_verdict(
         "Gate proved that the exact HEAD changed.\n"
-        "ИТОГ: УСТАРЕЛО (PR HEAD changed before mutation)"
+        "ИТОГ: УСТАРЕЛО (gate-fallback: PR HEAD changed before mutation)"
+    ) == "НЕ СМОГ"
+    assert _closing_workflow_verdict(
+        "Gate proved that the exact HEAD changed.\n"
+        "ИТОГ: УСТАРЕЛО (gate-fallback: PR HEAD changed before mutation)",
+        allow_targeted_stale=True,
     ) == "УСТАРЕЛО"
+    assert _closing_workflow_verdict(
+        "Gate refused.\nИТОГ: УСТАРЕЛО (PR HEAD changed)",
+        allow_targeted_stale=True,
+    ) == "НЕ СМОГ"
     assert _closing_workflow_verdict(
         "Проверять нечего.\nИТОГ: ПУСТО (очередь пуста)"
     ) == "ПУСТО"
@@ -59,6 +68,15 @@ def test_closing_workflow_verdict_accepts_stale_reselection_outcome():
         "  выполнены unit tests,\n"
         "  метка reviewed установлена"
     ) == "ГОТОВО"
+
+
+def test_global_contract_does_not_advertise_targeted_stale_outcome():
+    generic = ensure_closing_verdict_contract("do work")
+    targeted = ensure_closing_verdict_contract(
+        "do targeted work", allow_targeted_stale=True)
+
+    assert "ИТОГ: УСТАРЕЛО" not in generic
+    assert "ИТОГ: УСТАРЕЛО (gate-fallback: точная причина)" in targeted
 
 
 def test_agy_background_task_indicator_blocks_idle_completion():

@@ -136,8 +136,7 @@ ENV_FAILURE_RE = re.compile(
 # The agent is asked to end with this line so a finished task says WHAT
 # happened, not just that the process exited 0. Parsed whether or not we asked.
 VERDICTS = (
-    "ГОТОВО", "УЖЕ СДЕЛАНО", "НУЖЕН ЧЕЛОВЕК", "НЕ СМОГ", "УСТАРЕЛО",
-    "ПУСТО",
+    "ГОТОВО", "УЖЕ СДЕЛАНО", "НУЖЕН ЧЕЛОВЕК", "НЕ СМОГ", "ПУСТО",
 )
 VERDICT_RE = re.compile(r"^[ \t>*#-]*ИТОГ:\s*(" + "|".join(VERDICTS) + r")\b", re.M | re.I)
 
@@ -486,20 +485,11 @@ def _maybe_recur(task, failed: bool = False):
     recurrence = series["effective_recurrence"] if series else task.recurrence
     if task.series_id and series is None:  # series was explicitly ended
         return
-    # A stale exact target is neither a failed run nor useful work. Re-elect it
-    # immediately instead of making a busy queue wait for its ordinary cadence.
-    # Only the explicit closing verdict enables this path: generic failures and
-    # ambiguous gate errors keep their normal bounded schedule.
-    stale_pipeline_target = False
-    if (task.verdict or "").upper() == "УСТАРЕЛО":
-        try:
-            from . import pipeline_insights
-            stale_pipeline_target = pipeline_insights._matching_queue(task) is not None
-        except (AttributeError, OSError, TypeError, ValueError):
-            # A broken/temporarily unreadable optional profile must not turn
-            # an ordinary recurring task into an unbounded immediate loop.
-            stale_pipeline_target = False
-    next_dt = (datetime.now(timezone.utc) if stale_pipeline_target
+    # The durable series latch allows one immediate re-election after a
+    # validated targeted gate-fallback. Consecutive stale results use the
+    # ordinary cadence, so a moving target cannot create an unbounded hot loop.
+    next_dt = (datetime.now(timezone.utc)
+               if series and series.get("stale_reselect_immediate")
                else db.parse_recurrence(recurrence))
     if not next_dt:
         return
@@ -584,7 +574,8 @@ def _notify_requeued(task, next_run, reason: str):
 
 
 def _execute_herdr_task(task, provider_cfg, host=None, machine=None, prompt_override=None,
-                        admission_complete=None, require_closing_verdict=False):
+                        admission_complete=None, require_closing_verdict=False,
+                        allow_targeted_stale=False):
     """Run the task in a live herdr session (providers with executor=herdr).
 
     host is the ssh target of the machine the session lives on (None = local).
@@ -645,7 +636,8 @@ def _execute_herdr_task(task, provider_cfg, host=None, machine=None, prompt_over
                            on_worktree=on_worktree, on_pane=on_pane,
                            on_started=on_started,
                            prompt_override=prompt_override,
-                           require_closing_verdict=require_closing_verdict)
+                           require_closing_verdict=require_closing_verdict,
+                           allow_targeted_stale=allow_targeted_stale)
 
     if outcome.get("cancelled"):
         db.clear_cancel_request(task.id)
@@ -682,6 +674,8 @@ def _execute_herdr_task(task, provider_cfg, host=None, machine=None, prompt_over
         return
 
     verdict = outcome.get("verdict") or parse_verdict(outcome["output"])
+    if verdict == "УСТАРЕЛО" and not allow_targeted_stale:
+        verdict = "НЕ СМОГ"
     if require_closing_verdict and not outcome.get("verdict"):
         _retry_sqlite_busy(
             lambda: db.mark_failed(
@@ -782,6 +776,7 @@ def _execute_task_body(task, admission_complete=None):
 
     agent_prompt = effective_prompt(task)
     require_closing_verdict = False
+    allow_targeted_stale = False
     if task.series_id:
         try:
             from . import pipeline_insights
@@ -852,9 +847,18 @@ def _execute_task_body(task, admission_complete=None):
         require_closing_verdict = bool(
             route.get("profile_id") and route.get("queue_id")
         )
+        gate_command = route.get("gate_command")
+        allow_targeted_stale = bool(
+            require_closing_verdict
+            and route.get("next_already_run") is True
+            and isinstance(gate_command, list)
+            and gate_command
+            and all(isinstance(value, str) and value for value in gate_command)
+        )
         if require_closing_verdict:
             from .herdr_exec import ensure_closing_verdict_contract
-            agent_prompt = ensure_closing_verdict_contract(agent_prompt)
+            agent_prompt = ensure_closing_verdict_contract(
+                agent_prompt, allow_targeted_stale=allow_targeted_stale)
         if route.get("fallback_reason"):
             if route.get("next_already_run"):
                 print("  -> Pipeline tool selected target; continuing full skill: "
@@ -887,6 +891,7 @@ def _execute_task_body(task, admission_complete=None):
                 prompt_override=agent_prompt,
                 admission_complete=admission_complete,
                 require_closing_verdict=require_closing_verdict,
+                allow_targeted_stale=allow_targeted_stale,
             )
         finally:
             # Startup failures have no on_started callback.  Once their durable
@@ -1128,7 +1133,8 @@ def _execute_task_body(task, admission_complete=None):
 
     if require_closing_verdict:
         from .herdr_exec import _closing_workflow_verdict
-        verdict = _closing_workflow_verdict(verdict_source)
+        verdict = _closing_workflow_verdict(
+            verdict_source, allow_targeted_stale=allow_targeted_stale)
         if not verdict:
             _retry_sqlite_busy(
                 lambda: db.mark_failed(
@@ -1426,7 +1432,8 @@ def _claim_next_task(busy_keys=(), busy_lane_ids=()):
 
     try:
         policy = pipeline_insights.worker_lane_policy()
-    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+    except (AttributeError, OSError, TypeError, ValueError,
+            json.JSONDecodeError) as exc:
         print(f"  !! pipeline lane scheduler unavailable: {exc}", flush=True)
         policy = None
     if policy is None:
