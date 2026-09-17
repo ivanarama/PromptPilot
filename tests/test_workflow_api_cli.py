@@ -170,6 +170,11 @@ def test_ordinary_insights_api_does_not_enter_refresh_handler_after_restart(
         "count": 1, "items": [], "membership_complete": False,
     })
     monkeypatch.setattr(pipeline_insights, "_run_profile_health_check", lambda _profile: None)
+    monkeypatch.setattr(
+        pipeline_insights, "_github_rate_limits",
+        lambda: (_ for _ in ()).throw(
+            pipeline_insights._GitHubRateLimitUnavailable(
+                "GitHub CLI is not authenticated")))
     assert request(
         "GET", "/api/pipeline-insights/restart-api?refresh=true").status_code == 200
     pipeline_insights._cache.clear()

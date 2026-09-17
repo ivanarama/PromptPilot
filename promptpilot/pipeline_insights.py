@@ -1391,7 +1391,10 @@ def _rest_rate_limit_resource(payload: dict, name: str) -> dict:
     used = _rate_limit_integer(item, "used", f"REST {name}")
     remaining = _rate_limit_integer(item, "remaining", f"REST {name}")
     reset = _rate_limit_integer(item, "reset", f"REST {name}")
-    if used > limit or remaining > limit:
+    # A smaller sum is conservative if GitHub adjusts quota mid-window. A
+    # larger sum claims overlapping spent and available quota, so ``remaining``
+    # is not safe enough for admission.
+    if used + remaining > limit:
         raise _GitHubRateLimitUnavailable(
             f"GitHub REST /rate_limit response is invalid for {name}")
     try:
@@ -1432,7 +1435,7 @@ def _graphql_rate_limit_resource(payload: dict) -> dict:
     limit = _rate_limit_integer(item, "limit", "GraphQL")
     used = _rate_limit_integer(item, "used", "GraphQL")
     remaining = _rate_limit_integer(item, "remaining", "GraphQL")
-    if used > limit or remaining > limit:
+    if used + remaining > limit:
         raise _GitHubRateLimitUnavailable(
             "GitHub GraphQL rateLimit response is invalid")
     reset_at = item.get("resetAt")
@@ -3555,7 +3558,15 @@ def _analyze_without_budget(profile_id: str, series: list[dict], *,
             github_rate_limit = (cached[1].get("github_rate_limit")
                                  if cached else None)
         else:
-            github_rate_limit = _github_rate_limits()
+            try:
+                github_rate_limit = _github_rate_limits()
+            except _GitHubRateLimitUnavailable:
+                # Without an admission policy this is optional UI telemetry,
+                # not a safety gate. Budget-enabled profiles still propagate
+                # the error to analyze(), which records a fail-closed denial.
+                if _github_budget_policy(profile) is not None:
+                    raise
+                github_rate_limit = None
         result = {
             "profile_id": profile_id, "title": profile["title"],
             "repository": profile["repository"], "queues": queues,
