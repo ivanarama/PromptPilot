@@ -1043,6 +1043,7 @@ async function loadTasks() {
     const expanded = t.id === expandedId;
     const time = timeAgo(t.created_at);
     const parsed = parseResult(t.result);
+    const taskErrorLabel = githubApiWait(t) ? 'Причина ожидания' : 'Error';
 
     // Build result section
     let resultHTML = '';
@@ -1116,7 +1117,7 @@ async function loadTasks() {
         ${resultHTML}
 
         ${t.error ? `
-          <div class="detail-label">Error</div>
+          <div class="detail-label">${taskErrorLabel}</div>
           <div class="result-block">
             <pre>${esc(t.error)}</pre>
             <button class="copy-btn" data-copy="${escAttr(t.error)}" onclick="copyText(event)">Copy</button>

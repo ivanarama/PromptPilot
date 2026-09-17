@@ -415,6 +415,21 @@ def _projected_post_reservation(
     return projected
 
 
+def _budget_blocked_summary(item: dict, active_reservations: int) -> str:
+    """Explain signed admission arithmetic without implying a GitHub value."""
+    actual_remaining = item.get(
+        "remaining", item.get("reported_remaining", "—"))
+    return (
+        f"{item['resource']}: прогноз после резервов и оценки запуска "
+        f"{item['effective_after']} < безопасный остаток "
+        f"{item['minimum_remaining']} (фактический остаток GitHub "
+        f"{actual_remaining}; "
+        f"активных резервов {int(active_reservations)}; другими задачами "
+        f"зарезервировано {item['reserved_other']}; оценка этого запуска "
+        f"{item['requested_cost']})"
+    )
+
+
 def _budget_denied(policy: dict, *, state: str, reason: str,
                    now: float, limits: dict | None = None,
                    defer_at: float | None = None,
@@ -550,7 +565,7 @@ def _evaluate_github_budget(policy: dict, limits: dict | None, *,
             state = "budget_in_flight"
             reason_prefix = "GitHub API-бюджет временно занят выполняемой задачей"
         summary = ", ".join(
-            f"{item['resource']} {item['effective_after']} < {item['minimum_remaining']}"
+            _budget_blocked_summary(item, active_reservations)
             for item in blocked)
         return _budget_denied(
             policy, state=state, reason=f"{reason_prefix}: {summary}",
@@ -729,6 +744,7 @@ def _reservation_denied(policy: dict, limits: dict | None, result: dict, *,
                         status_revision: int | None) -> dict:
     now = time.time()
     blocked = result.get("blocked_resources") or []
+    active_reservations = int(result.get("active_reservations") or 0)
     if blocked:
         live_blocked = [item for item in blocked
                         if item.get("blocked_by") == "live"]
@@ -744,8 +760,8 @@ def _reservation_denied(policy: dict, limits: dict | None, result: dict, *,
             state = "budget_in_flight"
             reason_prefix = "GitHub API-бюджет временно занят выполняемой задачей"
         summary = ", ".join(
-            f"{item['resource']} {item['effective_after']} < "
-            f"{item['minimum_remaining']}" for item in blocked)
+            _budget_blocked_summary(item, active_reservations)
+            for item in blocked)
         reason = f"{reason_prefix}: {summary}"
     else:
         defer_at = now + policy["unavailable_retry_seconds"]
@@ -758,7 +774,7 @@ def _reservation_denied(policy: dict, limits: dict | None, result: dict, *,
         status_revision=status_revision,
         reserved_other=result.get("reserved_other"),
         effective_after=result.get("effective_after"),
-        active_reservations=int(result.get("active_reservations") or 0))
+        active_reservations=active_reservations)
 
 
 def _reserve_execution_admission(
