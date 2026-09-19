@@ -1434,6 +1434,36 @@ def _dispatch_configured_role(workflow: WorkflowInDB,
     ))
 
 
+def _run_gate_command_windows(argv: list[str], cwd: str, timeout: int) -> subprocess.CompletedProcess:
+    """subprocess.run для gate-команды, убивающий по timeout всё ДЕРЕВО процессов.
+
+    Обычный run() на Windows по таймауту убивает только прямого потомка
+    (powershell.exe). Выжившие дети (cmd.exe / java / gradle daemon) держат
+    унаследованные хэндлы stdout/stderr, и повторный communicate() внутри run()
+    блокируется до их смерти — на практике часами (см. #80: gate "timeout=1800s"
+    фиксировался ровно через 3 часа — idle TTL gradle-демона). taskkill /T /F
+    закрывает дерево, пайпы освобождаются, TimeoutExpired уходит наверх как раньше.
+    """
+    proc = subprocess.Popen(
+        argv, cwd=cwd,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, errors="replace",
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        subprocess.run(
+            ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+            capture_output=True,
+        )
+        try:
+            proc.communicate(timeout=30)  # забрать вывод и корректно похоронить
+        except subprocess.TimeoutExpired:
+            pass
+        raise
+    return subprocess.CompletedProcess(argv, proc.returncode, stdout or "", stderr or "")
+
+
 def _run_gate_commands(workflow: WorkflowInDB) -> WorkflowGateDecision:
     gate = _config_for(workflow).gate
     stage = (
@@ -1464,13 +1494,16 @@ def _run_gate_commands(workflow: WorkflowInDB) -> WorkflowGateDecision:
             if os.name == "nt" else ["/bin/sh", "-lc", command]
         )
         try:
-            completed = subprocess.run(
-                argv,
-                cwd=workflow.repository_path,
-                capture_output=True,
-                text=True,
-                timeout=gate.timeout_seconds,
-                errors="replace",
+            completed = (
+                _run_gate_command_windows(argv, workflow.repository_path, gate.timeout_seconds)
+                if os.name == "nt" else subprocess.run(
+                    argv,
+                    cwd=workflow.repository_path,
+                    capture_output=True,
+                    text=True,
+                    timeout=gate.timeout_seconds,
+                    errors="replace",
+                )
             )
             output = ((completed.stdout or "") + (completed.stderr or ""))[-4000:]
             evidence.append(
