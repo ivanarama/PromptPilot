@@ -381,7 +381,13 @@ def _read_process_pipe(pipe, chunks: list[str], task_id: int | None = None) -> N
         for line in iter(pipe.readline, ""):
             chunks.append(line)
             if task_id is not None:
-                _remember_stream_session(task_id, line)
+                # HOTFIX: исключение здесь (напр. sqlite 'database is locked' из
+                # set_session_id) убивало поток-читатель, finally закрывал пайп,
+                # и провайдер падал с os error 109. Чтение обязано продолжаться.
+                try:
+                    _remember_stream_session(task_id, line)
+                except Exception:
+                    pass
     finally:
         pipe.close()
 
