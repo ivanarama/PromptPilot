@@ -38,6 +38,19 @@ PIPELINE_PROFILE = {
 }
 
 
+def _complete_and_recur(isolated_db, series_id: int, verdict: str, result: str):
+    assert isolated_db.series_action(series_id, "run_now")
+    occurrence = isolated_db.get_next_runnable()
+    assert occurrence is not None
+    assert occurrence.series_id == series_id
+    assert isolated_db.mark_completed(
+        occurrence.id, result, verdict=verdict,
+        expected_started_at=occurrence.started_at,
+    )
+    worker._recur_after_run(occurrence)
+    return occurrence
+
+
 def _fresh_cache_data(profile_id: str, profile: dict,
                       diagnostics: dict | None = None) -> dict:
     """Publish a real durable cache token for wake-up race tests."""
@@ -114,6 +127,121 @@ def test_second_consecutive_stale_uses_normal_cadence_and_non_stale_resets(
         task.series_id, "УСТАРЕЛО")
     assert reset["stale_reselect_immediate"] is False
     assert after_reset["stale_reselect_immediate"] is True
+
+
+def test_pipeline_repeated_blocker_pauses_before_creating_third_occurrence(
+        isolated_db, monkeypatch):
+    monkeypatch.setattr(
+        pipeline_insights, "_profiles", lambda: {"example": PIPELINE_PROFILE})
+    created = isolated_db.create_task(TaskCreate(
+        prompt="ExampleProject - REVIEW", recurrence="15m"))
+
+    first = _complete_and_recur(
+        isolated_db, created.series_id, "НЕ СМОГ",
+        "Проверка остановлена.\n"
+        "ИТОГ: НЕ СМОГ (gate-fallback: PR #1458: headRefOid changed "
+        "from fe8ca2f66e724b958cc39115bcf1af6b0ac1a9e1 to "
+        "bb4dd5892d450c68bc272c2671a453a34b584c98 while loading parents; "
+        "task #1801 at 2026-09-20T18:01:02Z)\n\n"
+        "--- Meta ---\nTokens: 100 in / 20 out",
+    )
+    assert isolated_db.get_series(created.series_id)["paused"] is False
+
+    second = _complete_and_recur(
+        isolated_db, created.series_id, "UNABLE",
+        "Повторная проверка.\n"
+        "ИТОГ: НЕ СМОГ (gate-fallback: PR #1458: headRefOid changed "
+        "from aaaaaaa111111111111111111111111111111111 to "
+        "bbbbbbb222222222222222222222222222222222 while loading parents; "
+        "task #1802 at 2026-09-20T18:16:02Z)\n\n"
+        "--- Meta ---\nTokens: 900 in / 40 out",
+    )
+
+    series = isolated_db.get_series(created.series_id)
+    assert second.id != first.id
+    assert series["paused"] is True
+    assert series["broken"] is False
+    assert series["next_task_id"] is None
+    assert series["runs"] == 2
+    assert isolated_db.get_next_runnable() is None
+
+    assert isolated_db.series_action(created.series_id, "resume")
+    resumed = isolated_db.get_series(created.series_id)
+    assert resumed["paused"] is False
+    assert resumed["next_status"] == "pending"
+    assert resumed["next_task_id"] not in {first.id, second.id}
+
+
+def test_pipeline_repeat_guard_keeps_different_blockers_separate(
+        isolated_db, monkeypatch):
+    monkeypatch.setattr(
+        pipeline_insights, "_profiles", lambda: {"example": PIPELINE_PROFILE})
+    created = isolated_db.create_task(TaskCreate(
+        prompt="ExampleProject - REVIEW", recurrence="15m"))
+
+    _complete_and_recur(
+        isolated_db, created.series_id, "НУЖЕН ЧЕЛОВЕК",
+        "ИТОГ: НУЖЕН ЧЕЛОВЕК (нужно решение по PR #1458)",
+    )
+    _complete_and_recur(
+        isolated_db, created.series_id, "HUMAN_REQUIRED",
+        "ИТОГ: НУЖЕН ЧЕЛОВЕК (нужно решение по PR #1459)",
+    )
+
+    series = isolated_db.get_series(created.series_id)
+    assert series["paused"] is False
+    assert series["next_status"] == "pending"
+    assert series["runs"] == 3
+
+
+def test_productive_pipeline_result_resets_repeated_blocker_streak(
+        isolated_db, monkeypatch):
+    monkeypatch.setattr(
+        pipeline_insights, "_profiles", lambda: {"example": PIPELINE_PROFILE})
+    created = isolated_db.create_task(TaskCreate(
+        prompt="ExampleProject - REVIEW", recurrence="15m"))
+    blocker = "ИТОГ: НУЖЕН ЧЕЛОВЕК (нужно решение по issue #1428)"
+
+    _complete_and_recur(
+        isolated_db, created.series_id, "НУЖЕН ЧЕЛОВЕК", blocker)
+    _complete_and_recur(
+        isolated_db, created.series_id, "ГОТОВО",
+        "ИТОГ: ГОТОВО (проверка завершена)")
+    _complete_and_recur(
+        isolated_db, created.series_id, "HUMAN", blocker)
+
+    series = isolated_db.get_series(created.series_id)
+    assert series["paused"] is False
+    assert series["next_status"] == "pending"
+    assert series["runs"] == 4
+
+
+def test_repeated_blocker_does_not_pause_non_pipeline_series(
+        isolated_db, monkeypatch):
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {})
+    created = isolated_db.create_task(TaskCreate(
+        prompt="Generic recurring report", recurrence="15m"))
+    blocker = "ИТОГ: НЕ СМОГ (один и тот же внешний блокер)"
+
+    _complete_and_recur(isolated_db, created.series_id, "НЕ СМОГ", blocker)
+    _complete_and_recur(isolated_db, created.series_id, "НЕ СМОГ", blocker)
+
+    series = isolated_db.get_series(created.series_id)
+    assert series["paused"] is False
+    assert series["next_status"] == "pending"
+    assert series["runs"] == 3
+
+
+@pytest.mark.parametrize("result", [
+    "ИТОГ: НЕ СМОГ",
+    "ИТОГ: НЕ СМОГ (не получилось)",
+    "ИТОГ: НУЖЕН ЧЕЛОВЕК (см. отчёт выше)",
+])
+def test_pipeline_blocker_without_specific_reason_is_not_correlated(result):
+    from promptpilot import db
+
+    verdict = "НУЖЕН ЧЕЛОВЕК" if "НУЖЕН" in result else "UNABLE"
+    assert db._pipeline_blocker_fingerprint(verdict, result) is None
 
 
 def test_adaptive_cadence_uses_busy_interval_then_two_empty_runs(

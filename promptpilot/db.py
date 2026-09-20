@@ -6,6 +6,7 @@ import math
 import re
 import sqlite3
 import time
+import unicodedata
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -1754,7 +1755,7 @@ def list_series() -> list:
                 "failure_rate": round(failures / len(completed), 3) if completed else 0,
                 "empty_rate": round(empties / len(completed), 3) if completed else 0,
                 "avg_duration_seconds": round(sum(durations) / len(durations)) if durations else None,
-                "broken": not active and not s["ended_at"],
+                "broken": not active and not s["ended_at"] and not s["paused"],
             })
     out.sort(key=lambda x: (x["ended"], x["broken"], x["paused"], x["next_run_at"] or ""))
     return out
@@ -1990,6 +1991,169 @@ def _pipeline_series_wake_intent_key(series_id: int) -> str:
     return f"pipeline_series_wake_intent:v1:{series_id}"
 
 
+_PIPELINE_BLOCKER_VERDICTS = {
+    "НУЖЕН ЧЕЛОВЕК": "human",
+    "HUMAN": "human",
+    "HUMAN_REQUIRED": "human",
+    "NEEDS_HUMAN": "human",
+    "НЕ СМОГ": "unable",
+    "UNABLE": "unable",
+}
+_PIPELINE_BLOCKER_LINE_RE = re.compile(
+    r"^[ \t>*#-]*ИТОГ:\s*(?P<verdict>"
+    + "|".join(re.escape(value) for value in _PIPELINE_BLOCKER_VERDICTS)
+    + r")\b(?P<reason>.*)$",
+    re.IGNORECASE,
+)
+_PIPELINE_VOLATILE_UUID_RE = re.compile(
+    r"\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-"
+    r"[89ab][0-9a-f]{3}-[0-9a-f]{12}\b",
+    re.IGNORECASE,
+)
+_PIPELINE_VOLATILE_HEX_RE = re.compile(
+    r"\b(?=[0-9a-f]{7,64}\b)(?=[0-9a-f]*[a-f])[0-9a-f]+\b",
+    re.IGNORECASE,
+)
+_PIPELINE_VOLATILE_TIME_RE = re.compile(
+    r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}"
+    r"(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\b",
+    re.IGNORECASE,
+)
+_PIPELINE_VOLATILE_TASK_RE = re.compile(
+    r"\b(?:task|задач[аи])\s*#?\s*\d+\b",
+    re.IGNORECASE,
+)
+_PIPELINE_GENERIC_BLOCKER_REASONS = {
+    "blocked",
+    "failed",
+    "unable",
+    "не получилось",
+    "не смог",
+    "нужен человек",
+    "нужно решение",
+    "подробности выше",
+    "см. выше",
+    "см. отчет выше",
+    "см. отчёт выше",
+    "требуется решение",
+}
+
+
+def _pipeline_blocker_fingerprint(verdict: Optional[str], result: Optional[str]) -> Optional[str]:
+    """Stable identity of one explicit project-pipeline blocker.
+
+    Provider metadata, commit OIDs and the scheduler's own task id change on
+    every run and therefore cannot participate in repeat detection. Issue and
+    PR numbers deliberately remain: two blocked targets are two different
+    reasons. A bare HUMAN/UNABLE without a reason is not safe to correlate.
+    """
+    kind = _PIPELINE_BLOCKER_VERDICTS.get(str(verdict or "").strip().upper())
+    if kind is None:
+        return None
+
+    response = re.split(
+        r"(?m)^\s*--- Meta ---\s*$", str(result or ""), maxsplit=1,
+    )[0]
+    lines = response.splitlines()
+    selected = None
+    for index, line in enumerate(lines):
+        match = _PIPELINE_BLOCKER_LINE_RE.match(line)
+        if not match:
+            continue
+        line_kind = _PIPELINE_BLOCKER_VERDICTS.get(
+            match.group("verdict").strip().upper())
+        if line_kind != kind:
+            continue
+        parts = [match.group("reason")]
+        # Narrow terminals may wrap the final reason. Only indented lines are
+        # presentation continuations; stop before worktree summaries or prose.
+        for continuation in lines[index + 1:index + 9]:
+            if not continuation.strip():
+                break
+            if not continuation[:1].isspace():
+                break
+            parts.append(continuation.strip())
+        selected = " ".join(parts)
+    if selected is None:
+        return None
+
+    normalized = unicodedata.normalize("NFKC", selected).casefold()
+    normalized = re.sub(r"^\s*(?:[—–:-]\s*|\(\s*)+", "", normalized)
+    normalized = _PIPELINE_VOLATILE_UUID_RE.sub("<uuid>", normalized)
+    normalized = _PIPELINE_VOLATILE_HEX_RE.sub("<oid>", normalized)
+    normalized = _PIPELINE_VOLATILE_TIME_RE.sub("<time>", normalized)
+    normalized = _PIPELINE_VOLATILE_TASK_RE.sub("task <id>", normalized)
+    normalized = re.sub(r"\bpp[/\\]t\d+\b", "pp/t<id>", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip(" \t\r\n()[]{}.,;:—–-")
+    if (not normalized
+            or normalized in _PIPELINE_GENERIC_BLOCKER_REASONS
+            or not any(character.isalnum() for character in normalized)):
+        return None
+    return hashlib.sha256(f"{kind}\0{normalized}".encode("utf-8")).hexdigest()
+
+
+def pause_pipeline_series_on_repeated_blocker(
+        series_id: int, current_task_id: int) -> dict:
+    """Pause after two consecutive occurrences report the same blocker.
+
+    The caller applies this only to a configured project-pipeline series. The
+    comparison and pause share one write transaction, so no successor can be
+    inserted between the decision and the pause made by this worker.
+    """
+    with _connect(immediate=True) as conn:
+        series = conn.execute(
+            "SELECT paused, ended_at FROM task_series WHERE id = ?",
+            (series_id,),
+        ).fetchone()
+        if not series or series["ended_at"]:
+            return {"paused": False, "newly_paused": False, "repeated": False}
+        if series["paused"]:
+            return {"paused": True, "newly_paused": False, "repeated": False}
+
+        current = conn.execute(
+            """SELECT id, status, verdict, result FROM tasks
+               WHERE id = ? AND series_id = ?
+                 AND id = (SELECT MAX(id) FROM tasks WHERE series_id = ?)""",
+            (current_task_id, series_id, series_id),
+        ).fetchone()
+        if not current or current["status"] != "completed":
+            return {"paused": False, "newly_paused": False, "repeated": False}
+        current_fingerprint = _pipeline_blocker_fingerprint(
+            current["verdict"], current["result"])
+        if current_fingerprint is None:
+            return {"paused": False, "newly_paused": False, "repeated": False}
+
+        previous = conn.execute(
+            """SELECT id, status, verdict, result FROM tasks
+               WHERE series_id = ? AND id < ?
+               ORDER BY id DESC LIMIT 1""",
+            (series_id, current_task_id),
+        ).fetchone()
+        if (not previous or previous["status"] != "completed"
+                or _pipeline_blocker_fingerprint(
+                    previous["verdict"], previous["result"]
+                ) != current_fingerprint):
+            return {"paused": False, "newly_paused": False, "repeated": False}
+
+        now = _now()
+        changed = conn.execute(
+            """UPDATE task_series SET paused = 1, updated_at = ?
+               WHERE id = ? AND paused = 0 AND ended_at IS NULL""",
+            (now, series_id),
+        ).rowcount > 0
+        conn.execute(
+            "DELETE FROM settings WHERE key = ?",
+            (_pipeline_series_wake_intent_key(series_id),),
+        )
+        return {
+            "paused": True,
+            "newly_paused": changed,
+            "repeated": True,
+            "current_task_id": current_task_id,
+            "previous_task_id": int(previous["id"]),
+        }
+
+
 def _recreate_series_occurrence(conn, series_id: int, series,
                                 scheduled_at: datetime) -> bool:
     latest_row = conn.execute(
@@ -2195,8 +2359,20 @@ def series_action(series_id: int, action: str) -> bool:
                 (_pipeline_series_wake_intent_key(series_id),),
             )
         elif action == "resume":
-            conn.execute("UPDATE task_series SET paused = 0, updated_at = ? WHERE id = ? AND ended_at IS NULL",
-                         (now, series_id))
+            resumed = conn.execute(
+                """UPDATE task_series SET paused = 0, updated_at = ?
+                   WHERE id = ? AND paused = 1 AND ended_at IS NULL""",
+                (now, series_id),
+            ).rowcount > 0
+            if resumed and conn.execute(
+                    """SELECT 1 FROM tasks WHERE series_id = ?
+                       AND status IN ('pending', 'running', 'rate_limited')""",
+                    (series_id,),
+            ).fetchone() is None:
+                # An automatic repeat-blocker pause intentionally has no
+                # successor. Resume restores exactly one runnable occurrence.
+                _recreate_series_occurrence(
+                    conn, series_id, row, datetime.now(timezone.utc))
         elif action == "run_now":
             cur = conn.execute(
                 """UPDATE tasks
