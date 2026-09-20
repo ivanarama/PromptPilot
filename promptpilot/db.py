@@ -2106,9 +2106,11 @@ def pause_pipeline_series_on_repeated_blocker(
             (series_id,),
         ).fetchone()
         if not series or series["ended_at"]:
-            return {"paused": False, "newly_paused": False, "repeated": False}
-        if series["paused"]:
-            return {"paused": True, "newly_paused": False, "repeated": False}
+            return {
+                "suppress_recurrence": False,
+                "newly_paused": False,
+                "repeated": False,
+            }
 
         current = conn.execute(
             """SELECT id, status, verdict, result FROM tasks
@@ -2117,11 +2119,19 @@ def pause_pipeline_series_on_repeated_blocker(
             (current_task_id, series_id, series_id),
         ).fetchone()
         if not current or current["status"] != "completed":
-            return {"paused": False, "newly_paused": False, "repeated": False}
+            return {
+                "suppress_recurrence": False,
+                "newly_paused": False,
+                "repeated": False,
+            }
         current_fingerprint = _pipeline_blocker_fingerprint(
             current["verdict"], current["result"])
         if current_fingerprint is None:
-            return {"paused": False, "newly_paused": False, "repeated": False}
+            return {
+                "suppress_recurrence": False,
+                "newly_paused": False,
+                "repeated": False,
+            }
 
         previous = conn.execute(
             """SELECT id, status, verdict, result FROM tasks
@@ -2133,7 +2143,11 @@ def pause_pipeline_series_on_repeated_blocker(
                 or _pipeline_blocker_fingerprint(
                     previous["verdict"], previous["result"]
                 ) != current_fingerprint):
-            return {"paused": False, "newly_paused": False, "repeated": False}
+            return {
+                "suppress_recurrence": False,
+                "newly_paused": False,
+                "repeated": False,
+            }
 
         now = _now()
         changed = conn.execute(
@@ -2146,7 +2160,7 @@ def pause_pipeline_series_on_repeated_blocker(
             (_pipeline_series_wake_intent_key(series_id),),
         )
         return {
-            "paused": True,
+            "suppress_recurrence": True,
             "newly_paused": changed,
             "repeated": True,
             "current_task_id": current_task_id,

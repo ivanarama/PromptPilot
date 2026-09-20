@@ -172,6 +172,30 @@ def test_pipeline_repeated_blocker_pauses_before_creating_third_occurrence(
     assert resumed["next_task_id"] not in {first.id, second.id}
 
 
+def test_manual_pipeline_pause_keeps_hidden_successor_without_repeated_blocker(
+        isolated_db, monkeypatch):
+    monkeypatch.setattr(
+        pipeline_insights, "_profiles", lambda: {"example": PIPELINE_PROFILE})
+    created = isolated_db.create_task(TaskCreate(
+        prompt="ExampleProject - REVIEW", recurrence="15m"))
+    occurrence = isolated_db.get_next_runnable()
+    assert occurrence is not None
+    assert isolated_db.series_action(created.series_id, "pause")
+    assert isolated_db.mark_completed(
+        occurrence.id,
+        "ИТОГ: НУЖЕН ЧЕЛОВЕК (первое ожидание решения по PR #1458)",
+        verdict="НУЖЕН ЧЕЛОВЕК",
+        expected_started_at=occurrence.started_at,
+    )
+
+    worker._recur_after_run(occurrence)
+
+    series = isolated_db.get_series(created.series_id)
+    assert series["paused"] is True
+    assert series["next_status"] == "pending"
+    assert series["next_task_id"] != occurrence.id
+
+
 def test_pipeline_repeat_guard_keeps_different_blockers_separate(
         isolated_db, monkeypatch):
     monkeypatch.setattr(

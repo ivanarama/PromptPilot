@@ -952,7 +952,7 @@ def _pipeline_repeat_guard(task) -> dict | None:
             flush=True,
         )
         return None
-    if not state.get("paused"):
+    if not state.get("suppress_recurrence"):
         return state
     if state.get("newly_paused"):
         print(
@@ -979,7 +979,7 @@ def _maybe_recur(task, failed: bool = False):
     if not task.recurrence:
         return
     repeat_guard = _pipeline_repeat_guard(task)
-    if repeat_guard and repeat_guard.get("paused"):
+    if repeat_guard and repeat_guard.get("suppress_recurrence"):
         return
     series = db.prepare_series_recurrence(task.series_id, task.verdict) if task.series_id else None
     recurrence = series["effective_recurrence"] if series else task.recurrence

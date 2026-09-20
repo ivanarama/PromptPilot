@@ -249,6 +249,9 @@ def test_schedule_ui_exposes_durable_series_controls():
     assert "${taskStatusLabel(t)}" in html
     assert "if (t.series_paused)" in html
     assert "PAUSED" in html
+    assert "const repeatBlockerPause = s.paused && !s.next_task_id" in html
+    assert "автопауза — повторился тот же блокер" in html
+    assert "серия на паузе'} — Возобновить создаст следующий запуск" in html
     assert "aggregateDiagnosticFindings" in html
     assert "diagnosticOverview(data)" in html
     assert "pipelineHealthReason(data)" in html
