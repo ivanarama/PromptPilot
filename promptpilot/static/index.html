@@ -1502,9 +1502,25 @@ function restoreWorkflowOpenDetails(openKeys) {
   });
 }
 
+// Scroll-jump fix: while the user is actively reading the workflow card
+// (scrolling with the wheel, touch or paging keys), pause the 5s auto-refresh
+// entirely — even a perfectly restored scroll position flickers on rebuild.
+// One minute of inactivity resumes live updates.
+let wfReadingPausedUntil = 0;
+['wheel', 'touchmove'].forEach(evt => document.addEventListener(evt, e => {
+  const modal = document.getElementById('workflowModal');
+  if (modal?.classList.contains('open') && modal.contains(e.target)) wfReadingPausedUntil = Date.now() + 60000;
+}, { passive: true }));
+document.addEventListener('keydown', e => {
+  if (!['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '].includes(e.key)) return;
+  const modal = document.getElementById('workflowModal');
+  if (modal?.classList.contains('open') && modal.contains(document.activeElement)) wfReadingPausedUntil = Date.now() + 60000;
+});
+
 async function autoRefreshWorkflowState() {
   const modal = document.getElementById('workflowModal');
   if (!modal?.classList.contains('open') || !selectedWorkflowId || workflowAutoRefreshBusy) return;
+  if (Date.now() < wfReadingPausedUntil) return;
   const active = document.activeElement;
   // Never erase a prompt/decision while the user is typing or selecting it.
   if (active && document.getElementById('wfDetail')?.contains(active)
@@ -2176,7 +2192,19 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, 
     .concat(runs.map(r => `<div class="wf-round${r === activeRun ? ' current' : ''}"><b>${esc(r.role)} · попытка ${r.attempt_no}</b> · ${esc(r.status)}${r.task_id ? ` · task #${r.task_id}` : ''}</div>`)).join('');
   const eventRows = [...events].reverse().slice(0, 30).map(e => `<div class="wf-event"><code>${esc(e.event_type)}</code> · ${formatTime(e.created_at)}</div>`).join('');
   const historyRows = pastRounds.map(r => workflowRoundRow(r)).join('');
-  document.getElementById('wfDetail').innerHTML = `
+  // Scroll-jump fix: the 5s auto-refresh rebuilds this pane from scratch.
+  // While innerHTML is being replaced the pane momentarily collapses, so the
+  // modal scroller clamps to the top, and every rebuilt scrollable block
+  // (report <pre>, prompt textarea, history) restarts at scrollTop=0 — yanking
+  // a reading user back to the start of the text. Snapshot positions and
+  // typed values first, put them back after the rebuild.
+  const wfPane = document.getElementById('wfDetail');
+  const wfSnapScrolls = [...wfPane.querySelectorAll('*')].map(el => el.scrollTop);
+  const wfSnapValues = {};
+  wfPane.querySelectorAll('textarea,input').forEach(el => { if (el.id) wfSnapValues[el.id] = el.value; });
+  const wfModalScroller = wfPane.closest('.modal');
+  const wfSnapModalTop = wfModalScroller ? wfModalScroller.scrollTop : 0;
+  wfPane.innerHTML = `
     <div class="wf-title">${esc(wf.slug)} <span class="task-status" data-s="${escAttr(wf.status)}">${esc(statusInfo[0])}</span>
       ${wf.config?.automation?.enabled ? '<span class="task-status" data-s="running">АВТО</span>' : '<span class="wf-meta">ручной режим</span>'}</div>
     <div class="wf-stage" style="border-color:${ownerInfo.color}">
@@ -2225,6 +2253,21 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, 
     <details class="wf-technical" data-wf-detail="technical-log"><summary>Технический журнал · ${events.length} событий · state version ${wf.state_version}</summary>
       <div class="wf-history">${eventRows || '<div class="wf-meta">Событий пока нет.</div>'}</div>
     </details>`;
+  // Scroll-jump fix: restore what the user was reading/typing. Document order
+  // of the rebuilt DOM matches the snapshot for identical renders; if the
+  // structure changed, a stray scrollTop on a non-scrollable element is a
+  // harmless no-op. The agent screen keeps its own bottom autoscroll.
+  const wfNewEls = wfPane.querySelectorAll('*');
+  wfSnapScrolls.forEach((top, i) => {
+    const el = wfNewEls[i];
+    if (el && top > 0 && el.id !== 'wfAgentScreen') el.scrollTop = top;
+  });
+  wfPane.querySelectorAll('textarea,input').forEach(el => {
+    if (el.id && wfSnapValues[el.id] !== undefined && el.value !== wfSnapValues[el.id]) {
+      el.value = wfSnapValues[el.id];
+    }
+  });
+  if (wfModalScroller) wfModalScroller.scrollTop = wfSnapModalTop;
   if (['queued','reviewing'].includes(wf.status)) setTimeout(wfProviderChanged, 0);
   if (wf.status === 'awaiting_plan_approval') setTimeout(wfReindexStageCards, 0);
   if (activeWorkflowTaskId) setTimeout(() => wfRefreshScreen(activeWorkflowTaskId), 0);
