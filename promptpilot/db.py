@@ -2465,6 +2465,11 @@ def series_action(series_id: int, action: str) -> bool:
                 _recreate_series_occurrence(
                     conn, series_id, row, datetime.now(timezone.utc))
         elif action == "run_now":
+            # A paused series is an explicit stop. Creating or moving a task
+            # here would still leave it unclaimable and falsely report that
+            # the run started; Resume is the only way out of this state.
+            if row["paused"] or row["ended_at"]:
+                return False
             cur = conn.execute(
                 """UPDATE tasks
                    SET scheduled_at = ?, next_run_at = NULL,
@@ -2479,7 +2484,7 @@ def series_action(series_id: int, action: str) -> bool:
                     (_pipeline_series_wake_intent_key(series_id),),
                 )
                 return True
-            if row["ended_at"] or conn.execute(
+            if conn.execute(
                 "SELECT 1 FROM tasks WHERE series_id = ? AND status = 'running'",
                 (series_id,),
             ).fetchone():

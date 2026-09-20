@@ -253,6 +253,7 @@ def test_schedule_ui_exposes_durable_series_controls():
     assert "автопауза — повторился тот же блокер" in html
     assert "серия на паузе'} — Возобновить создаст следующий запуск" in html
     assert "Причина: ${esc(autoPauseReason)}" in html
+    assert "s.paused || !s.next_task_id ? 'disabled' : ''" in html
     assert "aggregateDiagnosticFindings" in html
     assert "diagnosticOverview(data)" in html
     assert "pipelineHealthReason(data)" in html
@@ -270,6 +271,34 @@ def test_schedule_ui_exposes_durable_series_controls():
     assert "это ещё не означает нарушение конвейера" in html
     assert "Текущая проверка" not in html
     assert "diagnosticGroups.slice(0,8)" in html
+
+
+def test_paused_series_rejects_run_now_and_bot_hides_control(isolated_db):
+    task = isolated_db.create_task(TaskCreate(
+        prompt="Example - REVIEW", recurrence="4h"))
+    assert isolated_db.series_action(task.series_id, "pause")
+
+    response = request(
+        "POST", f"/api/schedule/{task.series_id}/action",
+        json={"action": "run_now"},
+    )
+
+    assert response.status_code == 400
+    series = isolated_db.get_series(task.series_id)
+    assert series["paused"] is True
+    assert series["next_task_id"] == task.id
+    buttons = [
+        button.text
+        for row in bot._series_keyboard(series).inline_keyboard
+        for button in row
+    ]
+    assert "▶ Сейчас" not in buttons
+    assert "▶ Возобновить" in buttons
+    detail = bot._series_text({
+        **series,
+        "auto_pause_reason": "gate-fallback: PR #1458 changed",
+    })
+    assert "Причина автопаузы: gate-fallback: PR #1458 changed" in detail
 
 
 def test_workflow_setup_preflight_accepts_repo_provider_and_gate(isolated_db, monkeypatch):

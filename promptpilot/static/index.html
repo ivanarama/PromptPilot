@@ -2493,7 +2493,7 @@ async function openSchedule() {
       <div class="prov-cmd">Прошлый: ${last}</div>
       ${!s.ended ? `<div class="prov-actions" style="margin-top:9px">
         <button class="btn btn-sm btn-ghost" onclick="toggleSeriesEditor(${s.id})">⚙ Изменить</button>
-        <button class="btn btn-sm btn-ghost" onclick="seriesAction(${s.id},'run_now')" ${!s.next_task_id ? 'disabled' : ''}>▶ Сейчас</button>
+        <button class="btn btn-sm btn-ghost" onclick="seriesAction(${s.id},'run_now')" ${s.paused || !s.next_task_id ? 'disabled' : ''}>▶ Сейчас</button>
         <button class="btn btn-sm btn-ghost" onclick="seriesAction(${s.id},'${s.paused ? 'resume' : 'pause'}')">${s.paused ? '▶ Возобновить' : '⏸ Пауза'}</button>
         <button class="btn btn-sm btn-danger" onclick="seriesAction(${s.id},'end',true)">Завершить серию</button>
       </div>

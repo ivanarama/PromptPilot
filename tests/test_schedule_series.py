@@ -181,6 +181,12 @@ def test_pipeline_repeated_blocker_pauses_before_creating_third_occurrence(
     assert "task #1802" in series["auto_pause_reason"]
     assert isolated_db.get_next_runnable() is None
 
+    assert isolated_db.series_action(created.series_id, "run_now") is False
+    still_paused = isolated_db.get_series(created.series_id)
+    assert still_paused["paused"] is True
+    assert still_paused["next_task_id"] is None
+    assert still_paused["runs"] == 2
+
     assert isolated_db.series_action(created.series_id, "resume")
     resumed = isolated_db.get_series(created.series_id)
     assert resumed["paused"] is False
