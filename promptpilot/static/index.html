@@ -1080,6 +1080,10 @@ async function loadTasks() {
     return;
   }
 
+  // Scroll-jump fix: the 5s background refresh rebuilds the whole task list.
+  // Snapshot scroll positions (prompt/result blocks of the expanded card) so
+  // a reader is not yanked back to the top after the rebuild.
+  const taskScrolls = [...list.querySelectorAll('*')].map(el => el.scrollTop);
   list.innerHTML = tasks.map(t => {
     const expanded = t.id === expandedId;
     const time = timeAgo(t.created_at);
@@ -1201,6 +1205,13 @@ async function loadTasks() {
   // экран агента дорисован из кэша — держим прокрутку у свежих строк
   const sc = document.getElementById('screen-' + expandedId);
   if (sc && screenCache[expandedId]) sc.scrollTop = sc.scrollHeight;
+  // Scroll-jump fix: put the reader back where they were. The live agent
+  // screen keeps its own bottom autoscroll and is skipped here.
+  const taskNewEls = list.querySelectorAll('*');
+  taskScrolls.forEach((top, i) => {
+    const el = taskNewEls[i];
+    if (el && top > 0 && !(el.id && el.id.startsWith('screen-'))) el.scrollTop = top;
+  });
 }
 
 function providerOptions(current) {
@@ -1502,25 +1513,34 @@ function restoreWorkflowOpenDetails(openKeys) {
   });
 }
 
-// Scroll-jump fix: while the user is actively reading the workflow card
-// (scrolling with the wheel, touch or paging keys), pause the 5s auto-refresh
-// entirely — even a perfectly restored scroll position flickers on rebuild.
-// One minute of inactivity resumes live updates.
-let wfReadingPausedUntil = 0;
-['wheel', 'touchmove'].forEach(evt => document.addEventListener(evt, e => {
+// Reading-pause (scroll-jump fix): a background auto-refresh that rebuilds
+// DOM from scratch destroys scroll positions and mouse text selections while
+// the user is reading a long prompt or report. Any real interaction with the
+// task list or the workflow card pauses the auto-refresh for a minute:
+// scrolling (wheel, inner blocks, OR dragging a scrollbar — 'scroll' does not
+// bubble, so capture on document catches every case), starting a mouse
+// selection, touch, or paging keys. Explicit user actions are unaffected.
+const UI_READING_PAUSE_MS = 60000;
+const uiReadingPause = { tasks: 0, workflow: 0 };
+function uiNoteReading(node) {
+  if (!node || node.nodeType !== 1) return;
+  if (node.id === 'taskList' || node.closest('#taskList')) uiReadingPause.tasks = Date.now() + UI_READING_PAUSE_MS;
   const modal = document.getElementById('workflowModal');
-  if (modal?.classList.contains('open') && modal.contains(e.target)) wfReadingPausedUntil = Date.now() + 60000;
-}, { passive: true }));
+  if (modal?.classList.contains('open') && (node === modal || modal.contains(node))) {
+    uiReadingPause.workflow = Date.now() + UI_READING_PAUSE_MS;
+  }
+}
+['scroll', 'mousedown', 'touchmove'].forEach(evt => document.addEventListener(evt,
+  e => uiNoteReading(e.target), { passive: true, capture: true }));
 document.addEventListener('keydown', e => {
   if (!['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '].includes(e.key)) return;
-  const modal = document.getElementById('workflowModal');
-  if (modal?.classList.contains('open') && modal.contains(document.activeElement)) wfReadingPausedUntil = Date.now() + 60000;
+  uiNoteReading(document.activeElement);
 });
 
 async function autoRefreshWorkflowState() {
   const modal = document.getElementById('workflowModal');
   if (!modal?.classList.contains('open') || !selectedWorkflowId || workflowAutoRefreshBusy) return;
-  if (Date.now() < wfReadingPausedUntil) return;
+  if (Date.now() < uiReadingPause.workflow) return;
   const active = document.activeElement;
   // Never erase a prompt/decision while the user is typing or selecting it.
   if (active && document.getElementById('wfDetail')?.contains(active)
@@ -3273,14 +3293,18 @@ async function refresh() {
   if (refreshInFlight) return;
   refreshInFlight = true;
   try {
-    const requests = [loadStats()];
-    // Keep the list live even with a card expanded (a running task used to
-    // freeze once opened), but don't re-render under an unsaved inline edit.
-    const ae = document.activeElement;
-    if (!(ae && ae.id && (ae.id.startsWith('note-') || ae.id.startsWith('ed-')))) {
-      requests.push(loadTasks());
+    // Don't re-render out from under a user who is reading a long
+    // prompt/report (scroll-jump fix).
+    if (Date.now() >= uiReadingPause.tasks) {
+      const requests = [loadStats()];
+      // Keep the list live even with a card expanded (a running task used to
+      // freeze once opened), but don't re-render under an unsaved inline edit.
+      const ae = document.activeElement;
+      if (!(ae && ae.id && (ae.id.startsWith('note-') || ae.id.startsWith('ed-')))) {
+        requests.push(loadTasks());
+      }
+      await Promise.allSettled(requests);
     }
-    await Promise.allSettled(requests);
   } finally {
     refreshInFlight = false;
   }
