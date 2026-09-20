@@ -118,19 +118,27 @@ def test_malformed_optional_profile_falls_back_to_legacy_fifo(
 def test_worker_recovers_then_warms_pipeline_before_claiming(monkeypatch):
     events = []
     handlers = {}
+    repair_args = {}
 
     monkeypatch.setattr(
         worker.signal, "signal",
         lambda signum, handler: handlers.__setitem__(signum, handler),
     )
     monkeypatch.setattr(
-        worker, "_warm_pipeline_runtime", lambda: events.append("warm"))
+        worker, "_warm_pipeline_runtime",
+        lambda: events.append("warm") or SimpleNamespace(
+            repeat_guard_series_ids=lambda _series: [41]))
     monkeypatch.setattr(
         worker, "live_task_ids", lambda: events.append("live") or set())
     monkeypatch.setattr(
         worker.db, "recover_running", lambda **_kwargs: events.append("recover"))
-    monkeypatch.setattr(
-        worker.db, "repair_active_series_occurrences", lambda: [])
+    monkeypatch.setattr(worker.db, "list_series", lambda: [])
+
+    def repair(**kwargs):
+        repair_args.update(kwargs)
+        return []
+
+    monkeypatch.setattr(worker.db, "repair_active_series_occurrences", repair)
     monkeypatch.setattr(worker.db, "touch_worker_heartbeat", lambda _pid: None)
     monkeypatch.setattr(worker.db, "mark_worker_stopped", lambda _pid: None)
     monkeypatch.setattr(worker, "_code_snapshot", lambda: None)
@@ -153,6 +161,7 @@ def test_worker_recovers_then_warms_pipeline_before_claiming(monkeypatch):
     worker.run_worker()
 
     assert events[:4] == ["live", "recover", "warm", "claim"]
+    assert repair_args == {"repeat_guard_series_ids": [41]}
 
 
 def test_task_opens_fence_only_after_herdr_provider_started(monkeypatch):

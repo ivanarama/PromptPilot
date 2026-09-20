@@ -2466,11 +2466,10 @@ async function openSchedule() {
             + (s.last_verdict ? ` (${s.last_verdict})` : '') + `, ${when(s.last_at)}`)
       : 'ещё не запускалась';
     const githubWait = githubApiWait({status: s.next_status, scheduled_at: s.next_run_at, error: s.next_error});
-    const repeatBlockerPause = s.paused && !s.next_task_id && s.last_status === 'completed'
-      && ['НУЖЕН ЧЕЛОВЕК', 'НЕ СМОГ', 'HUMAN', 'HUMAN_REQUIRED', 'NEEDS_HUMAN', 'UNABLE']
-        .includes(String(s.last_verdict || '').trim().toUpperCase());
+    const autoPauseReason = typeof s.auto_pause_reason === 'string'
+      ? s.auto_pause_reason.trim() : '';
     const next = s.paused && !s.next_task_id
-      ? `<span style="color:var(--yellow)">${repeatBlockerPause ? 'автопауза — повторился тот же блокер' : 'серия на паузе'} — Возобновить создаст следующий запуск</span>`
+      ? `<span style="color:var(--yellow)"${autoPauseReason ? ` title="${escAttr(autoPauseReason)}"` : ''}>${autoPauseReason ? 'автопауза — повторился тот же блокер' : 'серия на паузе'} — Возобновить создаст следующий запуск</span>${autoPauseReason ? `<br><span title="${escAttr(autoPauseReason)}">Причина: ${esc(autoPauseReason)}</span>` : ''}`
       : s.broken
       ? '<span style="color:var(--red)">серия оборвана — следующего запуска нет</span>'
       : githubWait

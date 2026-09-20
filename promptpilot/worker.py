@@ -2438,7 +2438,22 @@ def run_worker():
     if alive:
         print(f"Живые прогоны найдены по метке в окружении, не трогаю: {sorted(alive)}")
     db.recover_running(keep_ids=alive)
-    repaired_series = db.repair_active_series_occurrences()
+
+    # Import/page-in routing after stale attempts have been recovered but
+    # before terminal-gap repair. Repair is intentionally generic; only
+    # profile-matched project series opt into repeat-blocker pausing.
+    pipeline_runtime = _warm_pipeline_runtime()
+    try:
+        repeat_guard_series_ids = pipeline_runtime.repeat_guard_series_ids(
+            db.list_series())
+    except Exception as exc:
+        print(
+            f"  !! repeat-blocker startup classification unavailable: {exc}",
+            flush=True,
+        )
+        repeat_guard_series_ids = ()
+    repaired_series = db.repair_active_series_occurrences(
+        repeat_guard_series_ids=repeat_guard_series_ids)
     if repaired_series:
         print(
             "Восстановлены потерянные в аварийном окне серии: "
@@ -2453,11 +2468,6 @@ def run_worker():
         workflows.sync_all_tasks()
     except Exception as exc:
         print(f"Не удалось синхронизировать workflow после восстановления: {exc}")
-
-    # Import/page-in the routing stack after stale attempts have been recovered
-    # but before a new queue item can be claimed. A slow startup remains visible
-    # through the heartbeat without making any task look actively running.
-    _warm_pipeline_runtime()
 
     code_snapshot = _code_snapshot()
 

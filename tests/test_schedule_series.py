@@ -51,6 +51,19 @@ def _complete_and_recur(isolated_db, series_id: int, verdict: str, result: str):
     return occurrence
 
 
+def _complete_without_recur(
+        isolated_db, series_id: int, verdict: str, result: str):
+    assert isolated_db.series_action(series_id, "run_now")
+    occurrence = isolated_db.get_next_runnable()
+    assert occurrence is not None
+    assert occurrence.series_id == series_id
+    assert isolated_db.mark_completed(
+        occurrence.id, result, verdict=verdict,
+        expected_started_at=occurrence.started_at,
+    )
+    return occurrence
+
+
 def _fresh_cache_data(profile_id: str, profile: dict,
                       diagnostics: dict | None = None) -> dict:
     """Publish a real durable cache token for wake-up race tests."""
@@ -163,11 +176,15 @@ def test_pipeline_repeated_blocker_pauses_before_creating_third_occurrence(
     assert series["broken"] is False
     assert series["next_task_id"] is None
     assert series["runs"] == 2
+    assert series["auto_pause_reason"].startswith(
+        "gate-fallback: PR #1458: headRefOid changed")
+    assert "task #1802" in series["auto_pause_reason"]
     assert isolated_db.get_next_runnable() is None
 
     assert isolated_db.series_action(created.series_id, "resume")
     resumed = isolated_db.get_series(created.series_id)
     assert resumed["paused"] is False
+    assert resumed["auto_pause_reason"] is None
     assert resumed["next_status"] == "pending"
     assert resumed["next_task_id"] not in {first.id, second.id}
 
@@ -192,6 +209,7 @@ def test_manual_pipeline_pause_keeps_hidden_successor_without_repeated_blocker(
 
     series = isolated_db.get_series(created.series_id)
     assert series["paused"] is True
+    assert series["auto_pause_reason"] is None
     assert series["next_status"] == "pending"
     assert series["next_task_id"] != occurrence.id
 
@@ -216,6 +234,147 @@ def test_pipeline_repeat_guard_keeps_different_blockers_separate(
     assert series["paused"] is False
     assert series["next_status"] == "pending"
     assert series["runs"] == 3
+
+
+def test_pipeline_blocker_fingerprint_preserves_russian_product_task_numbers():
+    from promptpilot import db
+
+    issue_1428 = db._pipeline_blocker_fingerprint(
+        "НУЖЕН ЧЕЛОВЕК",
+        "ИТОГ: НУЖЕН ЧЕЛОВЕК (не воспроизводится задача #1428)",
+    )
+    issue_1485 = db._pipeline_blocker_fingerprint(
+        "НУЖЕН ЧЕЛОВЕК",
+        "ИТОГ: НУЖЕН ЧЕЛОВЕК (не воспроизводится задача #1485)",
+    )
+
+    assert issue_1428 is not None
+    assert issue_1485 is not None
+    assert issue_1428 != issue_1485
+
+
+def test_startup_repair_pauses_repeated_pipeline_blocker_before_recreate(
+        isolated_db, monkeypatch):
+    monkeypatch.setattr(
+        pipeline_insights, "_profiles", lambda: {"example": PIPELINE_PROFILE})
+    created = isolated_db.create_task(TaskCreate(
+        prompt="ExampleProject - REVIEW", recurrence="15m"))
+    blocker = (
+        "ИТОГ: НЕ СМОГ (gate-fallback: PR #1458: "
+        "headRefOid changed while loading parents)"
+    )
+    _complete_and_recur(
+        isolated_db, created.series_id, "НЕ СМОГ", blocker)
+    second = _complete_without_recur(
+        isolated_db, created.series_id, "UNABLE", blocker)
+
+    repaired = isolated_db.repair_active_series_occurrences(
+        repeat_guard_series_ids=[created.series_id])
+
+    series = isolated_db.get_series(created.series_id)
+    assert repaired == []
+    assert series["paused"] is True
+    assert series["next_task_id"] is None
+    assert series["last_task_id"] == second.id
+    assert series["auto_pause_reason"] == (
+        "gate-fallback: PR #1458: headRefOid changed while loading parents")
+
+
+def test_pipeline_wake_pauses_repeated_blocker_in_terminal_gap(
+        isolated_db, monkeypatch):
+    monkeypatch.setattr(
+        pipeline_insights, "_profiles", lambda: {"example": PIPELINE_PROFILE})
+    created = isolated_db.create_task(TaskCreate(
+        prompt="ExampleProject - REVIEW", recurrence="15m"))
+    blocker = "ИТОГ: НУЖЕН ЧЕЛОВЕК (нужно решение по PR #1458)"
+    _complete_and_recur(
+        isolated_db, created.series_id, "НУЖЕН ЧЕЛОВЕК", blocker)
+    _complete_without_recur(
+        isolated_db, created.series_id, "HUMAN_REQUIRED", blocker)
+
+    requested = isolated_db.request_pipeline_series_wake(created.series_id)
+
+    series = isolated_db.get_series(created.series_id)
+    assert requested == {"accepted": False, "state": "repeat_blocker_paused"}
+    assert series["paused"] is True
+    assert series["next_task_id"] is None
+    assert series["auto_pause_reason"] == "нужно решение по PR #1458"
+
+
+def test_pipeline_group_wake_pauses_repeated_blocker_in_terminal_gap(
+        isolated_db, monkeypatch):
+    monkeypatch.setattr(
+        pipeline_insights, "_profiles", lambda: {"example": PIPELINE_PROFILE})
+    monkeypatch.setattr(
+        isolated_db, "_pipeline_cache_guard_matches",
+        lambda _conn, _guard: True)
+    created = isolated_db.create_task(TaskCreate(
+        prompt="ExampleProject - REVIEW", recurrence="15m"))
+    blocker = "ИТОГ: НЕ СМОГ (GitHub API недоступен для PR #1458)"
+    _complete_and_recur(
+        isolated_db, created.series_id, "UNABLE", blocker)
+    _complete_without_recur(
+        isolated_db, created.series_id, "НЕ СМОГ", blocker)
+
+    woken = isolated_db.wake_series_group_once(
+        [created.series_id], "wake:review", "snapshot-repeat",
+        cache_guard={})
+
+    series = isolated_db.get_series(created.series_id)
+    assert woken == []
+    assert series["paused"] is True
+    assert series["next_task_id"] is None
+    assert series["auto_pause_reason"] == "GitHub API недоступен для PR #1458"
+    assert isolated_db.get_setting("wake:review") is None
+
+
+def test_generic_startup_repair_does_not_apply_pipeline_repeat_guard(
+        isolated_db, monkeypatch):
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {})
+    created = isolated_db.create_task(TaskCreate(
+        prompt="Generic recurring report", recurrence="15m"))
+    blocker = "ИТОГ: НЕ СМОГ (один и тот же внешний блокер)"
+    _complete_and_recur(
+        isolated_db, created.series_id, "НЕ СМОГ", blocker)
+    _complete_without_recur(
+        isolated_db, created.series_id, "UNABLE", blocker)
+
+    repaired = isolated_db.repair_active_series_occurrences()
+
+    series = isolated_db.get_series(created.series_id)
+    assert repaired == [created.series_id]
+    assert series["paused"] is False
+    assert series["next_status"] == "pending"
+    assert series["auto_pause_reason"] is None
+
+
+def test_repeat_guard_series_identity_uses_prompt_not_mutable_title(monkeypatch):
+    monkeypatch.setattr(
+        pipeline_insights, "_profiles", lambda: {"example": PIPELINE_PROFILE})
+    series = [
+        {
+            "id": 1,
+            "title": "Renamed to ExampleProject - REVIEW",
+            "prompt": "Generic recurring report\nbody",
+            "ended": False,
+        },
+        {
+            "id": 2,
+            "title": "Renamed to a generic title",
+            "prompt": "ExampleProject - REVIEW\nbody",
+            "ended": False,
+        },
+    ]
+
+    assert pipeline_insights.repeat_guard_series_ids(series) == [2]
+    renamed_generic = SimpleNamespace(
+        series_id=1, series_title=series[0]["title"],
+        prompt=series[0]["prompt"])
+    renamed_pipeline = SimpleNamespace(
+        series_id=2, series_title=series[1]["title"],
+        prompt=series[1]["prompt"])
+    assert pipeline_insights._matching_queue(renamed_generic) is None
+    assert pipeline_insights._matching_queue(renamed_pipeline)[2]["id"] == "review"
 
 
 def test_productive_pipeline_result_resets_repeated_blocker_streak(
@@ -913,6 +1072,8 @@ def test_list_series_uses_constant_lightweight_queries(
                if statement.lstrip().upper().startswith(("SELECT", "WITH"))]
     assert {item["id"] for item in listed} == set(expected_ids)
     assert len(selects) == 3
+    assert sum("pipeline_repeat_blocker_pause:v1:" in statement
+               for statement in selects) == 1
     assert prohibited_reads == []
     assert all("SELECT *" not in statement.upper() for statement in selects)
 
