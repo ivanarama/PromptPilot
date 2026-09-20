@@ -2281,17 +2281,49 @@ def dispatch_gate(task) -> dict | None:
     return None
 
 
+def _repeat_guard_series_identity(prompt, fallback_title=None) -> str:
+    lines = str(prompt or "").splitlines()
+    return (lines[0] if lines else str(fallback_title or "")).lower()
+
+
 def _matching_queue(task) -> tuple[str, dict, dict] | None:
     """Return the profile and queue owning a recurring task, if configured."""
     if not getattr(task, "series_id", None):
         return None
-    title = (getattr(task, "series_title", None) or task.prompt.splitlines()[0]).lower()
+    title = _repeat_guard_series_identity(
+        getattr(task, "prompt", ""), getattr(task, "series_title", None))
     for profile_id, profile in _profiles().items():
         for queue in profile.get("queues", []):
             marker = str(queue.get("series_contains", "")).lower()
             if marker and marker in title:
                 return profile_id, profile, queue
     return None
+
+
+def repeat_guard_series_ids(series: list[dict]) -> list[int]:
+    """Return every active series owned by a configured pipeline queue.
+
+    Startup repair is otherwise generic, so the caller passes this explicit
+    allowlist before applying project-pipeline-only recurrence policy.
+    """
+    markers = {
+        str(queue.get("series_contains") or "").lower()
+        for profile in _profiles().values()
+        for queue in profile.get("queues", [])
+        if isinstance(queue, dict) and queue.get("series_contains")
+    }
+    matching = []
+    for item in series:
+        if item.get("ended") or item.get("ended_at"):
+            continue
+        value = item.get("id")
+        if type(value) is not int or value <= 0:
+            continue
+        identity = _repeat_guard_series_identity(
+            item.get("prompt"), item.get("title"))
+        if any(marker in identity for marker in markers):
+            matching.append(value)
+    return matching
 
 
 def worker_lane_policy() -> dict | None:

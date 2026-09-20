@@ -2466,7 +2466,11 @@ async function openSchedule() {
             + (s.last_verdict ? ` (${s.last_verdict})` : '') + `, ${when(s.last_at)}`)
       : 'ещё не запускалась';
     const githubWait = githubApiWait({status: s.next_status, scheduled_at: s.next_run_at, error: s.next_error});
-    const next = s.broken
+    const autoPauseReason = typeof s.auto_pause_reason === 'string'
+      ? s.auto_pause_reason.trim() : '';
+    const next = s.paused && !s.next_task_id
+      ? `<span style="color:var(--yellow)"${autoPauseReason ? ` title="${escAttr(autoPauseReason)}"` : ''}>${autoPauseReason ? 'автопауза — повторился тот же блокер' : 'серия на паузе'} — Возобновить создаст следующий запуск</span>${autoPauseReason ? `<br><span title="${escAttr(autoPauseReason)}">Причина: ${esc(autoPauseReason)}</span>` : ''}`
+      : s.broken
       ? '<span style="color:var(--red)">серия оборвана — следующего запуска нет</span>'
       : githubWait
       ? `<span style="color:var(--yellow)" title="${escAttr(githubWait.reason)}">#${s.next_task_id} — ждёт GitHub API до ${when(githubWait.until)}</span><br><span title="${escAttr(githubWait.reason)}">Причина: ${esc(githubWait.reason)}</span>`
@@ -2489,7 +2493,7 @@ async function openSchedule() {
       <div class="prov-cmd">Прошлый: ${last}</div>
       ${!s.ended ? `<div class="prov-actions" style="margin-top:9px">
         <button class="btn btn-sm btn-ghost" onclick="toggleSeriesEditor(${s.id})">⚙ Изменить</button>
-        <button class="btn btn-sm btn-ghost" onclick="seriesAction(${s.id},'run_now')" ${!s.next_task_id ? 'disabled' : ''}>▶ Сейчас</button>
+        <button class="btn btn-sm btn-ghost" onclick="seriesAction(${s.id},'run_now')" ${s.paused || !s.next_task_id ? 'disabled' : ''}>▶ Сейчас</button>
         <button class="btn btn-sm btn-ghost" onclick="seriesAction(${s.id},'${s.paused ? 'resume' : 'pause'}')">${s.paused ? '▶ Возобновить' : '⏸ Пауза'}</button>
         <button class="btn btn-sm btn-danger" onclick="seriesAction(${s.id},'end',true)">Завершить серию</button>
       </div>

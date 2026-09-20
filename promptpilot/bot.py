@@ -793,6 +793,12 @@ def _series_keyboard(series: dict) -> InlineKeyboardMarkup:
     sid = series["id"]
     state = "▶ Возобновить" if series["paused"] else "⏸ Пауза"
     state_action = "resume" if series["paused"] else "pause"
+    action_buttons = [
+        InlineKeyboardButton(state, callback_data=f"sera:{sid}:{state_action}")]
+    if not series["paused"]:
+        action_buttons.insert(
+            0, InlineKeyboardButton(
+                "▶ Сейчас", callback_data=f"sera:{sid}:run_now"))
     rows = [
         [InlineKeyboardButton("30м", callback_data=f"seri:{sid}:30m"),
          InlineKeyboardButton("1ч", callback_data=f"seri:{sid}:1h"),
@@ -800,8 +806,7 @@ def _series_keyboard(series: dict) -> InlineKeyboardMarkup:
          InlineKeyboardButton("4ч", callback_data=f"seri:{sid}:4h")],
         [InlineKeyboardButton("⚡ временно 30м", callback_data=f"serb:{sid}:30m"),
          InlineKeyboardButton("⚡ временно 1ч", callback_data=f"serb:{sid}:1h")],
-        [InlineKeyboardButton("▶ Сейчас", callback_data=f"sera:{sid}:run_now"),
-         InlineKeyboardButton(state, callback_data=f"sera:{sid}:{state_action}")],
+        action_buttons,
         [InlineKeyboardButton("← К расписанию", callback_data="series:list")],
     ]
     return InlineKeyboardMarkup(rows)
@@ -813,8 +818,10 @@ def _series_text(s: dict) -> str:
         boost = (f"\n⚡ Временно: {s['effective_recurrence']}; "
                  f"ПУСТО {s['temporary_empty_count']}/{s['temporary_empty_limit'] or '∞'}")
     state = "завершена" if s["ended"] else "пауза" if s["paused"] else "активна"
+    pause_reason = (f"\nПричина автопаузы: {s['auto_pause_reason']}"
+                    if s.get("auto_pause_reason") else "")
     return (f"{s['title']}\n\nСостояние: {state}\nОсновной интервал: {s['recurrence']}"
-            f"{boost}\nЭффорт: {s['effort'] or 'по умолчанию'}\n"
+            f"{pause_reason}{boost}\nЭффорт: {s['effort'] or 'по умолчанию'}\n"
             f"Следующий запуск: {_local_str(s['next_run_at'])}\n"
             f"Прогонов: {s['runs']}; ошибок {round(s['failure_rate']*100)}%; "
             f"ПУСТО {round(s['empty_rate']*100)}%")

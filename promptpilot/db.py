@@ -6,6 +6,7 @@ import math
 import re
 import sqlite3
 import time
+import unicodedata
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -1654,13 +1655,17 @@ def list_series() -> list:
         # queue snapshot even if a worker completes a run between SELECTs.
         conn.execute("BEGIN")
         series_rows = [dict(r) for r in conn.execute(
-            """SELECT id, title, prompt, working_dir, base_recurrence,
-                      temporary_recurrence, temporary_until,
-                      temporary_empty_limit, temporary_empty_count,
-                      provider, model, effort, priority, task_timeout,
-                      paused, ended_at
-               FROM task_series
-               ORDER BY id DESC""")]
+            """SELECT s.id, s.title, s.prompt, s.working_dir,
+                      s.base_recurrence, s.temporary_recurrence,
+                      s.temporary_until, s.temporary_empty_limit,
+                      s.temporary_empty_count, s.provider, s.model, s.effort,
+                      s.priority, s.task_timeout, s.paused, s.ended_at,
+                      auto_pause.value AS auto_pause_data
+               FROM task_series AS s
+               LEFT JOIN settings AS auto_pause
+                 ON auto_pause.key = ? || CAST(s.id AS TEXT)
+               ORDER BY s.id DESC""",
+            (_PIPELINE_REPEAT_BLOCKER_PAUSE_PREFIX,))]
         # Keep this read deliberately narrow.  Task result/prompt/note payloads
         # can be very large and none of them contributes to series health.
         # Fetching all series histories in one pass also avoids the old N+1
@@ -1725,6 +1730,15 @@ def list_series() -> list:
                 if r["started_at"] and r["completed_at"]:
                     durations.append((_parse_dt(r["completed_at"]) -
                                       _parse_dt(r["started_at"])).total_seconds())
+            auto_pause_reason = None
+            try:
+                auto_pause = json.loads(s["auto_pause_data"])
+                reason = auto_pause.get("reason")
+                if (auto_pause.get("kind") == "repeated_blocker"
+                        and isinstance(reason, str) and reason.strip()):
+                    auto_pause_reason = reason.strip()
+            except (TypeError, ValueError, json.JSONDecodeError, AttributeError):
+                pass
             out.append({
                 "id": s["id"], "title": s["title"], "prompt": s["prompt"],
                 "working_dir": s["working_dir"], "runs": len(tasks),
@@ -1742,6 +1756,7 @@ def list_series() -> list:
                 "detached": bool(active_detail["detached"]) if active_detail else False,
                 "herdr_target": active_detail["herdr_target"] if active_detail else None,
                 "paused": bool(s["paused"]), "ended": bool(s["ended_at"]),
+                "auto_pause_reason": auto_pause_reason if s["paused"] else None,
                 "next_task_id": active["id"] if active else None,
                 "next_status": active["status"] if active else None,
                 "next_run_at": active_detail["scheduled_at"] if active_detail else None,
@@ -1754,7 +1769,7 @@ def list_series() -> list:
                 "failure_rate": round(failures / len(completed), 3) if completed else 0,
                 "empty_rate": round(empties / len(completed), 3) if completed else 0,
                 "avg_duration_seconds": round(sum(durations) / len(durations)) if durations else None,
-                "broken": not active and not s["ended_at"],
+                "broken": not active and not s["ended_at"] and not s["paused"],
             })
     out.sort(key=lambda x: (x["ended"], x["broken"], x["paused"], x["next_run_at"] or ""))
     return out
@@ -1990,6 +2005,219 @@ def _pipeline_series_wake_intent_key(series_id: int) -> str:
     return f"pipeline_series_wake_intent:v1:{series_id}"
 
 
+_PIPELINE_BLOCKER_VERDICTS = {
+    "НУЖЕН ЧЕЛОВЕК": "human",
+    "HUMAN": "human",
+    "HUMAN_REQUIRED": "human",
+    "NEEDS_HUMAN": "human",
+    "НЕ СМОГ": "unable",
+    "UNABLE": "unable",
+}
+_PIPELINE_BLOCKER_LINE_RE = re.compile(
+    r"^[ \t>*#-]*ИТОГ:\s*(?P<verdict>"
+    + "|".join(re.escape(value) for value in _PIPELINE_BLOCKER_VERDICTS)
+    + r")\b(?P<reason>.*)$",
+    re.IGNORECASE,
+)
+_PIPELINE_VOLATILE_UUID_RE = re.compile(
+    r"\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-"
+    r"[89ab][0-9a-f]{3}-[0-9a-f]{12}\b",
+    re.IGNORECASE,
+)
+_PIPELINE_VOLATILE_HEX_RE = re.compile(
+    r"\b(?=[0-9a-f]{7,64}\b)(?=[0-9a-f]*[a-f])[0-9a-f]+\b",
+    re.IGNORECASE,
+)
+_PIPELINE_VOLATILE_TIME_RE = re.compile(
+    r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}"
+    r"(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\b",
+    re.IGNORECASE,
+)
+_PIPELINE_VOLATILE_TASK_RE = re.compile(
+    r"\b(?:(?:scheduler\s+)?task\s*#?\s*\d+"
+    r"|задач[аи]\s+(?:promptpilot|планировщика)\s*#?\s*\d+)\b",
+    re.IGNORECASE,
+)
+_PIPELINE_GENERIC_BLOCKER_REASONS = {
+    "blocked",
+    "failed",
+    "unable",
+    "не получилось",
+    "не смог",
+    "нужен человек",
+    "нужно решение",
+    "подробности выше",
+    "см. выше",
+    "см. отчет выше",
+    "см. отчёт выше",
+    "требуется решение",
+}
+_PIPELINE_REPEAT_BLOCKER_PAUSE_PREFIX = "pipeline_repeat_blocker_pause:v1:"
+
+
+def _pipeline_blocker_details(
+        verdict: Optional[str], result: Optional[str]) -> Optional[dict]:
+    """Stable identity and readable reason of one explicit blocker.
+
+    Provider metadata, commit OIDs and the scheduler's own task id change on
+    every run and therefore cannot participate in repeat detection. Issue and
+    PR numbers deliberately remain: two blocked targets are two different
+    reasons. A bare HUMAN/UNABLE without a reason is not safe to correlate.
+    """
+    kind = _PIPELINE_BLOCKER_VERDICTS.get(str(verdict or "").strip().upper())
+    if kind is None:
+        return None
+
+    response = re.split(
+        r"(?m)^\s*--- Meta ---\s*$", str(result or ""), maxsplit=1,
+    )[0]
+    lines = response.splitlines()
+    selected = None
+    for index, line in enumerate(lines):
+        match = _PIPELINE_BLOCKER_LINE_RE.match(line)
+        if not match:
+            continue
+        line_kind = _PIPELINE_BLOCKER_VERDICTS.get(
+            match.group("verdict").strip().upper())
+        if line_kind != kind:
+            continue
+        parts = [match.group("reason")]
+        # Narrow terminals may wrap the final reason. Only indented lines are
+        # presentation continuations; stop before worktree summaries or prose.
+        for continuation in lines[index + 1:index + 9]:
+            if not continuation.strip():
+                break
+            if not continuation[:1].isspace():
+                break
+            parts.append(continuation.strip())
+        selected = " ".join(parts)
+    if selected is None:
+        return None
+
+    display_reason = unicodedata.normalize("NFKC", selected)
+    display_reason = re.sub(
+        r"^\s*(?:[—–:-]\s*|\(\s*)+", "", display_reason)
+    display_reason = re.sub(r"\s+", " ", display_reason).strip(
+        " \t\r\n()[]{}.,;:—–-")
+    normalized = display_reason.casefold()
+    normalized = _PIPELINE_VOLATILE_UUID_RE.sub("<uuid>", normalized)
+    normalized = _PIPELINE_VOLATILE_HEX_RE.sub("<oid>", normalized)
+    normalized = _PIPELINE_VOLATILE_TIME_RE.sub("<time>", normalized)
+    normalized = _PIPELINE_VOLATILE_TASK_RE.sub("task <id>", normalized)
+    normalized = re.sub(r"\bpp[/\\]t\d+\b", "pp/t<id>", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip(" \t\r\n()[]{}.,;:—–-")
+    if (not normalized
+            or normalized in _PIPELINE_GENERIC_BLOCKER_REASONS
+            or not any(character.isalnum() for character in normalized)):
+        return None
+    return {
+        "fingerprint": hashlib.sha256(
+            f"{kind}\0{normalized}".encode("utf-8")).hexdigest(),
+        "reason": display_reason[:1000],
+    }
+
+
+def _pipeline_blocker_fingerprint(
+        verdict: Optional[str], result: Optional[str]) -> Optional[str]:
+    details = _pipeline_blocker_details(verdict, result)
+    return details["fingerprint"] if details else None
+
+
+def _pipeline_repeat_blocker_pause_key(series_id: int) -> str:
+    if isinstance(series_id, bool) or not isinstance(series_id, int) or series_id <= 0:
+        raise ValueError("pipeline series id must be a positive integer")
+    return f"{_PIPELINE_REPEAT_BLOCKER_PAUSE_PREFIX}{series_id}"
+
+
+def _continue_pipeline_recurrence() -> dict:
+    return {
+        "suppress_recurrence": False,
+        "newly_paused": False,
+        "repeated": False,
+    }
+
+
+def _pause_pipeline_series_on_repeated_blocker(
+        conn, series_id: int, current_task_id: int) -> dict:
+    """Transactional implementation shared by recurrence and repair paths."""
+    series = conn.execute(
+        "SELECT paused, ended_at FROM task_series WHERE id = ?",
+        (series_id,),
+    ).fetchone()
+    if not series or series["ended_at"]:
+        return _continue_pipeline_recurrence()
+
+    current = conn.execute(
+        """SELECT id, status, verdict, result FROM tasks
+           WHERE id = ? AND series_id = ?
+             AND id = (SELECT MAX(id) FROM tasks WHERE series_id = ?)""",
+        (current_task_id, series_id, series_id),
+    ).fetchone()
+    if not current or current["status"] != "completed":
+        return _continue_pipeline_recurrence()
+    current_details = _pipeline_blocker_details(
+        current["verdict"], current["result"])
+    if current_details is None:
+        return _continue_pipeline_recurrence()
+
+    previous = conn.execute(
+        """SELECT id, status, verdict, result FROM tasks
+           WHERE series_id = ? AND id < ?
+           ORDER BY id DESC LIMIT 1""",
+        (series_id, current_task_id),
+    ).fetchone()
+    if (not previous or previous["status"] != "completed"
+            or _pipeline_blocker_fingerprint(
+                previous["verdict"], previous["result"]
+            ) != current_details["fingerprint"]):
+        return _continue_pipeline_recurrence()
+
+    now = _now()
+    changed = conn.execute(
+        """UPDATE task_series SET paused = 1, updated_at = ?
+           WHERE id = ? AND paused = 0 AND ended_at IS NULL""",
+        (now, series_id),
+    ).rowcount > 0
+    conn.execute(
+        "DELETE FROM settings WHERE key = ?",
+        (_pipeline_series_wake_intent_key(series_id),),
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+        (
+            _pipeline_repeat_blocker_pause_key(series_id),
+            json.dumps({
+                "kind": "repeated_blocker",
+                "reason": current_details["reason"],
+                "fingerprint": current_details["fingerprint"],
+                "previous_task_id": int(previous["id"]),
+                "current_task_id": current_task_id,
+            }, ensure_ascii=False, separators=(",", ":")),
+        ),
+    )
+    return {
+        "suppress_recurrence": True,
+        "newly_paused": changed,
+        "repeated": True,
+        "reason": current_details["reason"],
+        "current_task_id": current_task_id,
+        "previous_task_id": int(previous["id"]),
+    }
+
+
+def pause_pipeline_series_on_repeated_blocker(
+        series_id: int, current_task_id: int) -> dict:
+    """Pause after two consecutive occurrences report the same blocker.
+
+    The caller applies this only to a configured project-pipeline series. The
+    comparison and pause share one write transaction, so no successor can be
+    inserted between the decision and the pause made by this worker.
+    """
+    with _connect(immediate=True) as conn:
+        return _pause_pipeline_series_on_repeated_blocker(
+            conn, series_id, current_task_id)
+
+
 def _recreate_series_occurrence(conn, series_id: int, series,
                                 scheduled_at: datetime) -> bool:
     latest_row = conn.execute(
@@ -2078,6 +2306,16 @@ def request_pipeline_series_wake(series_id: int) -> dict:
                 (key,),
             )
             return {"accepted": True, "state": "latched"}
+        latest = conn.execute(
+            """SELECT id, status FROM tasks WHERE series_id = ?
+               ORDER BY id DESC LIMIT 1""",
+            (series_id,),
+        ).fetchone()
+        if latest and latest["status"] == "completed":
+            repeat_guard = _pause_pipeline_series_on_repeated_blocker(
+                conn, series_id, int(latest["id"]))
+            if repeat_guard["suppress_recurrence"]:
+                return {"accepted": False, "state": "repeat_blocker_paused"}
         if _recreate_series_occurrence(
                 conn, series_id, series, datetime.now(timezone.utc)):
             conn.execute("DELETE FROM settings WHERE key = ?", (key,))
@@ -2085,13 +2323,20 @@ def request_pipeline_series_wake(series_id: int) -> dict:
         return {"accepted": False, "state": "missing"}
 
 
-def repair_active_series_occurrences() -> list[int]:
+def repair_active_series_occurrences(
+        *, repeat_guard_series_ids=()) -> list[int]:
     """Recreate active series lost after a terminal commit and hard crash.
 
     A worker can die after marking an occurrence completed/failed but before
     its ``finally`` schedules the successor.  Repair only that narrow terminal
     state: a cancelled latest occurrence remains an explicit human stop.
+    ``repeat_guard_series_ids`` is an explicit project-profile allowlist;
+    generic recurring schedules retain their historical repair behaviour.
     """
+    guarded = {
+        value for value in repeat_guard_series_ids
+        if type(value) is int and value > 0
+    }
     repaired = []
     with _connect(immediate=True) as conn:
         series_rows = conn.execute(
@@ -2108,12 +2353,17 @@ def repair_active_series_occurrences() -> list[int]:
             ).fetchone() is not None:
                 continue
             latest = conn.execute(
-                """SELECT status, completed_at FROM tasks WHERE series_id = ?
+                """SELECT id, status, completed_at FROM tasks WHERE series_id = ?
                    ORDER BY id DESC LIMIT 1""",
                 (series_id,),
             ).fetchone()
             if (latest is None
                     or latest["status"] not in ("completed", "failed")):
+                continue
+            if (series_id in guarded and latest["status"] == "completed"
+                    and _pause_pipeline_series_on_repeated_blocker(
+                        conn, series_id, int(latest["id"]))[
+                            "suppress_recurrence"]):
                 continue
             wake_key = _pipeline_series_wake_intent_key(series_id)
             has_wake = conn.execute(
@@ -2195,9 +2445,31 @@ def series_action(series_id: int, action: str) -> bool:
                 (_pipeline_series_wake_intent_key(series_id),),
             )
         elif action == "resume":
-            conn.execute("UPDATE task_series SET paused = 0, updated_at = ? WHERE id = ? AND ended_at IS NULL",
-                         (now, series_id))
+            resumed = conn.execute(
+                """UPDATE task_series SET paused = 0, updated_at = ?
+                   WHERE id = ? AND paused = 1 AND ended_at IS NULL""",
+                (now, series_id),
+            ).rowcount > 0
+            if resumed:
+                conn.execute(
+                    "DELETE FROM settings WHERE key = ?",
+                    (_pipeline_repeat_blocker_pause_key(series_id),),
+                )
+            if resumed and conn.execute(
+                    """SELECT 1 FROM tasks WHERE series_id = ?
+                       AND status IN ('pending', 'running', 'rate_limited')""",
+                    (series_id,),
+            ).fetchone() is None:
+                # An automatic repeat-blocker pause intentionally has no
+                # successor. Resume restores exactly one runnable occurrence.
+                _recreate_series_occurrence(
+                    conn, series_id, row, datetime.now(timezone.utc))
         elif action == "run_now":
+            # A paused series is an explicit stop. Creating or moving a task
+            # here would still leave it unclaimable and falsely report that
+            # the run started; Resume is the only way out of this state.
+            if row["paused"] or row["ended_at"]:
+                return False
             cur = conn.execute(
                 """UPDATE tasks
                    SET scheduled_at = ?, next_run_at = NULL,
@@ -2212,7 +2484,7 @@ def series_action(series_id: int, action: str) -> bool:
                     (_pipeline_series_wake_intent_key(series_id),),
                 )
                 return True
-            if row["ended_at"] or conn.execute(
+            if conn.execute(
                 "SELECT 1 FROM tasks WHERE series_id = ? AND status = 'running'",
                 (series_id,),
             ).fetchone():
@@ -2243,6 +2515,10 @@ def series_action(series_id: int, action: str) -> bool:
             conn.execute(
                 "DELETE FROM settings WHERE key = ?",
                 (_pipeline_series_wake_intent_key(series_id),),
+            )
+            conn.execute(
+                "DELETE FROM settings WHERE key = ?",
+                (_pipeline_repeat_blocker_pause_key(series_id),),
             )
         else:
             return False
@@ -2422,12 +2698,17 @@ def wake_series_group_once(series_ids: list[int], latch_key: str,
                     # so only repair the same terminal states as
                     # ``repair_active_series_occurrences``.
                     latest = conn.execute(
-                        """SELECT status FROM tasks WHERE series_id = ?
+                        """SELECT id, status FROM tasks WHERE series_id = ?
                            ORDER BY id DESC LIMIT 1""",
                         (series_id,),
                     ).fetchone()
                     if (latest is None
                             or latest["status"] not in ("completed", "failed")):
+                        continue
+                    if (latest["status"] == "completed"
+                            and _pause_pipeline_series_on_repeated_blocker(
+                                conn, series_id, int(latest["id"]))[
+                                    "suppress_recurrence"]):
                         continue
                     if not _recreate_series_occurrence(
                             conn, series_id, series, datetime.now(timezone.utc)):

@@ -934,9 +934,52 @@ def _recur_after_run(task):
         db.consume_pipeline_series_wake(fresh.series_id)
 
 
+def _pipeline_repeat_guard(task) -> dict | None:
+    """Apply the repeat-blocker circuit breaker to configured pipeline work."""
+    if not task.series_id:
+        return None
+    try:
+        from . import pipeline_insights
+        if pipeline_insights._matching_queue(task) is None:
+            return None
+        state = db.pause_pipeline_series_on_repeated_blocker(
+            task.series_id, task.id)
+    except Exception as exc:
+        # Profile visibility is optional infrastructure. Do not silently kill
+        # an otherwise healthy generic schedule when it cannot be classified.
+        print(
+            f"  !! repeat-blocker guard unavailable for #{task.id}: {exc}",
+            flush=True,
+        )
+        return None
+    if not state.get("suppress_recurrence"):
+        return state
+    if state.get("newly_paused"):
+        print(
+            f"  -> Series #{task.series_id} paused: tasks "
+            f"#{state['previous_task_id']} and #{task.id} reported the same blocker",
+            flush=True,
+        )
+        if task.tg_chat_id:
+            try:
+                db.add_notification(
+                    task.tg_chat_id,
+                    f"⏸ Серия «{task.prompt.splitlines()[0]}» приостановлена: "
+                    "два запуска подряд вернули одинаковый блокер. "
+                    "После устранения причины нажмите Resume.",
+                    task_id=task.id,
+                )
+            except Exception as exc:
+                print(f"  -> notify repeat-blocker pause failed: {exc}")
+    return state
+
+
 def _maybe_recur(task, failed: bool = False):
     """Enqueue the next occurrence of a recurring task."""
     if not task.recurrence:
+        return
+    repeat_guard = _pipeline_repeat_guard(task)
+    if repeat_guard and repeat_guard.get("suppress_recurrence"):
         return
     series = db.prepare_series_recurrence(task.series_id, task.verdict) if task.series_id else None
     recurrence = series["effective_recurrence"] if series else task.recurrence
@@ -2395,7 +2438,22 @@ def run_worker():
     if alive:
         print(f"Живые прогоны найдены по метке в окружении, не трогаю: {sorted(alive)}")
     db.recover_running(keep_ids=alive)
-    repaired_series = db.repair_active_series_occurrences()
+
+    # Import/page-in routing after stale attempts have been recovered but
+    # before terminal-gap repair. Repair is intentionally generic; only
+    # profile-matched project series opt into repeat-blocker pausing.
+    pipeline_runtime = _warm_pipeline_runtime()
+    try:
+        repeat_guard_series_ids = pipeline_runtime.repeat_guard_series_ids(
+            db.list_series())
+    except Exception as exc:
+        print(
+            f"  !! repeat-blocker startup classification unavailable: {exc}",
+            flush=True,
+        )
+        repeat_guard_series_ids = ()
+    repaired_series = db.repair_active_series_occurrences(
+        repeat_guard_series_ids=repeat_guard_series_ids)
     if repaired_series:
         print(
             "Восстановлены потерянные в аварийном окне серии: "
@@ -2410,11 +2468,6 @@ def run_worker():
         workflows.sync_all_tasks()
     except Exception as exc:
         print(f"Не удалось синхронизировать workflow после восстановления: {exc}")
-
-    # Import/page-in the routing stack after stale attempts have been recovered
-    # but before a new queue item can be claimed. A slow startup remains visible
-    # through the heartbeat without making any task look actively running.
-    _warm_pipeline_runtime()
 
     code_snapshot = _code_snapshot()
 
