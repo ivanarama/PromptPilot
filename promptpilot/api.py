@@ -11,7 +11,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -19,7 +20,7 @@ from pydantic import BaseModel
 import os
 import re as _re
 
-from . import db, workflows
+from . import db, epf_tools, workflows
 from . import pipeline_insights
 from .config import API_TOKEN, DB_DIR, EFFORT_LEVELS, PIPELINE_SNAPSHOT_INTERVAL, get_provider_models, get_skills, load_providers, mask_secret_value, provider_available, PROJECTS_ROOT
 from .models import (
@@ -141,9 +142,22 @@ else:
 
 # --- API ---
 
-@app.get("/api/tasks", response_model=List[TaskInDB])
+def _task_with_epf(task: TaskInDB) -> dict:
+    """TaskInDB + карточка 1С-доработки (epf_jobs), если задача из /epf."""
+    d = task.model_dump()
+    job = db.get_epf_job_by_task(task.id)
+    if job:
+        d["epf"] = {
+            "base_label": job["base_label"],
+            "status": job["status"],
+            "epf_path": job["epf_path"] or "",
+        }
+    return d
+
+
+@app.get("/api/tasks")
 def api_list_tasks(status: Optional[TaskStatus] = None, limit: int = 50, offset: int = 0):
-    return db.list_tasks(status=status, limit=limit, offset=offset)
+    return [_task_with_epf(t) for t in db.list_tasks(status=status, limit=limit, offset=offset)]
 
 
 @app.post("/api/tasks", response_model=TaskInDB, status_code=201)
@@ -156,12 +170,12 @@ def api_create_task(task: TaskCreate):
     return db.create_task(task)
 
 
-@app.get("/api/tasks/{task_id}", response_model=TaskInDB)
+@app.get("/api/tasks/{task_id}")
 def api_get_task(task_id: int):
     task = db.get_task(task_id)
     if not task:
         raise HTTPException(404, "Task not found")
-    return task
+    return _task_with_epf(task)
 
 
 @app.patch("/api/tasks/{task_id}", response_model=dict)
@@ -812,6 +826,111 @@ async def api_upload(files: List[UploadFile] = File(...)):
             Path(s["path"]).unlink(missing_ok=True)
         raise
     return saved
+
+
+# --- Доработка обработок 1С (/epf) ---
+
+class EpfSettings(BaseModel):
+    exe_path: str = ""
+    bases_root: str = ""
+    base_path: str = ""
+    ut11: str = ""
+    bp3: str = ""
+    erp: str = ""
+    unf: str = ""
+    aa: str = ""
+    skills_repo: str = ""
+    skills_dir: str = ""
+
+
+@app.get("/api/epf/status")
+def api_epf_status():
+    v8 = epf_tools.find_v8_exe()
+    return {
+        "available": v8 is not None,
+        "v8_path": str(v8) if v8 else "",
+        "bases_count": len(epf_tools.scan_available_bases()),
+        "env_keys": epf_tools.env_overridden_keys(),
+        "config": epf_tools.load_1c_config(),
+    }
+
+
+@app.post("/api/epf/settings")
+def api_epf_save_settings(s: EpfSettings):
+    """Записать секцию "1c" в tg_config.json. Переменные PP_1C_* в env
+    сильнее — их из UI не перекрыть (см. status.env_keys)."""
+    epf_tools.save_1c_config(s.model_dump())
+    return api_epf_status()
+
+
+@app.get("/api/epf/bases")
+def api_epf_bases():
+    bases = [{"key": "stub", "label": "🧩 Авто (Stub-DB)"}]
+    for key, label in epf_tools.PRESET_LABELS.items():
+        path, _ = epf_tools.resolve_base(key)
+        bases.append({"key": key, "label": label, "missing": path is None})
+    for b in epf_tools.scan_available_bases():
+        bases.append({"key": b["path"], "label": f"📁 {b['name']}"})
+    return bases
+
+
+@app.post("/api/epf/rework", status_code=201)
+async def api_epf_rework(
+    file: UploadFile = File(...),
+    prompt: str = Form(...),
+    base_key: str = Form("stub"),
+):
+    """Создать доработку обработки 1С: декомпиляция → задача в очереди.
+
+    Декомпиляция тяжёлая (до нескольких минут) — преп-фаза в threadpool.
+    Сборка результата происходит в боте по завершении задачи (epf_jobs).
+    """
+    if not epf_tools.is_available():
+        raise HTTPException(409, "1cv8.exe не найден — 1С-доработка недоступна")
+
+    name = Path(file.filename or "").name
+    if not name.lower().endswith((".epf", ".erf")):
+        raise HTTPException(400, "Нужен файл .epf или .erf")
+
+    base_path, base_label = epf_tools.resolve_base(base_key)
+    if base_key != "stub" and not base_path:
+        raise HTTPException(400, f"База «{base_key}» не найдена на этой машине")
+
+    UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+    dest = UPLOADS_DIR / f"{uuid.uuid4().hex}{Path(name).suffix}"
+    size = 0
+    try:
+        with open(dest, "wb") as out:
+            while chunk := await file.read(1024 * 1024):
+                size += len(chunk)
+                if size > MAX_UPLOAD_BYTES:
+                    raise HTTPException(413, f"«{name}» больше 20 МБ")
+                out.write(chunk)
+    except HTTPException:
+        dest.unlink(missing_ok=True)
+        raise
+
+    try:
+        projects_root = Path(PROJECTS_ROOT) if PROJECTS_ROOT else Path.cwd() / "pp-epf-projects"
+        projects_root.mkdir(parents=True, exist_ok=True)
+        project_dir, warnings = await run_in_threadpool(
+            epf_tools.prepare_project, dest, name, base_path, projects_root,
+        )
+    except epf_tools.EpfError as e:
+        raise HTTPException(422, f"Не удалось декомпилировать: {str(e)[:800]}")
+    finally:
+        dest.unlink(missing_ok=True)
+
+    task = db.create_task(TaskCreate(
+        prompt=prompt.strip(),
+        working_dir=str(project_dir),
+        skip_permissions=True,  # агенту нужен запуск 1cv8/epf-build и правка файлов
+    ))
+    db.create_epf_job(
+        task_id=task.id, project_dir=str(project_dir), original_name=name,
+        base_key=base_key, base_label=base_label, chat_id=None,
+    )
+    return {"task": task.model_dump(), "base_label": base_label, "warnings": warnings}
 
 
 # --- Экран агента herdr-задачи ---

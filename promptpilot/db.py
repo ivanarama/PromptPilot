@@ -399,6 +399,22 @@ MIGRATIONS = [
     "ALTER TABLE tasks ADD COLUMN pipeline_priority_restore INTEGER",
     "ALTER TABLE tasks ADD COLUMN budget_wait_started_at TEXT",
     "CREATE INDEX IF NOT EXISTS idx_tasks_budget_wait_fairness ON tasks(budget_wait_scope, status, budget_wait_started_at, priority, id)",
+    # 1С-доработка (epf_tools): связь PP-задачи с проектом обработки
+    """CREATE TABLE IF NOT EXISTS epf_jobs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        project_dir TEXT NOT NULL,
+        original_name TEXT NOT NULL,
+        base_key TEXT,
+        base_label TEXT,
+        chat_id INTEGER,
+        status TEXT NOT NULL DEFAULT 'queued',
+        epf_path TEXT,
+        error TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_epf_jobs_task ON epf_jobs(task_id)",
 ]
 
 WORKFLOW_SCHEMA_VERSION = "workflow_orchestrator_w0_v1"
@@ -4415,6 +4431,55 @@ def mark_notified(task_id: int):
         conn.execute(
             "UPDATE tasks SET notified_at = ? WHERE id = ?",
             (_now(), task_id),
+        )
+
+
+# ── 1С-доработка (epf_tools): связь задачи с проектом обработки ─────────
+
+def create_epf_job(task_id: int, project_dir: str, original_name: str,
+                   base_key: str | None, base_label: str,
+                   chat_id: int | None) -> int:
+    now = _now()
+    with _connect() as conn:
+        cur = conn.execute(
+            """INSERT INTO epf_jobs (task_id, project_dir, original_name,
+               base_key, base_label, chat_id, status, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?)""",
+            (task_id, project_dir, original_name, base_key, base_label,
+             chat_id, now, now),
+        )
+        return int(cur.lastrowid)
+
+
+def get_epf_job(job_id: int) -> Optional[dict]:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM epf_jobs WHERE id = ?", (job_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def get_epf_job_by_task(task_id: int) -> Optional[dict]:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM epf_jobs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def update_epf_job(job_id: int, fields: dict):
+    """Обновить поля epf_jobs (status, epf_path, error, base_key, base_label)."""
+    allowed = {"status", "epf_path", "error", "base_key", "base_label"}
+    sets = {k: v for k, v in fields.items() if k in allowed}
+    if not sets:
+        return
+    sets["updated_at"] = _now()
+    cols = ", ".join(f"{k} = ?" for k in sets)
+    with _connect() as conn:
+        conn.execute(
+            f"UPDATE epf_jobs SET {cols} WHERE id = ?",
+            (*sets.values(), job_id),
         )
 
 

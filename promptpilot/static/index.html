@@ -695,9 +695,50 @@
     <button class="btn-pause" onclick="openSchedule()" style="margin-left:8px">🗓 Расписание</button>
     <button class="btn-pause" onclick="openWorkflows()" style="margin-left:8px">Workflows</button>
     <button class="btn-pause" onclick="openProviders()" style="margin-left:8px">⚙ Providers</button>
+    <button class="btn-pause" onclick="openEpf()" style="margin-left:8px" title="Доработка внешних обработок 1С">🔧 1С</button>
   </div>
 
   <div class="task-list" id="taskList"></div>
+</div>
+
+<div class="modal-overlay" id="epfModal" onclick="if(event.target===this)closeEpf()">
+  <div class="modal" style="max-width:720px">
+    <h2>🔧 1С: доработка обработок <button class="btn btn-sm btn-ghost" style="margin-left:auto" onclick="closeEpf()">✕ Закрыть</button></h2>
+    <div id="epfStatus" style="font-size:13px;color:var(--text2);margin-bottom:10px"></div>
+
+    <div style="border-top:1px solid var(--border); padding-top:12px">
+      <b style="font-size:14px">Новая доработка</b>
+      <form onsubmit="return epfRework(event)" style="display:flex;flex-direction:column;gap:8px;margin-top:8px">
+        <input type="file" id="epfFile" accept=".epf,.erf" required style="font-size:13px;color:inherit">
+        <textarea id="epfPrompt" placeholder="Что сделать с обработкой?" required style="min-height:80px;resize:vertical;background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:inherit;padding:8px;font-size:13px;font-family:inherit"></textarea>
+        <label style="font-size:13px;color:var(--text2)">База 1С
+          <select id="epfBase" style="width:100%;background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:inherit;padding:7px 10px;font-size:13px"></select>
+        </label>
+        <button class="btn btn-primary" type="submit" id="epfReworkBtn">Декомпилировать и поставить в очередь</button>
+        <div id="epfReworkMsg" style="font-size:13px"></div>
+      </form>
+    </div>
+
+    <details style="margin-top:14px">
+      <summary style="cursor:pointer;font-size:14px">⚙ Настройки 1С</summary>
+      <div id="epfEnvHint" style="font-size:12px;color:var(--yellow);margin:6px 0"></div>
+      <form onsubmit="return epfSaveSettings(event)" style="display:flex;flex-direction:column;gap:8px;margin-top:6px">
+        <input id="epfExe" placeholder="Путь к 1cv8.exe (пусто — авто: реестр/Program Files)" style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:inherit;padding:7px 10px;font-size:13px">
+        <input id="epfBasesRoot" placeholder="Каталог баз для сканирования" style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:inherit;padding:7px 10px;font-size:13px">
+        <input id="epfBasePath" placeholder="База декомпиляции по умолчанию" style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:inherit;padding:7px 10px;font-size:13px">
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+          <input id="epfUt11" placeholder="База УТ 11" style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:inherit;padding:7px 10px;font-size:13px">
+          <input id="epfBp3" placeholder="База БП 3.0" style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:inherit;padding:7px 10px;font-size:13px">
+          <input id="epfErp" placeholder="База ERP" style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:inherit;padding:7px 10px;font-size:13px">
+          <input id="epfUnf" placeholder="База УНФ" style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:inherit;padding:7px 10px;font-size:13px">
+          <input id="epfAa" placeholder="База Альфа-Авто" style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:inherit;padding:7px 10px;font-size:13px">
+          <input id="epfSkills" placeholder="Каталог cc-1c-skills (опционально)" style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:inherit;padding:7px 10px;font-size:13px">
+        </div>
+        <button class="btn btn-primary" type="submit">Сохранить настройки</button>
+        <div id="epfSetMsg" style="font-size:13px"></div>
+      </form>
+    </details>
+  </div>
 </div>
 
 <div class="modal-overlay" id="workflowModal" onclick="if(event.target===this)closeWorkflows()">
@@ -1075,6 +1116,7 @@ async function loadTasks() {
         <span class="task-prompt" title="${escAttr(taskDisplayTitle(t))}">${esc(taskDisplayTitle(t))}</span>
         ${t.working_dir ? `<span class="task-meta">📁 ${esc(t.working_dir.split(/[/\\]/).filter(Boolean).pop() || t.working_dir)}</span>` : ''}
         ${t.worktree ? `<span class="task-meta" title="отдельный git worktree">🌿 ${esc(t.worktree_branch || 'worktree')}</span>` : ''}
+        ${t.epf ? `<span class="task-meta" title="доработка обработки 1С: ${escAttr(t.epf.base_label || '')}">🔧 ${esc(EPF_STATUS_RU[t.epf.status] || '1С')}</span>` : ''}
         ${t.verdict ? `<span class="task-meta" title="итог, которым задача сама себя закрыла">${verdictIcon(t.verdict)} ${esc(t.verdict)}</span>` : ''}
         ${t.note ? `<span class="task-meta" title="${escAttr(t.note)}">✎ приписка</span>` : ''}
         ${t.provider ? `<span class="task-meta">${esc(t.provider)}</span>` : ''}
@@ -1090,6 +1132,7 @@ async function loadTasks() {
         </div>
 
         ${t.working_dir ? `<div class="detail-info"><span class="label">Dir: </span><span>${esc(t.working_dir)}</span></div>` : ''}
+        ${t.epf ? `<div class="detail-info"><span class="label">1С (${esc(t.epf.base_label || '')}): </span><span>${t.epf.epf_path ? esc(t.epf.epf_path) : esc(EPF_STATUS_RU[t.epf.status] || t.epf.status)}</span></div>` : ''}
         ${t.worktree ? `<div class="detail-info"><span class="label">Worktree: </span><span>${esc(t.worktree_path || 'ещё не создан')}</span>${t.worktree_branch ? ` <span class="label">ветка</span> <span>${esc(t.worktree_branch)}</span>` : ''}</div>` : ''}
 
         <div class="detail-info" style="align-items:center;gap:6px">
@@ -2903,6 +2946,103 @@ async function openProviders() {
   await renderMachineList();
 }
 function closeProviders() { document.getElementById('provModal').classList.remove('open'); }
+
+// --- 1С: доработка обработок ---
+const EPF_STATUS_RU = { queued: 'в работе', building: 'сборка…', built: 'собрана', build_failed: 'сбой сборки' };
+
+function openEpf() {
+  document.getElementById('epfModal').classList.add('open');
+  loadEpfStatus();
+  loadEpfBases();
+}
+function closeEpf() { document.getElementById('epfModal').classList.remove('open'); }
+
+async function loadEpfStatus() {
+  const s = await fetchJSON(`${API}/epf/status`);
+  const el = document.getElementById('epfStatus');
+  if (s.available) {
+    el.innerHTML = `✅ Платформа: <code>${esc(s.v8_path)}</code> · баз просканировано: <b>${s.bases_count}</b>`;
+    document.getElementById('epfReworkBtn').disabled = false;
+  } else {
+    el.innerHTML = `❌ 1cv8.exe не найден — укажите путь в настройках ниже (или переменной PP_1C_EXE_PATH).`;
+    document.getElementById('epfReworkBtn').disabled = true;
+  }
+  const hint = document.getElementById('epfEnvHint');
+  hint.textContent = s.env_keys.length
+    ? `Задано переменными окружения (форма их не перекрывает): ${s.env_keys.join(', ')}`
+    : '';
+  const c = s.config || {}, p = c.presets || {};
+  document.getElementById('epfExe').value = c.exe_path || '';
+  document.getElementById('epfBasesRoot').value = c.bases_root || '';
+  document.getElementById('epfBasePath').value = c.base_path || '';
+  document.getElementById('epfUt11').value = p.ut11 || '';
+  document.getElementById('epfBp3').value = p.bp3 || '';
+  document.getElementById('epfErp').value = p.erp || '';
+  document.getElementById('epfUnf').value = p.unf || '';
+  document.getElementById('epfAa').value = p.aa || '';
+  document.getElementById('epfSkills').value = c.skills_dir || '';
+}
+
+async function loadEpfBases() {
+  const bases = await fetchJSON(`${API}/epf/bases`);
+  document.getElementById('epfBase').innerHTML = bases.map(b =>
+    `<option value="${escAttr(b.key)}"${b.missing ? ' disabled' : ''}>${esc(b.label)}${b.missing ? ' (не найдена)' : ''}</option>`
+  ).join('');
+}
+
+async function epfRework(event) {
+  event.preventDefault();
+  const msg = document.getElementById('epfReworkMsg');
+  const btn = document.getElementById('epfReworkBtn');
+  const file = document.getElementById('epfFile').files[0];
+  if (!file) { msg.textContent = 'Выберите файл .epf/.erf'; return false; }
+  msg.textContent = '⏳ Декомпиляция (может занять несколько минут)...';
+  btn.disabled = true;
+  try {
+    const fd = new FormData();
+    fd.append('file', file);
+    fd.append('prompt', document.getElementById('epfPrompt').value);
+    fd.append('base_key', document.getElementById('epfBase').value);
+    const res = await fetchJSON(`${API}/epf/rework`, { method: 'POST', body: fd });
+    msg.innerHTML = `✅ Задача <a href="#" onclick="toggleTask(${res.task.id});closeEpf();return false">#${res.task.id}</a> поставлена в очередь${res.warnings && res.warnings.length ? ' (⚠ ' + esc(res.warnings.join('; ')) + ')' : ''}.`;
+    document.getElementById('epfFile').value = '';
+    document.getElementById('epfPrompt').value = '';
+    await loadTasks();
+  } catch (e) {
+    msg.textContent = '❌ ' + (e.message || e);
+  } finally {
+    btn.disabled = false;
+  }
+  return false;
+}
+
+async function epfSaveSettings(event) {
+  event.preventDefault();
+  const msg = document.getElementById('epfSetMsg');
+  try {
+    const s = await fetchJSON(`${API}/epf/settings`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        exe_path: document.getElementById('epfExe').value,
+        bases_root: document.getElementById('epfBasesRoot').value,
+        base_path: document.getElementById('epfBasePath').value,
+        ut11: document.getElementById('epfUt11').value,
+        bp3: document.getElementById('epfBp3').value,
+        erp: document.getElementById('epfErp').value,
+        unf: document.getElementById('epfUnf').value,
+        aa: document.getElementById('epfAa').value,
+        skills_dir: document.getElementById('epfSkills').value,
+      }),
+    });
+    msg.textContent = s.available ? '✅ Сохранено, платформа найдена' : 'Сохранено, но 1cv8.exe пока не найден';
+    await loadEpfStatus();
+    await loadEpfBases();
+  } catch (e) {
+    msg.textContent = '❌ ' + (e.message || e);
+  }
+  return false;
+}
 
 let provManageData = {};
 
