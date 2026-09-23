@@ -186,3 +186,74 @@ def test_reviewer_report_parser_accepts_structured_findings():
     assert parsed is not None
     assert parsed.verdict.value == "REVISION_REQUIRED"
     assert parsed.findings[0].severity.value == "high"
+
+
+def _revision_review(round_no: int) -> str:
+    return (
+        'AUDIT_FINDINGS_JSON: [{"fingerprint":"f' + str(round_no) + '","severity":"high",'
+        '"category":"runtime","title":"Broken","status":"open",'
+        '"payload":{"path":"x"}}]\n'
+        "AUDIT_VERDICT: REVISION_REQUIRED\n"
+        "ИТОГ: ГОТОВО — аудит завершён"
+    )
+
+
+def _create_planless(isolated_db, slug, stage=None, max_rounds=10):
+    config = autonomous_config(max_rounds=max_rounds)
+    if stage is not None:
+        config["stage"] = stage
+    return isolated_db.create_workflow(WorkflowCreate(
+        slug=slug,
+        objective="Исправлять до независимого PASS",
+        repository_path=str(isolated_db.DB_DIR),
+        candidate_branch="feature/rev-limit",
+        config=config,
+    ))
+
+
+def test_planless_revision_budget_from_stage_config(isolated_db):
+    # Issue #88: a planless workflow has no stage row, and
+    # config.stage.max_revision_rounds used to be ignored — the
+    # executor/auditor loop ran 14+ rounds before limits.max_rounds.
+    workflow = _create_planless(
+        isolated_db, "rev-limit", stage={"max_revision_rounds": 2})
+    workflows.start_workflow(
+        workflow.id, WorkflowStartRequest(expected_version=0))
+    assert workflows.advance_workflow(workflow.id).status.value == "executing"
+
+    for round_no in (1, 2):
+        complete_next(isolated_db, f"executor report round {round_no}")
+        complete_next(isolated_db, _revision_review(round_no))
+
+    limited = isolated_db.get_workflow(workflow.id)
+    assert limited.status.value == "awaiting_human"
+    # The budget stopped a third revision round instead of creating it.
+    assert limited.current_round == 2
+
+    limit_events = [
+        event for event in isolated_db.list_workflow_events(workflow.id, limit=1000)
+        if event.event_type == "limit.stage_revisions"
+    ]
+    assert len(limit_events) == 1
+    assert limit_events[0].payload["max_revision_rounds"] == 2
+
+
+def test_planless_revision_budget_falls_back_to_planning_config(isolated_db):
+    # No config.stage budget: planning.max_revisions_per_stage (default 3)
+    # bounds planless revisions too.
+    workflow = _create_planless(isolated_db, "rev-limit-default")
+    workflows.start_workflow(
+        workflow.id, WorkflowStartRequest(expected_version=0))
+    assert workflows.advance_workflow(workflow.id).status.value == "executing"
+
+    for round_no in (1, 2):
+        complete_next(isolated_db, f"executor report round {round_no}")
+        complete_next(isolated_db, _revision_review(round_no))
+        assert isolated_db.get_workflow(workflow.id).status.value != "awaiting_human"
+
+    complete_next(isolated_db, "executor report round 3")
+    complete_next(isolated_db, _revision_review(3))
+
+    limited = isolated_db.get_workflow(workflow.id)
+    assert limited.status.value == "awaiting_human"
+    assert limited.current_round == 3
