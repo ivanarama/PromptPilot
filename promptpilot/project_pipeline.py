@@ -1795,6 +1795,115 @@ def pending_merge_action(gh: GitHub, config: dict, intent: dict) -> dict:
             "complete": "run the same command with: complete merge --lease <lease>"}
 
 
+def _base_sync_owner_action(gh: GitHub, config: dict, owner: dict) -> dict | None:
+    """Deterministic MERGE handling for the base-sync owner (issue #42).
+
+    The owner holds the single-flight barrier, so the ordinary merge path
+    refuses it and the queue waits on a manual full-skill run. With the
+    ``base_sync_merge`` opt-in a provably-ready owner is served directly:
+
+    ``BEHIND`` — issue an update-branch lease. The update is the only
+    mutation, guarded by GitHub's ``expected_head_sha`` compare-and-swap; no
+    proof/epoch gates are needed because nothing is published until a later
+    ``next merge`` re-runs every ordinary gate against the updated HEAD.
+
+    ``CLEAN`` — the owner rides the ordinary ``intent → merge → done``
+    machinery through the same gates as any ship PR, with the lease marked
+    ``base_sync_owner`` so ``complete merge`` does not fail on the barrier it
+    itself represents.
+
+    Anything else keeps the full-skill fallback (return ``None``).
+    """
+    number, head = int(owner["number"]), str(owner["head"])
+    snapshot = stable_timeline(gh, config, number)
+    validate_common(snapshot, config, {"head": head})
+    if snapshot["headRefOid"] != head:
+        return None
+    labels = set(snapshot["labels"])
+    if "ship" not in labels or labels & {"hold", "needs-decision"}:
+        return None
+    status, checks = pr_checks(gh, config, number)
+    if status.get("mergeable") != "MERGEABLE":
+        return None
+    state = status.get("mergeStateStatus")
+    if state == "BEHIND":
+        lease = {"version": 1, "stage": "merge", "mode": "update-branch",
+                 "repository": config["repository"], "number": number,
+                 "head": head, "base_sync_owner": True}
+        return {"action": "merge", "target": {"number": number, "head": head},
+                "lease": encode_lease(lease),
+                "complete": "run the same command with: complete merge --lease <lease>"}
+    if state != "CLEAN":
+        return None
+    info = epoch(snapshot, config["trusted_account"])
+    validate_epoch_safety(info, config["trusted_account"])
+    established = proof(info, head, config["trusted_account"])
+    if not established or not trusted_ship_authorized(info, config["trusted_account"]):
+        return None
+    ready, reason = checks_ready(config, checks)
+    if not ready:
+        return {"action": "wait", "reason": reason, "number": number}
+    body = status.get("body") or ""
+    issues = same_repo_closing_issues(body, config["repository"])
+    marker = intent_body(head, established, body, issues)
+    intent, _pending = reserve_merge_intent(gh, config, number, marker)
+    if intent is None:
+        return {"action": "wait", "stage": "merge", "number": number,
+                "reason": "another merge cleanup intent won"}
+    lease = {"version": 1, "stage": "merge", "repository": config["repository"],
+             "number": number, "head": head, "snapshot": digest(snapshot),
+             "proof": established, "intent": intent, "base_sync_owner": True}
+    return {"action": "merge", "target": {"number": number, "head": head},
+            "lease": encode_lease(lease),
+            "complete": "run the same command with: complete merge --lease <lease>"}
+
+
+def _complete_base_sync_update(gh: GitHub, config: dict, lease: dict) -> dict:
+    """BEHIND owner: fast-forward the branch, verify, publish nothing else.
+
+    The branch update is the only mutation of this lease, and the
+    update-branch response is verified before the command reports success —
+    a 422 conflict raises with the intent/done markers never published
+    (issue #42: done was once published after a 422). The merge itself and
+    the done marker happen on a subsequent ``next merge`` / ``complete
+    merge`` against the updated HEAD, through the ordinary machinery.
+    """
+    number, head = int(lease["number"]), str(lease["head"])
+    pr = gh.json("api", f"repos/{config['repository']}/pulls/{number}")
+    if pr.get("state") != "open" or (pr.get("head") or {}).get("sha") != head:
+        raise PipelineError("base-sync owner changed; rerun next merge")
+    payload = {"expected_head_sha": head}
+    if config.get("merge_method") in ("merge", "rebase"):
+        payload["update_method"] = config["merge_method"]
+    gh.json("api", f"repos/{config['repository']}/pulls/{number}/update-branch",
+            "--method", "PUT", "--input", "-", input_value=payload)
+    timeout = int(config.get("base_sync_update_timeout_seconds", 300))
+    deadline = time.monotonic() + timeout
+    while True:
+        pr = gh.json("api", f"repos/{config['repository']}/pulls/{number}")
+        current = (pr.get("head") or {}).get("sha")
+        if current and current != head:
+            return {"action": "updated", "stage": "merge", "number": number,
+                    "old_head": head, "new_head": current,
+                    "next": "rerun next merge: the updated owner merges through the ordinary path"}
+        if time.monotonic() >= deadline:
+            raise PipelineError(
+                f"branch update did not complete within {timeout}s; rerun next merge")
+        time.sleep(2)
+
+
+def _barrier_blocks_merge(health: dict, lease: dict) -> bool:
+    """Whether a single-flight barrier forbids completing this merge lease."""
+    barriers = [item for item in health.get("findings", [])
+                if item.get("code") == "single_flight_barrier"]
+    if not barriers:
+        return False
+    # The base-sync owner merges through the owner lane itself (issue #42);
+    # a barrier pointing at ANOTHER PR remains a fail-closed owner change.
+    return not (lease.get("base_sync_owner")
+                and all(item.get("pr") == lease.get("number") for item in barriers))
+
+
 def next_merge(gh: GitHub, config: dict, *, config_path: str | None = None) -> dict:
     pending = pending_merge_intents(gh, config)
     if pending:
@@ -1810,6 +1919,11 @@ def next_merge(gh: GitHub, config: dict, *, config_path: str | None = None) -> d
     if health.get("state") == "red":
         return {"action": "fallback", "reason": "health check is red"}
     if any(item.get("code") == "single_flight_barrier" for item in health.get("findings", [])):
+        owner = health.get("integration_owner")
+        if config.get("base_sync_merge") and isinstance(owner, dict) and owner.get("number"):
+            action = _base_sync_owner_action(gh, config, owner)
+            if action is not None:
+                return action
         return fallback_target(config, health, "merge", health.get("integration_owner"),
                                "single-flight/base-sync owner requires the full skill")
     queue = list_ship(gh, config)
@@ -1848,6 +1962,8 @@ def complete_merge(gh: GitHub, config: dict, lease_value: str,
     lease = decode_lease(lease_value)
     if lease.get("stage") != "merge" or lease.get("repository") != config["repository"]:
         raise PipelineError("lease belongs to another stage or repository")
+    if lease.get("mode") == "update-branch":
+        return _complete_base_sync_update(gh, config, lease)
     identity_contract = (config["repository"], config["trusted_account"])
     ensure_identity(gh, config)
     health = run_health(config, config_path=config_path)
@@ -1857,7 +1973,7 @@ def complete_merge(gh: GitHub, config: dict, lease_value: str,
         ensure_identity(gh, config)
     if health.get("state") == "red":
         raise PipelineError("health check became red")
-    if any(item.get("code") == "single_flight_barrier" for item in health.get("findings", [])):
+    if _barrier_blocks_merge(health, lease):
         raise PipelineError("single-flight owner appeared; rerun next merge")
     snapshot = stable_timeline(gh, config, lease["number"])
     validate_common(snapshot, config, lease)
