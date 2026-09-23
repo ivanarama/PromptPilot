@@ -16,7 +16,8 @@ from typing import Optional
 
 from . import db, worktree
 from .config import (BASE_DELAY, CONCURRENCY, DEFAULT_CLI, MAX_DELAY, MIN_FREE_MB,
-                     POLL_INTERVAL, TASK_TIMEOUT, VERDICT_REQUIRED, build_cmd,
+                     POLL_INTERVAL, TASK_TIMEOUT, VERDICT_REPAIR,
+                     VERDICT_REPAIR_TIMEOUT, VERDICT_REQUIRED, build_cmd,
                      get_provider_env, load_providers)
 from .process_tree import OwnedProcess, ProcessTreeError
 
@@ -159,6 +160,58 @@ def parse_verdict(text: str) -> str:
     """
     matches = VERDICT_RE.findall(text or "")
     return matches[-1].upper() if matches else ""
+
+
+VERDICT_REPAIR_PROMPT = (
+    "Предыдущий ответ не содержал финальной строки вердикта. Конец отчёта:\n\n"
+    "{tail}\n\n"
+    "Не запускай никаких инструментов и ничего не меняй. Ответь ровно одной "
+    "финальной строкой:\n"
+    "ИТОГ: ГОТОВО — сделано\n"
+    "ИТОГ: УЖЕ СДЕЛАНО — оказалось, что уже исправлено\n"
+    "ИТОГ: НУЖЕН ЧЕЛОВЕК — нужно решение или доступ человека\n"
+    "ИТОГ: НЕ СМОГ — не получилось\n"
+    "ИТОГ: ПУСТО — проснулся по расписанию, а делать нечего\n"
+    "После двоеточия можно коротко пояснить причину."
+)
+
+
+def _repair_verdict(task, provider: str, provider_cfg: dict,
+                    report_tail: str, run_dir: str) -> str:
+    """One micro-request asking the same provider to restate the verdict.
+
+    Long multi-step runs on cheap models keep the quality but lose the closing
+    ИТОГ line (issue #82): the work is done, the report is complete, the parser
+    finds nothing. A short repeat-request costs a fraction of a full retry and
+    keeps the pipeline moving. Returns "" on any failure — the caller then
+    falls back to its existing no-verdict behavior.
+    """
+    prompt = VERDICT_REPAIR_PROMPT.format(tail=(report_tail or "")[-4000:])
+    try:
+        cmd = build_cmd(provider, prompt,
+                        model=getattr(task, "model", None),
+                        effort=getattr(task, "effort", None),
+                        guard=True)
+        prompt_stdin = prompt if provider_cfg.get("prompt_stdin") else None
+        env = get_provider_env(provider)
+        env.pop("PP_TASK_ID", None)
+        result = subprocess.run(
+            cmd,
+            cwd=run_dir,
+            env=env,
+            input=prompt_stdin,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=VERDICT_REPAIR_TIMEOUT,
+        )
+    except Exception as exc:
+        print(f"  !! Verdict repair request failed: {type(exc).__name__}: {exc}")
+        return ""
+    stdout = result.stdout or ""
+    if is_stream_json(stdout):
+        stdout = parse_stream_json(stdout).get("text", "")
+    return parse_verdict(stdout)
 
 
 def effective_prompt(task) -> str:
@@ -1980,6 +2033,16 @@ def _execute_task_body(task, admission_complete=None):
         from .herdr_exec import _closing_workflow_verdict
         verdict = _closing_workflow_verdict(
             verdict_source, allow_targeted_stale=allow_targeted_stale)
+        if not verdict and VERDICT_REPAIR and not machine:
+            # Issue #82: one micro-request beats failing the whole pipeline
+            # round (and paying for a full re-run) over a dropped last line.
+            repaired = _repair_verdict(task, provider, provider_cfg,
+                                       verdict_source or output, run_dir)
+            if repaired:
+                verdict = _closing_workflow_verdict(
+                    repaired, allow_targeted_stale=allow_targeted_stale)
+                if verdict:
+                    print(f"  -> Verdict repaired via micro-request: {verdict}")
         if not verdict:
             changed = _commit_terminal_or_defer(
                 task,
@@ -1996,6 +2059,13 @@ def _execute_task_body(task, admission_complete=None):
             return
     else:
         verdict = parse_verdict(output)
+        if (not verdict and VERDICT_REQUIRED and VERDICT_REPAIR
+                and not machine):
+            repaired = _repair_verdict(task, provider, provider_cfg,
+                                       verdict_source or output, run_dir)
+            if repaired:
+                verdict = repaired
+                print(f"  -> Verdict repaired via micro-request: {verdict}")
     changes = None
     if wt_note:
         output += wt_note
