@@ -35,6 +35,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 STATE_FILE = ROOT / ".state.json"
+EVENTS_FILE = ROOT / "events.jsonl"
 ATTACH_ROOT = Path.home() / ".promptpilot" / "inbox"
 
 NO_REPLY_RE = re.compile(
@@ -456,6 +457,13 @@ def note_created(state: dict) -> None:
     state["created"] = {today: state["created"].get(today, 0) + 1}
 
 
+def log_event(event: dict) -> None:
+    """Журнал для inbox_bot (этап 2): append-only JSONL, читает его хвостом."""
+    event = dict(event, ts=time.time())
+    with EVENTS_FILE.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+
 def run_once(env: dict, dry: bool, refresh: bool = False) -> None:
     config = json.loads((ROOT / env.get("CATALOG", "projects.json"))
                         .read_text(encoding="utf-8"))
@@ -502,6 +510,15 @@ def run_once(env: dict, dry: bool, refresh: bool = False) -> None:
                 "from": full["from"],
                 "subject": full["subject"],
                 "date": full["date"],
+            })
+            log_event({
+                "type": "triage_created",
+                "task_id": task_id,
+                "from": full["from"],
+                "subject": full["subject"],
+                "date": full["date"],
+                "message_id": full["message_id"],
+                "attachments": full.get("attachments", []),
             })
     finally:
         save_state(state)
