@@ -1083,7 +1083,7 @@ async function loadTasks() {
   // Scroll-jump fix: the 5s background refresh rebuilds the whole task list.
   // Snapshot scroll positions (prompt/result blocks of the expanded card) so
   // a reader is not yanked back to the top after the rebuild.
-  const taskScrolls = [...list.querySelectorAll('*')].map(el => el.scrollTop);
+  const taskScrolls = uiSnapScrolls(list);
   list.innerHTML = tasks.map(t => {
     const expanded = t.id === expandedId;
     const time = timeAgo(t.created_at);
@@ -1207,11 +1207,7 @@ async function loadTasks() {
   if (sc && screenCache[expandedId]) sc.scrollTop = sc.scrollHeight;
   // Scroll-jump fix: put the reader back where they were. The live agent
   // screen keeps its own bottom autoscroll and is skipped here.
-  const taskNewEls = list.querySelectorAll('*');
-  taskScrolls.forEach((top, i) => {
-    const el = taskNewEls[i];
-    if (el && top > 0 && !(el.id && el.id.startsWith('screen-'))) el.scrollTop = top;
-  });
+  uiRestoreScrolls(list, taskScrolls);
 }
 
 function providerOptions(current) {
@@ -1522,6 +1518,27 @@ function restoreWorkflowOpenDetails(openKeys) {
 // selection, touch, or paging keys. Explicit user actions are unaffected.
 const UI_READING_PAUSE_MS = 60000;
 const uiReadingPause = { tasks: 0, workflow: 0 };
+// Scroll-jump fix helpers: a rebuild resets the scrollTop of every block it
+// recreates, so snapshot/restore the few real scrollers (report/result
+// <pre>, round history, prompt textareas). Keyed by element id when present,
+// else by position within this narrow NodeList — a document-wide index map
+// would break as soon as the render shape changes. The live agent screen
+// keeps its own bottom autoscroll and is excluded.
+const UI_SCROLL_SELECTOR = '.result-block pre:not(.agent-screen), .wf-history, textarea';
+function uiSnapScrolls(root) {
+  const snaps = new Map();
+  root.querySelectorAll(UI_SCROLL_SELECTOR).forEach((el, i) => {
+    if (el.scrollTop > 0) snaps.set(el.id || i, el.scrollTop);
+  });
+  return snaps;
+}
+function uiRestoreScrolls(root, snaps) {
+  if (!snaps || !snaps.size) return;
+  root.querySelectorAll(UI_SCROLL_SELECTOR).forEach((el, i) => {
+    const top = snaps.get(el.id || i);
+    if (top) el.scrollTop = top;
+  });
+}
 function uiNoteReading(node) {
   if (!node || node.nodeType !== 1) return;
   if (node.id === 'taskList' || node.closest('#taskList')) uiReadingPause.tasks = Date.now() + UI_READING_PAUSE_MS;
@@ -2219,7 +2236,7 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, 
   // a reading user back to the start of the text. Snapshot positions and
   // typed values first, put them back after the rebuild.
   const wfPane = document.getElementById('wfDetail');
-  const wfSnapScrolls = [...wfPane.querySelectorAll('*')].map(el => el.scrollTop);
+  const wfSnapScrolls = uiSnapScrolls(wfPane);
   const wfSnapValues = {};
   wfPane.querySelectorAll('textarea,input').forEach(el => { if (el.id) wfSnapValues[el.id] = el.value; });
   const wfModalScroller = wfPane.closest('.modal');
@@ -2273,15 +2290,10 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, 
     <details class="wf-technical" data-wf-detail="technical-log"><summary>Технический журнал · ${events.length} событий · state version ${wf.state_version}</summary>
       <div class="wf-history">${eventRows || '<div class="wf-meta">Событий пока нет.</div>'}</div>
     </details>`;
-  // Scroll-jump fix: restore what the user was reading/typing. Document order
-  // of the rebuilt DOM matches the snapshot for identical renders; if the
-  // structure changed, a stray scrollTop on a non-scrollable element is a
-  // harmless no-op. The agent screen keeps its own bottom autoscroll.
-  const wfNewEls = wfPane.querySelectorAll('*');
-  wfSnapScrolls.forEach((top, i) => {
-    const el = wfNewEls[i];
-    if (el && top > 0 && el.id !== 'wfAgentScreen') el.scrollTop = top;
-  });
+  // Scroll-jump fix: restore what the user was reading/typing. Keys are ids
+  // (or positions within the narrow scroller list), so a changed render shape
+  // cannot shift the mapping. The agent screen keeps its own bottom autoscroll.
+  uiRestoreScrolls(wfPane, wfSnapScrolls);
   wfPane.querySelectorAll('textarea,input').forEach(el => {
     if (el.id && wfSnapValues[el.id] !== undefined && el.value !== wfSnapValues[el.id]) {
       el.value = wfSnapValues[el.id];
