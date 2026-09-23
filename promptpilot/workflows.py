@@ -1060,6 +1060,7 @@ def human_input(workflow_id: str,
                     "SELECT * FROM workflow_stages WHERE id=?",
                     (workflow["current_stage_id"],),
                 ).fetchone()
+            revision_limit_reason = None
             if current_stage:
                 spec = db._json_load(current_stage["spec_json"])
                 configured_limit = (
@@ -1071,18 +1072,40 @@ def human_input(workflow_id: str,
                        WHERE stage_id=? AND status='revision_required'""",
                     (current_stage["id"],),
                 ).fetchone()[0]
-                if revision_count >= int(configured_limit):
-                    if state is WorkflowStatus.AWAITING_HUMAN:
-                        return db._row_to_workflow(workflow)
-                    workflow = _transition(
-                        conn, workflow, WorkflowStatus.AWAITING_HUMAN,
-                        "limit.stage_revisions",
-                        {"text": action.text, "stage_id": current_stage["id"],
-                         "stage_code": current_stage["code"],
-                         "max_revision_rounds": int(configured_limit)},
-                        round_id=round_row["id"],
-                    )
+                revision_limit_reason = {
+                    "text": action.text, "stage_id": current_stage["id"],
+                    "stage_code": current_stage["code"],
+                    "max_revision_rounds": int(configured_limit),
+                }
+            else:
+                # Planless workflows have no stage row, but config.stage can
+                # still carry a revision budget. It used to be ignored here,
+                # so the executor/auditor loop ran unbounded (issue #88:
+                # 14+ rounds with max_revision_rounds=6).
+                stage_cfg = (db._json_load(workflow["config_json"]).get("stage") or {})
+                configured_limit = (
+                    stage_cfg.get("max_revision_rounds")
+                    or _config_for(db._row_to_workflow(workflow)).planning.max_revisions_per_stage
+                )
+                revision_count = conn.execute(
+                    """SELECT COUNT(*) FROM workflow_rounds
+                       WHERE workflow_id=? AND status='revision_required'""",
+                    (workflow["id"],),
+                ).fetchone()[0]
+                revision_limit_reason = {
+                    "text": action.text,
+                    "max_revision_rounds": int(configured_limit),
+                }
+            if revision_count >= int(configured_limit):
+                if state is WorkflowStatus.AWAITING_HUMAN:
                     return db._row_to_workflow(workflow)
+                workflow = _transition(
+                    conn, workflow, WorkflowStatus.AWAITING_HUMAN,
+                    "limit.stage_revisions",
+                    revision_limit_reason,
+                    round_id=round_row["id"],
+                )
+                return db._row_to_workflow(workflow)
             if not _check_round_budget(conn, workflow, next_round):
                 if state is WorkflowStatus.AWAITING_HUMAN:
                     return db._row_to_workflow(workflow)
