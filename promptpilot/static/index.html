@@ -2778,7 +2778,7 @@ async function loadPipelineInsights(profile, refresh=false) {
     const duration = seconds => seconds == null ? '—' : seconds < 3600 ? `${Math.round(seconds/60)} мин` : `${(seconds/3600).toFixed(1)} ч`;
     const historyNote = h5.complete ? 'за последние 5 часов' : `история ${h5.coverage_hours} из 5 ч`;
     const runs = h5.runs;
-    const outcomes = data.outcomes || {safe_deferrals_now:0, stale_reselections_5h:0, real_errors_5h:0};
+    const outcomes = data.outcomes || {safe_deferrals_now:0, stale_reselections_5h:0, safe_refusals_5h:0, real_errors_5h:0};
     const activeUnable = runs.unresolved_unable ?? runs.unable;
     const activeFailed = runs.unresolved_failed ?? runs.failed;
     const recoveredRuns = (runs.recovered_unable || 0) + (runs.recovered_failed || 0);
@@ -2940,7 +2940,7 @@ async function loadPipelineInsights(profile, refresh=false) {
         <div class="pipeline-metric"><div class="pipeline-metric-label">Переходы / churn</div><div class="pipeline-metric-value">${h5.complete?`${h5.transitions} / ${h5.churn_items}`:'—'}</div><div class="pipeline-metric-note">между очередями / 3+ состояний</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Возраст p90 / max</div><div class="pipeline-metric-value">${age(data.age.p90_hours)} / ${age(data.age.oldest_hours)}</div><div class="pipeline-metric-note">текущие элементы</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Прогоны 5 ч</div><div class="pipeline-metric-value">${runs.runs}</div><div class="pipeline-metric-note">с действием ${runs.ready} · без действий ${runs.no_change || 0} · пусто ${runs.empty} · перевыбор ${runs.stale || 0}</div></div>
-        <div class="pipeline-metric"><div class="pipeline-metric-label">Безопасные ожидания / ошибки</div><div class="pipeline-metric-value">${outcomes.safe_deferrals_now + outcomes.stale_reselections_5h} / ${outcomes.real_errors_5h}</div><div class="pipeline-metric-note">ожидают сейчас ${outcomes.safe_deferrals_now} · stale-перевыборов 5 ч ${outcomes.stale_reselections_5h} · активных ошибок ${outcomes.real_errors_5h}</div></div>
+        <div class="pipeline-metric"><div class="pipeline-metric-label">Безопасные ожидания / ошибки</div><div class="pipeline-metric-value">${outcomes.safe_deferrals_now + outcomes.stale_reselections_5h + outcomes.safe_refusals_5h} / ${outcomes.real_errors_5h}</div><div class="pipeline-metric-note">ожидают сейчас ${outcomes.safe_deferrals_now} · stale-перевыборов 5 ч ${outcomes.stale_reselections_5h} · безопасных отказов 5 ч ${outcomes.safe_refusals_5h} · активных ошибок ${outcomes.real_errors_5h}</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Требуют внимания</div><div class="pipeline-metric-value">${runs.human + activeUnable + activeFailed}</div><div class="pipeline-metric-note">человек ${runs.human} · не смог ${activeUnable} · упало ${activeFailed}${recoveredRuns ? ` · восстановлено ${recoveredRuns}` : ''}</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Последнее REVIEW</div><div class="pipeline-metric-value">${esc(lastReviewValue)}</div><div class="pipeline-metric-note">${esc(lastReviewNote)}</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Токены 5 ч</div><div class="pipeline-metric-value">${esc(tokenValue)}</div><div class="pipeline-metric-note">измерено запусков: ${runs.tokens_known_runs || 0} из ${runs.runs}</div></div>

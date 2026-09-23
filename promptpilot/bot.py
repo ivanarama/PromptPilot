@@ -968,9 +968,10 @@ def _pipeline_text(data: dict) -> str:
                  f"{bottleneck['title']} (ETA {bottleneck.get('eta_hours', '—')} ч)"
                  if bottleneck else "нет"),
              "Безопасные ожидания / ошибки: "
-             f"{outcomes.get('safe_deferrals_now', 0) + outcomes.get('stale_reselections_5h', 0)} / "
+             f"{outcomes.get('safe_deferrals_now', 0) + outcomes.get('stale_reselections_5h', 0) + outcomes.get('safe_refusals_5h', 0)} / "
              f"{outcomes.get('real_errors_5h', 0)} "
-             f"(stale-перевыборов {outcomes.get('stale_reselections_5h', 0)}).",
+             f"(stale-перевыборов {outcomes.get('stale_reselections_5h', 0)}, "
+             f"безопасных отказов {outcomes.get('safe_refusals_5h', 0)}).",
              f"Цель оценки: текущая очередь примерно за {data['target_clear_hours']:g} ч.", ""]
     runtime = data.get("runtime", {})
     if runtime:
