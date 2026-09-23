@@ -572,14 +572,42 @@ def parse_stream_json(stdout: str) -> dict:
     return {"text": text, "meta": meta, "rate_limit_info": rate_limit_info}
 
 
+def detect_unrecognized_model(raw: str) -> str | None:
+    """Catch the claude-z bridge's silent model fallback (issue #81).
+
+    When the CLI does not recognize the requested model name it prints
+    ``[claude-code:unrecognized_model] {...}`` (usually on stderr), keeps
+    running on its baked-in default and never surfaces the substitution
+    anywhere else. Return the unrecognized name so the warning can be stored
+    with the task result; the Meta block's ``Model:`` shows the fallback model
+    actually used.
+    """
+    if not raw:
+        return None
+    m = re.search(r"\[claude-code:unrecognized_model\]\s*(.+)", raw)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(1)).get("model")
+    except (json.JSONDecodeError, TypeError):
+        return "unknown"
+
+
 def format_result(parsed: dict) -> str:
     """Format parsed result for storage — human-readable text + JSON meta."""
     parts = []
 
+    meta = parsed["meta"]
+    if meta.get("unrecognized_model"):
+        parts.append(
+            f"⚠️ Модель «{meta['unrecognized_model']}» не распознана провайдером — "
+            "CLI молча откатился на дефолт. Фактически задачу выполняла модель из Meta ниже."
+        )
+        parts.append("")
+
     if parsed["text"]:
         parts.append(parsed["text"])
 
-    meta = parsed["meta"]
     if meta:
         parts.append("")
         parts.append("--- Meta ---")
@@ -1905,6 +1933,13 @@ def _execute_task_body(task, admission_complete=None):
     session_id = None
     if is_stream_json(result.stdout):
         parsed = parse_stream_json(result.stdout)
+        unrecognized = (detect_unrecognized_model(result.stdout)
+                        or detect_unrecognized_model(result.stderr))
+        if unrecognized:
+            # Silent fallback would otherwise leave no trace in the stored
+            # result (issue #81): the marker line is non-JSON noise the user
+            # never sees, and Meta's Model is the fallback actually used.
+            parsed["meta"]["unrecognized_model"] = unrecognized
         output = format_result(parsed)
         verdict_source = parsed["text"]
         model_used = parsed["meta"].get("model")
