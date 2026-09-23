@@ -3946,6 +3946,7 @@ def _refresh_local_state(result: dict, profile: dict, series: list[dict], *,
     data["outcomes"] = {
         "safe_deferrals_now": safe_deferrals,
         "stale_reselections_5h": aggregate_runs.get("stale", 0),
+        "safe_refusals_5h": aggregate_runs.get("safe_refusal", 0),
         "real_errors_5h": (
             aggregate_runs.get("unresolved_unable", aggregate_runs.get("unable", 0))
             + aggregate_runs.get("unresolved_failed", aggregate_runs.get("failed", 0))

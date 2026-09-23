@@ -2068,6 +2068,24 @@ _PIPELINE_GENERIC_BLOCKER_REASONS = {
     "см. отчёт выше",
     "требуется решение",
 }
+
+# Issue #37: pipelinectl refuses before the first mutation when a
+# single-flight/allowlist race takes the item away (owner appeared, item left
+# the allowlist, base-sync lineage changed). That fence doing its job is a
+# safe retry — a run ending НЕ СМОГ with one of these reasons must not count
+# as an execution incident.
+_PIPELINE_SAFE_RACE_MARKERS = (
+    "single-flight owner appeared",
+    "single-flight/base-sync owner requires the full skill",
+    "base-sync lineage requires the full skill",
+    "integration/base-sync state requires the full skill",
+    "target left the allowlist",
+)
+
+
+def _is_safe_race_refusal(output: str) -> bool:
+    text = (output or "").lower()
+    return any(marker in text for marker in _PIPELINE_SAFE_RACE_MARKERS)
 _PIPELINE_REPEAT_BLOCKER_PAUSE_PREFIX = "pipeline_repeat_blocker_pause:v1:"
 
 
@@ -3000,7 +3018,7 @@ def pipeline_run_metrics(series_ids: list[int], since: datetime) -> dict:
     ids = sorted({int(value) for value in series_ids if value is not None})
     empty = {"runs": 0, "ready": 0, "empty": 0, "human": 0,
              "no_change": 0, "stale": 0, "unable": 0, "failed": 0,
-             "other": 0,
+             "other": 0, "safe_refusal": 0,
              "unresolved_unable": 0, "unresolved_failed": 0,
              "recovered_unable": 0, "recovered_failed": 0,
              "tokens_known_runs": 0, "input_tokens": 0,
@@ -3056,8 +3074,14 @@ def pipeline_run_metrics(series_ids: list[int], since: datetime) -> dict:
             result["stale"] += 1
             unresolved[int(row["series_id"])] = {"unable": 0, "failed": 0}
         elif verdict == "НЕ СМОГ":
-            result["unable"] += 1
-            unresolved[int(row["series_id"])]["unable"] += 1
+            if _is_safe_race_refusal(output):
+                # A pre-mutation owner/allowlist race: the fence worked and
+                # re-election follows — neutral, not an incident (issue #37).
+                result["safe_refusal"] += 1
+                unresolved[int(row["series_id"])] = {"unable": 0, "failed": 0}
+            else:
+                result["unable"] += 1
+                unresolved[int(row["series_id"])]["unable"] += 1
         else:
             result["other"] += 1
     result["unresolved_unable"] = sum(item["unable"] for item in unresolved.values())

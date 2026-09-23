@@ -3695,3 +3695,69 @@ def test_pipeline_metrics_separate_successful_noop_and_sum_known_tokens(isolated
     assert metrics["total_tokens"] == 150
     assert activity["summary"] == "ИТОГ: ГОТОВО"
     assert activity["input_tokens"] == 120
+
+
+def test_pipeline_run_metrics_classify_allowlist_race_refusal_as_safe(isolated_db):
+    # Issue #37: a pre-mutation single-flight/owner race is the fence working,
+    # not an execution incident — НЕ СМОГ with the race reason is neutral.
+    task = isolated_db.create_task(TaskCreate(
+        prompt="Project - REVIEW", recurrence="1h"))
+    isolated_db.set_verdict(task.id, "НЕ СМОГ")
+    isolated_db.mark_completed(
+        task.id,
+        "next merge: single-flight owner appeared; rerun next merge\n"
+        "ИТОГ: НЕ СМОГ — single-flight owner appeared; rerun next merge")
+
+    metrics = isolated_db.pipeline_run_metrics(
+        [task.series_id], datetime.now(timezone.utc) - timedelta(hours=1))
+
+    assert metrics["runs"] == 1
+    assert metrics["safe_refusal"] == 1
+    assert metrics["unable"] == 0
+    assert metrics["unresolved_unable"] == 0
+
+
+def test_pipeline_run_metrics_classify_superseded_review_refusal_as_safe(isolated_db):
+    # Issue #37, #1367 case: integration owner changed before the first
+    # mutation; the refusal names the base-sync owner fallback.
+    task = isolated_db.create_task(TaskCreate(
+        prompt="Project - REVIEW", recurrence="1h"))
+    isolated_db.set_verdict(task.id, "НЕ СМОГ")
+    isolated_db.mark_completed(
+        task.id,
+        "review target: integration/base-sync state requires the full skill")
+
+    metrics = isolated_db.pipeline_run_metrics(
+        [task.series_id], datetime.now(timezone.utc) - timedelta(hours=1))
+
+    assert metrics["safe_refusal"] == 1
+    assert metrics["unresolved_unable"] == 0
+
+
+def test_pipeline_run_metrics_keep_plain_unable_as_incident(isolated_db):
+    task = isolated_db.create_task(TaskCreate(
+        prompt="Project - REVIEW", recurrence="1h"))
+    isolated_db.set_verdict(task.id, "НЕ СМОГ")
+    isolated_db.mark_completed(task.id, "что-то реально сломалось")
+
+    metrics = isolated_db.pipeline_run_metrics(
+        [task.series_id], datetime.now(timezone.utc) - timedelta(hours=1))
+
+    assert metrics["safe_refusal"] == 0
+    assert metrics["unable"] == 1
+    assert metrics["unresolved_unable"] == 1
+
+
+def test_safe_race_refusals_do_not_turn_health_red():
+    # The window holds only safe race refusals: unresolved counters stay at
+    # zero, so the runs branch never reaches red (issue #37).
+    health = pipeline_insights._health(
+        10,
+        {"5h": {"complete": True,
+                "runs": {"unresolved_failed": 0, "unresolved_unable": 0,
+                         "safe_refusal": 3}}},
+        0,
+        runtime={"required": True, "paused": True, "state": "online",
+                 "stalled": []})
+
+    assert health["state"] != "red"
