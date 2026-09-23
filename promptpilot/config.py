@@ -247,8 +247,8 @@ BUILTIN_PROVIDERS = {
         "supports_effort": True,
         "env": {
             "ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic",
-            "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-4.7",
-            "ANTHROPIC_DEFAULT_OPUS_MODEL": "glm-4.7",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5.3",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": "glm-5.3",
         },
     },
     "codex": {
