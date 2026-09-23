@@ -142,8 +142,8 @@ def test_complete_update_branch_verifies_and_reports_new_head():
                       "number": OWNER["number"], "old_head": HEAD,
                       "new_head": NEW_HEAD,
                       "next": result["next"]}
-    method, path = gh.calls[1][0][:2], gh.calls[1][0][2]
-    assert (method, path) == (("api",), "repos/owner/repo/pulls/1232/update-branch")
+    assert gh.calls[1][0][:2] == ("api", "repos/owner/repo/pulls/1232/update-branch")
+    assert gh.calls[1][0][2:] == ("--method", "PUT", "--input", "-")
     assert gh.calls[1][1] == {"expected_head_sha": HEAD}
 
 
