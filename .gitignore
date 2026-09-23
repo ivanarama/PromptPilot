@@ -14,3 +14,4 @@ article_habr.md
 Screenshot*.png
 promptpilot/_build_commit.py
 scripts/inbox/.state.json
+scripts/inbox/outbox/
