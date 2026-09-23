@@ -193,6 +193,110 @@ def sender_allowed(sender: str, allow_from: str) -> bool:
     return any(address == item or address.endswith("@" + item) for item in entries)
 
 
+# --- Каталог проектов из файловой системы (PROJECTS_ROOT) -------------------
+
+DOC_NAMES = ("README.md", "README.txt", "readme.md", "PLAN.md", "план.md")
+PROJECT_MARKERS = (".git", "docs", "src", "bsl", "build", "epf")
+
+
+def looks_like_project(d: Path) -> bool:
+    try:
+        names = {entry.name for entry in d.iterdir()}
+    except OSError:
+        return False
+    if names & set(PROJECT_MARKERS):
+        return True
+    return any((d / doc).is_file() for doc in DOC_NAMES)
+
+
+def read_description(d: Path) -> str:
+    for doc in DOC_NAMES:
+        path = d / doc
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")[:300]
+        except OSError:
+            return ""
+        text = re.sub(r"\s+", " ", text).strip(" #-*")
+        if len(text) > 40:  # заголовок-пустышка не считаем описанием
+            return text[:160]
+    return ""
+
+
+def build_catalog(env: dict, state: dict, force: bool = False) -> list[dict]:
+    """Проекты = папки PROJECTS_ROOT (уровень 1 + уровень 2 у групп).
+
+    Описание — первые строки README/PLAN.md. Кэш в state на день,
+    пересобрать принудительно: --refresh.
+    """
+    today = date.today().isoformat()
+    cached = state.get("catalog_cache") or {}
+    if not force and cached.get("date") == today:
+        return cached.get("items", [])
+    root = Path(env.get("PROJECTS_ROOT", r"C:\Projects"))
+    items: list[dict] = []
+    if root.is_dir():
+        try:
+            level1 = sorted(d for d in root.iterdir()
+                            if d.is_dir() and not d.name.startswith((".", "_")))
+        except OSError:
+            level1 = []
+        for d1 in level1:
+            if looks_like_project(d1):
+                items.append({"name": d1.name, "path": str(d1),
+                              "desc": read_description(d1)})
+                continue
+            try:
+                level2 = sorted(c for c in d1.iterdir()
+                                if c.is_dir() and not c.name.startswith((".", "_")))
+            except OSError:
+                continue
+            for d2 in level2:
+                if looks_like_project(d2):
+                    items.append({"name": f"{d1.name}/{d2.name}",
+                                  "path": str(d2), "desc": read_description(d2)})
+    state["catalog_cache"] = {"date": today, "items": items}
+    return items
+
+
+def catalog_text(items: list[dict], limit: int = 7000) -> str:
+    """Имя [путь] — описание; с капом, чтобы раздуть промпт до отказа."""
+    lines = []
+    size = 0
+    for item in items:
+        line = f"- {item['name']} [{item['path']}]"
+        if item["desc"]:
+            line += f" — {item['desc']}"
+        size += len(line) + 1
+        if size > limit:
+            lines.append(f"- …и ещё {len(items) - len(lines)} проектов")
+            break
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def resolve_known_project(card: dict, items: list[dict],
+                          sender_map: dict) -> dict | None:
+    """Проект, указанный человеком: маркер в письме или правило отправителя."""
+    hay = f"{card['subject']}\n{card['body'][:1500]}".lower()
+    for match in re.finditer(r"(?:\[?\s*проект\s*:\s*([^#\]\n]+)|#проект:([\w/\\.-]+))",
+                             hay, re.I):
+        wanted = (match.group(1) or match.group(2)).strip().lower().rstrip(".")
+        for item in items:
+            if wanted and (item["name"].lower().endswith(wanted)
+                           or wanted in item["name"].lower()):
+                return item
+    address = (card["from"].split("<")[-1].strip(">") if "<" in card["from"]
+               else card["from"]).lower()
+    wanted = sender_map.get(address) or sender_map.get("*@" + address.split("@")[-1])
+    if wanted:
+        for item in items:
+            if item["name"].lower().endswith(str(wanted).lower()):
+                return item
+    return None
+
+
 def connect(env: dict) -> imaplib.IMAP4_SSL:
     imaplib.Commands["ID"] = ("AUTH", "SELECTED", "NONAUTH")
     client = imaplib.IMAP4_SSL(env["IMAP_HOST"], int(env.get("IMAP_PORT", "993")))
@@ -232,9 +336,7 @@ def fetch_full(client: imaplib.IMAP4_SSL, card: dict) -> dict:
     return card
 
 
-def triage_prompt(card: dict, catalog: dict) -> str:
-    projects = "\n".join(
-        f"- {name}: {desc}" for name, desc in catalog.get("projects", {}).items())
+def triage_prompt(card: dict, catalog: str, known: dict | None = None) -> str:
     body = card["body"]
     if len(body) > 6000:
         body = body[:6000] + "\n…(обрезано)"
@@ -243,20 +345,55 @@ def triage_prompt(card: dict, catalog: dict) -> str:
         listed = "\n".join(f"- {path}" for path in card["attachments"])
         attachments = ("\nВложения (сохранены на диск, при необходимости открой "
                        "и посмотри):\n" + listed + "\n")
+    if known:
+        project_block = (
+            f"Проект УКАЗАН ЧЕЛОВЕКОМ: {known['name']}\n"
+            f"Корень проекта: {known['path']}\n"
+            f"Описание проекта: {known['desc'] or '(нет)'}\n\n"
+            "Проект уже выбран — НЕ выбирай его сам. Составь ТЗ, опираясь на "
+            "контекст проекта; в ТЗ обязательно укажи «Рабочая папка: "
+            f"{known['path']}».\nЕсли из текста обращения очевидно, что оно "
+            "вообще не про этот проект, — так и напиши отдельной строкой "
+            "«ПРОЕКТ НЕПОДОХОДИТ» перед ТЗ.\n"
+        )
+        header = (
+            "Ты — ассистент диспетчерской. Для обращения подготовь "
+            "техническое задание.\n\n" + project_block + "\n"
+            f"Обращение (канал: email)\nОт: {card['from']}\n"
+            f"Тема: {card['subject']}\nДата: {card['date']}\nТекст:\n{body}\n"
+            f"{attachments}\n"
+            "Ответь строго в этом формате:\n"
+            f"ПРОЕКТ: {known['name']}\n"
+            "УВЕРЕННОСТЬ: <0.0..1.0>\n"
+            "ТИП: <баг|задача|вопрос|фича>\n"
+            "ПРИОРИТЕТ: <1..10, где 1 — срочнее>\n"
+            "РАБОЧАЯ ПАПКА: <корень проекта>\n"
+            "ТЕХНИЧЕСКОЕ ЗАДАНИЕ:\n"
+            "Контекст: <1-3 предложения>\n"
+            "Что нужно: <по пунктам, с опорой на структуру проекта>\n"
+            "Критерий готовности: <как проверить, что сделано>\n"
+            "Открытые вопросы: <что неясно, или «нет»>\n\n"
+            "Последней строкой напиши вердикт:\n"
+            "ИТОГ: ГОТОВО — триаж завершён"
+        )
+        return header
+
     return (
-        "Ты — triage-ассистент диспетчерской. Определи по обращению проект и "
-        "подготовь техническое задание.\n\n"
-        "Каталог проектов:\n" + (projects or "(каталог пуст)") + "\n\n"
+        "Ты — triage-ассистент диспетчерской. Определи по обращению проект "
+        "(это реальная папка на диске) и подготовь техническое задание.\n\n"
+        "Каталог проектов (имя [путь] — описание):\n" + catalog + "\n\n"
         f"Обращение (канал: email)\nОт: {card['from']}\n"
         f"Тема: {card['subject']}\nДата: {card['date']}\nТекст:\n{body}\n"
         f"{attachments}\n"
         "Правило: служебные уведомления и рассылки (не требуют человека) — "
-        "ПРОЕКТ: НЕТ, ТИП: вопрос, ПРИОРИТЕТ: 10, без ТЗ.\n\n"
+        "ПРОЕКТ: НЕТ, ТИП: вопрос, ПРИОРИТЕТ: 10, без ТЗ.\n"
+        "Если ни один проект не подходит — ПРОЕКТ: НЕТ.\n\n"
         "Ответь строго в этом формате:\n"
         "ПРОЕКТ: <имя из каталога, либо НЕТ>\n"
         "УВЕРЕННОСТЬ: <0.0..1.0>\n"
         "ТИП: <баг|задача|вопрос|фича>\n"
         "ПРИОРИТЕТ: <1..10, где 1 — срочнее>\n"
+        "РАБОЧАЯ ПАПКА: <путь проекта из каталога, если ПРОЕКТ не НЕТ>\n"
         "ТЕХНИЧЕСКОЕ ЗАДАНИЕ:\n"
         "Контекст: <1-3 предложения>\n"
         "Что нужно: <по пунктам>\n"
@@ -319,13 +456,16 @@ def note_created(state: dict) -> None:
     state["created"] = {today: state["created"].get(today, 0) + 1}
 
 
-def run_once(env: dict, dry: bool) -> None:
-    catalog = json.loads((ROOT / env.get("CATALOG", "projects.json"))
-                         .read_text(encoding="utf-8"))
+def run_once(env: dict, dry: bool, refresh: bool = False) -> None:
+    config = json.loads((ROOT / env.get("CATALOG", "projects.json"))
+                        .read_text(encoding="utf-8"))
+    sender_map = config.get("sender_map", {})
     state = load_state()
     daily_cap = int(env.get("MAX_PER_DAY", "20"))
     if not dry:
         flush_saves(env, state)
+    items = build_catalog(env, state, force=refresh)
+    catalog = catalog_text(items)
     client = connect(env)
     try:
         for card in fetch_new_cards(client, state):
@@ -346,7 +486,10 @@ def run_once(env: dict, dry: bool) -> None:
             print(f"Новое обращение: {full['from']} — {full['subject']}")
             if full["attachments"]:
                 print(f"  вложений: {len(full['attachments'])}")
-            prompt = triage_prompt(full, catalog)
+            known = resolve_known_project(full, items, sender_map)
+            if known:
+                print(f"  проект указан человеком: {known['name']}")
+            prompt = triage_prompt(full, catalog, known)
             if dry:
                 print("DRY: задача не создаётся, промпт:\n" + prompt[:1500])
                 continue
@@ -373,6 +516,8 @@ def main() -> int:
     parser.add_argument("--dry", action="store_true", help="не создавать задачи")
     parser.add_argument("--once", action="store_true", help="один проход")
     parser.add_argument("--interval", type=int, default=60)
+    parser.add_argument("--refresh", action="store_true",
+                        help="пересобрать каталог проектов с диска")
     args = parser.parse_args()
 
     env = load_env(ROOT / ".env")
@@ -383,7 +528,7 @@ def main() -> int:
         return 2
     while True:
         try:
-            run_once(env, dry=args.dry)
+            run_once(env, dry=args.dry, refresh=args.refresh)
         except Exception as exc:
             print(f"!! проход не удался: {type(exc).__name__}: {exc}", flush=True)
         if args.once:
