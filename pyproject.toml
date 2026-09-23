@@ -1,6 +1,6 @@
 [project]
 name = "promptpilot"
-version = "0.5.0"
+version = "0.5.1"
 description = "Background task queue for AI CLIs — queue, schedule, and retry prompts for Claude Code, Codex, Qwen and others"
 requires-python = ">=3.10"
 license = { text = "MIT" }
