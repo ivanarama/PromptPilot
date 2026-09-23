@@ -1080,6 +1080,10 @@ async function loadTasks() {
     return;
   }
 
+  // Scroll-jump fix: the 5s background refresh rebuilds the whole task list.
+  // Snapshot scroll positions (prompt/result blocks of the expanded card) so
+  // a reader is not yanked back to the top after the rebuild.
+  const taskScrolls = uiSnapScrolls(list);
   list.innerHTML = tasks.map(t => {
     const expanded = t.id === expandedId;
     const time = timeAgo(t.created_at);
@@ -1201,6 +1205,9 @@ async function loadTasks() {
   // экран агента дорисован из кэша — держим прокрутку у свежих строк
   const sc = document.getElementById('screen-' + expandedId);
   if (sc && screenCache[expandedId]) sc.scrollTop = sc.scrollHeight;
+  // Scroll-jump fix: put the reader back where they were. The live agent
+  // screen keeps its own bottom autoscroll and is skipped here.
+  uiRestoreScrolls(list, taskScrolls);
 }
 
 function providerOptions(current) {
@@ -1502,9 +1509,55 @@ function restoreWorkflowOpenDetails(openKeys) {
   });
 }
 
+// Reading-pause (scroll-jump fix): a background auto-refresh that rebuilds
+// DOM from scratch destroys scroll positions and mouse text selections while
+// the user is reading a long prompt or report. Any real interaction with the
+// task list or the workflow card pauses the auto-refresh for a minute:
+// scrolling (wheel, inner blocks, OR dragging a scrollbar — 'scroll' does not
+// bubble, so capture on document catches every case), starting a mouse
+// selection, touch, or paging keys. Explicit user actions are unaffected.
+const UI_READING_PAUSE_MS = 60000;
+const uiReadingPause = { tasks: 0, workflow: 0 };
+// Scroll-jump fix helpers: a rebuild resets the scrollTop of every block it
+// recreates, so snapshot/restore the few real scrollers (report/result
+// <pre>, round history, prompt textareas). Keyed by element id when present,
+// else by position within this narrow NodeList — a document-wide index map
+// would break as soon as the render shape changes. The live agent screen
+// keeps its own bottom autoscroll and is excluded.
+const UI_SCROLL_SELECTOR = '.result-block pre:not(.agent-screen), .wf-history, textarea';
+function uiSnapScrolls(root) {
+  const snaps = new Map();
+  root.querySelectorAll(UI_SCROLL_SELECTOR).forEach((el, i) => {
+    if (el.scrollTop > 0) snaps.set(el.id || i, el.scrollTop);
+  });
+  return snaps;
+}
+function uiRestoreScrolls(root, snaps) {
+  if (!snaps || !snaps.size) return;
+  root.querySelectorAll(UI_SCROLL_SELECTOR).forEach((el, i) => {
+    const top = snaps.get(el.id || i);
+    if (top) el.scrollTop = top;
+  });
+}
+function uiNoteReading(node) {
+  if (!node || node.nodeType !== 1) return;
+  if (node.id === 'taskList' || node.closest('#taskList')) uiReadingPause.tasks = Date.now() + UI_READING_PAUSE_MS;
+  const modal = document.getElementById('workflowModal');
+  if (modal?.classList.contains('open') && (node === modal || modal.contains(node))) {
+    uiReadingPause.workflow = Date.now() + UI_READING_PAUSE_MS;
+  }
+}
+['scroll', 'mousedown', 'touchmove'].forEach(evt => document.addEventListener(evt,
+  e => uiNoteReading(e.target), { passive: true, capture: true }));
+document.addEventListener('keydown', e => {
+  if (!['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '].includes(e.key)) return;
+  uiNoteReading(document.activeElement);
+});
+
 async function autoRefreshWorkflowState() {
   const modal = document.getElementById('workflowModal');
   if (!modal?.classList.contains('open') || !selectedWorkflowId || workflowAutoRefreshBusy) return;
+  if (Date.now() < uiReadingPause.workflow) return;
   const active = document.activeElement;
   // Never erase a prompt/decision while the user is typing or selecting it.
   if (active && document.getElementById('wfDetail')?.contains(active)
@@ -2176,7 +2229,19 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, 
     .concat(runs.map(r => `<div class="wf-round${r === activeRun ? ' current' : ''}"><b>${esc(r.role)} · попытка ${r.attempt_no}</b> · ${esc(r.status)}${r.task_id ? ` · task #${r.task_id}` : ''}</div>`)).join('');
   const eventRows = [...events].reverse().slice(0, 30).map(e => `<div class="wf-event"><code>${esc(e.event_type)}</code> · ${formatTime(e.created_at)}</div>`).join('');
   const historyRows = pastRounds.map(r => workflowRoundRow(r)).join('');
-  document.getElementById('wfDetail').innerHTML = `
+  // Scroll-jump fix: the 5s auto-refresh rebuilds this pane from scratch.
+  // While innerHTML is being replaced the pane momentarily collapses, so the
+  // modal scroller clamps to the top, and every rebuilt scrollable block
+  // (report <pre>, prompt textarea, history) restarts at scrollTop=0 — yanking
+  // a reading user back to the start of the text. Snapshot positions and
+  // typed values first, put them back after the rebuild.
+  const wfPane = document.getElementById('wfDetail');
+  const wfSnapScrolls = uiSnapScrolls(wfPane);
+  const wfSnapValues = {};
+  wfPane.querySelectorAll('textarea,input').forEach(el => { if (el.id) wfSnapValues[el.id] = el.value; });
+  const wfModalScroller = wfPane.closest('.modal');
+  const wfSnapModalTop = wfModalScroller ? wfModalScroller.scrollTop : 0;
+  wfPane.innerHTML = `
     <div class="wf-title">${esc(wf.slug)} <span class="task-status" data-s="${escAttr(wf.status)}">${esc(statusInfo[0])}</span>
       ${wf.config?.automation?.enabled ? '<span class="task-status" data-s="running">АВТО</span>' : '<span class="wf-meta">ручной режим</span>'}</div>
     <div class="wf-stage" style="border-color:${ownerInfo.color}">
@@ -2225,6 +2290,16 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, 
     <details class="wf-technical" data-wf-detail="technical-log"><summary>Технический журнал · ${events.length} событий · state version ${wf.state_version}</summary>
       <div class="wf-history">${eventRows || '<div class="wf-meta">Событий пока нет.</div>'}</div>
     </details>`;
+  // Scroll-jump fix: restore what the user was reading/typing. Keys are ids
+  // (or positions within the narrow scroller list), so a changed render shape
+  // cannot shift the mapping. The agent screen keeps its own bottom autoscroll.
+  uiRestoreScrolls(wfPane, wfSnapScrolls);
+  wfPane.querySelectorAll('textarea,input').forEach(el => {
+    if (el.id && wfSnapValues[el.id] !== undefined && el.value !== wfSnapValues[el.id]) {
+      el.value = wfSnapValues[el.id];
+    }
+  });
+  if (wfModalScroller) wfModalScroller.scrollTop = wfSnapModalTop;
   if (['queued','reviewing'].includes(wf.status)) setTimeout(wfProviderChanged, 0);
   if (wf.status === 'awaiting_plan_approval') setTimeout(wfReindexStageCards, 0);
   if (activeWorkflowTaskId) setTimeout(() => wfRefreshScreen(activeWorkflowTaskId), 0);
@@ -3230,14 +3305,18 @@ async function refresh() {
   if (refreshInFlight) return;
   refreshInFlight = true;
   try {
-    const requests = [loadStats()];
-    // Keep the list live even with a card expanded (a running task used to
-    // freeze once opened), but don't re-render under an unsaved inline edit.
-    const ae = document.activeElement;
-    if (!(ae && ae.id && (ae.id.startsWith('note-') || ae.id.startsWith('ed-')))) {
-      requests.push(loadTasks());
+    // Don't re-render out from under a user who is reading a long
+    // prompt/report (scroll-jump fix).
+    if (Date.now() >= uiReadingPause.tasks) {
+      const requests = [loadStats()];
+      // Keep the list live even with a card expanded (a running task used to
+      // freeze once opened), but don't re-render under an unsaved inline edit.
+      const ae = document.activeElement;
+      if (!(ae && ae.id && (ae.id.startsWith('note-') || ae.id.startsWith('ed-')))) {
+        requests.push(loadTasks());
+      }
+      await Promise.allSettled(requests);
     }
-    await Promise.allSettled(requests);
   } finally {
     refreshInFlight = false;
   }
