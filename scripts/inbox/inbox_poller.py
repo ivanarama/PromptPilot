@@ -42,6 +42,62 @@ NO_REPLY_RE = re.compile(
 BULK_HINT_HEADERS = ("List-Unsubscribe", "List-Id", "X-Mailinglist")
 
 
+def outbox_dir(env: dict) -> Path:
+    return Path(env.get("OUTBOX_DIR", str(ROOT / "outbox")))
+
+
+def safe_filename(text: str, limit: int = 60) -> str:
+    cleaned = re.sub(r"[<>:\"/\\|?*\n\r\t]", " ", text)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
+    return cleaned[:limit].rstrip(" .")
+
+
+def save_spec(env: dict, item: dict, task: dict) -> Path:
+    """Готовое ТЗ обращения — в markdown-файл бэклога (outbox)."""
+    status = task.get("status")
+    stamp = (task.get("created_at") or "")[:10]
+    name = f"{stamp} #{task['id']} — {safe_filename(item['subject'])}.md"
+    path = outbox_dir(env) / name
+    meta = (
+        f"# {item['subject']}\n\n"
+        f"- Задача PromptPilot: #{task['id']}\n"
+        f"- От: {item['from']}\n"
+        f"- Дата обращения: {item['date'] or task.get('created_at', '')}\n"
+        f"- Статус триажа: {status} · вердикт: {task.get('verdict') or '—'}\n\n"
+        "---\n\n"
+    )
+    body = (task.get("result") or "").strip()
+    if status != "completed":
+        body = f"Триаж не завершился (статус {status}):\n\n{task.get('error') or body}"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(meta + body + "\n", encoding="utf-8")
+    return path
+
+
+def flush_saves(env: dict, state: dict) -> None:
+    """Сохранить ТЗ задач, завершившихся с прошлого прохода."""
+    still_pending = []
+    for item in state.get("pending_saves", []):
+        try:
+            request = urllib.request.Request(
+                f"{env['PP_API'].rstrip('/')}/api/tasks/{item['task_id']}")
+            token = env.get("PP_API_TOKEN", "")
+            if token:
+                request.add_header("Authorization", f"Bearer {token}")
+            with urllib.request.urlopen(request, timeout=15) as response:
+                task = json.loads(response.read().decode("utf-8"))
+        except Exception as exc:
+            print(f"!! не удалось прочитать задачу #{item['task_id']}: {exc}")
+            still_pending.append(item)
+            continue
+        if task["status"] in ("pending", "running", "retry", "scheduled"):
+            still_pending.append(item)
+            continue
+        path = save_spec(env, item, task)
+        print(f"  -> ТЗ сохранено: {path.name}")
+    state["pending_saves"] = still_pending
+
+
 def load_env(path: Path) -> dict:
     env = {}
     for line in path.read_text(encoding="utf-8").splitlines():
@@ -238,11 +294,12 @@ def create_task(env: dict, prompt: str) -> int:
 
 
 def load_state() -> dict:
-    state = {"processed": [], "created": {}}
+    state = {"processed": [], "created": {}, "pending_saves": []}
     if STATE_FILE.exists():
         state.update(json.loads(STATE_FILE.read_text(encoding="utf-8")))
     state.setdefault("processed", [])
     state.setdefault("created", {})
+    state.setdefault("pending_saves", [])
     return state
 
 
@@ -267,6 +324,8 @@ def run_once(env: dict, dry: bool) -> None:
                          .read_text(encoding="utf-8"))
     state = load_state()
     daily_cap = int(env.get("MAX_PER_DAY", "20"))
+    if not dry:
+        flush_saves(env, state)
     client = connect(env)
     try:
         for card in fetch_new_cards(client, state):
@@ -295,6 +354,12 @@ def run_once(env: dict, dry: bool) -> None:
             print(f"  -> Задача триажа #{task_id} создана")
             state["processed"].append(full["message_id"])
             note_created(state)
+            state["pending_saves"].append({
+                "task_id": task_id,
+                "from": full["from"],
+                "subject": full["subject"],
+                "date": full["date"],
+            })
     finally:
         save_state(state)
         try:
