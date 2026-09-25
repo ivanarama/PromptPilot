@@ -1068,6 +1068,69 @@ def api_providers():
     }
 
 
+# ── TypeSafe Jev (решатель самопочинки) ──────────────────────────────
+# Вотчер (verdict-repair-watcher.py) берёт ключ из env TYPESAFE_API_KEY,
+# иначе из файла Desktop\TypeSafe.txt — читает при каждом вызове, поэтому
+# ключ, сохранённый через UI, подхватывается без перезапуска.
+
+def _typesafe_key_file() -> Path:
+    return Path.home() / "Desktop" / "TypeSafe.txt"
+
+
+def _typesafe_key_source() -> dict:
+    env = os.environ.get("TYPESAFE_API_KEY", "").strip()
+    file_path = _typesafe_key_file()
+    file_set = file_path.is_file() and bool(
+        file_path.read_text(encoding="utf-8", errors="replace").strip())
+    return {"env_set": bool(env), "file_set": file_set,
+            "file_path": str(file_path),
+            "active": "env" if env else ("file" if file_set else "none")}
+
+
+@app.get("/api/typesafe")
+def api_typesafe_status():
+    return _typesafe_key_source()
+
+
+@app.post("/api/typesafe")
+def api_typesafe_save(body: dict):
+    key = (body.get("key") or "").strip()
+    if not key:
+        raise HTTPException(400, "пустой ключ")
+    _typesafe_key_file().write_text(key + "\n", encoding="utf-8")
+    return _typesafe_key_source()
+
+
+@app.post("/api/typesafe/test")
+def api_typesafe_test():
+    key = os.environ.get("TYPESAFE_API_KEY", "").strip()
+    source = "env"
+    if not key:
+        source = "file"
+        file_path = _typesafe_key_file()
+        if file_path.is_file():
+            key = file_path.read_text(encoding="utf-8", errors="replace").strip()
+    if not key:
+        raise HTTPException(400, "ключ не задан — введите его и сохраните")
+    import json as _json
+    import urllib.error
+    import urllib.request
+    payload = _json.dumps({
+        "state": "Проверка связи из настроек PromptPilot.",
+        "model": "jev-latest",
+        "questions": {"probe": {"type": "noul", "instructions": "Связь установлена?"}},
+    }, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.typesafe.ai/v1/systemone", data=payload, method="POST",
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=45) as r:
+            reply = _json.loads(r.read().decode("utf-8"))
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as exc:
+        raise HTTPException(502, f"TypeSafe недоступен: {exc}")
+    return {"ok": True, "source": source, "reply": reply}
+
+
 @app.get("/api/herdr/agents")
 def api_herdr_agents(machine: str = ""):
     """Live herdr agents for the session-target picker (locally or on a machine)."""

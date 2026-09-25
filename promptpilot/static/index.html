@@ -784,6 +784,7 @@
       <button class="set-tab active" data-tab="appearance" onclick="setTab('appearance')">🎨 Оформление</button>
       <button class="set-tab" data-tab="review" onclick="setTab('review')">🛡 Проверка кода</button>
       <button class="set-tab" data-tab="helpers" onclick="setTab('helpers')">🤖 Помощники</button>
+      <button class="set-tab" data-tab="auto" onclick="setTab('auto')">🩺 Автопилот</button>
     </div>
 
     <div class="set-pane" id="set-appearance">
@@ -807,6 +808,8 @@
       <p class="cz-hint" style="margin-bottom:10px">Помощники — это разные модели ИИ. Настраиваются один раз (команды запуска и ключи — для опытных), назначаются на работу во вкладке «Проверка кода».</p>
       <div id="set-helpers-list"></div>
     </div>
+
+    <div class="set-pane" id="set-auto" style="display:none"></div>
   </div>
 </div>
 
@@ -1000,6 +1003,7 @@
       <label><input type="radio" name="pfType" value="cmd" checked onchange="pfTypeChange()"> Команда (шаблон с {prompt})</label>
       <label><input type="radio" name="pfType" value="herdr" onchange="pfTypeChange()"> herdr-сессия (живая, blocked ждёт человека)</label>
       <input id="pfCmd" placeholder='например: myai run {prompt}'>
+      <div class="cz-hint">Вместо {prompt} подставится текст задачи. API-ключи провайдера — в поле «Ключи и переменные окружения» ниже.</div>
       <div id="pfHerdr" style="display:none; flex-direction:column; gap:8px">
         <input id="pfKind" placeholder="агент: claude, codex, gemini, cursor, opencode, grok...">
         <input id="pfArgs" placeholder='доп. аргументы CLI агента, например: --model opus'>
@@ -1016,7 +1020,9 @@
           <option value="max">max</option>
         </select>
       </label>
-      <textarea id="pfEnv" rows="2" placeholder="переменные окружения, по одной на строку: KEY=VALUE"></textarea>
+      <b style="font-size:13px">🔑 Ключи и переменные окружения</b>
+      <div class="cz-hint">API-ключи провайдера — по одной на строку в виде KEY=значение, например OPENAI_API_KEY=sk-… Секреты показываются маской *** — оставляйте их как есть или впишите новое значение.</div>
+      <textarea id="pfEnv" rows="3" placeholder="например:&#10;OPENAI_API_KEY=sk-...&#10;GOOSE_MODEL=glm-5.3-flash"></textarea>
       <button class="btn btn-primary" type="submit" style="align-self:flex-start">Сохранить</button>
       <div id="pfError" style="color:var(--red); font-size:13px"></div>
     </form>
@@ -1194,6 +1200,7 @@ function setTab(name) {
   document.querySelectorAll('.set-pane').forEach(p => p.style.display = p.id === 'set-' + name ? '' : 'none');
   if (name === 'helpers') renderHelpersTab();
   if (name === 'review') renderReviewTab();
+  if (name === 'auto') renderAutoTab();
 }
 
 // ── Тема ──
@@ -1519,6 +1526,54 @@ function renderHelpersTab() {
     </div>`;
   }).join('');
   if (!entries.length) list.innerHTML = '<div class="cz-hint">Помощников нет — добавьте в ⚙ Providers.</div>';
+}
+
+// ── Вкладка «Автопилот»: Jev (TypeSafe) — решатель самопочинки ──
+async function renderAutoTab() {
+  const pane = document.getElementById('set-auto');
+  let st = {};
+  try { st = await fetchJSON(`${API}/typesafe`); }
+  catch (e) {
+    pane.innerHTML = `<div class="cz-hint">Служба самопочинки недоступна (${esc(e.message)}). Обновите страницу после перезапуска сервера.</div>`;
+    return;
+  }
+  const statusLine = st.active === 'env'
+    ? '✅ Ключ найден в переменной окружения TYPESAFE_API_KEY — она приоритетнее файла.'
+    : st.active === 'file'
+      ? `✅ Ключ найден в файле <code>${esc(st.file_path)}</code>.`
+      : '❌ Ключ не задан — авто-решения Jev работать не будут (будет только уведомление вам).';
+  pane.innerHTML = `
+    <div class="cz-row"><b>🧠 Jev (TypeSafe) — решает «продолжить самому или позвать вас»</b></div>
+    <div class="cz-hint" style="margin:6px 0 10px">Когда исполнитель теряет итоговую строку отчёта или зависает, вотчер самопочинки показывает отчёт решателю Jev. Однозначное «работа сделана» — конвейер продолжается сам; сомнение — остановка и уведомление вам. Jev — не языковая модель и код не пишет.</div>
+    <div class="cz-row"><span id="ts-status">${statusLine}</span></div>
+    <div class="cz-row" style="margin-top:10px">
+      <input type="password" id="ts-key" placeholder="вставьте ключ TypeSafe" style="flex:1;min-width:220px">
+      <button class="btn btn-sm btn-primary" onclick="tsSaveKey()">Сохранить ключ</button>
+      <button class="btn btn-sm btn-ghost" onclick="tsTest()">Проверить связь</button>
+    </div>
+    <div class="cz-hint" id="ts-msg" style="margin-top:6px">Ключ хранится только на этом компьютере и начинает действовать сразу, без перезапуска. ${st.env_set ? 'Внимание: сейчас активен ключ из переменной окружения — файл будет запасным.' : ''}</div>`;
+}
+async function tsSaveKey() {
+  const msg = document.getElementById('ts-msg');
+  const key = document.getElementById('ts-key').value.trim();
+  if (!key) { msg.textContent = 'Сначала вставьте ключ в поле.'; return; }
+  try {
+    await fetchJSON(`${API}/typesafe`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key }),
+    });
+    document.getElementById('ts-key').value = '';
+    msg.textContent = '✅ Ключ сохранён и уже действует.';
+    renderAutoTab();
+  } catch (e) { msg.textContent = '❌ ' + e.message; }
+}
+async function tsTest() {
+  const msg = document.getElementById('ts-msg');
+  msg.textContent = '⏳ Опрашиваю Jev…';
+  try {
+    await fetchJSON(`${API}/typesafe/test`, { method: 'POST' });
+    msg.textContent = '✅ Связь есть — Jev ответил.';
+  } catch (e) { msg.textContent = '❌ ' + e.message; }
 }
 
 // ── Каскад ревью: визуальный редактор цепочки (config.review_chain) ──
