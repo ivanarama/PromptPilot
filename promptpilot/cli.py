@@ -58,6 +58,7 @@ import click
 
 from . import db
 from .models import TaskCreate, TaskStatus
+from .version import full_version
 from .worktree import branch_for as wt_branch
 
 
@@ -90,6 +91,8 @@ def _status_color(status: str) -> str:
 
 
 @click.group(invoke_without_command=True)
+@click.version_option(version=full_version(), prog_name="pp",
+                      message="%(prog)s %(version)s")
 @click.pass_context
 def cli(ctx):
     """PromptPilot — AI Prompt Scheduler"""

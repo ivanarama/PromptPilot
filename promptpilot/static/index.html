@@ -771,6 +771,7 @@
     <button class="btn-pause" onclick="openSchedule()" style="margin-left:8px">🗓 Расписание</button>
     <button class="btn-pause" onclick="openWorkflows()" style="margin-left:8px">Workflows</button>
     <button class="btn-pause" onclick="openProviders()" style="margin-left:8px">⚙ Providers</button>
+    <button class="btn-pause" onclick="openEpf()" style="margin-left:8px" title="Доработка внешних обработок 1С">🔧 1С</button>
   </div>
 
   <div class="task-list" id="taskList"></div>
@@ -806,6 +807,46 @@
       <p class="cz-hint" style="margin-bottom:10px">Помощники — это разные модели ИИ. Настраиваются один раз (команды запуска и ключи — для опытных), назначаются на работу во вкладке «Проверка кода».</p>
       <div id="set-helpers-list"></div>
     </div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="epfModal" onclick="if(event.target===this)closeEpf()">
+  <div class="modal" style="max-width:720px">
+    <h2>🔧 1С: доработка обработок <button class="btn btn-sm btn-ghost" style="margin-left:auto" onclick="closeEpf()">✕ Закрыть</button></h2>
+    <div id="epfStatus" style="font-size:13px;color:var(--text2);margin-bottom:10px"></div>
+
+    <div style="border-top:1px solid var(--border); padding-top:12px">
+      <b style="font-size:14px">Новая доработка</b>
+      <form onsubmit="return epfRework(event)" style="display:flex;flex-direction:column;gap:8px;margin-top:8px">
+        <input type="file" id="epfFile" accept=".epf,.erf" required style="font-size:13px;color:inherit">
+        <textarea id="epfPrompt" placeholder="Что сделать с обработкой?" required style="min-height:80px;resize:vertical;background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:inherit;padding:8px;font-size:13px;font-family:inherit"></textarea>
+        <label style="font-size:13px;color:var(--text2)">База 1С
+          <select id="epfBase" style="width:100%;background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:inherit;padding:7px 10px;font-size:13px"></select>
+        </label>
+        <button class="btn btn-primary" type="submit" id="epfReworkBtn">Декомпилировать и поставить в очередь</button>
+        <div id="epfReworkMsg" style="font-size:13px"></div>
+      </form>
+    </div>
+
+    <details style="margin-top:14px">
+      <summary style="cursor:pointer;font-size:14px">⚙ Настройки 1С</summary>
+      <div id="epfEnvHint" style="font-size:12px;color:var(--yellow);margin:6px 0"></div>
+      <form onsubmit="return epfSaveSettings(event)" style="display:flex;flex-direction:column;gap:8px;margin-top:6px">
+        <input id="epfExe" placeholder="Путь к 1cv8.exe (пусто — авто: реестр/Program Files)" style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:inherit;padding:7px 10px;font-size:13px">
+        <input id="epfBasesRoot" placeholder="Каталог баз для сканирования" style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:inherit;padding:7px 10px;font-size:13px">
+        <input id="epfBasePath" placeholder="База декомпиляции по умолчанию" style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:inherit;padding:7px 10px;font-size:13px">
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+          <input id="epfUt11" placeholder="База УТ 11" style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:inherit;padding:7px 10px;font-size:13px">
+          <input id="epfBp3" placeholder="База БП 3.0" style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:inherit;padding:7px 10px;font-size:13px">
+          <input id="epfErp" placeholder="База ERP" style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:inherit;padding:7px 10px;font-size:13px">
+          <input id="epfUnf" placeholder="База УНФ" style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:inherit;padding:7px 10px;font-size:13px">
+          <input id="epfAa" placeholder="База Альфа-Авто" style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:inherit;padding:7px 10px;font-size:13px">
+          <input id="epfSkills" placeholder="Каталог cc-1c-skills (опционально)" style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:inherit;padding:7px 10px;font-size:13px">
+        </div>
+        <button class="btn btn-primary" type="submit">Сохранить настройки</button>
+        <div id="epfSetMsg" style="font-size:13px"></div>
+      </form>
+    </details>
   </div>
 </div>
 
@@ -1083,10 +1124,22 @@ function renderResultMeta(parsed) {
 }
 
 // --- Schedule display ---
+function githubApiWait(t, now = new Date()) {
+  if (t.status !== 'pending' || !t.scheduled_at || new Date(t.scheduled_at) <= now) return null;
+  const reason = String(t.error || '');
+  if (!/github/i.test(reason) || !/(api|budget|бюджет|rate[ _-]*limit|лимит|reservation|scan|скан)/i.test(reason)) return null;
+  return {until: t.scheduled_at, reason};
+}
+
 function scheduleInfo(t) {
   if (t.status === 'completed' || t.status === 'failed' || t.status === 'cancelled') return '';
   if (t.status === 'running') return '<span class="task-schedule">running now</span>';
   if (t.series_paused) return '<span class="task-schedule paused" title="Recurring series is paused">PAUSED</span>';
+  const githubWait = githubApiWait(t);
+  if (githubWait) {
+    const until = new Date(githubWait.until).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
+    return `<span class="task-schedule" title="${escAttr(githubWait.reason)}">до ${until}</span>`;
+  }
   if (t.next_run_at) {
     return `<span class="task-schedule">retry ${formatTime(t.next_run_at)}</span>`;
   }
@@ -1101,6 +1154,7 @@ function scheduleInfo(t) {
 function taskStatusLabel(t) {
   if (t.status !== 'pending') return t.status.replace('_', ' ');
   if (t.series_paused) return 'paused';
+  if (githubApiWait(t)) return 'ждёт GitHub API';
   if (t.scheduled_at && new Date(t.scheduled_at) > new Date()) return 'scheduled';
   return 'queued';
 }
@@ -1498,7 +1552,7 @@ async function loadTasks() {
   // Scroll-jump fix: the 5s background refresh rebuilds the whole task list.
   // Snapshot scroll positions (prompt/result blocks of the expanded card) so
   // a reader is not yanked back to the top after the rebuild.
-  const taskScrolls = [...list.querySelectorAll('*')].map(el => el.scrollTop);
+  const taskScrolls = uiSnapScrolls(list);
   list.innerHTML = tasks.map(t => {
     const expanded = t.id === expandedId;
     const time = timeAgo(t.created_at);
@@ -1516,6 +1570,7 @@ async function loadTasks() {
     const roleChip = isReviewRole
       ? '<span class="role-chip role-review" title="задача ревьюера">ревью</span>'
       : '<span class="role-chip role-exec" title="задача исполнителя">исполнение</span>';
+    const taskErrorLabel = githubApiWait(t) ? 'Причина ожидания' : 'Error';
 
     // Build result section
     let resultHTML = '';
@@ -1549,6 +1604,7 @@ async function loadTasks() {
         <span class="task-prompt" title="${escAttr(taskDisplayTitle(t))}">${esc(taskDisplayTitle(t))}</span>
         ${t.working_dir ? `<span class="task-meta">📁 ${esc(t.working_dir.split(/[/\\]/).filter(Boolean).pop() || t.working_dir)}</span>` : ''}
         ${t.worktree ? `<span class="task-meta" title="отдельный git worktree">🌿 ${esc(t.worktree_branch || 'worktree')}</span>` : ''}
+        ${t.epf ? `<span class="task-meta" title="доработка обработки 1С: ${escAttr(t.epf.base_label || '')}">🔧 ${esc(EPF_STATUS_RU[t.epf.status] || '1С')}</span>` : ''}
         ${t.verdict ? `<span class="task-meta" title="итог, которым задача сама себя закрыла">${verdictIcon(t.verdict)} ${esc(t.verdict)}</span>` : ''}
         ${t.note ? `<span class="task-meta" title="${escAttr(t.note)}">✎ приписка</span>` : ''}
         ${t.provider ? `<span class="task-meta">${esc(t.provider)}</span>` : ''}
@@ -1564,6 +1620,7 @@ async function loadTasks() {
         </div>
 
         ${t.working_dir ? `<div class="detail-info"><span class="label">Dir: </span><span>${esc(t.working_dir)}</span></div>` : ''}
+        ${t.epf ? `<div class="detail-info"><span class="label">1С (${esc(t.epf.base_label || '')}): </span><span>${t.epf.epf_path ? esc(t.epf.epf_path) : esc(EPF_STATUS_RU[t.epf.status] || t.epf.status)}</span></div>` : ''}
         ${t.worktree ? `<div class="detail-info"><span class="label">Worktree: </span><span>${esc(t.worktree_path || 'ещё не создан')}</span>${t.worktree_branch ? ` <span class="label">ветка</span> <span>${esc(t.worktree_branch)}</span>` : ''}</div>` : ''}
 
         <div class="detail-info" style="align-items:center;gap:6px">
@@ -1591,7 +1648,7 @@ async function loadTasks() {
         ${resultHTML}
 
         ${t.error ? `
-          <div class="detail-label">Error</div>
+          <div class="detail-label">${taskErrorLabel}</div>
           <div class="result-block">
             <pre>${esc(t.error)}</pre>
             <button class="copy-btn" data-copy="${escAttr(t.error)}" onclick="copyText(event)">Copy</button>
@@ -1623,7 +1680,7 @@ async function loadTasks() {
         <div class="detail-actions">
           ${['pending','rate_limited','running'].includes(t.status) ? `<button class="btn btn-sm btn-ghost" onclick="cancelTask(event,${t.id})">Cancel</button>` : ''}
           ${t.status === 'running' ? `<button class="btn btn-sm btn-ghost" onclick="resetTask(event,${t.id})">Reset to pending</button>` : ''}
-          <button class="btn btn-sm btn-danger" onclick="deleteTask(event,${t.id})">Delete</button>
+          ${t.status !== 'running' ? `<button class="btn btn-sm btn-danger" onclick="deleteTask(event,${t.id})">Delete</button>` : ''}
         </div>
       </div>
     </div>`;
@@ -1634,11 +1691,7 @@ async function loadTasks() {
   if (sc && screenCache[expandedId]) sc.scrollTop = sc.scrollHeight;
   // Scroll-jump fix: put the reader back where they were. The live agent
   // screen keeps its own bottom autoscroll and is skipped here.
-  const taskNewEls = list.querySelectorAll('*');
-  taskScrolls.forEach((top, i) => {
-    const el = taskNewEls[i];
-    if (el && top > 0 && !(el.id && el.id.startsWith('screen-'))) el.scrollTop = top;
-  });
+  uiRestoreScrolls(list, taskScrolls);
 }
 
 function providerOptions(current) {
@@ -1949,6 +2002,27 @@ function restoreWorkflowOpenDetails(openKeys) {
 // selection, touch, or paging keys. Explicit user actions are unaffected.
 const UI_READING_PAUSE_MS = 60000;
 const uiReadingPause = { tasks: 0, workflow: 0 };
+// Scroll-jump fix helpers: a rebuild resets the scrollTop of every block it
+// recreates, so snapshot/restore the few real scrollers (report/result
+// <pre>, round history, prompt textareas). Keyed by element id when present,
+// else by position within this narrow NodeList — a document-wide index map
+// would break as soon as the render shape changes. The live agent screen
+// keeps its own bottom autoscroll and is excluded.
+const UI_SCROLL_SELECTOR = '.result-block pre:not(.agent-screen), .wf-history, textarea';
+function uiSnapScrolls(root) {
+  const snaps = new Map();
+  root.querySelectorAll(UI_SCROLL_SELECTOR).forEach((el, i) => {
+    if (el.scrollTop > 0) snaps.set(el.id || i, el.scrollTop);
+  });
+  return snaps;
+}
+function uiRestoreScrolls(root, snaps) {
+  if (!snaps || !snaps.size) return;
+  root.querySelectorAll(UI_SCROLL_SELECTOR).forEach((el, i) => {
+    const top = snaps.get(el.id || i);
+    if (top) el.scrollTop = top;
+  });
+}
 function uiNoteReading(node) {
   if (!node || node.nodeType !== 1) return;
   if (node.id === 'taskList' || node.closest('#taskList')) uiReadingPause.tasks = Date.now() + UI_READING_PAUSE_MS;
@@ -2646,7 +2720,7 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, 
   // a reading user back to the start of the text. Snapshot positions and
   // typed values first, put them back after the rebuild.
   const wfPane = document.getElementById('wfDetail');
-  const wfSnapScrolls = [...wfPane.querySelectorAll('*')].map(el => el.scrollTop);
+  const wfSnapScrolls = uiSnapScrolls(wfPane);
   const wfSnapValues = {};
   wfPane.querySelectorAll('textarea,input').forEach(el => { if (el.id) wfSnapValues[el.id] = el.value; });
   const wfModalScroller = wfPane.closest('.modal');
@@ -2703,15 +2777,10 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, 
     <details class="wf-technical" data-wf-detail="technical-log"><summary>Технический журнал · ${events.length} событий · state version ${wf.state_version}</summary>
       <div class="wf-history">${eventRows || '<div class="wf-meta">Событий пока нет.</div>'}</div>
     </details>`;
-  // Scroll-jump fix: restore what the user was reading/typing. Document order
-  // of the rebuilt DOM matches the snapshot for identical renders; if the
-  // structure changed, a stray scrollTop on a non-scrollable element is a
-  // harmless no-op. The agent screen keeps its own bottom autoscroll.
-  const wfNewEls = wfPane.querySelectorAll('*');
-  wfSnapScrolls.forEach((top, i) => {
-    const el = wfNewEls[i];
-    if (el && top > 0 && el.id !== 'wfAgentScreen') el.scrollTop = top;
-  });
+  // Scroll-jump fix: restore what the user was reading/typing. Keys are ids
+  // (or positions within the narrow scroller list), so a changed render shape
+  // cannot shift the mapping. The agent screen keeps its own bottom autoscroll.
+  uiRestoreScrolls(wfPane, wfSnapScrolls);
   wfPane.querySelectorAll('textarea,input').forEach(el => {
     if (el.id && wfSnapValues[el.id] !== undefined && el.value !== wfSnapValues[el.id]) {
       el.value = wfSnapValues[el.id];
@@ -3001,8 +3070,15 @@ async function openSchedule() {
       ? esc(`#${s.last_task_id} — ${STATUS_RU[s.last_status] || s.last_status}`
             + (s.last_verdict ? ` (${s.last_verdict})` : '') + `, ${when(s.last_at)}`)
       : 'ещё не запускалась';
-    const next = s.broken
+    const githubWait = githubApiWait({status: s.next_status, scheduled_at: s.next_run_at, error: s.next_error});
+    const autoPauseReason = typeof s.auto_pause_reason === 'string'
+      ? s.auto_pause_reason.trim() : '';
+    const next = s.paused && !s.next_task_id
+      ? `<span style="color:var(--yellow)"${autoPauseReason ? ` title="${escAttr(autoPauseReason)}"` : ''}>${autoPauseReason ? 'автопауза — повторился тот же блокер' : 'серия на паузе'} — Возобновить создаст следующий запуск</span>${autoPauseReason ? `<br><span title="${escAttr(autoPauseReason)}">Причина: ${esc(autoPauseReason)}</span>` : ''}`
+      : s.broken
       ? '<span style="color:var(--red)">серия оборвана — следующего запуска нет</span>'
+      : githubWait
+      ? `<span style="color:var(--yellow)" title="${escAttr(githubWait.reason)}">#${s.next_task_id} — ждёт GitHub API до ${when(githubWait.until)}</span><br><span title="${escAttr(githubWait.reason)}">Причина: ${esc(githubWait.reason)}</span>`
       : `#${s.next_task_id} — ${STATUS_RU[s.next_status] || s.next_status}, ${when(s.next_run_at)}`;
     const title = s.title || (s.prompt || '').split(/\r?\n/, 1)[0] || '(без названия)';
     const boost = s.temporary_recurrence
@@ -3022,7 +3098,7 @@ async function openSchedule() {
       <div class="prov-cmd">Прошлый: ${last}</div>
       ${!s.ended ? `<div class="prov-actions" style="margin-top:9px">
         <button class="btn btn-sm btn-ghost" onclick="toggleSeriesEditor(${s.id})">⚙ Изменить</button>
-        <button class="btn btn-sm btn-ghost" onclick="seriesAction(${s.id},'run_now')" ${!s.next_task_id ? 'disabled' : ''}>▶ Сейчас</button>
+        <button class="btn btn-sm btn-ghost" onclick="seriesAction(${s.id},'run_now')" ${s.paused || !s.next_task_id ? 'disabled' : ''}>▶ Сейчас</button>
         <button class="btn btn-sm btn-ghost" onclick="seriesAction(${s.id},'${s.paused ? 'resume' : 'pause'}')">${s.paused ? '▶ Возобновить' : '⏸ Пауза'}</button>
         <button class="btn btn-sm btn-danger" onclick="seriesAction(${s.id},'end',true)">Завершить серию</button>
       </div>
@@ -3184,10 +3260,12 @@ async function loadPipelineInsights(profile, refresh=false) {
     const h7d = data.history['168h'] || {complete:false, coverage_hours:0};
     const h30d = data.history['720h'] || {complete:false, coverage_hours:0};
     const signed = n => n > 0 ? `+${n}` : String(n);
+    const perHour = n => n == null ? '—' : `${signed(Number(n).toFixed(2))}/ч`;
     const age = value => value == null ? '—' : value < 24 ? `${Math.round(value)} ч` : `${(value/24).toFixed(1)} д`;
     const duration = seconds => seconds == null ? '—' : seconds < 3600 ? `${Math.round(seconds/60)} мин` : `${(seconds/3600).toFixed(1)} ч`;
     const historyNote = h5.complete ? 'за последние 5 часов' : `история ${h5.coverage_hours} из 5 ч`;
     const runs = h5.runs;
+    const outcomes = data.outcomes || {safe_deferrals_now:0, stale_reselections_5h:0, safe_refusals_5h:0, real_errors_5h:0};
     const activeUnable = runs.unresolved_unable ?? runs.unable;
     const activeFailed = runs.unresolved_failed ?? runs.failed;
     const recoveredRuns = (runs.recovered_unable || 0) + (runs.recovered_failed || 0);
@@ -3201,6 +3279,7 @@ async function loadPipelineInsights(profile, refresh=false) {
       ? Number(runs.total_tokens || 0).toLocaleString()
       : 'нет данных';
     const githubLimits = data.github_rate_limit || {};
+    const githubBudgetState = data.github_budget || {};
     const cache = data.cache || {source:'unknown',available:false,stale:true,age_seconds:null};
     const cacheSources = {live:'новый',memory:'память',durable:'SQLite',snapshot:'история',none:'нет'};
     const cacheAge = cache.age_seconds == null ? 'возраст неизвестен'
@@ -3210,8 +3289,13 @@ async function loadPipelineInsights(profile, refresh=false) {
     const cacheValue = !cache.available ? 'нет снимка' : !cache.complete ? 'частичный' : cache.stale ? 'устарел' : 'свежий';
     const cacheNote = `${cacheAge} · ${cacheSources[cache.source] || cache.source} · обычное открытие без GitHub API`;
     const cacheColor = cache.stale || !cache.complete ? 'var(--yellow)' : '';
+    const blockedUntil = cache.refresh_deferred_until
+      ? ` Следующая попытка: ${new Date(cache.refresh_deferred_until).toLocaleString()}.`
+      : '';
     const cacheNotice = cache.refresh_blocked === 'worker_paused'
       ? `<div class="prov-cmd" style="color:var(--yellow);margin-top:8px">Обновление GitHub пропущено: включена общая пауза. ${cache.available ? 'Показан последний локальный снимок.' : 'Снимка ещё нет.'}</div>`
+      : cache.refresh_blocked
+      ? `<div class="prov-cmd" style="color:var(--yellow);margin-top:8px">Обновление GitHub отложено: ${esc(cache.refresh_blocked_reason || cache.refresh_blocked)}.${esc(blockedUntil)} ${cache.available ? 'Показан последний локальный снимок.' : 'Снимка ещё нет.'}</div>`
       : !cache.available
         ? '<div class="prov-cmd" style="color:var(--yellow);margin-top:8px">Снимка GitHub ещё нет. Нажмите «Обновить» для первого явного запроса.</div>'
         : !cache.complete
@@ -3219,16 +3303,52 @@ async function loadPipelineInsights(profile, refresh=false) {
         : cache.stale
         ? `<div class="prov-cmd" style="color:var(--yellow);margin-top:8px">Данные GitHub устарели (${esc(cacheAge)}). Нажмите «Обновить» для явного запроса.</div>`
         : '';
-    const githubBudget = name => {
+    const githubLimitText = name => {
       const limit = githubLimits[name];
       if (!limit) return 'нет данных';
       const reset = limit.reset_at ? ` · сброс ${new Date(limit.reset_at).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}` : '';
       return `${Number(limit.remaining).toLocaleString()} / ${Number(limit.limit).toLocaleString()}${reset}`;
     };
+    const reservedBudget = githubBudgetState.reserved_in_flight || {};
+    const spendableBudget = githubBudgetState.spendable_before_route || {};
+    const projectedBudget = githubBudgetState.projected_post_reservation || {};
+    const budgetFloor = githubBudgetState.minimum_remaining || {};
+    const priorityHeadroom = githubBudgetState.priority_one_headroom || {};
+    const ledgerKnown = githubBudgetState.ledger_state !== 'unavailable';
+    const reservationCount = ledgerKnown
+      ? Number(githubBudgetState.active_reservations || 0).toLocaleString()
+      : '—';
+    const budgetNumber = (values, name) => values[name] == null ? '—' : Number(values[name]).toLocaleString();
+    const projectedNumber = (name, field) => {
+      const value = projectedBudget[name] && projectedBudget[name][field];
+      return value == null ? '—' : Number(value).toLocaleString();
+    };
+    const hasPriorityHeadroom = ['core', 'search', 'graphql']
+      .some(name => Number(priorityHeadroom[name] || 0) > 0);
+    const priorityHeadroomNote = hasPriorityHeadroom
+      ? `<div class="pipeline-metric-note">Резерв для приоритета PromptPilot 1: REST ${budgetNumber(priorityHeadroom, 'core')} · Search ${budgetNumber(priorityHeadroom, 'search')} · GraphQL ${budgetNumber(priorityHeadroom, 'graphql')} · задачи приоритетов 2–10 и полное обновление статистики оставляют этот запас</div>`
+      : '';
+    const rateObserved = data.github_rate_limit_observed_at
+      ? `измерено ${timeAgo(data.github_rate_limit_observed_at)}`
+      : 'на момент снимка очереди';
+    const budgetProblem = githubBudgetState.ledger_state === 'unavailable'
+      ? githubBudgetState.ledger_reason
+      : githubBudgetState.rate_snapshot_state === 'unavailable'
+      ? githubBudgetState.rate_snapshot_reason
+      : githubBudgetState.allowed === false ? githubBudgetState.reason : '';
+    const budgetMetric = githubBudgetState.enabled ? `<div class="pipeline-metric">
+      <div class="pipeline-metric-label">GitHub budget в работе</div>
+      <div class="pipeline-metric-value">${reservationCount} · REST −${ledgerKnown ? budgetNumber(reservedBudget, 'core') : '—'}</div>
+      <div class="pipeline-metric-note">прогноз после активных резервов (не фактический GitHub remaining): REST доступно ${projectedNumber('core', 'available')}, дефицит ${projectedNumber('core', 'deficit')} · Search доступно ${projectedNumber('search', 'available')}, дефицит ${projectedNumber('search', 'deficit')} · GraphQL доступно ${projectedNumber('graphql', 'available')}, дефицит ${projectedNumber('graphql', 'deficit')}</div>
+      <div class="pipeline-metric-note">можно выдать до hard reserve: REST ${budgetNumber(spendableBudget, 'core')} · Search ${budgetNumber(spendableBudget, 'search')} · GraphQL ${budgetNumber(spendableBudget, 'graphql')} · reserve REST ${budgetNumber(budgetFloor, 'core')}${budgetProblem ? ` · ${esc(budgetProblem)}` : ''}</div>
+      ${priorityHeadroomNote}
+    </div>` : '';
     const coreLimit = githubLimits.core;
     const coreShare = coreLimit && coreLimit.limit ? coreLimit.remaining / coreLimit.limit : null;
     const coreColor = coreShare == null ? 'var(--muted)' : coreShare <= 0.05 ? 'var(--red)' : coreShare <= 0.2 ? 'var(--yellow)' : '';
-    const deltaByQueue = h5.queue_deltas || {};
+    const deltaRateByQueue = h5.queue_deltas_per_hour || {};
+    const throughputRateByQueue = h5.queue_throughput_per_hour || {};
+    const bottleneckQueue = (data.queues || []).find(q => q.id === data.bottleneck);
     const diagnostics = data.diagnostics;
     const runtime = data.runtime || {};
     const healthLabel = data.health.label === 'нужна проверка' ? 'есть ожидания' : data.health.label;
@@ -3247,16 +3367,28 @@ async function loadPipelineInsights(profile, refresh=false) {
       const lastLine = last && last.at
         ? `последний #${last.task_id}: ${timeAgo(last.at)} · ${last.verdict || last.status}${lastTokens}`
         : 'завершённых запусков нет';
-      const stageLine = `5 ч: ${stageRuns.runs || 0} запусков · действий ${stageRuns.ready || 0} · холостых ${stageRuns.no_change || 0}`;
+      const stageLine = `5 ч: ${stageRuns.runs || 0} запусков · действий ${stageRuns.ready || 0} · холостых ${stageRuns.no_change || 0} · фактический выход ${perHour(throughputRateByQueue[q.id])}`;
       const route = q.execution || {configured:'skill',effective:'skill'};
       const routeLine = `маршрут: ${route.configured}${route.configured!==route.effective ? ` → ${route.effective}` : ''}${route.reason && route.effective!=='tool' ? ` · ${route.reason}` : ''}`;
       const wake = q.wake;
       const wakeLine = wake ? (wake.suppressed
         ? `автозапуск: ждёт изменения состояния · снимок ${wake.fingerprint}`
         : wake.ready ? `автозапуск: готов · ${wake.matches}` : 'автозапуск: работы нет') : null;
+      const cadence = q.adaptive_cadence;
+      const cadenceLine = cadence
+        ? `интервал: ${cadence.mode} · ${cadence.effective_recurrence || 'нет серии'}${cadence.empty_runs_before_idle ? ` · ПУСТО ${cadence.empty_runs}/${cadence.empty_runs_before_idle}` : ''}${cadence.event_wake ? ' · event wake' : ''}`
+        : null;
+      const replicaStatus = q.replica_status || {configured:1,present:q.series_id?1:0,active:q.series_id?1:0,valid:true,issues:[],series:[]};
+      const replicaSummary = `реплики: ${replicaStatus.active}/${replicaStatus.configured} активны · найдено ${replicaStatus.present}`;
+      const replicaIssues = replicaStatus.valid ? '' : ` · ошибка: ${(replicaStatus.issues || []).join('; ')}`;
+      const replicaLines = (q.series_replicas || []).map(replica =>
+        `#${replica.series_id} ${replica.task_status || (replica.paused ? 'paused' : replica.broken ? 'broken' : 'idle')} · ${replica.interval || 'без интервала'} · ${replica.working_dir || 'working_dir не задан'}`
+      );
+      const replicaLine = `${replicaSummary}${replicaIssues}${replicaLines.length ? ` · ${replicaLines.join(' | ')}` : ''}`;
       const bottleneck = data.bottleneck===q.id ? 'bottleneck' : '';
-      return `<tr class="${bottleneck}"><td class="insights-stage-title">${data.bottleneck===q.id?'⚠ ':''}${esc(q.title)}</td><td class="num">${q.backlog == null ? '—' : q.backlog}</td><td class="num">${h5.complete?signed(deltaByQueue[q.id]||0):'—'}</td><td class="num">${q.capacity}</td><td class="num">${q.runs_needed == null ? '—' : q.runs_needed}</td><td>${duration(q.avg_duration_seconds)}</td><td>${q.eta_hours == null ? '—' : q.eta_hours+' ч'}</td><td>${age(q.age.oldest_hours)}</td><td>${esc(q.interval || 'нет серии')}</td><td class="insights-recommendation">${esc(q.recommendation || '—')}</td></tr>
-        <tr class="insights-stage-detail ${bottleneck}"><td colspan="10"><div class="insights-stage-meta"><span class="prov-cmd" title="${escAttr(last?.summary || '')}">${esc(lastLine)}</span><span class="prov-cmd">${esc(stageLine)}</span><span class="prov-cmd">${esc(routeLine)}</span>${wakeLine?`<span class="prov-cmd">${esc(wakeLine)}</span>`:''}</div></td></tr>`;
+      const capacity = `${q.capacity} × ${q.replicas_active || 0} = ${q.parallel_capacity}`;
+      return `<tr class="${bottleneck}"><td class="insights-stage-title">${data.bottleneck===q.id?'⚠ ':''}${esc(q.title)}${q.replica_count>1?` ×${q.replica_count}`:''}</td><td class="num">${q.backlog == null ? '—' : q.backlog}</td><td class="num">${h5.complete?perHour(deltaRateByQueue[q.id] ?? 0):'—'}</td><td class="num">${capacity}</td><td class="num">${q.runs_needed == null ? '—' : q.runs_needed}</td><td>${duration(q.avg_duration_seconds)}</td><td>${q.eta_hours == null ? '—' : q.eta_hours+' ч'}</td><td>${age(q.age.oldest_hours)}</td><td>${esc(q.interval || 'нет серии')}</td><td class="insights-recommendation">${esc(q.recommendation || '—')}</td></tr>
+        <tr class="insights-stage-detail ${bottleneck}"><td colspan="10"><div class="insights-stage-meta"><span class="prov-cmd" title="${escAttr(last?.summary || '')}">${esc(lastLine)}</span><span class="prov-cmd">${esc(stageLine)}</span><span class="prov-cmd">${esc(routeLine)}</span><span class="prov-cmd" style="${replicaStatus.valid?'':'color:var(--red)'}">${esc(replicaLine)}</span>${wakeLine?`<span class="prov-cmd">${esc(wakeLine)}</span>`:''}${cadenceLine?`<span class="prov-cmd">${esc(cadenceLine)}</span>`:''}</div></td></tr>`;
     }).join('');
     const priorityHtml = data.priority_control ? `<details style="margin-top:12px" open>
       <summary style="cursor:pointer"><b>Приоритет элементов очереди</b> · P0 выполняется первым, старые задачи повышаются каждые ${data.priority_control.aging_hours} ч до P1</summary>
@@ -3289,11 +3421,13 @@ async function loadPipelineInsights(profile, refresh=false) {
       ${cacheNotice}
       <div class="pipeline-summary">
         <div class="pipeline-metric"><div class="pipeline-metric-label">Снимок GitHub</div><div class="pipeline-metric-value" style="${cacheColor ? `color:${cacheColor}` : ''}">${esc(cacheValue)}</div><div class="pipeline-metric-note">${esc(cacheNote)}</div></div>
-        <div class="pipeline-metric"><div class="pipeline-metric-label">Backlog сейчас</div><div class="pipeline-metric-value">${data.backlog_total == null ? '—' : data.backlog_total}</div><div class="pipeline-metric-note">Δ 5 ч: ${h5.complete?signed(h5.backlog_delta):'копится история'}</div></div>
-        <div class="pipeline-metric"><div class="pipeline-metric-label">Вход / выход</div><div class="pipeline-metric-value">${h5.complete?`${h5.entered} / ${h5.exited}`:'—'}</div><div class="pipeline-metric-note">${historyNote}</div></div>
+        <div class="pipeline-metric"><div class="pipeline-metric-label">Backlog сейчас</div><div class="pipeline-metric-value">${data.backlog_total == null ? '—' : data.backlog_total}</div><div class="pipeline-metric-note">Δ/ч: ${h5.complete?perHour(h5.backlog_delta_per_hour):'копится история'}</div></div>
+        <div class="pipeline-metric"><div class="pipeline-metric-label">Вход / выход</div><div class="pipeline-metric-value">${h5.complete?`${perHour(h5.entered_per_hour)} / ${perHour(h5.exited_per_hour)}`:'—'}</div><div class="pipeline-metric-note">фактическая скорость · ${historyNote}</div></div>
+        <div class="pipeline-metric"><div class="pipeline-metric-label">Узкое место</div><div class="pipeline-metric-value">${bottleneckQueue?esc(bottleneckQueue.title):'нет'}</div><div class="pipeline-metric-note">${bottleneckQueue&&bottleneckQueue.eta_hours!=null?`ETA ${bottleneckQueue.eta_hours} ч · очередь ${bottleneckQueue.backlog}`:'активной очереди нет'}</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Переходы / churn</div><div class="pipeline-metric-value">${h5.complete?`${h5.transitions} / ${h5.churn_items}`:'—'}</div><div class="pipeline-metric-note">между очередями / 3+ состояний</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Возраст p90 / max</div><div class="pipeline-metric-value">${age(data.age.p90_hours)} / ${age(data.age.oldest_hours)}</div><div class="pipeline-metric-note">текущие элементы</div></div>
-        <div class="pipeline-metric"><div class="pipeline-metric-label">Прогоны 5 ч</div><div class="pipeline-metric-value">${runs.runs}</div><div class="pipeline-metric-note">с действием ${runs.ready} · без действий ${runs.no_change || 0} · пусто ${runs.empty}</div></div>
+        <div class="pipeline-metric"><div class="pipeline-metric-label">Прогоны 5 ч</div><div class="pipeline-metric-value">${runs.runs}</div><div class="pipeline-metric-note">с действием ${runs.ready} · без действий ${runs.no_change || 0} · пусто ${runs.empty} · перевыбор ${runs.stale || 0}</div></div>
+        <div class="pipeline-metric"><div class="pipeline-metric-label">Безопасные ожидания / ошибки</div><div class="pipeline-metric-value">${outcomes.safe_deferrals_now + outcomes.stale_reselections_5h + outcomes.safe_refusals_5h} / ${outcomes.real_errors_5h}</div><div class="pipeline-metric-note">ожидают сейчас ${outcomes.safe_deferrals_now} · stale-перевыборов 5 ч ${outcomes.stale_reselections_5h} · безопасных отказов 5 ч ${outcomes.safe_refusals_5h} · активных ошибок ${outcomes.real_errors_5h}</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Требуют внимания</div><div class="pipeline-metric-value">${runs.human + activeUnable + activeFailed}</div><div class="pipeline-metric-note">человек ${runs.human} · не смог ${activeUnable} · упало ${activeFailed}${recoveredRuns ? ` · восстановлено ${recoveredRuns}` : ''}</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Последнее REVIEW</div><div class="pipeline-metric-value">${esc(lastReviewValue)}</div><div class="pipeline-metric-note">${esc(lastReviewNote)}</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Токены 5 ч</div><div class="pipeline-metric-value">${esc(tokenValue)}</div><div class="pipeline-metric-note">измерено запусков: ${runs.tokens_known_runs || 0} из ${runs.runs}</div></div>
@@ -3302,10 +3436,11 @@ async function loadPipelineInsights(profile, refresh=false) {
         <div class="pipeline-metric"><div class="pipeline-metric-label">Δ backlog 30 дней</div><div class="pipeline-metric-value">${h30d.complete?signed(h30d.backlog_delta):'—'}</div><div class="pipeline-metric-note">покрытие ${h30d.coverage_hours} из 720 ч</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Цель очистки</div><div class="pipeline-metric-value">${data.target_clear_hours} ч</div><div class="pipeline-metric-note">без прогноза нового входа</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Worker</div><div class="pipeline-metric-value">${runtime.state==='online'?'online':'offline'}</div><div class="pipeline-metric-note">${runtime.age_seconds == null ? 'heartbeat отсутствует' : 'heartbeat '+runtime.age_seconds+' сек назад'}</div></div>
-        <div class="pipeline-metric"><div class="pipeline-metric-label">GitHub REST API</div><div class="pipeline-metric-value" style="${coreColor ? `color:${coreColor}` : ''}">${esc(githubBudget('core'))}</div><div class="pipeline-metric-note">на момент снимка · Search ${esc(githubBudget('search'))} · GraphQL ${esc(githubBudget('graphql'))}</div></div>
+        <div class="pipeline-metric"><div class="pipeline-metric-label">GitHub REST API</div><div class="pipeline-metric-value" style="${coreColor ? `color:${coreColor}` : ''}">${esc(githubLimitText('core'))}</div><div class="pipeline-metric-note">${esc(rateObserved)} · Search ${esc(githubLimitText('search'))} · GraphQL ${esc(githubLimitText('graphql'))}</div></div>
+        ${budgetMetric}
       </div>
       ${diagnosticHtml}
-      <table class="insights-table"><colgroup><col class="insights-col-stage"><col class="insights-col-small"><col class="insights-col-small"><col class="insights-col-capacity"><col class="insights-col-capacity"><col class="insights-col-duration"><col class="insights-col-small"><col class="insights-col-oldest"><col class="insights-col-interval"><col class="insights-col-recommendation"></colgroup><thead><tr><th>Этап</th><th class="num">Очередь</th><th class="num">Δ 5 ч</th><th class="num">За прогон</th><th class="num">Прогонов</th><th>Средний запуск</th><th>ETA</th><th>Самый старый</th><th>Интервал</th><th>Рекомендация</th></tr></thead><tbody>${rows}</tbody></table>
+      <table class="insights-table"><colgroup><col class="insights-col-stage"><col class="insights-col-small"><col class="insights-col-small"><col class="insights-col-capacity"><col class="insights-col-capacity"><col class="insights-col-duration"><col class="insights-col-small"><col class="insights-col-oldest"><col class="insights-col-interval"><col class="insights-col-recommendation"></colgroup><thead><tr><th>Этап</th><th class="num">Очередь</th><th class="num">Δ/ч</th><th class="num">За реплику × активные</th><th class="num">Прогонов</th><th>Средний запуск</th><th>ETA</th><th>Самый старый</th><th>Интервал</th><th>Рекомендация</th></tr></thead><tbody>${rows}</tbody></table>
       ${priorityHtml}
     </div>`;
   } catch(e) { box.innerHTML = `<div style="color:var(--red);margin-bottom:10px">Анализ очереди недоступен: ${esc(e.message)}</div>`; }
@@ -3315,7 +3450,7 @@ async function setPipelineItemPriority(profile, queue, kind, number, level, runN
   try {
     const path = `${API}/pipeline-insights/${encodeURIComponent(profile)}/queues/${encodeURIComponent(queue)}/items/${encodeURIComponent(kind)}/${number}/priority`;
     const result = await fetchJSON(path, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({level,run_now:runNow})});
-    const wake = runNow ? (result.series_woken ? ' Серия поставлена на ближайший запуск.' : result.series_paused ? ' Серия на паузе.' : '') : '';
+    const wake = runNow ? (result.series_woken ? ` Серии поставлены на ближайший запуск: ${result.series_woken_count || 1}.` : result.series_paused ? ' Серии на паузе.' : '') : '';
     toast(level === 'auto' ? `#${number}: автоматический приоритет.${wake}` : `#${number}: ${level.toUpperCase()}.${wake}`, false);
     await loadPipelineInsights(profile, true);
   } catch(e) { toast('Не удалось изменить приоритет: ' + e.message); }
@@ -3373,6 +3508,103 @@ async function openProviders() {
   await renderMachineList();
 }
 function closeProviders() { document.getElementById('provModal').classList.remove('open'); }
+
+// --- 1С: доработка обработок ---
+const EPF_STATUS_RU = { queued: 'в работе', building: 'сборка…', built: 'собрана', build_failed: 'сбой сборки' };
+
+function openEpf() {
+  document.getElementById('epfModal').classList.add('open');
+  loadEpfStatus();
+  loadEpfBases();
+}
+function closeEpf() { document.getElementById('epfModal').classList.remove('open'); }
+
+async function loadEpfStatus() {
+  const s = await fetchJSON(`${API}/epf/status`);
+  const el = document.getElementById('epfStatus');
+  if (s.available) {
+    el.innerHTML = `✅ Платформа: <code>${esc(s.v8_path)}</code> · баз просканировано: <b>${s.bases_count}</b>`;
+    document.getElementById('epfReworkBtn').disabled = false;
+  } else {
+    el.innerHTML = `❌ 1cv8.exe не найден — укажите путь в настройках ниже (или переменной PP_1C_EXE_PATH).`;
+    document.getElementById('epfReworkBtn').disabled = true;
+  }
+  const hint = document.getElementById('epfEnvHint');
+  hint.textContent = s.env_keys.length
+    ? `Задано переменными окружения (форма их не перекрывает): ${s.env_keys.join(', ')}`
+    : '';
+  const c = s.config || {}, p = c.presets || {};
+  document.getElementById('epfExe').value = c.exe_path || '';
+  document.getElementById('epfBasesRoot').value = c.bases_root || '';
+  document.getElementById('epfBasePath').value = c.base_path || '';
+  document.getElementById('epfUt11').value = p.ut11 || '';
+  document.getElementById('epfBp3').value = p.bp3 || '';
+  document.getElementById('epfErp').value = p.erp || '';
+  document.getElementById('epfUnf').value = p.unf || '';
+  document.getElementById('epfAa').value = p.aa || '';
+  document.getElementById('epfSkills').value = c.skills_dir || '';
+}
+
+async function loadEpfBases() {
+  const bases = await fetchJSON(`${API}/epf/bases`);
+  document.getElementById('epfBase').innerHTML = bases.map(b =>
+    `<option value="${escAttr(b.key)}"${b.missing ? ' disabled' : ''}>${esc(b.label)}${b.missing ? ' (не найдена)' : ''}</option>`
+  ).join('');
+}
+
+async function epfRework(event) {
+  event.preventDefault();
+  const msg = document.getElementById('epfReworkMsg');
+  const btn = document.getElementById('epfReworkBtn');
+  const file = document.getElementById('epfFile').files[0];
+  if (!file) { msg.textContent = 'Выберите файл .epf/.erf'; return false; }
+  msg.textContent = '⏳ Декомпиляция (может занять несколько минут)...';
+  btn.disabled = true;
+  try {
+    const fd = new FormData();
+    fd.append('file', file);
+    fd.append('prompt', document.getElementById('epfPrompt').value);
+    fd.append('base_key', document.getElementById('epfBase').value);
+    const res = await fetchJSON(`${API}/epf/rework`, { method: 'POST', body: fd });
+    msg.innerHTML = `✅ Задача <a href="#" onclick="toggleTask(${res.task.id});closeEpf();return false">#${res.task.id}</a> поставлена в очередь${res.warnings && res.warnings.length ? ' (⚠ ' + esc(res.warnings.join('; ')) + ')' : ''}.`;
+    document.getElementById('epfFile').value = '';
+    document.getElementById('epfPrompt').value = '';
+    await loadTasks();
+  } catch (e) {
+    msg.textContent = '❌ ' + (e.message || e);
+  } finally {
+    btn.disabled = false;
+  }
+  return false;
+}
+
+async function epfSaveSettings(event) {
+  event.preventDefault();
+  const msg = document.getElementById('epfSetMsg');
+  try {
+    const s = await fetchJSON(`${API}/epf/settings`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        exe_path: document.getElementById('epfExe').value,
+        bases_root: document.getElementById('epfBasesRoot').value,
+        base_path: document.getElementById('epfBasePath').value,
+        ut11: document.getElementById('epfUt11').value,
+        bp3: document.getElementById('epfBp3').value,
+        erp: document.getElementById('epfErp').value,
+        unf: document.getElementById('epfUnf').value,
+        aa: document.getElementById('epfAa').value,
+        skills_dir: document.getElementById('epfSkills').value,
+      }),
+    });
+    msg.textContent = s.available ? '✅ Сохранено, платформа найдена' : 'Сохранено, но 1cv8.exe пока не найден';
+    await loadEpfStatus();
+    await loadEpfBases();
+  } catch (e) {
+    msg.textContent = '❌ ' + (e.message || e);
+  }
+  return false;
+}
 
 let provManageData = {};
 
@@ -3552,15 +3784,29 @@ function timeAgo(iso) {
   return Math.floor(diff / 86400) + 'd';
 }
 
-function refresh() {
-  loadStats();
-  // Keep the list live even with a card expanded (a running task used to freeze
-  // once opened) — but don't re-render out from under an unsaved inline edit
-  // or a user who is reading a long prompt/report (scroll-jump fix).
-  if (Date.now() < uiReadingPause.tasks) return;
-  const ae = document.activeElement;
-  if (ae && ae.id && (ae.id.startsWith('note-') || ae.id.startsWith('ed-'))) return;
-  loadTasks();
+let refreshInFlight = false;
+async function refresh() {
+  // Slow storage used to let the five-second timer stack another stats/tasks
+  // pair on top of an unfinished one. Keep at most one ordinary dashboard
+  // refresh in flight; the next timer tick will observe the completed state.
+  if (refreshInFlight) return;
+  refreshInFlight = true;
+  try {
+    // Don't re-render out from under a user who is reading a long
+    // prompt/report (scroll-jump fix).
+    if (Date.now() >= uiReadingPause.tasks) {
+      const requests = [loadStats()];
+      // Keep the list live even with a card expanded (a running task used to
+      // freeze once opened), but don't re-render under an unsaved inline edit.
+      const ae = document.activeElement;
+      if (!(ae && ae.id && (ae.id.startsWith('note-') || ae.id.startsWith('ed-')))) {
+        requests.push(loadTasks());
+      }
+      await Promise.allSettled(requests);
+    }
+  } finally {
+    refreshInFlight = false;
+  }
 }
 
 // --- Set default schedule to current datetime ---

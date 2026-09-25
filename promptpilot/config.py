@@ -247,8 +247,8 @@ BUILTIN_PROVIDERS = {
         "supports_effort": True,
         "env": {
             "ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic",
-            "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-4.7",
-            "ANTHROPIC_DEFAULT_OPUS_MODEL": "glm-4.7",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5.3",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": "glm-5.3",
         },
     },
     "codex": {
@@ -1014,6 +1014,13 @@ MIN_FREE_MB = _int_env("PP_MIN_FREE_MB", 0)
 # Ask every task to end with "ИТОГ: ..." so a finished task says WHAT happened,
 # not just that the process exited 0. Off by default — it appends to the prompt.
 VERDICT_REQUIRED = os.environ.get("PP_VERDICT", "0") == "1"
+
+# Issue #82: cheap models keep finishing quality work on long trajectories but
+# drop the closing ИТОГ line. When a verdict was expected and the parser found
+# none, one micro-request to the same provider ("restate only the verdict")
+# rescues the run at a fraction of a full retry. Disable with PP_VERDICT_REPAIR=0.
+VERDICT_REPAIR = os.environ.get("PP_VERDICT_REPAIR", "1") not in ("0", "false", "no")
+VERDICT_REPAIR_TIMEOUT = int(os.environ.get("PP_VERDICT_REPAIR_TIMEOUT", "300"))
 
 # Guard — hard limits for unattended runs, enforced by a PreToolUse hook
 # (see promptpilot/guard.py). "auto" wires it into exactly the runs where

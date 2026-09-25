@@ -1060,6 +1060,7 @@ def human_input(workflow_id: str,
                     "SELECT * FROM workflow_stages WHERE id=?",
                     (workflow["current_stage_id"],),
                 ).fetchone()
+            revision_limit_reason = None
             if current_stage:
                 spec = db._json_load(current_stage["spec_json"])
                 configured_limit = (
@@ -1071,18 +1072,40 @@ def human_input(workflow_id: str,
                        WHERE stage_id=? AND status='revision_required'""",
                     (current_stage["id"],),
                 ).fetchone()[0]
-                if revision_count >= int(configured_limit):
-                    if state is WorkflowStatus.AWAITING_HUMAN:
-                        return db._row_to_workflow(workflow)
-                    workflow = _transition(
-                        conn, workflow, WorkflowStatus.AWAITING_HUMAN,
-                        "limit.stage_revisions",
-                        {"text": action.text, "stage_id": current_stage["id"],
-                         "stage_code": current_stage["code"],
-                         "max_revision_rounds": int(configured_limit)},
-                        round_id=round_row["id"],
-                    )
+                revision_limit_reason = {
+                    "text": action.text, "stage_id": current_stage["id"],
+                    "stage_code": current_stage["code"],
+                    "max_revision_rounds": int(configured_limit),
+                }
+            else:
+                # Planless workflows have no stage row, but config.stage can
+                # still carry a revision budget. It used to be ignored here,
+                # so the executor/auditor loop ran unbounded (issue #88:
+                # 14+ rounds with max_revision_rounds=6).
+                stage_cfg = (db._json_load(workflow["config_json"]).get("stage") or {})
+                configured_limit = (
+                    stage_cfg.get("max_revision_rounds")
+                    or _config_for(db._row_to_workflow(workflow)).planning.max_revisions_per_stage
+                )
+                revision_count = conn.execute(
+                    """SELECT COUNT(*) FROM workflow_rounds
+                       WHERE workflow_id=? AND status='revision_required'""",
+                    (workflow["id"],),
+                ).fetchone()[0]
+                revision_limit_reason = {
+                    "text": action.text,
+                    "max_revision_rounds": int(configured_limit),
+                }
+            if revision_count >= int(configured_limit):
+                if state is WorkflowStatus.AWAITING_HUMAN:
                     return db._row_to_workflow(workflow)
+                workflow = _transition(
+                    conn, workflow, WorkflowStatus.AWAITING_HUMAN,
+                    "limit.stage_revisions",
+                    revision_limit_reason,
+                    round_id=round_row["id"],
+                )
+                return db._row_to_workflow(workflow)
             if not _check_round_budget(conn, workflow, next_round):
                 if state is WorkflowStatus.AWAITING_HUMAN:
                     return db._row_to_workflow(workflow)
@@ -1434,6 +1457,36 @@ def _dispatch_configured_role(workflow: WorkflowInDB,
     ))
 
 
+def _run_gate_command_windows(argv: list[str], cwd: str, timeout: int) -> subprocess.CompletedProcess:
+    """subprocess.run для gate-команды, убивающий по timeout всё ДЕРЕВО процессов.
+
+    Обычный run() на Windows по таймауту убивает только прямого потомка
+    (powershell.exe). Выжившие дети (cmd.exe / java / gradle daemon) держат
+    унаследованные хэндлы stdout/stderr, и повторный communicate() внутри run()
+    блокируется до их смерти — на практике часами (см. #80: gate "timeout=1800s"
+    фиксировался ровно через 3 часа — idle TTL gradle-демона). taskkill /T /F
+    закрывает дерево, пайпы освобождаются, TimeoutExpired уходит наверх как раньше.
+    """
+    proc = subprocess.Popen(
+        argv, cwd=cwd,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, errors="replace",
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        subprocess.run(
+            ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+            capture_output=True,
+        )
+        try:
+            proc.communicate(timeout=30)  # забрать вывод и корректно похоронить
+        except subprocess.TimeoutExpired:
+            pass
+        raise
+    return subprocess.CompletedProcess(argv, proc.returncode, stdout or "", stderr or "")
+
+
 def _run_gate_commands(workflow: WorkflowInDB) -> WorkflowGateDecision:
     gate = _config_for(workflow).gate
     stage = (
@@ -1464,13 +1517,16 @@ def _run_gate_commands(workflow: WorkflowInDB) -> WorkflowGateDecision:
             if os.name == "nt" else ["/bin/sh", "-lc", command]
         )
         try:
-            completed = subprocess.run(
-                argv,
-                cwd=workflow.repository_path,
-                capture_output=True,
-                text=True,
-                timeout=gate.timeout_seconds,
-                errors="replace",
+            completed = (
+                _run_gate_command_windows(argv, workflow.repository_path, gate.timeout_seconds)
+                if os.name == "nt" else subprocess.run(
+                    argv,
+                    cwd=workflow.repository_path,
+                    capture_output=True,
+                    text=True,
+                    timeout=gate.timeout_seconds,
+                    errors="replace",
+                )
             )
             output = ((completed.stdout or "") + (completed.stderr or ""))[-4000:]
             evidence.append(

@@ -1,4 +1,6 @@
+import json
 import os
+import sqlite3
 import subprocess
 import sys
 import time
@@ -112,6 +114,101 @@ def test_closing_after_root_exit_kills_lingering_descendant():
         assert _wait_not_running(descendant_pid)
     finally:
         tree.close()
+
+
+def test_failed_boundary_close_can_be_retried_without_losing_ownership(monkeypatch):
+    process = SimpleNamespace(kill=lambda: None)
+    if os.name == "nt":
+        calls = []
+
+        def terminate(job, code):
+            calls.append((job, code))
+            return len(calls) > 1
+
+        monkeypatch.setattr(process_tree, "_TerminateJobObject", terminate)
+        monkeypatch.setattr(
+            process_tree, "_windows_error",
+            lambda message: process_tree.ProcessTreeError(message),
+        )
+        monkeypatch.setattr(process_tree, "_CloseHandle", lambda _job: True)
+        tree = OwnedProcess(process, job=99)
+
+        with pytest.raises(process_tree.ProcessTreeError):
+            tree.close()
+        assert tree._job == 99
+        tree.close()
+        assert tree._job is None
+        assert calls == [(99, 1), (99, 1)]
+    else:
+        calls = []
+
+        def killpg(group_id, sig):
+            calls.append((group_id, sig))
+            if len(calls) == 1:
+                raise OSError("temporary kill failure")
+
+        monkeypatch.setattr(process_tree.os, "killpg", killpg)
+        tree = OwnedProcess(process, group_id=4242)
+
+        with pytest.raises(OSError, match="temporary"):
+            tree.close()
+        assert tree._group_id == 4242
+        tree.close()
+        assert tree._group_id is None
+        assert calls == [(4242, process_tree.signal.SIGKILL)] * 2
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Job Object setup")
+def test_windows_close_terminates_job_with_retained_handle_not_unrelated_process():
+    """Normal completion must not depend on PromptPilot owning the last handle."""
+    import ctypes
+    from ctypes import wintypes
+
+    duplicate_same_access = 0x00000002
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetCurrentProcess.argtypes = []
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.DuplicateHandle.argtypes = [
+        wintypes.HANDLE, wintypes.HANDLE, wintypes.HANDLE,
+        ctypes.POINTER(wintypes.HANDLE), wintypes.DWORD, wintypes.BOOL,
+        wintypes.DWORD,
+    ]
+    kernel32.DuplicateHandle.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    spawn_and_exit = (
+        "import subprocess, sys; "
+        "child = subprocess.Popen([sys.executable, '-c', %r], "
+        "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); "
+        "print(child.pid, flush=True)"
+    ) % SLEEP_CODE
+    unrelated = subprocess.Popen([sys.executable, "-c", SLEEP_CODE])
+    tree = OwnedProcess.start(
+        [sys.executable, "-c", spawn_and_exit],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    retained_job = wintypes.HANDLE()
+    try:
+        current = kernel32.GetCurrentProcess()
+        assert kernel32.DuplicateHandle(
+            current, tree._job, current, ctypes.byref(retained_job),
+            0, False, duplicate_same_access,
+        )
+        descendant_pid = int(tree.process.stdout.readline().strip())
+        tree.process.stdout.close()
+        tree.process.wait(timeout=10)
+
+        tree.close()
+
+        assert _wait_not_running(descendant_pid)
+        assert unrelated.poll() is None
+    finally:
+        tree.close()
+        if retained_job:
+            kernel32.CloseHandle(retained_job)
+        _stop_unrelated(unrelated)
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows Job Object setup")
@@ -283,15 +380,18 @@ def test_owned_herdr_close_failure_is_not_silently_accepted(monkeypatch):
     ]
 
 
-def test_owned_herdr_close_accepts_verified_missing_agent(monkeypatch):
+def test_owned_herdr_close_accepts_verified_missing_exact_ids_after_rename(
+        monkeypatch):
     responses = iter([
         (0, {"result": {}}, "closed"),
-        (1, {"error": {"code": "agent_not_found"}}, "not found"),
+        (0, {"result": {"tabs": []}}, "absent"),
+        (0, {"result": {"agents": []}}, "absent"),
     ])
     monkeypatch.setattr(herdr_exec, "_run", lambda *_args, **_kwargs: next(responses))
 
     assert herdr_exec._close_owned_session(
-        "pp-t42", ["tab", "close", "owned-tab"], host=None,
+        "renamed-agent", ["tab", "close", "owned-tab"], host=None,
+        pane_id="owned-pane",
     ) == ""
 
 
@@ -353,6 +453,47 @@ def test_rate_limit_is_not_requeued_when_owned_close_is_unverified(monkeypatch):
     assert outcome["ok"] is False
     assert outcome["rate_limited"] is False
     assert "still running" in outcome["error"]
+
+
+def test_pane_bookkeeping_failure_closes_tab_before_agent_start(monkeypatch):
+    calls = []
+    closed = []
+
+    def fake_run(args, host=None, timeout=None):
+        calls.append(args)
+        if args[:2] == ["tab", "create"]:
+            return 0, {"result": {
+                "root_pane": {"pane_id": "pane-1"},
+                "tab": {"tab_id": "tab-1"},
+            }}, ""
+        raise AssertionError(args)
+
+    task = SimpleNamespace(
+        id=42, herdr_target=None, model=None, effort=None, session_id=None,
+        skip_permissions=False, detached=False, working_dir=".", worktree=False,
+    )
+    monkeypatch.setattr(herdr_exec, "_ensure_server", lambda _host: None)
+    monkeypatch.setattr(herdr_exec, "_close_stale_tabs", lambda *_args: None)
+    monkeypatch.setattr(herdr_exec, "_run", fake_run)
+    monkeypatch.setattr(
+        herdr_exec, "_close_owned_session",
+        lambda name, close_args, host, **_kwargs: closed.append(
+            (name, close_args, host)) or "",
+    )
+
+    outcome = herdr_exec.run_in_herdr(
+        task, {"kind": "agy"},
+        on_pane=lambda _pane: (_ for _ in ()).throw(
+            sqlite3.OperationalError("database is locked")),
+        prompt_override="test prompt",
+    )
+
+    assert outcome["ok"] is False
+    assert "pane bookkeeping failed before agent start" in outcome["error"]
+    assert len(closed) == 1
+    assert closed[0][0].startswith("pp-t42-")
+    assert closed[0][1:] == (["tab", "close", "tab-1"], None)
+    assert not any(call[:2] == ["agent", "start"] for call in calls)
 
 
 def test_cancel_does_not_close_foreign_herdr_target(monkeypatch):
@@ -446,3 +587,126 @@ def test_worker_cancel_kills_provider_descendant(isolated_db, monkeypatch, tmp_p
     descendant_pid = int(child_pid_file.read_text())
     assert settled.status.value == "cancelled"
     assert _wait_not_running(descendant_pid)
+
+
+def test_worker_success_kills_provider_descendant_not_unrelated(
+        isolated_db, monkeypatch, tmp_path):
+    child_pid_file = tmp_path / "completed-provider-child.pid"
+    spawn_record_and_exit = (
+        "import pathlib, subprocess, sys; "
+        "child = subprocess.Popen([sys.executable, '-c', %r], "
+        "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); "
+        "pathlib.Path(sys.argv[1]).write_text(str(child.pid)); "
+        "print('provider completed')"
+    ) % SLEEP_CODE
+    command = [
+        sys.executable, "-c", spawn_record_and_exit, str(child_pid_file),
+    ]
+    unrelated = subprocess.Popen([sys.executable, "-c", SLEEP_CODE])
+    created = isolated_db.create_task(TaskCreate(
+        prompt="test owned process normal completion",
+        provider="process-tree-test",
+        working_dir=str(tmp_path),
+    ))
+    task = isolated_db.get_next_runnable()
+    assert task.id == created.id
+
+    monkeypatch.setattr(worker, "load_providers", lambda: {"process-tree-test": {}})
+    monkeypatch.setattr(worker, "build_cmd", lambda *_args, **_kwargs: command.copy())
+    monkeypatch.setattr(worker, "get_provider_env", lambda _provider: os.environ.copy())
+
+    try:
+        worker._execute_task_inner(task)
+
+        settled = isolated_db.get_task(task.id)
+        descendant_pid = int(child_pid_file.read_text())
+        assert settled.status.value == "completed"
+        assert _wait_not_running(descendant_pid)
+        assert unrelated.poll() is None
+    finally:
+        _stop_unrelated(unrelated)
+
+
+def test_headless_pipeline_success_without_closing_verdict_is_failed(
+        isolated_db, monkeypatch, tmp_path):
+    created = isolated_db.create_task(TaskCreate(
+        prompt="ExampleProject - REVIEW", recurrence="4h",
+        provider="process-tree-test", working_dir=str(tmp_path),
+    ))
+    task = isolated_db.get_next_runnable()
+    assert task.id == created.id
+
+    from promptpilot import pipeline_insights
+
+    monkeypatch.setattr(pipeline_insights, "dispatch_gate", lambda _task: None)
+    monkeypatch.setattr(
+        pipeline_insights, "execution_route",
+        lambda *_args, **_kwargs: {
+            "action": "prompt", "mode": "skill", "prompt": task.prompt,
+            "profile_id": "example", "queue_id": "review",
+        },
+    )
+    monkeypatch.setattr(worker, "load_providers", lambda: {"process-tree-test": {}})
+    monkeypatch.setattr(
+        worker, "build_cmd",
+        lambda *_args, **_kwargs: [
+            sys.executable, "-c", "print('work ended without verdict')",
+        ],
+    )
+    monkeypatch.setattr(worker, "get_provider_env", lambda _provider: os.environ.copy())
+
+    worker._execute_task_inner(task)
+
+    settled = isolated_db.get_task(task.id)
+    assert settled.status.value == "failed"
+    assert "without a closing ИТОГ verdict" in settled.error
+
+
+def test_headless_stream_pipeline_validates_verdict_before_stored_meta(
+        isolated_db, monkeypatch, tmp_path):
+    created = isolated_db.create_task(TaskCreate(
+        prompt="ExampleProject - REVIEW", recurrence="4h",
+        provider="process-tree-test", working_dir=str(tmp_path),
+    ))
+    task = isolated_db.get_next_runnable()
+    assert task.id == created.id
+
+    from promptpilot import pipeline_insights
+
+    events = [
+        {"type": "thread.started", "thread_id": "thread-603"},
+        {"type": "item.completed", "item": {
+            "type": "agent_message", "text": "ИТОГ: ГОТОВО (reviewed #1414)",
+        }},
+        {"type": "turn.completed", "usage": {
+            "input_tokens": 120, "cached_input_tokens": 80,
+            "output_tokens": 30, "reasoning_output_tokens": 10,
+        }},
+    ]
+    encoded_events = json.dumps(events, ensure_ascii=True)
+    script = (
+        "import json; events=json.loads(" + repr(encoded_events)
+        + "); [print(json.dumps(event)) for event in events]"
+    )
+    monkeypatch.setattr(pipeline_insights, "dispatch_gate", lambda _task: None)
+    monkeypatch.setattr(
+        pipeline_insights, "execution_route",
+        lambda *_args, **_kwargs: {
+            "action": "prompt", "mode": "skill", "prompt": task.prompt,
+            "profile_id": "example", "queue_id": "review",
+        },
+    )
+    monkeypatch.setattr(worker, "load_providers", lambda: {"process-tree-test": {}})
+    monkeypatch.setattr(
+        worker, "build_cmd", lambda *_args, **_kwargs: [sys.executable, "-c", script],
+    )
+    monkeypatch.setattr(worker, "get_provider_env", lambda _provider: os.environ.copy())
+
+    worker._execute_task_inner(task)
+
+    settled = isolated_db.get_task(task.id)
+    assert settled.status.value == "completed"
+    assert settled.verdict == "ГОТОВО"
+    assert settled.session_id == "thread-603"
+    assert "--- Meta ---" in settled.result
+    assert "Tokens: 120 in / 30 out" in settled.result

@@ -88,7 +88,7 @@ class TaskInDB(BaseModel):
     worktree_branch: Optional[str] = None
     herdr_pane: Optional[str] = None  # pane of a herdr-executor run (📺 in the bot)
     note: Optional[str] = None  # the human's late word, injected into the next attempt
-    verdict: Optional[str] = None  # ГОТОВО | УЖЕ СДЕЛАНО | НУЖЕН ЧЕЛОВЕК | НЕ СМОГ | ПУСТО (тихий: без TG-уведомления)
+    verdict: Optional[str] = None  # ГОТОВО | УЖЕ СДЕЛАНО | НУЖЕН ЧЕЛОВЕК | НЕ СМОГ | УСТАРЕЛО | ПУСТО
     series_id: Optional[int] = None
     series_title: Optional[str] = None
     series_paused: bool = False

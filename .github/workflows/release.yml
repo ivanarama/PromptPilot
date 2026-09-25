@@ -25,6 +25,16 @@ jobs:
           pip install -e .
           pip install pyinstaller
 
+      # Issue #79: a packaged pp.exe must be able to say which commit it was
+      # built from (`pp --version`). The module is generated and never tracked.
+      - name: Stamp build identity
+        shell: bash
+        run: |
+          cat > promptpilot/_build_commit.py <<EOF
+          BUILD_COMMIT = "${{ github.sha }}"
+          BUILD_LABEL = "${{ github.ref_name }}"
+          EOF
+
       - name: Build exe
         run: python -m PyInstaller pp.spec --clean
 
@@ -53,6 +63,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e .
           pip install pyinstaller
+
+      - name: Stamp build identity
+        shell: bash
+        run: |
+          cat > promptpilot/_build_commit.py <<EOF
+          BUILD_COMMIT = "${{ github.sha }}"
+          BUILD_LABEL = "${{ github.ref_name }}"
+          EOF
 
       - name: Build binary
         run: python -m PyInstaller pp.spec --clean
@@ -100,8 +118,54 @@ jobs:
           name: python-dist
           path: dist/
 
+  # Issue #79: the packaged Windows exe once shipped years-stale code while the
+  # source tree already had Workflows. Run the artifact, not the sources:
+  # the served UI must contain the Workflows panel and /api/workflows must
+  # answer, and --version must name the commit the exe was built from.
+  smoke-exe:
+    needs: [build-exe]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-zip
+
+      - name: Unpack
+        shell: pwsh
+        run: Expand-Archive -Path "PromptPilot-*-windows.zip" -DestinationPath pp-smoke
+
+      - name: --version carries the build identity
+        shell: pwsh
+        run: |
+          $v = & .\pp-smoke\pp.exe --version
+          Write-Host "pp --version → $v"
+          if ($v -notlike "*build*") { throw "--version has no build stamp (issue #79)" }
+
+      - name: Serve the exe and check Workflows UI + API
+        shell: pwsh
+        run: |
+          $proc = Start-Process -FilePath ".\pp-smoke\pp.exe" `
+            -ArgumentList "server", "--port", "8599" -PassThru
+          try {
+            $apiOk = $false
+            foreach ($i in 1..45) {
+              Start-Sleep -Seconds 2
+              try {
+                $api = Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:8599/api/workflows"
+                if ($api.StatusCode -eq 200) { $apiOk = $true; break }
+              } catch { if ($proc.HasExited) { throw "pp.exe exited during startup" } }
+            }
+            if (-not $apiOk) { throw "GET /api/workflows did not return 200" }
+            $page = Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:8599/"
+            if ($page.Content -notmatch "Workflows") { throw "served UI has no 'Workflows' (stale artifact?)" }
+            if ($page.Content -notmatch "workflowModal") { throw "served UI has no 'workflowModal'" }
+            Write-Host "OK: /api/workflows = 200, UI contains Workflows + workflowModal"
+          } finally {
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+          }
+
   release:
-    needs: [build-exe, build-exe-linux, build-wheel]
+    needs: [build-exe, build-exe-linux, build-wheel, smoke-exe]
     runs-on: ubuntu-latest
     permissions:
       contents: write

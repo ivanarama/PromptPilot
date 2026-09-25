@@ -12,3 +12,6 @@ logs/
 article_habr.md
 Переписка.txt
 Screenshot*.png
+promptpilot/_build_commit.py
+scripts/inbox/.state.json
+scripts/inbox/outbox/

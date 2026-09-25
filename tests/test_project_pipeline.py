@@ -1,6 +1,10 @@
 import copy
 import json
 import os
+from pathlib import Path
+import sqlite3
+import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from datetime import datetime, timezone
@@ -8,6 +12,7 @@ from datetime import datetime, timezone
 import pytest
 
 from promptpilot import project_pipeline as pp
+from promptpilot.models import TaskCreate
 
 
 HEAD = "a" * 40
@@ -137,6 +142,100 @@ def test_capabilities_is_executor_neutral(tmp_path):
     }), encoding="utf-8")
     config = pp.load_config(str(config_path))
     assert pp.capabilities(config)["protocol"] == "promptpilot-pipelinectl-v1"
+    assert config["github_timeout_seconds"] == 120
+    assert config["health_timeout_seconds"] == 300
+    assert config["merge_comment_backfill_timeout_seconds"] == 900
+
+
+@pytest.mark.parametrize("key,value", [
+    ("github_timeout_seconds", 0),
+    ("health_timeout_seconds", True),
+    ("merge_comment_backfill_timeout_seconds", 59),
+])
+def test_pipeline_timeouts_are_validated(tmp_path, key, value):
+    config_path = tmp_path / "pipelinectl.json"
+    config_path.write_text(json.dumps({
+        "repository": "owner/repo", "trusted_account": "owner",
+        "health_command": ["health", "--json"], key: value,
+    }), encoding="utf-8")
+
+    with pytest.raises(pp.PipelineError, match=key):
+        pp.load_config(str(config_path))
+
+
+def test_pipelinectl_applies_configured_github_timeout(
+        tmp_path, monkeypatch, capsys):
+    config_path = tmp_path / "pipelinectl.json"
+    config_path.write_text(json.dumps({
+        "repository": "owner/repo", "trusted_account": "owner",
+        "health_command": ["health", "--json"],
+        "github_timeout_seconds": 37,
+    }), encoding="utf-8")
+    gh = SimpleNamespace(timeout_seconds=None)
+    monkeypatch.setattr(pp, "GitHub", lambda: gh)
+    monkeypatch.setattr(
+        pp, "next_review",
+        lambda *_args, **_kwargs: {"action": "empty", "verdict": "ПУСТО"},
+    )
+
+    assert pp.run(["--config", str(config_path), "next", "review"]) == 0
+    assert gh.timeout_seconds == 37
+    assert json.loads(capsys.readouterr().out)["action"] == "empty"
+
+
+def test_pipelinectl_entrypoint_does_not_create_scheduler_database(tmp_path):
+    config_path = tmp_path / "pipelinectl.json"
+    config_path.write_text(json.dumps({
+        "repository": "owner/repo", "trusted_account": "owner",
+        "health_command": ["health", "--json"],
+    }), encoding="utf-8")
+    data_dir = tmp_path / "promptpilot-data"
+    env = os.environ.copy()
+    env["PP_DATA_DIR"] = str(data_dir)
+
+    completed = subprocess.run(
+        [sys.executable, "-m", "promptpilot", "pipelinectl", "--config",
+         str(config_path), "capabilities"],
+        cwd=Path(__file__).resolve().parents[1], env=env,
+        capture_output=True, text=True, timeout=5, encoding="utf-8",
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout)["protocol"] == "promptpilot-pipelinectl-v1"
+    assert not (data_dir / "promptpilot.db").exists()
+
+
+def test_pipelinectl_entrypoint_ignores_locked_scheduler_database(tmp_path):
+    config_path = tmp_path / "pipelinectl.json"
+    config_path.write_text(json.dumps({
+        "repository": "owner/repo", "trusted_account": "owner",
+        "health_command": ["health", "--json"],
+    }), encoding="utf-8")
+    data_dir = tmp_path / "promptpilot-data"
+    data_dir.mkdir()
+    database = data_dir / "promptpilot.db"
+    owner = sqlite3.connect(database)
+    owner.execute("CREATE TABLE sentinel (value INTEGER)")
+    owner.execute("INSERT INTO sentinel VALUES (1)")
+    owner.commit()
+    owner.execute("BEGIN IMMEDIATE")
+    owner.execute("UPDATE sentinel SET value = 2")
+    env = os.environ.copy()
+    env["PP_DATA_DIR"] = str(data_dir)
+
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-m", "promptpilot", "pipelinectl", "--config",
+             str(config_path), "capabilities"],
+            cwd=Path(__file__).resolve().parents[1], env=env,
+            capture_output=True, text=True, timeout=3, encoding="utf-8",
+        )
+    finally:
+        owner.rollback()
+        owner.close()
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout)["protocol"] == "promptpilot-pipelinectl-v1"
 
 
 def test_queue_priority_manual_auto_and_aging():
@@ -166,6 +265,104 @@ def test_health_exposes_configured_gh_to_nested_checker(monkeypatch):
     assert captured["env"]["PATH"].split(os.pathsep)[0] == os.path.dirname(gh)
 
 
+@pytest.mark.parametrize("stdout", ["", "not-json"])
+def test_health_preserves_wrapper_stderr_when_allowed_exit_has_no_json(
+        monkeypatch, stdout):
+    stderr = (
+        "GraphQL: API rate limit exceeded for user ID 12345. (HTTP 403)\n"
+        "exit status 2\n"
+    )
+    monkeypatch.setattr(
+        pp.subprocess, "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=1, stdout=stdout, stderr=stderr),
+    )
+
+    with pytest.raises(pp.PipelineError) as raised:
+        pp.run_health({"health_command": ["go", "run", "./tools/pipelinehealth", "--json"]})
+
+    assert str(raised.value) == stderr.strip()
+    assert "invalid JSON" not in str(raised.value)
+
+
+def test_health_keeps_valid_json_authoritative_on_allowed_exit(monkeypatch):
+    monkeypatch.setattr(
+        pp.subprocess, "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=1, stdout='{"state":"red"}', stderr="health is red"),
+    )
+
+    assert pp.run_health({"health_command": ["project-health", "--json"]}) == {
+        "state": "red",
+    }
+
+
+def test_health_success_with_invalid_json_remains_contract_error(monkeypatch):
+    monkeypatch.setattr(
+        pp.subprocess, "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0, stdout="not-json", stderr="non-fatal warning"),
+    )
+
+    with pytest.raises(pp.PipelineError, match="health command returned invalid JSON"):
+        pp.run_health({"health_command": ["project-health", "--json"]})
+
+
+def test_github_cli_timeout_is_bounded_and_structured(monkeypatch):
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr(pp.subprocess, "run", fake_run)
+    gh = pp.GitHub(executable="gh", timeout_seconds=17)
+
+    with pytest.raises(pp.PipelineError, match="GitHub CLI api timed out after 17s"):
+        gh.run("api", "user")
+
+    assert calls[0][1]["timeout"] == 17
+
+
+def test_health_timeout_is_bounded_and_structured(monkeypatch):
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr(pp.subprocess, "run", fake_run)
+
+    with pytest.raises(pp.PipelineError, match="health command timed out after 19s"):
+        pp.run_health({
+            "health_command": ["project-health", "--json"],
+            "health_timeout_seconds": 19,
+        })
+
+    assert calls[0][1]["timeout"] == 19
+
+
+def test_pipelinectl_reports_health_wrapper_stderr_in_error_payload(
+        tmp_path, monkeypatch, capsys):
+    config_path = tmp_path / "pipelinectl.json"
+    config_path.write_text(json.dumps({
+        "repository": "owner/repo", "trusted_account": "owner",
+        "health_command": ["go", "run", "./tools/pipelinehealth", "--json"],
+    }), encoding="utf-8")
+    stderr = "GitHub API rate limit exceeded; reset at 2026-09-14T01:00:00Z\nexit status 2\n"
+    monkeypatch.setattr(pp, "GitHub", lambda **_kwargs: object())
+    monkeypatch.setattr(
+        pp.subprocess, "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=1, stdout="", stderr=stderr),
+    )
+
+    assert pp.run(["--config", str(config_path), "next", "review"]) == 2
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {"action": "error", "error": stderr.strip()}
+
+
 def test_health_fast_forwards_clean_base_before_checker(monkeypatch):
     calls = []
     outputs = iter(["main\n", "", "", "", '{"state":"green"}'])
@@ -183,12 +380,37 @@ def test_health_fast_forwards_clean_base_before_checker(monkeypatch):
 
     assert result["state"] == "green"
     assert calls == [
-        ["git", "branch", "--show-current"],
-        ["git", "status", "--porcelain", "--untracked-files=no"],
-        ["git", "fetch", "origin", "--prune"],
-        ["git", "merge", "--ff-only", "origin/main"],
+        ["git", "-c", "maintenance.auto=false", "branch", "--show-current"],
+        ["git", "-c", "maintenance.auto=false", "status", "--porcelain", "--untracked-files=no"],
+        ["git", "-c", "maintenance.auto=false", "fetch", "--no-tags", "origin",
+         "+refs/heads/main:refs/remotes/origin/main"],
+        ["git", "-c", "maintenance.auto=false", "merge", "--ff-only", "origin/main"],
         ["project-health", "-json"],
     ]
+
+
+def test_base_sync_disables_auto_maintenance_and_bounds_git(monkeypatch):
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        if command[-2:] == ["branch", "--show-current"]:
+            return SimpleNamespace(returncode=0, stdout="main\n", stderr="")
+        if command[-3:] == ["status", "--porcelain", "--untracked-files=no"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr(pp.subprocess, "run", fake_run)
+
+    with pytest.raises(pp.PipelineError, match="git fetch timed out after 7s"):
+        pp.sync_base_before_health({
+            "base_branch": "main", "sync_base_before_health": True,
+            "base_sync_timeout_seconds": 7,
+        })
+
+    assert all(call[:3] == ["git", "-c", "maintenance.auto=false"]
+               for call, _kwargs in calls)
+    assert all(kwargs["timeout"] == 7 for _call, kwargs in calls)
 
 
 def test_next_review_reloads_config_after_base_sync(tmp_path, monkeypatch, capsys):
@@ -219,13 +441,14 @@ def test_next_review_reloads_config_after_base_sync(tmp_path, monkeypatch, capsy
 
     def fake_run(command, **_kwargs):
         calls.append(command)
-        if command == ["git", "branch", "--show-current"]:
+        if command == ["git", "-c", "maintenance.auto=false", "branch", "--show-current"]:
             return SimpleNamespace(returncode=0, stdout="main\n", stderr="")
-        if command == ["git", "status", "--porcelain", "--untracked-files=no"]:
+        if command == ["git", "-c", "maintenance.auto=false", "status", "--porcelain", "--untracked-files=no"]:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
-        if command == ["git", "fetch", "origin", "--prune"]:
+        if command == ["git", "-c", "maintenance.auto=false", "fetch", "--no-tags", "origin",
+                       "+refs/heads/main:refs/remotes/origin/main"]:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
-        if command == ["git", "merge", "--ff-only", "origin/main"]:
+        if command == ["git", "-c", "maintenance.auto=false", "merge", "--ff-only", "origin/main"]:
             config_path.write_text(json.dumps(updated), encoding="utf-8")
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         if command in (["old-health", "-json"], ["new-health", "-json"]):
@@ -276,13 +499,14 @@ def test_complete_review_fails_closed_if_gate_changes_during_sync(
     }), encoding="utf-8")
 
     def fake_run(command, **_kwargs):
-        if command == ["git", "branch", "--show-current"]:
+        if command == ["git", "-c", "maintenance.auto=false", "branch", "--show-current"]:
             return SimpleNamespace(returncode=0, stdout="main\n", stderr="")
-        if command == ["git", "status", "--porcelain", "--untracked-files=no"]:
+        if command == ["git", "-c", "maintenance.auto=false", "status", "--porcelain", "--untracked-files=no"]:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
-        if command == ["git", "fetch", "origin", "--prune"]:
+        if command == ["git", "-c", "maintenance.auto=false", "fetch", "--no-tags", "origin",
+                       "+refs/heads/main:refs/remotes/origin/main"]:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
-        if command == ["git", "merge", "--ff-only", "origin/main"]:
+        if command == ["git", "-c", "maintenance.auto=false", "merge", "--ff-only", "origin/main"]:
             config_path.write_text(json.dumps(updated), encoding="utf-8")
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         if command == ["project-health", "-json"]:
@@ -512,6 +736,47 @@ def test_complete_review_rechecks_expiry_before_first_mutation(tmp_path, monkeyp
         pp.complete_review(object(), config, pp.encode_signed_lease(lease), str(report))
 
 
+def test_complete_review_requires_live_replica_reservation_before_mutation(
+        isolated_db, tmp_path, monkeypatch):
+    config = {
+        "repository": "owner/repo", "trusted_account": "owner",
+        "base_branch": "main", "review_completion_gate": "target-v1",
+        "target_reservation_ttl_seconds": 300,
+    }
+    current = snapshot()
+    isolated_db.create_task(TaskCreate(prompt="complete review"))
+    owner = isolated_db.get_next_runnable()
+    started_at = owner.started_at.astimezone(timezone.utc).isoformat()
+    reservation = isolated_db.reserve_pipeline_target(
+        "owner/repo", "review", 42, HEAD, owner.id, 300,
+        task_started_at=started_at, ownership_kind="headless")
+    lease = target_review_lease(current)
+    lease.update({
+        "target_stage": "review", "target_reservation": reservation,
+    })
+    report = tmp_path / "report.json"
+    report.write_text(json.dumps({
+        "change": "safe change", "checks": ["pytest"],
+        "blocking": [], "tail": [],
+    }), encoding="utf-8")
+    monkeypatch.setenv("PP_TASK_ID", str(owner.id))
+    monkeypatch.setenv("PP_TASK_STARTED_AT", started_at)
+    monkeypatch.setenv("PP_PROVIDER_OWNERSHIP_KIND", "headless")
+    monkeypatch.setenv("PP_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setattr(pp, "ensure_identity", lambda _gh, _config: None)
+    monkeypatch.setattr(
+        pp, "stable_timeline",
+        lambda _gh, _config, _number: copy.deepcopy(current),
+    )
+    monkeypatch.setattr(
+        pp, "post_comment", lambda *_args: pytest.fail("mutation started"))
+    encoded = pp.encode_signed_lease(lease)
+    isolated_db.release_pipeline_target_reservations(owner.id)
+
+    with pytest.raises(pp.PipelineError, match="expired or was released"):
+        pp.complete_review(object(), config, encoded, str(report))
+
+
 @pytest.mark.parametrize("label", ["hold", "needs-decision", "changes-requested"])
 def test_content_review_target_gate_rejects_routing_labels(label):
     value = snapshot()
@@ -584,7 +849,7 @@ def test_plan_handoff_returns_approved_issue_to_fix():
                 return [{"name": value} for value in input_value["labels"]]
             raise AssertionError(path)
 
-        def run(self, *args, input_value=None, allow=(0,)):
+        def run(self, *args, input_value=None, allow=(0,), **_kwargs):
             if "--paginate" in args:
                 return ""
             self.removed.append(args[-1].rsplit("/", 1)[-1])
@@ -636,7 +901,9 @@ def test_same_repo_closing_issues_preserve_repository_identity():
     assert pp.same_repo_closing_issues(body, "owner/repo") == [3, 9, 17]
 
 
-def test_pending_merge_intents_skip_completed_and_untrusted_comments():
+def test_pending_merge_intents_skip_completed_and_untrusted_comments(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("PP_DATA_DIR", str(tmp_path))
     intent_1 = (
         f"<!-- pp:merge-cleanup-intent head={HEAD} proof-sha256={'b' * 64} "
         f"body-sha256={'c' * 64} issues=3,9 -->"
@@ -673,7 +940,323 @@ def test_pending_merge_intents_skip_completed_and_untrusted_comments():
     ]
 
 
-def test_recover_merge_cleanup_finishes_labels_before_done(monkeypatch):
+def _repository_comment(comment_id, body, *, number=42,
+                        created="2026-01-01T00:00:00Z", updated=None,
+                        login="owner"):
+    return {
+        "id": comment_id,
+        "body": body,
+        "user": {"login": login},
+        "created_at": created,
+        "updated_at": updated or created,
+        "issue_url": f"https://api.github.com/repos/owner/repo/issues/{number}",
+    }
+
+
+def test_merge_comment_index_backfills_once_then_scans_only_updated_delta(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("PP_DATA_DIR", str(tmp_path))
+    clock = iter([
+        datetime(2026, 1, 1, 0, 10, tzinfo=timezone.utc),
+        datetime(2026, 1, 1, 0, 20, tzinfo=timezone.utc),
+    ])
+    monkeypatch.setattr(pp, "_utc_now", lambda: next(clock))
+    config = {
+        "repository": "owner/repo", "trusted_account": "owner",
+        "merge_comment_backfill_timeout_seconds": 777,
+    }
+    intent_body = (
+        f"<!-- pp:merge-cleanup-intent head={HEAD} proof-sha256={'b' * 64} "
+        f"body-sha256={'c' * 64} issues=none -->"
+    )
+    baseline = [
+        _repository_comment(10, "ordinary", created="2026-01-01T00:00:00Z"),
+        # Seen near the end of a long initial pagination.  It must not move the
+        # durable watermark past an unseen marker created during that scan.
+        _repository_comment(11, "late page", created="2026-01-01T00:19:00Z"),
+    ]
+    intent = _repository_comment(
+        20, intent_body, created="2026-01-01T00:11:00Z")
+
+    class FakeGitHub:
+        def __init__(self):
+            self.queries = []
+            self.timeouts = []
+
+        def run(self, *args, **_kwargs):
+            query = next(item for item in args if item.startswith("repos/"))
+            self.queries.append(query)
+            self.timeouts.append(_kwargs.get("timeout_seconds"))
+            values = baseline if "&since=" not in query else [intent]
+            return "\n".join(json.dumps(item) for item in values)
+
+    gh = FakeGitHub()
+    assert pp.pending_merge_intents(gh, config) == []
+    assert [item["id"] for item in pp.pending_merge_intents(gh, config)] == [20]
+
+    assert len(gh.queries) == 2
+    assert "sort=created&direction=asc" in gh.queries[0]
+    assert "&since=" not in gh.queries[0]
+    assert "&since=2026-01-01T00:05:00Z" in gh.queries[1]
+    assert "sort=updated&direction=asc" in gh.queries[1]
+    assert gh.timeouts == [777, None]
+    assert not (tmp_path / "promptpilot.db").exists()
+
+
+def test_long_backfill_watermark_catches_concurrent_marker_edit(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("PP_DATA_DIR", str(tmp_path))
+    clock = iter([
+        datetime(2026, 1, 1, 0, 10, tzinfo=timezone.utc),
+        datetime(2026, 1, 1, 0, 30, tzinfo=timezone.utc),
+    ])
+    monkeypatch.setattr(pp, "_utc_now", lambda: next(clock))
+    config = {"repository": "owner/repo", "trusted_account": "owner"}
+    body = (
+        f"<!-- pp:merge-cleanup-intent head={HEAD} proof-sha256={'b' * 64} "
+        f"body-sha256={'c' * 64} issues=none -->"
+    )
+    original = _repository_comment(30, body)
+    edited = _repository_comment(
+        30, body + " edited", created="2026-01-01T00:00:00Z",
+        updated="2026-01-01T00:11:00Z")
+    late_page = _repository_comment(
+        31, "late page", created="2026-01-01T00:20:00Z")
+
+    class FakeGitHub:
+        def __init__(self):
+            self.calls = 0
+            self.queries = []
+
+        def run(self, *args, **_kwargs):
+            self.calls += 1
+            self.queries.append(next(
+                item for item in args if item.startswith("repos/")))
+            values = [original, late_page] if self.calls == 1 else [edited]
+            return "\n".join(json.dumps(value) for value in values)
+
+    gh = FakeGitHub()
+    assert [item["id"] for item in pp.pending_merge_intents(gh, config)] == [30]
+    assert pp.pending_merge_intents(gh, config) == []
+    assert "&since=2026-01-01T00:05:00Z" in gh.queries[1]
+
+
+def test_comment_scan_tolerates_duplicate_id_at_same_timestamp():
+    config = {"repository": "owner/repo", "trusted_account": "owner"}
+    body = pp.intent_body(HEAD, {"review_id": 17}, "", [])
+    marker = _repository_comment(35, body)
+    edited = _repository_comment(35, body + " edited")
+    state = pp._new_merge_comment_index(config)
+
+    pp._apply_merge_comments(state, [marker, edited], config)
+
+    assert pp._pending_from_merge_comment_index(state) == []
+
+
+def test_empty_repository_backfill_persists_scan_start_for_next_delta(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("PP_DATA_DIR", str(tmp_path))
+    clock = iter([
+        datetime(2026, 1, 1, 0, 10, tzinfo=timezone.utc),
+        datetime(2026, 1, 1, 0, 20, tzinfo=timezone.utc),
+    ])
+    monkeypatch.setattr(pp, "_utc_now", lambda: next(clock))
+    config = {"repository": "owner/repo", "trusted_account": "owner"}
+    body = pp.intent_body(HEAD, {"review_id": 17}, "", [])
+    intent = _repository_comment(
+        40, body, created="2026-01-01T00:11:00Z")
+
+    class FakeGitHub:
+        def __init__(self):
+            self.queries = []
+
+        def run(self, *args, **_kwargs):
+            query = next(item for item in args if item.startswith("repos/"))
+            self.queries.append(query)
+            return "" if len(self.queries) == 1 else json.dumps(intent)
+
+    gh = FakeGitHub()
+    assert pp.pending_merge_intents(gh, config) == []
+    state = json.loads(
+        pp._merge_comment_index_path(config).read_text(encoding="utf-8"))
+    assert state["initialized"] is True
+    assert state["checkpoint"] == "2026-01-01T00:10:00Z"
+
+    assert [item["id"] for item in pp.pending_merge_intents(gh, config)] == [40]
+    assert "&since=2026-01-01T00:05:00Z" in gh.queries[1]
+
+
+def test_corrupt_merge_comment_index_fails_closed_without_github_scan(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("PP_DATA_DIR", str(tmp_path))
+    config = {"repository": "owner/repo", "trusted_account": "owner"}
+    path = pp._merge_comment_index_path(config)
+    path.parent.mkdir(parents=True)
+    path.write_text("{}", encoding="utf-8")
+
+    class FakeGitHub:
+        def run(self, *_args, **_kwargs):
+            pytest.fail("a corrupt durable index must not be silently replaced")
+
+    with pytest.raises(pp.PipelineError, match="invalid identity or schema"):
+        pp.pending_merge_intents(FakeGitHub(), config)
+
+
+def test_direct_intent_does_not_advance_listing_checkpoint_or_hide_a_racer(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("PP_DATA_DIR", str(tmp_path))
+    clock = iter([
+        datetime(2026, 1, 1, 0, 10, tzinfo=timezone.utc),
+        datetime(2026, 1, 1, 0, 11, tzinfo=timezone.utc),
+        datetime(2026, 1, 1, 0, 12, tzinfo=timezone.utc),
+    ])
+    monkeypatch.setattr(pp, "_utc_now", lambda: next(clock))
+    config = {"repository": "owner/repo", "trusted_account": "owner"}
+    baseline = _repository_comment(10, "ordinary")
+    own_body = pp.intent_body(HEAD, {"review_id": 17}, "", [])
+    own = _repository_comment(
+        100, own_body, created="2026-01-01T00:30:00Z")
+    racer_body = pp.intent_body("d" * 40, {"review_id": 18}, "", [])
+    racer = _repository_comment(
+        99, racer_body, number=43, created="2026-01-01T00:10:30Z")
+
+    class FakeGitHub:
+        def __init__(self):
+            self.scans = 0
+            self.expose_racer = False
+
+        def run(self, *args, **_kwargs):
+            if args[:2] != ("api", "--paginate"):
+                raise AssertionError(args)
+            self.scans += 1
+            values = [baseline] if self.scans == 1 else []
+            if self.expose_racer:
+                values.append(racer)
+            return "\n".join(json.dumps(item) for item in values)
+
+        def json(self, *args, input_value=None):
+            assert args[-2:] == ("--input", "-")
+            assert input_value == {"body": own_body}
+            return own
+
+    gh = FakeGitHub()
+    reserved, pending = pp.reserve_merge_intent(gh, config, 42, own_body)
+    assert reserved["id"] == 100
+    assert [item["id"] for item in pending] == [100]
+    state = json.loads(pp._merge_comment_index_path(config).read_text(encoding="utf-8"))
+    assert state["checkpoint"] == "2026-01-01T00:11:00Z"
+
+    gh.expose_racer = True
+    assert [item["id"] for item in pp.pending_merge_intents(gh, config)] == [99, 100]
+
+
+def test_merge_intent_publication_is_single_flight_across_local_processors(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("PP_DATA_DIR", str(tmp_path))
+    config = {"repository": "owner/repo", "trusted_account": "owner"}
+    baseline = _repository_comment(10, "ordinary")
+    posted = []
+
+    class FakeGitHub:
+        def run(self, *args, **_kwargs):
+            assert args[:2] == ("api", "--paginate")
+            return json.dumps(baseline)
+
+        def json(self, *args, input_value=None):
+            number = int(args[1].split("/issues/", 1)[1].split("/", 1)[0])
+            comment = _repository_comment(
+                100 + len(posted), input_value["body"], number=number,
+                created="2026-01-01T00:01:00Z")
+            posted.append(comment)
+            return comment
+
+    gh = FakeGitHub()
+    first = pp.intent_body(HEAD, {"review_id": 1}, "", [])
+    second = pp.intent_body("d" * 40, {"review_id": 2}, "", [])
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(
+            lambda item: pp.reserve_merge_intent(gh, config, *item),
+            [(42, first), (43, second)],
+        ))
+
+    assert len(posted) == 1
+    assert sum(result[0] is not None for result in results) == 1
+    assert all([item["id"] for item in result[1]] == [100] for result in results)
+
+
+@pytest.mark.parametrize("marker", ["missing", "edited"])
+def test_cached_intent_must_still_be_exact_in_open_pr_timeline(
+        monkeypatch, marker):
+    config = {
+        "repository": "owner/repo", "trusted_account": "owner",
+        "base_branch": "main", "allow_no_checks": True,
+    }
+    body = pp.intent_body(HEAD, {"review_id": 17}, "", [])
+    intent = pp.parse_merge_intent(_repository_comment(70, body), config)
+    value = snapshot()
+    if marker == "edited":
+        value["edges"].append(trusted_comment("c2", 70, body + " edited"))
+
+    class FakeGitHub:
+        def json(self, *_args, **_kwargs):
+            return {
+                "state": "open", "merged": False,
+                "head": {"sha": HEAD}, "base": {"ref": "main"},
+            }
+
+    monkeypatch.setattr(pp, "stable_timeline", lambda *_: value)
+    monkeypatch.setattr(
+        pp, "pr_checks",
+        lambda *_: pytest.fail("an absent exact marker must stop before checks"),
+    )
+
+    result = pp.pending_merge_action(FakeGitHub(), config, intent)
+
+    assert result == {
+        "action": "fallback",
+        "reason": "merge cleanup intent is missing or edited in GraphQL timeline",
+    }
+
+
+def test_complete_merge_revalidates_exact_intent_before_mutation(monkeypatch):
+    config = {
+        "repository": "owner/repo", "trusted_account": "owner",
+        "base_branch": "main", "merge_method": "merge",
+        "allow_no_checks": True,
+    }
+    established = {"review_id": 17}
+    body = pp.intent_body(HEAD, established, "", [])
+    intent = pp.parse_merge_intent(_repository_comment(70, body), config)
+    value = snapshot(ship_event("c2"))
+    value["labels"] = ["ship"]
+    lease = {
+        "version": 1, "stage": "merge", "repository": "owner/repo",
+        "number": 42, "head": HEAD, "snapshot": pp.digest(value),
+        "proof": established, "intent": intent,
+    }
+
+    class FakeGitHub:
+        def json(self, *args, **_kwargs):
+            pytest.fail(f"merge mutation must not run: {args}")
+
+    monkeypatch.setattr(pp, "ensure_identity", lambda *_: None)
+    monkeypatch.setattr(pp, "run_health", lambda *_args, **_kwargs: {"state": "green"})
+    monkeypatch.setattr(pp, "stable_timeline", lambda *_: value)
+    monkeypatch.setattr(pp, "epoch", lambda *_: {})
+    monkeypatch.setattr(pp, "validate_epoch_safety", lambda *_: None)
+    monkeypatch.setattr(pp, "proof", lambda *_: established)
+    monkeypatch.setattr(
+        pp, "pr_checks",
+        lambda *_: ({"mergeStateStatus": "CLEAN", "mergeable": "MERGEABLE",
+                     "body": ""}, []),
+    )
+
+    with pytest.raises(pp.PipelineError, match="missing or edited"):
+        pp.complete_merge(FakeGitHub(), config, pp.encode_lease(lease))
+
+
+def test_recover_merge_cleanup_finishes_labels_before_done(tmp_path, monkeypatch):
+    monkeypatch.setenv("PP_DATA_DIR", str(tmp_path))
     comments = []
 
     class FakeGitHub:
@@ -686,11 +1269,17 @@ def test_recover_merge_cleanup_finishes_labels_before_done(monkeypatch):
                 return {"login": "owner"}
             if path.endswith("/comments"):
                 comments.append(input_value["body"])
-                return {"id": 900, "body": input_value["body"], "user": {"login": "owner"}}
+                return {
+                    "id": 900, "body": input_value["body"],
+                    "user": {"login": "owner"},
+                    "created_at": "2026-01-01T00:03:00Z",
+                    "updated_at": "2026-01-01T00:03:00Z",
+                    "issue_url": "https://api.github.com/repos/owner/repo/issues/42",
+                }
             number = int(path.rsplit("/", 1)[-1])
             return {"state": "closed", "labels": [{"name": value} for value in sorted(self.labels[number])]}
 
-        def run(self, *args, input_value=None, allow=(0,)):
+        def run(self, *args, input_value=None, allow=(0,), **_kwargs):
             if "--paginate" in args:
                 return ""
             path = args[-1]

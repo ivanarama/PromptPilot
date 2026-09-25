@@ -5,11 +5,40 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 
 _RELEASES_URL = "https://api.github.com/repos/ivanarama/PromptPilot/releases/latest"
 _CACHE_FILE = Path.home() / ".promptpilot" / "version-check.json"
 _CACHE_HOURS = 24
+
+
+def _load_build_meta() -> dict:
+    """Commit/label stamped into release binaries at build time (issue #79).
+
+    release.yml writes ``promptpilot/_build_commit.py`` right before
+    PyInstaller runs, so a packaged pp.exe can tell which commit it was built
+    from. In a source checkout (and the wheel) the module does not exist.
+    """
+    try:
+        from ._build_commit import BUILD_COMMIT, BUILD_LABEL
+    except ImportError:
+        return {}
+    return {"commit": BUILD_COMMIT or "", "label": BUILD_LABEL or ""}
+
+
+_BUILD_META = _load_build_meta()
+
+
+def full_version() -> str:
+    """``0.5.1`` in dev; ``0.5.1 build 171f3e5a12 v0.5.1`` in stamped builds."""
+    parts = [__version__]
+    commit = _BUILD_META.get("commit")
+    if commit:
+        parts.append(f"build {commit[:10]}")
+    label = _BUILD_META.get("label")
+    if label:
+        parts.append(label)
+    return " ".join(parts)
 
 
 def _compare(a: str, b: str) -> int:

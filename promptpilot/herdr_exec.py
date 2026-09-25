@@ -63,17 +63,48 @@ OVERLOADED_RE = re.compile(
 PROMPT_STALL_RETRIES = 3
 WORKFLOW_IDLE_GRACE_SECONDS = 30
 WORKFLOW_CONTRACT_MARKER = '<promptpilot-workflow-contract version="w1-verdict-v1">'
+WORKFLOW_CONTRACT_END = "</promptpilot-workflow-contract>"
+WORKFLOW_CONTRACT_SUFFIX = f"""{WORKFLOW_CONTRACT_MARKER}
+Последняя непустая строка ответа должна быть ровно одного из форматов:
+ИТОГ: ГОТОВО (краткая причина)
+ИТОГ: УЖЕ СДЕЛАНО (краткая причина)
+ИТОГ: НУЖЕН ЧЕЛОВЕК (краткая причина)
+ИТОГ: НЕ СМОГ (краткая причина)
+ИТОГ: ПУСТО (краткая причина)
+{WORKFLOW_CONTRACT_END}"""
 WORKFLOW_CLOSING_VERDICT_RE = re.compile(
-    r"^ИТОГ:\s*(ГОТОВО|УЖЕ СДЕЛАНО|НУЖЕН ЧЕЛОВЕК|НЕ СМОГ)(?:\s*[—-].*)?$",
+    r"^ИТОГ:\s*(ГОТОВО|УЖЕ СДЕЛАНО|НУЖЕН ЧЕЛОВЕК|НЕ СМОГ|ПУСТО)"
+    r"(?:\s*(?:[—-]\s*.*|\([^\r\n)]*\)))?$",
+    re.IGNORECASE,
+)
+TARGETED_STALE_CLOSING_VERDICT_RE = re.compile(
+    r"^ИТОГ:\s*УСТАРЕЛО\s+\(gate-fallback:\s*(?=\S).+\)$",
     re.IGNORECASE,
 )
 AGY_BACKGROUND_RUNNING_RE = re.compile(
-    r"(?mi)^\s*[●•]\s*\[[^\]]+\].*\brunning\s*$"
+    r"(?mi)^(?:\s*[●•]\s*\[[^\]]+\].*\brunning\s*"
+    r"|\s*[\u2800-\u28ff]\s+Running command(?:\.\.\.)?\s*)$"
 )
 
 
 class HerdrError(Exception):
     pass
+
+
+def ensure_closing_verdict_contract(
+        prompt: str, *, allow_targeted_stale: bool = False) -> str:
+    """Add a trusted response boundary and closing-verdict contract once."""
+    if (WORKFLOW_CONTRACT_MARKER in prompt
+            and prompt.rstrip().endswith(WORKFLOW_CONTRACT_END)):
+        return prompt
+    suffix = WORKFLOW_CONTRACT_SUFFIX
+    if allow_targeted_stale:
+        suffix = suffix.replace(
+            "ИТОГ: ПУСТО (краткая причина)",
+            "ИТОГ: УСТАРЕЛО (gate-fallback: точная причина)\n"
+            "ИТОГ: ПУСТО (краткая причина)",
+        )
+    return f"{prompt.rstrip()}\n\n{suffix}"
 
 
 def herdr_argv(args, host=None) -> list:
@@ -141,23 +172,69 @@ def _run(args, host=None, timeout=None):
     return proc.returncode, data, raw
 
 
-def _close_owned_session(name: str, close_args: list, host=None) -> str:
+def _owned_container_probe(close_args: list) -> tuple[list[str], str, str]:
+    """Return list command, result collection, and immutable id to verify."""
+    if close_args[:2] == ["tab", "close"] and len(close_args) >= 3:
+        return ["tab", "list"], "tabs", str(close_args[2])
+    if close_args[:2] == ["workspace", "close"] and len(close_args) >= 3:
+        return ["workspace", "list"], "workspaces", str(close_args[2])
+    if close_args[:2] == ["worktree", "remove"]:
+        try:
+            index = close_args.index("--workspace")
+            workspace_id = str(close_args[index + 1])
+        except (ValueError, IndexError):
+            return [], "", ""
+        return ["workspace", "list"], "workspaces", workspace_id
+    return [], "", ""
+
+
+def _exact_herdr_ids_absent(close_args: list, pane_id: str, host=None) -> tuple[bool, str]:
+    """Prove immutable container and pane IDs disappeared after cleanup."""
+    list_args, collection, container_id = _owned_container_probe(close_args)
+    if not list_args or not container_id:
+        return False, "invalid owned-session close descriptor"
+    rc, data, raw = _run(list_args, host=host, timeout=10)
+    values = _dig(data, "result", collection, default=None)
+    if rc != 0 or not isinstance(values, list):
+        return False, raw or f"herdr {list_args[0]} list failed"
+    id_field = "tab_id" if collection == "tabs" else "workspace_id"
+    if any(not isinstance(value, dict)
+           or not isinstance(value.get(id_field), str)
+           or not value.get(id_field) for value in values):
+        return False, f"herdr {collection} list is malformed"
+    if any(str(value.get(id_field) or "") == container_id for value in values):
+        return False, f"owned {id_field} {container_id} is still present"
+    if pane_id:
+        rc, data, raw = _run(["agent", "list"], host=host, timeout=10)
+        agents = _dig(data, "result", "agents", default=None)
+        if rc != 0 or not isinstance(agents, list):
+            return False, raw or "herdr agent list failed"
+        if any(not isinstance(agent, dict)
+               or not isinstance(agent.get("pane_id"), str)
+               or not agent.get("pane_id") for agent in agents):
+            return False, "herdr agent list is malformed"
+        if any(str(agent.get("pane_id") or "") == pane_id for agent in agents):
+            return False, f"owned pane_id {pane_id} is still present"
+    return True, ""
+
+
+def _close_owned_session(name: str, close_args: list, host=None, *,
+                         pane_id: str = "") -> str:
     """Close and verify a PromptPilot-owned herdr session.
 
     A failed best-effort close must not be reported as a successful task
-    cancellation: the agent could still be changing its checkout.  Repeating
-    the exact tab/workspace command is safe, and never targets the shared
-    server or a user-provided ``herdr_target``.
+    cancellation: the agent could still be changing its checkout. Repeating
+    the exact tab/workspace command is safe. Success is proved by immutable
+    container/pane IDs, never by the mutable agent/tab/workspace label.
     """
     last_raw = ""
     for _ in range(3):
         # Let _run choose the operation-aware bound: worktree removal gets the
         # longer configured allowance, while tab/workspace close stays short.
         _, _, close_raw = _run(close_args, host=host)
-        rc, data, probe_raw = _run(["agent", "get", name], host=host, timeout=10)
-        # Only herdr's explicit not-found response proves absence. A successful
-        # but incomplete/unknown schema is not evidence that the agent stopped.
-        if rc != 0 and _error_code(data) == "agent_not_found":
+        absent, probe_raw = _exact_herdr_ids_absent(
+            close_args, pane_id, host)
+        if absent:
             return ""
         last_raw = probe_raw or close_raw
         time.sleep(0.2)
@@ -328,11 +405,12 @@ def _trim_transcript(raw: str, prompt: str) -> str:
     # Workflow prompts contain verdict examples.  Do not return those examples
     # as task output (the generic verdict parser would otherwise accept the
     # echoed ГОТОВО).  The actual assistant turn begins after the closing tag.
+    contract_boundary_found = False
     if WORKFLOW_CONTRACT_MARKER in prompt:
         for i in range(start, len(lines)):
-            if "</promptpilot-workflow-contract>" in lines[i]:
+            if WORKFLOW_CONTRACT_END in lines[i]:
                 start = i + 1
-                break
+                contract_boundary_found = True
 
     # The bottom input box begins at the first *full-width* ─ separator after
     # start.  Markdown horizontal rules rendered inside an agy report are only
@@ -354,7 +432,9 @@ def _trim_transcript(raw: str, prompt: str) -> str:
         end -= 1
 
     out = "\n".join(lines[start:end]).strip()
-    return out if out else raw.strip()
+    if out or contract_boundary_found:
+        return out
+    return raw.strip()
 
 
 def _retry_reason(cleaned: str):
@@ -389,10 +469,11 @@ def _looks_env_failure(cleaned: str) -> str:
     return env_failure(response_only)
 
 
-def _closing_workflow_verdict(cleaned: str) -> str:
+def _closing_workflow_verdict(
+        cleaned: str, *, allow_targeted_stale: bool = False) -> str:
     """Return a workflow verdict only when it is the final response line.
 
-    The prompt itself contains all four allowed verdict examples. Searching the
+    The prompt itself can contain all allowed verdict examples. Searching the
     whole transcript would therefore accept the echoed contract before the
     agent had done any work. The workflow contract requires the verdict on the
     last line, which is both safer and easier to observe across agent UIs.
@@ -400,13 +481,31 @@ def _closing_workflow_verdict(cleaned: str) -> str:
     lines = [line for line in (cleaned or "").splitlines() if line.strip()]
     if not lines:
         return ""
-    match = WORKFLOW_CLOSING_VERDICT_RE.fullmatch(lines[-1].strip())
-    if not match and len(lines) >= 2 and lines[-1][:1].isspace():
-        # Narrow agy terminals wrap the final verdict.  The first physical line
-        # still contains the verdict and its dash text; the indented last line
-        # is only a visual continuation, not a later assistant paragraph.
-        match = WORKFLOW_CLOSING_VERDICT_RE.fullmatch(lines[-2].strip())
-    return match.group(1).upper() if match else ""
+    candidates = [lines[-1].strip()]
+    # Narrow agy terminals can wrap a detailed verdict across several physical
+    # lines.  A continuation is presentation-only only when every later line is
+    # indented; cap the look-behind so an older verdict in prose is never joined
+    # to an arbitrarily long answer.
+    for start in range(len(lines) - 2, max(-1, len(lines) - 9), -1):
+        if (lines[start].lstrip().upper().startswith("ИТОГ:")
+                and all(line[:1].isspace() for line in lines[start + 1:])):
+            candidates.append(" ".join(
+                line.strip() for line in lines[start:]
+            ))
+            break
+    for candidate in candidates:
+        if (allow_targeted_stale
+                and TARGETED_STALE_CLOSING_VERDICT_RE.fullmatch(candidate)):
+            return "УСТАРЕЛО"
+        match = WORKFLOW_CLOSING_VERDICT_RE.fullmatch(candidate)
+        if match:
+            return match.group(1).upper()
+        if re.match(r"^ИТОГ:\s*УСТАРЕЛО\b", candidate, re.IGNORECASE):
+            # Only a targeted fallback route may safely ask for re-election,
+            # and only with its exact gate-fallback evidence wrapper. Treat an
+            # invented or malformed stale result as a real execution failure.
+            return "НЕ СМОГ"
+    return ""
 
 
 def _has_running_background_task(text: str) -> bool:
@@ -415,25 +514,28 @@ def _has_running_background_task(text: str) -> bool:
 
 
 def _stabilize_workflow_completion(name, prompt, state, raw, deadline,
-                                   cancel_check, on_blocked=None, host=None):
+                                   cancel_check, on_blocked=None, host=None,
+                                   require_closing_verdict=False,
+                                   allow_targeted_stale=False):
     """Do not treat a transient idle between agy background tasks as done.
 
     Antigravity can briefly return to an idle prompt while a managed background
-    task or a self-relaunched process continues. For W1 prompts we have a much
+    task or a self-relaunched process continues. Pipeline and W1 prompts have a
     stronger completion contract: the final response must end in ``ИТОГ:``.
     Keep observing the existing pane until that marker appears, or until the
-    pane stays idle for a full grace period (then normal invalid-output handling
-    is allowed to take over).
+    pane stays idle for a full grace period (then the caller rejects the output
+    as an invalid completion).
     """
-    if WORKFLOW_CONTRACT_MARKER not in prompt:
+    if not require_closing_verdict and WORKFLOW_CONTRACT_MARKER not in prompt:
         return state, raw
 
     idle_since = time.monotonic() if state in {"idle", "done"} else None
+    blocked_since = time.monotonic() if state == "blocked" else None
     blocked_reported = False
     while True:
         if cancel_check and cancel_check():
             return "__cancel__", raw
-        if deadline and time.monotonic() > deadline:
+        if deadline and blocked_since is None and time.monotonic() > deadline:
             return "__timeout__", raw
 
         rc, _, recent = _run(
@@ -445,7 +547,10 @@ def _stabilize_workflow_completion(name, prompt, state, raw, deadline,
         if rc == 0:
             raw = recent
             background_running = _has_running_background_task(recent)
-            if _closing_workflow_verdict(_trim_transcript(recent, prompt)):
+            if (state in {"idle", "done"} and not background_running
+                    and _closing_workflow_verdict(
+                        _trim_transcript(recent, prompt),
+                        allow_targeted_stale=allow_targeted_stale)):
                 return state, raw
 
         rc, data, status_raw = _run(["agent", "get", name], host=host)
@@ -454,9 +559,18 @@ def _stabilize_workflow_completion(name, prompt, state, raw, deadline,
         state = _agent_status(data)
         if state == "blocked":
             idle_since = None
+            if blocked_since is None:
+                blocked_since = time.monotonic()
             if on_blocked and not blocked_reported:
                 on_blocked(_dig(data, "result", "agent", "pane_id") or name)
                 blocked_reported = True
+        else:
+            if blocked_since is not None:
+                if deadline:
+                    deadline += max(0, time.monotonic() - blocked_since)
+                blocked_since = None
+        if state == "blocked":
+            pass
         elif state == "working":
             idle_since = None
             blocked_reported = False
@@ -495,12 +609,20 @@ def _wait_settled(name, until_args, deadline, cancel_check, host=None):
 
 def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
                  cancel_check=None, keep_pane: bool = None, host: str = None,
-                 on_worktree=None, on_pane=None, prompt_override: str = None) -> dict:
+                 on_worktree=None, on_pane=None, on_session=None,
+                 on_started=None,
+                 prompt_override: str = None,
+                 require_closing_verdict: bool = False,
+                 allow_targeted_stale: bool = False) -> dict:
     """Run a task in a herdr-managed agent session.
 
     on_blocked(pane_id) is called once when the agent first enters ``blocked``.
     on_pane(pane_id) is called as soon as the pane is known — the bot's task
     card wants a «📺 Экран» button while the run is still going.
+    on_session(pane_id, tab_id, workspace_id) durably binds immutable owned
+    session IDs before its agent is allowed to start.
+    on_started(pane_id) is called only after an existing target was verified or
+    a newly owned provider was successfully started.
     on_worktree(path, branch) is called as soon as a ``worktree`` task has its
     own checkout — long before the run ends, which is when the user wants it.
     timeout (seconds) bounds the ACTIVE prompt turn; time spent in ``blocked``
@@ -518,18 +640,42 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
     outcome = {"ok": False, "rate_limited": False, "retry_reason": "",
                "cancelled": False,
                "output": "", "error": "", "pane_id": "", "env_failure": "",
+               "verdict": "",
                "worktree_path": "", "worktree_branch": ""}
+    strict_ownership = bool(provider_cfg.get("strict_owned_session"))
+    strict_cleanup = None
     attach = attach_hint(host)
     from .worker import effective_prompt
     prompt = prompt_override if prompt_override is not None else effective_prompt(task)
+    requires_verdict = (
+        require_closing_verdict or WORKFLOW_CONTRACT_MARKER in prompt
+    )
+    if require_closing_verdict:
+        prompt = ensure_closing_verdict_contract(
+            prompt, allow_targeted_stale=allow_targeted_stale)
+    if strict_ownership and getattr(task, "herdr_target", None):
+        outcome["error"] = (
+            "strict pipeline ownership is incompatible with herdr_target")
+        return outcome
+    if requires_verdict and getattr(task, "detached", False):
+        outcome["error"] = (
+            "herdr detached mode is incompatible with a required closing "
+            "ИТОГ verdict"
+        )
+        return outcome
     workspace_id = ""  # set only when the task got its own worktree workspace
     repo_root = ""
     wt_copied = []
 
     try:
+        target = getattr(task, "herdr_target", None)
+        if not target and cancel_check and cancel_check():
+            outcome["cancelled"] = True
+            outcome["cancel_note"] = (
+                "Cancelled before the herdr session was created")
+            return outcome
         _ensure_server(host)
 
-        target = getattr(task, "herdr_target", None)
         if target:
             # Target mode: send the prompt into an EXISTING session. The pane
             # belongs to the user — never close or rename it.
@@ -543,19 +689,61 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
             tab_id = None
             outcome["pane_id"] = pane_id
             if on_pane:
-                on_pane(pane_id)
+                try:
+                    on_pane(pane_id)
+                except Exception as exc:
+                    outcome["error"] = (
+                        "herdr pane bookkeeping failed before prompt: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    return outcome
         else:
-            _close_stale_tabs(task.id, host)
+            def close_stale_owned_tabs():
+                try:
+                    _close_stale_tabs(task.id, host)
+                except Exception as exc:
+                    return (
+                        "could not confirm stale PromptPilot herdr sessions "
+                        f"were closed: {type(exc).__name__}: {exc}"
+                    )
+                return ""
+
+            stale_close_error = close_stale_owned_tabs()
+            if stale_close_error:
+                outcome["error"] = stale_close_error
+                if strict_ownership:
+                    # A stale pp-t<id>-* session may still be running the same
+                    # task from a prior attempt. Keep the target reservation
+                    # fenced until a later worker recovery confirms cleanup.
+                    outcome["ownership_uncertain"] = True
+                    outcome["_ownership_cleanup"] = close_stale_owned_tabs
+                return outcome
             name = f"pp-t{task.id}-{int(time.time()) % 100000}"
             # Remote: the working dir must exist on THAT machine; without one
             # herdr falls back to its own default (the user's home there).
             cwd = task.working_dir or (None if host else ".")
             # PP_TASK_ID marks the run in the pane's environment and is
             # inherited by the agent, so a live run can be found by process.
-            env_args = ["--env", f"PP_TASK_ID={task.id}"]
+            tab_env = {"PP_TASK_ID": str(task.id)}
+            # A local herdr pane is created by the long-lived server rather
+            # than as our child process, so it does not inherit PromptPilot's
+            # runtime paths. Forward only the non-secret paths required by the
+            # repository adapter. Remote paths must come from that machine's
+            # explicit provider env; local Windows paths would corrupt it.
+            if not host:
+                for key in (
+                        "PP_DATA_DIR", "PP_PIPELINE_LEASE_KEY_FILE",
+                        "PP_GH_EXE", "PP_GO_EXE"):
+                    if os.environ.get(key):
+                        tab_env[key] = os.environ[key]
             for k, v in (provider_cfg.get("env") or {}).items():
                 if v:
-                    env_args += ["--env", f"{k}={v}"]
+                    tab_env[k] = str(v)
+            # Scheduler identity is reserved per claimed attempt. A stale
+            # provider-level setting must never retag this owned session.
+            tab_env["PP_TASK_ID"] = str(task.id)
+            env_args = [part for key, value in tab_env.items()
+                        for part in ("--env", f"{key}={value}")]
 
             if getattr(task, "worktree", False):
                 wt = _open_worktree(task, cwd, name, host)
@@ -587,8 +775,36 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
                 outcome["error"] = f"herdr tab create failed: {raw}"
                 return outcome
             outcome["pane_id"] = pane_id
+            if on_session:
+                try:
+                    on_session(pane_id, tab_id, workspace_id)
+                except Exception as exc:
+                    close_args = (["workspace", "close", workspace_id]
+                                  if workspace_id else ["tab", "close", tab_id])
+                    close_error = _close_owned_session(
+                        name, close_args, host, pane_id=pane_id)
+                    message = (
+                        "herdr session bookkeeping failed before agent start: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    outcome["error"] = (
+                        f"{message}\n{close_error}" if close_error else message)
+                    return outcome
             if on_pane:
-                on_pane(pane_id)
+                try:
+                    on_pane(pane_id)
+                except Exception as exc:
+                    close_args = (["workspace", "close", workspace_id]
+                                  if workspace_id else ["tab", "close", tab_id])
+                    close_error = _close_owned_session(
+                        name, close_args, host, pane_id=pane_id)
+                    message = (
+                        "herdr pane bookkeeping failed before agent start: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    outcome["error"] = (
+                        f"{message}\n{close_error}" if close_error else message)
+                    return outcome
 
         def close_tab(remove_untouched=True):
             if workspace_id:
@@ -599,12 +815,18 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
                     close_args = ["worktree", "remove", "--workspace", workspace_id]
                 else:
                     close_args = ["workspace", "close", workspace_id]
-                return _close_owned_session(name, close_args, host)
+                return _close_owned_session(
+                    name, close_args, host, pane_id=pane_id)
             if tab_id:
-                return _close_owned_session(name, ["tab", "close", tab_id], host)
+                return _close_owned_session(
+                    name, ["tab", "close", tab_id], host, pane_id=pane_id)
             return ""  # herdr_target: foreign pane, intentionally untouched.
 
+        strict_cleanup = lambda: close_tab(remove_untouched=False)
+
         def fail(msg, keep_pane=True):
+            if strict_ownership:
+                keep_pane = False
             if keep_pane:
                 outcome["error"] = f"{msg}\n(панель {pane_id} оставлена — подключись командой: {attach})"
             else:
@@ -626,7 +848,8 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
             agent_args += ["--effort", eff]
         if task.session_id:
             agent_args += ["--resume", task.session_id]
-        if task.skip_permissions:
+        if (task.skip_permissions
+                and "--dangerously-skip-permissions" not in agent_args):
             agent_args.append("--dangerously-skip-permissions")
         if not host and guard_enabled(provider_cfg, task.skip_permissions):
             # Local only: the settings file with the hook lives on this machine.
@@ -650,6 +873,9 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
                 close_error = close_tab(remove_untouched=False)
                 outcome["error"] = f"{message}\n{close_error}" if close_error else message
                 return outcome
+
+        if on_started:
+            on_started(pane_id)
 
         # Detached: submit the prompt, confirm it landed, leave the pane open.
         if task.detached:
@@ -708,33 +934,46 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
             time.sleep(2)
 
         # blocked = waiting for a human (permission dialog etc.) — no deadline.
-        if state == "blocked" and on_blocked:
-            on_blocked(pane_id)
+        blocked_since = None
+        if state == "blocked":
+            blocked_since = time.monotonic()
+            if on_blocked:
+                on_blocked(pane_id)
         while state == "blocked":
             state, raw = _wait_settled(name, ["--until", "idle", "--until", "done"],
                                        None, cancel_check, host)
+        if deadline and blocked_since is not None:
+            deadline += max(0, time.monotonic() - blocked_since)
 
         if state not in {"__cancel__", "__timeout__", "__error__"}:
             state, raw = _stabilize_workflow_completion(
                 name, prompt, state, raw, deadline, cancel_check,
                 on_blocked=on_blocked, host=host,
+                require_closing_verdict=requires_verdict,
+                allow_targeted_stale=allow_targeted_stale,
             )
 
         if state == "__cancel__":
+            cancel_intent = {
+                "cancelled": True,
+                "error": "",
+                "cancel_note": "Отменена пользователем во время выполнения",
+            }
             if target:
-                outcome["cancel_note"] = (
+                cancel_intent["cancel_note"] = (
                     "Отменено ожидание PromptPilot; пользовательская herdr-сессия "
                     f"{name} не закрывалась и агент в ней может продолжать работу"
                 )
             else:
                 close_error = close_tab(remove_untouched=False)
                 if close_error:
+                    outcome["_terminal_intent"] = cancel_intent
                     outcome["error"] = (
                         "herdr: cancellation requested, but the owned session "
                         f"could not be stopped safely\n{close_error}"
                     )
                     return outcome
-            outcome["cancelled"] = True
+            outcome.update(cancel_intent)
             return outcome
         if state == "__timeout__":
             message = f"herdr: таймаут задачи ({timeout}s)"
@@ -755,24 +994,37 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
 
         reason = _retry_reason(cleaned)
         if reason:
+            retry_intent = {
+                "rate_limited": True, "retry_reason": reason,
+                "error": cleaned,
+            }
             close_error = close_tab(remove_untouched=False)
             if close_error:
+                outcome["_terminal_intent"] = retry_intent
                 outcome["error"] = f"{cleaned}\n{close_error}"
                 return outcome
-            outcome["rate_limited"] = True
-            outcome["retry_reason"] = reason
-            outcome["error"] = cleaned
+            outcome.update(retry_intent)
             return outcome
 
         env_marker = _looks_env_failure(cleaned)
         if env_marker:
+            env_intent = {"env_failure": env_marker, "error": cleaned}
             close_error = close_tab(remove_untouched=False)
             if close_error:
+                outcome["_terminal_intent"] = env_intent
                 outcome["error"] = f"{cleaned}\n{close_error}"
                 return outcome
-            outcome["env_failure"] = env_marker
-            outcome["error"] = cleaned
+            outcome.update(env_intent)
             return outcome
+
+        closing_verdict = _closing_workflow_verdict(
+            cleaned, allow_targeted_stale=allow_targeted_stale)
+        if requires_verdict and not closing_verdict:
+            return fail(
+                "herdr agent finished without the required closing ИТОГ verdict",
+                keep_pane=False,
+            )
+        outcome["verdict"] = closing_verdict
 
         # task checkbox decides; provider flag / env force keep-open regardless
         where = f", машина {as_remote(host).host}" if host else ""
@@ -792,7 +1044,8 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
             if changes:
                 wt_meta += f"\nИзменения: {changes}"
 
-        keep = bool(keep_pane) or provider_cfg.get("keep_pane") or HERDR_KEEP_PANE
+        keep = (not strict_ownership and (
+            bool(keep_pane) or provider_cfg.get("keep_pane") or HERDR_KEEP_PANE))
         if keep:
             # Keep the live session for follow-up work. Rename the agent out of
             # the pp-t* namespace so the Telegram bridge watches the continued
@@ -809,14 +1062,18 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
             )
             return outcome
 
+        success_intent = {
+            "ok": True, "error": "",
+            "output": (f"{cleaned}\n\n--- Meta ---\n"
+                       f"Executor: herdr (pane {pane_id}{where}){wt_meta}"),
+        }
         close_error = close_tab()
         if close_error:
+            outcome["_terminal_intent"] = success_intent
             outcome["error"] = ("herdr task finished, but its owned session could not "
                                 f"be stopped safely\n{close_error}")
             return outcome
-        outcome["ok"] = True
-        outcome["output"] = (f"{cleaned}\n\n--- Meta ---\n"
-                             f"Executor: herdr (pane {pane_id}{where}){wt_meta}")
+        outcome.update(success_intent)
         return outcome
 
     except HerdrError as e:
@@ -825,3 +1082,23 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
     except Exception as e:  # never crash the worker loop over a herdr hiccup
         outcome["error"] = f"herdr executor error: {type(e).__name__}: {e}"
         return outcome
+    finally:
+        if strict_ownership and not outcome["ok"] and callable(strict_cleanup):
+            try:
+                close_error = strict_cleanup()
+            except Exception as exc:
+                close_error = (
+                    "strict herdr cleanup failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+            if close_error:
+                outcome["ownership_uncertain"] = True
+                outcome["_ownership_cleanup"] = strict_cleanup
+                if close_error not in outcome["error"]:
+                    outcome["error"] = (
+                        f"{outcome['error']}\n{close_error}"
+                        if outcome["error"] else close_error)
+            else:
+                terminal_intent = outcome.pop("_terminal_intent", None)
+                if isinstance(terminal_intent, dict):
+                    outcome.update(terminal_intent)
