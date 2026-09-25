@@ -1,0 +1,80 @@
+{
+  "version": 1,
+  "name": "bookapp-reader-parallel",
+  "description": "Four independent investigations, then isolated implementation and a Jev-ready checkpoint.",
+  "max_parallel": 4,
+  "nodes": [
+    {
+      "id": "api-analysis",
+      "prompt": "Inspect the BookApp reader API and data flow. Record concrete findings, file paths, risks, and a minimal implementation plan. Do not edit production files.",
+      "working_dir": "${BOOKAPP_DIR}",
+      "mode": "worktree",
+      "provider": "analysis-provider",
+      "max_retries": 1
+    },
+    {
+      "id": "ui-analysis",
+      "prompt": "Inspect the BookApp reader UI and identify the smallest clear UX improvements. Record current behavior, proposed states, and affected files. Do not edit production files.",
+      "working_dir": "${BOOKAPP_DIR}",
+      "mode": "worktree",
+      "provider": "analysis-provider",
+      "max_retries": 1
+    },
+    {
+      "id": "test-analysis",
+      "prompt": "Inspect the BookApp tests and runtime checks. Propose focused acceptance checks for the reader change and identify missing coverage. Do not edit production files.",
+      "working_dir": "${BOOKAPP_DIR}",
+      "mode": "worktree",
+      "provider": "analysis-provider",
+      "max_retries": 1
+    },
+    {
+      "id": "risk-analysis",
+      "prompt": "Perform a bounded architecture and migration risk review of the reader change. Look for concurrency, data-loss, security, and rollback risks. Do not edit production files.",
+      "working_dir": "${BOOKAPP_DIR}",
+      "mode": "worktree",
+      "provider": "analysis-provider",
+      "max_retries": 1
+    },
+    {
+      "id": "plan-synthesis",
+      "prompt": "Synthesize the four analysis artifacts into one implementation plan. Resolve contradictions, name file ownership, and state which work can be parallel and which must be serial.",
+      "depends_on": ["api-analysis", "ui-analysis", "test-analysis", "risk-analysis"],
+      "working_dir": "${BOOKAPP_DIR}",
+      "mode": "worktree",
+      "provider": "planner-provider",
+      "max_retries": 1
+    },
+    {
+      "id": "backend-implementation",
+      "prompt": "Implement the backend portion of the synthesized reader plan. Keep the change bounded to the owned files, run focused checks, and report evidence.",
+      "depends_on": ["plan-synthesis"],
+      "working_dir": "${BOOKAPP_DIR}",
+      "mode": "worktree",
+      "provider": "implementation-provider",
+      "max_retries": 1
+    },
+    {
+      "id": "ui-implementation",
+      "prompt": "Implement the UI portion of the synthesized reader plan. Keep the change bounded to the owned files, run focused checks, and report evidence.",
+      "depends_on": ["plan-synthesis"],
+      "working_dir": "${BOOKAPP_DIR}",
+      "mode": "worktree",
+      "provider": "implementation-provider",
+      "max_retries": 1
+    },
+    {
+      "id": "integration-review",
+      "kind": "review",
+      "review": true,
+      "autofix": true,
+      "max_repairs": 2,
+      "prompt": "Integrate the backend and UI worktrees into this isolated worktree, run the focused acceptance checks, inspect all dependency evidence, and finish with exactly one AUDIT_VERDICT line. If work is incomplete, emit AUDIT_VERDICT: REVISION_REQUIRED and AUDIT_FINDINGS_JSON: [...].",
+      "depends_on": ["backend-implementation", "ui-implementation"],
+      "working_dir": "${BOOKAPP_DIR}",
+      "mode": "worktree",
+      "provider": "strong-reviewer",
+      "max_retries": 1
+    }
+  ]
+}
