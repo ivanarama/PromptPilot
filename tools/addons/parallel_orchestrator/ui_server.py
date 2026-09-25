@@ -326,6 +326,87 @@ class ParallelUiServer(ThreadingHTTPServer):
         self.index_path = index_path
 
 
+_SHARED_RUNNER: UiRunner | None = None
+
+
+def get_shared_runner() -> UiRunner:
+    """Return the singleton used when the add-on is mounted into PromptPilot."""
+    global _SHARED_RUNNER
+    if _SHARED_RUNNER is None:
+        _SHARED_RUNNER = UiRunner()
+    return _SHARED_RUNNER
+
+
+def create_fastapi_router():
+    """Create optional same-port routes for PromptPilot's existing FastAPI app.
+
+    The import is kept here, rather than at module import time, so the
+    add-on's standalone UI remains usable without importing FastAPI itself.
+    """
+    from fastapi import APIRouter, HTTPException
+
+    router = APIRouter(prefix="/api/parallel", tags=["parallel-addon"])
+    runner = get_shared_runner()
+
+    @router.get("/config")
+    def config() -> dict[str, Any]:
+        result = runner.config()
+        # Calling the same PromptPilot process over HTTP from this route would
+        # deadlock a single-worker uvicorn instance. Read provider names in
+        # process when the integration is mounted into PromptPilot.
+        try:
+            from promptpilot.config import load_providers
+
+            result["providers"] = sorted(load_providers(), key=str.casefold)
+            result["core_reachable"] = True
+            result["core_error"] = None
+        except Exception as exc:
+            result["core_reachable"] = False
+            result["core_error"] = str(exc)
+        return result
+
+    @router.get("/status")
+    def status() -> dict[str, Any]:
+        return runner.status()
+
+    @router.post("/validate")
+    def validate(payload: dict[str, Any]) -> dict[str, Any]:
+        raw_plan = payload.get("plan")
+        if not isinstance(raw_plan, dict):
+            raise HTTPException(400, "план не передан")
+        try:
+            return {"ok": True, **runner.validate(raw_plan)}
+        except PlanError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @router.post("/run", status_code=202)
+    def run(payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return {"ok": True, **runner.start(payload)}
+        except PlanError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @router.post("/stop")
+    def stop() -> dict[str, Any]:
+        return {"ok": True, **runner.stop()}
+
+    @router.post("/resolve")
+    def resolve(payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return {
+                "ok": True,
+                **runner.resolve(str(payload.get("node") or ""), str(payload.get("action") or "")),
+            }
+        except PlanError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    return router
+
+
+def addon_index_path() -> Path:
+    return Path(__file__).with_name("ui") / "index.html"
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="PromptPilot Parallel visual add-on")
     parser.add_argument("--host", default=DEFAULT_UI_HOST)

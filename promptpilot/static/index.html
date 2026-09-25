@@ -496,6 +496,8 @@
   .pipeline-health.red { color:var(--red); border-color:var(--red); }
   .pipeline-health.warming { color:var(--accent); border-color:var(--accent); }
   #pipelineModal .modal { max-width:1120px; }
+  #parallelModal .modal { max-width:1450px; width:calc(100vw - 32px); height:calc(100vh - 48px); max-height:none; padding:10px; overflow:hidden; }
+  #parallelFrame { width:100%; height:calc(100% - 32px); border:0; border-radius:8px; background:var(--bg); }
   @media (max-width: 720px) {
     .pipeline-summary { grid-template-columns:repeat(2,minmax(120px,1fr)); }
     .insights-table { table-layout:auto; display:block; overflow-x:auto; white-space:nowrap; }
@@ -770,6 +772,7 @@
     <button class="btn-pause" onclick="openPipelines()" style="margin-left:8px">📈 Конвейеры</button>
     <button class="btn-pause" onclick="openSchedule()" style="margin-left:8px">🗓 Расписание</button>
     <button class="btn-pause" onclick="openWorkflows()" style="margin-left:8px">Workflows</button>
+    <button class="btn-pause" onclick="openParallel()" style="margin-left:8px">⚡ Parallel</button>
     <button class="btn-pause" onclick="openProviders()" style="margin-left:8px">⚙ Providers</button>
     <button class="btn-pause" onclick="openEpf()" style="margin-left:8px" title="Доработка внешних обработок 1С">🔧 1С</button>
   </div>
@@ -957,6 +960,13 @@
       </div>
       <div id="wfDetail" class="wf-panel"><span class="wf-meta">Выберите workflow слева.</span></div>
     </div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="parallelModal" onclick="if(event.target===this)closeParallel()">
+  <div class="modal">
+    <h2>⚡ Параллельный конструктор <button class="btn btn-sm btn-ghost" style="margin-left:auto" onclick="closeParallel()">Закрыть</button></h2>
+    <iframe id="parallelFrame" src="/parallel" title="PromptPilot Parallel"></iframe>
   </div>
 </div>
 
@@ -2202,6 +2212,12 @@ function openWorkflows() {
 }
 
 function closeWorkflows() { document.getElementById('workflowModal').classList.remove('open'); }
+
+function openParallel() {
+  document.getElementById('parallelModal').classList.add('open');
+}
+
+function closeParallel() { document.getElementById('parallelModal').classList.remove('open'); }
 
 let workflowAutoRefreshBusy = false;
 

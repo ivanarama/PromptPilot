@@ -100,6 +100,15 @@ async def _lifespan(application: FastAPI):
 
 app = FastAPI(title="PromptPilot", version="0.1.0", lifespan=_lifespan)
 
+# Optional additive UI integration. The scheduler remains outside the core
+# worker and database; this only exposes its visual panel on the same origin.
+try:
+    from tools.addons.parallel_orchestrator.ui_server import addon_index_path, create_fastapi_router
+
+    app.include_router(create_fastapi_router())
+except ImportError:
+    addon_index_path = None
+
 
 _SAFE_METHODS = ("GET", "HEAD", "OPTIONS")
 
@@ -1370,3 +1379,10 @@ def api_projects():
 @app.get("/")
 def index():
     return FileResponse(STATIC_DIR / "index.html")
+
+
+@app.get("/parallel")
+def parallel_addon_index():
+    if addon_index_path is None or not addon_index_path().is_file():
+        raise HTTPException(404, "Parallel add-on UI is not installed")
+    return FileResponse(addon_index_path())

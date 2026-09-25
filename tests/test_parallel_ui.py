@@ -33,3 +33,17 @@ def test_visual_page_contains_drag_drop_and_run_controls():
     html = page.read_text(encoding="utf-8")
     for marker in ("Перетащите блоки", "id=\"canvas\"", "id=\"runBtn\"", "id=\"fileInput\""):
         assert marker in html
+
+
+def test_existing_promptpilot_app_exposes_same_origin_parallel_panel():
+    from promptpilot.api import app
+
+    paths = set(app.openapi()["paths"])
+    assert "/parallel" in paths
+    assert "/api/parallel/config" in paths
+    assert "/api/parallel/run" in paths
+
+    index = Path(__file__).parents[1] / "promptpilot" / "static" / "index.html"
+    source = index.read_text(encoding="utf-8")
+    assert 'onclick="openParallel()"' in source
+    assert 'src="/parallel"' in source

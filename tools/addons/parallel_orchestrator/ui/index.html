@@ -199,6 +199,7 @@
 
   <script>
     const $ = (id) => document.getElementById(id);
+    const UI_API = location.pathname.startsWith('/parallel') ? '/api/parallel' : '/api/ui';
     let plan = { version: 1, name: 'Новый параллельный запуск', description: '', max_parallel: 4, nodes: [] };
     let providers = [];
     let nodeDragId = null;
@@ -338,7 +339,7 @@
     }
     async function validatePlan(showToast = true) {
       try {
-        const response = await fetch('/api/ui/validate', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({plan}) });
+        const response = await fetch(`${UI_API}/validate`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({plan}) });
         const data = await response.json(); if (!response.ok) throw new Error(data.error || 'План не прошёл проверку');
         plan = normalisePlan(data.plan); renderNodes(); if (showToast) toast(`План корректен: ${data.node_count} блоков, ${data.waves.length} волн`); return true;
       } catch (error) { toast(error.message, true); return false; }
@@ -346,13 +347,13 @@
     async function runPlan() {
       if (!await validatePlan(false)) return;
       const payload = { plan, base_url: $('baseUrl').value.trim(), state_file: $('stateFile').value.trim(), poll_seconds: Number($('pollSeconds').value || 3) };
-      try { const response = await fetch('/api/ui/run', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)}); const data = await response.json(); if (!response.ok) throw new Error(data.error || 'Не удалось запустить'); toast('Запуск начат'); renderStatus(data); } catch (error) { toast(error.message, true); }
+      try { const response = await fetch(`${UI_API}/run`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)}); const data = await response.json(); if (!response.ok) throw new Error(data.error || 'Не удалось запустить'); toast('Запуск начат'); renderStatus(data); } catch (error) { toast(error.message, true); }
     }
     async function stopRun() {
-      try { const response = await fetch('/api/ui/stop', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'}); const data = await response.json(); if (!response.ok) throw new Error(data.error || 'Не удалось остановить'); toast('Scheduler остановлен; уже запущенные задачи не отменены'); renderStatus(data); } catch (error) { toast(error.message, true); }
+      try { const response = await fetch(`${UI_API}/stop`, {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'}); const data = await response.json(); if (!response.ok) throw new Error(data.error || 'Не удалось остановить'); toast('Scheduler остановлен; уже запущенные задачи не отменены'); renderStatus(data); } catch (error) { toast(error.message, true); }
     }
     async function resolveNode(node, action) {
-      try { const response = await fetch('/api/ui/resolve', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({node, action})}); const data = await response.json(); if (!response.ok) throw new Error(data.error || 'Не удалось выполнить действие'); toast(`Для ${node}: ${action}`); renderStatus(data); } catch (error) { toast(error.message, true); }
+      try { const response = await fetch(`${UI_API}/resolve`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({node, action})}); const data = await response.json(); if (!response.ok) throw new Error(data.error || 'Не удалось выполнить действие'); toast(`Для ${node}: ${action}`); renderStatus(data); } catch (error) { toast(error.message, true); }
     }
     function renderStatus(data) {
       latestStatus = data; const state = data.state;
@@ -368,7 +369,7 @@
       const events = state?.events || []; $('events').textContent = events.slice(-18).map(event => `${event.at || ''}  ${event.kind || ''}  ${event.node || ''} ${event.reason || ''}`).join('\n') || (data.last_error || 'События появятся после запуска.');
       document.querySelectorAll('.node-card').forEach(card => { const status = rows[card.dataset.id]?.status || 'pending'; const badge = card.querySelector('.node-status'); if (badge) { badge.textContent = status; badge.className = 'node-status ' + status; } });
     }
-    async function pollStatus() { try { const response = await fetch('/api/ui/status'); if (response.ok) renderStatus(await response.json()); } catch (_) {} }
+    async function pollStatus() { try { const response = await fetch(`${UI_API}/status`); if (response.ok) renderStatus(await response.json()); } catch (_) {} }
     function downloadPlan() { const blob = new Blob([JSON.stringify(plan, null, 2)], {type:'application/json'}); const link = document.createElement('a'); link.href = URL.createObjectURL(blob); link.download = `${slug(plan.name) || 'parallel-plan'}.json`; link.click(); URL.revokeObjectURL(link.href); }
     function importFile(file) { const reader = new FileReader(); reader.onload = () => { try { plan = normalisePlan(JSON.parse(reader.result)); syncSettingsFromPlan(); renderNodes(); toast('План загружен'); } catch (error) { toast('Не удалось прочитать JSON: ' + error.message, true); } }; reader.readAsText(file); }
 
@@ -392,7 +393,7 @@
     $('baseUrl').addEventListener('change', event => { if (event.target.value) localStorage.setItem('pp-parallel-base-url', event.target.value); });
 
     async function boot() {
-      try { const response = await fetch('/api/ui/config'); const config = await response.json(); if (config.base_url) $('baseUrl').value = localStorage.getItem('pp-parallel-base-url') || config.base_url; if (config.default_state_file) $('stateFile').value = config.default_state_file; providers = config.providers || []; if (config.default_working_dir) $('workingDir').value = config.default_working_dir; renderStatus({core_reachable: config.core_reachable, jev_enabled: config.jev_enabled, runner_status:'idle', state:null}); } catch (error) { toast('UI-сервер запущен, но PromptPilot пока недоступен', true); }
+      try { const response = await fetch(`${UI_API}/config`); const config = await response.json(); if (config.base_url) $('baseUrl').value = localStorage.getItem('pp-parallel-base-url') || config.base_url; if (config.default_state_file) $('stateFile').value = config.default_state_file; providers = config.providers || []; if (config.default_working_dir) $('workingDir').value = config.default_working_dir; renderStatus({core_reachable: config.core_reachable, jev_enabled: config.jev_enabled, runner_status:'idle', state:null}); } catch (error) { toast('Не удалось подключиться к визуальному контроллеру', true); }
       renderNodes(); pollStatus(); setInterval(pollStatus, 2000);
     }
     boot();

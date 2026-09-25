@@ -1,2 +1,2 @@
 @echo off
-call "%~dp0tools\addons\parallel_orchestrator\PromptPilot-Parallel-UI.bat"
+start "" "http://127.0.0.1:8420/"
