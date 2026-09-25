@@ -94,9 +94,23 @@ if (Test-CmdLine 'queued-nudger') {
     Write-Host '[5] Queued-Nudger started (hidden)' -ForegroundColor Green
 }
 
+# 6. Cascade review controller (optional additive owner of review_chain)
+if (Test-CmdLine 'cascade-review\.py') {
+    Write-Host '[6] Cascade Review: already running' -ForegroundColor Green
+} else {
+    $cascadePython = if (Test-Path 'C:\Python314\python.exe') { 'C:\Python314\python.exe' } else { 'python' }
+    Start-HiddenConsole $cascadePython '-X utf8 "C:\Users\Nachfin\Desktop\Projets\Other\PromptPilot\cascade-review.py"' $PpDir
+    Start-Sleep -Seconds 2
+    if (Test-CmdLine 'cascade-review\.py') {
+        Write-Host '[6] Cascade Review started (hidden)' -ForegroundColor Green
+    } else {
+        Write-Host '[6] Cascade Review FAILED - see ~/.promptpilot/cascade-review.log' -ForegroundColor Red
+    }
+}
 
-# 6. Авто-Продолжить: все воркфлоу в awaiting_human получают resume+sync
-Write-Host '[6] Авто-Продолжить воркфлоу...' -ForegroundColor Cyan
+# 7. Авто-Продолжить: обычные workflow в awaiting_human получают resume+sync.
+# Review-chain воркфлоу принадлежат каскадному контроллеру и здесь не будятся.
+Write-Host '[7] Авто-Продолжить обычные воркфлоу...' -ForegroundColor Cyan
 try {
     $wfs = Invoke-RestMethod 'http://127.0.0.1:8420/api/workflows' -TimeoutSec 5
     $resumed = @()
@@ -105,6 +119,10 @@ try {
     foreach ($w in $wfs) {
         if ($w.status -ne 'awaiting_human') { continue }
         if ($dead -contains $w.slug) { continue }
+        if ($w.config -and $w.config.review_chain -and $w.config.review_chain.enabled) {
+            Write-Host ("    " + $w.slug + ": оставлен каскаду ревью") -ForegroundColor DarkGray
+            continue
+        }
         try {
             Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8420/api/workflows/$($w.id)/human-input" -ContentType 'application/json' -Body (@{expected_version=$w.state_version; text='Продолжить работу с учётом сохранённого состояния'; resume=$true} | ConvertTo-Json) -TimeoutSec 15 | Out-Null
             $resumed += $w.slug
@@ -126,6 +144,6 @@ try {
         } catch {}
     }
     if ($resumed.Count -eq 0) { Write-Host '    Ожидающих человека воркфлоу нет' }
-} catch { Write-Host '[6] ошибка авто-Продолжить' -ForegroundColor Yellow }
+} catch { Write-Host '[7] ошибка авто-Продолжить' -ForegroundColor Yellow }
 
 Write-Host '=== Done. Logs: ~/.promptpilot/*.log ===' -ForegroundColor Cyan

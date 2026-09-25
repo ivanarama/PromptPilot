@@ -1271,8 +1271,8 @@ function setFixerHuman(s) {
   return setHumanName(s.fixer);
 }
 function setStepHint(s) {
-  const bits = [`находки чинит: ${setFixerHuman(s)}`, `раундов: ${s.max_rounds || 2}`];
-  if (s.window) bits.push(`🌙 окно ${s.window.from || '22:00'}–${s.window.to || '04:00'} (МСК)`);
+  const bits = [`исправляет: ${setFixerHuman(s)}`, `раундов: ${s.max_rounds || 2}`];
+  if (s.window) bits.push(`🌙 ждёт окна ${s.window.from || '22:00'}–${s.window.to || '04:00'} (МСК)`);
   if (s.blocking === false) bits.push('не блокирующая');
   return bits.join(' · ');
 }
@@ -1299,6 +1299,11 @@ function setReviewLoad() {
   setReviewSteps = JSON.parse(JSON.stringify(chain.steps || []));
   const execProv = wf.config?.roles?.executor?.provider || '';
   const revProv = wf.config?.roles?.reviewer?.provider || '';
+  const automation = wf.config?.automation || {};
+  const cascadeOwnsReview = chain.enabled &&
+    automation.auto_dispatch_reviewer === false &&
+    automation.auto_apply_review === false &&
+    automation.auto_resume_revision === false;
   const preset = setDetectPreset(setReviewSteps, chain.enabled);
   body.innerHTML = `
     <div class="cz-row">
@@ -1313,6 +1318,7 @@ function setReviewLoad() {
       <label class="cz-inline"><input type="radio" name="set-preset" value="none" ${preset === 'none' ? 'checked' : ''} onchange="setPreset('none')"> ⏭ Без каскада</label>
     </div>
     <div class="cz-hint">Пресет заполняет ступени ниже — после этого любую ступень можно поменять вручную и сохранить.
+      ${chain.enabled && (chain.steps || []).length ? `<br>При включённом каскаде ревьюер из каждой ступени получает отдельный аудит; его провайдер получает и задачу исправления, если выбран «сам проверяющий».<br><b style="color:${cascadeOwnsReview ? 'var(--green)' : 'var(--yellow)'}">${cascadeOwnsReview ? '✓ Каскадный контроллер управляет переходами' : '⚠ Нажмите «Сохранить»: старые автоматические переходы ещё не переданы каскаду'}</b>` : ''}
       ${preset === 'none' ? `Сейчас работает обычный ревьюер воркфлоу${revProv ? ': ' + esc(setHumanName(revProv)) : ''}.` : ''}</div>
     <div id="set-slots" style="margin-top:8px"></div>
     <div class="cz-row" style="margin-top:6px">
@@ -1340,6 +1346,8 @@ function renderSetSlots() {
   if (!box) return;
   box.innerHTML = setReviewSteps.map((s, i) => {
     const win = s.window || {};
+    const fixer = s.fixer || 'executor';
+    const customFixer = !['executor', 'self'].includes(fixer);
     return `<div class="cz-card" draggable="true" data-set-slot="${i}"
         ondragstart="setDragStart(event,${i})" ondragover="setDragOver(event,${i})"
         ondrop="setDrop(event,${i})" ondragend="setDragEnd(event)">
@@ -1354,9 +1362,11 @@ function renderSetSlots() {
       <div class="cz-row">
         <span class="cz-label-sm">Находки чинит:</span>
         <select class="cz-fixer" onchange="setFixerChanged(${i}, this.value)">
-          <option value="self" ${s.fixer === 'self' ? 'selected' : ''}>сам проверяющий</option>
-          <option value="executor" ${(s.fixer || '') === 'executor' ? 'selected' : ''}>исполнитель (кто пишет код)</option>
+          <option value="self" ${fixer === 'self' ? 'selected' : ''}>сам проверяющий</option>
+          <option value="executor" ${fixer === 'executor' ? 'selected' : ''}>исполнитель (кто пишет код)</option>
+          <option value="custom" ${customFixer ? 'selected' : ''}>указать помощника</option>
         </select>
+        <select class="cz-fixer-custom" style="display:${customFixer ? '' : 'none'}" onchange="setFixerCustomChanged(${i}, this.value)">${setProvOpts(customFixer ? fixer : '')}</select>
         <label class="cz-inline" style="margin-left:10px">раундов:
           <input type="number" min="1" max="10" value="${s.max_rounds || 2}" onchange="setNumChanged(${i}, this.value)" style="width:44px">
         </label>
@@ -1385,7 +1395,11 @@ function setReadSlots() {
     const s = setReviewSteps[i];
     if (!s) return;
     s.provider = card.querySelector('.cz-prov').value || s.provider;
-    s.fixer = card.querySelector('.cz-fixer').value || 'executor';
+    const fixerSelect = card.querySelector('.cz-fixer');
+    const customFixer = card.querySelector('.cz-fixer-custom');
+    s.fixer = fixerSelect.value === 'custom'
+      ? (customFixer?.value || s.fixer || 'executor')
+      : (fixerSelect.value || 'executor');
     s.max_rounds = parseInt(card.querySelector('input[type="number"]').value, 10) || 2;
     s.blocking = card.querySelector('input[type="checkbox"]:not([onchange*="setWindowChanged"])').checked;
     s.window = card.querySelector('input[onchange*="setWindowChanged"]').checked
@@ -1427,7 +1441,23 @@ function setMove(i, dir) {
   renderSetSlots();
 }
 function setProvChanged(i, v) { setReviewSteps[i].provider = v; refreshSetHints(); }
-function setFixerChanged(i, v) { setReviewSteps[i].fixer = v; refreshSetHints(); }
+function setFixerChanged(i, v) {
+  if (v === 'custom') {
+    const current = setReviewSteps[i].fixer;
+    if (!current || ['custom', 'self', 'executor'].includes(current)) {
+      setReviewSteps[i].fixer = Object.keys(providersData || {}).find(name =>
+        !['self', 'executor'].includes(name) && !(providersData[name] || {}).hidden
+      ) || 'executor';
+    }
+  } else {
+    setReviewSteps[i].fixer = v;
+  }
+  renderSetSlots();
+}
+function setFixerCustomChanged(i, v) {
+  setReviewSteps[i].fixer = v || 'executor';
+  refreshSetHints();
+}
 function setNumChanged(i, v) { setReviewSteps[i].max_rounds = parseInt(v, 10) || 2; refreshSetHints(); }
 function setBlockingChanged(i, checked) { setReviewSteps[i].blocking = checked; refreshSetHints(); }
 function setWindowChanged(i, checked) {
@@ -1468,17 +1498,52 @@ async function setReviewSave() {
   const exec = document.getElementById('set-exec')?.value || '';
   if (steps.length && steps.some(s => !s.provider)) { toast('У ступени не выбран помощник'); return; }
   const cfg = JSON.parse(JSON.stringify(wf.config));
-  cfg.review_chain = { enabled: steps.length > 0, steps: steps.map((s, i) => ({ ...s, slot: i + 1 })) };
+  const oldChain = cfg.review_chain || {};
+  const oldRoles = cfg.roles || {};
+  const oldAutomation = cfg.automation || {};
+  const chainEnabled = steps.length > 0;
+  const baseExecutor = oldChain.base_executor_provider ?? oldRoles.executor?.provider ?? exec ?? null;
+  const baseReviewer = oldChain.base_reviewer_provider ?? oldRoles.reviewer?.provider ?? null;
+  const baseReviewerPrompt = oldChain.base_reviewer_prompt_template ?? oldRoles.reviewer?.prompt_template ?? '';
+  cfg.review_chain = {
+    ...oldChain,
+    enabled: chainEnabled,
+    steps: steps.map((s, i) => ({ ...s, slot: i + 1 })),
+    base_executor_provider: baseExecutor,
+    base_reviewer_provider: baseReviewer,
+    base_reviewer_prompt_template: baseReviewerPrompt,
+  };
   if (exec) {
     cfg.roles = cfg.roles || {};
     cfg.roles.executor = { ...(cfg.roles.executor || {}), provider: exec };
+  }
+  cfg.roles = cfg.roles || {};
+  cfg.roles.reviewer = { ...(cfg.roles.reviewer || {}) };
+  cfg.automation = { ...oldAutomation };
+  if (chainEnabled) {
+    // The core has one reviewer slot.  The additive cascade controller owns
+    // reviewer dispatch, intermediate PASS decisions, and revision resumes.
+    cfg.roles.reviewer.provider = steps[0].provider;
+    cfg.automation.auto_dispatch_reviewer = false;
+    cfg.automation.auto_apply_review = false;
+    cfg.automation.auto_resume_revision = false;
+  } else {
+    // Removing the cascade returns the workflow to the core's ordinary
+    // single-reviewer behavior and restores the provider used before it.
+    if (baseReviewer) cfg.roles.reviewer.provider = baseReviewer;
+    if (Object.prototype.hasOwnProperty.call(cfg.review_chain, 'base_reviewer_prompt_template')) {
+      cfg.roles.reviewer.prompt_template = baseReviewerPrompt;
+    }
+    cfg.automation.auto_dispatch_reviewer = true;
+    cfg.automation.auto_apply_review = true;
+    cfg.automation.auto_resume_revision = true;
   }
   try {
     await fetchJSON(`${API}/workflows/${wfId}`, {
       method: 'PATCH', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ config: cfg, expected_version: wf.state_version }),
     });
-    toast(steps.length ? 'Проверка кода сохранена — действует с ближайшего диспетча.' : 'Каскад выключен — работает обычный ревьюер.', false);
+    toast(steps.length ? 'Проверка кода сохранена — каскад управляет ближайшим ревью-этапом.' : 'Каскад выключен — работает обычный ревьюер.', false);
     await loadWorkflows();
     setReviewLoad();
   } catch (e) {
@@ -1590,6 +1655,11 @@ async function tsTest() {
 
 function cascadeEditorHTML(wf) {
   const chain = (wf.config && wf.config.review_chain) || { enabled: false, steps: [] };
+  const automation = (wf.config && wf.config.automation) || {};
+  const cascadeOwnsReview = chain.enabled &&
+    automation.auto_dispatch_reviewer === false &&
+    automation.auto_apply_review === false &&
+    automation.auto_resume_revision === false;
   const steps = chain.steps || [];
   const provOpts = (selected) =>
     workflowProviderOptions(selected || '', false)
@@ -1610,7 +1680,7 @@ function cascadeEditorHTML(wf) {
         <label class="cz-inline">раунды: <input type="number" id="cz-rounds-${i}" min="1" max="10" value="${s.max_rounds || 2}" style="width:44px"></label>
         <select id="cz-exhaust-${i}" class="cz-exhaust">
           ${['arbitrate_planner', 'accept_if_gate_green', 'human'].map(p =>
-            `<option value="${p}" ${s.on_exhaust === p ? 'selected' : ''}>${{arbitrate_planner:'исчерпан → арбитраж планером', accept_if_gate_green:'исчерпан → принять при зелёном гейте', human:'исчерпан → человеку'}[p]}</option>`).join('')}
+            `<option value="${p}" ${s.on_exhaust === p ? 'selected' : ''}>${{arbitrate_planner:'исчерпан → человеку (арбитраж планером не включён)', accept_if_gate_green:'исчерпан → принять при зелёном гейте', human:'исчерпан → человеку'}[p]}</option>`).join('')}
         </select>
       </div>
       <div class="cz-row">
@@ -1647,6 +1717,7 @@ function cascadeEditorHTML(wf) {
       <button class="btn btn-sm btn-primary" onclick="czSave()">Сохранить каскад</button>
       <span class="cz-hint">настройка действует с ближайшего диспетча; движок: cascade-review.py</span>
     </div>
+    ${chain.enabled && chain.steps.length ? `<div class="cz-hint" style="margin-top:6px;color:${cascadeOwnsReview ? 'var(--green)' : 'var(--yellow)'}">${cascadeOwnsReview ? '✓ Переходами управляет каскадный контроллер.' : '⚠ Сохраните каскад: автоматические переходы ядра ещё включены.'}</div>` : ''}
   </div>`;
 }
 
@@ -1690,7 +1761,28 @@ async function czSave() {
     return;
   }
   const cfg = JSON.parse(JSON.stringify(selectedWorkflowData.config));
+  const oldChain = cfg.review_chain || {};
+  const oldRoles = cfg.roles || {};
+  const oldReviewer = oldRoles.reviewer || {};
+  chain.base_executor_provider = oldChain.base_executor_provider ?? oldRoles.executor?.provider ?? null;
+  chain.base_reviewer_provider = oldChain.base_reviewer_provider ?? oldReviewer.provider ?? null;
+  chain.base_reviewer_prompt_template = oldChain.base_reviewer_prompt_template ?? oldReviewer.prompt_template ?? '';
   cfg.review_chain = chain;
+  cfg.roles = cfg.roles || {};
+  cfg.roles.reviewer = { ...(cfg.roles.reviewer || {}) };
+  cfg.automation = { ...(cfg.automation || {}) };
+  if (chain.enabled && chain.steps.length) {
+    cfg.roles.reviewer.provider = chain.steps[0].provider;
+    cfg.automation.auto_dispatch_reviewer = false;
+    cfg.automation.auto_apply_review = false;
+    cfg.automation.auto_resume_revision = false;
+  } else {
+    if (chain.base_reviewer_provider) cfg.roles.reviewer.provider = chain.base_reviewer_provider;
+    cfg.roles.reviewer.prompt_template = chain.base_reviewer_prompt_template;
+    cfg.automation.auto_dispatch_reviewer = true;
+    cfg.automation.auto_apply_review = true;
+    cfg.automation.auto_resume_revision = true;
+  }
   try {
     await fetchJSON(`${API}/workflows/${selectedWorkflowId}`, {
       method: 'PATCH', headers: { 'Content-Type': 'application/json' },

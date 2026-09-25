@@ -69,6 +69,15 @@ $pids = [ordered]@{ worker = $w.Id; server = $s.Id }
 Write-Host "  Worker  PID $($w.Id)   logs\worker.log" -ForegroundColor Green
 Write-Host "  Server  PID $($s.Id)   http://127.0.0.1:8420" -ForegroundColor Green
 
+# The review-chain controller is an additive companion.  It uses the same
+# PromptPilot DB and port, and stays idle for workflows without review_chain.
+$cascadePython = if (Test-Path 'C:\Python314\python.exe') { 'C:\Python314\python.exe' } elseif (Test-Path "$PSScriptRoot\.venv\Scripts\python.exe") { "$PSScriptRoot\.venv\Scripts\python.exe" } else { 'python' }
+$cascade = Start-Process $cascadePython -ArgumentList @('-X', 'utf8', "$PSScriptRoot\cascade-review.py") `
+    -WorkingDirectory $PSScriptRoot -RedirectStandardOutput "$logDir\cascade-review.log" `
+    -RedirectStandardError "$logDir\cascade-review.err" -WindowStyle Hidden -PassThru
+$pids.cascade = $cascade.Id
+Write-Host "  Cascade PID $($cascade.Id)   ~/.promptpilot/cascade-review.log" -ForegroundColor Green
+
 if ($Bot -or $env:PP_TG_TOKEN) {
     if (-not $env:PP_TG_TOKEN) {
         Write-Host "PP_TG_TOKEN is not set, skipping bot." -ForegroundColor Yellow
