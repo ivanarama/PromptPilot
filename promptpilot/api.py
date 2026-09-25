@@ -103,6 +103,9 @@ app = FastAPI(title="PromptPilot", version="0.1.0", lifespan=_lifespan)
 # Optional additive UI integration. The scheduler remains outside the core
 # worker and database; this only exposes its visual panel on the same origin.
 try:
+    _repo_root = Path(__file__).resolve().parent.parent
+    if (_repo_root / "tools").is_dir() and str(_repo_root) not in sys.path:
+        sys.path.insert(0, str(_repo_root))
     from tools.addons.parallel_orchestrator.ui_server import addon_index_path, create_fastapi_router
 
     app.include_router(create_fastapi_router())
