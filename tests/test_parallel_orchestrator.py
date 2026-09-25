@@ -115,6 +115,9 @@ def test_modes_map_to_promptpilot_worktree_flag(tmp_path: Path):
     by_prompt = {task["prompt"]: task for task in client.created}
     assert by_prompt["isolated"]["worktree"] is True
     assert by_prompt["serial"]["worktree"] is False
+    assert by_prompt["isolated"]["priority"] == 5
+    assert by_prompt["isolated"]["max_retries"] == 0
+    assert by_prompt["isolated"]["keep_pane"] is False
 
 
 def test_shared_serial_same_directory_uses_one_scheduler_slot(tmp_path: Path):

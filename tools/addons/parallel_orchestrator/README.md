@@ -90,6 +90,11 @@ already running, its concurrency was fixed when that worker started; set
 four submitted tasks concurrently. The wrapper does not alter any existing
 launcher or service.
 
+The example intentionally leaves `provider` unset so it uses the configured
+PromptPilot default. Add a provider name that exists in
+`%USERPROFILE%\\.promptpilot\\providers.json` when a particular model is
+required for an analysis, implementation, or review node.
+
 ## Plan shape
 
 ```json

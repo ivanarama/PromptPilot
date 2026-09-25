@@ -9,7 +9,6 @@
       "prompt": "Inspect the BookApp reader API and data flow. Record concrete findings, file paths, risks, and a minimal implementation plan. Do not edit production files.",
       "working_dir": "${BOOKAPP_DIR}",
       "mode": "worktree",
-      "provider": "analysis-provider",
       "max_retries": 1
     },
     {
@@ -17,7 +16,6 @@
       "prompt": "Inspect the BookApp reader UI and identify the smallest clear UX improvements. Record current behavior, proposed states, and affected files. Do not edit production files.",
       "working_dir": "${BOOKAPP_DIR}",
       "mode": "worktree",
-      "provider": "analysis-provider",
       "max_retries": 1
     },
     {
@@ -25,7 +23,6 @@
       "prompt": "Inspect the BookApp tests and runtime checks. Propose focused acceptance checks for the reader change and identify missing coverage. Do not edit production files.",
       "working_dir": "${BOOKAPP_DIR}",
       "mode": "worktree",
-      "provider": "analysis-provider",
       "max_retries": 1
     },
     {
@@ -33,7 +30,6 @@
       "prompt": "Perform a bounded architecture and migration risk review of the reader change. Look for concurrency, data-loss, security, and rollback risks. Do not edit production files.",
       "working_dir": "${BOOKAPP_DIR}",
       "mode": "worktree",
-      "provider": "analysis-provider",
       "max_retries": 1
     },
     {
@@ -42,7 +38,6 @@
       "depends_on": ["api-analysis", "ui-analysis", "test-analysis", "risk-analysis"],
       "working_dir": "${BOOKAPP_DIR}",
       "mode": "worktree",
-      "provider": "planner-provider",
       "max_retries": 1
     },
     {
@@ -51,7 +46,6 @@
       "depends_on": ["plan-synthesis"],
       "working_dir": "${BOOKAPP_DIR}",
       "mode": "worktree",
-      "provider": "implementation-provider",
       "max_retries": 1
     },
     {
@@ -60,7 +54,6 @@
       "depends_on": ["plan-synthesis"],
       "working_dir": "${BOOKAPP_DIR}",
       "mode": "worktree",
-      "provider": "implementation-provider",
       "max_retries": 1
     },
     {
@@ -73,7 +66,6 @@
       "depends_on": ["backend-implementation", "ui-implementation"],
       "working_dir": "${BOOKAPP_DIR}",
       "mode": "worktree",
-      "provider": "strong-reviewer",
       "max_retries": 1
     }
   ]

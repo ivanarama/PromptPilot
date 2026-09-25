@@ -111,7 +111,7 @@ class NodeSpec:
     provider: str | None = None
     model: str | None = None
     effort: str | None = None
-    priority: int = 0
+    priority: int = 5
     max_retries: int = 0
     max_repairs: int = 0
     autofix: bool = False
@@ -164,7 +164,7 @@ class NodeSpec:
                 raise PlanError(f"node {node_id!r}: {name} must be between {minimum} and {maximum}")
             return result
 
-        timeout = raw.get("timeout")
+        timeout = raw.get("task_timeout", raw.get("timeout"))
         if timeout is not None:
             try:
                 timeout = int(timeout)
@@ -183,7 +183,7 @@ class NodeSpec:
             provider=(str(raw["provider"]) if raw.get("provider") is not None else None),
             model=(str(raw["model"]) if raw.get("model") is not None else None),
             effort=(str(raw["effort"]) if raw.get("effort") is not None else None),
-            priority=bounded_int("priority", 0, -1000, 1000),
+            priority=bounded_int("priority", 5, 1, 10),
             max_retries=bounded_int("max_retries", 0, 0, 10),
             max_repairs=bounded_int("max_repairs", 0, 0, 10),
             autofix=_as_bool(raw.get("autofix"), False),
@@ -877,9 +877,13 @@ class ParallelOrchestrator:
         payload: dict[str, Any] = {
             "prompt": full_prompt,
             "priority": node.priority,
+            # The add-on owns retry accounting; do not silently add the core's
+            # default five retries on top of the plan's bounded retry budget.
+            "max_retries": 0,
             "skip_permissions": node.skip_permissions,
             "detached": node.detached,
             "worktree": worktree,
+            "keep_pane": node.keep_pane,
         }
         if working_dir:
             payload["working_dir"] = working_dir
@@ -890,9 +894,7 @@ class ParallelOrchestrator:
         if node.effort:
             payload["effort"] = node.effort
         if node.timeout is not None:
-            payload["timeout"] = node.timeout
-        if node.keep_pane:
-            payload["keep_pane"] = True
+            payload["task_timeout"] = node.timeout
         if node.herdr_target:
             payload["herdr_target"] = node.herdr_target
         if node.machine:
