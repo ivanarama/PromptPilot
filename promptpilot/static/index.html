@@ -1225,9 +1225,40 @@ if (localStorage.getItem('pp-theme') === 'light') {
   });
 }
 
-// ── Вкладка «Проверка кода»: пресеты + ступени ──
+// ── Вкладка «Проверка кода»: пресеты + РЕДАКТИРУЕМЫЕ ступени ──
 let setReviewWf = null;
-let setReviewPresetPending = null;
+let setReviewSteps = [];   // источник истины для карточек ступеней
+let setDragIdx = -1;
+
+function setProvOpts(sel) {
+  // человеческие имена в дропдаунах настроек; служебные (живые сессии) скрыты
+  const opts = Object.entries(providersData || {})
+    .filter(([, p]) => !p.hidden && !p.session_target)
+    .map(([name, p]) => {
+      const label = (p.human && p.human.label) || name;
+      return `<option value="${escAttr(name)}"${name === sel ? ' selected' : ''}>${esc(label)}</option>`;
+    });
+  if (sel && !(providersData || {})[sel]) {
+    opts.push(`<option value="${escAttr(sel)}" selected>${esc(sel)} · недоступен</option>`);
+  }
+  return (sel ? '' : '<option value="">— выбрать —</option>') + opts.join('');
+}
+function setHumanName(pid) {
+  const h = (providersData[pid] || {}).human || {};
+  return h.label || pid;
+}
+// Кто чинит находки ступени — человеческая подпись
+function setFixerHuman(s) {
+  if (s.fixer === 'self') return 'сам проверяющий';
+  if (s.fixer === 'executor' || !s.fixer) return 'исполнитель (пишет код)';
+  return setHumanName(s.fixer);
+}
+function setStepHint(s) {
+  const bits = [`находки чинит: ${setFixerHuman(s)}`, `раундов: ${s.max_rounds || 2}`];
+  if (s.window) bits.push(`🌙 окно ${s.window.from || '22:00'}–${s.window.to || '04:00'} (МСК)`);
+  if (s.blocking === false) bits.push('не блокирующая');
+  return bits.join(' · ');
+}
 
 function renderReviewTab() {
   const sel = document.getElementById('set-wf');
@@ -1248,105 +1279,246 @@ function setReviewLoad() {
   const body = document.getElementById('set-review-body');
   if (!wf) { body.innerHTML = '<div class="cz-hint">Воркфлоу не найден.</div>'; return; }
   const chain = (wf.config && wf.config.review_chain) || { enabled: false, steps: [] };
-  const steps = chain.steps || [];
-  let preset = 'custom';
-  if (!steps.length) preset = 'none';
-  else if (steps.length === 1 && steps[0].provider === 'goose-zai' && steps[0].fixer === 'self') preset = 'standard';
-  else if (steps.length === 2 && steps[1].provider === 'qwen-review') preset = 'strict';
-  const human = (pid) => {
-    const h = (providersData[pid] || {}).human || {};
-    return h.label || pid;
-  };
-  const executorHuman = wf.config?.roles?.executor?.provider
-    ? human(wf.config.roles.executor.provider) : '?';
-  const stepsHuman = steps.map((s, i) =>
-    `<div class="cz-row"><b>Ступень ${i + 1}:</b> ${esc(human(s.provider))}` +
-    ` · чинит: ${s.fixer === 'self' ? 'сам' : esc(human(s.fixer) || s.fixer)}` +
-    `${s.window ? ' · 🌙 ночное окно' : ''}</div>`).join('');
+  setReviewSteps = JSON.parse(JSON.stringify(chain.steps || []));
+  const execProv = wf.config?.roles?.executor?.provider || '';
+  const revProv = wf.config?.roles?.reviewer?.provider || '';
+  const preset = setDetectPreset(setReviewSteps, chain.enabled);
   body.innerHTML = `
-    <div class="cz-row"><span class="cz-label">Кто пишет код:</span> <b>${executorHuman}</b></div>
-    <div class="cz-row" style="margin-top:8px"><span class="cz-label">Как проверяют код:</span></div>
     <div class="cz-row">
-      <label class="cz-inline"><input type="radio" name="set-preset" value="standard" ${preset === 'standard' ? 'checked' : ''} onchange="setPreset('standard')"> 🛡 Обычная — проверяет и исправляет сам</label>
+      <span class="cz-label">Кто пишет код:</span>
+      <select id="set-exec" class="cz-prov" style="max-width:300px">${setProvOpts(execProv)}</select>
+      <span class="cz-hint" id="set-exec-note">${execProv && !(providersData[execProv] || {}).human ? 'у этого помощника нет человеческого имени — задать можно в Помощниках' : ''}</span>
     </div>
+    <div class="cz-row" style="margin-top:10px"><span class="cz-label">Как проверяют код:</span></div>
     <div class="cz-row">
-      <label class="cz-inline"><input type="radio" name="set-preset" value="strict" ${preset === 'strict' ? 'checked' : ''} onchange="setPreset('strict')"> 🛡🛡 Строгая — двойная проверка (ГЛМ + Квен)</label>
+      <label class="cz-inline"><input type="radio" name="set-preset" value="standard" ${preset === 'standard' ? 'checked' : ''} onchange="setPreset('standard')"> 🛡 Обычная</label>
+      <label class="cz-inline"><input type="radio" name="set-preset" value="strict" ${preset === 'strict' ? 'checked' : ''} onchange="setPreset('strict')"> 🛡🛡 Строгая (двойная)</label>
+      <label class="cz-inline"><input type="radio" name="set-preset" value="none" ${preset === 'none' ? 'checked' : ''} onchange="setPreset('none')"> ⏭ Без каскада</label>
     </div>
-    <div class="cz-row">
-      <label class="cz-inline"><input type="radio" name="set-preset" value="none" ${preset === 'none' ? 'checked' : ''} onchange="setPreset('none')"> ⏭ Без проверки (быстро, только тесты)</label>
+    <div class="cz-hint">Пресет заполняет ступени ниже — после этого любую ступень можно поменять вручную и сохранить.
+      ${preset === 'none' ? `Сейчас работает обычный ревьюер воркфлоу${revProv ? ': ' + esc(setHumanName(revProv)) : ''}.` : ''}</div>
+    <div id="set-slots" style="margin-top:8px"></div>
+    <div class="cz-row" style="margin-top:6px">
+      <button class="btn btn-sm btn-ghost" onclick="setAddStep()">+ Добавить ступень</button>
+      <span class="cz-hint">ступени идут по порядку сверху вниз; карточку можно перетащить мышью за ⠿ или стрелками ↑↓</span>
     </div>
-    <div style="margin-top:8px" id="set-review-steps-preview"></div>
-    <details style="margin-top:8px"><summary class="cz-hint">▸ Дополнительные настройки (для опытных)</summary>
-      <div id="set-review-steps" style="margin-top:8px">${stepsHuman || '<div class="cz-hint">ступеней нет</div>'}</div>
-      <div class="cz-hint" style="margin-top:6px">Тонкая настройка ступеней — в карточке воркфлоу (⚙ Каскад ревью).</div>
-    </details>
     <div class="cz-row" style="margin-top:10px">
       <button class="btn btn-sm btn-primary" onclick="setReviewSave()">Сохранить</button>
       <span class="cz-hint">действует с ближайшего диспетча</span>
     </div>`;
-  body.dataset.preset = preset;
-  showPreview(preset);
+  renderSetSlots();
+}
+
+function setDetectPreset(steps, enabled) {
+  if (!steps.length) return enabled ? 'custom' : 'none';
+  const one = steps.length === 1 && steps[0].provider === 'goose-zai' && steps[0].fixer === 'self' && !steps[0].window;
+  const two = steps.length === 2 && steps[1].provider === 'qwen-review' && !!(steps[1].window);
+  if (one && !two) return 'standard';
+  if (one && two) return 'strict';
+  return 'custom';
+}
+
+function renderSetSlots() {
+  const box = document.getElementById('set-slots');
+  if (!box) return;
+  box.innerHTML = setReviewSteps.map((s, i) => {
+    const win = s.window || {};
+    return `<div class="cz-card" draggable="true" data-set-slot="${i}"
+        ondragstart="setDragStart(event,${i})" ondragover="setDragOver(event,${i})"
+        ondrop="setDrop(event,${i})" ondragend="setDragEnd(event)">
+      <div class="cz-row">
+        <span class="cz-label" style="cursor:grab" title="перетащить, чтобы поменять порядок">⠿</span>
+        <span class="cz-label">Ступень ${i + 1}:</span>
+        <select class="cz-prov" onchange="setProvChanged(${i}, this.value)">${setProvOpts(s.provider)}</select>
+        <button class="btn btn-sm btn-ghost" onclick="setMove(${i},-1)" ${i === 0 ? 'disabled' : ''} title="поднять ступень">↑</button>
+        <button class="btn btn-sm btn-ghost" onclick="setMove(${i},1)" ${i === setReviewSteps.length - 1 ? 'disabled' : ''} title="опустить ступень">↓</button>
+        <button class="btn btn-sm btn-danger" onclick="setRemoveStep(${i})" title="убрать ступень">✕</button>
+      </div>
+      <div class="cz-row">
+        <span class="cz-label-sm">Находки чинит:</span>
+        <select class="cz-fixer" onchange="setFixerChanged(${i}, this.value)">
+          <option value="self" ${s.fixer === 'self' ? 'selected' : ''}>сам проверяющий</option>
+          <option value="executor" ${(s.fixer || '') === 'executor' ? 'selected' : ''}>исполнитель (кто пишет код)</option>
+        </select>
+        <label class="cz-inline" style="margin-left:10px">раундов:
+          <input type="number" min="1" max="10" value="${s.max_rounds || 2}" onchange="setNumChanged(${i}, this.value)" style="width:44px">
+        </label>
+      </div>
+      <div class="cz-row">
+        <label class="cz-inline"><input type="checkbox" ${s.blocking !== false ? 'checked' : ''} onchange="setBlockingChanged(${i}, this.checked)"> блокирующая</label>
+        <label class="cz-inline" style="margin-left:10px"><input type="checkbox" ${win.from ? 'checked' : ''} onchange="setWindowChanged(${i}, this.checked)"> 🌙 ночное окно</label>
+        <span ${win.from ? '' : 'style="display:none"'}>с
+          <input type="time" value="${win.from || '22:00'}" onchange="setWindowTime(${i},'from',this.value)" style="width:74px">
+          до
+          <input type="time" value="${win.to || '04:00'}" onchange="setWindowTime(${i},'to',this.value)" style="width:74px">
+          МСК</span>
+      </div>
+      <div class="cz-row">
+        <span class="cz-hint">${setStepHint(s)}</span>
+      </div>
+    </div>`;
+  }).join('') ||
+    `<div class="cz-hint">Ступеней нет. «Сохранить» выключит каскад — проверки уйдут обычному ревьюеру из настроек воркфлоу.</div>`;
+}
+
+function setReadSlots() {
+  // перенести текущие значения DOM в массив (перед мутирующими операциями)
+  document.querySelectorAll('#set-slots .cz-card').forEach(card => {
+    const i = parseInt(card.dataset.setSlot, 10);
+    const s = setReviewSteps[i];
+    if (!s) return;
+    s.provider = card.querySelector('.cz-prov').value || s.provider;
+    s.fixer = card.querySelector('.cz-fixer').value || 'executor';
+    s.max_rounds = parseInt(card.querySelector('input[type="number"]').value, 10) || 2;
+    s.blocking = card.querySelector('input[type="checkbox"]:not([onchange*="setWindowChanged"])').checked;
+    s.window = card.querySelector('input[onchange*="setWindowChanged"]').checked
+      ? { from: card.querySelector('input[type="time"]').value || '22:00',
+          to: card.querySelectorAll('input[type="time"]')[1]?.value || '04:00',
+          tz_offset_hours: 3 } : undefined;
+  });
 }
 
 function setPreset(name) {
   const builders = {
-    standard: () => [{ slot: 1, provider: 'goose-zai', fixer: 'self', blocking: true, max_rounds: 2, on_exhaust: 'arbitrate_planner' }],
+    standard: () => [{ provider: 'goose-zai', fixer: 'self', blocking: true, max_rounds: 2 }],
     strict: () => [
-      { slot: 1, provider: 'goose-zai', fixer: 'self', blocking: true, max_rounds: 2, on_exhaust: 'arbitrate_planner' },
-      { slot: 2, provider: 'qwen-review', fixer: 'goose-zai', blocking: true, max_rounds: 3, on_exhaust: 'arbitrate_planner', window: { from: '22:00', to: '04:00', tz_offset_hours: 3 } },
+      { provider: 'goose-zai', fixer: 'self', blocking: true, max_rounds: 2 },
+      { provider: 'qwen-review', fixer: 'goose-zai', blocking: true, max_rounds: 3,
+        window: { from: '22:00', to: '04:00', tz_offset_hours: 3 } },
     ],
     none: () => [],
   };
-  const steps = (builders[name] || (() => []))();
-  const human = (pid) => (providersData[pid] || {}).human || {};
-  const lines = steps.map(s => `Ступень ${s.slot}: ${human(s.provider).label || s.provider}` +
-    (s.window ? ' (🌙 ночное окно)' : '')).join('<br>');
-  const prev = document.getElementById('set-review-steps-preview');
-  if (prev) prev.innerHTML = `<div class="cz-hint">Получится: ${lines || 'без ревью-ступеней'}</div>`;
-  setReviewPresetPending = { name, steps };
+  setReviewSteps = (builders[name] || (() => []))();
+  renderSetSlots();
 }
+
+function setAddStep() {
+  setReadSlots();
+  setReviewSteps.push({ provider: 'goose-zai', fixer: 'self', blocking: true, max_rounds: 2 });
+  renderSetSlots();
+}
+function setRemoveStep(i) {
+  setReadSlots();
+  setReviewSteps.splice(i, 1);
+  renderSetSlots();
+}
+function setMove(i, dir) {
+  setReadSlots();
+  const j = i + dir;
+  if (j < 0 || j >= setReviewSteps.length) return;
+  [setReviewSteps[i], setReviewSteps[j]] = [setReviewSteps[j], setReviewSteps[i]];
+  renderSetSlots();
+}
+function setProvChanged(i, v) { setReviewSteps[i].provider = v; refreshSetHints(); }
+function setFixerChanged(i, v) { setReviewSteps[i].fixer = v; refreshSetHints(); }
+function setNumChanged(i, v) { setReviewSteps[i].max_rounds = parseInt(v, 10) || 2; refreshSetHints(); }
+function setBlockingChanged(i, checked) { setReviewSteps[i].blocking = checked; refreshSetHints(); }
+function setWindowChanged(i, checked) {
+  setReviewSteps[i].window = checked
+    ? { from: '22:00', to: '04:00', tz_offset_hours: 3 } : undefined;
+  renderSetSlots();
+}
+function setWindowTime(i, key, v) {
+  if (setReviewSteps[i].window) { setReviewSteps[i].window[key] = v; refreshSetHints(); }
+}
+function refreshSetHints() {
+  document.querySelectorAll('#set-slots .cz-card').forEach(card => {
+    const s = setReviewSteps[parseInt(card.dataset.setSlot, 10)];
+    if (s) card.querySelector('.cz-hint').textContent = setStepHint(s);
+  });
+}
+
+// Drag-and-drop порядка ступеней
+function setDragStart(ev, i) { setDragIdx = i; ev.dataTransfer.effectAllowed = 'move'; }
+function setDragOver(ev, i) { ev.preventDefault(); ev.dataTransfer.dropEffect = 'move'; }
+function setDrop(ev, i) {
+  ev.preventDefault();
+  if (setDragIdx < 0 || setDragIdx === i) return;
+  setReadSlots();
+  const [moved] = setReviewSteps.splice(setDragIdx, 1);
+  setReviewSteps.splice(i, 0, moved);
+  setDragIdx = -1;
+  renderSetSlots();
+}
+function setDragEnd() { setDragIdx = -1; }
 
 async function setReviewSave() {
   const wfId = document.getElementById('set-wf').value;
   const wf = (workflowCache || []).find(x => x.id === wfId);
   if (!wf) { toast('Воркфлоу не найден'); return; }
+  setReadSlots();
+  const steps = setReviewSteps.filter(s => s.provider);
+  const exec = document.getElementById('set-exec')?.value || '';
+  if (steps.length && steps.some(s => !s.provider)) { toast('У ступени не выбран помощник'); return; }
   const cfg = JSON.parse(JSON.stringify(wf.config));
-  if (setReviewPresetPending) {
-    cfg.review_chain = { enabled: setReviewPresetPending.name !== 'none', steps: setReviewPresetPending.steps };
+  cfg.review_chain = { enabled: steps.length > 0, steps: steps.map((s, i) => ({ ...s, slot: i + 1 })) };
+  if (exec) {
+    cfg.roles = cfg.roles || {};
+    cfg.roles.executor = { ...(cfg.roles.executor || {}), provider: exec };
   }
   try {
     await fetchJSON(`${API}/workflows/${wfId}`, {
       method: 'PATCH', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ config: cfg, expected_version: wf.state_version }),
     });
-    toast('Проверка кода сохранена — действует с ближайшего диспетча.', false);
-    setReviewPresetPending = null;
+    toast(steps.length ? 'Проверка кода сохранена — действует с ближайшего диспетча.' : 'Каскад выключен — работает обычный ревьюер.', false);
     await loadWorkflows();
-    renderReviewTab();
+    setReviewLoad();
   } catch (e) {
     toast('Сохранение: ' + e.message);
   }
 }
 
-// ── Вкладка «Помощники»: человеческие карточки над каталогом ──
+// ── Вкладка «Помощники»: кликабельные карточки → свойства провайдера ──
+async function helperConfigure(name) {
+  await openProviders();          // загружает provManageData
+  provEdit(name);                 // заполняет форму свойств этого провайдера
+}
+
 function renderHelpersTab() {
   const list = document.getElementById('set-helpers-list');
-  const entries = Object.entries(providersData || {}).filter(([n, p]) => !p.hidden);
+  const entries = Object.entries(providersData || {}).filter(([n, p]) => !p.hidden)
+    .sort((a, b) =>
+      (((b[1].human && Object.keys(b[1].human).length) ? 1 : 0) -
+       ((a[1].human && Object.keys(a[1].human).length) ? 1 : 0)) || a[0].localeCompare(b[0]));
   const roleLabel = { writer: 'пишет код', reviewer: 'проверяет код', planner: 'планирует', both: 'пишет и проверяет' };
+  // где помощник сейчас задействован (по воркфлоу из вкладки «Проверка кода»)
+  const wf = (workflowCache || []).find(x => x.id === setReviewWf) || (workflowCache || [])[0];
+  const busy = {};
+  if (wf) {
+    const ep = wf.config?.roles?.executor?.provider; if (ep) busy[ep] = busy[ep] || [];
+    busy[ep].push(`пишет код в «${wf.slug}»`);
+    const rp = wf.config?.roles?.reviewer?.provider; if (rp) busy[rp] = busy[rp] || [];
+    busy[rp].push(`обычный ревьюер в «${wf.slug}»`);
+    ((wf.config?.review_chain || {}).steps || []).forEach((s, i) => {
+      busy[s.provider] = busy[s.provider] || [];
+      busy[s.provider].push(`ступень ${i + 1} проверки`);
+      if (s.fixer && !['self', 'executor'].includes(s.fixer)) {
+        busy[s.fixer] = busy[s.fixer] || [];
+        busy[s.fixer].push(`чинит за ступень ${i + 1}`);
+      }
+    });
+    const pp = wf.config?.roles?.planner?.provider; if (pp) busy[pp] = busy[pp] || [];
+    busy[pp].push('планировщик');
+  }
   list.innerHTML = entries.map(([name, p]) => {
     const h = p.human || {};
     const label = h.label || name;
     const role = h.role ? (roleLabel[h.role] || h.role) : '';
-    return `<div class="cz-card">
+    const now = (busy[name] || []).join(' · ');
+    return `<div class="cz-card" style="cursor:pointer" onclick="helperConfigure('${escAttr(name)}')" title="нажмите, чтобы открыть свойства помощника">
       <div class="cz-row">
         <b>${esc(label)}</b>
         ${role ? `<span class="cz-hint">· ${esc(role)}</span>` : ''}
         ${p.available === false ? '<span class="cz-hint" style="color:var(--red)">· недоступен</span>' : ''}
+        <span style="margin-left:auto"><button class="btn btn-sm btn-ghost" onclick="event.stopPropagation();helperConfigure('${escAttr(name)}')">⚙ Свойства</button></span>
       </div>
       ${h.desc ? `<div class="cz-hint">${esc(h.desc)}</div>` : ''}
+      ${now ? `<div class="cz-hint" style="color:var(--cyan)">сейчас: ${esc(now)}</div>` : '<div class="cz-hint" style="color:var(--text2)">сейчас нигде не задействован</div>'}
       <div class="cz-hint">технически: ${esc(name)}</div>
     </div>`;
   }).join('');
+  if (!entries.length) list.innerHTML = '<div class="cz-hint">Помощников нет — добавьте в ⚙ Providers.</div>';
 }
 
 // ── Каскад ревью: визуальный редактор цепочки (config.review_chain) ──
