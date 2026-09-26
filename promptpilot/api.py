@@ -587,10 +587,13 @@ def api_list_workflow_events(
     workflow_id: str,
     after_seq: int = Query(default=0, ge=0),
     limit: int = Query(default=200, ge=1, le=1000),
+    tail: bool = Query(default=False),
 ):
     if not db.get_workflow(workflow_id):
         raise HTTPException(404, "Workflow not found")
-    return db.list_workflow_events(workflow_id, after_seq=after_seq, limit=limit)
+    return db.list_workflow_events(
+        workflow_id, after_seq=after_seq, limit=limit, tail=tail
+    )
 
 
 @app.get(

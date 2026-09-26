@@ -1235,6 +1235,11 @@ function wfSlugColor(slug) {
 // ── ⚙ Настройки: единое окно (Оформление / Проверка кода / Помощники) ──
 
 function openSettings() { document.getElementById('settingsModal').classList.add('open'); setTab('appearance'); }
+function openReviewSettingsFor(workflowId) {
+  setReviewWf = workflowId || setReviewWf;
+  openSettings();
+  setTab('review');
+}
 function closeSettings() { document.getElementById('settingsModal').classList.remove('open'); }
 
 function setTab(name) {
@@ -1303,10 +1308,16 @@ function setFixerHuman(s) {
   return setHumanName(s.fixer);
 }
 function setStepHint(s) {
-  const bits = [`исправляет: ${setFixerHuman(s)}`, `раундов: ${s.max_rounds || 2}`];
+  const autoAttempts = document.getElementById('set-attempt-mode')?.value === 'auto';
+  const bits = [`исправляет: ${setFixerHuman(s)}`, autoAttempts ? 'попыток: авто (1/2/3)' : `раундов: ${s.max_rounds || 2}`];
   if (s.window) bits.push(`🌙 ждёт окна ${s.window.from || '22:00'}–${s.window.to || '04:00'} (МСК)`);
   if (s.blocking === false) bits.push('не блокирующая');
   return bits.join(' · ');
+}
+
+function attemptNumber(id, fallback) {
+  const parsed = parseInt(document.getElementById(id)?.value, 10);
+  return Number.isFinite(parsed) ? Math.max(1, Math.min(10, parsed)) : fallback;
 }
 
 function renderReviewTab() {
@@ -1332,6 +1343,8 @@ function setReviewLoad() {
   const execProv = wf.config?.roles?.executor?.provider || '';
   const revProv = wf.config?.roles?.reviewer?.provider || '';
   const automation = wf.config?.automation || {};
+  const attemptPolicy = chain.attempt_policy || {};
+  const attemptBySeverity = attemptPolicy.by_severity || {};
   const cascadeOwnsReview = chain.enabled &&
     automation.auto_dispatch_reviewer === false &&
     automation.auto_apply_review === false &&
@@ -1352,6 +1365,24 @@ function setReviewLoad() {
     <div class="cz-hint">Пресет заполняет ступени ниже — после этого любую ступень можно поменять вручную и сохранить.
       ${chain.enabled && (chain.steps || []).length ? `<br>При включённом каскаде ревьюер из каждой ступени получает отдельный аудит; его провайдер получает и задачу исправления, если выбран «сам проверяющий».<br><b style="color:${cascadeOwnsReview ? 'var(--green)' : 'var(--yellow)'}">${cascadeOwnsReview ? '✓ Каскадный контроллер управляет переходами' : '⚠ Нажмите «Сохранить»: старые автоматические переходы ещё не переданы каскаду'}</b>` : ''}
       ${preset === 'none' ? `Сейчас работает обычный ревьюер воркфлоу${revProv ? ': ' + esc(setHumanName(revProv)) : ''}.` : ''}</div>
+    <div class="cz-row" style="margin-top:8px">
+      <span class="cz-label">Попытки исправления:</span>
+      <select id="set-attempt-mode" class="cz-prov" style="max-width:300px">
+        <option value="auto" ${(chain.attempt_policy?.mode || 'manual') === 'auto' ? 'selected' : ''}>Авто по тяжести замечаний (1/2/3)</option>
+        <option value="manual" ${(chain.attempt_policy?.mode || 'manual') !== 'auto' ? 'selected' : ''}>Вручную по каждой ступени</option>
+      </select>
+      <span class="cz-hint">low → 1, medium → 2, high/blocker → 3; число в карточке используется в ручном режиме.</span>
+    </div>
+    <div class="cz-row" style="margin-top:6px;gap:6px;flex-wrap:wrap">
+      <span class="cz-label-sm">Правила авто:</span>
+      <label class="cz-inline">по умолчанию <input id="set-attempt-default" type="number" min="1" max="10" value="${attemptPolicy.default || 2}" style="width:44px"></label>
+      <label class="cz-inline">максимум <input id="set-attempt-max" type="number" min="1" max="10" value="${attemptPolicy.max || 3}" style="width:44px"></label>
+      <label class="cz-inline">low <input id="set-attempt-low" type="number" min="1" max="10" value="${attemptBySeverity.low || 1}" style="width:44px"></label>
+      <label class="cz-inline">medium <input id="set-attempt-medium" type="number" min="1" max="10" value="${attemptBySeverity.medium || 2}" style="width:44px"></label>
+      <label class="cz-inline">high <input id="set-attempt-high" type="number" min="1" max="10" value="${attemptBySeverity.high || 3}" style="width:44px"></label>
+      <label class="cz-inline">blocker <input id="set-attempt-blocker" type="number" min="1" max="10" value="${attemptBySeverity.blocker || 3}" style="width:44px"></label>
+    </div>
+    <div class="cz-hint">Эти числа работают только в режиме «Авто»; общий максимум ограничивает каждое правило.</div>
     <div id="set-slots" style="margin-top:8px"></div>
     <div class="cz-row" style="margin-top:6px">
       <button class="btn btn-sm btn-ghost" onclick="setAddStep()">+ Добавить ступень</button>
@@ -1452,6 +1483,8 @@ function setPreset(name) {
     none: () => [],
   };
   setReviewSteps = (builders[name] || (() => []))();
+  const attemptMode = document.getElementById('set-attempt-mode');
+  if (attemptMode) attemptMode.value = name === 'none' ? 'manual' : 'auto';
   renderSetSlots();
 }
 
@@ -1537,10 +1570,27 @@ async function setReviewSave() {
   const baseExecutor = oldChain.base_executor_provider ?? oldRoles.executor?.provider ?? exec ?? null;
   const baseReviewer = oldChain.base_reviewer_provider ?? oldRoles.reviewer?.provider ?? null;
   const baseReviewerPrompt = oldChain.base_reviewer_prompt_template ?? oldRoles.reviewer?.prompt_template ?? '';
+  const attemptMode = document.getElementById('set-attempt-mode')?.value || oldChain.attempt_policy?.mode || 'manual';
+  const attemptDefault = attemptNumber('set-attempt-default', 2);
+  const attemptMax = Math.max(attemptDefault, attemptNumber('set-attempt-max', 3));
+  const boundedAttempt = id => Math.min(attemptMax, attemptNumber(id, attemptDefault));
+  const attemptPolicy = {
+    ...(oldChain.attempt_policy || {}),
+    mode: attemptMode,
+    default: attemptDefault,
+    max: attemptMax,
+    by_severity: {
+      low: boundedAttempt('set-attempt-low'),
+      medium: boundedAttempt('set-attempt-medium'),
+      high: boundedAttempt('set-attempt-high'),
+      blocker: boundedAttempt('set-attempt-blocker'),
+    },
+  };
   cfg.review_chain = {
     ...oldChain,
     enabled: chainEnabled,
     steps: steps.map((s, i) => ({ ...s, slot: i + 1 })),
+    attempt_policy: attemptPolicy,
     base_executor_provider: baseExecutor,
     base_reviewer_provider: baseReviewer,
     base_reviewer_prompt_template: baseReviewerPrompt,
@@ -1687,6 +1737,8 @@ async function tsTest() {
 
 function cascadeEditorHTML(wf) {
   const chain = (wf.config && wf.config.review_chain) || { enabled: false, steps: [] };
+  const attemptPolicy = chain.attempt_policy || {};
+  const attemptBySeverity = attemptPolicy.by_severity || {};
   const automation = (wf.config && wf.config.automation) || {};
   const cascadeOwnsReview = chain.enabled &&
     automation.auto_dispatch_reviewer === false &&
@@ -1743,6 +1795,25 @@ function cascadeEditorHTML(wf) {
       <label class="cz-inline"><input type="checkbox" id="cz-enabled" ${chain.enabled ? 'checked' : ''}> каскад включён (иначе — обычный один ревьюер)</label>
       <span class="cz-hint">поток: ревью-1 → … → ревью-N → закрытие этапа</span>
     </div>
+    <div class="cz-row">
+      <label class="cz-inline">Попытки исправления:
+        <select id="cz-attempt-mode" class="cz-prov">
+          <option value="auto" ${(chain.attempt_policy?.mode || 'manual') === 'auto' ? 'selected' : ''}>авто по тяжести находок (1/2/3)</option>
+          <option value="manual" ${(chain.attempt_policy?.mode || 'manual') !== 'auto' ? 'selected' : ''}>вручную по ступеням</option>
+        </select>
+      </label>
+      <span class="cz-hint">low → 1, medium → 2, high/blocker → 3; число в карточке используется в ручном режиме.</span>
+    </div>
+    <div class="cz-row" style="gap:6px;flex-wrap:wrap">
+      <span class="cz-label-sm">Правила авто:</span>
+      <label class="cz-inline">по умолчанию <input id="cz-attempt-default" type="number" min="1" max="10" value="${attemptPolicy.default || 2}" style="width:44px"></label>
+      <label class="cz-inline">максимум <input id="cz-attempt-max" type="number" min="1" max="10" value="${attemptPolicy.max || 3}" style="width:44px"></label>
+      <label class="cz-inline">low <input id="cz-attempt-low" type="number" min="1" max="10" value="${attemptBySeverity.low || 1}" style="width:44px"></label>
+      <label class="cz-inline">medium <input id="cz-attempt-medium" type="number" min="1" max="10" value="${attemptBySeverity.medium || 2}" style="width:44px"></label>
+      <label class="cz-inline">high <input id="cz-attempt-high" type="number" min="1" max="10" value="${attemptBySeverity.high || 3}" style="width:44px"></label>
+      <label class="cz-inline">blocker <input id="cz-attempt-blocker" type="number" min="1" max="10" value="${attemptBySeverity.blocker || 3}" style="width:44px"></label>
+    </div>
+    <div class="cz-hint">Используется только в режиме «авто»; общий максимум ограничивает каждое правило.</div>
     <div id="cz-steps">${stepCards}</div>
     <div class="cz-row">
       ${addBtn}
@@ -1784,9 +1855,24 @@ function czCollectSteps() {
 }
 
 async function czSave() {
+  const attemptDefault = attemptNumber('cz-attempt-default', 2);
+  const attemptMax = Math.max(attemptDefault, attemptNumber('cz-attempt-max', 3));
+  const boundedAttempt = id => Math.min(attemptMax, attemptNumber(id, attemptDefault));
   const chain = {
     enabled: document.getElementById('cz-enabled')?.checked !== false,
     steps: czCollectSteps(),
+    attempt_policy: {
+      ...((selectedWorkflowData.config || {}).review_chain?.attempt_policy || {}),
+      mode: document.getElementById('cz-attempt-mode')?.value || 'manual',
+      default: attemptDefault,
+      max: attemptMax,
+      by_severity: {
+        low: boundedAttempt('cz-attempt-low'),
+        medium: boundedAttempt('cz-attempt-medium'),
+        high: boundedAttempt('cz-attempt-high'),
+        blocker: boundedAttempt('cz-attempt-blocker'),
+      },
+    },
   };
   if (chain.enabled && !chain.steps.length) {
     toast('Каскад включён, но ступеней нет — добавьте ступень или снимите галочку.');
@@ -2788,7 +2874,7 @@ async function selectWorkflow(id) {
   selectedWorkflowData = wf;
   const [rounds, events, findings, plan, stages] = await Promise.all([
     fetchJSON(`${API}/workflows/${id}/rounds`),
-    fetchJSON(`${API}/workflows/${id}/events?limit=200`),
+    fetchJSON(`${API}/workflows/${id}/events?limit=200&tail=true`),
     fetchJSON(`${API}/workflows/${id}/findings`),
     fetchJSON(`${API}/workflows/${id}/plan`),
     fetchJSON(`${API}/workflows/${id}/stages`),
@@ -2893,7 +2979,7 @@ function workflowSettingsHtml(wf) {
   </details>`;
 }
 
-function workflowStatusInfo(status, reviewerDone = false) {
+function workflowStatusInfo(status, reviewerDone = false, decisionState = {}) {
   const info = {
     draft: ['Черновик', 'Следующее действие: сформировать план этапов либо запустить быструю задачу.'],
     planning: ['Планирование', 'Сильный планировщик исследует задачу и формирует этапы.'],
@@ -2903,8 +2989,10 @@ function workflowStatusInfo(status, reviewerDone = false) {
     gating: ['Автоматические проверки', 'Следующее действие: зафиксировать результат gate.'],
     reviewing: ['Независимое ревью', 'Следующее действие: запустить проверяющего.'],
     revision_required: ['Нужны исправления', 'Следующее действие: открыть новый раунд доработок.'],
-    awaiting_human: reviewerDone
-      ? ['Ожидается вердикт ревью', 'Следующее действие: принять, вернуть на доработку или запросить решение человека.']
+    awaiting_human: reviewerDone && decisionState.budgetExhausted
+      ? ['Лимит попыток исчерпан', 'Каскад остановлен после предельного числа исправлений. Автоматический арбитраж не запущен.']
+      : reviewerDone
+      ? ['Ожидается ваше решение по ревью', 'Следующее действие: принять, вернуть на доработку или запросить решение человека.']
       : ['Ожидается ваше решение', 'Предыдущая попытка не завершила этап. Следующее действие: продолжить текущий раунд.'],
     completed: ['Завершён', 'Цель workflow принята независимым ревью.'],
     failed: ['Завершён с ошибкой', 'Требуется анализ причины и новый workflow либо ручное решение.'],
@@ -2918,7 +3006,15 @@ function workflowNeedsHuman(wf) {
     .includes(wf?.status);
 }
 
-function workflowHumanAlertCopy(status, reviewerDone) {
+function workflowHumanAlertCopy(status, reviewerDone, decisionState = {}) {
+  if (status === 'awaiting_human' && reviewerDone && decisionState.budgetExhausted) {
+    return ['Каскад остановлен по лимиту попыток',
+      'Ревью уже завершено, но автоматическая ступень исчерпала свои попытки. Сначала нужно выбрать новую политику или явно принять риск вручную.'];
+  }
+  if (status === 'revision_required' && decisionState.budgetExhausted) {
+    return ['Лимит попыток исчерпан',
+      'Новый раунд сейчас заблокирован защитным лимитом. Измените политику попыток или создайте новый этап после проверки замечаний.'];
+  }
   if (status === 'awaiting_human' && reviewerDone) {
     return ['Требуется ваше решение по ревью',
       'Проверяющий уже закончил. Выберите один из вариантов ниже — после этого PromptPilot продолжит или завершит workflow.'];
@@ -2939,7 +3035,7 @@ function workflowHumanAlertCopy(status, reviewerDone) {
     'Проверьте причину остановки и нажмите «Продолжить пайплайн», чтобы передать управление обратно оркестратору.'];
 }
 
-function workflowOwnerInfo(wf, activeRun, reviewerDone) {
+function workflowOwnerInfo(wf, activeRun, reviewerDone, decisionState = {}) {
   if (wf.status === 'planning') return {
     who: 'Планировщик', detail: activeRun?.task_id ? `task #${activeRun.task_id} · разбивает задачу на этапы` : 'запускается',
     next: 'Дальше: ваше однократное утверждение плана', color: 'var(--accent)',
@@ -2961,8 +3057,13 @@ function workflowOwnerInfo(wf, activeRun, reviewerDone) {
     next: 'Дальше: PASS либо новый раунд исправлений', color: 'var(--accent)',
   };
   if (wf.status === 'awaiting_human') return {
-    who: 'Вы', detail: reviewerDone ? 'нужно зафиксировать решение по аудиту' : 'автоматический этап остановлен',
-    next: reviewerDone ? 'Выбрать: принять / вернуть на доработку / нужен человек' : 'Проверить причину остановки', color: 'var(--red)',
+    who: decisionState.budgetExhausted ? 'Каскад / арбитраж' : 'Вы',
+    detail: decisionState.budgetExhausted
+      ? 'попытки ступени исчерпаны; автоматический арбитраж не создан'
+      : (reviewerDone ? 'нужно зафиксировать решение по аудиту' : 'автоматический этап остановлен'),
+    next: decisionState.budgetExhausted
+      ? 'Изменить политику попыток или принять риск вручную'
+      : (reviewerDone ? 'Выбрать: принять / вернуть на доработку / нужен человек' : 'Проверить причину остановки'), color: 'var(--red)',
   };
   if (wf.status === 'revision_required') return {
     who: 'Вы', detail: 'аудитор вернул результат на доработку',
@@ -2993,11 +3094,35 @@ function workflowRoundRow(round, current = false) {
   </div>`;
 }
 
+function workflowDecisionState(events = []) {
+  const list = [...events].sort((a, b) => (a.seq || 0) - (b.seq || 0));
+  const lastOf = types => [...list].reverse().find(e => types.includes(e.event_type));
+  const progress = lastOf([
+    'planner.dispatched','planner.completed','plan.edited','plan.approved','stage.advanced',
+    'human.resumed','executor.dispatched','executor.completed','gate.passed','reviewer.dispatched',
+    'review.awaiting_decision','review.passed','review.revision_required','workflow.completed',
+  ]);
+  const stop = lastOf([
+    'planner.invalid_output','executor.invalid_output','reviewer.invalid_output','gate.failed',
+    'gate.human_required','run.failed','automation.paused','limit.max_rounds',
+    'limit.stage_revisions','cascade.exhausted','cascade.max_rounds',
+  ]);
+  const activeStop = !!stop && (!progress || (stop.seq || 0) > (progress.seq || 0));
+  const budgetEvent = activeStop && ['limit.stage_revisions','cascade.exhausted','cascade.max_rounds'].includes(stop.event_type)
+    ? stop : null;
+  return {
+    activeStop,
+    budgetExhausted: !!budgetEvent,
+    budgetEvent,
+    cascadeExhausted: budgetEvent?.event_type === 'cascade.exhausted',
+  };
+}
+
 function workflowStopReason(events) {
   const stopping = [
     'planner.invalid_output','executor.invalid_output','reviewer.invalid_output','gate.failed',
     'gate.human_required','run.failed','automation.paused','limit.max_rounds',
-    'limit.stage_revisions',
+    'limit.stage_revisions','cascade.exhausted','cascade.max_rounds',
   ];
   const superseding = [
     'planner.dispatched','planner.completed','plan.edited','plan.approved','stage.advanced',
@@ -3016,6 +3141,15 @@ function workflowStopReason(events) {
   const task = latest.payload?.task_id ? `Task #${latest.payload.task_id}: ` : '';
   if (reason === 'missing successful workflow verdict') {
     return `${task}PromptPilot не получил финальную строку «ИТОГ: …» от агента.`;
+  }
+  if (latest.event_type === 'limit.stage_revisions') {
+    const max = latest.payload?.max_revision_rounds || '?';
+    const stage = latest.payload?.stage_code ? ` этапа ${latest.payload.stage_code}` : '';
+    return `Лимит возвратов${stage} исчерпан: ${max}. Новый раунд сейчас заблокирован.`;
+  }
+  if (latest.event_type === 'cascade.exhausted') {
+    return (reason || 'Каскад исчерпал попытки и остановился перед арбитражем.')
+      .replace('Лимит ступени', 'Лимит попыток');
   }
   return `${task}${reason}`;
 }
@@ -3073,8 +3207,9 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, 
   const pastRounds = rounds.filter(r => r.round_no !== wf.current_round);
   const importedCount = rounds.filter(r => r.summary?.historical).length;
   const stage = stages.find(item => item.id === wf.current_stage_id) || wf.config?.stage || {};
-  const statusInfo = workflowStatusInfo(wf.status, !!reviewerDone);
-  const ownerInfo = workflowOwnerInfo(wf, activeRun, reviewerDone);
+  const decisionState = workflowDecisionState(events);
+  const statusInfo = workflowStatusInfo(wf.status, !!reviewerDone, decisionState);
+  const ownerInfo = workflowOwnerInfo(wf, activeRun, reviewerDone, decisionState);
   const stopReason = workflowStopReason(events);
   const previousAudit = [...pastRounds].reverse().find(r => r.summary?.summary);
   const stageTitle = stage.title || `Раунд ${wf.current_round}: доработка после последнего аудита`;
@@ -3110,10 +3245,18 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, 
       <div class="wf-round-summary">Не запускайте новый раунд. Дождитесь завершения фоновых build/pytest; экран агента показан ниже.</div>
     </div>`;
   } else if (wf.status === 'revision_required' || (wf.status === 'awaiting_human' && !reviewerDone)) {
-    action = `<div class="wf-form"><input class="wide" id="wfHumanText" value="Продолжить работу с учётом сохранённого состояния" required>
-      <button class="btn btn-sm btn-primary" onclick="wfResume()">▶ Продолжить пайплайн${wf.status === 'revision_required' ? ' новым раундом' : ''}</button></div>`;
+    action = decisionState.budgetExhausted
+      ? `<div class="wf-form"><div class="wf-round-summary" style="color:var(--red)"><b>Продолжение заблокировано:</b> лимит попыток уже исчерпан.</div>
+          <button class="btn btn-sm btn-danger" disabled>▶ Новый раунд недоступен</button>
+          <button class="btn btn-sm btn-ghost" onclick="openReviewSettingsFor('${escAttr(wf.id)}')">⚙ Настроить попытки</button></div>`
+      : `<div class="wf-form"><input class="wide" id="wfHumanText" value="Продолжить работу с учётом сохранённого состояния" required>
+        <button class="btn btn-sm btn-primary" onclick="wfResume()">▶ Продолжить пайплайн${wf.status === 'revision_required' ? ' новым раундом' : ''}</button></div>`;
   } else if (wf.status === 'awaiting_human' && reviewerDone) {
     const auditColor = auditVerdict === 'PASS' ? 'var(--green)' : 'var(--red)';
+    const correctionAction = decisionState.budgetExhausted
+      ? `<button class="btn btn-sm btn-danger" disabled title="Лимит попыток исчерпан; сначала измените политику попыток">↻ Исправление заблокировано: лимит исчерпан</button>
+         <button class="btn btn-sm btn-ghost" onclick="openReviewSettingsFor('${escAttr(wf.id)}')">⚙ Настроить попытки</button>`
+      : `<button class="btn btn-sm btn-danger" onclick="wfReview('REVISION_REQUIRED')">↻ Отправить на исправление</button>`;
     action = `<div class="wf-stage" style="border-color:${auditColor}">
       <b style="color:${auditColor}">Аудитор task #${reviewerDone.task_id}: ${esc(auditVerdict || 'отчёт готов')}</b>
       <details data-wf-detail="audit-report"><summary>Показать отчёт независимого аудитора</summary>
@@ -3121,13 +3264,13 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, 
       </details>
     </div>
     <div class="wf-form"><input class="wide" id="wfDecisionSummary" placeholder="Итог независимого ревью">
-      <button class="btn btn-sm btn-primary" onclick="wfReview('PASS')">✓ Принять ревью и продолжить</button>
-      <button class="btn btn-sm btn-danger" onclick="wfReview('REVISION_REQUIRED')">↻ Отправить на исправление</button>
+      <button class="btn btn-sm btn-primary" onclick="wfReview('PASS')">✓ Принять вручную и продолжить</button>
+      ${correctionAction}
       <button class="btn btn-sm btn-ghost wide" onclick="wfReview('HUMAN_REQUIRED')">Оставить на ручном решении</button></div>`;
   }
   let humanAttention = '';
   if (workflowNeedsHuman(wf)) {
-    const [attentionTitle, attentionCopy] = workflowHumanAlertCopy(wf.status, !!reviewerDone);
+    const [attentionTitle, attentionCopy] = workflowHumanAlertCopy(wf.status, !!reviewerDone, decisionState);
     const alertKind = (wf.status === 'awaiting_human' && reviewerDone) ? 'decision' : 'action';
     const authHint = /401|unauthorized|incorrect api key|api key/i.test(stopReason || '')
       ? '<div class="wf-round-summary" style="color:var(--yellow)"><b>Похоже на ошибку авторизации провайдера.</b> Сначала исправьте ключ/профиль исполнителя или выберите другой провайдер, затем нажмите продолжение.</div>'
@@ -3159,9 +3302,14 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, 
   wfPane.querySelectorAll('textarea,input').forEach(el => { if (el.id) wfSnapValues[el.id] = el.value; });
   const wfModalScroller = wfPane.closest('.modal');
   const wfSnapModalTop = wfModalScroller ? wfModalScroller.scrollTop : 0;
+  const cascadeOwned = !!wf.config?.review_chain?.enabled
+    && wf.config?.automation?.auto_dispatch_reviewer === false
+    && wf.config?.automation?.auto_apply_review === false
+    && wf.config?.automation?.auto_resume_revision === false;
+  const autoBadge = cascadeOwned ? 'АВТО · КАСКАД' : 'АВТО';
   wfPane.innerHTML = `
     <div class="wf-title">${esc(wf.slug)} <span class="task-status" data-s="${escAttr(wf.status)}">${esc(statusInfo[0])}</span>
-      ${wf.config?.automation?.enabled ? '<span class="task-status" data-s="running">АВТО</span>' : '<span class="wf-meta">ручной режим</span>'}</div>
+      ${wf.config?.automation?.enabled ? `<span class="task-status" data-s="running">${autoBadge}</span>` : '<span class="wf-meta">ручной режим</span>'}</div>
     ${humanAttention}
     <div class="wf-stage" style="border-color:${ownerInfo.color}">
       <div class="wf-stage-title">🏓 Мяч сейчас: <span style="color:${ownerInfo.color}">${esc(ownerInfo.who)}</span></div>

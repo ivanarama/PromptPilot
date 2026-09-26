@@ -43,6 +43,23 @@ DEFAULT_POLL_SECONDS = 15
 DEFAULT_LOG_PATH = Path.home() / ".promptpilot" / "cascade-review.log"
 DEFAULT_STATE_PATH = Path.home() / ".promptpilot" / "cascade-review-state.json"
 
+# A review-chain slot may use an explicit budget, or the additive controller
+# can derive a conservative budget from the severity of the open findings.
+# The derived values are deliberately small: the workflow-level round budget
+# remains the final safety cap.
+DEFAULT_AUTO_ATTEMPT_POLICY = {
+    "mode": "manual",
+    "default": 2,
+    "max": 3,
+    "by_severity": {
+        "low": 1,
+        "medium": 2,
+        "high": 3,
+        "blocker": 3,
+    },
+}
+_SEVERITY_RANK = {"low": 1, "medium": 2, "high": 3, "blocker": 4}
+
 
 def _json_copy(value: Any) -> Any:
     return json.loads(json.dumps(value, ensure_ascii=False))
@@ -165,6 +182,79 @@ class CascadeController:
             step.setdefault("max_rounds", 2)
             step.setdefault("on_exhaust", "human")
         return chain, steps
+
+    @staticmethod
+    def _attempt_policy(chain: dict[str, Any]) -> dict[str, Any]:
+        """Return a bounded attempt policy without changing the stored config."""
+        raw = chain.get("attempt_policy")
+        raw = raw if isinstance(raw, dict) else {}
+        policy = _json_copy(DEFAULT_AUTO_ATTEMPT_POLICY)
+        policy.update({key: value for key, value in raw.items()
+                       if key in {"mode", "default", "max", "by_severity"}})
+        try:
+            policy["default"] = max(1, min(10, int(policy["default"])))
+        except (TypeError, ValueError):
+            policy["default"] = DEFAULT_AUTO_ATTEMPT_POLICY["default"]
+        try:
+            policy["max"] = max(1, min(10, int(policy["max"])))
+        except (TypeError, ValueError):
+            policy["max"] = DEFAULT_AUTO_ATTEMPT_POLICY["max"]
+        policy["max"] = max(policy["max"], policy["default"])
+        if not isinstance(policy.get("by_severity"), dict):
+            policy["by_severity"] = {}
+        cleaned = {}
+        for severity, fallback in DEFAULT_AUTO_ATTEMPT_POLICY["by_severity"].items():
+            value = policy["by_severity"].get(severity, fallback)
+            try:
+                cleaned[severity] = max(1, min(policy["max"], int(value)))
+            except (TypeError, ValueError):
+                cleaned[severity] = min(policy["max"], fallback)
+        policy["by_severity"] = cleaned
+        policy["mode"] = "auto" if str(policy.get("mode", "manual")).lower() == "auto" else "manual"
+        return policy
+
+    @staticmethod
+    def _finding_value(finding: Any, name: str) -> str:
+        value = getattr(finding, name, "")
+        return str(getattr(value, "value", value) or "").lower()
+
+    def _max_rounds_for_slot(
+        self,
+        workflow: WorkflowInDB,
+        chain: dict[str, Any],
+        slot: dict[str, Any],
+        decision: WorkflowReviewDecision | None = None,
+    ) -> tuple[int, str]:
+        """Resolve the retry budget and expose why that value was selected."""
+        policy = self._attempt_policy(chain)
+        mode = str(slot.get("attempts_mode") or policy["mode"]).lower()
+        if mode != "auto":
+            try:
+                value = max(1, min(10, int(slot.get("max_rounds") or 2)))
+            except (TypeError, ValueError):
+                value = 2
+            return value, "manual"
+
+        findings: list[Any] = []
+        try:
+            current_round_no = int(workflow.current_round or 0)
+            findings.extend(
+                finding for finding in db.list_workflow_findings(workflow.id)
+                if int(getattr(finding, "last_seen_round", 0) or 0) == current_round_no
+            )
+        except Exception:  # noqa: BLE001 - a policy fallback must not stop routing
+            pass
+        if decision is not None:
+            findings.extend(decision.findings)
+        open_severities = {
+            self._finding_value(item, "severity")
+            for item in findings
+            if self._finding_value(item, "status") in {"open", "reopened"}
+        }
+        selected = max(open_severities, key=lambda item: _SEVERITY_RANK.get(item, 0), default="")
+        value = policy["by_severity"].get(selected, policy["default"])
+        value = max(1, min(policy["max"], int(value)))
+        return value, f"auto:{selected or 'default'}"
 
     @staticmethod
     def _current_round(workflow: WorkflowInDB):
@@ -477,6 +567,48 @@ class CascadeController:
             payload={"run_id": run_id, **payload},
         ))
 
+    def _record_review_once(
+        self,
+        workflow: WorkflowInDB,
+        decision: WorkflowReviewDecision,
+    ) -> WorkflowInDB:
+        """Record a verdict, reusing a durable core verdict after a takeover.
+
+        The core may have parsed the reviewer output just before the cascade
+        controller disabled the core review flags. Replaying the same report
+        then collides on the strict finding idempotency key. If the durable
+        round already contains the same revision verdict, continue from that
+        projection instead of treating the collision as a new failure.
+        """
+        try:
+            return workflows.record_review(
+                workflow.id,
+                decision.model_copy(update={"expected_version": workflow.state_version}),
+            )
+        except db.WorkflowConflictError as exc:
+            if "idempotency key" not in str(exc):
+                raise
+            if decision.verdict is not ReviewVerdict.REVISION_REQUIRED:
+                raise
+            refreshed = db.get_workflow(workflow.id)
+            if not refreshed:
+                raise
+            current = self._current_round(refreshed)
+            if not current:
+                raise
+            already_applied = any(
+                event.event_type == "review.revision_required"
+                and event.round_id == current.id
+                for event in self._events(refreshed.id)
+            )
+            if not already_applied:
+                raise
+            self.log(
+                f"{workflow.slug}: повторный verdict уже записан core; "
+                "продолжаю каскад без повторной записи findings"
+            )
+            return refreshed
+
     def _hold_for_human(
         self,
         workflow: WorkflowInDB,
@@ -485,6 +617,7 @@ class CascadeController:
         event_type: str,
         reason: str,
         run_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> WorkflowInDB:
         with db._connect(immediate=True) as conn:
             row = conn.execute(
@@ -497,6 +630,8 @@ class CascadeController:
                 "slot": int(slot.get("slot", 1)),
                 "reason": reason,
             }
+            if metadata:
+                payload.update(metadata)
             if state in {WorkflowStatus.REVISION_REQUIRED, WorkflowStatus.REVIEWING}:
                 row = workflows._transition(
                     conn, row, WorkflowStatus.AWAITING_HUMAN,
@@ -528,9 +663,11 @@ class CascadeController:
         self,
         workflow: WorkflowInDB,
         *,
+        chain: dict[str, Any],
         slot: dict[str, Any],
         attempt: int,
-        max_rounds: int,
+        max_rounds: int | None,
+        budget_source: str | None,
         fixer: str,
         text: str,
     ) -> WorkflowInDB:
@@ -562,6 +699,10 @@ class CascadeController:
                     "cascade revision expected revision_required, "
                     f"got workflow={state.value}, round={round_row['status']}"
                 )
+            if max_rounds is None:
+                max_rounds, budget_source = self._max_rounds_for_slot(
+                    workflow, chain, slot
+                )
             next_round = int(row["current_round"]) + 1
             if not workflows._check_round_budget(conn, row, next_round):
                 payload = {
@@ -572,6 +713,8 @@ class CascadeController:
                     "refused_round": next_round,
                     "text": text,
                     "fixer": fixer,
+                    "attempt_budget": max_rounds,
+                    "attempt_budget_source": budget_source,
                 }
                 if state is WorkflowStatus.AWAITING_HUMAN:
                     row = workflows._touch(
@@ -610,6 +753,8 @@ class CascadeController:
                     "slot": int(slot.get("slot", 1)),
                     "attempt": attempt,
                     "max_rounds": max_rounds,
+                    "attempt_budget": max_rounds,
+                    "attempt_budget_source": budget_source,
                     "fixer": fixer,
                     "text": text,
                     "previous_round": round_row["round_no"],
@@ -624,17 +769,24 @@ class CascadeController:
         self,
         workflow: WorkflowInDB,
         *,
+        chain: dict[str, Any],
         state: dict[str, Any],
         slot: dict[str, Any],
         attempt: int,
         fixer: str,
         reason: str,
+        max_rounds: int | None = None,
+        budget_source: str | None = None,
     ) -> WorkflowInDB:
-        max_rounds = max(1, int(slot.get("max_rounds") or 2))
+        if max_rounds is None:
+            max_rounds, budget_source = self._max_rounds_for_slot(
+                workflow, chain, slot
+            )
         index = int(slot.get("slot", 1)) - 1
         resume_text = (
             f"Каскад: исправить замечания ревью-ступени {index + 1} "
-            f"провайдером {fixer}. Раунд {attempt}/{max_rounds}."
+            f"провайдером {fixer}. Раунд {attempt}/{max_rounds} "
+            f"({budget_source or 'manual'})."
         )
         configured = self._update_runtime_config(
             workflow,
@@ -645,9 +797,11 @@ class CascadeController:
         )
         resumed = self._resume_chain_revision(
             configured,
+            chain=chain,
             slot=slot,
             attempt=attempt,
             max_rounds=max_rounds,
+            budget_source=budget_source,
             fixer=fixer,
             text=resume_text,
         )
@@ -657,7 +811,8 @@ class CascadeController:
         advanced = workflows.advance_workflow(resumed.id)
         self.log(
             f"{workflow.slug}: ступень {index + 1} REVISION_REQUIRED → "
-            f"исправление provider={fixer}, раунд {attempt}/{max_rounds}"
+            f"исправление provider={fixer}, раунд {attempt}/{max_rounds} "
+            f"({budget_source or 'manual'})"
         )
         return advanced
 
@@ -761,7 +916,9 @@ class CascadeController:
         index = int(state["slot"])
         attempts = int(state["attempts"].get(str(index), 0)) + 1
         state["attempts"][str(index)] = attempts
-        max_rounds = max(1, int(slot.get("max_rounds") or 2))
+        max_rounds, budget_source = self._max_rounds_for_slot(
+            workflow, chain, slot, decision
+        )
         if attempts > max_rounds:
             policy = str(slot.get("on_exhaust") or "human")
             if policy == "accept_if_gate_green" and self._gate_is_green(workflow):
@@ -769,12 +926,9 @@ class CascadeController:
                     passed = decision.model_copy(update={"verdict": ReviewVerdict.PASS})
                     return self._apply_pass(workflow, state, passed, chain)
                 try:
-                    return workflows.record_review(
-                        workflow.id,
-                        decision.model_copy(
-                            update={"verdict": ReviewVerdict.PASS,
-                                    "expected_version": workflow.state_version}
-                        ),
+                    return self._record_review_once(
+                        workflow,
+                        decision.model_copy(update={"verdict": ReviewVerdict.PASS}),
                     )
                 except db.WorkflowConflictError:
                     pass
@@ -782,14 +936,20 @@ class CascadeController:
                 workflow,
                 slot=slot,
                 event_type="cascade.exhausted",
-                reason=f"Лимит ступени исчерпан ({attempts - 1}/{max_rounds}); политика: {policy}.",
+                reason=(
+                    f"Лимит попыток исчерпан ({attempts - 1}/{max_rounds}); "
+                    f"бюджет {budget_source}; политика: {policy}."
+                ),
                 run_id=str(state.get("last_run_id") or "") or None,
+                metadata={
+                    "attempt": attempts - 1,
+                    "attempt_budget": max_rounds,
+                    "attempt_budget_source": budget_source,
+                    "on_exhaust": policy,
+                },
             )
 
-        recorded = workflows.record_review(
-            workflow.id,
-            decision.model_copy(update={"expected_version": workflow.state_version}),
-        )
+        recorded = self._record_review_once(workflow, decision)
         current_round = self._current_round(recorded)
         self._append_marker(
             recorded.id,
@@ -800,6 +960,8 @@ class CascadeController:
                 "stage_id": recorded.current_stage_id or "planless",
                 "slot": index + 1,
                 "attempt": attempts,
+                "attempt_budget": max_rounds,
+                "attempt_budget_source": budget_source,
             },
         )
         fixer = self._resolve_fixer(slot, chain, recorded)
@@ -813,11 +975,14 @@ class CascadeController:
             )
         return self._resume_recorded_revision(
             recorded,
+            chain=chain,
             state=state,
             slot=slot,
             attempt=attempts,
             fixer=fixer,
             reason="route revision to configured fixer",
+            max_rounds=max_rounds,
+            budget_source=budget_source,
         )
 
     def _apply_pass(
@@ -867,10 +1032,7 @@ class CascadeController:
             reviewer_provider=str(slot["provider"]),
             reason="restore executor after final review slot",
         )
-        completed = workflows.record_review(
-            configured.id,
-            decision.model_copy(update={"expected_version": configured.state_version}),
-        )
+        completed = self._record_review_once(configured, decision)
         state["slot"] = 0
         state["attempts"] = {}
         state["last_run_id"] = None
@@ -909,10 +1071,7 @@ class CascadeController:
             )
         state["last_run_id"] = reviewer.id
         if decision.verdict is ReviewVerdict.HUMAN_REQUIRED:
-            recorded = workflows.record_review(
-                workflow.id,
-                decision.model_copy(update={"expected_version": workflow.state_version}),
-            )
+            recorded = self._record_review_once(workflow, decision)
             return self._hold_for_human(
                 recorded,
                 slot=slot,
@@ -960,6 +1119,7 @@ class CascadeController:
                     )
                 return self._resume_recorded_revision(
                     workflow,
+                    chain=chain,
                     state=state,
                     slot=slot,
                     attempt=attempts,
@@ -1055,6 +1215,7 @@ class CascadeController:
                     if fixer:
                         result = self._resume_recorded_revision(
                             workflow,
+                            chain=chain,
                             state=state,
                             slot=slot,
                             attempt=attempt,
@@ -1106,6 +1267,7 @@ class CascadeController:
                 if fixer:
                     result = self._resume_recorded_revision(
                         workflow,
+                        chain=chain,
                         state=state,
                         slot=slot,
                         attempt=attempt,
