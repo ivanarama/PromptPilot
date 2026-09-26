@@ -15,3 +15,4 @@ Screenshot*.png
 promptpilot/_build_commit.py
 scripts/inbox/.state.json
 scripts/inbox/outbox/
+scripts/inbox/events.jsonl
