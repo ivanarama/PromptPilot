@@ -386,9 +386,19 @@
     enhanceCascadeEditor();
 
     const observer = new MutationObserver(() => {
-      installLocaleControl();
-      enhanceCascadeEditor();
-      translateDynamicTerms();
+      // Не реагируем на собственные правки: обработчики переписывают тексты
+      // (installLocaleControl/translateDynamicTerms), а присваивание textContent
+      // само по себе мутация childList — без отключения цикл бесконечен.
+      observer.disconnect();
+      try {
+        installLocaleControl();
+        enhanceCascadeEditor();
+        translateDynamicTerms();
+      } finally {
+        requestAnimationFrame(() => {
+          observer.observe(document.body, { childList: true, subtree: true });
+        });
+      }
     });
     observer.observe(document.body, { childList: true, subtree: true });
     window.addEventListener('storage', event => {
