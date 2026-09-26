@@ -119,6 +119,27 @@
     .toast.bad { border-color: #74343f; }
     @media (max-width: 980px) { .top-grid, .bottom-grid { grid-template-columns: 1fr; } }
     @media (max-width: 620px) { .shell { width: min(100% - 20px, 1500px); padding-top: 15px; } .two, .three { grid-template-columns: 1fr; } .node-head { grid-template-columns: auto minmax(100px, 1fr) auto; } .node-kind { display: none; } .badges { justify-content: flex-start; } }
+
+    /* Светлая тема: та же схема переменных, светлые значения (синхронизировано
+       с главной страницей через localStorage 'pp-theme', тот же источник). */
+    body.theme-light {
+      --bg: #f5f6f8;
+      --panel: #ffffff;
+      --panel-2: #eef0f3;
+      --line: #d9dde3;
+      --text: #1a1d21;
+      --muted: #5b616e;
+      --accent: #4c5fd5;
+      --accent-2: #3b4fc0;
+      --green: #1a7f37;
+      --red: #cf222e;
+      --yellow: #9a6700;
+      --cyan: #0969da;
+      --shadow: 0 18px 50px #00000022;
+      --radius: 14px;
+      background: radial-gradient(circle at 20% 0%, #ffffff 0, var(--bg) 42%);
+    }
+    body.theme-light button.danger { color: #8a1218; border-color: #b3444d; background: #fbe9ea; }
   </style>
 </head>
 <body>
@@ -132,6 +153,7 @@
         <span id="coreBadge" class="badge">● PromptPilot: проверка</span>
         <span id="runnerBadge" class="badge">● Запуск: нет</span>
         <span id="jevBadge" class="badge">● Jev: не настроен</span>
+        <button id="themeBtn" title="Переключить светлую/тёмную тему (общая с главной страницей)">☀ Светлая</button>
       </div>
     </header>
 
@@ -200,6 +222,23 @@
   <script>
     const $ = (id) => document.getElementById(id);
     const UI_API = location.pathname.startsWith('/parallel') ? '/api/parallel' : '/api/ui';
+
+    // Тема общая с главной страницей PromptPilot (тот же origin → localStorage).
+    function applySharedTheme() {
+      const light = localStorage.getItem('pp-theme') === 'light';
+      document.body.classList.toggle('theme-light', light);
+      const btn = $('themeBtn');
+      if (btn) btn.textContent = light ? '🌙 Тёмная' : '☀ Светлая';
+    }
+    document.addEventListener('DOMContentLoaded', () => {
+      applySharedTheme();
+      $('themeBtn').addEventListener('click', () => {
+        localStorage.setItem('pp-theme',
+          localStorage.getItem('pp-theme') === 'light' ? 'dark' : 'light');
+        applySharedTheme();
+      });
+    });
+
     let plan = { version: 1, name: 'Новый параллельный запуск', description: '', max_parallel: 4, nodes: [] };
     let providers = [];
     let nodeDragId = null;

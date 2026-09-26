@@ -269,6 +269,10 @@
     flex-shrink: 0;
     font-family: var(--mono);
   }
+  .stage-chip {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
   .role-chip {
     border-radius: 4px;
     padding: 1px 6px;
@@ -1287,9 +1291,11 @@ let setReviewSteps = [];   // источник истины для карточ�
 let setDragIdx = -1;
 
 function setProvOpts(sel) {
-  // человеческие имена в дропдаунах настроек; служебные (живые сессии) скрыты
+  // человеческие имена в дропдаунах настроек; порядок — как во вкладке
+  // «Помощники» (ui_order), служебные (живые сессии) скрыты
   const opts = Object.entries(providersData || {})
     .filter(([, p]) => !p.hidden && !p.session_target)
+    .sort((a, b) => ((a[1].ui_order ?? 9999) - (b[1].ui_order ?? 9999)) || a[0].localeCompare(b[0]))
     .map(([name, p]) => {
       const label = (p.human && p.human.label) || name;
       return `<option value="${escAttr(name)}"${name === sel ? ' selected' : ''}>${esc(label)}</option>`;
@@ -1367,6 +1373,30 @@ function setReviewLoad() {
     <div class="cz-hint">Пресет заполняет ступени ниже — после этого любую ступень можно поменять вручную и сохранить.
       ${chain.enabled && (chain.steps || []).length ? `<br>При включённом каскаде ревьюер из каждой ступени получает отдельный аудит; его провайдер получает и задачу исправления, если выбран «сам проверяющий».<br><b style="color:${cascadeOwnsReview ? 'var(--green)' : 'var(--yellow)'}">${cascadeOwnsReview ? '✓ Каскадный контроллер управляет переходами' : '⚠ Нажмите «Сохранить»: старые автоматические переходы ещё не переданы каскаду'}</b>` : ''}
       ${preset === 'none' ? `Сейчас работает обычный ревьюер воркфлоу${revProv ? ': ' + esc(setHumanName(revProv)) : ''}.` : ''}</div>
+    <details style="margin-top:10px"><summary class="cz-hint" style="cursor:pointer">❓ Что значат все эти настройки — подробное объяснение для не-программиста</summary>
+      <div class="cz-hint" style="margin-top:8px;line-height:1.6">
+        <b>Ступень</b> — один круг проверки кода. «Строгая» проверка = две ступени подряд: сначала первый помощник, затем второй. Каждая ступень — карточка ниже.<br><br>
+        <b>🛡 Кто пишет код</b> — помощник, который делает основную работу (пишет и правит код по заданию этапа).<br><br>
+        <b>Находки чинит</b> — кто исправляет замечания проверяющего:<br>
+        • «сам проверяющий» — кто нашёл, тот и чинит. Быстрее и дешевле, подходит для мелких правок.<br>
+        • «исполнитель» — замечание уходит тому, кто писал код. Надёжнее для крупных переделок.<br>
+        <i>Пример: ГЛМ нашёл ошибку → МиниМакс чинит → ГЛМ перепроверяет.</i><br><br>
+        <b>Раундов</b> (в карточке ступени) — сколько раз может повториться круг «нашли → починили → перепроверили» для этой ступени. Кончились попытки → действует правило исчерпания (в редакторе каскада в карточке воркфлоу: планер решает / принять при зелёных тестах / спросить вас).<br><br>
+        <b>Блокирующая</b> — строгость ступени:<br>
+        • <b>Включена</b> — пока есть незакрытые замечания, следующий этап НЕ начинается. Ошибки не проезжают в проект, но конвейер может стоять пока чинят.<br>
+        • <b>Выключена</b> — замечания пишутся в «лист долга», конвейер едет дальше. Быстрее, но долг копится и всплывёт на финальной проверке.<br><br>
+        <b>🌙 Ночное окно</b> — ступень работает только в указанные часы (ночью тариф проверяющего часто в разы дешевле). Вне окна ступень пропускается, конвейер не ждёт.<br>
+        <i>Пример: окно 22:00–04:00 — вечером этап едет без этой ступени, а к утру Квен ночью всё проверил.</i><br><br>
+        <b>Попытки исправления</b> — сколько раз конвейер пробует починить замечание, прежде чем звать человека:<br>
+        • «Авто по тяжести» — число попыток выбирается само по серьёзности замечания: low (мелочь — форматирование, опечатка) → 1 попытка; medium (среднее — некорректная логика в узком месте) → 2; high (серьёзное — ошибка в основной функции) и blocker (пропускать нельзя — краш, потеря данных) → 3.<br>
+        • «Вручную» — вы сами задаёте «раундов» в каждой карточке ступени.<br>
+        • «Правила авто» (по умолчанию / максимум / low / medium / high / blocker) — точные числа попыток для каждого случая; «максимум» — потолок для любого правила. <i>Пример: blocker = 4, максимум = 3 → серьёзное замечание получит 3 попытки, не 4.</i><br><br>
+        <b>Пресеты</b> — готовые наборы:<br>
+        • 🛡 Обычная — один проверяющий (ГЛМ), сам чинит. Баланс цены и качества на каждый день.<br>
+        • 🛡🛡 Строгая — двойная проверка (ГЛМ + Квен ночью) для важных этапов.<br>
+        • ⏭ Без каскада — ступеней нет, проверяет штатный ревьюер воркфлоу (его назначение — в карточке воркфлоу, раздел настроек роли).
+      </div>
+    </details>
     <div class="cz-row" style="margin-top:8px">
       <span class="cz-label">Попытки исправления:</span>
       <select id="set-attempt-mode" class="cz-prov" style="max-width:300px">
@@ -1425,20 +1455,20 @@ function renderSetSlots() {
         <button class="btn btn-sm btn-danger" onclick="setRemoveStep(${i})" title="убрать ступень">✕</button>
       </div>
       <div class="cz-row">
-        <span class="cz-label-sm">Находки чинит:</span>
-        <select class="cz-fixer" onchange="setFixerChanged(${i}, this.value)">
+        <span class="cz-label-sm" title="кто будет исправлять замечания, которые найдёт этот проверяющий">Находки чинит:</span>
+        <select class="cz-fixer" onchange="setFixerChanged(${i}, this.value)" title="сам проверяющий = быстрее и дешевле; исполнитель = надёжнее для крупных правок">
           <option value="self" ${fixer === 'self' ? 'selected' : ''}>сам проверяющий</option>
           <option value="executor" ${fixer === 'executor' ? 'selected' : ''}>исполнитель (кто пишет код)</option>
           <option value="custom" ${customFixer ? 'selected' : ''}>указать помощника</option>
         </select>
         <select class="cz-fixer-custom" style="display:${customFixer ? '' : 'none'}" onchange="setFixerCustomChanged(${i}, this.value)">${setProvOpts(customFixer ? fixer : '')}</select>
-        <label class="cz-inline" style="margin-left:10px">раундов:
+        <label class="cz-inline" style="margin-left:10px" title="сколько раз повторится круг «нашли → починили → перепроверили», пока не сработает правило исчерпания">раундов:
           <input type="number" min="1" max="10" value="${s.max_rounds || 2}" onchange="setNumChanged(${i}, this.value)" style="width:44px">
         </label>
       </div>
       <div class="cz-row">
-        <label class="cz-inline"><input type="checkbox" ${s.blocking !== false ? 'checked' : ''} onchange="setBlockingChanged(${i}, this.checked)"> блокирующая</label>
-        <label class="cz-inline" style="margin-left:10px"><input type="checkbox" ${win.from ? 'checked' : ''} onchange="setWindowChanged(${i}, this.checked)"> 🌙 ночное окно</label>
+        <label class="cz-inline" title="ВКЛ: пока есть незакрытые замечания — следующий этап не начинается. ВЫКЛ: замечания копятся в лист долга, конвейер едет дальше" style="cursor:help"><input type="checkbox" ${s.blocking !== false ? 'checked' : ''} onchange="setBlockingChanged(${i}, this.checked)"> блокирующая</label>
+        <label class="cz-inline" style="margin-left:10px;cursor:help" title="ступень работает только в эти часы (ночью тариф часто дешевле); вне окна ступень пропускается"><input type="checkbox" ${win.from ? 'checked' : ''} onchange="setWindowChanged(${i}, this.checked)"> 🌙 ночное окно</label>
         <span ${win.from ? '' : 'style="display:none"'}>с
           <input type="time" value="${win.from || '22:00'}" onchange="setWindowTime(${i},'from',this.value)" style="width:74px">
           до
@@ -1641,12 +1671,14 @@ async function helperConfigure(name) {
   provEdit(name);                 // заполняет форму свойств этого провайдера
 }
 
+let helperDragIdx = -1;
+
 function renderHelpersTab() {
   const list = document.getElementById('set-helpers-list');
+  const humanLen = (p) => (p.human && Object.keys(p.human).length) ? 1 : 0;
   const entries = Object.entries(providersData || {}).filter(([n, p]) => !p.hidden)
-    .sort((a, b) =>
-      (((b[1].human && Object.keys(b[1].human).length) ? 1 : 0) -
-       ((a[1].human && Object.keys(a[1].human).length) ? 1 : 0)) || a[0].localeCompare(b[0]));
+    .sort((a, b) => ((a[1].ui_order ?? 9999) - (b[1].ui_order ?? 9999)) ||
+      (humanLen(b[1]) - humanLen(a[1])) || a[0].localeCompare(b[0]));
   const roleLabel = { writer: 'пишет код', reviewer: 'проверяет код', planner: 'планирует', both: 'пишет и проверяет' };
   // где помощник сейчас задействован (по воркфлоу из вкладки «Проверка кода»)
   const wf = (workflowCache || []).find(x => x.id === setReviewWf) || (workflowCache || [])[0];
@@ -1667,17 +1699,23 @@ function renderHelpersTab() {
     const pp = wf.config?.roles?.planner?.provider; if (pp) busy[pp] = busy[pp] || [];
     busy[pp].push('планировщик');
   }
-  list.innerHTML = entries.map(([name, p]) => {
+  list.innerHTML = entries.map(([name, p], i) => {
     const h = p.human || {};
     const label = h.label || name;
     const role = h.role ? (roleLabel[h.role] || h.role) : '';
     const now = (busy[name] || []).join(' · ');
-    return `<div class="cz-card" style="cursor:pointer" onclick="helperConfigure('${escAttr(name)}')" title="нажмите, чтобы открыть свойства помощника">
+    return `<div class="cz-card" draggable="true" data-helper-idx="${i}" style="cursor:pointer"
+        onclick="helperConfigure('${escAttr(name)}')" title="нажмите, чтобы открыть свойства помощника"
+        ondragstart="helperDragStart(event,${i})" ondragover="helperDragOver(event,${i})"
+        ondrop="helperDrop(event,${i})" ondragend="helperDragIdx = -1">
       <div class="cz-row">
+        <span class="cz-label" style="cursor:grab" title="перетащите карточку, чтобы изменить порядок помощников">⠿</span>
         <b>${esc(label)}</b>
         ${role ? `<span class="cz-hint">· ${esc(role)}</span>` : ''}
         ${p.available === false ? '<span class="cz-hint" style="color:var(--red)">· недоступен</span>' : ''}
-        <span style="margin-left:auto"><button class="btn btn-sm btn-ghost" onclick="event.stopPropagation();helperConfigure('${escAttr(name)}')">⚙ Свойства</button></span>
+        <span style="margin-left:auto;display:flex;gap:6px">
+          <button class="btn btn-sm btn-ghost" onclick="event.stopPropagation();helperConfigure('${escAttr(name)}')">⚙ Свойства</button>
+        </span>
       </div>
       ${h.desc ? `<div class="cz-hint">${esc(h.desc)}</div>` : ''}
       ${now ? `<div class="cz-hint" style="color:var(--cyan)">сейчас: ${esc(now)}</div>` : '<div class="cz-hint" style="color:var(--text2)">сейчас нигде не задействован</div>'}
@@ -1685,6 +1723,37 @@ function renderHelpersTab() {
     </div>`;
   }).join('');
   if (!entries.length) list.innerHTML = '<div class="cz-hint">Помощников нет — добавьте в ⚙ Providers.</div>';
+  else list.insertAdjacentHTML('beforeend',
+    '<div class="cz-hint" style="margin-top:8px">Карточку можно перетащить за ⠿ — порядок сохранится и появится в выпадающих списках «Проверки кода». Клик по карточке — свойства (команда запуска, ключи, модель).</div>');
+}
+
+function helperDragStart(ev, i) {
+  // тянем только за маркер ⠿, чтобы клик по карточке открывал свойства
+  if (!ev.target.closest || !ev.target.closest('.cz-label[style*="cursor:grab"]')) {
+    ev.preventDefault(); return;
+  }
+  helperDragIdx = i;
+  ev.dataTransfer.effectAllowed = 'move';
+}
+function helperDragOver(ev, i) { ev.preventDefault(); ev.dataTransfer.dropEffect = 'move'; }
+async function helperDrop(ev, i) {
+  ev.preventDefault();
+  if (helperDragIdx < 0 || helperDragIdx === i) return;
+  const humanLen = (p) => (p.human && Object.keys(p.human).length) ? 1 : 0;
+  const entries = Object.entries(providersData || {}).filter(([n, p]) => !p.hidden)
+    .sort((a, b) => ((a[1].ui_order ?? 9999) - (b[1].ui_order ?? 9999)) ||
+      (humanLen(b[1]) - humanLen(a[1])) || a[0].localeCompare(b[0]));
+  const [moved] = entries.splice(helperDragIdx, 1);
+  entries.splice(i, 0, moved);
+  helperDragIdx = -1;
+  try {
+    await fetchJSON(`${API}/providers/reorder`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ names: entries.map(([n]) => n) }),
+    });
+    await loadProviders();          // обновит ui_order в providersData
+    renderHelpersTab();
+  } catch (e) { toast('Порядок не сохранён: ' + e.message); }
 }
 
 // ── Вкладка «Автопилот»: Jev (TypeSafe) — решатель самопочинки ──
@@ -1976,6 +2045,29 @@ function czWindowChanged(i) {
 
 // ── Каскад ревью: конец ──
 
+// ── Этапы воркфлоу для строки задачи: бейдж этапа + прогресс ──
+// Кэш wfStagesCache[wfId] = {version, list, byId, done, total, pct}.
+const wfStagesCache = {};
+async function ensureWfStages(wf) {
+  if (!wf || !wf.id) return;
+  const cached = wfStagesCache[wf.id];
+  if (cached && cached.version === wf.state_version) return;
+  try {
+    const list = await fetchJSON(`${API}/workflows/${wf.id}/stages`);
+    const byId = {};
+    let done = 0;
+    (list || []).forEach(s => {
+      byId[s.id] = s;
+      if (s.status === 'completed') done++;
+    });
+    wfStagesCache[wf.id] = {
+      version: wf.state_version, list: list || [], byId,
+      done, total: (list || []).length,
+      pct: (list || []).length ? Math.round(done * 100 / list.length) : 0,
+    };
+  } catch (e) { /* не критично: без бейджа */ }
+}
+
 async function loadTasks() {
   const params = currentFilter ? `?status=${currentFilter}&limit=100` : '?limit=100';
   const tasks = await fetchJSON(`${API}/tasks${params}`);
@@ -1986,6 +2078,9 @@ async function loadTasks() {
   // workflowCache is only filled when the Workflows modal was opened — fetch
   // it lazily here too; chips appear on the next refresh tick.
   if (!(workflowCache || []).length) loadWorkflows();
+  // Этапы и прогресс каждого воркфлоу (для бейджа «G7b · Закладки» и %):
+  // кэш по state_version — перезагружается только когда воркфлоу реально двинулся.
+  await Promise.all((workflowCache || []).map(w => ensureWfStages(w)));
   const wfByDir = new Map((workflowCache || [])
     .filter(w => w.repository_path)
     .map(w => [w.repository_path, w.slug]));
@@ -2022,6 +2117,26 @@ async function loadTasks() {
     const taskWfColor = taskWf ? wfSlugColor(taskWf.slug) : null;
     const taskWfChip = taskWf
       ? `<span class="wf-chip" style="border-color:${taskWfColor};color:${taskWfColor}" title="воркфлоу ${escAttr(taskWf.slug)}">${esc(taskWf.slug)}</span>`
+      : '';
+    // Этап воркфлоу, над которым шла эта задача, и общий прогресс проекта.
+    const wfStages = taskWf ? wfStagesCache[taskWf.id] : null;
+    const curStage = wfStages ? (wfStages.byId[taskWf.current_stage_id] || null) : null;
+    let stageLabel = '';
+    if (curStage) {
+      // планер иногда даёт заголовкам вид «G7b: G7b Ручные…» — убираем повторы кода
+      let t = (curStage.title || '').trim();
+      if (curStage.code) {
+        const re = new RegExp('^' + curStage.code.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*[:—-]?\\s*', 'i');
+        while (re.test(t)) t = t.replace(re, '');
+      }
+      const stageShort = (t.split(/[:(—-]/)[0].trim() || t).slice(0, 24);
+      stageLabel = (curStage.code ? curStage.code + ' · ' : '') + stageShort;
+    }
+    const stageChip = curStage
+      ? `<span class="wf-chip stage-chip" title="этап воркфлоу: ${escAttr(curStage.code ? curStage.code + ': ' : '')}${escAttr(curStage.title || '')}">${esc(stageLabel)}</span>`
+      : '';
+    const progressChip = wfStages && wfStages.total
+      ? `<span class="task-meta" title="закрыто ${wfStages.done} из ${wfStages.total} этапов воркфлоу">◌ ${wfStages.pct}% (${wfStages.done}/${wfStages.total})</span>`
       : '';
     const taskHumanFlag = taskWf && latestTaskByWorkflow.get(taskWf.id)?.id === t.id && workflowNeedsHuman(taskWf)
       ? `<button class="wf-human-flag" type="button" onclick="event.stopPropagation(); openWorkflowFromTask('${escAttr(taskWf.id)}')" title="Открыть workflow и выполнить требуемое действие">🔺 ДЕЙСТВИЕ</button>`
@@ -2062,7 +2177,9 @@ async function loadTasks() {
       <div class="task-header" onclick="toggleTask(${t.id})">
         <span class="task-id">#${t.id}</span>
         ${taskWfChip}
+        ${stageChip}
         ${roleChip}
+        ${progressChip}
         <span class="task-status" data-s="${t.status}">${taskStatusLabel(t)}</span>
         ${taskHumanFlag}
         <span class="task-prompt" title="${escAttr(taskDisplayTitle(t))}">${esc(taskDisplayTitle(t))}</span>

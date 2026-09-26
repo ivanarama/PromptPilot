@@ -1075,6 +1075,8 @@ def api_providers():
             "hidden": bool(info.get("hidden")),
             "executor": info.get("executor", ""),
             "session_target": bool(info.get("session_target")),
+            # Порядок карточек помощников (drag&drop в ⚙ Настройки).
+            "ui_order": info.get("ui_order", 9999),
             # HOTFIX (bookapp): человеческий слой для UI настроек —
             # необязательный блок из providers.json (label/role/desc).
             "human": info.get("human", {}),
@@ -1340,6 +1342,17 @@ def api_provider_create(p: ProviderCreate):
         # он единственный, который приходится менять от этапа к этапу.
         save_provider(p.name, p.cmd, p.description, env=p.env or None,
                       models=p.models or None, effort=p.effort)
+    return {"ok": True}
+
+
+@app.post("/api/providers/reorder")
+def api_providers_reorder(body: dict):
+    """Save the helper-card order (list of provider names, desired order)."""
+    from .config import set_providers_ui_order
+    names = body.get("names")
+    if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
+        raise HTTPException(400, "Ожидается {\"names\": [имена провайдеров по порядку]}")
+    set_providers_ui_order(names)
     return {"ok": True}
 
 

@@ -395,6 +395,24 @@ def _write_custom_providers(custom: dict):
     _atomic_write_json(_providers_file(), custom)
 
 
+def set_providers_ui_order(names: list) -> bool:
+    """Persist the helper-card order chosen by drag&drop in the UI.
+
+    Stored as a per-provider `ui_order` field (partial-override friendly:
+    missing entries keep their default alphabetical tail).
+    """
+    known = set(load_providers())
+    custom = _load_custom_providers()
+    for idx, name in enumerate(names):
+        if name not in known:
+            continue
+        entry = custom.get(name, {})
+        entry["ui_order"] = idx
+        custom[name] = entry
+    _write_custom_providers(custom)
+    return True
+
+
 def save_provider(name: str, cmd: str = None, description: str = "", env: dict = None,
                   executor: str = None, kind: str = None, keep_pane: bool = False,
                   models: list = None, args: list = None, effort: str = None):
