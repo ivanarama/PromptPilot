@@ -291,13 +291,16 @@ def mark_seen(client: imaplib.IMAP4_SSL, folder: str, num: str) -> None:
 TG_ALLOWED: dict = {}
 
 
-def tg(token: str, method: str, **params):
-    data = json.dumps(params, ensure_ascii=False).encode("utf-8")
-    request = urllib.request.Request(
-        f"https://api.telegram.org/bot{token}/{method}", data=data,
-        headers={"Content-Type": "application/json"}, method="POST")
-    with urllib.request.urlopen(request, timeout=40) as response:
-        payload = json.loads(response.read().decode("utf-8"))
+def tg(method: str, token: str, **params):
+    """Telegram API через curl (стабильнее urllib в этой сети).
+    Внимание: порядок (method, token) — вызовы идут tg("getUpdates", token)."""
+    url = f"https://api.telegram.org/bot{token}/{method}"
+    cmd = ["curl", "-sS", "-m", "45", "-X", "POST",
+           "-H", "Content-Type: application/json",
+           "--data-binary", "@-", url]
+    input_data = json.dumps(params, ensure_ascii=False).encode("utf-8")
+    result = subprocess.run(cmd, input=input_data, capture_output=True, timeout=50)
+    payload = json.loads((result.stdout or b"{}").decode("utf-8", "replace").strip() or "{}")
     if not payload.get("ok"):
         raise RuntimeError(f"telegram {method}: {payload}")
     return payload.get("result")
