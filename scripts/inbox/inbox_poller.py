@@ -95,7 +95,12 @@ def flush_saves(env: dict, state: dict) -> None:
             still_pending.append(item)
             continue
         if item.get("kt"):
-            verdict = parse_game_verdict(task.get("result") or "")
+            result = task.get("result") or ""
+            verdict = parse_game_verdict(result)
+            spec_index = result.upper().find("ТЕХНИЧЕСКОЕ ЗАДАНИЕ:")
+            spec = result[spec_index + len("ТЕХНИЧЕСКОЕ ЗАДАНИЕ:"):].strip() \
+                if spec_index >= 0 else ""
+            spec = spec.split(META_CUT)[0][:900]
             stage = {"ПРИНЯТЬ": "принято", "ОТКЛОНИТЬ": "отклонено",
                      "УТОЧНИТЬ": "уточняется"}.get(
                 verdict.get("вердикт", "").upper(), "триаж")
@@ -106,6 +111,7 @@ def flush_saves(env: dict, state: dict) -> None:
                         "reason": verdict.get("причина", ""),
                         "category": verdict.get("категория", ""),
                         "priority": verdict.get("приоритет", ""),
+                        "spec": spec,
                         "stage": entry.get("stage", stage) if stage == "триаж" else stage,
                     })
                     break
@@ -374,8 +380,8 @@ def write_kt_feed(env: dict, state: dict) -> None:
     items = []
     for entry in state.get("kt_feed", [])[-50:]:
         item = {key: entry.get(key, "") for key in
-                ("task_id", "from", "subject", "verdict", "reason",
-                 "category", "priority")}
+                ("task_id", "from", "title", "subject", "verdict", "reason",
+                 "category", "priority", "spec")}
         item["stage"] = entry.get("stage", "триаж")
         items.append(item)
     path = Path(feed_path)
@@ -603,6 +609,15 @@ def run_once(env: dict, dry: bool, refresh: bool = False) -> None:
                     print("  !! нет KT_CONCEPT — игровой триаж невозможен, пропуск")
                     state["processed"].append(full["message_id"])
                     continue
+                # Форма сайта шлёт общую тему "[KT] Предложение по игре" —
+                # заголовком карточки делаем первую содержательную строку текста.
+                if re.sub(r"^\[KT\]\s*", "", full["subject"], flags=re.I).strip().lower() \
+                        in ("предложение по игре", ""):
+                    first_line = next((line.strip() for line in full["body"].splitlines()
+                                       if len(line.strip()) > 15), full["subject"])
+                    full["title"] = first_line[:80]
+                else:
+                    full["title"] = re.sub(r"^\[KT\]\s*", "", full["subject"], flags=re.I).strip()[:80]
                 prompt = game_triage_prompt(full, concept)
             else:
                 known = resolve_known_project(full, items, sender_map)
@@ -632,6 +647,7 @@ def run_once(env: dict, dry: bool, refresh: bool = False) -> None:
                     "task_id": task_id,
                     "from": full["from"],
                     "subject": full["subject"],
+                    "title": full.get("title", ""),
                     "verdict": "В РАБОТЕ",
                     "reason": "", "category": "", "priority": "",
                 })
