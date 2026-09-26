@@ -17,6 +17,8 @@ import email
 import imaplib
 import json
 import re
+import smtplib
+import subprocess
 import sys
 import time
 import urllib.parse
@@ -52,55 +54,36 @@ def load_env(path: Path) -> dict:
 
 def gl(env: dict, method: str, path: str, payload: dict | None = None,
        raw_file: tuple[str, bytes] | None = None):
+    """GitLab API через curl: надёжный транспорт без зависимости от
+    TLS-отпечатков и хрупкой сборки URL. JSON-тело передаётся через stdin
+    (--data-binary @-), файлы — multipart через временный файл."""
     url = f"{env['GITLAB_URL'].rstrip('/')}/api/v4{path}"
-    headers = {"PRIVATE-TOKEN": env["GITLAB_TOKEN"],
-               "User-Agent": "OsIntake/1.0"}
-    data = None
-    content_type = None
+    input_data = b""
     if raw_file is not None:
         field, blob = raw_file
-        boundary = "----OsIntakeBoundary"
-        body = [
-            f"--{boundary}".encode(),
-            f'Content-Disposition: form-data; name="file"; filename="{field}"'.encode(),
-            "Content-Type: application/octet-stream".encode(),
-            b"", blob, f"--{boundary}--".encode(), b"",
-        ]
-        data = b"\r\n".join(body)
-        content_type = f"multipart/form-data; boundary={boundary}"
-    elif payload is not None:
-        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        content_type = "application/json"
-    if content_type:
-        headers["Content-Type"] = content_type
-    request = urllib.request.Request(url + method, data=data, headers=headers)
-    # Корпоративный прокси/GitLab иногда отдаёт разовые 404/400/5xx на те же
-    # самые запросы. GET-запросы безопасно повторять; мутации повторяем только
-    # при сетевых сбоях (не по HTTP-ответу), чтобы не создать issue дважды.
-    last_exc = None
-    for attempt in range(5):
-        try:
-            with urllib.request.urlopen(request, timeout=30) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            detail = ""
-            try:
-                detail = exc.read().decode("utf-8", errors="replace")[:500]
-            except Exception:
-                pass
-            last_exc = RuntimeError(
-                f"GitLab {method} {path} -> HTTP {exc.code}: {detail}")
-            if method == "GET" and attempt < 3:
-                time.sleep(2 * (attempt + 1))
-                continue
-            raise last_exc from exc
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            last_exc = exc
-            if attempt < 3:
-                time.sleep(2 * (attempt + 1))
-                continue
-            raise RuntimeError(f"GitLab {method} {path}: {exc}") from exc
-    raise last_exc
+        tmp = ATTACH_ROOT / f"upload-{time.time_ns()}-{field}"
+        tmp.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_bytes(blob)
+        cmd = ["curl", "-sS", "-m", "120", "-X", "POST",
+               "-H", f"PRIVATE-TOKEN: {env['GITLAB_TOKEN']}",
+               "-F", f"file=@{tmp}", url]
+    else:
+        cmd = ["curl", "-sS", "-m", "120", "-X", method,
+               "-H", f"PRIVATE-TOKEN: {env['GITLAB_TOKEN']}",
+               "-H", "Content-Type: application/json"]
+        if payload is not None:
+            input_data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        cmd += ["--data-binary", "@-", url]
+    result = subprocess.run(cmd, input=input_data, capture_output=True, timeout=180)
+    if raw_file is not None:
+        tmp.unlink(missing_ok=True)
+    out = (result.stdout or b"").decode("utf-8", errors="replace").strip()
+    if result.returncode != 0:
+        raise RuntimeError(f"curl {method} {path}: {result.stderr or result.returncode}")
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError:
+        raise RuntimeError(f"GitLab {method} {path} вернул не-JSON: {out[:200]}")
 
 
 def project_api(env: dict, path: str, method: str = "GET",
