@@ -9,9 +9,14 @@
 #   5. Queued-Nudger                 (пинок queued-воркфлоу, баг resume-not-noticed)
 
 $ErrorActionPreference = 'Continue'
-$PpDir    = 'C:\Users\Nachfin\Desktop\Projets\Other\PromptPilot'
-$Pem      = 'C:\Users\Nachfin\Desktop\Projets\VPN\vpn-almaty.pem'
-$KzServer = 'root@85.198.88.68'
+$PpDir    = Split-Path -Parent $MyInvocation.MyCommand.Path
+# Туннель для Telegram-бота задаётся переменными окружения (не хардкодим
+# приватную инфраструктуру в репозитории):
+#   PP_TUNNEL_PEM    — путь к ssh-ключу, например C:\keys\tunnel.pem
+#   PP_TUNNEL_SERVER — user@host SOCKS-прокси-сервера
+# Без обеих переменных туннель и бот пропускаются, остальное поднимается.
+$Pem      = $env:PP_TUNNEL_PEM
+$KzServer = $env:PP_TUNNEL_SERVER
 $Socks    = 10811
 
 function Test-Port([int]$Port) {
@@ -49,9 +54,11 @@ if ($healthy) {
     }
 }
 
-# 2. SSH tunnel (Telegram)
-if (Test-Port $Socks) {
-    Write-Host '[2] SSH tunnel KZ: already up' -ForegroundColor Green
+# 2. SSH tunnel (Telegram) — только если задан PP_TUNNEL_PEM/PP_TUNNEL_SERVER
+if (-not $Pem -or -not $KzServer) {
+    Write-Host '[2] SSH tunnel: skipped - PP_TUNNEL_PEM/PP_TUNNEL_SERVER not set' -ForegroundColor Yellow
+} elseif (Test-Port $Socks) {
+    Write-Host '[2] SSH tunnel: already up' -ForegroundColor Green
 } else {
     Write-Host '[2] Raising SSH tunnel...'
     Start-Process -WindowStyle Hidden -FilePath 'ssh' -ArgumentList @(
@@ -66,8 +73,9 @@ if (Test-Port $Socks) {
 # 3. Telegram bot
 if (Test-CmdLine 'promptpilot bot') {
     Write-Host '[3] Telegram bot: already running' -ForegroundColor Green
-} elseif (Test-Port $Socks) {
-    Start-HiddenConsole 'powershell.exe' '-NoProfile -ExecutionPolicy Bypass -Command "$env:ALL_PROXY=''socks5h://127.0.0.1:10811''; $env:HTTPS_PROXY=''socks5h://127.0.0.1:10811''; & ''C:\Users\Nachfin\Desktop\Projets\Other\PromptPilot\.venv\Scripts\python.exe'' -m promptpilot bot"' $PpDir
+} elseif ((Test-Port $Socks) -and $Pem -and $KzServer) {
+    $BotPy = Join-Path $PpDir '.venv\Scripts\python.exe'
+    Start-HiddenConsole 'powershell.exe' "-NoProfile -ExecutionPolicy Bypass -Command `"`$env:ALL_PROXY=''socks5h://127.0.0.1:$Socks''; `$env:HTTPS_PROXY=''socks5h://127.0.0.1:$Socks''; & ''$BotPy'' -m promptpilot bot`"" $PpDir
     Write-Host '[3] Telegram bot started (hidden)' -ForegroundColor Green
 } else {
     Write-Host '[3] Telegram bot: skipped - no tunnel' -ForegroundColor Yellow
