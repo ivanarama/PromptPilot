@@ -326,6 +326,17 @@ KT_MARKER = "[KT]"
 META_CUT = "--- Meta ---"
 
 
+def form_nick(body: str) -> str:
+    """Ник игрока из письма формы (FormSubmit: 'name: …'), иначе аноним.
+
+    Публичная стена показывает только ник — почта отправителя остаётся
+    во внутренней карточке задачи.
+    """
+    match = re.search(r"(?mi)^\s*name\s*:\s*(.+)$", body or "")
+    nick = match.group(1).strip() if match else ""
+    return (nick[:30] or "Анонимный странник")
+
+
 def is_kt(subject: str) -> bool:
     return subject.strip().upper().startswith(KT_MARKER)
 
@@ -380,7 +391,7 @@ def write_kt_feed(env: dict, state: dict) -> None:
     items = []
     for entry in state.get("kt_feed", [])[-50:]:
         item = {key: entry.get(key, "") for key in
-                ("task_id", "from", "title", "subject", "verdict", "reason",
+                ("task_id", "author", "title", "subject", "verdict", "reason",
                  "category", "priority", "spec")}
         item["stage"] = entry.get("stage", "триаж")
         items.append(item)
@@ -618,6 +629,7 @@ def run_once(env: dict, dry: bool, refresh: bool = False) -> None:
                     full["title"] = first_line[:80]
                 else:
                     full["title"] = re.sub(r"^\[KT\]\s*", "", full["subject"], flags=re.I).strip()[:80]
+                full["author"] = form_nick(full["body"])
                 prompt = game_triage_prompt(full, concept)
             else:
                 known = resolve_known_project(full, items, sender_map)
@@ -645,7 +657,7 @@ def run_once(env: dict, dry: bool, refresh: bool = False) -> None:
             if game_mode:
                 state["kt_feed"].append({
                     "task_id": task_id,
-                    "from": full["from"],
+                    "author": full.get("author", "Анонимный странник"),
                     "subject": full["subject"],
                     "title": full.get("title", ""),
                     "verdict": "В РАБОТЕ",
