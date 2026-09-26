@@ -85,7 +85,8 @@ if (Test-CmdLine 'promptpilot bot') {
 if (Test-CmdLine 'verdict-repair-watcher') {
     Write-Host '[4] Verdict-Repair Watcher: already running' -ForegroundColor Green
 } else {
-    Start-HiddenConsole 'C:\Python314\pythonw.exe' '-X utf8 "C:\Users\Nachfin\Desktop\Projets\Other\PromptPilot\verdict-repair-watcher.py"' $PpDir
+    $pyw = if (Test-Path 'C:\Python314\pythonw.exe') { 'C:\Python314\pythonw.exe' } else { 'pythonw.exe' }
+    Start-HiddenConsole $pyw '-X utf8 "$PpDir\verdict-repair-watcher.py"' $PpDir
     Start-Sleep -Seconds 3
     if (Test-CmdLine 'verdict-repair-watcher') {
         Write-Host '[4] Verdict-Repair Watcher started (hidden)' -ForegroundColor Green
@@ -98,7 +99,8 @@ if (Test-CmdLine 'verdict-repair-watcher') {
 if (Test-CmdLine 'quota-failover-watcher') {
     Write-Host '[4b] Quota-Failover Watcher: already running' -ForegroundColor Green
 } else {
-    Start-HiddenConsole 'C:\Python314\pythonw.exe' '-X utf8 "C:\Users\Nachfin\Desktop\Projets\Other\PromptPilot\quota-failover-watcher.py"' $PpDir
+    $pyw = if (Test-Path 'C:\Python314\pythonw.exe') { 'C:\Python314\pythonw.exe' } else { 'pythonw.exe' }
+    Start-HiddenConsole $pyw '-X utf8 "$PpDir\quota-failover-watcher.py"' $PpDir
     Start-Sleep -Seconds 3
     if (Test-CmdLine 'quota-failover-watcher') {
         Write-Host '[4b] Quota-Failover Watcher started (hidden)' -ForegroundColor Green
@@ -111,7 +113,8 @@ if (Test-CmdLine 'quota-failover-watcher') {
 if (Test-CmdLine 'queued-nudger') {
     Write-Host '[5] Queued-Nudger: already running' -ForegroundColor Green
 } else {
-    Start-HiddenConsole 'C:\Python314\python.exe' '-X utf8 "C:\Users\Nachfin\Desktop\Projets\Other\PromptPilot\queued-nudger.py"' $PpDir
+    $py = if (Test-Path 'C:\Python314\python.exe') { 'C:\Python314\python.exe' } else { 'python.exe' }
+    Start-HiddenConsole $py '-X utf8 "$PpDir\queued-nudger.py"' $PpDir
     Write-Host '[5] Queued-Nudger started (hidden)' -ForegroundColor Green
 }
 
@@ -120,7 +123,7 @@ if (Test-CmdLine 'cascade-review\.py') {
     Write-Host '[6] Cascade Review: already running' -ForegroundColor Green
 } else {
     $cascadePython = if (Test-Path 'C:\Python314\python.exe') { 'C:\Python314\python.exe' } else { 'python' }
-    Start-HiddenConsole $cascadePython '-X utf8 "C:\Users\Nachfin\Desktop\Projets\Other\PromptPilot\cascade-review.py"' $PpDir
+    Start-HiddenConsole $cascadePython '-X utf8 "$PpDir\cascade-review.py"' $PpDir
     Start-Sleep -Seconds 2
     if (Test-CmdLine 'cascade-review\.py') {
         Write-Host '[6] Cascade Review started (hidden)' -ForegroundColor Green

@@ -10,7 +10,7 @@
 # воркера прерывает текущую задачу. Система сама продолжит её после старта.
 
 $ErrorActionPreference = 'Continue'
-$PpDir = 'C:\Users\Nachfin\Desktop\Projets\Other\PromptPilot'
+$PpDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 Write-Host '=== PromptPilot Update ===' -ForegroundColor Cyan
 Set-Location $PpDir
