@@ -1128,6 +1128,7 @@ def api_typesafe_test():
     if not key:
         raise HTTPException(400, "ключ не задан — введите его и сохраните")
     import json as _json
+    import socket as _socket
     import urllib.error
     import urllib.request
     payload = _json.dumps({
@@ -1142,7 +1143,23 @@ def api_typesafe_test():
         with urllib.request.urlopen(req, timeout=45) as r:
             reply = _json.loads(r.read().decode("utf-8"))
     except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as exc:
-        raise HTTPException(502, f"TypeSafe недоступен: {exc}")
+        diag = {}
+        try:
+            diag["resolved"] = sorted(
+                ai[4][0] for ai in _socket.getaddrinfo("api.typesafe.ai", 443, _socket.AF_INET))
+        except Exception as dns_exc:
+            diag["resolved"] = f"DNS fail: {dns_exc}"
+        diag["proxies"] = urllib.request.getproxies()
+        diag["env_proxy"] = {k: v for k, v in os.environ.items() if "proxy" in k.lower()}
+        for ip in (diag["resolved"] if isinstance(diag["resolved"], list) else []):
+            try:
+                _c = _socket.create_connection((ip, 443), timeout=8)
+                _c.close()
+                diag[f"connect_{ip}"] = "OK"
+            except Exception as conn_exc:
+                diag[f"connect_{ip}"] = f"{type(conn_exc).__name__}: {conn_exc}"
+        raise HTTPException(
+            502, f"TypeSafe недоступен: {exc}; диагностика: {_json.dumps(diag, ensure_ascii=False)}")
     return {"ok": True, "source": source, "reply": reply}
 
 
