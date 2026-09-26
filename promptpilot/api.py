@@ -17,6 +17,7 @@ from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+import json
 import os
 import re as _re
 
@@ -1165,37 +1166,76 @@ def api_typesafe_test():
     return {"ok": True, "source": source, "reply": reply}
 
 
-# ── Квота-фейловер (переключение исполнителя при исчерпании квоты) ──
+# ── Квота-фейловер (лестница смен исполнителей) ──
+_QF_CONFIG = Path.home() / ".promptpilot" / "quota-failover.json"
+_QF_STATE = Path.home() / ".promptpilot" / "quota-failover-state.json"
+
+
+def _qf_read(path: Path):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
 @app.get("/api/quota-failover")
 def api_quota_failover():
-    """Состояние квота-фейловера: режим, проценты квоты, кто сейчас в ролях."""
-    import json as _json
-    base = Path.home() / ".promptpilot"
+    """Состояние лестницы смен: ступень, проценты квоты, кто в ролях."""
     result = {"enabled": False, "mode": "unknown", "available": False}
-    try:
-        cfg = _json.loads((base / "quota-failover.json").read_text(encoding="utf-8"))
-        result["enabled"] = bool(cfg.get("enabled", True))
-        result["failover_executor"] = cfg.get("failover", {}).get("executor")
-        result["thresholds"] = {
-            "failover_below_pct": cfg.get("failover_below_pct"),
-            "recover_above_pct": cfg.get("recover_above_pct"),
-        }
-    except (OSError, _json.JSONDecodeError, AttributeError):
+    cfg = _qf_read(_QF_CONFIG)
+    if cfg is None:
         return result
-    try:
-        state = _json.loads((base / "quota-failover-state.json").read_text(encoding="utf-8"))
+    result["enabled"] = bool(cfg.get("enabled", True))
+    result["thresholds"] = {
+        "failover_below_pct": cfg.get("failover_below_pct"),
+        "recover_above_pct": cfg.get("recover_above_pct"),
+    }
+    state = _qf_read(_QF_STATE)
+    if state is not None:
+        ladder = cfg.get("ladder") or []
+        rung = state.get("rung", 0)
         result.update({
             "available": True,
-            "mode": state.get("mode", "primary"),
+            "mode": f"смена {rung}",
+            "rung": rung,
+            "run_executor": ladder[rung].get("executor") if rung < len(ladder) else None,
             "interval_pct": state.get("interval_pct"),
             "weekly_pct": state.get("weekly_pct"),
+            "info": state.get("current_info"),
             "last_check": state.get("last_check"),
             "switched_at": state.get("switched_at"),
-            "snapshot_executor": (state.get("snapshot") or {}).get("executor"),
+            "switch_reason": state.get("switch_reason"),
         })
-    except (OSError, _json.JSONDecodeError):
-        pass
     return result
+
+
+@app.get("/api/quota-failover/config")
+def api_quota_failover_config_get():
+    """Конфиг лестницы смен для UI (v1-конфиг нормализуется в лестницу)."""
+    raw = _qf_read(_QF_CONFIG)
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "qfw", Path(__file__).resolve().parent.parent / "quota-failover-watcher.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    cfg = mod.normalize_config(raw if raw is not None else {})
+    if raw is None:
+        _QF_CONFIG.write_text(
+            json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")
+    return cfg
+
+
+@app.put("/api/quota-failover/config")
+def api_quota_failover_config(body: dict):
+    """Сохранить конфиг лестницы из UI (вотчер перечитывает каждый цикл)."""
+    if not isinstance(body, dict) or not isinstance(body.get("ladder"), list):
+        raise HTTPException(400, "Ожидается объект с массивом ladder")
+    for rung in body["ladder"]:
+        if not isinstance(rung, dict) or not rung.get("executor"):
+            raise HTTPException(400, "У каждой смены должен быть исполнитель")
+    _QF_CONFIG.write_text(
+        json.dumps(body, ensure_ascii=False, indent=1), encoding="utf-8")
+    return {"ok": True, "rungs": len(body["ladder"])}
 
 
 @app.get("/api/herdr/agents")

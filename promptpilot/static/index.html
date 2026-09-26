@@ -826,6 +826,7 @@
       <button class="set-tab" data-tab="review" onclick="setTab('review')">🛡 Проверка кода</button>
       <button class="set-tab" data-tab="helpers" onclick="setTab('helpers')">🤖 Помощники</button>
       <button class="set-tab" data-tab="auto" onclick="setTab('auto')">🩺 Автопилот</button>
+      <button class="set-tab" data-tab="shifts" onclick="setTab('shifts')">🔁 Смены</button>
     </div>
 
     <div class="set-pane" id="set-appearance">
@@ -851,6 +852,8 @@
     </div>
 
     <div class="set-pane" id="set-auto" style="display:none"></div>
+
+    <div class="set-pane" id="set-shifts" style="display:none"></div>
   </div>
 </div>
 
@@ -1254,6 +1257,7 @@ function setTab(name) {
   if (name === 'helpers') renderHelpersTab();
   if (name === 'review') renderReviewTab();
   if (name === 'auto') renderAutoTab();
+  if (name === 'shifts') renderShiftsTab();
 }
 
 // ── Тема ──
@@ -1785,18 +1789,168 @@ async function renderAutoTab() {
     const qf = await fetchJSON(`${API}/quota-failover`);
     const el = document.getElementById('qf-block');
     if (!qf.available) {
-      el.innerHTML = '<div class="cz-hint" style="margin-top:10px">🪫 Квота-фейловер: вотчер не запущен (запускается вместе с системой, состояние появится после первого замера).</div>';
+      el.innerHTML = '<div class="cz-hint" style="margin-top:10px">🪫 Лестница смен: вотчер ещё не сделал ни одного замера (запускается вместе с системой).</div>';
     } else {
-      const modeLine = qf.mode === 'failover'
-        ? `<b style="color:var(--yellow)">⚠ аварийный режим</b> — работает запасной исполнитель ${esc(qf.failover_executor || '')}, ревью у Квена`
-        : '<b style="color:var(--green)">✓ основной режим</b> — штатный исполнитель, каскад по вашим настройкам';
+      const modeLine = (qf.rung ?? 0) > 0
+        ? `<b style="color:var(--yellow)">⚠ смена ${(qf.rung ?? 0) + 1}</b> — работает исполнитель ${esc(qf.run_executor || '')}${qf.switch_reason ? ', причина: ' + esc(qf.switch_reason) : ''}`
+        : '<b style="color:var(--green)">✓ основная смена</b>';
       el.innerHTML = `
-        <div class="cz-row" style="margin-top:14px"><b>🪫 Квота-фейловер (авто-переключение исполнителя)</b></div>
-        <div class="cz-hint" style="margin:6px 0">Следит за квотой МиниМакса штатной командой. Остаток ≤ ${qf.thresholds?.failover_below_pct ?? 10}% — конвейер сам переходит на запасного исполнителя, ревью забирает Квен, работу принимает планер. Квота восстановилась — возвращается основной состав. Пороги и команду можно править в файле <code>~/.promptpilot/quota-failover.json</code>.</div>
+        <div class="cz-row" style="margin-top:14px"><b>🪫 Лестница смен (авто-переключение при исчерпании квот)</b></div>
+        <div class="cz-hint" style="margin:6px 0">Исполнители выстраиваются в очередь: квота кончилась — конвейер сам переходит на следующую смену (её исполнитель + её схема ревью), восстановилась — возвращается. Состав настраивается во вкладке «🔁 Смены».</div>
         <div class="cz-row">${modeLine}</div>
-        <div class="cz-row"><span class="cz-hint">Квота МиниМакс: окно ${qf.interval_pct ?? '?'}% · неделя ${qf.weekly_pct ?? '?'}%${qf.last_check ? ' · замер ' + esc(qf.last_check.replace('T', ' ')) : ''}${qf.mode === 'failover' && qf.snapshot_executor ? ' · возврат на ' + esc(qf.snapshot_executor) + ' при восстановлении' : ''}</span></div>`;
+        <div class="cz-row"><span class="cz-hint">${qf.info ? esc(qf.info) + ' · ' : ''}${qf.last_check ? 'замер ' + esc(String(qf.last_check).replace('T', ' ')) : ''}</span></div>`;
     }
   } catch (e) { /* блок не критичен */ }
+}
+
+// ── Вкладка «🔁 Смены»: лестница исполнителей на случай исчерпания квот ──
+let qfConfig = null;
+let qfDragIdx = -1;
+
+const QF_REVIEW_LABELS = {
+  keep: 'как настроено в 🛡 Проверке кода',
+  standard: '🛡 Обычная (ГЛМ сам чинит)',
+  strict: '🛡🛡 Строгая (ГЛМ + Квен ночью)',
+  qwen_main: '🧐 Квен — главный ревьюер',
+  none: '⏭ без каскада',
+};
+
+async function renderShiftsTab() {
+  const pane = document.getElementById('set-shifts');
+  let cfg = null, status = {};
+  try { cfg = await fetchJSON(`${API}/quota-failover/config`); } catch (e) {}
+  try { status = await fetchJSON(`${API}/quota-failover`); } catch (e) {}
+  if (!cfg || !Array.isArray(cfg.ladder)) {
+    pane.innerHTML = '<div class="cz-hint">Конфиг лестницы недоступен — перезапустите сервер (нужен новый api.py).</div>';
+    return;
+  }
+  qfConfig = cfg;
+  const rungNow = status.rung ?? 0;
+  const statusLine = status.available
+    ? `Сейчас: <b>смена ${rungNow + 1}${rungNow === 0 ? ' (основная)' : ''}</b>` +
+      (status.info ? ` · ${esc(status.info)}` : '') +
+      (status.last_check ? ` · проверка ${esc(String(status.last_check).replace('T', ' '))}` : '')
+    : 'Вотчер ещё не сделал ни одного замера.';
+  const cards = cfg.ladder.map((r, i) => `
+    <div class="cz-card" draggable="true" data-qf-idx="${i}"
+        ondragstart="qfDragStart(event,${i})" ondragover="qfDragOver(event,${i})"
+        ondrop="qfDrop(event,${i})" ondragend="qfDragIdx = -1">
+      <div class="cz-row">
+        <span class="cz-label" style="cursor:grab" title="перетащите, чтобы поменять порядок смен">⠿</span>
+        <span class="cz-label">Смена ${i + 1}:</span>
+        <input type="text" value="${escAttr(r.name || '')}" data-qf-field="name" placeholder="название" style="width:150px">
+        <select data-qf-field="executor">${setProvOpts(r.executor)}</select>
+        ${i === rungNow ? '<span class="role-chip role-review" title="работает сейчас">активна</span>' : ''}
+        <button class="btn btn-sm btn-ghost" onclick="qfMove(${i},-1)" ${i === 0 ? 'disabled' : ''}>↑</button>
+        <button class="btn btn-sm btn-ghost" onclick="qfMove(${i},1)" ${i === cfg.ladder.length - 1 ? 'disabled' : ''}>↓</button>
+        <button class="btn btn-sm btn-danger" onclick="qfRemove(${i})" title="убрать смену">✕</button>
+      </div>
+      <div class="cz-row">
+        <span class="cz-label-sm" title="как проверять исчерпание квоты этой смены">Проверка квоты:</span>
+        <select data-qf-field="quota">
+          <option value="">по ошибкам задач (429/лимиты) — любой провайдер</option>
+          <option value="mmx" ${r.quota && (r.quota.cmd || '').includes('mmx') ? 'selected' : ''}>штатная MiniMax (mmx quota show)</option>
+        </select>
+      </div>
+      <div class="cz-row">
+        <span class="cz-label-sm" title="схема проверки кода, пока эта смена работает">Ревью на смене:</span>
+        <select data-qf-field="review">
+          ${Object.entries(QF_REVIEW_LABELS).map(([v, l]) =>
+            `<option value="${v}" ${(r.review || 'keep') === v ? 'selected' : ''}>${l}</option>`).join('')}
+        </select>
+      </div>
+    </div>`).join('');
+  pane.innerHTML = `
+    <div class="cz-row"><b>🔁 Лестница смен исполнителей</b></div>
+    <div class="cz-hint" style="margin:6px 0 10px">Конвейер работает на первой смене. Квота исчерпалась (штатная проверка или повторные ошибки «лимит/429») — автоматически переходит на следующую смену целиком: её исполнитель и её схема ревью. Квота верхней смены восстановилась — возврат на неё между задачами (текущая задача не рвётся). У любой смены можно выбрать любого помощника — состав не привязан к конкретным моделям.</div>
+    <div class="cz-row"><span class="cz-hint">${statusLine}</span></div>
+    <div id="qf-cards" style="margin-top:8px">${cards}</div>
+    <div class="cz-row" style="margin-top:6px">
+      <button class="btn btn-sm btn-ghost" onclick="qfAdd()">+ Добавить смену</button>
+      <button class="btn btn-sm btn-ghost" onclick="qfPreset()" title="заполнить типовой набор: МиниМакс → ГЛМ-Быстрый+Квен → GPT">Заполнить нашу типовую лестницу</button>
+    </div>
+    <details style="margin-top:10px"><summary class="cz-hint" style="cursor:pointer">▸ Пороги и тонкости (для опытных)</summary>
+      <div class="cz-row" style="margin-top:8px">
+        <label class="cz-inline" title="остаток квоты ниже этого процента — сменить">уход в фейловер при остатке ≤
+          <input type="number" min="1" max="90" value="${cfg.failover_below_pct ?? 10}" data-qf-global="failover_below_pct" style="width:44px">%</label>
+        <label class="cz-inline">возврат при остатке ≥
+          <input type="number" min="10" max="100" value="${cfg.recover_above_pct ?? 50}" data-qf-global="recover_above_pct" style="width:44px">%</label>
+        <label class="cz-inline">неделя ≥
+          <input type="number" min="0" max="100" value="${cfg.recover_weekly_min_pct ?? 20}" data-qf-global="recover_weekly_min_pct" style="width:44px">%</label>
+        <label class="cz-inline" title="сколько ошибок «лимит/квота» за окно считается исчерпанием">ошибок до смены:
+          <input type="number" min="1" max="10" value="${cfg.error_strikes ?? 2}" data-qf-global="error_strikes" style="width:44px"></label>
+        <label class="cz-inline">окно ошибок, мин:
+          <input type="number" min="5" max="240" value="${cfg.error_window_minutes ?? 30}" data-qf-global="error_window_minutes" style="width:52px"></label>
+        <label class="cz-inline" title="как часто проверять квоту штатной командой">проверка каждые, сек:
+          <input type="number" min="60" max="3600" value="${cfg.poll_seconds ?? 300}" data-qf-global="poll_seconds" style="width:60px"></label>
+      </div>
+    </details>
+    <div class="cz-row" style="margin-top:10px">
+      <button class="btn btn-sm btn-primary" onclick="qfSave()">Сохранить лестницу</button>
+      <span class="cz-hint">вотчер подхватывает настройки со следующего цикла; смена состава применяется к ближайшей задаче</span>
+    </div>`;
+}
+
+function qfCollect() {
+  document.querySelectorAll('#qf-cards .cz-card').forEach(card => {
+    const i = parseInt(card.dataset.qfIdx, 10);
+    const r = qfConfig.ladder[i];
+    r.name = card.querySelector('[data-qf-field="name"]').value.trim();
+    r.executor = card.querySelector('[data-qf-field="executor"]').value;
+    r.quota = card.querySelector('[data-qf-field="quota"]').value === 'mmx'
+      ? { cmd: 'mmx quota show --output json', model: 'general' } : null;
+    r.review = card.querySelector('[data-qf-field="review"]').value;
+  });
+  document.querySelectorAll('[data-qf-global]').forEach(el => {
+    qfConfig[el.dataset.qfGlobal] = parseInt(el.value, 10);
+  });
+}
+function qfReRender() { qfCollect(); renderShiftsTab(); }
+function qfAdd() {
+  qfCollect();
+  qfConfig.ladder.push({ name: `Смена ${qfConfig.ladder.length + 1}`, executor: 'codex', quota: null, review: 'keep' });
+  renderShiftsTab();
+}
+function qfRemove(i) { qfCollect(); qfConfig.ladder.splice(i, 1); renderShiftsTab(); }
+function qfMove(i, dir) {
+  qfCollect();
+  const j = i + dir;
+  if (j < 0 || j >= qfConfig.ladder.length) return;
+  [qfConfig.ladder[i], qfConfig.ladder[j]] = [qfConfig.ladder[j], qfConfig.ladder[i]];
+  renderShiftsTab();
+}
+function qfDragStart(ev, i) {
+  if (!ev.target.closest || !ev.target.closest('.cz-label[style*="cursor:grab"]')) { ev.preventDefault(); return; }
+  qfDragIdx = i; ev.dataTransfer.effectAllowed = 'move';
+}
+function qfDragOver(ev, i) { ev.preventDefault(); ev.dataTransfer.dropEffect = 'move'; }
+function qfDrop(ev, i) {
+  ev.preventDefault();
+  if (qfDragIdx < 0 || qfDragIdx === i) return;
+  qfCollect();
+  const [moved] = qfConfig.ladder.splice(qfDragIdx, 1);
+  qfConfig.ladder.splice(i, 0, moved);
+  qfDragIdx = -1;
+  renderShiftsTab();
+}
+function qfPreset() {
+  qfConfig.ladder = [
+    { name: 'Основная смена', executor: 'mmx-m3', quota: { cmd: 'mmx quota show --output json', model: 'general' }, review: 'keep' },
+    { name: 'Смена 2', executor: 'goose-flash', quota: null, review: 'qwen_main' },
+    { name: 'Смена 3', executor: 'codex', quota: null, review: 'keep' },
+  ];
+  renderShiftsTab();
+}
+async function qfSave() {
+  qfCollect();
+  if (!qfConfig.ladder.length) { toast('Нужна хотя бы одна смена'); return; }
+  try {
+    await fetchJSON(`${API}/quota-failover/config`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(qfConfig),
+    });
+    toast('Лестница смен сохранена — вотчер применит со следующего цикла.', false);
+  } catch (e) { toast('Сохранение: ' + e.message); }
 }
 
 async function tsSaveKey() {
