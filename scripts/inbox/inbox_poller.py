@@ -94,6 +94,18 @@ def flush_saves(env: dict, state: dict) -> None:
         if task["status"] in ("pending", "running", "retry", "scheduled"):
             still_pending.append(item)
             continue
+        if item.get("kt"):
+            verdict = parse_game_verdict(task.get("result") or "")
+            for entry in state.get("kt_feed", []):
+                if entry.get("task_id") == item["task_id"]:
+                    entry.update({
+                        "verdict": verdict.get("вердикт") or task["status"],
+                        "reason": verdict.get("причина", ""),
+                        "category": verdict.get("категория", ""),
+                        "priority": verdict.get("приоритет", ""),
+                    })
+                    break
+            write_kt_feed(env, state)
         path = save_spec(env, item, task)
         print(f"  -> ТЗ сохранено: {path.name}")
     state["pending_saves"] = still_pending
@@ -298,6 +310,75 @@ def resolve_known_project(card: dict, items: list[dict],
     return None
 
 
+# --- Игровой конвейер ([KT]: «Сказки Королевства») --------------------------
+
+KT_MARKER = "[KT]"
+META_CUT = "--- Meta ---"
+
+
+def is_kt(subject: str) -> bool:
+    return subject.strip().upper().startswith(KT_MARKER)
+
+
+def game_triage_prompt(card: dict, concept: str) -> str:
+    body = card["body"]
+    if len(body) > 5000:
+        body = body[:5000] + "\n…(обрезано)"
+    return (
+        "Ты — хранитель концепции игры «Сказки Королевства» (ламповая "
+        "пошаговая RPG в духе King's Bounty и HoMM3). Игрок прислал "
+        "предложение. Сверь его с концепцией.\n\n"
+        "КОНЦЕПЦИЯ ИГРЫ:\n" + concept[:8000] + "\n\n"
+        f"Предложение игрока: {card['from']}\nТема: {card['subject']}\n"
+        f"Текст:\n{body}\n\n"
+        "Правила решения:\n"
+        "- ОТКЛОНИТЬ, если предложение ломает столпы или из антискоупа "
+        "(мультиплеер, крафт, мрачняк, платное, смена движка/стиля);\n"
+        "- ОТКЛОНИТЬ служебный спам и не-игровые тексты;\n"
+        "- ПРИНЯТЬ, если вписывается в скоуп и тон;\n"
+        "- УТОЧНИТЬ, если идея приемлема, но без деталей игрока её не "
+        "реализовать — тогда в ТЗ перечисли открытые вопросы.\n\n"
+        "Ответь строго в этом формате:\n"
+        "ВЕРДИКТ: ПРИНЯТЬ|ОТКЛОНИТЬ|УТОЧНИТЬ\n"
+        "ПРИЧИНА: <1-2 предложения, вежливо, для игрока>\n"
+        "КАТЕГОРИЯ: <баг|фича|баланс|контент|ux>\n"
+        "ПРИОРИТЕТ: <1..10, где 1 — срочнее>\n"
+        "РАБОЧАЯ ПАПКА: C:\\Projects\\mm_rpg_monolithic_gemini\n"
+        "ТЕХНИЧЕСКОЕ ЗАДАНИЕ:\n"
+        "Контекст: <кратко>\n"
+        "Что нужно: <по пунктам, с опорой на структуру проекта>\n"
+        "Критерий готовности: <как проверить>\n\n"
+        "Последней строкой напиши:\n"
+        "ИТОГ: ГОТОВО — триаж завершён"
+    )
+
+
+def parse_game_verdict(result: str) -> dict:
+    text = (result or "").split(META_CUT)[0]
+    fields = {}
+    for key in ("ВЕРДИКТ", "ПРИЧИНА", "КАТЕГОРИЯ", "ПРИОРИТЕТ"):
+        match = re.search(rf"^{key}:\s*(.+)$", text, re.M | re.I)
+        fields[key.lower()] = match.group(1).strip() if match else ""
+    return fields
+
+
+def write_kt_feed(env: dict, state: dict) -> None:
+    """Стена предложений для страницы игры: site/kt/feed.json."""
+    feed_path = env.get("KT_SITE_FEED")
+    if not feed_path:
+        return
+    items = []
+    for entry in state.get("kt_feed", [])[-50:]:
+        items.append({key: entry.get(key, "") for key in
+                      ("task_id", "from", "subject", "verdict", "reason",
+                       "category", "priority")})
+    path = Path(feed_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"updated": time.strftime("%Y-%m-%d %H:%M"),
+                                "items": items}, ensure_ascii=False, indent=1),
+                    encoding="utf-8")
+
+
 def connect(env: dict) -> imaplib.IMAP4_SSL:
     imaplib.Commands["ID"] = ("AUTH", "SELECTED", "NONAUTH")
     client = imaplib.IMAP4_SSL(env["IMAP_HOST"], int(env.get("IMAP_PORT", "993")))
@@ -308,28 +389,34 @@ def connect(env: dict) -> imaplib.IMAP4_SSL:
     return client
 
 
-def fetch_new_cards(client: imaplib.IMAP4_SSL, state: dict) -> list[dict]:
-    """Все письма, чей Message-ID ещё не обработан (независимо от UNSEEN)."""
-    client.select("INBOX")
-    typ, data = client.search(None, "ALL")
+def fetch_new_cards(client: imaplib.IMAP4_SSL, state: dict,
+                    folders: list[str]) -> list[dict]:
+    """Письма, чей Message-ID ещё не обработан (независимо от UNSEEN)."""
     cards = []
-    for num in (data[0] or b"").split():
-        typ, md = client.fetch(num, "(BODY.PEEK[HEADER])")
-        msg = email.message_from_bytes(md[0][1], policy=policy.default)
-        card = {
-            "num": num.decode(),
-            "message_id": msg.get("Message-ID") or f"<no-id-{num.decode()}>",
-            "from": decode_mime(msg.get("From")),
-            "subject": decode_mime(msg.get("Subject")) or "(без темы)",
-            "date": msg.get("Date") or "",
-        }
-        if card["message_id"] in state["processed"]:
+    for folder in folders:
+        typ, _ = client.select(folder)
+        if typ != "OK":
             continue
-        cards.append(card)
+        typ, data = client.search(None, "ALL")
+        for num in (data[0] or b"").split():
+            typ, md = client.fetch(num, "(BODY.PEEK[HEADER])")
+            msg = email.message_from_bytes(md[0][1], policy=policy.default)
+            card = {
+                "num": num.decode(),
+                "folder": folder,
+                "message_id": msg.get("Message-ID") or f"<no-id-{folder}-{num.decode()}>",
+                "from": decode_mime(msg.get("From")),
+                "subject": decode_mime(msg.get("Subject")) or "(без темы)",
+                "date": msg.get("Date") or "",
+            }
+            if card["message_id"] in state["processed"]:
+                continue
+            cards.append(card)
     return cards
 
 
 def fetch_full(client: imaplib.IMAP4_SSL, card: dict) -> dict:
+    client.select(card["folder"])
     typ, md = client.fetch(card["num"], "(RFC822)")
     msg = email.message_from_bytes(md[0][1], policy=policy.default)
     card["body"] = message_body(msg)
@@ -438,6 +525,7 @@ def load_state() -> dict:
     state.setdefault("processed", [])
     state.setdefault("created", {})
     state.setdefault("pending_saves", [])
+    state.setdefault("kt_feed", [])
     return state
 
 
@@ -470,38 +558,59 @@ def run_once(env: dict, dry: bool, refresh: bool = False) -> None:
     sender_map = config.get("sender_map", {})
     state = load_state()
     daily_cap = int(env.get("MAX_PER_DAY", "20"))
+    folders = [f.strip() for f in env.get("IMAP_FOLDERS", "INBOX").split(",") if f.strip()]
+    concept = ""
+    if env.get("KT_CONCEPT"):
+        try:
+            concept = Path(env["KT_CONCEPT"]).read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            print(f"!! не прочитать концепцию {env['KT_CONCEPT']}: {exc}")
     if not dry:
         flush_saves(env, state)
     items = build_catalog(env, state, force=refresh)
     catalog = catalog_text(items)
     client = connect(env)
     try:
-        for card in fetch_new_cards(client, state):
+        for card in fetch_new_cards(client, state, folders):
+            client.select(card["folder"])
             client.store(card["num"], "+FLAGS", "\\Seen")
             full = fetch_full(client, card)
-            reason = bulk_reason(full, full["from"])
+            game_mode = is_kt(full["subject"])
+            reason = None if game_mode else bulk_reason(full, full["from"])
             if reason:
                 print(f"Пропущен как не-обращение ({reason}): {full['from']} — {full['subject']}")
                 state["processed"].append(full["message_id"])
                 continue
-            if not sender_allowed(full["from"], env.get("ALLOW_FROM", "")):
+            if not game_mode and not sender_allowed(full["from"], env.get("ALLOW_FROM", "")):
                 print(f"Пропущен: отправитель вне ALLOW_FROM — {full['from']}")
                 state["processed"].append(full["message_id"])
                 continue
             if not dry and tasks_created_today(state) >= daily_cap:
                 print(f"Дневной лимит {daily_cap} исчерпан — письмо ждёт следующего прохода: {full['subject']}")
                 continue
-            print(f"Новое обращение: {full['from']} — {full['subject']}")
+            print(f"Новое обращение: {full['from']} — {full['subject']}"
+                  + ("  [игровой конвейер]" if game_mode else ""))
             if full["attachments"]:
                 print(f"  вложений: {len(full['attachments'])}")
-            known = resolve_known_project(full, items, sender_map)
-            if known:
-                print(f"  проект указан человеком: {known['name']}")
-            prompt = triage_prompt(full, catalog, known)
+            if game_mode:
+                if not concept:
+                    print("  !! нет KT_CONCEPT — игровой триаж невозможен, пропуск")
+                    state["processed"].append(full["message_id"])
+                    continue
+                prompt = game_triage_prompt(full, concept)
+            else:
+                known = resolve_known_project(full, items, sender_map)
+                if known:
+                    print(f"  проект указан человеком: {known['name']}")
+                prompt = triage_prompt(full, catalog, known)
             if dry:
                 print("DRY: задача не создаётся, промпт:\n" + prompt[:1500])
                 continue
-            task_id = create_task(env, prompt)
+            task_env = dict(env)
+            if game_mode:
+                task_env["PP_PROVIDER"] = env.get("KT_PROVIDER", env.get("PP_PROVIDER", "claude-z"))
+                task_env["PP_WORKING_DIR"] = env.get("KT_WORKING_DIR", env.get("PP_WORKING_DIR", str(ROOT)))
+            task_id = create_task(task_env, prompt)
             print(f"  -> Задача триажа #{task_id} создана")
             state["processed"].append(full["message_id"])
             note_created(state)
@@ -510,7 +619,17 @@ def run_once(env: dict, dry: bool, refresh: bool = False) -> None:
                 "from": full["from"],
                 "subject": full["subject"],
                 "date": full["date"],
+                "kt": game_mode,
             })
+            if game_mode:
+                state["kt_feed"].append({
+                    "task_id": task_id,
+                    "from": full["from"],
+                    "subject": full["subject"],
+                    "verdict": "В РАБОТЕ",
+                    "reason": "", "category": "", "priority": "",
+                })
+                write_kt_feed(env, state)
             log_event({
                 "type": "triage_created",
                 "task_id": task_id,
@@ -519,9 +638,11 @@ def run_once(env: dict, dry: bool, refresh: bool = False) -> None:
                 "date": full["date"],
                 "message_id": full["message_id"],
                 "attachments": full.get("attachments", []),
+                "kt": game_mode,
             })
     finally:
         save_state(state)
+        write_kt_feed(env, state)
         try:
             client.logout()
         except Exception:
