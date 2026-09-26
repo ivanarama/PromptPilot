@@ -3142,7 +3142,7 @@ function workflowStopReason(events) {
   const reason = latest.payload?.reason || latest.payload?.summary || latest.event_type;
   const task = latest.payload?.task_id ? `Task #${latest.payload.task_id}: ` : '';
   if (reason === 'missing successful workflow verdict') {
-    return `${task}PromptPilot не получил финальную строку «ИТОГ: …» от агента.`;
+    return `${task}Агент закончил без успешного вердикта «ИТОГ: ГОТОВО/УЖЕ СДЕЛАНО» — либо потерял итоговую строку, либо сам просит человека (смотри отчёт задачи ниже).`;
   }
   if (latest.event_type === 'limit.stage_revisions') {
     const max = latest.payload?.max_revision_rounds || '?';
