@@ -209,10 +209,26 @@ def send_reply(env: dict, meta: dict, reply_text: str) -> None:
     if signature:
         body += "\n\n" + signature
     message.set_content(body)
-    with smtplib.SMTP_SSL(env.get("SMTP_HOST", "smtp.mail.ru"),
-                          int(env.get("SMTP_PORT", "465")), timeout=30) as smtp:
-        smtp.login(env["IMAP_USER"], env["IMAP_PASSWORD"])
-        smtp.send_message(message)
+    signature = env.get("REPLY_SIGNATURE", "")
+    body = reply_text.strip()
+    if signature:
+        body += "\n\n" + signature
+    message.set_content(body)
+    # Mail.ru безопасность иногда волнами отвергает вход автоматики —
+    # повторяем с паузой: блокировка отпускает через десятки секунд.
+    last_exc = None
+    for attempt in range(3):
+        try:
+            with smtplib.SMTP_SSL(env.get("SMTP_HOST", "smtp.mail.ru"),
+                                  int(env.get("SMTP_PORT", "465")), timeout=30) as smtp:
+                smtp.login(env["IMAP_USER"], env["IMAP_PASSWORD"])
+                smtp.send_message(message)
+            return
+        except Exception as exc:
+            last_exc = exc
+            print(f"  !! SMTP попытка {attempt + 1} не прошла: {exc}", flush=True)
+            time.sleep(20 * (attempt + 1))
+    raise last_exc
 
 
 # --- карточки ---------------------------------------------------------------
