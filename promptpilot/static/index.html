@@ -237,6 +237,8 @@
   .task-status[data-s="completed"] { color: var(--green); background: #4ade8015; }
   .task-status[data-s="failed"] { color: var(--red); background: #f8717115; }
   .task-status[data-s="rate_limited"] { color: var(--yellow); background: #fbbf2415; }
+  .task-status[data-s="awaiting_human"], .task-status[data-s="revision_required"] { color: var(--red); background: #f8717115; }
+  .task-status[data-s="awaiting_plan_approval"], .task-status[data-s="gating"] { color: var(--yellow); background: #fbbf2415; }
   .task-status[data-s="cancelled"] { color: var(--text2); background: var(--surface2); }
 
   @keyframes pulse {
@@ -351,9 +353,13 @@
     font-family: var(--mono);
     font-size: 12px;
     white-space: pre-wrap;
+    overflow-wrap: anywhere;
     word-break: break-word;
+    max-width: 100%;
+    min-width: 0;
     max-height: 400px;
     overflow-y: auto;
+    overflow-x: hidden;
     color: var(--text);
     user-select: text;
   }
@@ -454,7 +460,7 @@
   .btn-pause.paused { border-color: var(--yellow); color: var(--yellow); background: #fbbf2410; }
   .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: none; z-index: 50; }
   .modal-overlay.open { display: flex; align-items: flex-start; justify-content: center; padding: 40px 16px; overflow-y: auto; }
-  .modal { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; max-width: 780px; width: 100%; padding: 20px; max-height: 85vh; overflow-y: auto; }
+  .modal { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; max-width: 780px; width: 100%; padding: 20px; max-height: 85vh; overflow-y: auto; overflow-x: hidden; }
   .modal h2 { font-size: 16px; margin-bottom: 14px; display: flex; align-items: center; }
   .prov-row { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; }
   .prov-row.dim { opacity: .55; }
@@ -508,15 +514,26 @@
   }
 
   /* Workflow orchestrator */
-  .wf-grid { display: grid; grid-template-columns: minmax(220px, 34%) 1fr; gap: 12px; }
-  .wf-list { display: flex; flex-direction: column; gap: 6px; }
-  .wf-row { border: 1px solid var(--border); border-radius: 7px; padding: 9px 10px; cursor: pointer; }
+  /* Every workflow column is allowed to shrink. Without the explicit min-width:0
+     rules below, a long Windows path, prompt, or audit report makes the grid
+     wider than the modal and the browser exposes a second horizontal scrollbar. */
+  #workflowModal .modal {
+    width: 100%;
+    max-width: min(1160px, calc(100vw - 32px));
+    max-height: calc(100vh - 32px);
+    padding: clamp(12px, 2vw, 20px);
+    overscroll-behavior: contain;
+  }
+  #workflowModal .modal > *, #wfDetail, #wfList, .wf-grid > * { min-width: 0; max-width: 100%; }
+  .wf-grid { display: grid; grid-template-columns: minmax(190px, 30%) minmax(0, 1fr); gap: 12px; min-width: 0; }
+  .wf-list { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+  .wf-row { border: 1px solid var(--border); border-radius: 7px; padding: 9px 10px; cursor: pointer; min-width: 0; overflow: hidden; }
   .wf-row:hover, .wf-row.active { border-color: var(--accent); background: var(--surface2); }
-  .wf-title { font-weight: 600; font-size: 13px; }
-  .wf-meta { color: var(--text2); font-size: 11px; margin-top: 3px; }
-  .wf-panel { border: 1px solid var(--border); border-radius: 8px; padding: 12px; min-height: 220px; }
-  .wf-actions { display: flex; flex-wrap: wrap; gap: 7px; margin: 10px 0; }
-  .wf-form { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 10px; }
+  .wf-title { font-weight: 600; font-size: 13px; min-width: 0; overflow-wrap: anywhere; word-break: break-word; }
+  .wf-meta { color: var(--text2); font-size: 11px; margin-top: 3px; min-width: 0; overflow-wrap: anywhere; word-break: break-word; }
+  .wf-panel { border: 1px solid var(--border); border-radius: 8px; padding: 12px; min-height: 220px; min-width: 0; overflow-x: hidden; }
+  .wf-actions { display: flex; flex-wrap: wrap; gap: 7px; margin: 10px 0; min-width: 0; }
+  .wf-form { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 8px; margin-top: 10px; min-width: 0; }
   .wf-form .wide { grid-column: 1 / -1; }
   .wf-form input, .wf-form select, .wf-form textarea {
     width: 100%; background: var(--bg); border: 1px solid var(--border);
@@ -527,7 +544,7 @@
   .wf-wizard.open { display:block; }
   .wf-wizard-head { display:flex; justify-content:space-between; gap:12px; align-items:center; margin-bottom:14px; }
   .wf-wizard-head h3 { margin:0; font-size:15px; }
-  .wf-wizard-profile { display:flex; gap:6px; align-items:center; }
+  .wf-wizard-profile { display:flex; gap:6px; align-items:center; flex-wrap:wrap; min-width:0; }
   .wf-wizard-profile select, .wf-wizard-profile input { background:var(--bg); border:1px solid var(--border); border-radius:6px; color:var(--text); padding:6px 8px; font-size:12px; }
   .wf-wizard-steps { display:grid; grid-template-columns:repeat(4,1fr); gap:7px; margin-bottom:16px; }
   .wf-wizard-step { border:1px solid var(--border); border-radius:8px; padding:8px 9px; color:var(--text2); background:var(--bg); font-size:11px; }
@@ -538,14 +555,14 @@
   .wf-wizard-panel.active { display:block; }
   .wf-wizard-panel h4 { margin:0 0 5px; font-size:14px; }
   .wf-wizard-help { color:var(--text2); font-size:11px; margin-bottom:12px; line-height:1.5; }
-  .wf-wizard-fields { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  .wf-wizard-fields { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:10px; min-width:0; }
   .wf-wizard-fields .wide { grid-column:1/-1; }
   .wf-wizard-fields label { display:flex; flex-direction:column; gap:5px; color:var(--text2); font-size:12px; }
   .wf-wizard-fields label.check { flex-direction:row; align-items:center; }
   .wf-wizard-fields input, .wf-wizard-fields select, .wf-wizard-fields textarea { width:100%; background:var(--bg); border:1px solid var(--border); border-radius:6px; color:var(--text); padding:8px 9px; font-size:12px; }
   .wf-wizard-fields textarea { min-height:88px; resize:vertical; font-family:var(--mono); }
-  .wf-wizard-roles { display:grid; grid-template-columns:repeat(3,1fr); gap:9px; }
-  .wf-wizard-role { border:1px solid var(--border); border-radius:8px; background:var(--bg); padding:10px; }
+  .wf-wizard-roles { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:9px; min-width:0; }
+  .wf-wizard-role { border:1px solid var(--border); border-radius:8px; background:var(--bg); padding:10px; min-width:0; }
   .wf-wizard-role.reviewer { border-color:#ed6e8666; }
   .wf-wizard-role.executor { border-color:#7781ff66; }
   .wf-wizard-role h5 { margin:0 0 5px; font-size:13px; }
@@ -555,7 +572,7 @@
   .wf-wizard-role input, .wf-wizard-role select { width:100%; background:var(--surface2); border:1px solid var(--border); border-radius:6px; color:var(--text); padding:7px; }
   .wf-wizard-role label.check input, .wf-wizard-fields label.check input { width:auto; }
   .wf-wizard-danger { margin-top:8px; padding:8px 10px; border:1px solid #ed6e8666; border-radius:7px; color:#f59aad; font-size:11px; }
-  .wf-wizard-summary { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin:10px 0; }
+  .wf-wizard-summary { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:8px; margin:10px 0; min-width:0; }
   .wf-wizard-summary > div { background:var(--bg); border:1px solid var(--border); border-radius:7px; padding:9px; font-size:11px; }
   .wf-wizard-summary b { display:block; margin-bottom:3px; color:var(--text); }
   .wf-preflight { display:flex; flex-direction:column; gap:5px; margin:10px 0; }
@@ -565,8 +582,8 @@
   .wf-preflight-row[data-status="error"] { border-left-color:var(--red); color:#f59aad; }
   .wf-wizard-nav { display:flex; justify-content:space-between; align-items:center; gap:8px; margin-top:14px; padding-top:12px; border-top:1px solid var(--border); }
   .wf-wizard-nav-right { display:flex; gap:7px; }
-  .wf-settings-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:10px; }
-  .wf-settings-card { background:var(--bg); border:1px solid var(--border); border-radius:8px; padding:10px; }
+  .wf-settings-grid { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:10px; margin-top:10px; min-width:0; }
+  .wf-settings-card { background:var(--bg); border:1px solid var(--border); border-radius:8px; padding:10px; min-width:0; overflow:hidden; }
   .wf-settings-card h4 { margin:0 0 8px; font-size:13px; }
   .wf-settings-card label { display:flex; flex-direction:column; gap:4px; margin:7px 0; color:var(--text2); font-size:12px; }
   .wf-settings-card label.check { flex-direction:row; align-items:center; }
@@ -575,25 +592,40 @@
   }
   .wf-settings-card textarea { min-height:90px; resize:vertical; font-family:var(--mono); }
   .wf-stage-list { display:flex; flex-direction:column; gap:8px; margin:10px 0; }
-  .wf-stage-card { background:var(--bg); border:1px solid var(--border); border-left:4px solid var(--border); border-radius:8px; padding:10px; }
+  .wf-stage-card { background:var(--bg); border:1px solid var(--border); border-left:4px solid var(--border); border-radius:8px; padding:10px; min-width:0; overflow:hidden; }
   .wf-stage-card[data-status="executing"] { border-left-color:var(--accent); }
   .wf-stage-card[data-status="completed"] { border-left-color:var(--green); }
   .wf-stage-card[data-status="failed"] { border-left-color:var(--red); }
-  .wf-stage-editor { display:grid; grid-template-columns:120px 1fr 150px; gap:7px; }
+  .wf-stage-editor { display:grid; grid-template-columns:minmax(0,120px) minmax(0,1fr) minmax(0,150px); gap:7px; min-width:0; }
   .wf-stage-editor .wide { grid-column:1/-1; }
   .wf-stage-editor input, .wf-stage-editor select, .wf-stage-editor textarea { background:var(--surface2); border:1px solid var(--border); border-radius:6px; color:var(--text); padding:7px 8px; }
   .wf-stage-editor textarea { min-height:58px; resize:vertical; font-family:var(--mono); }
-  .wf-history { margin-top: 12px; max-height: 260px; overflow-y: auto; }
+  .wf-history { margin-top: 12px; max-height: 260px; overflow-y: auto; overflow-x: hidden; min-width:0; }
   .wf-event { border-top: 1px solid var(--border); padding: 6px 0; font-size: 11px; }
   .wf-event code { color: var(--accent2); }
-  .wf-stage { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 11px 12px; margin: 9px 0; }
-  .wf-stage-title { font-size: 15px; font-weight: 650; }
-  .wf-next { color: var(--cyan); font-size: 12px; margin-top: 5px; }
+  .wf-stage { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 11px 12px; margin: 9px 0; min-width:0; overflow:hidden; }
+  .wf-stage-title { font-size: 15px; font-weight: 650; overflow-wrap:anywhere; word-break:break-word; }
+  .wf-next { color: var(--cyan); font-size: 12px; margin-top: 5px; overflow-wrap:anywhere; word-break:break-word; }
   .wf-section-title { margin-top: 14px; margin-bottom: 5px; font-size: 12px; font-weight: 650; color: var(--text); }
-  .wf-round { border-left: 3px solid var(--border); padding: 6px 9px; margin: 5px 0; background: var(--bg); border-radius: 0 6px 6px 0; }
+  .wf-round { border-left: 3px solid var(--border); padding: 6px 9px; margin: 5px 0; background: var(--bg); border-radius: 0 6px 6px 0; min-width:0; overflow-wrap:anywhere; word-break:break-word; }
   .wf-round.current { border-left-color: var(--accent2); }
   .wf-round-summary { font-size: 12px; margin-top: 2px; }
-  .wf-technical summary { cursor: pointer; color: var(--text2); font-size: 11px; margin-top: 12px; }
+  .wf-technical summary { cursor: pointer; color: var(--text2); font-size: 11px; margin-top: 12px; overflow-wrap:anywhere; }
+  .wf-panel pre, #wfDetail pre, #wfDetail code { max-width:100%; min-width:0; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word; }
+  .wf-human-alert { display:grid; grid-template-columns:auto minmax(0,1fr); gap:10px; align-items:start; margin:10px 0 12px; padding:12px; border:1px solid var(--red); border-radius:9px; background:#f8717112; min-width:0; }
+  .wf-human-alert[data-kind="decision"] { border-color:var(--yellow); background:#fbbf2412; }
+  .wf-human-icon { font-size:24px; line-height:1; animation:wf-human-pulse 1.2s ease-in-out infinite; }
+  .wf-human-alert-title { color:var(--red); font-size:14px; font-weight:750; }
+  .wf-human-alert[data-kind="decision"] .wf-human-alert-title { color:var(--yellow); }
+  .wf-human-alert-copy { margin-top:3px; color:var(--text2); font-size:12px; overflow-wrap:anywhere; }
+  .wf-human-alert .wf-actions { margin:9px 0 0; }
+  .wf-human-alert .btn-primary { margin-left:0; }
+  .wf-human-alert input { min-width:0; width:100%; background:var(--bg); border:1px solid var(--border); border-radius:6px; color:var(--text); padding:7px 9px; font-size:12px; }
+  .wf-human-flag { display:inline-flex; align-items:center; gap:4px; margin-top:6px; padding:2px 7px; border:1px solid var(--red); border-radius:999px; color:var(--red); font-size:10px; font-weight:750; animation:wf-human-pulse 1.2s ease-in-out infinite; }
+  .wf-human-link { margin-top:7px; color:var(--red); font-size:11px; font-weight:650; }
+  @keyframes wf-human-pulse { 0%,100% { opacity:1; transform:scale(1); } 50% { opacity:.58; transform:scale(.98); } }
+  @media (prefers-reduced-motion: reduce) { .wf-human-icon, .wf-human-flag { animation:none; } }
+  @media (max-width: 900px) { .wf-grid { grid-template-columns:minmax(160px,28%) minmax(0,1fr); } }
   @media (max-width: 720px) { .wf-grid, .wf-settings-grid, .wf-stage-editor, .wf-wizard-fields, .wf-wizard-roles, .wf-wizard-summary { grid-template-columns: 1fr; } .wf-stage-editor .wide, .wf-wizard-fields .wide { grid-column:auto; } .wf-wizard-steps { grid-template-columns:1fr 1fr; } .wf-wizard-head { align-items:flex-start; flex-direction:column; } }
 
   /* Update banner */
@@ -1869,6 +1901,17 @@ async function loadTasks() {
   const wfByDir = new Map((workflowCache || [])
     .filter(w => w.repository_path)
     .map(w => [w.repository_path, w.slug]));
+  // A workflow shares its working directory with every historical task. Keep
+  // the red human-action marker on the newest task only; otherwise one paused
+  // workflow paints the whole task history as if every task needed attention.
+  const latestTaskByWorkflow = new Map();
+  tasks.forEach(t => {
+    const wf = (workflowCache || []).find(w => w.repository_path && t.working_dir &&
+      w.repository_path.toLowerCase() === t.working_dir.toLowerCase());
+    if (!wf) return;
+    const previous = latestTaskByWorkflow.get(wf.id);
+    if (!previous || Number(t.id) > Number(previous.id)) latestTaskByWorkflow.set(wf.id, t);
+  });
 
   if (!tasks.length) {
     list.innerHTML = `<div class="empty">
@@ -1891,6 +1934,9 @@ async function loadTasks() {
     const taskWfColor = taskWf ? wfSlugColor(taskWf.slug) : null;
     const taskWfChip = taskWf
       ? `<span class="wf-chip" style="border-color:${taskWfColor};color:${taskWfColor}" title="воркфлоу ${escAttr(taskWf.slug)}">${esc(taskWf.slug)}</span>`
+      : '';
+    const taskHumanFlag = taskWf && latestTaskByWorkflow.get(taskWf.id)?.id === t.id && workflowNeedsHuman(taskWf)
+      ? `<button class="wf-human-flag" type="button" onclick="event.stopPropagation(); openWorkflowFromTask('${escAttr(taskWf.id)}')" title="Открыть workflow и выполнить требуемое действие">🔺 ДЕЙСТВИЕ</button>`
       : '';
     // Роль задачи: ревьюерские промпты всегда несут AUDIT-контракт или слово
     // «аудитор» (вшито и планировщиком, и нашими шаблонами) — остальное
@@ -1930,6 +1976,7 @@ async function loadTasks() {
         ${taskWfChip}
         ${roleChip}
         <span class="task-status" data-s="${t.status}">${taskStatusLabel(t)}</span>
+        ${taskHumanFlag}
         <span class="task-prompt" title="${escAttr(taskDisplayTitle(t))}">${esc(taskDisplayTitle(t))}</span>
         ${t.working_dir ? `<span class="task-meta">📁 ${esc(t.working_dir.split(/[/\\]/).filter(Boolean).pop() || t.working_dir)}</span>` : ''}
         ${t.worktree ? `<span class="task-meta" title="отдельный git worktree">🌿 ${esc(t.worktree_branch || 'worktree')}</span>` : ''}
@@ -2304,6 +2351,13 @@ function openWorkflows() {
 }
 
 function closeWorkflows() { document.getElementById('workflowModal').classList.remove('open'); }
+
+// Open the same workflow panel from a task row. The task list only flags the
+// blocked workflow; the actual decision/resume controls stay in one place.
+function openWorkflowFromTask(workflowId) {
+  selectedWorkflowId = workflowId;
+  openWorkflows();
+}
 
 function openParallel() {
   document.getElementById('parallelModal').classList.add('open');
@@ -2721,6 +2775,7 @@ async function loadWorkflows() {
     <div class="wf-row${w.id === selectedWorkflowId ? ' active' : ''}" onclick="selectWorkflow('${escAttr(w.id)}')">
       <div class="wf-title">${esc(w.slug)}</div>
       <div class="wf-meta">${esc(w.status)} · раунд ${w.current_round} · v${w.state_version}</div>
+      ${workflowNeedsHuman(w) ? `<button class="wf-human-flag" type="button" onclick="event.stopPropagation(); selectWorkflow('${escAttr(w.id)}')" title="Открыть решение для остановленного workflow">🔺 НУЖНО ДЕЙСТВИЕ</button>` : ''}
     </div>`).join('') : '<div class="wf-meta">Workflow пока нет.</div>';
   if (!selectedWorkflowId && workflowCache.length) selectedWorkflowId = workflowCache[0].id;
   if (selectedWorkflowId) await selectWorkflow(selectedWorkflowId);
@@ -2856,6 +2911,32 @@ function workflowStatusInfo(status, reviewerDone = false) {
     cancelled: ['Отменён', 'Workflow остановлен пользователем.'],
   };
   return info[status] || [status, ''];
+}
+
+function workflowNeedsHuman(wf) {
+  return ['awaiting_human', 'revision_required', 'awaiting_plan_approval', 'gating']
+    .includes(wf?.status);
+}
+
+function workflowHumanAlertCopy(status, reviewerDone) {
+  if (status === 'awaiting_human' && reviewerDone) {
+    return ['Требуется ваше решение по ревью',
+      'Проверяющий уже закончил. Выберите один из вариантов ниже — после этого PromptPilot продолжит или завершит workflow.'];
+  }
+  if (status === 'revision_required') {
+    return ['Нужны исправления',
+      'Ревью вернуло текущий этап на доработку. Проверьте отчёт и нажмите «Продолжить пайплайн».'];
+  }
+  if (status === 'awaiting_plan_approval') {
+    return ['Нужно утвердить план',
+      'Проверьте порядок этапов и gate-команды, затем нажмите «Сохранить и утвердить».'];
+  }
+  if (status === 'gating') {
+    return ['Нужно решение по проверкам',
+      'Gate завершён. Выберите PASS, если проверки пройдены, или FAIL, если этап нужно вернуть исполнителю.'];
+  }
+  return ['Пайплайн остановлен: требуется действие человека',
+    'Проверьте причину остановки и нажмите «Продолжить пайплайн», чтобы передать управление обратно оркестратору.'];
 }
 
 function workflowOwnerInfo(wf, activeRun, reviewerDone) {
@@ -3020,9 +3101,9 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, 
     </div>`;
   } else if (wf.status === 'gating') {
     action = `<div class="wf-form"><input class="wide" id="wfDecisionSummary" placeholder="Итог gate">
-      <button class="btn btn-sm btn-primary" onclick="wfGate('PASS')">Gate PASS</button>
-      <button class="btn btn-sm btn-danger" onclick="wfGate('FAIL')">Gate FAIL</button>
-      <button class="btn btn-sm btn-ghost wide" onclick="wfGate('HUMAN_REQUIRED')">Нужен человек</button></div>`;
+      <button class="btn btn-sm btn-primary" onclick="wfGate('PASS')">✓ Проверки пройдены (PASS)</button>
+      <button class="btn btn-sm btn-danger" onclick="wfGate('FAIL')">✕ Вернуть на исправление (FAIL)</button>
+      <button class="btn btn-sm btn-ghost wide" onclick="wfGate('HUMAN_REQUIRED')">Оставить на ручном решении</button></div>`;
   } else if (orphanPane) {
     action = `<div class="wf-stage" style="border-color:var(--red)">
       <b style="color:var(--red)">Task #${orphanPane.task_id} отмечен завершённым, но его агент ещё работает.</b>
@@ -3030,7 +3111,7 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, 
     </div>`;
   } else if (wf.status === 'revision_required' || (wf.status === 'awaiting_human' && !reviewerDone)) {
     action = `<div class="wf-form"><input class="wide" id="wfHumanText" value="Продолжить работу с учётом сохранённого состояния" required>
-      <button class="btn btn-sm btn-primary" onclick="wfResume()">Продолжить ${wf.status === 'revision_required' ? 'новым раундом' : 'текущий раунд'}</button></div>`;
+      <button class="btn btn-sm btn-primary" onclick="wfResume()">▶ Продолжить пайплайн${wf.status === 'revision_required' ? ' новым раундом' : ''}</button></div>`;
   } else if (wf.status === 'awaiting_human' && reviewerDone) {
     const auditColor = auditVerdict === 'PASS' ? 'var(--green)' : 'var(--red)';
     action = `<div class="wf-stage" style="border-color:${auditColor}">
@@ -3040,9 +3121,27 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, 
       </details>
     </div>
     <div class="wf-form"><input class="wide" id="wfDecisionSummary" placeholder="Итог независимого ревью">
-      <button class="btn btn-sm btn-primary" onclick="wfReview('PASS')">Review PASS</button>
-      <button class="btn btn-sm btn-danger" onclick="wfReview('REVISION_REQUIRED')">Нужны исправления</button>
-      <button class="btn btn-sm btn-ghost wide" onclick="wfReview('HUMAN_REQUIRED')">Нужен человек</button></div>`;
+      <button class="btn btn-sm btn-primary" onclick="wfReview('PASS')">✓ Принять ревью и продолжить</button>
+      <button class="btn btn-sm btn-danger" onclick="wfReview('REVISION_REQUIRED')">↻ Отправить на исправление</button>
+      <button class="btn btn-sm btn-ghost wide" onclick="wfReview('HUMAN_REQUIRED')">Оставить на ручном решении</button></div>`;
+  }
+  let humanAttention = '';
+  if (workflowNeedsHuman(wf)) {
+    const [attentionTitle, attentionCopy] = workflowHumanAlertCopy(wf.status, !!reviewerDone);
+    const alertKind = (wf.status === 'awaiting_human' && reviewerDone) ? 'decision' : 'action';
+    const authHint = /401|unauthorized|incorrect api key|api key/i.test(stopReason || '')
+      ? '<div class="wf-round-summary" style="color:var(--yellow)"><b>Похоже на ошибку авторизации провайдера.</b> Сначала исправьте ключ/профиль исполнителя или выберите другой провайдер, затем нажмите продолжение.</div>'
+      : '';
+    humanAttention = `<div class="wf-human-alert" data-kind="${alertKind}">
+      <div class="wf-human-icon" aria-hidden="true">🔺</div>
+      <div><div class="wf-human-alert-title">${attentionTitle}</div>
+        <div class="wf-human-alert-copy">${attentionCopy}</div>
+        ${stopReason ? `<div class="wf-round-summary" style="color:var(--red)"><b>Причина остановки:</b> ${esc(stopReason)}</div>` : ''}
+        ${authHint}
+        ${action || '<div class="wf-human-alert-copy">Откройте технический журнал, чтобы увидеть последнее событие.</div>'}
+      </div>
+    </div>`;
+    action = '';
   }
   const runRows = (plannerTask ? [`<div class="wf-round${plannerRun ? ' current' : ''}"><b>planner</b> · ${esc(plannerTask.status)} · task #${plannerTask.id}</div>`] : [])
     .concat(runs.map(r => `<div class="wf-round${r === activeRun ? ' current' : ''}"><b>${esc(r.role)} · попытка ${r.attempt_no}</b> · ${esc(r.status)}${r.task_id ? ` · task #${r.task_id}` : ''}</div>`)).join('');
@@ -3063,6 +3162,7 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, 
   wfPane.innerHTML = `
     <div class="wf-title">${esc(wf.slug)} <span class="task-status" data-s="${escAttr(wf.status)}">${esc(statusInfo[0])}</span>
       ${wf.config?.automation?.enabled ? '<span class="task-status" data-s="running">АВТО</span>' : '<span class="wf-meta">ручной режим</span>'}</div>
+    ${humanAttention}
     <div class="wf-stage" style="border-color:${ownerInfo.color}">
       <div class="wf-stage-title">🏓 Мяч сейчас: <span style="color:${ownerInfo.color}">${esc(ownerInfo.who)}</span></div>
       <div class="wf-round-summary">${esc(ownerInfo.detail)}</div>
