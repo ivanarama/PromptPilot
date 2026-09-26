@@ -1387,6 +1387,24 @@ def index():
     return FileResponse(STATIC_DIR / "index.html")
 
 
+@app.get("/ui_shell.css", include_in_schema=False)
+def ui_shell_css():
+    """Serve the optional presentation layer from the existing same-origin UI."""
+    path = STATIC_DIR / "ui_shell.css"
+    if not path.is_file():
+        raise HTTPException(404, "UI shell stylesheet is not installed")
+    return FileResponse(path, media_type="text/css")
+
+
+@app.get("/ui_shell.js", include_in_schema=False)
+def ui_shell_js():
+    """Serve the optional presentation layer from the existing same-origin UI."""
+    path = STATIC_DIR / "ui_shell.js"
+    if not path.is_file():
+        raise HTTPException(404, "UI shell script is not installed")
+    return FileResponse(path, media_type="application/javascript")
+
+
 @app.get("/parallel")
 def parallel_addon_index():
     if addon_index_path is None or not addon_index_path().is_file():
