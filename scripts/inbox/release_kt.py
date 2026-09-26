@@ -101,17 +101,39 @@ def update_site_changelog(version: str) -> None:
         print("    летопись уже содержит эту версию")
 
 
+def mark_released(version: str, closes: list[int]) -> None:
+    """Отметить на стене предложений, какие идеи вошли в этот релиз."""
+    feed_path = ROOT / ".." / ".." / "site" / "kt" / "feed.json"
+    env_file = ROOT / ".env"
+    for line in env_file.read_text(encoding="utf-8").splitlines():
+        if line.strip().startswith("KT_SITE_FEED="):
+            feed_path = pathlib.Path(line.split("=", 1)[1].strip())
+    if not feed_path.exists():
+        print("    фид не найден, стена не обновлена")
+        return
+    feed = json.loads(feed_path.read_text(encoding="utf-8"))
+    for item in feed.get("items", []):
+        if int(item.get("task_id", 0)) in closes:
+            item["stage"] = f"в релизе v{version}"
+    feed_path.write_text(json.dumps(feed, ensure_ascii=False, indent=1),
+                         encoding="utf-8")
+    print(f"    стена: {len(closes)} предложений отмечены как в релизе v{version}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--minor", action="store_true", help="поднять MINOR (фича), иначе PATCH")
     parser.add_argument("--export", action="store_true", help="собрать APK")
     parser.add_argument("--release", action="store_true", help="опубликовать GitHub Release")
+    parser.add_argument("--closes", default="", help="id задач триажа через запятую, попавшие в релиз")
     args = parser.parse_args()
 
     gate()
     version = bump(args.minor)
     publish(version, args.export, args.release)
     update_site_changelog(version)
+    if args.closes and args.release:
+        mark_released(version, [int(x) for x in args.closes.split(",") if x.strip()])
     print(f"Готово: v{version}" + (" (опубликована)" if args.release else " (локально, без публикации)"))
     return 0
 

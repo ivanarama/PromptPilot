@@ -248,6 +248,25 @@ def reply_keyboard(exec_id: int) -> dict:
 
 # --- циклы ------------------------------------------------------------------
 
+def mark_stage(env: dict, triage_task_id, stage: str) -> None:
+    """Отметить стадию предложения в фиде сайта (стена предложений)."""
+    feed_path = env.get("KT_SITE_FEED")
+    if not feed_path:
+        return
+    path = Path(feed_path)
+    if not path.exists():
+        return
+    try:
+        feed = json.loads(path.read_text(encoding="utf-8"))
+        for item in feed.get("items", []):
+            if str(item.get("task_id")) == str(triage_task_id):
+                item["stage"] = stage
+        path.write_text(json.dumps(feed, ensure_ascii=False, indent=1),
+                        encoding="utf-8")
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"!! mark_stage: {exc}", flush=True)
+
+
 def handle_callback(env: dict, state: dict, config: dict, callback: dict) -> None:
     token = env["INBOX_BOT_TOKEN"]
     chat_id = str(callback["message"]["chat"]["id"])
@@ -274,6 +293,7 @@ def handle_callback(env: dict, state: dict, config: dict, callback: dict) -> Non
                 return
             parsed = parse_triage(card["spec"])
             exec_id = create_execution(env, parsed, card["meta"], state)
+            mark_stage(env, card["meta"].get("triage_task_id"), "в работе")
             tg("editMessageText", token, chat_id=chat_id,
                message_id=int(card_message_id),
                text=f"▶ Запущено: задача исполнения #{exec_id}. "

@@ -96,6 +96,9 @@ def flush_saves(env: dict, state: dict) -> None:
             continue
         if item.get("kt"):
             verdict = parse_game_verdict(task.get("result") or "")
+            stage = {"ПРИНЯТЬ": "принято", "ОТКЛОНИТЬ": "отклонено",
+                     "УТОЧНИТЬ": "уточняется"}.get(
+                verdict.get("вердикт", "").upper(), "триаж")
             for entry in state.get("kt_feed", []):
                 if entry.get("task_id") == item["task_id"]:
                     entry.update({
@@ -103,6 +106,7 @@ def flush_saves(env: dict, state: dict) -> None:
                         "reason": verdict.get("причина", ""),
                         "category": verdict.get("категория", ""),
                         "priority": verdict.get("приоритет", ""),
+                        "stage": entry.get("stage", stage) if stage == "триаж" else stage,
                     })
                     break
             write_kt_feed(env, state)
@@ -369,9 +373,11 @@ def write_kt_feed(env: dict, state: dict) -> None:
         return
     items = []
     for entry in state.get("kt_feed", [])[-50:]:
-        items.append({key: entry.get(key, "") for key in
-                      ("task_id", "from", "subject", "verdict", "reason",
-                       "category", "priority")})
+        item = {key: entry.get(key, "") for key in
+                ("task_id", "from", "subject", "verdict", "reason",
+                 "category", "priority")}
+        item["stage"] = entry.get("stage", "триаж")
+        items.append(item)
     path = Path(feed_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"updated": time.strftime("%Y-%m-%d %H:%M"),
