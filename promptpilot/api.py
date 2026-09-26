@@ -1165,6 +1165,39 @@ def api_typesafe_test():
     return {"ok": True, "source": source, "reply": reply}
 
 
+# ── Квота-фейловер (переключение исполнителя при исчерпании квоты) ──
+@app.get("/api/quota-failover")
+def api_quota_failover():
+    """Состояние квота-фейловера: режим, проценты квоты, кто сейчас в ролях."""
+    import json as _json
+    base = Path.home() / ".promptpilot"
+    result = {"enabled": False, "mode": "unknown", "available": False}
+    try:
+        cfg = _json.loads((base / "quota-failover.json").read_text(encoding="utf-8"))
+        result["enabled"] = bool(cfg.get("enabled", True))
+        result["failover_executor"] = cfg.get("failover", {}).get("executor")
+        result["thresholds"] = {
+            "failover_below_pct": cfg.get("failover_below_pct"),
+            "recover_above_pct": cfg.get("recover_above_pct"),
+        }
+    except (OSError, _json.JSONDecodeError, AttributeError):
+        return result
+    try:
+        state = _json.loads((base / "quota-failover-state.json").read_text(encoding="utf-8"))
+        result.update({
+            "available": True,
+            "mode": state.get("mode", "primary"),
+            "interval_pct": state.get("interval_pct"),
+            "weekly_pct": state.get("weekly_pct"),
+            "last_check": state.get("last_check"),
+            "switched_at": state.get("switched_at"),
+            "snapshot_executor": (state.get("snapshot") or {}).get("executor"),
+        })
+    except (OSError, _json.JSONDecodeError):
+        pass
+    return result
+
+
 @app.get("/api/herdr/agents")
 def api_herdr_agents(machine: str = ""):
     """Live herdr agents for the session-target picker (locally or on a machine)."""

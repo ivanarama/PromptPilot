@@ -86,6 +86,19 @@ if (Test-CmdLine 'verdict-repair-watcher') {
     }
 }
 
+# 4b. Quota-Failover Watcher (квота MiniMax -> перекройка ролей конвейера)
+if (Test-CmdLine 'quota-failover-watcher') {
+    Write-Host '[4b] Quota-Failover Watcher: already running' -ForegroundColor Green
+} else {
+    Start-HiddenConsole 'C:\Python314\pythonw.exe' '-X utf8 "C:\Users\Nachfin\Desktop\Projets\Other\PromptPilot\quota-failover-watcher.py"' $PpDir
+    Start-Sleep -Seconds 3
+    if (Test-CmdLine 'quota-failover-watcher') {
+        Write-Host '[4b] Quota-Failover Watcher started (hidden)' -ForegroundColor Green
+    } else {
+        Write-Host '[4b] Quota-Failover Watcher FAILED - see ~/.promptpilot/quota-failover.log' -ForegroundColor Red
+    }
+}
+
 # 5. Queued-Nudger
 if (Test-CmdLine 'queued-nudger') {
     Write-Host '[5] Queued-Nudger: already running' -ForegroundColor Green

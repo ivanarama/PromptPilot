@@ -1779,8 +1779,26 @@ async function renderAutoTab() {
       <button class="btn btn-sm btn-primary" onclick="tsSaveKey()">Сохранить ключ</button>
       <button class="btn btn-sm btn-ghost" onclick="tsTest()">Проверить связь</button>
     </div>
-    <div class="cz-hint" id="ts-msg" style="margin-top:6px">Ключ хранится только на этом компьютере и начинает действовать сразу, без перезапуска. ${st.env_set ? 'Внимание: сейчас активен ключ из переменной окружения — файл будет запасным.' : ''}</div>`;
+    <div class="cz-hint" id="ts-msg" style="margin-top:6px">Ключ хранится только на этом компьютере и начинает действовать сразу, без перезапуска. ${st.env_set ? 'Внимание: сейчас активен ключ из переменной окружения — файл будет запасным.' : ''}</div>
+    <div id="qf-block"></div>`;
+  try {
+    const qf = await fetchJSON(`${API}/quota-failover`);
+    const el = document.getElementById('qf-block');
+    if (!qf.available) {
+      el.innerHTML = '<div class="cz-hint" style="margin-top:10px">🪫 Квота-фейловер: вотчер не запущен (запускается вместе с системой, состояние появится после первого замера).</div>';
+    } else {
+      const modeLine = qf.mode === 'failover'
+        ? `<b style="color:var(--yellow)">⚠ аварийный режим</b> — работает запасной исполнитель ${esc(qf.failover_executor || '')}, ревью у Квена`
+        : '<b style="color:var(--green)">✓ основной режим</b> — штатный исполнитель, каскад по вашим настройкам';
+      el.innerHTML = `
+        <div class="cz-row" style="margin-top:14px"><b>🪫 Квота-фейловер (авто-переключение исполнителя)</b></div>
+        <div class="cz-hint" style="margin:6px 0">Следит за квотой МиниМакса штатной командой. Остаток ≤ ${qf.thresholds?.failover_below_pct ?? 10}% — конвейер сам переходит на запасного исполнителя, ревью забирает Квен, работу принимает планер. Квота восстановилась — возвращается основной состав. Пороги и команду можно править в файле <code>~/.promptpilot/quota-failover.json</code>.</div>
+        <div class="cz-row">${modeLine}</div>
+        <div class="cz-row"><span class="cz-hint">Квота МиниМакс: окно ${qf.interval_pct ?? '?'}% · неделя ${qf.weekly_pct ?? '?'}%${qf.last_check ? ' · замер ' + esc(qf.last_check.replace('T', ' ')) : ''}${qf.mode === 'failover' && qf.snapshot_executor ? ' · возврат на ' + esc(qf.snapshot_executor) + ' при восстановлении' : ''}</span></div>`;
+    }
+  } catch (e) { /* блок не критичен */ }
 }
+
 async function tsSaveKey() {
   const msg = document.getElementById('ts-msg');
   const key = document.getElementById('ts-key').value.trim();
