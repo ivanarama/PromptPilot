@@ -38,7 +38,16 @@ NOISE_SENDER_DOMAINS = (
     "e.mail.ru", "id.mail.ru", "notify.mail.ru", "agent.mail.ru",
 )
 GAME_MARKER = "[KT]"
-OS_MARKER = "[OS]"  # задачи oneservice помечаются темой; [KT] — игра;
+OS_MARKER = "[OS]"
+
+_HOMOGLYPHS = str.maketrans("АВСЕНКМОРТХ", "ABSEHKMOPTX")
+
+
+def marker_of(subject: str) -> str:
+    """Маркер проекта из темы; кириллица/латиница равнозначны."""
+    norm = (subject or "").strip().upper().translate(_HOMOGLYPHS)
+    m = re.match(r"^\[([A-Z]{2})\]", norm)
+    return m.group(1) if m else ""  # задачи oneservice помечаются темой; [KT] — игра;
 # всё остальное остаётся в общем бэклоге (inbox_poller: каталог проектов)
 
 
@@ -231,10 +240,10 @@ def process_email_mode(env: dict, dry: bool) -> None:
                 subject = decode_mime(msg.get("Subject")) or "(без темы)"
                 sender = decode_mime(msg.get("From"))
                 client.select(folder)  # fetch HEADER переключил папку
-                if subject.strip().upper().startswith(GAME_MARKER):
+                if marker_of(subject) == "KT":
                     state["processed"].append(message_id)  # игровой конвейер
                     continue
-                if not subject.strip().upper().startswith(OS_MARKER):
+                if marker_of(subject) != "OS":
                     # Не помечено [OS] — это не задача oneservice: письмо
                     # остаётся в общем бэклоге (inbox_poller сам определит
                     # проект по каталогу). OS-конвейер его не трогает.

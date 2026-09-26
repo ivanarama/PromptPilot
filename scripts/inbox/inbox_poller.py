@@ -323,6 +323,21 @@ def resolve_known_project(card: dict, items: list[dict],
 # --- Игровой конвейер ([KT]: «Сказки Королевства») --------------------------
 
 KT_MARKER = "[KT]"
+
+# Кириллические близнецы латиницы в маркерах: [КТ] на русской раскладке и
+# [KT] латиницей должны вести себя одинаково.
+_HOMOGLYPHS = str.maketrans("АВСЕНКМОРТХ", "ABSEHKMOPTX")
+
+
+def marker_of(subject: str) -> str:
+    """Двухбуквенный маркер проекта из темы ([KT], [OS], [КТ]…) — или ''."""
+    norm = (subject or "").strip().upper().translate(_HOMOGLYPHS)
+    m = re.match(r"^\[([A-Z]{2})\]", norm)
+    return m.group(1) if m else ""
+
+
+def is_kt(subject: str) -> bool:
+    return marker_of(subject) == "KT"
 META_CUT = "--- Meta ---"
 
 
@@ -335,10 +350,6 @@ def form_nick(body: str) -> str:
     match = re.search(r"(?mi)^\s*name\s*:\s*(.+)$", body or "")
     nick = match.group(1).strip() if match else ""
     return (nick[:30] or "Анонимный странник")
-
-
-def is_kt(subject: str) -> bool:
-    return subject.strip().upper().startswith(KT_MARKER)
 
 
 def game_triage_prompt(card: dict, concept: str) -> str:
@@ -598,7 +609,7 @@ def run_once(env: dict, dry: bool, refresh: bool = False) -> None:
             client.select(card["folder"])
             client.store(card["num"], "+FLAGS", "\\Seen")
             full = fetch_full(client, card)
-            if full["subject"].strip().upper().startswith("[OS]"):
+            if marker_of(card["subject"]) == "OS":
                 # Oneservice-конвейер: [OS]-письма ведёт os_intake (GitLab).
                 print(f"→ [OS] задача oneservice: {full['subject']}")
                 state["processed"].append(full["message_id"])
