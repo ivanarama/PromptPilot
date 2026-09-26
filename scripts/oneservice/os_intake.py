@@ -96,6 +96,21 @@ def project_api(env: dict, path: str, method: str = "GET",
               payload=payload, raw_file=raw_file)
 
 
+def pp_request(env: dict, path: str, method: str = "GET",
+               payload: dict | None = None) -> dict:
+    """Локальная очередь PromptPilot: задачи хранителя исполняет воркер."""
+    request = urllib.request.Request(env["PP_API"].rstrip("/") + path, method=method)
+    token = env.get("PP_API_TOKEN", "")
+    if token:
+        request.add_header("Authorization", f"Bearer {token}")
+    data = None
+    if payload is not None:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        request.add_header("Content-Type", "application/json")
+    with urllib.request.urlopen(request, timeout=30, data=data) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
 def ensure_labels(env: dict, labels: dict[str, str]) -> None:
     try:
         existing = {item["title"] for item in project_api(env, "/labels")}
@@ -365,6 +380,125 @@ def tg_loop(env: dict) -> None:
             time.sleep(5)
 
 
+# --- хранитель целесообразности (этап 2) ------------------------------------
+
+KEEPER_STATE = ROOT / ".os_keeper.json"
+OS_REPO = Path(r"C:\Projects\oneservice-cc_v2")
+VERDICT_CONTRACT = (
+    "\n\nПоследней строкой ответа напиши ровно одну из:\n"
+    "ИТОГ: ГОТОВО — решение принято\n"
+    "ИТОГ: НЕ СМОГ — не получилось\n"
+)
+
+
+def load_keeper_state() -> dict:
+    state = {"sent": {}}
+    if KEEPER_STATE.exists():
+        state.update(json.loads(KEEPER_STATE.read_text(encoding="utf-8")))
+    state.setdefault("sent", {})
+    state.setdefault("processed", [])
+    return state
+
+
+def repo_context(env: dict) -> str:
+    """Каркас репозитория для ТЗ: имена файлов до второго уровня."""
+    root = Path(env.get("OS_WORKING_DIR", str(OS_REPO)))
+    lines = []
+    try:
+        for d in sorted(root.iterdir()):
+            if d.name.startswith("."):
+                continue
+            if d.is_dir():
+                children = [c.name for c in sorted(d.iterdir())][:12]
+                lines.append(f"{d.name}/: " + ", ".join(children))
+            else:
+                lines.append(d.name)
+    except OSError:
+        pass
+    return "\n".join(lines[:80])
+
+
+def keeper_prompt(env: dict, issue: dict) -> str:
+    body = (issue.get("description") or "")[:5000]
+    return (
+        "Ты — хранитель целесообразности проекта oneservice-cc_v2 "
+        "(1С-конфигурация). Оцени обращение и подготовь решение.\n\n"
+        f"Структура проекта:\n{repo_context(env)}\n\n"
+        f"Обращение (GitLab issue #{issue['iid']}, автор: "
+        f"{issue['author'].get('name') or issue['author'].get('username')}):\n"
+        f"{body}\n\n"
+        "Реши:\n"
+        "- ЦЕЛЕСООБРАЗНО — реальная задача этого сервиса, принимаем в работу;\n"
+        "- НЕ ЦЕЛЕСООБРАЗНО — не про сервис, дубль или мусор;\n"
+        "- ПЛАТФОРМА — упирается в ошибку/ограничение платформы, нужен issue "
+        "в бэклог платформы.\n\n"
+        "Ответь строго в формате:\n"
+        "ВЕРДИКТ: ЦЕЛЕСООБРАЗНО|НЕ ЦЕЛЕСООБРАЗНО|ПЛАТФОРМА\n"
+        "ПРИЧИНА: <1-3 предложения, вежливо, для автора обращения>\n"
+        "ТЕХНИЧЕСКОЕ ЗАДАНИЕ:\n"
+        "Контекст: <кратко>\n"
+        "Что нужно: <по пунктам, с файлами конфигурации>\n"
+        "Критерий готовности: <как проверить>\n\n"
+        + VERDICT_CONTRACT
+    )
+
+
+def keeper_pass(env: dict, state: dict, dry: bool) -> None:
+    """Один проход хранителя: раздача задач PP + перенос вердиктов в GitLab."""
+    # 1. новые issues с label «подано» -> задача хранителя в PP
+    for issue in project_api(env, "/issues?labels=%D0%BF%D0%BE%D0%B4%D0%B0%D0%BD%D0%BE&state=opened"):
+        iid = str(issue["iid"])
+        if iid in state["sent"]:
+            continue
+        if dry:
+            print(f"DRY: хранитель взял бы issue #{iid}")
+            continue
+        payload = {
+            "prompt": keeper_prompt(env, issue),
+            "provider": env.get("OS_PROVIDER", "agy"),
+            "working_dir": env.get("OS_WORKING_DIR", str(OS_REPO)),
+            "priority": 2,
+        }
+        task = pp_request(env, "/api/tasks", "POST", payload)
+        state["sent"][iid] = task["id"]
+        project_api(env, f"/issues/{iid}", "PUT", {"labels": "целесообразность"})
+        print(f"хранитель: issue #{iid} -> задача #{task['id']}")
+    # 2. завершённые задачи хранителя -> комментарий и метки в GitLab
+    for iid, pp_task_id in list(state["sent"].items()):
+        task = pp_request(env, f"/api/tasks/{pp_task_id}")
+        if task["status"] not in ("completed", "failed", "cancelled"):
+            continue
+        result = (task.get("result") or "").split("--- Meta ---")[0].strip()
+        verdict_match = re.search(r"^ВЕРДИКТ:\s*(.+)$", result, re.M)
+        verdict = verdict_match.group(1).strip().upper() if verdict_match else "НЕ СМОГ"
+        note = f"🧊 **Хранитель целесообразности** (задача #{pp_task_id})\n\n{result[:3500]}"
+        if "ПЛАТФОРМА" in verdict:
+            note += "\n\n⚓ Эскалация: требуется issue в бэклоге платформы (onebase)."
+            project_api(env, f"/issues/{iid}/notes", "POST", {"body": note})
+            project_api(env, f"/issues/{iid}", "PUT",
+                        {"labels": "блокирована платформой"})
+        elif "ЦЕЛЕСООБРАЗНО" in verdict and "НЕ " not in verdict.upper().replace(
+                "ЦЕЛЕСООБРАЗНО", ""):
+            project_api(env, f"/issues/{iid}/notes", "POST", {"body": note})
+            project_api(env, f"/issues/{iid}", "PUT", {"labels": "триаж-ТЗ"})
+        else:
+            project_api(env, f"/issues/{iid}/notes", "POST", {"body": note})
+            project_api(env, f"/issues/{iid}", "PUT", {"labels": "отклонено"})
+        state["sent"].pop(iid)
+        print(f"хранитель: issue #{iid} — {verdict}")
+
+
+def keeper_loop(env: dict, interval: int) -> None:
+    while True:
+        try:
+            state = load_keeper_state()
+            keeper_pass(env, state, dry=False)
+            save_state(KEEPER_STATE, state)
+        except Exception as exc:
+            print(f"!! keeper: {type(exc).__name__}: {exc}", flush=True)
+        time.sleep(interval)
+
+
 # --- общее ------------------------------------------------------------------
 
 def load_state(path: Path) -> dict:
@@ -396,7 +530,20 @@ def main() -> int:
     if mode == "tg":
         tg_loop(env)
         return 0
-    print("использование: os_intake.py email [--dry] | os_intake.py tg")
+    if mode == "keeper":
+        interval = int(env.get("KEEPER_INTERVAL", "120"))
+        while True:
+            try:
+                state = load_keeper_state()
+                keeper_pass(env, state, dry="--dry" in sys.argv)
+                save_state(KEEPER_STATE, state)
+            except Exception as exc:
+                print(f"!! keeper: {type(exc).__name__}: {exc}", flush=True)
+            if "--once" in sys.argv:
+                return 0
+            time.sleep(interval)
+    print("использование: os_intake.py email [--dry] | os_intake.py tg | "
+          "os_intake.py keeper [--once] [--dry]")
     return 2
 
 
