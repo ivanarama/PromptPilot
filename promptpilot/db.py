@@ -3022,7 +3022,8 @@ def pipeline_run_metrics(series_ids: list[int], since: datetime) -> dict:
              "unresolved_unable": 0, "unresolved_failed": 0,
              "recovered_unable": 0, "recovered_failed": 0,
              "tokens_known_runs": 0, "input_tokens": 0,
-             "output_tokens": 0, "total_tokens": 0}
+             "output_tokens": 0, "total_tokens": 0,
+             "cost_known_runs": 0, "total_cost_usd": 0.0}
     if not ids:
         return empty
     marks = ",".join("?" for _ in ids)
@@ -3046,6 +3047,11 @@ def pipeline_run_metrics(series_ids: list[int], since: datetime) -> dict:
             result["input_tokens"] += input_tokens
             result["output_tokens"] += output_tokens
             result["total_tokens"] += input_tokens + output_tokens
+        cost = re.search(
+            r"(?mi)^Cost:\s*\$(\d+(?:\.\d+)?)\s*$", output)
+        if cost:
+            result["cost_known_runs"] += 1
+            result["total_cost_usd"] += float(cost.group(1))
         reported_no_change = any(pattern in output.lower() for pattern in (
             "github не изменялся", "очередь оставлена без изменений",
             "ничего не влито", "изменений не выполнялось",
@@ -3088,6 +3094,7 @@ def pipeline_run_metrics(series_ids: list[int], since: datetime) -> dict:
     result["unresolved_failed"] = sum(item["failed"] for item in unresolved.values())
     result["recovered_unable"] = result["unable"] - result["unresolved_unable"]
     result["recovered_failed"] = result["failed"] - result["unresolved_failed"]
+    result["total_cost_usd"] = round(result["total_cost_usd"], 6)
     return result
 
 

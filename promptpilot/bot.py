@@ -7,6 +7,7 @@ After authorization all task management features are available.
 
 import asyncio
 import functools
+import html
 import json
 import logging
 import os
@@ -121,7 +122,7 @@ def _main_menu() -> ReplyKeyboardMarkup:
     rows = [
         ["📋 Задачи", "🖥 Окна", "➕ Добавить задачу"],
         ["📊 Статистика", "🗓 Расписание", "🔌 Провайдеры"],
-        ["📈 Очередь", "⚡ Скилы"],
+        ["📈 Очередь", "🧾 Итоги", "⚡ Скилы"],
     ]
     if _epf_available():
         rows.append(["🔧 1С обработка"])
@@ -1085,6 +1086,223 @@ async def cb_pipeline_profile(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.answer()
     profile_id = query.data.split(":", 1)[1]
     await _send_pipeline_insights(query.message, profile_id)
+
+
+# ---------------------------------------------------------------------------
+# Pipeline period report
+# ---------------------------------------------------------------------------
+
+_REPORT_PERIODS = ((24, "24 часа"), (168, "7 дней"), (720, "30 дней"))
+_REPORT_PROFILE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def _report_profiles_keyboard(profiles: list[dict]) -> InlineKeyboardMarkup:
+    rows = []
+    for profile in profiles:
+        profile_id = str(profile.get("id", ""))
+        callback = f"report:profile:{profile_id}"
+        longest_callback = f"report:refresh:720:{profile_id}"
+        # Telegram limits callback_data to 64 UTF-8 bytes. Profile ids are
+        # configuration keys, but still validate them before putting them into
+        # a button because callback payloads must never be trusted as ids.
+        if (_REPORT_PROFILE_ID_RE.fullmatch(profile_id)
+                and len(longest_callback.encode("utf-8")) <= 64):
+            rows.append([InlineKeyboardButton(
+                str(profile.get("title") or profile_id)[:55],
+                callback_data=callback,
+            )])
+    return InlineKeyboardMarkup(rows)
+
+
+def _report_period_keyboard(profile_id: str) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(
+        label, callback_data=f"report:period:{hours}:{profile_id}")
+        for hours, label in _REPORT_PERIODS]]
+    rows.append([InlineKeyboardButton(
+        "← К проектам", callback_data="report:profiles")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _report_result_keyboard(profile_id: str, hours: int) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(
+        "↻ Уточнить результат в GitHub",
+        callback_data=f"report:refresh:{hours}:{profile_id}",
+    )]]
+    rows.extend(_report_period_keyboard(profile_id).inline_keyboard)
+    return InlineKeyboardMarkup(rows)
+
+
+def _report_profile(profile_id: str) -> dict | None:
+    """Resolve an untrusted callback id against the current configuration."""
+    return next(
+        (profile for profile in pipeline_insights.list_profiles()
+         if str(profile.get("id")) == profile_id),
+        None,
+    )
+
+
+def _clip_report_markdown(text: str, limit: int = TG_LIMIT) -> str:
+    """Clip a rendered report at a complete line, preserving Markdown links."""
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    suffix = "\n…"
+    cut_at = text.rfind("\n", 0, limit - len(suffix))
+    if cut_at < 1:
+        return _clip(text, limit)
+    return text[:cut_at].rstrip() + suffix
+
+
+def _report_markdown_as_plain(text: str) -> str:
+    """Readable fallback when Telegram rejects otherwise valid Markdown."""
+    text = re.sub(
+        r"\[([^\]]+)]\((https?://[^\s)]+)\)",
+        lambda match: f"{match.group(1)} — {match.group(2)}",
+        text,
+    )
+    text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
+    text = re.sub(r"\\([\\_*\[\]()~`>#+\-=|{}.!])", r"\1", text)
+    return html.unescape(text.replace("**", "").replace("`", ""))
+
+
+def _build_pipeline_period_report(
+        profile_id: str, hours: int, refresh_delivery: bool) -> tuple[dict, str]:
+    """Keep DB and potentially remote delivery reads off the bot event loop."""
+    report = pipeline_insights.build_period_report(
+        profile_id,
+        db.list_series(),
+        hours=hours,
+        refresh_delivery=refresh_delivery,
+    )
+    return report, pipeline_insights.render_period_report_markdown(report)
+
+
+@require_auth
+async def show_pipeline_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    profiles = pipeline_insights.list_profiles()
+    keyboard = _report_profiles_keyboard(profiles)
+    if not profiles:
+        await update.message.reply_text(
+            "🧾 Профили конвейеров не настроены. Добавьте их в "
+            "~/.promptpilot/pipeline_profiles.json."
+        )
+        return
+    if not keyboard.inline_keyboard:
+        await update.message.reply_text(
+            "🧾 Идентификаторы профилей не подходят для Telegram-кнопок. "
+            "Используйте латинские буквы, цифры, точку, дефис или подчёркивание."
+        )
+        return
+    await update.message.reply_text(
+        "🧾 Итоги конвейера\n\nВыберите проект:",
+        reply_markup=keyboard,
+    )
+
+
+@require_auth
+async def cb_report_profiles(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    profiles = pipeline_insights.list_profiles()
+    keyboard = _report_profiles_keyboard(profiles)
+    if not keyboard.inline_keyboard:
+        await query.edit_message_text("Профили конвейеров не настроены.")
+        return
+    await query.edit_message_text(
+        "🧾 Итоги конвейера\n\nВыберите проект:",
+        reply_markup=keyboard,
+    )
+
+
+@require_auth
+async def cb_report_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    profile_id = query.data.split(":", 2)[2]
+    profile = _report_profile(profile_id)
+    if profile is None:
+        await query.edit_message_text(
+            "Профиль больше не настроен. Откройте /report заново."
+        )
+        return
+    await query.edit_message_text(
+        f"🧾 {profile['title']}\n\nЗа какой период показать итоги?",
+        reply_markup=_report_period_keyboard(profile_id),
+    )
+
+
+@require_auth
+async def cb_report_period(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    _, _, hours_text, profile_id = query.data.split(":", 3)
+    try:
+        hours = int(hours_text)
+    except ValueError:
+        hours = 0
+    if hours not in {period for period, _ in _REPORT_PERIODS}:
+        await query.edit_message_text("Неизвестный период. Откройте /report заново.")
+        return
+    profile = _report_profile(profile_id)
+    if profile is None:
+        await query.edit_message_text(
+            "Профиль больше не настроен. Откройте /report заново."
+        )
+        return
+
+    await _send_pipeline_period_report(query, profile_id, hours, refresh_delivery=False)
+
+
+@require_auth
+async def cb_report_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    _, _, hours_text, profile_id = query.data.split(":", 3)
+    try:
+        hours = int(hours_text)
+    except ValueError:
+        hours = 0
+    if hours not in {period for period, _ in _REPORT_PERIODS}:
+        await query.edit_message_text("Неизвестный период. Откройте /report заново.")
+        return
+    if _report_profile(profile_id) is None:
+        await query.edit_message_text(
+            "Профиль больше не настроен. Откройте /report заново."
+        )
+        return
+    await _send_pipeline_period_report(query, profile_id, hours, refresh_delivery=True)
+
+
+async def _send_pipeline_period_report(
+        query, profile_id: str, hours: int, *, refresh_delivery: bool):
+    status = ("🧾 Уточняю результат в GitHub…" if refresh_delivery
+              else "🧾 Собираю итоги из локальной истории…")
+    await query.edit_message_text(status)
+    try:
+        _report, rendered = await asyncio.to_thread(
+            _build_pipeline_period_report, profile_id, hours, refresh_delivery)
+        text = _clip_report_markdown(str(rendered))
+        keyboard = _report_result_keyboard(profile_id, hours)
+        try:
+            # The shared renderer produces ordinary Markdown. Keep its issue/PR
+            # links clickable, but fall back to plain text if Telegram's more
+            # restrictive parser rejects a title or other external text.
+            await query.edit_message_text(
+                text,
+                parse_mode="Markdown",
+                reply_markup=keyboard,
+            )
+        except BadRequest:
+            await query.edit_message_text(
+                _clip(_report_markdown_as_plain(str(rendered))),
+                reply_markup=keyboard,
+            )
+    except Exception as exc:
+        logger.warning("pipeline period report failed for %s: %s", profile_id, exc)
+        await query.edit_message_text(
+            "Не удалось собрать итоги. Текущая очередь доступна в /pipeline.",
+            reply_markup=_report_result_keyboard(profile_id, hours),
+        )
 
 
 async def toggle_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3858,10 +4076,11 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "➕ Добавить задачу — мастер: промпт → где выполнить → папка → 🚀 Запустить\n"
         "   (приоритет, права, worktree, повтор, отложенный запуск — «⚙ Дополнительно»)\n"
         "📊 Статистика — сводка по статусам и расходы\n"
+        "🧾 Итоги — что влито, закрыто и продвинулось за 24 часа, 7 или 30 дней\n"
         "🔌 Провайдеры — список и настройки\n"
         "⚡ Скилы — запустить /skill Claude Code\n"
         "⏸ Пауза — приостановить воркер без потери задач\n\n"
-        "Команды: /tasks, /windows, /add, /stats, /providers, /pause, /skills, /help\n"
+        "Команды: /tasks, /windows, /add, /stats, /report, /providers, /pause, /skills, /help\n"
         "/cancel — прервать текущий мастер или диалог\n\n"
         "Совет: задайте PP_PROJECTS_ROOT в .env — рабочую папку можно будет "
         "выбирать кнопками, а не печатать путь.",
@@ -3890,6 +4109,7 @@ def run_bot():
                 BotCommand("stats", "Статистика"),
                 BotCommand("schedule", "Расписание и ускорение серий"),
                 BotCommand("pipeline", "Узкие места внешней очереди"),
+                BotCommand("report", "Итоги конвейера за период"),
                 BotCommand("providers", "Провайдеры"),
                 BotCommand("pause", "Пауза / продолжить воркер"),
                 BotCommand("skills", "Скилы Claude Code"),
@@ -4119,6 +4339,19 @@ def run_bot():
     app.add_handler(CallbackQueryHandler(cb_windows_refresh, pattern=r"^win_rf$"), group=-1)
     app.add_handler(CallbackQueryHandler(cb_windows_list, pattern=r"^win_ls$"), group=-1)
 
+    # Report buttons can be opened from /report even while a task wizard is
+    # active, so they must not be swallowed by that wizard's callback fallback.
+    app.add_handler(CallbackQueryHandler(
+        cb_report_profiles, pattern=r"^report:profiles$"), group=-1)
+    app.add_handler(CallbackQueryHandler(
+        cb_report_profile, pattern=r"^report:profile:[A-Za-z0-9_.-]+$"), group=-1)
+    app.add_handler(CallbackQueryHandler(
+        cb_report_period,
+        pattern=r"^report:period:(24|168|720):[A-Za-z0-9_.-]+$"), group=-1)
+    app.add_handler(CallbackQueryHandler(
+        cb_report_refresh,
+        pattern=r"^report:refresh:(24|168|720):[A-Za-z0-9_.-]+$"), group=-1)
+
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("skills", cmd_skills))
@@ -4129,6 +4362,7 @@ def run_bot():
     app.add_handler(CommandHandler("stats", show_stats))
     app.add_handler(CommandHandler("schedule", show_schedule))
     app.add_handler(CommandHandler("pipeline", show_pipeline_insights))
+    app.add_handler(CommandHandler("report", show_pipeline_report))
     app.add_handler(CommandHandler("providers", show_providers))
     app.add_handler(CommandHandler("pause", toggle_pause))
     app.add_handler(MessageHandler(filters.CONTACT, handle_contact))
@@ -4141,6 +4375,7 @@ def run_bot():
     app.add_handler(MessageHandler(filters.Regex("^📊 Статистика$"), show_stats))
     app.add_handler(MessageHandler(filters.Regex("^🗓 Расписание$"), show_schedule))
     app.add_handler(MessageHandler(filters.Regex("^📈 Очередь$"), show_pipeline_insights))
+    app.add_handler(MessageHandler(filters.Regex("^🧾 Итоги$"), show_pipeline_report))
     app.add_handler(MessageHandler(filters.Regex("^🔌 Провайдеры$"), show_providers))
     app.add_handler(MessageHandler(filters.Regex("^⚡ Скилы$"), cmd_skills))
     app.add_handler(MessageHandler(filters.Regex(r"^(⏸ Пауза|▶ Продолжить)$"), toggle_pause))

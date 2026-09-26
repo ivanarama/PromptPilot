@@ -41,6 +41,8 @@ _CACHE_PUBLISHED_PROFILE_REVISION_PREFIX = \
 _INTERVAL_PRESETS = ((0.25, "15m"), (0.5, "30m"), (1, "1h"), (2, "2h"),
                      (4, "4h"), (8, "8h"), (12, "12h"), (24, "24h"))
 _HISTORY_WINDOWS = (5, 24, 24 * 7, 24 * 30)
+_REPORT_HOURS = (24, 24 * 7, 24 * 30)
+_ATTENTION_LABELS = ("ship", "needs-decision", "hold")
 _PRIORITY_LEVELS = ("p0", "p1", "p2", "p3")
 _DEFAULT_PRIORITY_RULES = (
     ({"security", "severity:critical", "blocker", "data-loss"}, 0, "critical label"),
@@ -1598,6 +1600,8 @@ def _github_search(repository: str, query: str) -> dict:
             "labels": sorted(label.get("name", "") for label in item.get("labels", [])
                              if label.get("name")),
             "created_at": item.get("created_at"), "updated_at": item.get("updated_at"),
+            "closed_at": item.get("closed_at"),
+            "merged_at": (item.get("pull_request") or {}).get("merged_at"),
             "url": item.get("html_url"),
         })
     return {"count": total, "items": items, "membership_complete": total <= len(items)}
@@ -4642,6 +4646,658 @@ def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True,
         cache.pop("refresh_blocked_reason", None)
         cache.pop("refresh_deferred_until", None)
     return _with_live_github_budget_state(result, profile)
+
+
+def _report_series_ids(profile: dict, series: list[dict]) -> list[int]:
+    """Resolve current and ended recurring runs belonging to one profile.
+
+    The operational projection intentionally ignores ended series and may cap
+    legacy duplicates. A historical report must include their completed tasks:
+    ending or replacing a schedule during the selected period cannot erase the
+    work it already performed.
+    """
+    markers = {
+        str(queue.get("series_contains") or "").strip().lower()
+        for queue in profile.get("queues", [])
+        if str(queue.get("series_contains") or "").strip()
+    }
+    result = set()
+    for item in series:
+        identity = "\n".join((
+            str(item.get("title") or ""),
+            str(item.get("prompt") or ""),
+        )).lower()
+        series_id = item.get("id")
+        if series_id is not None and any(marker in identity for marker in markers):
+            result.add(int(series_id))
+    return sorted(result)
+
+
+def _report_snapshot_rows(profile_id: str, profile: dict,
+                          now: datetime, hours: int) -> list[dict]:
+    """Read the retained, configuration-compatible history for a report."""
+    profile_hash = _profile_fingerprint(profile)
+    rows = db.list_pipeline_snapshots(
+        profile_id,
+        # Queue cadence is capped at 24h. One extra cadence interval finds the
+        # nearest pre-window baseline without decoding a month for every 24h
+        # report opened in the Web UI or bot.
+        since=now - timedelta(hours=hours + 24),
+        limit=10000,
+    )
+    compatible = []
+    for row in rows:
+        payload = row.get("payload")
+        captured = _parse_time(row.get("captured_at"))
+        if (row.get("repository") != profile.get("repository")
+                or not isinstance(payload, dict)
+                or payload.get("profile_hash") != profile_hash
+                or not isinstance(payload.get("queues"), dict)
+                or captured is None):
+            continue
+        compatible.append((captured, row))
+    compatible.sort(key=lambda pair: (pair[0], int(pair[1].get("id") or 0)))
+    return [row for _captured, row in compatible]
+
+
+def _report_window_metrics(rows: list[dict], current_at: datetime,
+                           requested_end: datetime, hours: int,
+                           series_ids: list[int]) -> tuple[dict, dict | None]:
+    """Calculate movement around the requested wall-clock window.
+
+    The baseline nearest to the requested start wins, with an equally distant
+    post-start sample preferred. Coverage is the actual intersection with the
+    requested period. A baseline/tail gap beyond one cache TTL makes the window
+    explicitly incomplete instead of presenting a sparse 48h delta as 24h.
+    """
+    requested_start = requested_end - timedelta(hours=hours)
+    candidates = [
+        (row, _parse_time(row.get("captured_at"))) for row in rows
+    ]
+    candidates = [(row, stamp) for row, stamp in candidates
+                  if stamp is not None and stamp <= current_at]
+    if not candidates:
+        return {}, None
+    tolerance = float(_CACHE_TTL_SECONDS)
+    candidates = [
+        (row, stamp) for row, stamp in candidates
+        if stamp >= requested_start - timedelta(seconds=tolerance)
+    ]
+    if not candidates:
+        return {}, None
+    baseline_row, baseline_at = min(
+        candidates,
+        key=lambda pair: (
+            abs((pair[1] - requested_start).total_seconds()),
+            0 if pair[1] >= requested_start else 1,
+            pair[1],
+        ),
+    )
+    if baseline_at >= current_at:
+        return {
+            "hours": hours, "coverage_hours": 0.0, "complete": False,
+            "backlog_delta": None, "entered": None, "exited": None,
+            "moved": None, "transitions": None, "churn_items": None,
+            "queue_deltas": {}, "queue_throughput": {},
+        }, baseline_row
+
+    selected_rows = [row for row, stamp in candidates if stamp >= baseline_at]
+    actual_hours = (current_at - baseline_at).total_seconds() / 3600
+    movement = _window_metrics(
+        selected_rows, selected_rows[-1]["payload"], series_ids,
+        current_at, actual_hours)
+    observed_start = max(requested_start, baseline_at)
+    observed_end = min(requested_end, current_at)
+    coverage_seconds = max(0.0, (observed_end - observed_start).total_seconds())
+    baseline_gap = abs((baseline_at - requested_start).total_seconds())
+    tail_gap = max(0.0, (requested_end - current_at).total_seconds())
+    movement["hours"] = hours
+    movement["coverage_hours"] = round(
+        min(hours, coverage_seconds / 3600), 1)
+    movement["complete"] = (
+        baseline_gap < tolerance and tail_gap < tolerance
+        and coverage_seconds >= hours * 3600 - tolerance
+    )
+    return movement, baseline_row
+
+
+def _snapshot_membership_complete(payload: dict, expected_ids: set[str]) -> bool:
+    queues = payload.get("queues") if isinstance(payload, dict) else None
+    return bool(expected_ids) and isinstance(queues, dict) \
+        and set(queues) == expected_ids and all(
+            isinstance(queue, dict) and bool(queue.get("membership_complete"))
+            for queue in queues.values())
+
+
+def _report_attention(snapshot_queues: dict, repository: str) -> tuple[list[dict], bool]:
+    """Collect current human-attention labels once per issue/PR key."""
+    selected: dict[str, dict] = {}
+    membership = []
+    label_order = {label: index for index, label in enumerate(_ATTENTION_LABELS)}
+    for queue_id, queue in snapshot_queues.items():
+        if not isinstance(queue, dict):
+            continue
+        membership.append(bool(queue.get("membership_complete")))
+        for item in queue.get("items", []):
+            if not isinstance(item, dict):
+                continue
+            labels = {str(label).strip().lower()
+                      for label in item.get("labels", []) if str(label).strip()}
+            attention_labels = labels.intersection(_ATTENTION_LABELS)
+            if not attention_labels:
+                continue
+            key = str(item.get("key") or "").strip()
+            kind = str(item.get("kind") or "").strip().lower()
+            number = item.get("number")
+            if not key and kind in {"pr", "issue"} and isinstance(number, int):
+                key = f"{kind}:{number}"
+            if not key:
+                continue
+            if not kind and ":" in key:
+                kind = key.split(":", 1)[0]
+            if not isinstance(number, int):
+                try:
+                    number = int(key.split(":", 1)[1])
+                except (IndexError, TypeError, ValueError):
+                    continue
+            entry = selected.setdefault(key, {
+                "key": key, "kind": kind, "number": number,
+                "title": item.get("title") or f"#{number}",
+                "url": item.get("url"), "labels": set(), "queues": set(),
+            })
+            if not entry.get("url") and item.get("url"):
+                entry["url"] = item["url"]
+            if (not entry.get("title") or entry.get("title") == f"#{number}") \
+                    and item.get("title"):
+                entry["title"] = item["title"]
+            entry["labels"].update(attention_labels)
+            entry["queues"].add(str(queue_id))
+
+    result = []
+    for entry in selected.values():
+        labels = sorted(entry.pop("labels"), key=lambda label: label_order[label])
+        queues = sorted(entry.pop("queues"))
+        if not entry.get("url"):
+            path = "pull" if entry.get("kind") == "pr" else "issues"
+            entry["url"] = f"https://github.com/{repository}/{path}/{entry['number']}"
+        result.append({**entry, "labels": labels, "queues": queues})
+    result.sort(key=lambda item: (
+        min(label_order[label] for label in item["labels"]),
+        item["kind"], item["number"],
+    ))
+    return result, bool(membership) and all(membership)
+
+
+def _empty_delivery(status: str, reason: str, **extra) -> dict:
+    return {
+        "status": status, "exact": False, "reason": reason,
+        "merged_prs": [], "closed_issues": [], **extra,
+    }
+
+
+def _delivery_items(search: dict, repository: str, kind: str,
+                    start: datetime, end: datetime) -> tuple[list[dict], int]:
+    """Apply the exact timestamp boundary after GitHub's day-level search."""
+    result = []
+    missing_timestamps = 0
+    for item in search.get("items", []):
+        if not isinstance(item, dict):
+            continue
+        stamp = _parse_time(
+            item.get("merged_at") if kind == "pr" else item.get("closed_at"))
+        if stamp is None and kind == "pr":
+            # A merged PR is closed at merge time. GitHub's search result has
+            # historically omitted pull_request.merged_at in some API versions.
+            stamp = _parse_time(item.get("closed_at"))
+        if stamp is None:
+            missing_timestamps += 1
+            continue
+        if stamp < start or stamp > end:
+            continue
+        number = int(item["number"])
+        url = item.get("url")
+        if not url:
+            path = "pull" if kind == "pr" else "issues"
+            url = f"https://github.com/{repository}/{path}/{number}"
+        result.append({
+            "key": f"{kind}:{number}", "kind": kind, "number": number,
+            "title": item.get("title") or f"#{number}", "url": url,
+            "delivered_at": stamp.isoformat(),
+        })
+    result.sort(key=lambda item: (item["delivered_at"], item["number"]),
+                reverse=True)
+    return result, missing_timestamps
+
+
+def _refresh_report_delivery(profile_id: str, profile: dict, *,
+                             start: datetime, end: datetime) -> dict:
+    """Refresh exact delivered items under the ordinary insights admission."""
+    # A paused worker is an operator request for zero external pipeline I/O.
+    # Check before admission because budget admission itself probes /rate_limit
+    # (and may inspect GraphQL reservations) before _github_search sees pause.
+    if db.is_paused():
+        return _empty_delivery(
+            "blocked", "Конвейер на паузе; GitHub не запрашивался.",
+            blocker="worker_paused", retry_at=None)
+    repository = str(profile["repository"])
+    with _github_scan_admission(
+            profile, f"pipeline report delivery {profile_id}",
+            # Use the same quota class without publishing queue-refresh state:
+            # this enrichment neither refreshes nor invalidates queue snapshots.
+            budget_route="insights") as admission:
+        if not admission.get("allowed"):
+            return _empty_delivery(
+                "blocked",
+                str(admission.get("reason") or "GitHub refresh was not admitted"),
+                blocker=str(admission.get("state") or "github_budget"),
+                retry_at=admission.get("defer_until"),
+                github_budget=_public_budget_decision(admission),
+            )
+        try:
+            since_day = start.strftime("%Y-%m-%d")
+            merged_search = _github_search(
+                repository, f"is:pr is:merged merged:>={since_day}")
+            closed_search = _github_search(
+                repository, f"is:issue is:closed closed:>={since_day}")
+            _ensure_github_scan_lease(renew=True)
+            merged, missing_merged = _delivery_items(
+                merged_search, repository, "pr", start, end)
+            closed, missing_closed = _delivery_items(
+                closed_search, repository, "issue", start, end)
+            exact = (
+                bool(merged_search.get("membership_complete"))
+                and bool(closed_search.get("membership_complete"))
+                and missing_merged == 0 and missing_closed == 0
+            )
+            reason = None
+            if not exact:
+                reasons = []
+                if (not merged_search.get("membership_complete")
+                        or not closed_search.get("membership_complete")):
+                    reasons.append("GitHub вернул неполный состав результатов")
+                if missing_merged or missing_closed:
+                    reasons.append(
+                        "нет точного времени закрытия у элементов: "
+                        f"{missing_merged + missing_closed}")
+                reason = "; ".join(reasons)
+            return {
+                "status": "refreshed" if exact else "partial",
+                "exact": exact, "reason": reason,
+                "refreshed_at": end.isoformat(),
+                "merged_prs": merged, "closed_issues": closed,
+            }
+        except _GitHubScanPaused as exc:
+            return _empty_delivery(
+                "blocked", str(exc), blocker="worker_paused", retry_at=None)
+        except Exception as exc:
+            # Delivery is an optional enrichment. Queue movement and local run
+            # history remain useful even when GitHub or the scan lease fails.
+            return _empty_delivery(
+                "failed", str(exc) or type(exc).__name__,
+                blocker=type(exc).__name__, retry_at=None)
+
+
+def build_period_report(profile_id: str, series: list[dict], *, hours: int = 24,
+                        refresh_delivery: bool = False) -> dict:
+    """Build a deterministic pipeline digest, with GitHub strictly opt-in.
+
+    The default path reads only SQLite and the durable insights cache. Passing
+    ``refresh_delivery=True`` adds exact merged-PR/closed-issue lists through
+    the same scan lease and GitHub budget route as an explicit insights refresh.
+    """
+    if isinstance(hours, bool) or hours not in _REPORT_HOURS:
+        raise ValueError("hours должен быть одним из значений: 24, 168 или 720")
+    profiles = _profiles()
+    if profile_id not in profiles:
+        raise KeyError(profile_id)
+    profile = profiles[profile_id]
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(hours=hours)
+    cached = read_cached(profile_id, series)
+    series_ids = _report_series_ids(profile, series)
+    runs_raw = db.pipeline_run_metrics(series_ids, start)
+    rows = _report_snapshot_rows(profile_id, profile, now, hours)
+
+    movement = copy.deepcopy(
+        (cached.get("history") or {}).get(f"{hours}h") or {})
+    snapshot_queues = {}
+    data_through = None
+    current_at = None
+    baseline_row = None
+    if rows:
+        current_row = rows[-1]
+        snapshot_queues = current_row["payload"]["queues"]
+        current_at = _parse_time(current_row.get("captured_at"))
+        if current_at is not None:
+            movement, baseline_row = _report_window_metrics(
+                rows, current_at, now, hours, series_ids)
+            data_through = current_at.isoformat()
+    if not snapshot_queues:
+        snapshot_queues = {
+            str(queue.get("id")): {
+                "backlog": queue.get("backlog"),
+                "items": queue.get("items") or [],
+                "membership_complete": bool(queue.get("membership_complete")),
+            }
+            for queue in cached.get("queues", []) if isinstance(queue, dict)
+        }
+    if data_through is None and cached.get("generated_at") is not None:
+        try:
+            generated = datetime.fromtimestamp(
+                float(cached["generated_at"]), timezone.utc)
+            data_through = generated.isoformat()
+            current_at = generated
+        except (TypeError, ValueError, OSError):
+            pass
+
+    attention, observed_membership_complete = _report_attention(
+        snapshot_queues, str(profile["repository"]))
+    expected_queue_ids = {str(config.get("id"))
+                          for config in profile.get("queues", [])}
+    attention_complete = (
+        bool(rows) and observed_membership_complete
+        and _snapshot_membership_complete(rows[-1]["payload"], expected_queue_ids)
+    )
+    membership_complete = (
+        attention_complete and baseline_row is not None
+        and _snapshot_membership_complete(
+            baseline_row["payload"], expected_queue_ids)
+    )
+    if not membership_complete and movement:
+        # Backlog counts remain meaningful, but set-based movement does not:
+        # an incomplete endpoint can make entries/exits and transitions up.
+        for key in ("entered", "exited", "moved", "transitions", "churn_items"):
+            movement[key] = None
+        movement["entered_per_hour"] = None
+        movement["exited_per_hour"] = None
+        movement["queue_throughput"] = {
+            queue_id: None for queue_id in expected_queue_ids}
+        movement["queue_throughput_per_hour"] = {
+            queue_id: None for queue_id in expected_queue_ids}
+    queue_deltas = movement.get("queue_deltas") or {}
+    queue_throughput = movement.get("queue_throughput") or {}
+    cached_queues = {str(queue.get("id")): queue
+                     for queue in cached.get("queues", [])
+                     if isinstance(queue, dict)}
+    queues = []
+    for config in profile.get("queues", []):
+        queue_id = str(config.get("id"))
+        local = cached_queues.get(queue_id, {})
+        saved = snapshot_queues.get(queue_id, {})
+        # Movement/deltas are anchored to the latest durable snapshot, so its
+        # backlog must win too. A separately published cache can be newer after
+        # a fenced snapshot write failed; mixing the two creates impossible
+        # totals for one report timestamp.
+        backlog = (saved.get("backlog") if rows
+                   else local.get("backlog", saved.get("backlog")))
+        queues.append({
+            "id": queue_id, "title": config.get("title") or queue_id,
+            "backlog": backlog if isinstance(backlog, int) else None,
+            "delta": (int(queue_deltas[queue_id])
+                      if isinstance(queue_deltas.get(queue_id), (int, float))
+                      else None),
+            "throughput": (int(queue_throughput[queue_id])
+                           if isinstance(queue_throughput.get(queue_id), (int, float))
+                           else None),
+            "membership_complete": bool(saved.get("membership_complete")),
+        })
+
+    if rows:
+        capacities = {
+            str(config.get("id")): max(1, int(config.get("capacity", 1)))
+            for config in profile.get("queues", [])
+        }
+        bottleneck_queue = max(
+            (queue for queue in queues
+             if isinstance(queue.get("backlog"), int) and queue["backlog"] > 0),
+            key=lambda queue: queue["backlog"] / capacities[queue["id"]],
+            default=None,
+        )
+    else:
+        bottleneck_id = cached.get("bottleneck")
+        bottleneck_queue = next(
+            (queue for queue in queues if queue["id"] == bottleneck_id), None)
+    bottleneck = ({
+        "id": bottleneck_queue["id"], "title": bottleneck_queue["title"],
+        "backlog": bottleneck_queue["backlog"],
+    } if bottleneck_queue else None)
+    verdicts = {key: int(runs_raw.get(key, 0)) for key in (
+        "ready", "empty", "no_change", "human", "stale", "safe_refusal",
+        "unable", "failed", "other",
+    )}
+    errors = {key: int(runs_raw.get(key, 0)) for key in (
+        "unable", "failed", "unresolved_unable", "unresolved_failed",
+        "recovered_unable", "recovered_failed",
+    )}
+    run_report = {
+        "total": int(runs_raw.get("runs", 0)), "verdicts": verdicts,
+        "tokens": {
+            "known_runs": int(runs_raw.get("tokens_known_runs", 0)),
+            "input": int(runs_raw.get("input_tokens", 0)),
+            "output": int(runs_raw.get("output_tokens", 0)),
+            "total": int(runs_raw.get("total_tokens", 0)),
+        },
+        "cost": {
+            "known_runs": int(runs_raw.get("cost_known_runs", 0)),
+            "total_usd": float(runs_raw.get("total_cost_usd", 0.0)),
+        },
+        "errors": errors,
+    }
+    coverage_hours = movement.get("coverage_hours")
+    period_snapshot_count = 0
+    if current_at is not None:
+        threshold = now - timedelta(hours=hours)
+        period_snapshot_count = sum(
+            1 for row in rows
+            if threshold <= (_parse_time(row.get("captured_at"))
+                             or datetime.min.replace(tzinfo=timezone.utc)) <= now
+        )
+    cache = copy.deepcopy(cached.get("cache") or {})
+    snapshot_age_seconds = (
+        max(0, round((now - current_at).total_seconds()))
+        if current_at is not None else None)
+    fresh = (snapshot_age_seconds is not None
+             and snapshot_age_seconds < _CACHE_TTL_SECONDS)
+    baseline_at = (_parse_time(baseline_row.get("captured_at"))
+                   if baseline_row is not None else None)
+    baseline_gap_seconds = (
+        abs((baseline_at - start).total_seconds())
+        if baseline_at is not None else None)
+    movement_period = ({
+        "from": baseline_at.isoformat(), "to": current_at.isoformat(),
+    } if baseline_at is not None and current_at is not None else None)
+    coverage = {
+        "snapshot_count": period_snapshot_count,
+        "coverage_hours": coverage_hours,
+        "complete": (bool(movement.get("complete"))
+                     and membership_complete and fresh),
+        "data_through": data_through,
+        "snapshot_age_seconds": snapshot_age_seconds,
+        "tail_gap_hours": (round(snapshot_age_seconds / 3600, 2)
+                           if snapshot_age_seconds is not None else None),
+        "baseline_gap_hours": (round(baseline_gap_seconds / 3600, 2)
+                               if baseline_gap_seconds is not None else None),
+        "movement_period": movement_period,
+        "fresh": fresh,
+        "membership_complete": membership_complete,
+        "attention_complete": attention_complete,
+        "source": "snapshots" if rows else str(cache.get("source") or "none"),
+    }
+    delivery = _empty_delivery(
+        "not_requested",
+        "Точное обновление результата в GitHub не запрошено; запросов к GitHub не было.")
+    if refresh_delivery:
+        delivery = _refresh_report_delivery(
+            profile_id, profile, start=start, end=now)
+
+    current_backlog = None if rows else cached.get("backlog_total")
+    if not isinstance(current_backlog, int):
+        known = [queue["backlog"] for queue in queues
+                 if isinstance(queue.get("backlog"), int)]
+        current_backlog = sum(known) if len(known) == len(queues) else None
+    unresolved_errors = (
+        errors["unresolved_unable"] + errors["unresolved_failed"])
+    delivered_count = (
+        len(delivery["merged_prs"]) + len(delivery["closed_issues"])
+        if delivery.get("exact") else None)
+    report = {
+        "profile_id": profile_id, "title": profile["title"],
+        "repository": profile["repository"], "hours": hours,
+        "period": {"from": start.isoformat(), "to": now.isoformat()},
+        "generated_at": now.isoformat(),
+        "summary": {
+            "backlog_current": current_backlog,
+            "backlog_delta": movement.get("backlog_delta"),
+            "entered": movement.get("entered"),
+            "exited": movement.get("exited"),
+            "moved": movement.get("moved"),
+            "runs": run_report["total"],
+            "useful_runs": verdicts["ready"],
+            "empty_or_no_change_runs": verdicts["empty"] + verdicts["no_change"],
+            "safe_reselections": verdicts["stale"] + verdicts["safe_refusal"],
+            "errors": unresolved_errors,
+            "total_tokens": run_report["tokens"]["total"],
+            "total_cost_usd": run_report["cost"]["total_usd"],
+            "attention": len(attention), "delivered": delivered_count,
+            "merged_prs": (len(delivery["merged_prs"])
+                           if delivery.get("exact") else None),
+            "closed_issues": (len(delivery["closed_issues"])
+                              if delivery.get("exact") else None),
+        },
+        "coverage": coverage,
+        "health": copy.deepcopy(cached.get("health") or {}),
+        "bottleneck": bottleneck,
+        "queues": queues, "runs": run_report,
+        "attention": attention, "delivery": delivery, "cache": cache,
+    }
+    return report
+
+
+def _markdown_escape(value) -> str:
+    return (str(value).replace("\\", "\\\\").replace("[", "\\[")
+            .replace("]", "\\]").replace("\r", " ").replace("\n", " "))
+
+
+def _markdown_link(title, url) -> str:
+    text = _markdown_escape(title)
+    target = str(url or "")
+    return f"[{text}]({target})" if target.startswith(("https://", "http://")) else text
+
+
+def render_period_report_markdown(report: dict) -> str:
+    """Render the public report shape as compact, human-readable Markdown."""
+    hours = int(report["hours"])
+    period_name = {24: "24 часа", 168: "7 дней", 720: "30 дней"}.get(
+        hours, f"{hours} часов")
+    summary = report["summary"]
+    coverage = report["coverage"]
+    health = report.get("health") or {}
+
+    def number(value, unknown="нет данных"):
+        return unknown if value is None else str(value)
+
+    def delta(value):
+        if value is None:
+            return "нет данных"
+        return f"{int(value):+d}"
+
+    lines = [
+        f"# {_markdown_escape(report['title'])} — итоги за {period_name}",
+        "",
+        (f"Период: `{report['period']['from']}` — `{report['period']['to']}`. "
+         f"Данные очередей по: `{coverage.get('data_through') or 'нет данных'}`."),
+        "",
+        "## Главное",
+        "",
+        (f"- Backlog: {number(summary.get('backlog_current'))} "
+         f"(изменение {delta(summary.get('backlog_delta'))})."),
+        (f"- Движение: пришло {number(summary.get('entered'))}, "
+         f"вышло {number(summary.get('exited'))}, между этапами перешло "
+         f"{number(summary.get('moved'))}."),
+        (f"- Прогоны: {summary.get('runs', 0)}; полезных {summary.get('useful_runs', 0)}; "
+         f"пустых или без изменений {summary.get('empty_or_no_change_runs', 0)}; "
+         f"безопасных перевыборов {summary.get('safe_reselections', 0)}; "
+         f"активных ошибок {summary.get('errors', 0)}."),
+        (f"- Токены: {summary.get('total_tokens', 0)} "
+         f"в {report['runs']['tokens'].get('known_runs', 0)} измеренных прогонах."),
+        (f"- Стоимость: ${summary.get('total_cost_usd', 0):.4f} "
+         f"в {report['runs']['cost'].get('known_runs', 0)} "
+         f"из {report['runs'].get('total', 0)} прогонов."),
+        (f"- Состояние: {_markdown_escape(health.get('label') or health.get('state') or 'нет данных')}"
+         + (f" — {_markdown_escape(health['reason'])}" if health.get("reason") else "")),
+    ]
+    bottleneck = report.get("bottleneck")
+    if bottleneck:
+        lines.append(
+            f"- Узкое место: {_markdown_escape(bottleneck['title'])} "
+            f"({number(bottleneck.get('backlog'))}).")
+    if not coverage.get("complete"):
+        lines.append(
+            f"- Покрытие неполное: {number(coverage.get('coverage_hours'))} ч; "
+            f"снимков {coverage.get('snapshot_count', 0)}; "
+            f"состав очередей полный: {'да' if coverage.get('membership_complete') else 'нет'}.")
+    if not coverage.get("complete") and coverage.get("movement_period"):
+        movement_period = coverage["movement_period"]
+        gaps = []
+        if coverage.get("baseline_gap_hours") is not None:
+            gaps.append(
+                f"отклонение начала {number(coverage.get('baseline_gap_hours'))} ч")
+        if coverage.get("tail_gap_hours") is not None:
+            gaps.append(
+                f"непокрытый хвост {number(coverage.get('tail_gap_hours'))} ч")
+        lines.append(
+            f"- Движение очередей рассчитано за фактическое окно "
+            f"`{movement_period['from']}` — `{movement_period['to']}`; "
+            f"{'; '.join(gaps) or 'окно неполное'}.")
+
+    delivery = report.get("delivery") or {}
+    lines.extend(["", "## Результат в GitHub", ""])
+    if not delivery.get("exact"):
+        status = _markdown_escape(delivery.get("status") or "unknown")
+        reason = _markdown_escape(
+            delivery.get("reason") or "точное обновление недоступно")
+        lines.append(f"- Точного списка нет (`{status}`): {reason}")
+    for item in delivery.get("merged_prs", []):
+        lines.append(
+            f"- Влит PR {_markdown_link('#' + str(item['number']) + ' ' + item['title'], item.get('url'))}"
+            f" — `{item['delivered_at']}`.")
+    for item in delivery.get("closed_issues", []):
+        lines.append(
+            f"- Закрыт issue {_markdown_link('#' + str(item['number']) + ' ' + item['title'], item.get('url'))}"
+            f" — `{item['delivered_at']}`.")
+    if delivery.get("exact") and not (
+            delivery.get("merged_prs") or delivery.get("closed_issues")):
+        lines.append("- За период не было влитых PR и закрытых issues.")
+
+    lines.extend(["", "## Очереди", ""])
+    if report.get("queues"):
+        for queue in report["queues"]:
+            lines.append(
+                f"- {_markdown_escape(queue['title'])}: "
+                f"{number(queue.get('backlog'))} (изменение {delta(queue.get('delta'))}, "
+                f"вышло {number(queue.get('throughput'))}).")
+    else:
+        lines.append("- Нет данных об очередях.")
+
+    lines.extend(["", "## Нужно внимание", ""])
+    if report.get("attention"):
+        for item in report["attention"]:
+            labels = ", ".join(f"`{_markdown_escape(label)}`"
+                               for label in item.get("labels", []))
+            lines.append(
+                f"- {_markdown_link('#' + str(item['number']) + ' ' + item['title'], item.get('url'))}"
+                f" — {labels}.")
+    else:
+        if coverage.get("attention_complete"):
+            lines.append(
+                "- В кэшированных очередях нет элементов с `ship`, "
+                "`needs-decision` или `hold`.")
+        else:
+            lines.append(
+                "- Полного снимка состава нет; среди доступных элементов "
+                "не найдено `ship`, `needs-decision` или `hold`.")
+
+    return "\n".join(lines) + "\n"
 
 
 def sample_active_profiles(series: list[dict]) -> dict[str, str]:

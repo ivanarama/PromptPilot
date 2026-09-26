@@ -13,8 +13,7 @@ from typing import List, Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse, Response
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import Response
 from pydantic import BaseModel
 
 import os
@@ -138,6 +137,14 @@ if getattr(sys, "frozen", False):
     STATIC_DIR = Path(sys._MEIPASS) / "promptpilot" / "static"
 else:
     STATIC_DIR = Path(__file__).parent / "static"
+
+# PyInstaller one-file builds unpack bundled data into a temporary directory.
+# macOS may clean an old extraction directory while a launchd service is still
+# running, so opening index.html lazily on every request eventually turns the
+# otherwise healthy API into HTTP 500. Keep the small single-file UI in memory
+# for the lifetime of the server; a broken package now also fails at startup
+# instead of surfacing only when somebody opens the dashboard.
+_INDEX_HTML = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
 
 
 # --- API ---
@@ -318,6 +325,29 @@ def api_series_action(series_id: int, body: SeriesAction):
 @app.get("/api/pipeline-insights/profiles")
 def api_pipeline_profiles():
     return pipeline_insights.list_profiles()
+
+
+@app.get("/api/pipeline-insights/{profile_id}/report")
+def api_pipeline_report(
+        profile_id: str,
+        hours: int = Query(24),
+        refresh: bool = False,
+        format: str = Query("json", pattern="^(json|markdown)$")):
+    try:
+        report = pipeline_insights.build_period_report(
+            profile_id, db.list_series(), hours=hours,
+            refresh_delivery=refresh)
+        if format == "markdown":
+            return Response(
+                content=pipeline_insights.render_period_report_markdown(report),
+                media_type="text/markdown")
+        return report
+    except KeyError:
+        raise HTTPException(404, "Профиль анализа конвейера не найден")
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    except (RuntimeError, OSError) as exc:
+        raise HTTPException(503, str(exc))
 
 
 @app.get("/api/pipeline-insights/{profile_id}")
@@ -1303,4 +1333,4 @@ def api_projects():
 
 @app.get("/")
 def index():
-    return FileResponse(STATIC_DIR / "index.html")
+    return Response(content=_INDEX_HTML, media_type="text/html")

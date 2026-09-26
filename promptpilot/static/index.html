@@ -421,9 +421,28 @@
   .pipeline-health.yellow { color:var(--yellow); border-color:var(--yellow); }
   .pipeline-health.red { color:var(--red); border-color:var(--red); }
   .pipeline-health.warming { color:var(--accent); border-color:var(--accent); }
+  .pipeline-view-tabs { display:inline-flex; padding:2px; gap:2px; border:1px solid var(--border); border-radius:8px; background:var(--surface2); }
+  .pipeline-view-tab { border:0; border-radius:6px; padding:5px 10px; color:var(--text2); background:transparent; cursor:pointer; font:inherit; font-size:12px; }
+  .pipeline-view-tab.active { color:var(--text); background:var(--surface); box-shadow:0 1px 3px rgba(0,0,0,.18); }
+  .pipeline-report-head { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; flex-wrap:wrap; }
+  .pipeline-periods { display:flex; gap:5px; flex-wrap:wrap; }
+  .pipeline-period.active { color:var(--accent); border-color:var(--accent); background:var(--surface2); }
+  .pipeline-report-grid { display:grid; grid-template-columns:repeat(3,minmax(180px,1fr)); gap:9px; margin:12px 0; }
+  .pipeline-report-section { border:1px solid var(--border); border-radius:8px; padding:11px 12px; margin-top:9px; }
+  .pipeline-report-section h3 { margin:0 0 8px; font-size:13px; }
+  .pipeline-report-list { margin:0; padding-left:19px; font-size:12px; }
+  .pipeline-report-list li { margin:5px 0; }
+  .pipeline-report-meta { color:var(--muted); font-size:11px; margin-top:4px; }
+  .pipeline-report-notice { border-left:3px solid var(--accent); padding:7px 9px; margin:9px 0; color:var(--text2); font-size:12px; background:var(--surface2); }
+  .pipeline-report-notice.warn { border-left-color:var(--yellow); }
+  .pipeline-report-notice.error { border-left-color:var(--red); }
+  .pipeline-report-queues { width:100%; border-collapse:collapse; font-size:12px; }
+  .pipeline-report-queues th, .pipeline-report-queues td { text-align:left; padding:5px 7px; border-top:1px solid var(--border); }
+  .pipeline-report-queues th.num, .pipeline-report-queues td.num { text-align:right; font-variant-numeric:tabular-nums; }
   #pipelineModal .modal { max-width:1120px; }
   @media (max-width: 720px) {
     .pipeline-summary { grid-template-columns:repeat(2,minmax(120px,1fr)); }
+    .pipeline-report-grid { grid-template-columns:repeat(2,minmax(120px,1fr)); }
     .insights-table { table-layout:auto; display:block; overflow-x:auto; white-space:nowrap; }
     .insights-table th, .insights-table td { min-width:75px; }
     .insights-table th:first-child, .insights-table td:first-child { min-width:130px; }
@@ -852,10 +871,11 @@
   <div class="modal">
     <h2>📈 Конвейеры <button class="btn btn-sm btn-ghost" style="margin-left:auto" onclick="closePipelines()">✕ Закрыть</button></h2>
     <div style="font-size:12px;color:var(--muted);margin-bottom:10px">
-      Профиль объединяет внешние очереди и связанные повторяющиеся серии. Метрики считаются обычным кодом; токены не расходуются.
+      Профиль объединяет внешние очереди и связанные повторяющиеся серии. Состояние показывает, где конвейер сейчас; «Итоги» — что произошло за период. Метрики считаются обычным кодом, токены не расходуются.
     </div>
     <div class="insights-tools" id="pipelineProfileTools"><span style="color:var(--muted);font-size:12px">Загрузка профилей…</span></div>
     <div id="pipelineInsights"></div>
+    <div id="pipelineReport" style="display:none"></div>
   </div>
 </div>
 
@@ -2645,23 +2665,74 @@ async function openSchedule() {
   box.innerHTML = activeHtml + brokenHtml;
 }
 
+let pipelineView = 'status';
+let pipelineReportHours = 24;
+let pipelineReportRequestId = 0;
+
 async function loadPipelineProfiles() {
   const box = document.getElementById('pipelineProfileTools');
   try {
     const profiles = await fetchJSON(`${API}/pipeline-insights/profiles`);
     if (!profiles.length) { box.innerHTML = '<span style="color:var(--muted);font-size:12px">Профили не настроены.</span>'; return; }
-    box.innerHTML = `<select id="pipelineProfileSelect" onchange="loadSelectedPipelineInsights(false)">${profiles.map(p=>`<option value="${escAttr(p.id)}">${esc(p.title)}</option>`).join('')}</select><button class="btn btn-sm btn-ghost" onclick="loadSelectedPipelineInsights(true)">↻ Обновить</button>`;
-    loadSelectedPipelineInsights(false);
+    box.innerHTML = `<select id="pipelineProfileSelect" aria-label="Профиль конвейера" onchange="loadSelectedPipelineView(false)">${profiles.map(p=>`<option value="${escAttr(p.id)}">${esc(p.title)}</option>`).join('')}</select>
+      <div class="pipeline-view-tabs" role="tablist" aria-label="Представление конвейера">
+        <button type="button" class="pipeline-view-tab" id="pipelineStatusTab" role="tab" onclick="setPipelineView('status')">Состояние</button>
+        <button type="button" class="pipeline-view-tab" id="pipelineReportTab" role="tab" onclick="setPipelineView('report')">Итоги</button>
+      </div>
+      <button class="btn btn-sm btn-ghost" id="pipelineRefreshButton" onclick="loadSelectedPipelineView(true)">↻ Обновить GitHub</button>`;
+    syncPipelineViewControls();
+    loadSelectedPipelineView(false);
   } catch(e) { box.innerHTML = `<span style="color:var(--red);font-size:12px">Профили анализа недоступны: ${esc(e.message)}</span>`; }
 }
 
 function openPipelines() {
   document.getElementById('pipelineModal').classList.add('open');
   document.getElementById('pipelineInsights').innerHTML = '';
+  document.getElementById('pipelineReport').innerHTML = '';
+  pipelineView = 'status';
   loadPipelineProfiles();
 }
 
 function closePipelines() { document.getElementById('pipelineModal').classList.remove('open'); }
+
+function syncPipelineViewControls() {
+  const status = pipelineView === 'status';
+  const statusBox = document.getElementById('pipelineInsights');
+  const reportBox = document.getElementById('pipelineReport');
+  if (statusBox) statusBox.style.display = status ? '' : 'none';
+  if (reportBox) reportBox.style.display = status ? 'none' : '';
+  const statusTab = document.getElementById('pipelineStatusTab');
+  const reportTab = document.getElementById('pipelineReportTab');
+  if (statusTab) {
+    statusTab.classList.toggle('active', status);
+    statusTab.setAttribute('aria-selected', String(status));
+  }
+  if (reportTab) {
+    reportTab.classList.toggle('active', !status);
+    reportTab.setAttribute('aria-selected', String(!status));
+  }
+  const refresh = document.getElementById('pipelineRefreshButton');
+  if (refresh) {
+    refresh.textContent = status ? '↻ Обновить GitHub' : '↻ Уточнить результат в GitHub';
+    refresh.title = status
+      ? 'Получить свежий снимок очередей. Использует лимит GitHub API.'
+      : 'Точно посчитать влитые PR и закрытые issues за период. Использует лимит GitHub API.';
+  }
+}
+
+function setPipelineView(view) {
+  if (view !== 'status' && view !== 'report') return;
+  pipelineView = view;
+  syncPipelineViewControls();
+  loadSelectedPipelineView(false);
+}
+
+function loadSelectedPipelineView(refresh=false) {
+  const select = document.getElementById('pipelineProfileSelect');
+  if (!select) return;
+  if (pipelineView === 'report') loadPipelineReport(select.value, pipelineReportHours, refresh);
+  else loadPipelineInsights(select.value, refresh);
+}
 
 function loadSelectedPipelineInsights(refresh=false) {
   const select = document.getElementById('pipelineProfileSelect');
@@ -2759,6 +2830,167 @@ function pipelineHealthReason(data) {
 
 function diagnosticBadgeLabel(diagnostics) {
   return diagnostics && diagnostics.checker_failed ? 'проверка недоступна' : diagnosticStateLabel(diagnostics.state);
+}
+
+function pipelineReportPeriodLabel(hours) {
+  return ({24: '24 часа', 168: '7 дней', 720: '30 дней'})[hours] || `${hours} ч`;
+}
+
+function pipelineReportNumber(value) {
+  return value == null || Number.isNaN(Number(value)) ? '—' : Number(value).toLocaleString('ru-RU');
+}
+
+function pipelineReportSigned(value) {
+  if (value == null || Number.isNaN(Number(value))) return '—';
+  const number = Number(value);
+  return `${number > 0 ? '+' : ''}${number.toLocaleString('ru-RU')}`;
+}
+
+function pipelineReportUrl(value) {
+  try {
+    const url = new URL(String(value || ''), window.location.href);
+    return url.protocol === 'https:' || url.protocol === 'http:' ? url.href : '';
+  } catch (_) { return ''; }
+}
+
+function setPipelineReportHours(hours) {
+  if (![24, 168, 720].includes(Number(hours))) return;
+  pipelineReportHours = Number(hours);
+  if (pipelineView === 'report') loadSelectedPipelineView(false);
+}
+
+function pipelineReportDeliveryNotice(delivery, periodLabel) {
+  const reason = delivery.reason ? ` ${esc(delivery.reason)}` : '';
+  if (delivery.status === 'refreshed') {
+    return `<div class="pipeline-report-notice">GitHub проверен: список влитых PR и закрытых issues за ${esc(periodLabel)} точный.</div>`;
+  }
+  if (delivery.status === 'partial') {
+    return `<div class="pipeline-report-notice warn">GitHub вернул частичный результат.${reason}</div>`;
+  }
+  if (delivery.status === 'blocked') {
+    return `<div class="pipeline-report-notice warn">Точный результат в GitHub пока не получен: лимит API сохранён.${reason}</div>`;
+  }
+  if (delivery.status === 'failed') {
+    return `<div class="pipeline-report-notice error">Не удалось уточнить результат в GitHub.${reason} Остальная часть отчёта собрана из локальной истории.</div>`;
+  }
+  return '<div class="pipeline-report-notice">Локальный отчёт не обращался к GitHub. Нажмите «Уточнить результат в GitHub», чтобы точно посчитать влитые PR и закрытые issues.</div>';
+}
+
+function pipelineReportItem(item, prefix='') {
+  const title = item.title ? ` — ${esc(item.title)}` : '';
+  const label = `${prefix}${item.number == null ? esc(item.key || '') : `#${pipelineReportNumber(item.number)}`}${title}`;
+  const url = pipelineReportUrl(item.url);
+  return url ? `<a href="${escAttr(url)}" target="_blank" rel="noopener noreferrer">${label}</a>` : label;
+}
+
+async function loadPipelineReport(profile, hours=24, refresh=false) {
+  const box = document.getElementById('pipelineReport');
+  if (!box) return;
+  const requestId = ++pipelineReportRequestId;
+  box.innerHTML = refresh
+    ? '<div class="prov-cmd">Уточняю доставку по GitHub и собираю отчёт…</div>'
+    : '<div class="prov-cmd">Собираю отчёт из локальной истории…</div>';
+  try {
+    const query = `hours=${encodeURIComponent(hours)}${refresh ? '&refresh=true' : ''}`;
+    const data = await fetchJSON(`${API}/pipeline-insights/${encodeURIComponent(profile)}/report?${query}`);
+    if (requestId !== pipelineReportRequestId) return;
+    const summary = data.summary || {};
+    const coverage = data.coverage || {};
+    const health = data.health || {state: 'warming', label: 'нет данных', reason: ''};
+    const delivery = data.delivery || {status: 'not_requested', merged_prs: [], closed_issues: []};
+    const merged = delivery.merged_prs || [];
+    const closed = delivery.closed_issues || [];
+    const delivered = merged.length + closed.length;
+    const deliveryExact = delivery.exact === true;
+    const queues = data.queues || [];
+    const attention = data.attention || [];
+    const runs = data.runs || {verdicts: {}, tokens: {}, errors: {}};
+    const verdicts = runs.verdicts || {};
+    const tokens = runs.tokens || {};
+    const cost = runs.cost || {};
+    const errors = runs.errors || {};
+    const periodLabel = pipelineReportPeriodLabel(Number(data.hours || hours));
+    const state = ['green', 'yellow', 'red', 'warming'].includes(health.state) ? health.state : 'warming';
+    const from = data.period && data.period.from ? new Date(data.period.from).toLocaleString('ru-RU') : '—';
+    const to = data.period && data.period.to ? new Date(data.period.to).toLocaleString('ru-RU') : '—';
+    const coverageText = coverage.complete
+      ? `покрытие ${pipelineReportNumber(coverage.coverage_hours)} ч, ${pipelineReportNumber(coverage.snapshot_count)} снимков`
+      : `наблюдаемая часть: ${pipelineReportNumber(coverage.coverage_hours)} ч из ${pipelineReportNumber(data.hours || hours)}, ${pipelineReportNumber(coverage.snapshot_count)} снимков`;
+    const tailText = coverage.fresh === false && coverage.tail_gap_hours != null
+      ? ` Последний снимок отстаёт на ${pipelineReportNumber(coverage.tail_gap_hours)} ч.`
+      : '';
+    const membershipText = coverage.membership_complete === false
+      ? ' Состав отдельных задач известен не для всех снимков, поэтому переходы могут быть занижены.'
+      : '';
+    const attentionText = coverage.attention_complete === false
+      ? ' Список элементов, требующих внимания, тоже может быть неполным.'
+      : '';
+    const movementPeriod = coverage.movement_period || {};
+    const movementPeriodText = movementPeriod.from && movementPeriod.to
+      ? `${new Date(movementPeriod.from).toLocaleString('ru-RU')} — ${new Date(movementPeriod.to).toLocaleString('ru-RU')}`
+      : '';
+    const deliveryRows = [
+      ...merged.map(item => `<li>${pipelineReportItem(item, 'PR ')}</li>`),
+      ...closed.map(item => `<li>${pipelineReportItem(item, 'Issue ')}</li>`),
+    ].join('');
+    const deliveryBody = deliveryExact
+      ? deliveryRows || `<div class="pipeline-report-meta">За ${esc(periodLabel)} влитых PR и закрытых issues не найдено.</div>`
+      : '<div class="pipeline-report-meta">Точный список появится после явного обновления GitHub.</div>';
+    const attentionRows = attention.map(item => {
+      const queuesText = item.queues && item.queues.length ? ` · ${item.queues.map(esc).join(', ')}` : '';
+      const labelsText = item.labels && item.labels.length ? ` · метки: ${item.labels.map(esc).join(', ')}` : '';
+      return `<li>${pipelineReportItem(item)}<span class="pipeline-report-meta">${queuesText}${labelsText}</span></li>`;
+    }).join('');
+    const queueRows = queues.map(queue => `<tr>
+      <td>${esc(queue.title || queue.id)}</td>
+      <td class="num">${pipelineReportNumber(queue.backlog)}</td>
+      <td class="num">${pipelineReportSigned(queue.delta)}</td>
+      <td class="num">${pipelineReportNumber(queue.throughput)}</td>
+    </tr>`).join('');
+    const bottleneck = data.bottleneck
+      ? `${esc(data.bottleneck.title || data.bottleneck.id)} · ${pipelineReportNumber(data.bottleneck.backlog)} в очереди`
+      : 'не обнаружено';
+    const tokenValue = tokens.known_runs ? pipelineReportNumber(tokens.total) : 'нет данных';
+    const costValue = cost.known_runs ? `$${Number(cost.total_usd || 0).toFixed(4)}` : 'нет данных';
+    const emptyRuns = summary.empty_or_no_change_runs == null
+      ? Number(verdicts.empty || 0) + Number(verdicts.no_change || 0)
+      : summary.empty_or_no_change_runs;
+
+    box.innerHTML = `<div class="pipeline-report-head">
+      <div>
+        <div><b>${esc(data.title || profile)}</b><span class="pipeline-health ${escAttr(state)}">${esc(health.label || state)}</span></div>
+        <div class="prov-cmd">${esc(data.repository || '')} · ${esc(from)} — ${esc(to)}</div>
+      </div>
+      <div class="pipeline-periods" aria-label="Период отчёта">
+        ${[24,168,720].map(value => `<button type="button" class="btn btn-sm btn-ghost pipeline-period ${Number(data.hours || hours) === value ? 'active' : ''}" onclick="setPipelineReportHours(${value})">${pipelineReportPeriodLabel(value)}</button>`).join('')}
+      </div>
+    </div>
+    <div class="pipeline-report-meta">${esc(coverageText)}.${esc(tailText)}${esc(membershipText)}${esc(attentionText)}</div>
+    ${coverage.complete ? '' : `<div class="pipeline-report-notice warn">Выводы предварительные: локальная история ещё не покрывает весь выбранный период.${movementPeriodText ? ` Движение посчитано только за ${esc(movementPeriodText)}.` : ''}</div>`}
+    <div class="pipeline-report-grid">
+      <div class="pipeline-metric"><div class="pipeline-metric-label">Влито PR / закрыто issues</div><div class="pipeline-metric-value">${deliveryExact ? `${pipelineReportNumber(merged.length)} / ${pipelineReportNumber(closed.length)}` : '— / —'}</div><div class="pipeline-metric-note">${deliveryExact ? `всего событий: ${pipelineReportNumber(delivered)}` : 'уточняется только по запросу'}</div></div>
+      <div class="pipeline-metric"><div class="pipeline-metric-label">Очередь сейчас / Δ</div><div class="pipeline-metric-value">${pipelineReportNumber(summary.backlog_current)} / ${pipelineReportSigned(summary.backlog_delta)}</div><div class="pipeline-metric-note">остаток и изменение за период</div></div>
+      <div class="pipeline-metric"><div class="pipeline-metric-label">Вошло / вышло / перешло</div><div class="pipeline-metric-value">${pipelineReportNumber(summary.entered)} / ${pipelineReportNumber(summary.exited)} / ${pipelineReportNumber(summary.moved)}</div><div class="pipeline-metric-note">движение между снимками очередей</div></div>
+      <div class="pipeline-metric"><div class="pipeline-metric-label">Полезные прогоны</div><div class="pipeline-metric-value">${pipelineReportNumber(summary.useful_runs)} из ${pipelineReportNumber(summary.runs)}</div><div class="pipeline-metric-note">пусто или без изменений: ${pipelineReportNumber(emptyRuns)}</div></div>
+      <div class="pipeline-metric"><div class="pipeline-metric-label">Требуют внимания</div><div class="pipeline-metric-value">${pipelineReportNumber(summary.attention == null ? attention.length : summary.attention)}</div><div class="pipeline-metric-note">не восстановлено после прогонов: ${pipelineReportNumber(summary.errors)}</div></div>
+      <div class="pipeline-metric"><div class="pipeline-metric-label">Токены</div><div class="pipeline-metric-value">${esc(tokenValue)}</div><div class="pipeline-metric-note">измерено запусков: ${pipelineReportNumber(tokens.known_runs)} из ${pipelineReportNumber(runs.total)}</div></div>
+      <div class="pipeline-metric"><div class="pipeline-metric-label">Стоимость</div><div class="pipeline-metric-value">${esc(costValue)}</div><div class="pipeline-metric-note">измерено запусков: ${pipelineReportNumber(cost.known_runs)} из ${pipelineReportNumber(runs.total)}</div></div>
+    </div>
+    ${pipelineReportDeliveryNotice(delivery, periodLabel)}
+    <div class="pipeline-report-section"><h3>Результат в GitHub</h3>${deliveryRows ? `<ul class="pipeline-report-list">${deliveryBody}</ul>` : deliveryBody}</div>
+    <div class="pipeline-report-section"><h3>Движение по этапам</h3>
+      <div class="pipeline-report-meta">Узкое место: ${bottleneck}</div>
+      ${queueRows ? `<table class="pipeline-report-queues"><thead><tr><th>Этап</th><th class="num">Сейчас</th><th class="num">Δ</th><th class="num">Вышло</th></tr></thead><tbody>${queueRows}</tbody></table>` : '<div class="pipeline-report-meta">Нет данных об очередях.</div>'}
+    </div>
+    <div class="pipeline-report-section"><h3>Запуски</h3>
+      <div class="pipeline-report-meta">готово к действию ${pipelineReportNumber(verdicts.ready)} · пусто ${pipelineReportNumber(verdicts.empty)} · без изменений ${pipelineReportNumber(verdicts.no_change)} · перевыбор ${pipelineReportNumber(verdicts.stale)} · безопасный отказ ${pipelineReportNumber(verdicts.safe_refusal)} · решение человека ${pipelineReportNumber(verdicts.human)}</div>
+      <div class="pipeline-report-meta">не смог ${pipelineReportNumber(verdicts.unable)} · упало ${pipelineReportNumber(verdicts.failed)} · активных ошибок ${pipelineReportNumber(Number(errors.unresolved_unable || 0) + Number(errors.unresolved_failed || 0))} · восстановлено ${pipelineReportNumber(Number(errors.recovered_unable || 0) + Number(errors.recovered_failed || 0))}</div>
+    </div>
+    <div class="pipeline-report-section"><h3>Нужно внимание</h3>${attentionRows ? `<ul class="pipeline-report-list">${attentionRows}</ul>` : '<div class="pipeline-report-meta">В текущем снимке нет элементов с метками ship, needs-decision или hold.</div>'}</div>`;
+  } catch(e) {
+    if (requestId !== pipelineReportRequestId) return;
+    box.innerHTML = `<div style="color:var(--red);margin-bottom:10px">Отчёт недоступен: ${esc(e.message)}</div>`;
+  }
 }
 
 async function loadPipelineInsights(profile, refresh=false) {
