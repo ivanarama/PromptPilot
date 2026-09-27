@@ -21,3 +21,4 @@ scripts/oneservice/.os_senders.json
 scripts/oneservice/.os_tg_allowed.json
 scripts/oneservice/.os_exec.json
 scripts/oneservice/.os_keeper.json
+scripts/oneservice/_template.html
