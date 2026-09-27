@@ -330,7 +330,8 @@ def handle_update(env: dict, state: dict, update: dict) -> None:
         return
     person = ((message.get("from") or {}).get("username")
               or (message.get("from") or {}).get("first_name") or "без имени")
-    text = (message.get("text") or "").strip()
+    # У фото/документов подпись живёт в caption, а не в text.
+    text = (message.get("text") or message.get("caption") or "").strip()
 
     if not allowed(TG_ALLOWED, chat_id):
         if text and text == env.get("OS_TG_PASSWORD", ""):
@@ -349,7 +350,10 @@ def handle_update(env: dict, state: dict, update: dict) -> None:
            text="Ты уже допущен. Пиши задачу одним сообщением (можно с фото/файлом).")
         return
 
-    title = text.splitlines()[0][:120] if text else "(без текста)"
+    media_present = bool(message.get("photo") or message.get("document"))
+    title = (text.splitlines()[0][:120] if text
+             else "(скриншот без подписи)" if media_present
+             else "(без темы)")
     description = (f"**Автор:** {person} (TG чат {chat_id})\n"
                    f"**Канал:** Telegram\n"
                    f"**Дата:** {time.strftime('%Y-%m-%d %H:%M')}\n\n---\n\n{text}")
@@ -364,7 +368,16 @@ def handle_update(env: dict, state: dict, update: dict) -> None:
             except Exception as exc:
                 attachments.append(f"(файл не прикрепился: {exc})")
     if attachments:
-        description += "\n\n**Вложения:**\n" + "\n".join(attachments)
+        # Картинки — inline (сразу видны в issue), остальные файлы — ссылками.
+        rendered = []
+        for mark in attachments:
+            filename = mark.split("]")[0][1:]
+            if filename.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp")):
+                url = mark.split("](", 1)[1].rstrip(")")
+                rendered.append(f"![{filename}]({url})")
+            else:
+                rendered.append(mark)
+        description += "\n\n**Вложения:**\n" + "\n".join(rendered)
     issue = create_issue(env, title, description, ["подано"])
     tg("sendMessage", token, chat_id=chat_id,
        text=f"✅ Задача принята: #{issue['iid']}\n{issue['web_url']}")
