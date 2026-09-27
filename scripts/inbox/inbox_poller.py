@@ -635,6 +635,16 @@ def run_once(env: dict, dry: bool, refresh: bool = False) -> None:
                   + ("  [игровой конвейер]" if game_mode else ""))
             if full["attachments"]:
                 print(f"  вложений: {len(full['attachments'])}")
+            # Дубль по нормализованной теме: письмо уже в летописи — не таскаем
+            subj_key = re.sub(r"[^a-zа-яё0-9]+", "",
+                              re.sub(r"^\[[^\]]+\]\s*", "",
+                                     full["subject"].lower()))
+            seen_keys = {re.sub(r"[^a-zа-яё0-9]+", "",
+                        (e.get("subject") or "").lower()) for e in state["kt_feed"]}
+            if game_mode and subj_key and subj_key in seen_keys:
+                print("  дубль уже принятого обращения — пропускаю")
+                state["processed"].append(full["message_id"])
+                continue
             if game_mode:
                 if not concept:
                     print("  !! нет KT_CONCEPT — игровой триаж невозможен, пропуск")
