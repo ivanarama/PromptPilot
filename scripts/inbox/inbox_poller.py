@@ -193,6 +193,10 @@ def bulk_reason(msg: email.message.Message, sender: str) -> str | None:
     """Причина считать письмо служебным/спамом, или None для живого обращения."""
     if (msg.get("X-Spam-Flag") or "").strip().lower() == "yes":
         return "помечен спамом отправителем"
+    address = (sender.split("<")[-1].strip("> ") if "<" in sender else sender).lower()
+    if address.endswith("formsubmit.co"):
+        return "форм-сервис"
+    auto = (msg.get("Auto-Submitted") or "").strip().lower()
     auto = (msg.get("Auto-Submitted") or "").strip().lower()
     if auto and auto != "no":
         return f"Auto-Submitted: {auto}"
