@@ -313,9 +313,15 @@ def tg_download(token: str, file_id: str) -> tuple[str, bytes]:
     info = tg("getFile", token, file_id=file_id)
     path = info["file_path"]
     name = path.rsplit("/", 1)[-1]
-    with urllib.request.urlopen(
-            f"https://api.telegram.org/file/bot{token}/{path}", timeout=60) as r:
-        return name, r.read()
+    # -f: при HTTP-ошибке curl вернёт non-zero — битый файл не сохраним
+    result = subprocess.run(
+        ["curl", "-sS", "-f", "-m", "120",
+         f"https://api.telegram.org/file/bot{token}/{path}"],
+        capture_output=True, timeout=120)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"скачивание {name} не удалось: {(result.stderr or '')[:150]}")
+    return name, result.stdout
 
 
 def allowed(chats: dict, chat_id: str) -> bool:
