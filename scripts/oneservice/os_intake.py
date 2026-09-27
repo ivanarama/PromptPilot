@@ -92,9 +92,12 @@ def gl(env: dict, method: str, path: str, payload: dict | None = None,
     if result.returncode != 0:
         raise RuntimeError(f"curl {method} {path}: {result.stderr or result.returncode}")
     try:
-        return json.loads(out)
+        data = json.loads(out)
     except json.JSONDecodeError:
         raise RuntimeError(f"GitLab {method} {path} вернул не-JSON: {out[:200]}")
+    if isinstance(data, dict) and "error" in data:
+        raise RuntimeError(f"GitLab {method} {path}: {data['error']}")
+    return data
 
 
 def project_api(env: dict, path: str, method: str = "GET",
