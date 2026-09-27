@@ -36,6 +36,7 @@ function Add-PromptPilotTarget([string]$name, [int]$processId) {
     $command = [string]$process.CommandLine
     $looksLikePromptPilot =
         $command -match '(?i)-m\s+promptpilot\s+(worker|server|bot)\b' -or
+        $command -match '(?i)cascade-review\.py\b' -or
         ($command -match '(?i)[\\/]pp(?:\.exe)?["'']?\s+(worker|server|bot)\b' -and
          $command.IndexOf($PSScriptRoot, [StringComparison]::OrdinalIgnoreCase) -ge 0)
     if (-not $looksLikePromptPilot) {

@@ -1,0 +1,441 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PromptPilot Parallel</title>
+  <style>
+    :root {
+      --bg: #0d1018;
+      --panel: #171c28;
+      --panel-2: #202737;
+      --line: #30394d;
+      --text: #edf2ff;
+      --muted: #96a1b8;
+      --accent: #7c8cff;
+      --accent-2: #a6b0ff;
+      --green: #45d483;
+      --red: #ff6f7d;
+      --yellow: #f4c95d;
+      --cyan: #4dd9ef;
+      --shadow: 0 18px 50px #0006;
+      --radius: 14px;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--text);
+      background: radial-gradient(circle at 20% 0%, #222a45 0, var(--bg) 42%);
+      font: 14px/1.45 Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif;
+    }
+    button, input, textarea, select { font: inherit; }
+    button, .button {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 9px 13px;
+      color: var(--text);
+      background: var(--panel-2);
+      cursor: pointer;
+      transition: .15s ease;
+    }
+    button:hover, .button:hover { border-color: var(--accent); transform: translateY(-1px); }
+    button:disabled { opacity: .45; cursor: not-allowed; transform: none; }
+    button.primary { border-color: transparent; background: linear-gradient(135deg, var(--accent), #5365e4); font-weight: 700; }
+    button.danger { color: #ffd6da; border-color: #7d3540; background: #421f2a; }
+    .shell { width: min(1500px, calc(100% - 34px)); margin: 0 auto; padding: 24px 0 50px; }
+    header { display: flex; justify-content: space-between; align-items: flex-start; gap: 20px; margin-bottom: 18px; }
+    h1 { margin: 0; font-size: clamp(25px, 3vw, 38px); letter-spacing: -.04em; }
+    h1 span { color: var(--accent-2); }
+    h2 { margin: 0 0 13px; font-size: 16px; }
+    h3 { margin: 0; font-size: 14px; }
+    p { margin: 5px 0 0; color: var(--muted); }
+    .badges, .toolbar, .button-row, .connection-list { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    .badges { justify-content: flex-end; }
+    .badge { display: inline-flex; gap: 6px; align-items: center; border: 1px solid var(--line); border-radius: 999px; padding: 6px 10px; color: var(--muted); background: #151a25; font-size: 12px; }
+    .badge.good { color: var(--green); border-color: #286747; }
+    .badge.warn { color: var(--yellow); border-color: #725d28; }
+    .badge.bad { color: var(--red); border-color: #74343f; }
+    .toolbar { padding: 12px; margin-bottom: 16px; border: 1px solid var(--line); border-radius: var(--radius); background: #131823cc; box-shadow: var(--shadow); }
+    .toolbar .spacer { flex: 1; }
+    .grid { display: grid; gap: 16px; }
+    .top-grid { grid-template-columns: minmax(300px, .85fr) minmax(220px, .35fr); }
+    .bottom-grid { grid-template-columns: minmax(320px, .8fr) minmax(320px, 1.2fr); }
+    .panel { min-width: 0; border: 1px solid var(--line); border-radius: var(--radius); padding: 17px; background: linear-gradient(180deg, #1a2030ee, #121722ee); box-shadow: var(--shadow); }
+    .panel + .panel { margin-top: 16px; }
+    .field { display: grid; gap: 6px; margin-bottom: 12px; }
+    .field label, .field > span { color: var(--muted); font-size: 12px; font-weight: 650; }
+    input, textarea, select {
+      width: 100%; color: var(--text); border: 1px solid var(--line); border-radius: 9px; padding: 9px 10px; outline: none; background: #0e131d;
+    }
+    textarea { min-height: 92px; resize: vertical; }
+    input:focus, textarea:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px #7c8cff22; }
+    .two { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .three { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
+    .dropzone { display: grid; place-items: center; min-height: 74px; padding: 14px; text-align: center; border: 1px dashed #6371a1; border-radius: 12px; color: var(--muted); background: #151b2a; cursor: pointer; }
+    .dropzone.dragover { color: var(--text); border-color: var(--accent-2); background: #273155; }
+    .dropzone strong { display: block; color: var(--text); }
+    .dropzone small { display: block; margin-top: 2px; }
+    .palette { display: grid; gap: 9px; }
+    .palette-card { padding: 11px; border: 1px solid var(--line); border-radius: 11px; background: #20283a; cursor: grab; }
+    .palette-card:active { cursor: grabbing; }
+    .palette-card strong { display: block; }
+    .palette-card small { color: var(--muted); }
+    .pipeline { margin-top: 16px; }
+    .canvas { min-height: 235px; padding: 12px; border: 1px dashed #526181; border-radius: 13px; background: #0d131f99; }
+    .canvas.empty { display: grid; place-items: center; color: var(--muted); text-align: center; }
+    .node-card { margin-bottom: 10px; padding: 12px; border: 1px solid var(--line); border-left: 4px solid var(--accent); border-radius: 12px; background: #1b2333; cursor: grab; }
+    .node-card.dragging { opacity: .5; }
+    .node-head { display: grid; grid-template-columns: auto minmax(120px, 1fr) auto auto; align-items: center; gap: 8px; }
+    .handle { color: var(--muted); font-size: 18px; cursor: grab; }
+    .node-kind { color: var(--accent-2); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; }
+    .node-status { justify-self: end; color: var(--muted); font-size: 11px; }
+    .node-status.completed { color: var(--green); }
+    .node-status.running, .node-status.queued { color: var(--cyan); }
+    .node-status.human_required { color: var(--yellow); }
+    .node-status.failed, .node-status.blocked { color: var(--red); }
+    .node-body { display: grid; gap: 10px; margin-top: 11px; padding-top: 11px; border-top: 1px solid var(--line); }
+    .node-body .field { margin: 0; }
+    .node-body textarea { min-height: 64px; }
+    .checks { display: flex; flex-wrap: wrap; gap: 6px 12px; }
+    .check { display: inline-flex; align-items: center; gap: 5px; color: var(--muted); font-size: 12px; }
+    .check input { width: auto; accent-color: var(--accent); }
+    .connection-list { min-height: 31px; margin-top: 10px; }
+    .connection { padding: 5px 9px; border-radius: 999px; color: #cbd3ff; background: #313b60; font-size: 12px; }
+    .waves { display: grid; gap: 8px; }
+    .wave { display: flex; align-items: center; gap: 8px; min-height: 36px; padding: 7px 9px; border-radius: 9px; background: #151c2a; }
+    .wave-number { width: 62px; color: var(--muted); font-size: 12px; }
+    .wave-node { padding: 3px 7px; border-radius: 6px; background: #2b3550; color: var(--accent-2); font-size: 12px; }
+    .error { color: var(--red); }
+    .muted { color: var(--muted); }
+    .status-list { display: grid; gap: 6px; max-height: 280px; overflow: auto; }
+    .status-row { display: grid; grid-template-columns: minmax(120px, 1fr) auto auto; align-items: center; gap: 8px; padding: 8px 9px; border-radius: 8px; background: #151b27; }
+    .status-row code { color: var(--accent-2); font-size: 12px; }
+    .status-row small { color: var(--muted); }
+    .events { max-height: 190px; overflow: auto; margin-top: 10px; padding: 9px; border-radius: 9px; background: #0c111a; color: #aab5cd; font: 11px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace; white-space: pre-wrap; }
+    .footer-note { margin-top: 14px; color: var(--muted); font-size: 12px; }
+    .toast { position: fixed; right: 22px; bottom: 22px; z-index: 10; max-width: 420px; padding: 12px 15px; border: 1px solid var(--line); border-radius: 11px; background: #20283b; box-shadow: var(--shadow); opacity: 0; transform: translateY(10px); pointer-events: none; transition: .2s ease; }
+    .toast.show { opacity: 1; transform: translateY(0); }
+    .toast.bad { border-color: #74343f; }
+    @media (max-width: 980px) { .top-grid, .bottom-grid { grid-template-columns: 1fr; } }
+    @media (max-width: 620px) { .shell { width: min(100% - 20px, 1500px); padding-top: 15px; } .two, .three { grid-template-columns: 1fr; } .node-head { grid-template-columns: auto minmax(100px, 1fr) auto; } .node-kind { display: none; } .badges { justify-content: flex-start; } }
+
+    /* Светлая тема: та же схема переменных, светлые значения (синхронизировано
+       с главной страницей через localStorage 'pp-theme', тот же источник). */
+    body.theme-light {
+      --bg: #f5f6f8;
+      --panel: #ffffff;
+      --panel-2: #eef0f3;
+      --line: #d9dde3;
+      --text: #1a1d21;
+      --muted: #5b616e;
+      --accent: #4c5fd5;
+      --accent-2: #3b4fc0;
+      --green: #1a7f37;
+      --red: #cf222e;
+      --yellow: #9a6700;
+      --cyan: #0969da;
+      --shadow: 0 18px 50px #00000022;
+      --radius: 14px;
+      background: radial-gradient(circle at 20% 0%, #ffffff 0, var(--bg) 42%);
+    }
+    body.theme-light button.danger { color: #8a1218; border-color: #b3444d; background: #fbe9ea; }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header>
+      <div>
+        <h1>PromptPilot <span>Parallel</span></h1>
+        <p>Визуальный конструктор параллельного запуска задач</p>
+      </div>
+      <div class="badges">
+        <span id="coreBadge" class="badge">● PromptPilot: проверка</span>
+        <span id="runnerBadge" class="badge">● Запуск: нет</span>
+        <span id="jevBadge" class="badge">● Jev: не настроен</span>
+        <button id="themeBtn" title="Переключить светлую/тёмную тему (общая с главной страницей)">☀ Светлая</button>
+      </div>
+    </header>
+
+    <div class="toolbar">
+      <button id="newPlan">＋ Новый план</button>
+      <label class="button">↥ Загрузить план<input id="fileInput" type="file" accept=".json,application/json" hidden></label>
+      <button id="downloadPlan">↧ Скачать план</button>
+      <span class="spacer"></span>
+      <button id="validateBtn">✓ Проверить</button>
+      <button id="runBtn" class="primary">▶ Запустить</button>
+      <button id="stopBtn" class="danger">■ Остановить</button>
+    </div>
+
+    <section class="grid top-grid">
+      <div class="panel">
+        <h2>1. Общие настройки</h2>
+        <div class="field"><label for="planName">Название плана</label><input id="planName" value="Новый параллельный запуск"></div>
+        <div class="field"><label for="taskPrompt">Большая задача</label><textarea id="taskPrompt" placeholder="Например: улучшить экран чтения BookApp, проверить API, UI и тесты..."></textarea></div>
+        <div class="two">
+          <div class="field"><label for="workingDir">Рабочая папка проекта</label><input id="workingDir" placeholder="C:\Users\...\BookApp"></div>
+          <div class="field"><label for="maxParallel">Одновременно</label><select id="maxParallel"><option>1</option><option>2</option><option>3</option><option selected>4</option><option>5</option><option>6</option><option>8</option></select></div>
+        </div>
+        <div class="two">
+          <div class="field"><label for="baseUrl">PromptPilot API</label><input id="baseUrl" value="http://127.0.0.1:8420"></div>
+          <div class="field"><label for="stateFile">Файл состояния</label><input id="stateFile" placeholder="%USERPROFILE%\.promptpilot\parallel-orchestrator\ui-run.json"></div>
+        </div>
+        <div class="field"><label for="pollSeconds">Проверять состояние, секунд</label><input id="pollSeconds" type="number" min="1" max="30" value="3"></div>
+        <div id="planDrop" class="dropzone"><div><strong>Перетащите сюда JSON-план</strong><small>или нажмите «Загрузить план» выше</small></div></div>
+      </div>
+
+      <div class="panel">
+        <h2>2. Перетащите блоки</h2>
+        <p style="margin-bottom:12px">Блоки анализа можно запустить одновременно. Review и integration ставьте после зависимостей.</p>
+        <div class="palette">
+          <div class="palette-card" draggable="true" data-kind="analysis"><strong>🔎 Анализ</strong><small>читает проект и пишет выводы</small></div>
+          <div class="palette-card" draggable="true" data-kind="synthesis"><strong>🧩 Сборка плана</strong><small>сводит результаты предыдущих блоков</small></div>
+          <div class="palette-card" draggable="true" data-kind="implementation"><strong>🛠 Реализация</strong><small>изолированная работа в worktree</small></div>
+          <div class="palette-card" draggable="true" data-kind="review"><strong>🛡 Review / Jev</strong><small>PASS, repair или human review</small></div>
+          <div class="palette-card" draggable="true" data-kind="custom"><strong>＋ Свой блок</strong><small>для любого отдельного шага</small></div>
+        </div>
+        <div class="footer-note">После добавления блока связи задаются галочками «зависит от». Стрелки появятся ниже схемы.</div>
+      </div>
+    </section>
+
+    <section class="panel pipeline">
+      <h2>3. Схема выполнения</h2>
+      <div id="canvas" class="canvas empty"><div>Перетащите блоки из правой панели сюда</div></div>
+      <div id="connections" class="connection-list"></div>
+    </section>
+
+    <section class="grid bottom-grid" style="margin-top:16px">
+      <div class="panel">
+        <h2>Волны выполнения</h2>
+        <div id="waves" class="waves"><div class="muted">Добавьте блоки, чтобы увидеть порядок.</div></div>
+        <div id="validationMessage" class="footer-note"></div>
+      </div>
+      <div class="panel">
+        <h2>Состояние запуска</h2>
+        <div id="statusList" class="status-list"><div class="muted">Запуск ещё не начинался.</div></div>
+        <div id="events" class="events">События появятся после запуска.</div>
+      </div>
+    </section>
+  </main>
+  <div id="toast" class="toast"></div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const UI_API = location.pathname.startsWith('/parallel') ? '/api/parallel' : '/api/ui';
+
+    // Тема общая с главной страницей PromptPilot (тот же origin → localStorage).
+    function applySharedTheme() {
+      const light = localStorage.getItem('pp-theme') === 'light';
+      document.body.classList.toggle('theme-light', light);
+      const btn = $('themeBtn');
+      if (btn) btn.textContent = light ? '🌙 Тёмная' : '☀ Светлая';
+    }
+    document.addEventListener('DOMContentLoaded', () => {
+      applySharedTheme();
+      $('themeBtn').addEventListener('click', () => {
+        localStorage.setItem('pp-theme',
+          localStorage.getItem('pp-theme') === 'light' ? 'dark' : 'light');
+        applySharedTheme();
+      });
+    });
+
+    let plan = { version: 1, name: 'Новый параллельный запуск', description: '', max_parallel: 4, nodes: [] };
+    let providers = [];
+    let nodeDragId = null;
+    let paletteDragKind = null;
+    let latestStatus = null;
+    let nodeCounter = 1;
+
+    const defaults = {
+      analysis: { kind: 'task', mode: 'worktree', prompt: 'Проанализируй эту часть задачи. Не меняй production-файлы. Дай конкретные файлы, риски и проверяемые выводы.' },
+      synthesis: { kind: 'task', mode: 'worktree', prompt: 'Сведи результаты зависимых анализов в единый план. Назови границы файлов и порядок реализации.' },
+      implementation: { kind: 'task', mode: 'worktree', prompt: 'Реализуй свою часть задачи в изолированном worktree. Выполни сфокусированные проверки и приложи доказательства.' },
+      review: { kind: 'review', mode: 'worktree', review: true, autofix: true, max_repairs: 2, prompt: 'Проверь все предыдущие результаты и закончи строго одной строкой AUDIT_VERDICT: PASS, AUDIT_VERDICT: REVISION_REQUIRED или AUDIT_VERDICT: HUMAN_REQUIRED.' },
+      custom: { kind: 'task', mode: 'worktree', prompt: 'Выполни этот шаг задачи и сообщи результат.' }
+    };
+
+    function esc(value) {
+      return String(value ?? '').replace(/[&<>'"]/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[ch]));
+    }
+    function slug(value) {
+      return String(value || 'node').toLowerCase().replace(/[^a-z0-9а-яё]+/gi, '-').replace(/^-|-$/g, '') || 'node';
+    }
+    function nodeLabel(node) { return node.id || 'без имени'; }
+    function getNode(id) { return plan.nodes.find(n => n.id === id); }
+    function toast(message, bad = false) {
+      const el = $('toast'); el.textContent = message; el.className = 'toast show' + (bad ? ' bad' : '');
+      clearTimeout(window.__toastTimer); window.__toastTimer = setTimeout(() => el.className = 'toast', 3800);
+    }
+    function normalisePlan(raw) {
+      const nodes = Array.isArray(raw.nodes) ? raw.nodes.map((node, index) => ({
+        id: String(node.id || `node-${index + 1}`), prompt: String(node.prompt || ''), depends_on: Array.isArray(node.depends_on) ? node.depends_on.map(String) : [],
+        kind: node.kind || 'task', mode: node.mode || 'worktree', working_dir: node.working_dir || '', provider: node.provider || '', model: node.model || '', effort: node.effort || '',
+        priority: Number(node.priority || 5), max_retries: Number(node.max_retries || 0), max_repairs: Number(node.max_repairs || 0), autofix: Boolean(node.autofix), review: Boolean(node.review || node.kind === 'review'),
+        include_dependency_context: node.include_dependency_context !== false, skip_permissions: Boolean(node.skip_permissions), keep_pane: Boolean(node.keep_pane), detached: Boolean(node.detached),
+        timeout: node.timeout ?? node.task_timeout ?? null, herdr_target: node.herdr_target || '', machine: node.machine || ''
+      })) : [];
+      return { version: Number(raw.version || 1), name: String(raw.name || 'Новый параллельный запуск'), description: String(raw.description || ''), max_parallel: Number(raw.max_parallel || 4), nodes };
+    }
+    function syncSettingsFromPlan() {
+      $('planName').value = plan.name;
+      $('maxParallel').value = String(plan.max_parallel);
+      if (plan.nodes.length && !$('workingDir').value) $('workingDir').value = plan.nodes[0].working_dir || '';
+      const prompt = plan.description || plan.nodes.find(n => n.id.startsWith('analysis-'))?.prompt || '';
+      if (!$('taskPrompt').value && prompt) $('taskPrompt').value = prompt;
+    }
+    function providerOptions(selected) {
+      return '<option value="">Авто / default</option>' + providers.map(p => `<option value="${esc(p)}" ${p === selected ? 'selected' : ''}>${esc(p)}</option>`).join('');
+    }
+    function kindName(node) { return node.kind === 'review' || node.review ? 'review' : node.id.startsWith('analysis-') ? 'analysis' : node.id.startsWith('implementation-') ? 'implementation' : 'task'; }
+    function renderNodes() {
+      const canvas = $('canvas');
+      if (!plan.nodes.length) { canvas.className = 'canvas empty'; canvas.innerHTML = '<div>Перетащите блоки из правой панели сюда</div>'; renderSummary(); return; }
+      canvas.className = 'canvas'; canvas.innerHTML = '';
+      plan.nodes.forEach(node => {
+        const status = latestStatus?.state?.nodes?.[node.id]?.status || 'pending';
+        const card = document.createElement('article'); card.className = 'node-card'; card.draggable = true; card.dataset.id = node.id;
+        const others = plan.nodes.filter(other => other.id !== node.id);
+        card.innerHTML = `
+          <div class="node-head">
+            <span class="handle">⠿</span>
+            <input data-field="id" value="${esc(node.id)}" aria-label="Имя блока">
+            <span class="node-kind">${esc(kindName(node))}</span>
+            <span class="node-status ${esc(status)}">${esc(status)}</span>
+          </div>
+          <div class="node-body">
+            <div class="field"><label>Что должен сделать блок</label><textarea data-field="prompt">${esc(node.prompt)}</textarea></div>
+            <div class="two">
+              <div class="field"><label>Режим</label><select data-field="mode"><option value="worktree" ${node.mode === 'worktree' ? 'selected' : ''}>Изолированный worktree</option><option value="shared_serial" ${node.mode === 'shared_serial' ? 'selected' : ''}>Общий checkout, последовательно</option><option value="read_only" ${node.mode === 'read_only' ? 'selected' : ''}>Только анализ</option></select></div>
+              <div class="field"><label>Провайдер</label><select data-field="provider">${providerOptions(node.provider)}</select></div>
+            </div>
+            <div class="two">
+              <div class="field"><label>Рабочая папка</label><input data-field="working_dir" value="${esc(node.working_dir || $('workingDir').value)}"></div>
+              <div class="field"><label>Повторить при ошибке</label><input data-field="max_retries" type="number" min="0" max="10" value="${Number(node.max_retries || 0)}"></div>
+            </div>
+            <div class="checks">
+              <label class="check"><input data-field="review" type="checkbox" ${node.review ? 'checked' : ''}> контрольный review</label>
+              <label class="check"><input data-field="autofix" type="checkbox" ${node.autofix ? 'checked' : ''}> автоисправление</label>
+              <label class="check"><input data-field="skip_permissions" type="checkbox" ${node.skip_permissions ? 'checked' : ''}> разрешить изменения</label>
+            </div>
+            ${node.review || node.kind === 'review' ? `<div class="field"><label>Максимум repair</label><input data-field="max_repairs" type="number" min="0" max="10" value="${Number(node.max_repairs || 0)}"></div>` : ''}
+            <div class="field"><label>Зависит от — эти блоки должны закончить раньше</label><div class="checks">${others.length ? others.map(other => `<label class="check"><input data-dep="${esc(other.id)}" type="checkbox" ${node.depends_on.includes(other.id) ? 'checked' : ''}>${esc(other.id)}</label>`).join('') : '<span class="muted">пока нет других блоков</span>'}</div></div>
+            <div class="button-row"><button data-remove="1" class="danger">Удалить блок</button></div>
+          </div>`;
+        card.addEventListener('dragstart', () => { nodeDragId = node.id; card.classList.add('dragging'); });
+        card.addEventListener('dragend', () => { nodeDragId = null; card.classList.remove('dragging'); });
+        card.addEventListener('dragover', event => event.preventDefault());
+        card.addEventListener('drop', event => { event.preventDefault(); if (nodeDragId && nodeDragId !== node.id) reorderNode(nodeDragId, node.id); });
+        card.querySelectorAll('[data-field]').forEach(input => {
+          const eventName = input.type === 'checkbox' || input.tagName === 'SELECT' ? 'change' : 'input';
+          input.addEventListener(eventName, () => {
+            const field = input.dataset.field; let value;
+            if (input.type === 'checkbox') value = input.checked;
+            else if (input.type === 'number') value = Number(input.value || 0);
+            else value = input.value;
+            if (field === 'id') { const old = node.id; value = slug(value); if (value !== old && plan.nodes.some(n => n.id === value)) { toast('Такое имя блока уже есть', true); input.value = old; return; } plan.nodes.forEach(n => n.depends_on = n.depends_on.map(dep => dep === old ? value : dep)); }
+            node[field] = value;
+            if (field === 'kind' && value === 'review') node.review = true;
+            renderSummary();
+            if (field === 'id' || field === 'review') renderNodes();
+          });
+        });
+        card.querySelectorAll('[data-dep]').forEach(input => input.addEventListener('change', () => {
+          node.depends_on = [...card.querySelectorAll('[data-dep]:checked')].map(el => el.dataset.dep); renderSummary();
+        }));
+        card.querySelector('[data-remove]').addEventListener('click', () => { plan.nodes = plan.nodes.filter(item => item.id !== node.id).map(item => ({...item, depends_on: item.depends_on.filter(dep => dep !== node.id)})); renderNodes(); });
+        canvas.appendChild(card);
+      });
+      renderSummary();
+    }
+    function reorderNode(fromId, toId) {
+      const from = plan.nodes.findIndex(n => n.id === fromId), to = plan.nodes.findIndex(n => n.id === toId); if (from < 0 || to < 0) return;
+      const [item] = plan.nodes.splice(from, 1); plan.nodes.splice(to, 0, item); renderNodes();
+    }
+    function addNode(kind) {
+      const preset = defaults[kind] || defaults.custom; const base = kind === 'custom' ? 'custom' : kind;
+      let id = `${base}-${nodeCounter++}`; while (plan.nodes.some(n => n.id === id)) id = `${base}-${nodeCounter++}`;
+      plan.nodes.push({ id, prompt: `${preset.prompt}\n\nГлавная задача:\n${$('taskPrompt').value || 'указана в настройках плана'}`, depends_on: [], kind: preset.kind || 'task', mode: preset.mode || 'worktree', working_dir: $('workingDir').value, provider: '', model: '', effort: '', priority: 5, max_retries: 0, max_repairs: preset.max_repairs || 0, autofix: Boolean(preset.autofix), review: Boolean(preset.review), include_dependency_context: true, skip_permissions: false, keep_pane: false, detached: false, timeout: null, herdr_target: '', machine: '' });
+      renderNodes(); toast(`Добавлен блок «${id}»`);
+    }
+    function computeWaves() {
+      const pending = new Map(plan.nodes.map(n => [n.id, new Set(n.depends_on)])); const waves = []; const errors = [];
+      plan.nodes.forEach(n => n.depends_on.forEach(dep => { if (!pending.has(dep)) errors.push(`${n.id}: неизвестная зависимость ${dep}`); }));
+      while (pending.size && !errors.length) {
+        const ready = [...pending.entries()].filter(([, deps]) => deps.size === 0).map(([id]) => id).sort();
+        if (!ready.length) { errors.push('Обнаружен цикл зависимостей'); break; }
+        waves.push(ready); ready.forEach(id => pending.delete(id)); pending.forEach(deps => ready.forEach(id => deps.delete(id)));
+      }
+      return { waves, errors };
+    }
+    function renderSummary() {
+      const result = computeWaves(); const waves = $('waves');
+      if (result.errors.length) waves.innerHTML = result.errors.map(error => `<div class="error">⚠ ${esc(error)}</div>`).join('');
+      else if (!result.waves.length) waves.innerHTML = '<div class="muted">Добавьте блоки, чтобы увидеть порядок.</div>';
+      else waves.innerHTML = result.waves.map((wave, index) => `<div class="wave"><span class="wave-number">Волна ${index + 1}</span>${wave.map(id => `<span class="wave-node">${esc(id)}</span>`).join('')}</div>`).join('');
+      $('validationMessage').textContent = result.errors.length ? result.errors.join(' · ') : (plan.nodes.length ? `${plan.nodes.length} блоков · максимум ${plan.max_parallel} одновременно` : '');
+      $('validationMessage').className = 'footer-note' + (result.errors.length ? ' error' : '');
+      $('connections').innerHTML = plan.nodes.flatMap(node => node.depends_on.map(dep => `<span class="connection">${esc(dep)} → ${esc(node.id)}</span>`)).join('') || '<span class="muted">Связей пока нет — независимые блоки стартуют вместе.</span>';
+    }
+    async function validatePlan(showToast = true) {
+      try {
+        const response = await fetch(`${UI_API}/validate`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({plan}) });
+        const data = await response.json(); if (!response.ok) throw new Error(data.error || 'План не прошёл проверку');
+        plan = normalisePlan(data.plan); renderNodes(); if (showToast) toast(`План корректен: ${data.node_count} блоков, ${data.waves.length} волн`); return true;
+      } catch (error) { toast(error.message, true); return false; }
+    }
+    async function runPlan() {
+      if (!await validatePlan(false)) return;
+      const payload = { plan, base_url: $('baseUrl').value.trim(), state_file: $('stateFile').value.trim(), poll_seconds: Number($('pollSeconds').value || 3) };
+      try { const response = await fetch(`${UI_API}/run`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)}); const data = await response.json(); if (!response.ok) throw new Error(data.error || 'Не удалось запустить'); toast('Запуск начат'); renderStatus(data); } catch (error) { toast(error.message, true); }
+    }
+    async function stopRun() {
+      try { const response = await fetch(`${UI_API}/stop`, {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'}); const data = await response.json(); if (!response.ok) throw new Error(data.error || 'Не удалось остановить'); toast('Scheduler остановлен; уже запущенные задачи не отменены'); renderStatus(data); } catch (error) { toast(error.message, true); }
+    }
+    async function resolveNode(node, action) {
+      try { const response = await fetch(`${UI_API}/resolve`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({node, action})}); const data = await response.json(); if (!response.ok) throw new Error(data.error || 'Не удалось выполнить действие'); toast(`Для ${node}: ${action}`); renderStatus(data); } catch (error) { toast(error.message, true); }
+    }
+    function renderStatus(data) {
+      latestStatus = data; const state = data.state;
+      const core = $('coreBadge'), runner = $('runnerBadge'), jev = $('jevBadge');
+      core.textContent = data.core_reachable === false ? '● PromptPilot: недоступен' : '● PromptPilot: подключён';
+      core.className = 'badge ' + (data.core_reachable === false ? 'bad' : 'good');
+      const runnerText = data.runner_status === 'running' ? '● Запуск: выполняется' : data.runner_status === 'finished' ? '● Запуск: завершён' : data.runner_status === 'error' ? '● Запуск: ошибка' : '● Запуск: нет';
+      runner.textContent = runnerText; runner.className = 'badge ' + (data.runner_status === 'running' ? 'good' : data.runner_status === 'error' ? 'bad' : '');
+      if (data.jev_enabled) { jev.textContent = '● Jev: включён'; jev.className = 'badge good'; }
+      const rows = state?.nodes || {};
+      $('statusList').innerHTML = Object.keys(rows).length ? Object.entries(rows).map(([id, runtime]) => `<div class="status-row"><code>${esc(id)}</code><small class="node-status ${esc(runtime.status)}">${esc(runtime.status)}</small>${runtime.status === 'human_required' ? `<span class="button-row"><button data-resolve="${esc(id)}" data-action="retry">Повторить</button><button data-resolve="${esc(id)}" data-action="accept">Принять</button></span>` : '<span></span>'}</div>`).join('') : '<div class="muted">Запуск ещё не начинался.</div>';
+      $('statusList').querySelectorAll('[data-resolve]').forEach(button => button.addEventListener('click', () => resolveNode(button.dataset.resolve, button.dataset.action)));
+      const events = state?.events || []; $('events').textContent = events.slice(-18).map(event => `${event.at || ''}  ${event.kind || ''}  ${event.node || ''} ${event.reason || ''}`).join('\n') || (data.last_error || 'События появятся после запуска.');
+      document.querySelectorAll('.node-card').forEach(card => { const status = rows[card.dataset.id]?.status || 'pending'; const badge = card.querySelector('.node-status'); if (badge) { badge.textContent = status; badge.className = 'node-status ' + status; } });
+    }
+    async function pollStatus() { try { const response = await fetch(`${UI_API}/status`); if (response.ok) renderStatus(await response.json()); } catch (_) {} }
+    function downloadPlan() { const blob = new Blob([JSON.stringify(plan, null, 2)], {type:'application/json'}); const link = document.createElement('a'); link.href = URL.createObjectURL(blob); link.download = `${slug(plan.name) || 'parallel-plan'}.json`; link.click(); URL.revokeObjectURL(link.href); }
+    function importFile(file) { const reader = new FileReader(); reader.onload = () => { try { plan = normalisePlan(JSON.parse(reader.result)); syncSettingsFromPlan(); renderNodes(); toast('План загружен'); } catch (error) { toast('Не удалось прочитать JSON: ' + error.message, true); } }; reader.readAsText(file); }
+
+    document.querySelectorAll('.palette-card').forEach(card => card.addEventListener('dragstart', event => { paletteDragKind = card.dataset.kind; event.dataTransfer.effectAllowed = 'copy'; }));
+    $('canvas').addEventListener('dragover', event => { event.preventDefault(); $('canvas').classList.add('dragover'); });
+    $('canvas').addEventListener('dragleave', () => $('canvas').classList.remove('dragover'));
+    $('canvas').addEventListener('drop', event => { event.preventDefault(); $('canvas').classList.remove('dragover'); if (paletteDragKind) { addNode(paletteDragKind); paletteDragKind = null; } });
+    $('planDrop').addEventListener('dragover', event => { event.preventDefault(); $('planDrop').classList.add('dragover'); });
+    $('planDrop').addEventListener('dragleave', () => $('planDrop').classList.remove('dragover'));
+    $('planDrop').addEventListener('drop', event => { event.preventDefault(); $('planDrop').classList.remove('dragover'); const file = event.dataTransfer.files[0]; if (file) importFile(file); });
+    $('fileInput').addEventListener('change', event => { if (event.target.files[0]) importFile(event.target.files[0]); });
+    $('newPlan').addEventListener('click', () => { if (plan.nodes.length && !confirm('Очистить текущую схему?')) return; plan = {version:1, name:'Новый параллельный запуск', description:'', max_parallel:4, nodes:[]}; $('taskPrompt').value=''; renderNodes(); });
+    $('downloadPlan').addEventListener('click', downloadPlan);
+    $('validateBtn').addEventListener('click', () => validatePlan(true));
+    $('runBtn').addEventListener('click', runPlan);
+    $('stopBtn').addEventListener('click', stopRun);
+    $('planName').addEventListener('input', event => { plan.name = event.target.value; });
+    $('taskPrompt').addEventListener('input', event => { plan.description = event.target.value; });
+    $('workingDir').addEventListener('input', event => { plan.nodes.filter(n => !n.working_dir).forEach(n => n.working_dir = event.target.value); });
+    $('maxParallel').addEventListener('change', event => { plan.max_parallel = Number(event.target.value); renderSummary(); });
+    $('baseUrl').addEventListener('change', event => { if (event.target.value) localStorage.setItem('pp-parallel-base-url', event.target.value); });
+
+    async function boot() {
+      try { const response = await fetch(`${UI_API}/config`); const config = await response.json(); if (config.base_url) $('baseUrl').value = localStorage.getItem('pp-parallel-base-url') || config.base_url; if (config.default_state_file) $('stateFile').value = config.default_state_file; providers = config.providers || []; if (config.default_working_dir) $('workingDir').value = config.default_working_dir; renderStatus({core_reachable: config.core_reachable, jev_enabled: config.jev_enabled, runner_status:'idle', state:null}); } catch (error) { toast('Не удалось подключиться к визуальному контроллеру', true); }
+      renderNodes(); pollStatus(); setInterval(pollStatus, 2000);
+    }
+    boot();
+  </script>
+</body>
+</html>

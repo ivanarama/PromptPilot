@@ -314,7 +314,11 @@ def load_providers() -> dict:
     user_file = _providers_file()
     if user_file.exists():
         try:
-            with open(user_file) as f:
+            # providers.json is written as UTF-8.  Do not use the Windows
+            # locale here (cp1251 on the supported desktop setup): otherwise
+            # human labels such as "🤖 МиниМакс" are returned to the UI as
+            # mojibake ("рџ¤– РњРёРЅРёРњР°РєСЃ").
+            with open(user_file, encoding="utf-8") as f:
                 custom = json.load(f)
             for name, info in custom.items():
                 if name in providers:
@@ -349,7 +353,7 @@ def load_providers_detailed() -> dict:
     custom_names = set()
     if user_file.exists():
         try:
-            with open(user_file) as f:
+            with open(user_file, encoding="utf-8") as f:
                 custom = json.load(f)
             for name, info in custom.items():
                 custom_names.add(name)
@@ -377,7 +381,7 @@ def _load_custom_providers() -> dict:
     user_file = _providers_file()
     if user_file.exists():
         try:
-            with open(user_file) as f:
+            with open(user_file, encoding="utf-8") as f:
                 return json.load(f)
         except json.JSONDecodeError as e:
             _warn_once("providers.json",
@@ -389,6 +393,24 @@ def _load_custom_providers() -> dict:
 
 def _write_custom_providers(custom: dict):
     _atomic_write_json(_providers_file(), custom)
+
+
+def set_providers_ui_order(names: list) -> bool:
+    """Persist the helper-card order chosen by drag&drop in the UI.
+
+    Stored as a per-provider `ui_order` field (partial-override friendly:
+    missing entries keep their default alphabetical tail).
+    """
+    known = set(load_providers())
+    custom = _load_custom_providers()
+    for idx, name in enumerate(names):
+        if name not in known:
+            continue
+        entry = custom.get(name, {})
+        entry["ui_order"] = idx
+        custom[name] = entry
+    _write_custom_providers(custom)
+    return True
 
 
 def save_provider(name: str, cmd: str = None, description: str = "", env: dict = None,
@@ -578,7 +600,7 @@ def remove_provider(name: str) -> bool:
     if not user_file.exists():
         return False
     try:
-        with open(user_file) as f:
+        with open(user_file, encoding="utf-8") as f:
             custom = json.load(f)
     except (json.JSONDecodeError, OSError):
         return False

@@ -5332,14 +5332,17 @@ def list_workflow_artifacts(workflow_id: str,
 
 
 def list_workflow_events(workflow_id: str, after_seq: int = 0,
-                         limit: int = 200) -> list[WorkflowEventInDB]:
+                         limit: int = 200, tail: bool = False) -> list[WorkflowEventInDB]:
     with _connect() as conn:
+        order = "DESC" if tail else "ASC"
         rows = conn.execute(
-            """SELECT * FROM workflow_events
+            f"""SELECT * FROM workflow_events
                WHERE workflow_id = ? AND seq > ?
-               ORDER BY seq LIMIT ?""",
+               ORDER BY seq {order} LIMIT ?""",
             (workflow_id, after_seq, limit),
         ).fetchall()
+        if tail:
+            rows = list(reversed(rows))
         return [_row_to_workflow_event(row) for row in rows]
 
 

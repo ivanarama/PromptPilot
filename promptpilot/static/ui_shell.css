@@ -1,0 +1,136 @@
+/* Additive PromptPilot UI shell.
+ * This file only changes presentation and interaction affordances. It does
+ * not alter workflow state, provider execution, or the API contract.
+ */
+:root {
+  --pp-content-max: 1240px;
+  --pp-panel-gap: 12px;
+}
+
+html { scroll-behavior: smooth; }
+
+.container {
+  width: min(var(--pp-content-max), calc(100% - 32px));
+  max-width: var(--pp-content-max);
+}
+
+/* Keep the primary composer short. Advanced task controls are moved into the
+ * disclosure by ui_shell.js after the existing page has initialised. */
+.pp-quick-fields,
+.pp-composer-actions,
+.pp-advanced-grid {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.pp-quick-fields { flex: 1 1 auto; min-width: 0; }
+.pp-composer-actions { margin-left: auto; }
+.pp-advanced {
+  flex: 1 0 100%;
+  margin-top: 4px;
+  border-top: 1px solid var(--border);
+  padding-top: 8px;
+}
+.pp-advanced > summary {
+  width: fit-content;
+  cursor: pointer;
+  color: var(--accent2);
+  font-size: 12px;
+  user-select: none;
+}
+.pp-advanced[open] > summary { margin-bottom: 8px; }
+.pp-advanced-grid { align-items: flex-end; }
+.pp-advanced-grid > label { margin-bottom: 4px; }
+
+/* The old filter row contained filters, service controls, and integrations in
+ * one flat line. The shell gives those groups separate visual roles. */
+#filterBar {
+  align-items: center;
+  gap: 8px;
+}
+.pp-filter-group,
+.pp-system-group,
+.pp-tools-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.pp-filter-group { flex: 1 1 auto; min-width: 0; }
+.pp-system-group { margin-left: auto; }
+.pp-tools-menu { position: relative; }
+.pp-tools-menu > summary {
+  list-style: none;
+  cursor: pointer;
+  padding: 5px 14px;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  color: var(--text2);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.pp-tools-menu > summary::-webkit-details-marker { display: none; }
+.pp-tools-menu[open] > summary,
+.pp-tools-menu > summary:hover { color: var(--text); border-color: var(--accent); }
+.pp-tools-menu .pp-tools-group {
+  position: absolute;
+  z-index: 20;
+  right: 0;
+  top: calc(100% + 6px);
+  min-width: 190px;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  box-shadow: 0 12px 28px rgba(0,0,0,.22);
+}
+.pp-tools-menu .pp-tools-group .btn-pause { margin-left: 0 !important; width: 100%; text-align: left; }
+
+/* Linear review editor: the advanced graph stays in the Parallel add-on. */
+#cz-steps .cz-card { position: relative; transition: border-color .15s, transform .15s, opacity .15s; }
+#cz-steps .cz-card.pp-dragging { opacity: .48; transform: scale(.99); }
+#cz-steps .cz-card.pp-drop-target { border-color: var(--accent2); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent2) 24%, transparent); }
+.pp-drag-handle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  min-width: 22px;
+  color: var(--text2);
+  cursor: grab;
+  user-select: none;
+  font-size: 16px;
+}
+.pp-drag-handle:active { cursor: grabbing; }
+.pp-drop-line {
+  height: 5px;
+  margin: -4px 0 4px;
+  border-radius: 4px;
+  background: transparent;
+  transition: background .12s;
+}
+.pp-drop-line.active { background: var(--accent); }
+
+/* Locale and density controls live in the existing Appearance pane. */
+.pp-preference-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+.pp-preference-row label { color: var(--text2); font-size: 12px; }
+.pp-preference-row select { min-width: 150px; }
+.pp-scope-note { color: var(--text2); font-size: 11px; }
+
+@media (max-width: 780px) {
+  .container { width: min(100% - 20px, var(--pp-content-max)); }
+  .pp-system-group { margin-left: 0; }
+  .pp-tools-menu .pp-tools-group { left: 0; right: auto; }
+  .pp-composer-actions { margin-left: 0; width: 100%; }
+  .pp-composer-actions .btn { width: 100%; }
+}

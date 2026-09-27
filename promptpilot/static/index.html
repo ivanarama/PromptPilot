@@ -22,6 +22,21 @@
     --font: 'Inter', -apple-system, system-ui, sans-serif;
     --mono: 'JetBrains Mono', 'Fira Code', monospace;
   }
+  /* Светлая тема (GitHub-Light): те же переменные, светлые значения. */
+  body.theme-light {
+    --bg: #f5f6f8;
+    --surface: #ffffff;
+    --surface2: #eef0f3;
+    --border: #d9dde3;
+    --text: #1a1d21;
+    --text2: #5b616e;
+    --accent: #4c5fd5;
+    --accent2: #3b4fc0;
+    --green: #1a7f37;
+    --red: #cf222e;
+    --yellow: #9a6700;
+    --cyan: #0969da;
+  }
 
   * { margin: 0; padding: 0; box-sizing: border-box; }
 
@@ -222,6 +237,8 @@
   .task-status[data-s="completed"] { color: var(--green); background: #4ade8015; }
   .task-status[data-s="failed"] { color: var(--red); background: #f8717115; }
   .task-status[data-s="rate_limited"] { color: var(--yellow); background: #fbbf2415; }
+  .task-status[data-s="awaiting_human"], .task-status[data-s="revision_required"] { color: var(--red); background: #f8717115; }
+  .task-status[data-s="awaiting_plan_approval"], .task-status[data-s="gating"] { color: var(--yellow); background: #fbbf2415; }
   .task-status[data-s="cancelled"] { color: var(--text2); background: var(--surface2); }
 
   @keyframes pulse {
@@ -242,6 +259,69 @@
     font-family: var(--mono);
     white-space: nowrap;
   }
+  .wf-chip {
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 1px 6px;
+    font-size: 11px;
+    font-weight: 600;
+    white-space: nowrap;
+    flex-shrink: 0;
+    font-family: var(--mono);
+  }
+  .stage-chip {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .role-chip {
+    border-radius: 4px;
+    padding: 1px 6px;
+    font-size: 10px;
+    font-weight: 700;
+    white-space: nowrap;
+    flex-shrink: 0;
+    letter-spacing: 0.3px;
+  }
+  .role-review { color: #ce93d8; border: 1px solid rgba(206, 147, 216, 0.45); }
+  .role-exec { color: #80cbc4; border: 1px solid rgba(128, 203, 196, 0.45); }
+  .cz-card {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    margin-bottom: 8px;
+    background: var(--surface);
+  }
+  .cz-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 6px;
+    flex-wrap: wrap;
+  }
+  .cz-label { font-weight: 600; font-size: 12px; }
+  .cz-label-sm { font-size: 11px; color: var(--text2); }
+  .cz-hint { font-size: 11px; color: var(--text2); margin-left: auto; }
+  .cz-inline { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; }
+  .set-tabs {
+    display: flex;
+    gap: 4px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 14px;
+  }
+  .set-tab {
+    background: none;
+    border: none;
+    border-bottom: 2px solid transparent;
+    color: var(--text2);
+    padding: 8px 14px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  .set-tab.active {
+    color: var(--text);
+    border-bottom-color: var(--accent);
+  }
+  .set-pane { min-height: 200px; }
   .task-schedule {
     font-size: 11px;
     color: var(--yellow);
@@ -277,9 +357,13 @@
     font-family: var(--mono);
     font-size: 12px;
     white-space: pre-wrap;
+    overflow-wrap: anywhere;
     word-break: break-word;
+    max-width: 100%;
+    min-width: 0;
     max-height: 400px;
     overflow-y: auto;
+    overflow-x: hidden;
     color: var(--text);
     user-select: text;
   }
@@ -380,7 +464,7 @@
   .btn-pause.paused { border-color: var(--yellow); color: var(--yellow); background: #fbbf2410; }
   .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: none; z-index: 50; }
   .modal-overlay.open { display: flex; align-items: flex-start; justify-content: center; padding: 40px 16px; overflow-y: auto; }
-  .modal { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; max-width: 780px; width: 100%; padding: 20px; max-height: 85vh; overflow-y: auto; }
+  .modal { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; max-width: 780px; width: 100%; padding: 20px; max-height: 85vh; overflow-y: auto; overflow-x: hidden; }
   .modal h2 { font-size: 16px; margin-bottom: 14px; display: flex; align-items: center; }
   .prov-row { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; }
   .prov-row.dim { opacity: .55; }
@@ -422,6 +506,8 @@
   .pipeline-health.red { color:var(--red); border-color:var(--red); }
   .pipeline-health.warming { color:var(--accent); border-color:var(--accent); }
   #pipelineModal .modal { max-width:1120px; }
+  #parallelModal .modal { max-width:1450px; width:calc(100vw - 32px); height:calc(100vh - 48px); max-height:none; padding:10px; overflow:hidden; }
+  #parallelFrame { width:100%; height:calc(100% - 32px); border:0; border-radius:8px; background:var(--bg); }
   @media (max-width: 720px) {
     .pipeline-summary { grid-template-columns:repeat(2,minmax(120px,1fr)); }
     .insights-table { table-layout:auto; display:block; overflow-x:auto; white-space:nowrap; }
@@ -432,15 +518,26 @@
   }
 
   /* Workflow orchestrator */
-  .wf-grid { display: grid; grid-template-columns: minmax(220px, 34%) 1fr; gap: 12px; }
-  .wf-list { display: flex; flex-direction: column; gap: 6px; }
-  .wf-row { border: 1px solid var(--border); border-radius: 7px; padding: 9px 10px; cursor: pointer; }
+  /* Every workflow column is allowed to shrink. Without the explicit min-width:0
+     rules below, a long Windows path, prompt, or audit report makes the grid
+     wider than the modal and the browser exposes a second horizontal scrollbar. */
+  #workflowModal .modal {
+    width: 100%;
+    max-width: min(1160px, calc(100vw - 32px));
+    max-height: calc(100vh - 32px);
+    padding: clamp(12px, 2vw, 20px);
+    overscroll-behavior: contain;
+  }
+  #workflowModal .modal > *, #wfDetail, #wfList, .wf-grid > * { min-width: 0; max-width: 100%; }
+  .wf-grid { display: grid; grid-template-columns: minmax(190px, 30%) minmax(0, 1fr); gap: 12px; min-width: 0; }
+  .wf-list { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+  .wf-row { border: 1px solid var(--border); border-radius: 7px; padding: 9px 10px; cursor: pointer; min-width: 0; overflow: hidden; }
   .wf-row:hover, .wf-row.active { border-color: var(--accent); background: var(--surface2); }
-  .wf-title { font-weight: 600; font-size: 13px; }
-  .wf-meta { color: var(--text2); font-size: 11px; margin-top: 3px; }
-  .wf-panel { border: 1px solid var(--border); border-radius: 8px; padding: 12px; min-height: 220px; }
-  .wf-actions { display: flex; flex-wrap: wrap; gap: 7px; margin: 10px 0; }
-  .wf-form { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 10px; }
+  .wf-title { font-weight: 600; font-size: 13px; min-width: 0; overflow-wrap: anywhere; word-break: break-word; }
+  .wf-meta { color: var(--text2); font-size: 11px; margin-top: 3px; min-width: 0; overflow-wrap: anywhere; word-break: break-word; }
+  .wf-panel { border: 1px solid var(--border); border-radius: 8px; padding: 12px; min-height: 220px; min-width: 0; overflow-x: hidden; }
+  .wf-actions { display: flex; flex-wrap: wrap; gap: 7px; margin: 10px 0; min-width: 0; }
+  .wf-form { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 8px; margin-top: 10px; min-width: 0; }
   .wf-form .wide { grid-column: 1 / -1; }
   .wf-form input, .wf-form select, .wf-form textarea {
     width: 100%; background: var(--bg); border: 1px solid var(--border);
@@ -451,7 +548,7 @@
   .wf-wizard.open { display:block; }
   .wf-wizard-head { display:flex; justify-content:space-between; gap:12px; align-items:center; margin-bottom:14px; }
   .wf-wizard-head h3 { margin:0; font-size:15px; }
-  .wf-wizard-profile { display:flex; gap:6px; align-items:center; }
+  .wf-wizard-profile { display:flex; gap:6px; align-items:center; flex-wrap:wrap; min-width:0; }
   .wf-wizard-profile select, .wf-wizard-profile input { background:var(--bg); border:1px solid var(--border); border-radius:6px; color:var(--text); padding:6px 8px; font-size:12px; }
   .wf-wizard-steps { display:grid; grid-template-columns:repeat(4,1fr); gap:7px; margin-bottom:16px; }
   .wf-wizard-step { border:1px solid var(--border); border-radius:8px; padding:8px 9px; color:var(--text2); background:var(--bg); font-size:11px; }
@@ -462,14 +559,14 @@
   .wf-wizard-panel.active { display:block; }
   .wf-wizard-panel h4 { margin:0 0 5px; font-size:14px; }
   .wf-wizard-help { color:var(--text2); font-size:11px; margin-bottom:12px; line-height:1.5; }
-  .wf-wizard-fields { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  .wf-wizard-fields { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:10px; min-width:0; }
   .wf-wizard-fields .wide { grid-column:1/-1; }
   .wf-wizard-fields label { display:flex; flex-direction:column; gap:5px; color:var(--text2); font-size:12px; }
   .wf-wizard-fields label.check { flex-direction:row; align-items:center; }
   .wf-wizard-fields input, .wf-wizard-fields select, .wf-wizard-fields textarea { width:100%; background:var(--bg); border:1px solid var(--border); border-radius:6px; color:var(--text); padding:8px 9px; font-size:12px; }
   .wf-wizard-fields textarea { min-height:88px; resize:vertical; font-family:var(--mono); }
-  .wf-wizard-roles { display:grid; grid-template-columns:repeat(3,1fr); gap:9px; }
-  .wf-wizard-role { border:1px solid var(--border); border-radius:8px; background:var(--bg); padding:10px; }
+  .wf-wizard-roles { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:9px; min-width:0; }
+  .wf-wizard-role { border:1px solid var(--border); border-radius:8px; background:var(--bg); padding:10px; min-width:0; }
   .wf-wizard-role.reviewer { border-color:#ed6e8666; }
   .wf-wizard-role.executor { border-color:#7781ff66; }
   .wf-wizard-role h5 { margin:0 0 5px; font-size:13px; }
@@ -479,7 +576,7 @@
   .wf-wizard-role input, .wf-wizard-role select { width:100%; background:var(--surface2); border:1px solid var(--border); border-radius:6px; color:var(--text); padding:7px; }
   .wf-wizard-role label.check input, .wf-wizard-fields label.check input { width:auto; }
   .wf-wizard-danger { margin-top:8px; padding:8px 10px; border:1px solid #ed6e8666; border-radius:7px; color:#f59aad; font-size:11px; }
-  .wf-wizard-summary { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin:10px 0; }
+  .wf-wizard-summary { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:8px; margin:10px 0; min-width:0; }
   .wf-wizard-summary > div { background:var(--bg); border:1px solid var(--border); border-radius:7px; padding:9px; font-size:11px; }
   .wf-wizard-summary b { display:block; margin-bottom:3px; color:var(--text); }
   .wf-preflight { display:flex; flex-direction:column; gap:5px; margin:10px 0; }
@@ -489,8 +586,8 @@
   .wf-preflight-row[data-status="error"] { border-left-color:var(--red); color:#f59aad; }
   .wf-wizard-nav { display:flex; justify-content:space-between; align-items:center; gap:8px; margin-top:14px; padding-top:12px; border-top:1px solid var(--border); }
   .wf-wizard-nav-right { display:flex; gap:7px; }
-  .wf-settings-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:10px; }
-  .wf-settings-card { background:var(--bg); border:1px solid var(--border); border-radius:8px; padding:10px; }
+  .wf-settings-grid { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:10px; margin-top:10px; min-width:0; }
+  .wf-settings-card { background:var(--bg); border:1px solid var(--border); border-radius:8px; padding:10px; min-width:0; overflow:hidden; }
   .wf-settings-card h4 { margin:0 0 8px; font-size:13px; }
   .wf-settings-card label { display:flex; flex-direction:column; gap:4px; margin:7px 0; color:var(--text2); font-size:12px; }
   .wf-settings-card label.check { flex-direction:row; align-items:center; }
@@ -499,25 +596,40 @@
   }
   .wf-settings-card textarea { min-height:90px; resize:vertical; font-family:var(--mono); }
   .wf-stage-list { display:flex; flex-direction:column; gap:8px; margin:10px 0; }
-  .wf-stage-card { background:var(--bg); border:1px solid var(--border); border-left:4px solid var(--border); border-radius:8px; padding:10px; }
+  .wf-stage-card { background:var(--bg); border:1px solid var(--border); border-left:4px solid var(--border); border-radius:8px; padding:10px; min-width:0; overflow:hidden; }
   .wf-stage-card[data-status="executing"] { border-left-color:var(--accent); }
   .wf-stage-card[data-status="completed"] { border-left-color:var(--green); }
   .wf-stage-card[data-status="failed"] { border-left-color:var(--red); }
-  .wf-stage-editor { display:grid; grid-template-columns:120px 1fr 150px; gap:7px; }
+  .wf-stage-editor { display:grid; grid-template-columns:minmax(0,120px) minmax(0,1fr) minmax(0,150px); gap:7px; min-width:0; }
   .wf-stage-editor .wide { grid-column:1/-1; }
   .wf-stage-editor input, .wf-stage-editor select, .wf-stage-editor textarea { background:var(--surface2); border:1px solid var(--border); border-radius:6px; color:var(--text); padding:7px 8px; }
   .wf-stage-editor textarea { min-height:58px; resize:vertical; font-family:var(--mono); }
-  .wf-history { margin-top: 12px; max-height: 260px; overflow-y: auto; }
+  .wf-history { margin-top: 12px; max-height: 260px; overflow-y: auto; overflow-x: hidden; min-width:0; }
   .wf-event { border-top: 1px solid var(--border); padding: 6px 0; font-size: 11px; }
   .wf-event code { color: var(--accent2); }
-  .wf-stage { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 11px 12px; margin: 9px 0; }
-  .wf-stage-title { font-size: 15px; font-weight: 650; }
-  .wf-next { color: var(--cyan); font-size: 12px; margin-top: 5px; }
+  .wf-stage { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 11px 12px; margin: 9px 0; min-width:0; overflow:hidden; }
+  .wf-stage-title { font-size: 15px; font-weight: 650; overflow-wrap:anywhere; word-break:break-word; }
+  .wf-next { color: var(--cyan); font-size: 12px; margin-top: 5px; overflow-wrap:anywhere; word-break:break-word; }
   .wf-section-title { margin-top: 14px; margin-bottom: 5px; font-size: 12px; font-weight: 650; color: var(--text); }
-  .wf-round { border-left: 3px solid var(--border); padding: 6px 9px; margin: 5px 0; background: var(--bg); border-radius: 0 6px 6px 0; }
+  .wf-round { border-left: 3px solid var(--border); padding: 6px 9px; margin: 5px 0; background: var(--bg); border-radius: 0 6px 6px 0; min-width:0; overflow-wrap:anywhere; word-break:break-word; }
   .wf-round.current { border-left-color: var(--accent2); }
   .wf-round-summary { font-size: 12px; margin-top: 2px; }
-  .wf-technical summary { cursor: pointer; color: var(--text2); font-size: 11px; margin-top: 12px; }
+  .wf-technical summary { cursor: pointer; color: var(--text2); font-size: 11px; margin-top: 12px; overflow-wrap:anywhere; }
+  .wf-panel pre, #wfDetail pre, #wfDetail code { max-width:100%; min-width:0; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word; }
+  .wf-human-alert { display:grid; grid-template-columns:auto minmax(0,1fr); gap:10px; align-items:start; margin:10px 0 12px; padding:12px; border:1px solid var(--red); border-radius:9px; background:#f8717112; min-width:0; }
+  .wf-human-alert[data-kind="decision"] { border-color:var(--yellow); background:#fbbf2412; }
+  .wf-human-icon { font-size:24px; line-height:1; animation:wf-human-pulse 1.2s ease-in-out infinite; }
+  .wf-human-alert-title { color:var(--red); font-size:14px; font-weight:750; }
+  .wf-human-alert[data-kind="decision"] .wf-human-alert-title { color:var(--yellow); }
+  .wf-human-alert-copy { margin-top:3px; color:var(--text2); font-size:12px; overflow-wrap:anywhere; }
+  .wf-human-alert .wf-actions { margin:9px 0 0; }
+  .wf-human-alert .btn-primary { margin-left:0; }
+  .wf-human-alert input { min-width:0; width:100%; background:var(--bg); border:1px solid var(--border); border-radius:6px; color:var(--text); padding:7px 9px; font-size:12px; }
+  .wf-human-flag { display:inline-flex; align-items:center; gap:4px; margin-top:6px; padding:2px 7px; border:1px solid var(--red); border-radius:999px; color:var(--red); font-size:10px; font-weight:750; animation:wf-human-pulse 1.2s ease-in-out infinite; }
+  .wf-human-link { margin-top:7px; color:var(--red); font-size:11px; font-weight:650; }
+  @keyframes wf-human-pulse { 0%,100% { opacity:1; transform:scale(1); } 50% { opacity:.58; transform:scale(.98); } }
+  @media (prefers-reduced-motion: reduce) { .wf-human-icon, .wf-human-flag { animation:none; } }
+  @media (max-width: 900px) { .wf-grid { grid-template-columns:minmax(160px,28%) minmax(0,1fr); } }
   @media (max-width: 720px) { .wf-grid, .wf-settings-grid, .wf-stage-editor, .wf-wizard-fields, .wf-wizard-roles, .wf-wizard-summary { grid-template-columns: 1fr; } .wf-stage-editor .wide, .wf-wizard-fields .wide { grid-column:auto; } .wf-wizard-steps { grid-template-columns:1fr 1fr; } .wf-wizard-head { align-items:flex-start; flex-direction:column; } }
 
   /* Update banner */
@@ -595,6 +707,8 @@
   .skill-arghint { font-size: 11px; color: var(--yellow); }
   .skill-desc { font-size: 11px; color: var(--text2); }
 </style>
+<link rel="stylesheet" href="/ui_shell.css?v=2">
+<script src="/ui_shell.js?v=2"></script>
 </head>
 <body>
 <div class="container">
@@ -691,14 +805,56 @@
     <button class="filter-btn" data-filter="failed">Failed</button>
     <button class="filter-btn" data-filter="rate_limited">Rate Limited</button>
     <button id="pauseBtn" class="btn-pause" onclick="toggleWorkerPause()" style="margin-left:auto">⏸ Pause</button>
+    <button class="btn-pause" onclick="openSettings()" style="margin-left:8px">⚙ Настройки</button>
+    <button class="btn-pause" id="themeBtn" onclick="toggleTheme()" style="margin-left:8px">☀ Светлая</button>
     <button class="btn-pause" onclick="openPipelines()" style="margin-left:8px">📈 Конвейеры</button>
     <button class="btn-pause" onclick="openSchedule()" style="margin-left:8px">🗓 Расписание</button>
     <button class="btn-pause" onclick="openWorkflows()" style="margin-left:8px">Workflows</button>
+    <button class="btn-pause" onclick="openParallel()" style="margin-left:8px">⚡ Parallel</button>
     <button class="btn-pause" onclick="openProviders()" style="margin-left:8px">⚙ Providers</button>
     <button class="btn-pause" onclick="openEpf()" style="margin-left:8px" title="Доработка внешних обработок 1С">🔧 1С</button>
   </div>
 
   <div class="task-list" id="taskList"></div>
+</div>
+
+<div class="modal-overlay" id="settingsModal" onclick="if(event.target===this)closeSettings()">
+  <div class="modal" style="max-width:820px">
+    <h2>⚙ Настройки <button class="btn btn-sm btn-ghost" style="margin-left:auto" onclick="closeSettings()">Закрыть</button></h2>
+    <div class="set-tabs">
+      <button class="set-tab active" data-tab="appearance" onclick="setTab('appearance')">🎨 Оформление</button>
+      <button class="set-tab" data-tab="review" onclick="setTab('review')">🛡 Проверка кода</button>
+      <button class="set-tab" data-tab="helpers" onclick="setTab('helpers')">🤖 Помощники</button>
+      <button class="set-tab" data-tab="auto" onclick="setTab('auto')">🩺 Автопилот</button>
+      <button class="set-tab" data-tab="shifts" onclick="setTab('shifts')">🔁 Смены</button>
+    </div>
+
+    <div class="set-pane" id="set-appearance">
+      <p class="cz-hint" style="margin-bottom:10px">Тема применяется сразу и запоминается.</p>
+      <div class="cz-row">
+        <label class="cz-inline"><input type="radio" name="set-theme" value="dark" onchange="applyThemeChoice()"> 🌙 Тёмная</label>
+        <label class="cz-inline"><input type="radio" name="set-theme" value="light" onchange="applyThemeChoice()"> ☀ Светлая (белый фон, чёрный текст)</label>
+      </div>
+      <div class="cz-hint" style="margin-top:8px">Светлая палитра — GitHub-Light: белые карточки, мягкие границы, чёрный текст.</div>
+    </div>
+
+    <div class="set-pane" id="set-review" style="display:none">
+      <div class="cz-row">
+        <span class="cz-label">Воркфлоу:</span>
+        <select id="set-wf" class="cz-prov" onchange="setReviewLoad()" style="max-width:280px"></select>
+      </div>
+      <div id="set-review-body"><div class="cz-hint">Загрузка…</div></div>
+    </div>
+
+    <div class="set-pane" id="set-helpers" style="display:none">
+      <p class="cz-hint" style="margin-bottom:10px">Помощники — это разные модели ИИ. Настраиваются один раз (команды запуска и ключи — для опытных), назначаются на работу во вкладке «Проверка кода».</p>
+      <div id="set-helpers-list"></div>
+    </div>
+
+    <div class="set-pane" id="set-auto" style="display:none"></div>
+
+    <div class="set-pane" id="set-shifts" style="display:none"></div>
+  </div>
 </div>
 
 <div class="modal-overlay" id="epfModal" onclick="if(event.target===this)closeEpf()">
@@ -848,6 +1004,13 @@
   </div>
 </div>
 
+<div class="modal-overlay" id="parallelModal" onclick="if(event.target===this)closeParallel()">
+  <div class="modal">
+    <h2>⚡ Параллельный конструктор <button class="btn btn-sm btn-ghost" style="margin-left:auto" onclick="closeParallel()">Закрыть</button></h2>
+    <iframe id="parallelFrame" src="/parallel" title="PromptPilot Parallel"></iframe>
+  </div>
+</div>
+
 <div class="modal-overlay" id="pipelineModal" onclick="if(event.target===this)closePipelines()">
   <div class="modal">
     <h2>📈 Конвейеры <button class="btn btn-sm btn-ghost" style="margin-left:auto" onclick="closePipelines()">✕ Закрыть</button></h2>
@@ -891,6 +1054,7 @@
       <label><input type="radio" name="pfType" value="cmd" checked onchange="pfTypeChange()"> Команда (шаблон с {prompt})</label>
       <label><input type="radio" name="pfType" value="herdr" onchange="pfTypeChange()"> herdr-сессия (живая, blocked ждёт человека)</label>
       <input id="pfCmd" placeholder='например: myai run {prompt}'>
+      <div class="cz-hint">Вместо {prompt} подставится текст задачи. API-ключи провайдера — в поле «Ключи и переменные окружения» ниже.</div>
       <div id="pfHerdr" style="display:none; flex-direction:column; gap:8px">
         <input id="pfKind" placeholder="агент: claude, codex, gemini, cursor, opencode, grok...">
         <input id="pfArgs" placeholder='доп. аргументы CLI агента, например: --model opus'>
@@ -907,7 +1071,9 @@
           <option value="max">max</option>
         </select>
       </label>
-      <textarea id="pfEnv" rows="2" placeholder="переменные окружения, по одной на строку: KEY=VALUE"></textarea>
+      <b style="font-size:13px">🔑 Ключи и переменные окружения</b>
+      <div class="cz-hint">API-ключи провайдера — по одной на строку в виде KEY=значение, например OPENAI_API_KEY=sk-… Секреты показываются маской *** — оставляйте их как есть или впишите новое значение.</div>
+      <textarea id="pfEnv" rows="3" placeholder="например:&#10;OPENAI_API_KEY=sk-...&#10;GOOSE_MODEL=glm-5.3-flash"></textarea>
       <button class="btn btn-primary" type="submit" style="align-self:flex-start">Сохранить</button>
       <div id="pfError" style="color:var(--red); font-size:13px"></div>
     </form>
@@ -1067,10 +1233,1040 @@ function taskDisplayTitle(t) {
   return firstLine ? firstLine.trim() : `Task #${t.id}`;
 }
 
+// Workflow chip: deterministic color per workflow slug + dir→slug lookup.
+function wfSlugColor(slug) {
+  let h = 0;
+  for (let i = 0; i < slug.length; i++) h = (h * 31 + slug.charCodeAt(i)) % 360;
+  return `hsl(${h}, 70%, 62%)`;
+}
+
+
+// ── ⚙ Настройки: единое окно (Оформление / Проверка кода / Помощники) ──
+
+function openSettings() { document.getElementById('settingsModal').classList.add('open'); setTab('appearance'); }
+function openReviewSettingsFor(workflowId) {
+  setReviewWf = workflowId || setReviewWf;
+  openSettings();
+  setTab('review');
+}
+function closeSettings() { document.getElementById('settingsModal').classList.remove('open'); }
+
+function setTab(name) {
+  document.querySelectorAll('.set-tab').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
+  document.querySelectorAll('.set-pane').forEach(p => p.style.display = p.id === 'set-' + name ? '' : 'none');
+  if (name === 'helpers') renderHelpersTab();
+  if (name === 'review') renderReviewTab();
+  if (name === 'auto') renderAutoTab();
+  if (name === 'shifts') renderShiftsTab();
+}
+
+// ── Тема ──
+function applyThemeChoice() {
+  const val = document.querySelector('input[name="set-theme"]:checked')?.value || 'dark';
+  document.body.classList.toggle('theme-light', val === 'light');
+  localStorage.setItem('pp-theme', val);
+  const btn = document.getElementById('themeBtn');
+  if (btn) btn.textContent = val === 'light' ? '🌙 Тёмная' : '☀ Светлая';
+}
+function toggleTheme() {
+  const cur = localStorage.getItem('pp-theme') || 'dark';
+  const next = cur === 'light' ? 'dark' : 'light';
+  localStorage.setItem('pp-theme', next);
+  document.body.classList.toggle('theme-light', next === 'light');
+  const btn = document.getElementById('themeBtn');
+  if (btn) btn.textContent = next === 'light' ? '🌙 Тёмная' : '☀ Светлая';
+  const radio = document.querySelector('input[name="set-theme"][value="' + next + '"]');
+  if (radio) radio.checked = true;
+}
+// Применить сохранённую тему сразу при загрузке страницы
+if (localStorage.getItem('pp-theme') === 'light') {
+  document.body.classList.add('theme-light');
+  document.addEventListener('DOMContentLoaded', () => {
+    const r = document.querySelector('input[name="set-theme"][value="light"]');
+    if (r) r.checked = true;
+    const btn = document.getElementById('themeBtn');
+    if (btn) btn.textContent = '🌙 Тёмная';
+  });
+}
+
+// ── Вкладка «Проверка кода»: пресеты + РЕДАКТИРУЕМЫЕ ступени ──
+let setReviewWf = null;
+let setReviewSteps = [];   // источник истины для карточек ступеней
+let setDragIdx = -1;
+
+function setProvOpts(sel) {
+  // человеческие имена в дропдаунах настроек; порядок — как во вкладке
+  // «Помощники» (ui_order), служебные (живые сессии) скрыты
+  const opts = Object.entries(providersData || {})
+    .filter(([, p]) => !p.hidden && !p.session_target)
+    .sort((a, b) => ((a[1].ui_order ?? 9999) - (b[1].ui_order ?? 9999)) || a[0].localeCompare(b[0]))
+    .map(([name, p]) => {
+      const label = (p.human && p.human.label) || name;
+      return `<option value="${escAttr(name)}"${name === sel ? ' selected' : ''}>${esc(label)}</option>`;
+    });
+  if (sel && !(providersData || {})[sel]) {
+    opts.push(`<option value="${escAttr(sel)}" selected>${esc(sel)} · недоступен</option>`);
+  }
+  return (sel ? '' : '<option value="">— выбрать —</option>') + opts.join('');
+}
+function setHumanName(pid) {
+  const h = (providersData[pid] || {}).human || {};
+  return h.label || pid;
+}
+// Кто чинит находки ступени — человеческая подпись
+function setFixerHuman(s) {
+  if (s.fixer === 'self') return 'сам проверяющий';
+  if (s.fixer === 'executor' || !s.fixer) return 'исполнитель (пишет код)';
+  return setHumanName(s.fixer);
+}
+function setStepHint(s) {
+  const autoAttempts = document.getElementById('set-attempt-mode')?.value === 'auto';
+  const bits = [`исправляет: ${setFixerHuman(s)}`, autoAttempts ? 'попыток: авто (1/2/3)' : `раундов: ${s.max_rounds || 2}`];
+  if (s.window) bits.push(`🌙 ждёт окна ${s.window.from || '22:00'}–${s.window.to || '04:00'} (МСК)`);
+  if (s.blocking === false) bits.push('не блокирующая');
+  return bits.join(' · ');
+}
+
+function attemptNumber(id, fallback) {
+  const parsed = parseInt(document.getElementById(id)?.value, 10);
+  return Number.isFinite(parsed) ? Math.max(1, Math.min(10, parsed)) : fallback;
+}
+
+function renderReviewTab() {
+  const sel = document.getElementById('set-wf');
+  if (!sel.options.length) {
+    (workflowCache || []).forEach(w => {
+      const o = document.createElement('option');
+      o.value = w.id; o.textContent = w.slug;
+      sel.appendChild(o);
+    });
+  }
+  if (setReviewWf && [...sel.options].some(o => o.value === setReviewWf)) sel.value = setReviewWf;
+  setReviewLoad();
+}
+
+function setReviewLoad() {
+  setReviewWf = document.getElementById('set-wf').value;
+  const wf = (workflowCache || []).find(x => x.id === setReviewWf);
+  const body = document.getElementById('set-review-body');
+  if (!wf) { body.innerHTML = '<div class="cz-hint">Воркфлоу не найден.</div>'; return; }
+  const chain = (wf.config && wf.config.review_chain) || { enabled: false, steps: [] };
+  setReviewSteps = JSON.parse(JSON.stringify(chain.steps || []));
+  const execProv = wf.config?.roles?.executor?.provider || '';
+  const revProv = wf.config?.roles?.reviewer?.provider || '';
+  const automation = wf.config?.automation || {};
+  const attemptPolicy = chain.attempt_policy || {};
+  const attemptBySeverity = attemptPolicy.by_severity || {};
+  const cascadeOwnsReview = chain.enabled &&
+    automation.auto_dispatch_reviewer === false &&
+    automation.auto_apply_review === false &&
+    automation.auto_resume_revision === false;
+  const preset = setDetectPreset(setReviewSteps, chain.enabled);
+  body.innerHTML = `
+    <div class="cz-row">
+      <span class="cz-label">Кто пишет код:</span>
+      <select id="set-exec" class="cz-prov" style="max-width:300px">${setProvOpts(execProv)}</select>
+      <span class="cz-hint" id="set-exec-note">${execProv && !(providersData[execProv] || {}).human ? 'у этого помощника нет человеческого имени — задать можно в Помощниках' : ''}</span>
+    </div>
+    <div class="cz-row" style="margin-top:10px"><span class="cz-label">Как проверяют код:</span></div>
+    <div class="cz-row">
+      <label class="cz-inline"><input type="radio" name="set-preset" value="standard" ${preset === 'standard' ? 'checked' : ''} onchange="setPreset('standard')"> 🛡 Обычная</label>
+      <label class="cz-inline"><input type="radio" name="set-preset" value="strict" ${preset === 'strict' ? 'checked' : ''} onchange="setPreset('strict')"> 🛡🛡 Строгая (двойная)</label>
+      <label class="cz-inline"><input type="radio" name="set-preset" value="none" ${preset === 'none' ? 'checked' : ''} onchange="setPreset('none')"> ⏭ Без каскада</label>
+    </div>
+    <div class="cz-hint">Пресет заполняет ступени ниже — после этого любую ступень можно поменять вручную и сохранить.
+      ${chain.enabled && (chain.steps || []).length ? `<br>При включённом каскаде ревьюер из каждой ступени получает отдельный аудит; его провайдер получает и задачу исправления, если выбран «сам проверяющий».<br><b style="color:${cascadeOwnsReview ? 'var(--green)' : 'var(--yellow)'}">${cascadeOwnsReview ? '✓ Каскадный контроллер управляет переходами' : '⚠ Нажмите «Сохранить»: старые автоматические переходы ещё не переданы каскаду'}</b>` : ''}
+      ${preset === 'none' ? `Сейчас работает обычный ревьюер воркфлоу${revProv ? ': ' + esc(setHumanName(revProv)) : ''}.` : ''}</div>
+    <details style="margin-top:10px"><summary class="cz-hint" style="cursor:pointer">❓ Что значат все эти настройки — подробное объяснение для не-программиста</summary>
+      <div class="cz-hint" style="margin-top:8px;line-height:1.6">
+        <b>Ступень</b> — один круг проверки кода. «Строгая» проверка = две ступени подряд: сначала первый помощник, затем второй. Каждая ступень — карточка ниже.<br><br>
+        <b>🛡 Кто пишет код</b> — помощник, который делает основную работу (пишет и правит код по заданию этапа).<br><br>
+        <b>Находки чинит</b> — кто исправляет замечания проверяющего:<br>
+        • «сам проверяющий» — кто нашёл, тот и чинит. Быстрее и дешевле, подходит для мелких правок.<br>
+        • «исполнитель» — замечание уходит тому, кто писал код. Надёжнее для крупных переделок.<br>
+        <i>Пример: ГЛМ нашёл ошибку → МиниМакс чинит → ГЛМ перепроверяет.</i><br><br>
+        <b>Раундов</b> (в карточке ступени) — сколько раз может повториться круг «нашли → починили → перепроверили» для этой ступени. Кончились попытки → действует правило исчерпания (в редакторе каскада в карточке воркфлоу: планер решает / принять при зелёных тестах / спросить вас).<br><br>
+        <b>Блокирующая</b> — строгость ступени:<br>
+        • <b>Включена</b> — пока есть незакрытые замечания, следующий этап НЕ начинается. Ошибки не проезжают в проект, но конвейер может стоять пока чинят.<br>
+        • <b>Выключена</b> — замечания пишутся в «лист долга», конвейер едет дальше. Быстрее, но долг копится и всплывёт на финальной проверке.<br><br>
+        <b>🌙 Ночное окно</b> — ступень работает только в указанные часы (ночью тариф проверяющего часто в разы дешевле). Вне окна ступень пропускается, конвейер не ждёт.<br>
+        <i>Пример: окно 22:00–04:00 — вечером этап едет без этой ступени, а к утру Квен ночью всё проверил.</i><br><br>
+        <b>Попытки исправления</b> — сколько раз конвейер пробует починить замечание, прежде чем звать человека:<br>
+        • «Авто по тяжести» — число попыток выбирается само по серьёзности замечания: low (мелочь — форматирование, опечатка) → 1 попытка; medium (среднее — некорректная логика в узком месте) → 2; high (серьёзное — ошибка в основной функции) и blocker (пропускать нельзя — краш, потеря данных) → 3.<br>
+        • «Вручную» — вы сами задаёте «раундов» в каждой карточке ступени.<br>
+        • «Правила авто» (по умолчанию / максимум / low / medium / high / blocker) — точные числа попыток для каждого случая; «максимум» — потолок для любого правила. <i>Пример: blocker = 4, максимум = 3 → серьёзное замечание получит 3 попытки, не 4.</i><br><br>
+        <b>Пресеты</b> — готовые наборы:<br>
+        • 🛡 Обычная — один проверяющий (ГЛМ), сам чинит. Баланс цены и качества на каждый день.<br>
+        • 🛡🛡 Строгая — двойная проверка (ГЛМ + Квен ночью) для важных этапов.<br>
+        • ⏭ Без каскада — ступеней нет, проверяет штатный ревьюер воркфлоу (его назначение — в карточке воркфлоу, раздел настроек роли).
+      </div>
+    </details>
+    <div class="cz-row" style="margin-top:8px">
+      <span class="cz-label">Попытки исправления:</span>
+      <select id="set-attempt-mode" class="cz-prov" style="max-width:300px">
+        <option value="auto" ${(chain.attempt_policy?.mode || 'manual') === 'auto' ? 'selected' : ''}>Авто по тяжести замечаний (1/2/3)</option>
+        <option value="manual" ${(chain.attempt_policy?.mode || 'manual') !== 'auto' ? 'selected' : ''}>Вручную по каждой ступени</option>
+      </select>
+      <span class="cz-hint">low → 1, medium → 2, high/blocker → 3; число в карточке используется в ручном режиме.</span>
+    </div>
+    <div class="cz-row" style="margin-top:6px;gap:6px;flex-wrap:wrap">
+      <span class="cz-label-sm">Правила авто:</span>
+      <label class="cz-inline">по умолчанию <input id="set-attempt-default" type="number" min="1" max="10" value="${attemptPolicy.default || 2}" style="width:44px"></label>
+      <label class="cz-inline">максимум <input id="set-attempt-max" type="number" min="1" max="10" value="${attemptPolicy.max || 3}" style="width:44px"></label>
+      <label class="cz-inline">low <input id="set-attempt-low" type="number" min="1" max="10" value="${attemptBySeverity.low || 1}" style="width:44px"></label>
+      <label class="cz-inline">medium <input id="set-attempt-medium" type="number" min="1" max="10" value="${attemptBySeverity.medium || 2}" style="width:44px"></label>
+      <label class="cz-inline">high <input id="set-attempt-high" type="number" min="1" max="10" value="${attemptBySeverity.high || 3}" style="width:44px"></label>
+      <label class="cz-inline">blocker <input id="set-attempt-blocker" type="number" min="1" max="10" value="${attemptBySeverity.blocker || 3}" style="width:44px"></label>
+    </div>
+    <div class="cz-hint">Эти числа работают только в режиме «Авто»; общий максимум ограничивает каждое правило.</div>
+    <div id="set-slots" style="margin-top:8px"></div>
+    <div class="cz-row" style="margin-top:6px">
+      <button class="btn btn-sm btn-ghost" onclick="setAddStep()">+ Добавить ступень</button>
+      <span class="cz-hint">ступени идут по порядку сверху вниз; карточку можно перетащить мышью за ⠿ или стрелками ↑↓</span>
+    </div>
+    <div class="cz-row" style="margin-top:10px">
+      <button class="btn btn-sm btn-primary" onclick="setReviewSave()">Сохранить</button>
+      <span class="cz-hint">действует с ближайшего диспетча</span>
+    </div>`;
+  renderSetSlots();
+}
+
+function setDetectPreset(steps, enabled) {
+  if (!steps.length) return enabled ? 'custom' : 'none';
+  const one = steps.length === 1 && steps[0].provider === 'goose-zai' && steps[0].fixer === 'self' && !steps[0].window;
+  const two = steps.length === 2 && steps[1].provider === 'qwen-review' && !!(steps[1].window);
+  if (one && !two) return 'standard';
+  if (one && two) return 'strict';
+  return 'custom';
+}
+
+function renderSetSlots() {
+  const box = document.getElementById('set-slots');
+  if (!box) return;
+  box.innerHTML = setReviewSteps.map((s, i) => {
+    const win = s.window || {};
+    const fixer = s.fixer || 'executor';
+    const customFixer = !['executor', 'self'].includes(fixer);
+    return `<div class="cz-card" draggable="true" data-set-slot="${i}"
+        ondragstart="setDragStart(event,${i})" ondragover="setDragOver(event,${i})"
+        ondrop="setDrop(event,${i})" ondragend="setDragEnd(event)">
+      <div class="cz-row">
+        <span class="cz-label" style="cursor:grab" title="перетащить, чтобы поменять порядок">⠿</span>
+        <span class="cz-label">Ступень ${i + 1}:</span>
+        <select class="cz-prov" onchange="setProvChanged(${i}, this.value)">${setProvOpts(s.provider)}</select>
+        <button class="btn btn-sm btn-ghost" onclick="setMove(${i},-1)" ${i === 0 ? 'disabled' : ''} title="поднять ступень">↑</button>
+        <button class="btn btn-sm btn-ghost" onclick="setMove(${i},1)" ${i === setReviewSteps.length - 1 ? 'disabled' : ''} title="опустить ступень">↓</button>
+        <button class="btn btn-sm btn-danger" onclick="setRemoveStep(${i})" title="убрать ступень">✕</button>
+      </div>
+      <div class="cz-row">
+        <span class="cz-label-sm" title="кто будет исправлять замечания, которые найдёт этот проверяющий">Находки чинит:</span>
+        <select class="cz-fixer" onchange="setFixerChanged(${i}, this.value)" title="сам проверяющий = быстрее и дешевле; исполнитель = надёжнее для крупных правок">
+          <option value="self" ${fixer === 'self' ? 'selected' : ''}>сам проверяющий</option>
+          <option value="executor" ${fixer === 'executor' ? 'selected' : ''}>исполнитель (кто пишет код)</option>
+          <option value="custom" ${customFixer ? 'selected' : ''}>указать помощника</option>
+        </select>
+        <select class="cz-fixer-custom" style="display:${customFixer ? '' : 'none'}" onchange="setFixerCustomChanged(${i}, this.value)">${setProvOpts(customFixer ? fixer : '')}</select>
+        <label class="cz-inline" style="margin-left:10px" title="сколько раз повторится круг «нашли → починили → перепроверили», пока не сработает правило исчерпания">раундов:
+          <input type="number" min="1" max="10" value="${s.max_rounds || 2}" onchange="setNumChanged(${i}, this.value)" style="width:44px">
+        </label>
+      </div>
+      <div class="cz-row">
+        <label class="cz-inline" title="ВКЛ: пока есть незакрытые замечания — следующий этап не начинается. ВЫКЛ: замечания копятся в лист долга, конвейер едет дальше" style="cursor:help"><input type="checkbox" ${s.blocking !== false ? 'checked' : ''} onchange="setBlockingChanged(${i}, this.checked)"> блокирующая</label>
+        <label class="cz-inline" style="margin-left:10px;cursor:help" title="ступень работает только в эти часы (ночью тариф часто дешевле); вне окна ступень пропускается"><input type="checkbox" ${win.from ? 'checked' : ''} onchange="setWindowChanged(${i}, this.checked)"> 🌙 ночное окно</label>
+        <span ${win.from ? '' : 'style="display:none"'}>с
+          <input type="time" value="${win.from || '22:00'}" onchange="setWindowTime(${i},'from',this.value)" style="width:74px">
+          до
+          <input type="time" value="${win.to || '04:00'}" onchange="setWindowTime(${i},'to',this.value)" style="width:74px">
+          МСК</span>
+      </div>
+      <div class="cz-row">
+        <span class="cz-hint">${setStepHint(s)}</span>
+      </div>
+    </div>`;
+  }).join('') ||
+    `<div class="cz-hint">Ступеней нет. «Сохранить» выключит каскад — проверки уйдут обычному ревьюеру из настроек воркфлоу.</div>`;
+}
+
+function setReadSlots() {
+  // перенести текущие значения DOM в массив (перед мутирующими операциями)
+  document.querySelectorAll('#set-slots .cz-card').forEach(card => {
+    const i = parseInt(card.dataset.setSlot, 10);
+    const s = setReviewSteps[i];
+    if (!s) return;
+    s.provider = card.querySelector('.cz-prov').value || s.provider;
+    const fixerSelect = card.querySelector('.cz-fixer');
+    const customFixer = card.querySelector('.cz-fixer-custom');
+    s.fixer = fixerSelect.value === 'custom'
+      ? (customFixer?.value || s.fixer || 'executor')
+      : (fixerSelect.value || 'executor');
+    s.max_rounds = parseInt(card.querySelector('input[type="number"]').value, 10) || 2;
+    s.blocking = card.querySelector('input[type="checkbox"]:not([onchange*="setWindowChanged"])').checked;
+    s.window = card.querySelector('input[onchange*="setWindowChanged"]').checked
+      ? { from: card.querySelector('input[type="time"]').value || '22:00',
+          to: card.querySelectorAll('input[type="time"]')[1]?.value || '04:00',
+          tz_offset_hours: 3 } : undefined;
+  });
+}
+
+function setPreset(name) {
+  const builders = {
+    standard: () => [{ provider: 'goose-zai', fixer: 'self', blocking: true, max_rounds: 2 }],
+    strict: () => [
+      { provider: 'goose-zai', fixer: 'self', blocking: true, max_rounds: 2 },
+      { provider: 'qwen-review', fixer: 'goose-zai', blocking: true, max_rounds: 3,
+        window: { from: '22:00', to: '04:00', tz_offset_hours: 3 } },
+    ],
+    none: () => [],
+  };
+  setReviewSteps = (builders[name] || (() => []))();
+  const attemptMode = document.getElementById('set-attempt-mode');
+  if (attemptMode) attemptMode.value = name === 'none' ? 'manual' : 'auto';
+  renderSetSlots();
+}
+
+function setAddStep() {
+  setReadSlots();
+  setReviewSteps.push({ provider: 'goose-zai', fixer: 'self', blocking: true, max_rounds: 2 });
+  renderSetSlots();
+}
+function setRemoveStep(i) {
+  setReadSlots();
+  setReviewSteps.splice(i, 1);
+  renderSetSlots();
+}
+function setMove(i, dir) {
+  setReadSlots();
+  const j = i + dir;
+  if (j < 0 || j >= setReviewSteps.length) return;
+  [setReviewSteps[i], setReviewSteps[j]] = [setReviewSteps[j], setReviewSteps[i]];
+  renderSetSlots();
+}
+function setProvChanged(i, v) { setReviewSteps[i].provider = v; refreshSetHints(); }
+function setFixerChanged(i, v) {
+  if (v === 'custom') {
+    const current = setReviewSteps[i].fixer;
+    if (!current || ['custom', 'self', 'executor'].includes(current)) {
+      setReviewSteps[i].fixer = Object.keys(providersData || {}).find(name =>
+        !['self', 'executor'].includes(name) && !(providersData[name] || {}).hidden
+      ) || 'executor';
+    }
+  } else {
+    setReviewSteps[i].fixer = v;
+  }
+  renderSetSlots();
+}
+function setFixerCustomChanged(i, v) {
+  setReviewSteps[i].fixer = v || 'executor';
+  refreshSetHints();
+}
+function setNumChanged(i, v) { setReviewSteps[i].max_rounds = parseInt(v, 10) || 2; refreshSetHints(); }
+function setBlockingChanged(i, checked) { setReviewSteps[i].blocking = checked; refreshSetHints(); }
+function setWindowChanged(i, checked) {
+  setReviewSteps[i].window = checked
+    ? { from: '22:00', to: '04:00', tz_offset_hours: 3 } : undefined;
+  renderSetSlots();
+}
+function setWindowTime(i, key, v) {
+  if (setReviewSteps[i].window) { setReviewSteps[i].window[key] = v; refreshSetHints(); }
+}
+function refreshSetHints() {
+  document.querySelectorAll('#set-slots .cz-card').forEach(card => {
+    const s = setReviewSteps[parseInt(card.dataset.setSlot, 10)];
+    if (s) card.querySelector('.cz-hint').textContent = setStepHint(s);
+  });
+}
+
+// Drag-and-drop порядка ступеней
+function setDragStart(ev, i) { setDragIdx = i; ev.dataTransfer.effectAllowed = 'move'; }
+function setDragOver(ev, i) { ev.preventDefault(); ev.dataTransfer.dropEffect = 'move'; }
+function setDrop(ev, i) {
+  ev.preventDefault();
+  if (setDragIdx < 0 || setDragIdx === i) return;
+  setReadSlots();
+  const [moved] = setReviewSteps.splice(setDragIdx, 1);
+  setReviewSteps.splice(i, 0, moved);
+  setDragIdx = -1;
+  renderSetSlots();
+}
+function setDragEnd() { setDragIdx = -1; }
+
+async function setReviewSave() {
+  const wfId = document.getElementById('set-wf').value;
+  const wf = (workflowCache || []).find(x => x.id === wfId);
+  if (!wf) { toast('Воркфлоу не найден'); return; }
+  setReadSlots();
+  const steps = setReviewSteps.filter(s => s.provider);
+  const exec = document.getElementById('set-exec')?.value || '';
+  if (steps.length && steps.some(s => !s.provider)) { toast('У ступени не выбран помощник'); return; }
+  const cfg = JSON.parse(JSON.stringify(wf.config));
+  const oldChain = cfg.review_chain || {};
+  const oldRoles = cfg.roles || {};
+  const oldAutomation = cfg.automation || {};
+  const chainEnabled = steps.length > 0;
+  const baseExecutor = oldChain.base_executor_provider ?? oldRoles.executor?.provider ?? exec ?? null;
+  const baseReviewer = oldChain.base_reviewer_provider ?? oldRoles.reviewer?.provider ?? null;
+  const baseReviewerPrompt = oldChain.base_reviewer_prompt_template ?? oldRoles.reviewer?.prompt_template ?? '';
+  const attemptMode = document.getElementById('set-attempt-mode')?.value || oldChain.attempt_policy?.mode || 'manual';
+  const attemptDefault = attemptNumber('set-attempt-default', 2);
+  const attemptMax = Math.max(attemptDefault, attemptNumber('set-attempt-max', 3));
+  const boundedAttempt = id => Math.min(attemptMax, attemptNumber(id, attemptDefault));
+  const attemptPolicy = {
+    ...(oldChain.attempt_policy || {}),
+    mode: attemptMode,
+    default: attemptDefault,
+    max: attemptMax,
+    by_severity: {
+      low: boundedAttempt('set-attempt-low'),
+      medium: boundedAttempt('set-attempt-medium'),
+      high: boundedAttempt('set-attempt-high'),
+      blocker: boundedAttempt('set-attempt-blocker'),
+    },
+  };
+  cfg.review_chain = {
+    ...oldChain,
+    enabled: chainEnabled,
+    steps: steps.map((s, i) => ({ ...s, slot: i + 1 })),
+    attempt_policy: attemptPolicy,
+    base_executor_provider: baseExecutor,
+    base_reviewer_provider: baseReviewer,
+    base_reviewer_prompt_template: baseReviewerPrompt,
+  };
+  if (exec) {
+    cfg.roles = cfg.roles || {};
+    cfg.roles.executor = { ...(cfg.roles.executor || {}), provider: exec };
+  }
+  cfg.roles = cfg.roles || {};
+  cfg.roles.reviewer = { ...(cfg.roles.reviewer || {}) };
+  cfg.automation = { ...oldAutomation };
+  if (chainEnabled) {
+    // The core has one reviewer slot.  The additive cascade controller owns
+    // reviewer dispatch, intermediate PASS decisions, and revision resumes.
+    cfg.roles.reviewer.provider = steps[0].provider;
+    cfg.automation.auto_dispatch_reviewer = false;
+    cfg.automation.auto_apply_review = false;
+    cfg.automation.auto_resume_revision = false;
+  } else {
+    // Removing the cascade returns the workflow to the core's ordinary
+    // single-reviewer behavior and restores the provider used before it.
+    if (baseReviewer) cfg.roles.reviewer.provider = baseReviewer;
+    if (Object.prototype.hasOwnProperty.call(cfg.review_chain, 'base_reviewer_prompt_template')) {
+      cfg.roles.reviewer.prompt_template = baseReviewerPrompt;
+    }
+    cfg.automation.auto_dispatch_reviewer = true;
+    cfg.automation.auto_apply_review = true;
+    cfg.automation.auto_resume_revision = true;
+  }
+  try {
+    await fetchJSON(`${API}/workflows/${wfId}`, {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ config: cfg, expected_version: wf.state_version }),
+    });
+    toast(steps.length ? 'Проверка кода сохранена — каскад управляет ближайшим ревью-этапом.' : 'Каскад выключен — работает обычный ревьюер.', false);
+    await loadWorkflows();
+    setReviewLoad();
+  } catch (e) {
+    toast('Сохранение: ' + e.message);
+  }
+}
+
+// ── Вкладка «Помощники»: кликабельные карточки → свойства провайдера ──
+async function helperConfigure(name) {
+  await openProviders();          // загружает provManageData
+  provEdit(name);                 // заполняет форму свойств этого провайдера
+}
+
+let helperDragIdx = -1;
+
+function renderHelpersTab() {
+  const list = document.getElementById('set-helpers-list');
+  const humanLen = (p) => (p.human && Object.keys(p.human).length) ? 1 : 0;
+  const entries = Object.entries(providersData || {}).filter(([n, p]) => !p.hidden)
+    .sort((a, b) => ((a[1].ui_order ?? 9999) - (b[1].ui_order ?? 9999)) ||
+      (humanLen(b[1]) - humanLen(a[1])) || a[0].localeCompare(b[0]));
+  const roleLabel = { writer: 'пишет код', reviewer: 'проверяет код', planner: 'планирует', both: 'пишет и проверяет' };
+  // где помощник сейчас задействован (по воркфлоу из вкладки «Проверка кода»)
+  const wf = (workflowCache || []).find(x => x.id === setReviewWf) || (workflowCache || [])[0];
+  const busy = {};
+  if (wf) {
+    const ep = wf.config?.roles?.executor?.provider; if (ep) busy[ep] = busy[ep] || [];
+    busy[ep].push(`пишет код в «${wf.slug}»`);
+    const rp = wf.config?.roles?.reviewer?.provider; if (rp) busy[rp] = busy[rp] || [];
+    busy[rp].push(`обычный ревьюер в «${wf.slug}»`);
+    ((wf.config?.review_chain || {}).steps || []).forEach((s, i) => {
+      busy[s.provider] = busy[s.provider] || [];
+      busy[s.provider].push(`ступень ${i + 1} проверки`);
+      if (s.fixer && !['self', 'executor'].includes(s.fixer)) {
+        busy[s.fixer] = busy[s.fixer] || [];
+        busy[s.fixer].push(`чинит за ступень ${i + 1}`);
+      }
+    });
+    const pp = wf.config?.roles?.planner?.provider; if (pp) busy[pp] = busy[pp] || [];
+    busy[pp].push('планировщик');
+  }
+  list.innerHTML = entries.map(([name, p], i) => {
+    const h = p.human || {};
+    const label = h.label || name;
+    const role = h.role ? (roleLabel[h.role] || h.role) : '';
+    const now = (busy[name] || []).join(' · ');
+    return `<div class="cz-card" draggable="true" data-helper-idx="${i}" style="cursor:pointer"
+        onclick="helperConfigure('${escAttr(name)}')" title="нажмите, чтобы открыть свойства помощника"
+        ondragstart="helperDragStart(event,${i})" ondragover="helperDragOver(event,${i})"
+        ondrop="helperDrop(event,${i})" ondragend="helperDragIdx = -1">
+      <div class="cz-row">
+        <span class="cz-label" style="cursor:grab" title="перетащите карточку, чтобы изменить порядок помощников">⠿</span>
+        <b>${esc(label)}</b>
+        ${role ? `<span class="cz-hint">· ${esc(role)}</span>` : ''}
+        ${p.available === false ? '<span class="cz-hint" style="color:var(--red)">· недоступен</span>' : ''}
+        <span style="margin-left:auto;display:flex;gap:6px">
+          <button class="btn btn-sm btn-ghost" onclick="event.stopPropagation();helperConfigure('${escAttr(name)}')">⚙ Свойства</button>
+        </span>
+      </div>
+      ${h.desc ? `<div class="cz-hint">${esc(h.desc)}</div>` : ''}
+      ${now ? `<div class="cz-hint" style="color:var(--cyan)">сейчас: ${esc(now)}</div>` : '<div class="cz-hint" style="color:var(--text2)">сейчас нигде не задействован</div>'}
+      <div class="cz-hint">технически: ${esc(name)}</div>
+    </div>`;
+  }).join('');
+  if (!entries.length) list.innerHTML = '<div class="cz-hint">Помощников нет — добавьте в ⚙ Providers.</div>';
+  else list.insertAdjacentHTML('beforeend',
+    '<div class="cz-hint" style="margin-top:8px">Карточку можно перетащить за ⠿ — порядок сохранится и появится в выпадающих списках «Проверки кода». Клик по карточке — свойства (команда запуска, ключи, модель).</div>');
+}
+
+function helperDragStart(ev, i) {
+  // тянем только за маркер ⠿, чтобы клик по карточке открывал свойства
+  if (!ev.target.closest || !ev.target.closest('.cz-label[style*="cursor:grab"]')) {
+    ev.preventDefault(); return;
+  }
+  helperDragIdx = i;
+  ev.dataTransfer.effectAllowed = 'move';
+}
+function helperDragOver(ev, i) { ev.preventDefault(); ev.dataTransfer.dropEffect = 'move'; }
+async function helperDrop(ev, i) {
+  ev.preventDefault();
+  if (helperDragIdx < 0 || helperDragIdx === i) return;
+  const humanLen = (p) => (p.human && Object.keys(p.human).length) ? 1 : 0;
+  const entries = Object.entries(providersData || {}).filter(([n, p]) => !p.hidden)
+    .sort((a, b) => ((a[1].ui_order ?? 9999) - (b[1].ui_order ?? 9999)) ||
+      (humanLen(b[1]) - humanLen(a[1])) || a[0].localeCompare(b[0]));
+  const [moved] = entries.splice(helperDragIdx, 1);
+  entries.splice(i, 0, moved);
+  helperDragIdx = -1;
+  try {
+    await fetchJSON(`${API}/providers/reorder`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ names: entries.map(([n]) => n) }),
+    });
+    await loadProviders();          // обновит ui_order в providersData
+    renderHelpersTab();
+  } catch (e) { toast('Порядок не сохранён: ' + e.message); }
+}
+
+// ── Вкладка «Автопилот»: Jev (TypeSafe) — решатель самопочинки ──
+async function renderAutoTab() {
+  const pane = document.getElementById('set-auto');
+  let st = {};
+  try { st = await fetchJSON(`${API}/typesafe`); }
+  catch (e) {
+    pane.innerHTML = `<div class="cz-hint">Служба самопочинки недоступна (${esc(e.message)}). Обновите страницу после перезапуска сервера.</div>`;
+    return;
+  }
+  const statusLine = st.active === 'env'
+    ? '✅ Ключ найден в переменной окружения TYPESAFE_API_KEY — она приоритетнее файла.'
+    : st.active === 'file'
+      ? `✅ Ключ найден в файле <code>${esc(st.file_path)}</code>.`
+      : '❌ Ключ не задан — авто-решения Jev работать не будут (будет только уведомление вам).';
+  pane.innerHTML = `
+    <div class="cz-row"><b>🧠 Jev (TypeSafe) — решает «продолжить самому или позвать вас»</b></div>
+    <div class="cz-hint" style="margin:6px 0 10px">Когда исполнитель теряет итоговую строку отчёта или зависает, вотчер самопочинки показывает отчёт решателю Jev. Однозначное «работа сделана» — конвейер продолжается сам; сомнение — остановка и уведомление вам. Jev — не языковая модель и код не пишет.</div>
+    <div class="cz-row"><span id="ts-status">${statusLine}</span></div>
+    <div class="cz-row" style="margin-top:10px">
+      <input type="password" id="ts-key" placeholder="вставьте ключ TypeSafe" style="flex:1;min-width:220px">
+      <button class="btn btn-sm btn-primary" onclick="tsSaveKey()">Сохранить ключ</button>
+      <button class="btn btn-sm btn-ghost" onclick="tsTest()">Проверить связь</button>
+    </div>
+    <div class="cz-hint" id="ts-msg" style="margin-top:6px">Ключ хранится только на этом компьютере и начинает действовать сразу, без перезапуска. ${st.env_set ? 'Внимание: сейчас активен ключ из переменной окружения — файл будет запасным.' : ''}</div>
+    <div id="qf-block"></div>`;
+  try {
+    const qf = await fetchJSON(`${API}/quota-failover`);
+    const el = document.getElementById('qf-block');
+    if (!qf.available) {
+      el.innerHTML = '<div class="cz-hint" style="margin-top:10px">🪫 Лестница смен: вотчер ещё не сделал ни одного замера (запускается вместе с системой).</div>';
+    } else {
+      const modeLine = (qf.rung ?? 0) > 0
+        ? `<b style="color:var(--yellow)">⚠ смена ${(qf.rung ?? 0) + 1}</b> — работает исполнитель ${esc(qf.run_executor || '')}${qf.switch_reason ? ', причина: ' + esc(qf.switch_reason) : ''}`
+        : '<b style="color:var(--green)">✓ основная смена</b>';
+      el.innerHTML = `
+        <div class="cz-row" style="margin-top:14px"><b>🪫 Лестница смен (авто-переключение при исчерпании квот)</b></div>
+        <div class="cz-hint" style="margin:6px 0">Исполнители выстраиваются в очередь: квота кончилась — конвейер сам переходит на следующую смену (её исполнитель + её схема ревью), восстановилась — возвращается. Состав настраивается во вкладке «🔁 Смены».</div>
+        <div class="cz-row">${modeLine}</div>
+        <div class="cz-row"><span class="cz-hint">${qf.info ? esc(qf.info) + ' · ' : ''}${qf.last_check ? 'замер ' + esc(String(qf.last_check).replace('T', ' ')) : ''}</span></div>`;
+    }
+  } catch (e) { /* блок не критичен */ }
+}
+
+// ── Вкладка «🔁 Смены»: лестница исполнителей на случай исчерпания квот ──
+let qfConfig = null;
+let qfDragIdx = -1;
+
+const QF_REVIEW_LABELS = {
+  keep: 'как настроено в 🛡 Проверке кода',
+  standard: '🛡 Обычная (ГЛМ сам чинит)',
+  strict: '🛡🛡 Строгая (ГЛМ + Квен ночью)',
+  qwen_main: '🧐 Квен — главный ревьюер',
+  none: '⏭ без каскада',
+};
+
+async function renderShiftsTab() {
+  const pane = document.getElementById('set-shifts');
+  let cfg = null, status = {};
+  try { cfg = await fetchJSON(`${API}/quota-failover/config`); } catch (e) {}
+  try { status = await fetchJSON(`${API}/quota-failover`); } catch (e) {}
+  if (!cfg || !Array.isArray(cfg.ladder)) {
+    pane.innerHTML = '<div class="cz-hint">Конфиг лестницы недоступен — перезапустите сервер (нужен новый api.py).</div>';
+    return;
+  }
+  qfConfig = cfg;
+  const rungNow = status.rung ?? 0;
+  const statusLine = status.available
+    ? `Сейчас: <b>смена ${rungNow + 1}${rungNow === 0 ? ' (основная)' : ''}</b>` +
+      (status.info ? ` · ${esc(status.info)}` : '') +
+      (status.last_check ? ` · проверка ${esc(String(status.last_check).replace('T', ' '))}` : '')
+    : 'Вотчер ещё не сделал ни одного замера.';
+  const cards = cfg.ladder.map((r, i) => `
+    <div class="cz-card" draggable="true" data-qf-idx="${i}"
+        ondragstart="qfDragStart(event,${i})" ondragover="qfDragOver(event,${i})"
+        ondrop="qfDrop(event,${i})" ondragend="qfDragIdx = -1">
+      <div class="cz-row">
+        <span class="cz-label" style="cursor:grab" title="перетащите, чтобы поменять порядок смен">⠿</span>
+        <span class="cz-label">Смена ${i + 1}:</span>
+        <input type="text" value="${escAttr(r.name || '')}" data-qf-field="name" placeholder="название" style="width:150px">
+        <select data-qf-field="executor">${setProvOpts(r.executor)}</select>
+        ${i === rungNow ? '<span class="role-chip role-review" title="работает сейчас">активна</span>' : ''}
+        <button class="btn btn-sm btn-ghost" onclick="qfMove(${i},-1)" ${i === 0 ? 'disabled' : ''}>↑</button>
+        <button class="btn btn-sm btn-ghost" onclick="qfMove(${i},1)" ${i === cfg.ladder.length - 1 ? 'disabled' : ''}>↓</button>
+        <button class="btn btn-sm btn-danger" onclick="qfRemove(${i})" title="убрать смену">✕</button>
+      </div>
+      <div class="cz-row">
+        <span class="cz-label-sm" title="как проверять исчерпание квоты этой смены">Проверка квоты:</span>
+        <select data-qf-field="quota">
+          <option value="">по ошибкам задач (429/лимиты) — любой провайдер</option>
+          <option value="mmx" ${r.quota && (r.quota.cmd || '').includes('mmx') ? 'selected' : ''}>штатная MiniMax (mmx quota show)</option>
+        </select>
+      </div>
+      <div class="cz-row">
+        <span class="cz-label-sm" title="схема проверки кода, пока эта смена работает">Ревью на смене:</span>
+        <select data-qf-field="review">
+          ${Object.entries(QF_REVIEW_LABELS).map(([v, l]) =>
+            `<option value="${v}" ${(r.review || 'keep') === v ? 'selected' : ''}>${l}</option>`).join('')}
+        </select>
+      </div>
+    </div>`).join('');
+  pane.innerHTML = `
+    <div class="cz-row"><b>🔁 Лестница смен исполнителей</b></div>
+    <div class="cz-hint" style="margin:6px 0 10px">Конвейер работает на первой смене. Квота исчерпалась (штатная проверка или повторные ошибки «лимит/429») — автоматически переходит на следующую смену целиком: её исполнитель и её схема ревью. Квота верхней смены восстановилась — возврат на неё между задачами (текущая задача не рвётся). У любой смены можно выбрать любого помощника — состав не привязан к конкретным моделям.</div>
+    <div class="cz-row"><span class="cz-hint">${statusLine}</span></div>
+    <div id="qf-cards" style="margin-top:8px">${cards}</div>
+    <div class="cz-row" style="margin-top:6px">
+      <button class="btn btn-sm btn-ghost" onclick="qfAdd()">+ Добавить смену</button>
+      <button class="btn btn-sm btn-ghost" onclick="qfPreset()" title="заполнить типовой набор: МиниМакс → ГЛМ-Быстрый+Квен → GPT">Заполнить нашу типовую лестницу</button>
+    </div>
+    <details style="margin-top:10px"><summary class="cz-hint" style="cursor:pointer">▸ Пороги и тонкости (для опытных)</summary>
+      <div class="cz-row" style="margin-top:8px">
+        <label class="cz-inline" title="остаток квоты ниже этого процента — сменить">уход в фейловер при остатке ≤
+          <input type="number" min="1" max="90" value="${cfg.failover_below_pct ?? 10}" data-qf-global="failover_below_pct" style="width:44px">%</label>
+        <label class="cz-inline">возврат при остатке ≥
+          <input type="number" min="10" max="100" value="${cfg.recover_above_pct ?? 50}" data-qf-global="recover_above_pct" style="width:44px">%</label>
+        <label class="cz-inline">неделя ≥
+          <input type="number" min="0" max="100" value="${cfg.recover_weekly_min_pct ?? 20}" data-qf-global="recover_weekly_min_pct" style="width:44px">%</label>
+        <label class="cz-inline" title="сколько ошибок «лимит/квота» за окно считается исчерпанием">ошибок до смены:
+          <input type="number" min="1" max="10" value="${cfg.error_strikes ?? 2}" data-qf-global="error_strikes" style="width:44px"></label>
+        <label class="cz-inline">окно ошибок, мин:
+          <input type="number" min="5" max="240" value="${cfg.error_window_minutes ?? 30}" data-qf-global="error_window_minutes" style="width:52px"></label>
+        <label class="cz-inline" title="как часто проверять квоту штатной командой">проверка каждые, сек:
+          <input type="number" min="60" max="3600" value="${cfg.poll_seconds ?? 300}" data-qf-global="poll_seconds" style="width:60px"></label>
+      </div>
+    </details>
+    <div class="cz-row" style="margin-top:10px">
+      <button class="btn btn-sm btn-primary" onclick="qfSave()">Сохранить лестницу</button>
+      <span class="cz-hint">вотчер подхватывает настройки со следующего цикла; смена состава применяется к ближайшей задаче</span>
+    </div>`;
+}
+
+function qfCollect() {
+  document.querySelectorAll('#qf-cards .cz-card').forEach(card => {
+    const i = parseInt(card.dataset.qfIdx, 10);
+    const r = qfConfig.ladder[i];
+    r.name = card.querySelector('[data-qf-field="name"]').value.trim();
+    r.executor = card.querySelector('[data-qf-field="executor"]').value;
+    r.quota = card.querySelector('[data-qf-field="quota"]').value === 'mmx'
+      ? { cmd: 'mmx quota show --output json', model: 'general' } : null;
+    r.review = card.querySelector('[data-qf-field="review"]').value;
+  });
+  document.querySelectorAll('[data-qf-global]').forEach(el => {
+    qfConfig[el.dataset.qfGlobal] = parseInt(el.value, 10);
+  });
+}
+function qfReRender() { qfCollect(); renderShiftsTab(); }
+function qfAdd() {
+  qfCollect();
+  qfConfig.ladder.push({ name: `Смена ${qfConfig.ladder.length + 1}`, executor: 'codex', quota: null, review: 'keep' });
+  renderShiftsTab();
+}
+function qfRemove(i) { qfCollect(); qfConfig.ladder.splice(i, 1); renderShiftsTab(); }
+function qfMove(i, dir) {
+  qfCollect();
+  const j = i + dir;
+  if (j < 0 || j >= qfConfig.ladder.length) return;
+  [qfConfig.ladder[i], qfConfig.ladder[j]] = [qfConfig.ladder[j], qfConfig.ladder[i]];
+  renderShiftsTab();
+}
+function qfDragStart(ev, i) {
+  if (!ev.target.closest || !ev.target.closest('.cz-label[style*="cursor:grab"]')) { ev.preventDefault(); return; }
+  qfDragIdx = i; ev.dataTransfer.effectAllowed = 'move';
+}
+function qfDragOver(ev, i) { ev.preventDefault(); ev.dataTransfer.dropEffect = 'move'; }
+function qfDrop(ev, i) {
+  ev.preventDefault();
+  if (qfDragIdx < 0 || qfDragIdx === i) return;
+  qfCollect();
+  const [moved] = qfConfig.ladder.splice(qfDragIdx, 1);
+  qfConfig.ladder.splice(i, 0, moved);
+  qfDragIdx = -1;
+  renderShiftsTab();
+}
+function qfPreset() {
+  qfConfig.ladder = [
+    { name: 'Основная смена', executor: 'mmx-m3', quota: { cmd: 'mmx quota show --output json', model: 'general' }, review: 'keep' },
+    { name: 'Смена 2', executor: 'goose-flash', quota: null, review: 'qwen_main' },
+    { name: 'Смена 3', executor: 'codex', quota: null, review: 'keep' },
+  ];
+  renderShiftsTab();
+}
+async function qfSave() {
+  qfCollect();
+  if (!qfConfig.ladder.length) { toast('Нужна хотя бы одна смена'); return; }
+  try {
+    await fetchJSON(`${API}/quota-failover/config`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(qfConfig),
+    });
+    toast('Лестница смен сохранена — вотчер применит со следующего цикла.', false);
+  } catch (e) { toast('Сохранение: ' + e.message); }
+}
+
+async function tsSaveKey() {
+  const msg = document.getElementById('ts-msg');
+  const key = document.getElementById('ts-key').value.trim();
+  if (!key) { msg.textContent = 'Сначала вставьте ключ в поле.'; return; }
+  try {
+    await fetchJSON(`${API}/typesafe`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key }),
+    });
+    document.getElementById('ts-key').value = '';
+    msg.textContent = '✅ Ключ сохранён и уже действует.';
+    renderAutoTab();
+  } catch (e) { msg.textContent = '❌ ' + e.message; }
+}
+async function tsTest() {
+  const msg = document.getElementById('ts-msg');
+  msg.textContent = '⏳ Опрашиваю Jev…';
+  try {
+    await fetchJSON(`${API}/typesafe/test`, { method: 'POST' });
+    msg.textContent = '✅ Связь есть — Jev ответил.';
+  } catch (e) { msg.textContent = '❌ ' + e.message; }
+}
+
+// ── Каскад ревью: визуальный редактор цепочки (config.review_chain) ──
+
+function cascadeEditorHTML(wf) {
+  const chain = (wf.config && wf.config.review_chain) || { enabled: false, steps: [] };
+  const attemptPolicy = chain.attempt_policy || {};
+  const attemptBySeverity = attemptPolicy.by_severity || {};
+  const automation = (wf.config && wf.config.automation) || {};
+  const cascadeOwnsReview = chain.enabled &&
+    automation.auto_dispatch_reviewer === false &&
+    automation.auto_apply_review === false &&
+    automation.auto_resume_revision === false;
+  const steps = chain.steps || [];
+  const provOpts = (selected) =>
+    workflowProviderOptions(selected || '', false)
+      .replace('<option value="" selected>', '<option value="">');
+
+  const stepCard = (s, i) => {
+    const fixer = s.fixer || 'executor';
+    const customFixer = !['executor', 'self'].includes(fixer);
+    const win = s.window || {};
+    return `<div class="cz-card" data-cz-slot="${i}">
+      <div class="cz-row">
+        <span class="cz-label">Ревью-сту­пень ${i + 1}</span>
+        <select id="cz-prov-${i}" class="cz-prov">${provOpts(s.provider)}</select>
+        <button class="btn btn-sm btn-danger" onclick="czRemoveStep(${i})">✕</button>
+      </div>
+      <div class="cz-row">
+        <label class="cz-inline"><input type="checkbox" id="cz-blocking-${i}" ${s.blocking !== false ? 'checked' : ''}> блокирующая</label>
+        <label class="cz-inline">раунды: <input type="number" id="cz-rounds-${i}" min="1" max="10" value="${s.max_rounds || 2}" style="width:44px"></label>
+        <select id="cz-exhaust-${i}" class="cz-exhaust">
+          ${['arbitrate_planner', 'accept_if_gate_green', 'human'].map(p =>
+            `<option value="${p}" ${s.on_exhaust === p ? 'selected' : ''}>${{arbitrate_planner:'исчерпан → человеку (арбитраж планером не включён)', accept_if_gate_green:'исчерпан → принять при зелёном гейте', human:'исчерпан → человеку'}[p]}</option>`).join('')}
+        </select>
+      </div>
+      <div class="cz-row">
+        <span class="cz-label-sm">Находки чинит:</span>
+        <select id="cz-fixer-${i}" class="cz-fixer" onchange="czFixerChanged(${i})">
+          <option value="executor" ${fixer === 'executor' ? 'selected' : ''}>исполнитель воркфлоу</option>
+          <option value="self" ${fixer === 'self' ? 'selected' : ''}>этот же провайдер</option>
+          <option value="custom" ${customFixer ? 'selected' : ''}>указать:</option>
+        </select>
+        <select id="cz-fixer-custom-${i}" style="display:${customFixer ? '' : 'none'}">${provOpts(customFixer ? fixer : '')}</select>
+      </div>
+      <div class="cz-row">
+        <label class="cz-inline"><input type="checkbox" id="cz-window-en-${i}" ${win.from ? 'checked' : ''} onchange="czWindowChanged(${i})"> ⏰ только в окне</label>
+        <span id="cz-window-times-${i}" style="display:${win.from ? '' : 'none'}">
+          с <input type="time" id="cz-from-${i}" value="${win.from || '22:00'}" style="width:70px">
+          до <input type="time" id="cz-to-${i}" value="${win.to || '04:00'}" style="width:70px">
+        </span>
+      </div>
+    </div>`;
+  };
+
+  const stepCards = steps.map(stepCard).join('');
+  const addBtn = steps.length < 4
+    ? `<button class="btn btn-sm btn-ghost" onclick="czAddStep()">+ Добавить ступень</button>` : '';
+
+  return `<div class="cz-editor">
+    <div class="cz-row">
+      <label class="cz-inline"><input type="checkbox" id="cz-enabled" ${chain.enabled ? 'checked' : ''}> каскад включён (иначе — обычный один ревьюер)</label>
+      <span class="cz-hint">поток: ревью-1 → … → ревью-N → закрытие этапа</span>
+    </div>
+    <div class="cz-row">
+      <label class="cz-inline">Попытки исправления:
+        <select id="cz-attempt-mode" class="cz-prov">
+          <option value="auto" ${(chain.attempt_policy?.mode || 'manual') === 'auto' ? 'selected' : ''}>авто по тяжести находок (1/2/3)</option>
+          <option value="manual" ${(chain.attempt_policy?.mode || 'manual') !== 'auto' ? 'selected' : ''}>вручную по ступеням</option>
+        </select>
+      </label>
+      <span class="cz-hint">low → 1, medium → 2, high/blocker → 3; число в карточке используется в ручном режиме.</span>
+    </div>
+    <div class="cz-row" style="gap:6px;flex-wrap:wrap">
+      <span class="cz-label-sm">Правила авто:</span>
+      <label class="cz-inline">по умолчанию <input id="cz-attempt-default" type="number" min="1" max="10" value="${attemptPolicy.default || 2}" style="width:44px"></label>
+      <label class="cz-inline">максимум <input id="cz-attempt-max" type="number" min="1" max="10" value="${attemptPolicy.max || 3}" style="width:44px"></label>
+      <label class="cz-inline">low <input id="cz-attempt-low" type="number" min="1" max="10" value="${attemptBySeverity.low || 1}" style="width:44px"></label>
+      <label class="cz-inline">medium <input id="cz-attempt-medium" type="number" min="1" max="10" value="${attemptBySeverity.medium || 2}" style="width:44px"></label>
+      <label class="cz-inline">high <input id="cz-attempt-high" type="number" min="1" max="10" value="${attemptBySeverity.high || 3}" style="width:44px"></label>
+      <label class="cz-inline">blocker <input id="cz-attempt-blocker" type="number" min="1" max="10" value="${attemptBySeverity.blocker || 3}" style="width:44px"></label>
+    </div>
+    <div class="cz-hint">Используется только в режиме «авто»; общий максимум ограничивает каждое правило.</div>
+    <div id="cz-steps">${stepCards}</div>
+    <div class="cz-row">
+      ${addBtn}
+      <button class="btn btn-sm btn-primary" onclick="czSave()">Сохранить каскад</button>
+      <span class="cz-hint">настройка действует с ближайшего диспетча; движок: cascade-review.py</span>
+    </div>
+    ${chain.enabled && chain.steps.length ? `<div class="cz-hint" style="margin-top:6px;color:${cascadeOwnsReview ? 'var(--green)' : 'var(--yellow)'}">${cascadeOwnsReview ? '✓ Переходами управляет каскадный контроллер.' : '⚠ Сохраните каскад: автоматические переходы ядра ещё включены.'}</div>` : ''}
+  </div>`;
+}
+
+function czCollectSteps() {
+  const steps = [];
+  document.querySelectorAll('#cz-steps .cz-card').forEach(card => {
+    const i = card.dataset.czSlot;
+    const provider = document.getElementById(`cz-prov-${i}`)?.value || '';
+    if (!provider) return;
+    const fixerSel = document.getElementById(`cz-fixer-${i}`);
+    const fixerCustom = document.getElementById(`cz-fixer-custom-${i}`);
+    let fixer = fixerSel ? fixerSel.value : 'executor';
+    if (fixer === 'custom' && fixerCustom) fixer = fixerCustom.value || 'executor';
+    const step = {
+      slot: steps.length + 1,
+      provider,
+      fixer,
+      blocking: document.getElementById(`cz-blocking-${i}`)?.checked !== false,
+      max_rounds: parseInt(document.getElementById(`cz-rounds-${i}`)?.value, 10) || 2,
+      on_exhaust: document.getElementById(`cz-exhaust-${i}`)?.value || 'arbitrate_planner',
+    };
+    if (document.getElementById(`cz-window-en-${i}`)?.checked) {
+      step.window = {
+        from: document.getElementById(`cz-from-${i}`)?.value || '22:00',
+        to: document.getElementById(`cz-to-${i}`)?.value || '04:00',
+        tz_offset_hours: 3,
+      };
+    }
+    steps.push(step);
+  });
+  return steps;
+}
+
+async function czSave() {
+  const attemptDefault = attemptNumber('cz-attempt-default', 2);
+  const attemptMax = Math.max(attemptDefault, attemptNumber('cz-attempt-max', 3));
+  const boundedAttempt = id => Math.min(attemptMax, attemptNumber(id, attemptDefault));
+  const chain = {
+    enabled: document.getElementById('cz-enabled')?.checked !== false,
+    steps: czCollectSteps(),
+    attempt_policy: {
+      ...((selectedWorkflowData.config || {}).review_chain?.attempt_policy || {}),
+      mode: document.getElementById('cz-attempt-mode')?.value || 'manual',
+      default: attemptDefault,
+      max: attemptMax,
+      by_severity: {
+        low: boundedAttempt('cz-attempt-low'),
+        medium: boundedAttempt('cz-attempt-medium'),
+        high: boundedAttempt('cz-attempt-high'),
+        blocker: boundedAttempt('cz-attempt-blocker'),
+      },
+    },
+  };
+  if (chain.enabled && !chain.steps.length) {
+    toast('Каскад включён, но ступеней нет — добавьте ступень или снимите галочку.');
+    return;
+  }
+  const cfg = JSON.parse(JSON.stringify(selectedWorkflowData.config));
+  const oldChain = cfg.review_chain || {};
+  const oldRoles = cfg.roles || {};
+  const oldReviewer = oldRoles.reviewer || {};
+  chain.base_executor_provider = oldChain.base_executor_provider ?? oldRoles.executor?.provider ?? null;
+  chain.base_reviewer_provider = oldChain.base_reviewer_provider ?? oldReviewer.provider ?? null;
+  chain.base_reviewer_prompt_template = oldChain.base_reviewer_prompt_template ?? oldReviewer.prompt_template ?? '';
+  cfg.review_chain = chain;
+  cfg.roles = cfg.roles || {};
+  cfg.roles.reviewer = { ...(cfg.roles.reviewer || {}) };
+  cfg.automation = { ...(cfg.automation || {}) };
+  if (chain.enabled && chain.steps.length) {
+    cfg.roles.reviewer.provider = chain.steps[0].provider;
+    cfg.automation.auto_dispatch_reviewer = false;
+    cfg.automation.auto_apply_review = false;
+    cfg.automation.auto_resume_revision = false;
+  } else {
+    if (chain.base_reviewer_provider) cfg.roles.reviewer.provider = chain.base_reviewer_provider;
+    cfg.roles.reviewer.prompt_template = chain.base_reviewer_prompt_template;
+    cfg.automation.auto_dispatch_reviewer = true;
+    cfg.automation.auto_apply_review = true;
+    cfg.automation.auto_resume_revision = true;
+  }
+  try {
+    await fetchJSON(`${API}/workflows/${selectedWorkflowId}`, {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ config: cfg, expected_version: selectedWorkflowData.state_version }),
+    });
+    toast('Каскад сохранён — действует с ближайшего диспетча.', false);
+    await loadWorkflows();
+  } catch (e) {
+    toast('Сохранение каскада: ' + e.message);
+  }
+}
+
+function czAddStep() {
+  const stepsBox = document.getElementById('cz-steps');
+  if (!stepsBox) return;
+  const i = stepsBox.querySelectorAll('.cz-card').length;
+  stepsBox.insertAdjacentHTML('beforeend', cascadeStepCardBlank(i));
+}
+
+function cascadeStepCardBlank(i) {
+  const provOpts = workflowProviderOptions('', false)
+    .replace('<option value="" selected>', '<option value="" selected>— выберите провайдера —</option>');
+  return `<div class="cz-card" data-cz-slot="${i}">
+    <div class="cz-row">
+      <span class="cz-label">Ревью-ступень ${i + 1}</span>
+      <select id="cz-prov-${i}" class="cz-prov">${provOpts}</select>
+      <button class="btn btn-sm btn-danger" onclick="czRemoveStep(${i})">✕</button>
+    </div>
+    <div class="cz-row">
+      <label class="cz-inline"><input type="checkbox" id="cz-blocking-${i}" checked> блокирующая</label>
+      <label class="cz-inline">раунды: <input type="number" id="cz-rounds-${i}" min="1" max="10" value="2" style="width:44px"></label>
+      <select id="cz-exhaust-${i}" class="cz-exhaust">
+        <option value="arbitrate_planner">исчерпан → арбитраж планером</option>
+        <option value="accept_if_gate_green">исчерпан → принять при зелёном гейте</option>
+        <option value="human">исчерпан → человеку</option>
+      </select>
+    </div>
+    <div class="cz-row">
+      <span class="cz-label-sm">Находки чинит:</span>
+      <select id="cz-fixer-${i}" class="cz-fixer">
+        <option value="executor">исполнитель воркфлоу</option>
+        <option value="self">этот же провайдер</option>
+      </select>
+    </div>
+    <div class="cz-row">
+      <label class="cz-inline"><input type="checkbox" id="cz-window-en-${i}"> ⏰ только в окне</label>
+      <span id="cz-window-times-${i}" style="display:none">
+        с <input type="time" id="cz-from-${i}" value="22:00" style="width:70px">
+        до <input type="time" id="cz-to-${i}" value="04:00" style="width:70px">
+      </span>
+    </div>
+  </div>`;
+}
+
+function czRemoveStep(i) {
+  const card = document.querySelector(`#cz-steps .cz-card[data-cz-slot="${i}"]`);
+  if (card) card.remove();
+  // Перенумеровать data-cz-slot, чтобы czCollectSteps читал актуальный порядок
+  document.querySelectorAll('#cz-steps .cz-card').forEach((c, idx) => c.dataset.czSlot = idx);
+}
+
+function czFixerChanged(i) {
+  const sel = document.getElementById(`cz-fixer-custom-${i}`);
+  if (sel) sel.style.display = document.getElementById(`cz-fixer-${i}`).value === 'custom' ? '' : 'none';
+}
+
+function czWindowChanged(i) {
+  const box = document.getElementById(`cz-window-times-${i}`);
+  if (box) box.style.display = document.getElementById(`cz-window-en-${i}`).checked ? '' : 'none';
+}
+
+// ── Каскад ревью: конец ──
+
+// ── Этапы воркфлоу для строки задачи: бейдж этапа + прогресс ──
+// Кэш wfStagesCache[wfId] = {version, list, byId, done, total, pct}.
+const wfStagesCache = {};
+async function ensureWfStages(wf) {
+  if (!wf || !wf.id) return;
+  const cached = wfStagesCache[wf.id];
+  if (cached && cached.version === wf.state_version) return;
+  try {
+    const list = await fetchJSON(`${API}/workflows/${wf.id}/stages`);
+    const byId = {};
+    let done = 0;
+    (list || []).forEach(s => {
+      byId[s.id] = s;
+      if (s.status === 'completed') done++;
+    });
+    wfStagesCache[wf.id] = {
+      version: wf.state_version, list: list || [], byId,
+      done, total: (list || []).length,
+      pct: (list || []).length ? Math.round(done * 100 / list.length) : 0,
+    };
+  } catch (e) { /* не критично: без бейджа */ }
+}
+
 async function loadTasks() {
   const params = currentFilter ? `?status=${currentFilter}&limit=100` : '?limit=100';
   const tasks = await fetchJSON(`${API}/tasks${params}`);
   const list = document.getElementById('taskList');
+
+  // Workflow chip: match a task's working_dir to a workflow's repository_path
+  // (unique per workflow) so tasks of parallel workflows are distinguishable.
+  // workflowCache is only filled when the Workflows modal was opened — fetch
+  // it lazily here too; chips appear on the next refresh tick.
+  if (!(workflowCache || []).length) loadWorkflows();
+  // Этапы и прогресс каждого воркфлоу (для бейджа «G7b · Закладки» и %):
+  // кэш по state_version — перезагружается только когда воркфлоу реально двинулся.
+  await Promise.all((workflowCache || []).map(w => ensureWfStages(w)));
+  const wfByDir = new Map((workflowCache || [])
+    .filter(w => w.repository_path)
+    .map(w => [w.repository_path, w.slug]));
+  // A workflow shares its working directory with every historical task. Keep
+  // the red human-action marker on the newest task only; otherwise one paused
+  // workflow paints the whole task history as if every task needed attention.
+  const latestTaskByWorkflow = new Map();
+  tasks.forEach(t => {
+    const wf = (workflowCache || []).find(w => w.repository_path && t.working_dir &&
+      w.repository_path.toLowerCase() === t.working_dir.toLowerCase());
+    if (!wf) return;
+    const previous = latestTaskByWorkflow.get(wf.id);
+    if (!previous || Number(t.id) > Number(previous.id)) latestTaskByWorkflow.set(wf.id, t);
+  });
 
   if (!tasks.length) {
     list.innerHTML = `<div class="empty">
@@ -1088,6 +2284,42 @@ async function loadTasks() {
     const expanded = t.id === expandedId;
     const time = timeAgo(t.created_at);
     const parsed = parseResult(t.result);
+    const taskWf = (workflowCache || []).find(w => w.repository_path && t.working_dir &&
+      w.repository_path.toLowerCase() === t.working_dir.toLowerCase());
+    const taskWfColor = taskWf ? wfSlugColor(taskWf.slug) : null;
+    const taskWfChip = taskWf
+      ? `<span class="wf-chip" style="border-color:${taskWfColor};color:${taskWfColor}" title="воркфлоу ${escAttr(taskWf.slug)}">${esc(taskWf.slug)}</span>`
+      : '';
+    // Этап воркфлоу, над которым шла эта задача, и общий прогресс проекта.
+    const wfStages = taskWf ? wfStagesCache[taskWf.id] : null;
+    const curStage = wfStages ? (wfStages.byId[taskWf.current_stage_id] || null) : null;
+    let stageLabel = '';
+    if (curStage) {
+      // планер иногда даёт заголовкам вид «G7b: G7b Ручные…» — убираем повторы кода
+      let t = (curStage.title || '').trim();
+      if (curStage.code) {
+        const re = new RegExp('^' + curStage.code.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*[:—-]?\\s*', 'i');
+        while (re.test(t)) t = t.replace(re, '');
+      }
+      const stageShort = (t.split(/[:(—-]/)[0].trim() || t).slice(0, 24);
+      stageLabel = (curStage.code ? curStage.code + ' · ' : '') + stageShort;
+    }
+    const stageChip = curStage
+      ? `<span class="wf-chip stage-chip" title="этап воркфлоу: ${escAttr(curStage.code ? curStage.code + ': ' : '')}${escAttr(curStage.title || '')}">${esc(stageLabel)}</span>`
+      : '';
+    const progressChip = wfStages && wfStages.total
+      ? `<span class="task-meta" title="закрыто ${wfStages.done} из ${wfStages.total} этапов воркфлоу">◌ ${wfStages.pct}% (${wfStages.done}/${wfStages.total})</span>`
+      : '';
+    const taskHumanFlag = taskWf && latestTaskByWorkflow.get(taskWf.id)?.id === t.id && workflowNeedsHuman(taskWf)
+      ? `<button class="wf-human-flag" type="button" onclick="event.stopPropagation(); openWorkflowFromTask('${escAttr(taskWf.id)}')" title="Открыть workflow и выполнить требуемое действие">🔺 ДЕЙСТВИЕ</button>`
+      : '';
+    // Роль задачи: ревьюерские промпты всегда несут AUDIT-контракт или слово
+    // «аудитор» (вшито и планировщиком, и нашими шаблонами) — остальное
+    // считаем исполнением.
+    const isReviewRole = /AUDIT_VERDICT|AUDIT_FINDINGS|независимый аудитор/i.test((t.prompt || '').slice(0, 1500));
+    const roleChip = isReviewRole
+      ? '<span class="role-chip role-review" title="задача ревьюера">ревью</span>'
+      : '<span class="role-chip role-exec" title="задача исполнителя">исполнение</span>';
     const taskErrorLabel = githubApiWait(t) ? 'Причина ожидания' : 'Error';
 
     // Build result section
@@ -1113,10 +2345,15 @@ async function loadTasks() {
     }
 
     return `
-    <div class="task-row${expanded ? ' expanded' : ''}">
+    <div class="task-row${expanded ? ' expanded' : ''}"${taskWfColor ? ` style="border-left:3px solid ${taskWfColor}"` : ''}>
       <div class="task-header" onclick="toggleTask(${t.id})">
         <span class="task-id">#${t.id}</span>
+        ${taskWfChip}
+        ${stageChip}
+        ${roleChip}
+        ${progressChip}
         <span class="task-status" data-s="${t.status}">${taskStatusLabel(t)}</span>
+        ${taskHumanFlag}
         <span class="task-prompt" title="${escAttr(taskDisplayTitle(t))}">${esc(taskDisplayTitle(t))}</span>
         ${t.working_dir ? `<span class="task-meta">📁 ${esc(t.working_dir.split(/[/\\]/).filter(Boolean).pop() || t.working_dir)}</span>` : ''}
         ${t.worktree ? `<span class="task-meta" title="отдельный git worktree">🌿 ${esc(t.worktree_branch || 'worktree')}</span>` : ''}
@@ -1491,6 +2728,19 @@ function openWorkflows() {
 }
 
 function closeWorkflows() { document.getElementById('workflowModal').classList.remove('open'); }
+
+// Open the same workflow panel from a task row. The task list only flags the
+// blocked workflow; the actual decision/resume controls stay in one place.
+function openWorkflowFromTask(workflowId) {
+  selectedWorkflowId = workflowId;
+  openWorkflows();
+}
+
+function openParallel() {
+  document.getElementById('parallelModal').classList.add('open');
+}
+
+function closeParallel() { document.getElementById('parallelModal').classList.remove('open'); }
 
 let workflowAutoRefreshBusy = false;
 
@@ -1902,6 +3152,7 @@ async function loadWorkflows() {
     <div class="wf-row${w.id === selectedWorkflowId ? ' active' : ''}" onclick="selectWorkflow('${escAttr(w.id)}')">
       <div class="wf-title">${esc(w.slug)}</div>
       <div class="wf-meta">${esc(w.status)} · раунд ${w.current_round} · v${w.state_version}</div>
+      ${workflowNeedsHuman(w) ? `<button class="wf-human-flag" type="button" onclick="event.stopPropagation(); selectWorkflow('${escAttr(w.id)}')" title="Открыть решение для остановленного workflow">🔺 НУЖНО ДЕЙСТВИЕ</button>` : ''}
     </div>`).join('') : '<div class="wf-meta">Workflow пока нет.</div>';
   if (!selectedWorkflowId && workflowCache.length) selectedWorkflowId = workflowCache[0].id;
   if (selectedWorkflowId) await selectWorkflow(selectedWorkflowId);
@@ -1914,7 +3165,7 @@ async function selectWorkflow(id) {
   selectedWorkflowData = wf;
   const [rounds, events, findings, plan, stages] = await Promise.all([
     fetchJSON(`${API}/workflows/${id}/rounds`),
-    fetchJSON(`${API}/workflows/${id}/events?limit=200`),
+    fetchJSON(`${API}/workflows/${id}/events?limit=200&tail=true`),
     fetchJSON(`${API}/workflows/${id}/findings`),
     fetchJSON(`${API}/workflows/${id}/plan`),
     fetchJSON(`${API}/workflows/${id}/stages`),
@@ -2019,7 +3270,7 @@ function workflowSettingsHtml(wf) {
   </details>`;
 }
 
-function workflowStatusInfo(status, reviewerDone = false) {
+function workflowStatusInfo(status, reviewerDone = false, decisionState = {}) {
   const info = {
     draft: ['Черновик', 'Следующее действие: сформировать план этапов либо запустить быструю задачу.'],
     planning: ['Планирование', 'Сильный планировщик исследует задачу и формирует этапы.'],
@@ -2029,8 +3280,10 @@ function workflowStatusInfo(status, reviewerDone = false) {
     gating: ['Автоматические проверки', 'Следующее действие: зафиксировать результат gate.'],
     reviewing: ['Независимое ревью', 'Следующее действие: запустить проверяющего.'],
     revision_required: ['Нужны исправления', 'Следующее действие: открыть новый раунд доработок.'],
-    awaiting_human: reviewerDone
-      ? ['Ожидается вердикт ревью', 'Следующее действие: принять, вернуть на доработку или запросить решение человека.']
+    awaiting_human: reviewerDone && decisionState.budgetExhausted
+      ? ['Лимит попыток исчерпан', 'Каскад остановлен после предельного числа исправлений. Автоматический арбитраж не запущен.']
+      : reviewerDone
+      ? ['Ожидается ваше решение по ревью', 'Следующее действие: принять, вернуть на доработку или запросить решение человека.']
       : ['Ожидается ваше решение', 'Предыдущая попытка не завершила этап. Следующее действие: продолжить текущий раунд.'],
     completed: ['Завершён', 'Цель workflow принята независимым ревью.'],
     failed: ['Завершён с ошибкой', 'Требуется анализ причины и новый workflow либо ручное решение.'],
@@ -2039,7 +3292,41 @@ function workflowStatusInfo(status, reviewerDone = false) {
   return info[status] || [status, ''];
 }
 
-function workflowOwnerInfo(wf, activeRun, reviewerDone) {
+function workflowNeedsHuman(wf) {
+  return ['awaiting_human', 'revision_required', 'awaiting_plan_approval', 'gating']
+    .includes(wf?.status);
+}
+
+function workflowHumanAlertCopy(status, reviewerDone, decisionState = {}) {
+  if (status === 'awaiting_human' && reviewerDone && decisionState.budgetExhausted) {
+    return ['Каскад остановлен по лимиту попыток',
+      'Ревью уже завершено, но автоматическая ступень исчерпала свои попытки. Сначала нужно выбрать новую политику или явно принять риск вручную.'];
+  }
+  if (status === 'revision_required' && decisionState.budgetExhausted) {
+    return ['Лимит попыток исчерпан',
+      'Новый раунд сейчас заблокирован защитным лимитом. Измените политику попыток или создайте новый этап после проверки замечаний.'];
+  }
+  if (status === 'awaiting_human' && reviewerDone) {
+    return ['Требуется ваше решение по ревью',
+      'Проверяющий уже закончил. Выберите один из вариантов ниже — после этого PromptPilot продолжит или завершит workflow.'];
+  }
+  if (status === 'revision_required') {
+    return ['Нужны исправления',
+      'Ревью вернуло текущий этап на доработку. Проверьте отчёт и нажмите «Продолжить пайплайн».'];
+  }
+  if (status === 'awaiting_plan_approval') {
+    return ['Нужно утвердить план',
+      'Проверьте порядок этапов и gate-команды, затем нажмите «Сохранить и утвердить».'];
+  }
+  if (status === 'gating') {
+    return ['Нужно решение по проверкам',
+      'Gate завершён. Выберите PASS, если проверки пройдены, или FAIL, если этап нужно вернуть исполнителю.'];
+  }
+  return ['Пайплайн остановлен: требуется действие человека',
+    'Проверьте причину остановки и нажмите «Продолжить пайплайн», чтобы передать управление обратно оркестратору.'];
+}
+
+function workflowOwnerInfo(wf, activeRun, reviewerDone, decisionState = {}) {
   if (wf.status === 'planning') return {
     who: 'Планировщик', detail: activeRun?.task_id ? `task #${activeRun.task_id} · разбивает задачу на этапы` : 'запускается',
     next: 'Дальше: ваше однократное утверждение плана', color: 'var(--accent)',
@@ -2061,8 +3348,13 @@ function workflowOwnerInfo(wf, activeRun, reviewerDone) {
     next: 'Дальше: PASS либо новый раунд исправлений', color: 'var(--accent)',
   };
   if (wf.status === 'awaiting_human') return {
-    who: 'Вы', detail: reviewerDone ? 'нужно зафиксировать решение по аудиту' : 'автоматический этап остановлен',
-    next: reviewerDone ? 'Выбрать: принять / вернуть на доработку / нужен человек' : 'Проверить причину остановки', color: 'var(--red)',
+    who: decisionState.budgetExhausted ? 'Каскад / арбитраж' : 'Вы',
+    detail: decisionState.budgetExhausted
+      ? 'попытки ступени исчерпаны; автоматический арбитраж не создан'
+      : (reviewerDone ? 'нужно зафиксировать решение по аудиту' : 'автоматический этап остановлен'),
+    next: decisionState.budgetExhausted
+      ? 'Изменить политику попыток или принять риск вручную'
+      : (reviewerDone ? 'Выбрать: принять / вернуть на доработку / нужен человек' : 'Проверить причину остановки'), color: 'var(--red)',
   };
   if (wf.status === 'revision_required') return {
     who: 'Вы', detail: 'аудитор вернул результат на доработку',
@@ -2093,11 +3385,35 @@ function workflowRoundRow(round, current = false) {
   </div>`;
 }
 
+function workflowDecisionState(events = []) {
+  const list = [...events].sort((a, b) => (a.seq || 0) - (b.seq || 0));
+  const lastOf = types => [...list].reverse().find(e => types.includes(e.event_type));
+  const progress = lastOf([
+    'planner.dispatched','planner.completed','plan.edited','plan.approved','stage.advanced',
+    'human.resumed','executor.dispatched','executor.completed','gate.passed','reviewer.dispatched',
+    'review.awaiting_decision','review.passed','review.revision_required','workflow.completed',
+  ]);
+  const stop = lastOf([
+    'planner.invalid_output','executor.invalid_output','reviewer.invalid_output','gate.failed',
+    'gate.human_required','run.failed','automation.paused','limit.max_rounds',
+    'limit.stage_revisions','cascade.exhausted','cascade.max_rounds',
+  ]);
+  const activeStop = !!stop && (!progress || (stop.seq || 0) > (progress.seq || 0));
+  const budgetEvent = activeStop && ['limit.stage_revisions','cascade.exhausted','cascade.max_rounds'].includes(stop.event_type)
+    ? stop : null;
+  return {
+    activeStop,
+    budgetExhausted: !!budgetEvent,
+    budgetEvent,
+    cascadeExhausted: budgetEvent?.event_type === 'cascade.exhausted',
+  };
+}
+
 function workflowStopReason(events) {
   const stopping = [
     'planner.invalid_output','executor.invalid_output','reviewer.invalid_output','gate.failed',
     'gate.human_required','run.failed','automation.paused','limit.max_rounds',
-    'limit.stage_revisions',
+    'limit.stage_revisions','cascade.exhausted','cascade.max_rounds',
   ];
   const superseding = [
     'planner.dispatched','planner.completed','plan.edited','plan.approved','stage.advanced',
@@ -2115,7 +3431,16 @@ function workflowStopReason(events) {
   const reason = latest.payload?.reason || latest.payload?.summary || latest.event_type;
   const task = latest.payload?.task_id ? `Task #${latest.payload.task_id}: ` : '';
   if (reason === 'missing successful workflow verdict') {
-    return `${task}PromptPilot не получил финальную строку «ИТОГ: …» от агента.`;
+    return `${task}Агент закончил без успешного вердикта «ИТОГ: ГОТОВО/УЖЕ СДЕЛАНО» — либо потерял итоговую строку, либо сам просит человека (смотри отчёт задачи ниже).`;
+  }
+  if (latest.event_type === 'limit.stage_revisions') {
+    const max = latest.payload?.max_revision_rounds || '?';
+    const stage = latest.payload?.stage_code ? ` этапа ${latest.payload.stage_code}` : '';
+    return `Лимит возвратов${stage} исчерпан: ${max}. Новый раунд сейчас заблокирован.`;
+  }
+  if (latest.event_type === 'cascade.exhausted') {
+    return (reason || 'Каскад исчерпал попытки и остановился перед арбитражем.')
+      .replace('Лимит ступени', 'Лимит попыток');
   }
   return `${task}${reason}`;
 }
@@ -2173,8 +3498,9 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, 
   const pastRounds = rounds.filter(r => r.round_no !== wf.current_round);
   const importedCount = rounds.filter(r => r.summary?.historical).length;
   const stage = stages.find(item => item.id === wf.current_stage_id) || wf.config?.stage || {};
-  const statusInfo = workflowStatusInfo(wf.status, !!reviewerDone);
-  const ownerInfo = workflowOwnerInfo(wf, activeRun, reviewerDone);
+  const decisionState = workflowDecisionState(events);
+  const statusInfo = workflowStatusInfo(wf.status, !!reviewerDone, decisionState);
+  const ownerInfo = workflowOwnerInfo(wf, activeRun, reviewerDone, decisionState);
   const stopReason = workflowStopReason(events);
   const previousAudit = [...pastRounds].reverse().find(r => r.summary?.summary);
   const stageTitle = stage.title || `Раунд ${wf.current_round}: доработка после последнего аудита`;
@@ -2201,19 +3527,27 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, 
     </div>`;
   } else if (wf.status === 'gating') {
     action = `<div class="wf-form"><input class="wide" id="wfDecisionSummary" placeholder="Итог gate">
-      <button class="btn btn-sm btn-primary" onclick="wfGate('PASS')">Gate PASS</button>
-      <button class="btn btn-sm btn-danger" onclick="wfGate('FAIL')">Gate FAIL</button>
-      <button class="btn btn-sm btn-ghost wide" onclick="wfGate('HUMAN_REQUIRED')">Нужен человек</button></div>`;
+      <button class="btn btn-sm btn-primary" onclick="wfGate('PASS')">✓ Проверки пройдены (PASS)</button>
+      <button class="btn btn-sm btn-danger" onclick="wfGate('FAIL')">✕ Вернуть на исправление (FAIL)</button>
+      <button class="btn btn-sm btn-ghost wide" onclick="wfGate('HUMAN_REQUIRED')">Оставить на ручном решении</button></div>`;
   } else if (orphanPane) {
     action = `<div class="wf-stage" style="border-color:var(--red)">
       <b style="color:var(--red)">Task #${orphanPane.task_id} отмечен завершённым, но его агент ещё работает.</b>
       <div class="wf-round-summary">Не запускайте новый раунд. Дождитесь завершения фоновых build/pytest; экран агента показан ниже.</div>
     </div>`;
   } else if (wf.status === 'revision_required' || (wf.status === 'awaiting_human' && !reviewerDone)) {
-    action = `<div class="wf-form"><input class="wide" id="wfHumanText" value="Продолжить работу с учётом сохранённого состояния" required>
-      <button class="btn btn-sm btn-primary" onclick="wfResume()">Продолжить ${wf.status === 'revision_required' ? 'новым раундом' : 'текущий раунд'}</button></div>`;
+    action = decisionState.budgetExhausted
+      ? `<div class="wf-form"><div class="wf-round-summary" style="color:var(--red)"><b>Продолжение заблокировано:</b> лимит попыток уже исчерпан.</div>
+          <button class="btn btn-sm btn-danger" disabled>▶ Новый раунд недоступен</button>
+          <button class="btn btn-sm btn-ghost" onclick="openReviewSettingsFor('${escAttr(wf.id)}')">⚙ Настроить попытки</button></div>`
+      : `<div class="wf-form"><input class="wide" id="wfHumanText" value="Продолжить работу с учётом сохранённого состояния" required>
+        <button class="btn btn-sm btn-primary" onclick="wfResume()">▶ Продолжить пайплайн${wf.status === 'revision_required' ? ' новым раундом' : ''}</button></div>`;
   } else if (wf.status === 'awaiting_human' && reviewerDone) {
     const auditColor = auditVerdict === 'PASS' ? 'var(--green)' : 'var(--red)';
+    const correctionAction = decisionState.budgetExhausted
+      ? `<button class="btn btn-sm btn-danger" disabled title="Лимит попыток исчерпан; сначала измените политику попыток">↻ Исправление заблокировано: лимит исчерпан</button>
+         <button class="btn btn-sm btn-ghost" onclick="openReviewSettingsFor('${escAttr(wf.id)}')">⚙ Настроить попытки</button>`
+      : `<button class="btn btn-sm btn-danger" onclick="wfReview('REVISION_REQUIRED')">↻ Отправить на исправление</button>`;
     action = `<div class="wf-stage" style="border-color:${auditColor}">
       <b style="color:${auditColor}">Аудитор task #${reviewerDone.task_id}: ${esc(auditVerdict || 'отчёт готов')}</b>
       <details data-wf-detail="audit-report"><summary>Показать отчёт независимого аудитора</summary>
@@ -2221,9 +3555,27 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, 
       </details>
     </div>
     <div class="wf-form"><input class="wide" id="wfDecisionSummary" placeholder="Итог независимого ревью">
-      <button class="btn btn-sm btn-primary" onclick="wfReview('PASS')">Review PASS</button>
-      <button class="btn btn-sm btn-danger" onclick="wfReview('REVISION_REQUIRED')">Нужны исправления</button>
-      <button class="btn btn-sm btn-ghost wide" onclick="wfReview('HUMAN_REQUIRED')">Нужен человек</button></div>`;
+      <button class="btn btn-sm btn-primary" onclick="wfReview('PASS')">✓ Принять вручную и продолжить</button>
+      ${correctionAction}
+      <button class="btn btn-sm btn-ghost wide" onclick="wfReview('HUMAN_REQUIRED')">Оставить на ручном решении</button></div>`;
+  }
+  let humanAttention = '';
+  if (workflowNeedsHuman(wf)) {
+    const [attentionTitle, attentionCopy] = workflowHumanAlertCopy(wf.status, !!reviewerDone, decisionState);
+    const alertKind = (wf.status === 'awaiting_human' && reviewerDone) ? 'decision' : 'action';
+    const authHint = /401|unauthorized|incorrect api key|api key/i.test(stopReason || '')
+      ? '<div class="wf-round-summary" style="color:var(--yellow)"><b>Похоже на ошибку авторизации провайдера.</b> Сначала исправьте ключ/профиль исполнителя или выберите другой провайдер, затем нажмите продолжение.</div>'
+      : '';
+    humanAttention = `<div class="wf-human-alert" data-kind="${alertKind}">
+      <div class="wf-human-icon" aria-hidden="true">🔺</div>
+      <div><div class="wf-human-alert-title">${attentionTitle}</div>
+        <div class="wf-human-alert-copy">${attentionCopy}</div>
+        ${stopReason ? `<div class="wf-round-summary" style="color:var(--red)"><b>Причина остановки:</b> ${esc(stopReason)}</div>` : ''}
+        ${authHint}
+        ${action || '<div class="wf-human-alert-copy">Откройте технический журнал, чтобы увидеть последнее событие.</div>'}
+      </div>
+    </div>`;
+    action = '';
   }
   const runRows = (plannerTask ? [`<div class="wf-round${plannerRun ? ' current' : ''}"><b>planner</b> · ${esc(plannerTask.status)} · task #${plannerTask.id}</div>`] : [])
     .concat(runs.map(r => `<div class="wf-round${r === activeRun ? ' current' : ''}"><b>${esc(r.role)} · попытка ${r.attempt_no}</b> · ${esc(r.status)}${r.task_id ? ` · task #${r.task_id}` : ''}</div>`)).join('');
@@ -2241,9 +3593,15 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, 
   wfPane.querySelectorAll('textarea,input').forEach(el => { if (el.id) wfSnapValues[el.id] = el.value; });
   const wfModalScroller = wfPane.closest('.modal');
   const wfSnapModalTop = wfModalScroller ? wfModalScroller.scrollTop : 0;
+  const cascadeOwned = !!wf.config?.review_chain?.enabled
+    && wf.config?.automation?.auto_dispatch_reviewer === false
+    && wf.config?.automation?.auto_apply_review === false
+    && wf.config?.automation?.auto_resume_revision === false;
+  const autoBadge = cascadeOwned ? 'АВТО · КАСКАД' : 'АВТО';
   wfPane.innerHTML = `
     <div class="wf-title">${esc(wf.slug)} <span class="task-status" data-s="${escAttr(wf.status)}">${esc(statusInfo[0])}</span>
-      ${wf.config?.automation?.enabled ? '<span class="task-status" data-s="running">АВТО</span>' : '<span class="wf-meta">ручной режим</span>'}</div>
+      ${wf.config?.automation?.enabled ? `<span class="task-status" data-s="running">${autoBadge}</span>` : '<span class="wf-meta">ручной режим</span>'}</div>
+    ${humanAttention}
     <div class="wf-stage" style="border-color:${ownerInfo.color}">
       <div class="wf-stage-title">🏓 Мяч сейчас: <span style="color:${ownerInfo.color}">${esc(ownerInfo.who)}</span></div>
       <div class="wf-round-summary">${esc(ownerInfo.detail)}</div>
@@ -2287,6 +3645,9 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, 
       </div>` : ''}
     <div class="wf-section-title">История завершённых раундов</div>
     <div class="wf-history">${historyRows || '<div class="wf-meta">Истории пока нет.</div>'}</div>
+    <details class="wf-technical" data-wf-detail="cascade-editor"><summary>⚙ Каскад ревью — настройка цепочки</summary>
+      ${cascadeEditorHTML(wf)}
+    </details>
     <details class="wf-technical" data-wf-detail="technical-log"><summary>Технический журнал · ${events.length} событий · state version ${wf.state_version}</summary>
       <div class="wf-history">${eventRows || '<div class="wf-meta">Событий пока нет.</div>'}</div>
     </details>`;

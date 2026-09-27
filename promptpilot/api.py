@@ -17,6 +17,7 @@ from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+import json
 import os
 import re as _re
 
@@ -99,6 +100,18 @@ async def _lifespan(application: FastAPI):
 
 
 app = FastAPI(title="PromptPilot", version="0.1.0", lifespan=_lifespan)
+
+# Optional additive UI integration. The scheduler remains outside the core
+# worker and database; this only exposes its visual panel on the same origin.
+try:
+    _repo_root = Path(__file__).resolve().parent.parent
+    if (_repo_root / "tools").is_dir() and str(_repo_root) not in sys.path:
+        sys.path.insert(0, str(_repo_root))
+    from tools.addons.parallel_orchestrator.ui_server import addon_index_path, create_fastapi_router
+
+    app.include_router(create_fastapi_router())
+except ImportError:
+    addon_index_path = None
 
 
 _SAFE_METHODS = ("GET", "HEAD", "OPTIONS")
@@ -575,10 +588,13 @@ def api_list_workflow_events(
     workflow_id: str,
     after_seq: int = Query(default=0, ge=0),
     limit: int = Query(default=200, ge=1, le=1000),
+    tail: bool = Query(default=False),
 ):
     if not db.get_workflow(workflow_id):
         raise HTTPException(404, "Workflow not found")
-    return db.list_workflow_events(workflow_id, after_seq=after_seq, limit=limit)
+    return db.list_workflow_events(
+        workflow_id, after_seq=after_seq, limit=limit, tail=tail
+    )
 
 
 @app.get(
@@ -1060,9 +1076,166 @@ def api_providers():
             "hidden": bool(info.get("hidden")),
             "executor": info.get("executor", ""),
             "session_target": bool(info.get("session_target")),
+            # Порядок карточек помощников (drag&drop в ⚙ Настройки).
+            "ui_order": info.get("ui_order", 9999),
+            # HOTFIX (bookapp): человеческий слой для UI настроек —
+            # необязательный блок из providers.json (label/role/desc).
+            "human": info.get("human", {}),
         }
         for name, info in providers.items()
     }
+
+
+# ── TypeSafe Jev (решатель самопочинки) ──────────────────────────────
+# Вотчер (verdict-repair-watcher.py) берёт ключ из env TYPESAFE_API_KEY,
+# иначе из файла Desktop\TypeSafe.txt — читает при каждом вызове, поэтому
+# ключ, сохранённый через UI, подхватывается без перезапуска.
+
+def _typesafe_key_file() -> Path:
+    return Path.home() / "Desktop" / "TypeSafe.txt"
+
+
+def _typesafe_key_source() -> dict:
+    env = os.environ.get("TYPESAFE_API_KEY", "").strip()
+    file_path = _typesafe_key_file()
+    file_set = file_path.is_file() and bool(
+        file_path.read_text(encoding="utf-8", errors="replace").strip())
+    return {"env_set": bool(env), "file_set": file_set,
+            "file_path": str(file_path),
+            "active": "env" if env else ("file" if file_set else "none")}
+
+
+@app.get("/api/typesafe")
+def api_typesafe_status():
+    return _typesafe_key_source()
+
+
+@app.post("/api/typesafe")
+def api_typesafe_save(body: dict):
+    key = (body.get("key") or "").strip()
+    if not key:
+        raise HTTPException(400, "пустой ключ")
+    _typesafe_key_file().write_text(key + "\n", encoding="utf-8")
+    return _typesafe_key_source()
+
+
+@app.post("/api/typesafe/test")
+def api_typesafe_test():
+    key = os.environ.get("TYPESAFE_API_KEY", "").strip()
+    source = "env"
+    if not key:
+        source = "file"
+        file_path = _typesafe_key_file()
+        if file_path.is_file():
+            key = file_path.read_text(encoding="utf-8", errors="replace").strip()
+    if not key:
+        raise HTTPException(400, "ключ не задан — введите его и сохраните")
+    import json as _json
+    import socket as _socket
+    import urllib.error
+    import urllib.request
+    payload = _json.dumps({
+        "state": "Проверка связи из настроек PromptPilot.",
+        "model": "jev-latest",
+        "questions": {"probe": {"type": "noul", "instructions": "Связь установлена?"}},
+    }, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.typesafe.ai/v1/systemone", data=payload, method="POST",
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=45) as r:
+            reply = _json.loads(r.read().decode("utf-8"))
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as exc:
+        diag = {}
+        try:
+            diag["resolved"] = sorted(
+                ai[4][0] for ai in _socket.getaddrinfo("api.typesafe.ai", 443, _socket.AF_INET))
+        except Exception as dns_exc:
+            diag["resolved"] = f"DNS fail: {dns_exc}"
+        diag["proxies"] = urllib.request.getproxies()
+        diag["env_proxy"] = {k: v for k, v in os.environ.items() if "proxy" in k.lower()}
+        for ip in (diag["resolved"] if isinstance(diag["resolved"], list) else []):
+            try:
+                _c = _socket.create_connection((ip, 443), timeout=8)
+                _c.close()
+                diag[f"connect_{ip}"] = "OK"
+            except Exception as conn_exc:
+                diag[f"connect_{ip}"] = f"{type(conn_exc).__name__}: {conn_exc}"
+        raise HTTPException(
+            502, f"TypeSafe недоступен: {exc}; диагностика: {_json.dumps(diag, ensure_ascii=False)}")
+    return {"ok": True, "source": source, "reply": reply}
+
+
+# ── Квота-фейловер (лестница смен исполнителей) ──
+_QF_CONFIG = Path.home() / ".promptpilot" / "quota-failover.json"
+_QF_STATE = Path.home() / ".promptpilot" / "quota-failover-state.json"
+
+
+def _qf_read(path: Path):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+@app.get("/api/quota-failover")
+def api_quota_failover():
+    """Состояние лестницы смен: ступень, проценты квоты, кто в ролях."""
+    result = {"enabled": False, "mode": "unknown", "available": False}
+    cfg = _qf_read(_QF_CONFIG)
+    if cfg is None:
+        return result
+    result["enabled"] = bool(cfg.get("enabled", True))
+    result["thresholds"] = {
+        "failover_below_pct": cfg.get("failover_below_pct"),
+        "recover_above_pct": cfg.get("recover_above_pct"),
+    }
+    state = _qf_read(_QF_STATE)
+    if state is not None:
+        ladder = cfg.get("ladder") or []
+        rung = state.get("rung", 0)
+        result.update({
+            "available": True,
+            "mode": f"смена {rung}",
+            "rung": rung,
+            "run_executor": ladder[rung].get("executor") if rung < len(ladder) else None,
+            "interval_pct": state.get("interval_pct"),
+            "weekly_pct": state.get("weekly_pct"),
+            "info": state.get("current_info"),
+            "last_check": state.get("last_check"),
+            "switched_at": state.get("switched_at"),
+            "switch_reason": state.get("switch_reason"),
+        })
+    return result
+
+
+@app.get("/api/quota-failover/config")
+def api_quota_failover_config_get():
+    """Конфиг лестницы смен для UI (v1-конфиг нормализуется в лестницу)."""
+    raw = _qf_read(_QF_CONFIG)
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "qfw", Path(__file__).resolve().parent.parent / "quota-failover-watcher.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    cfg = mod.normalize_config(raw if raw is not None else {})
+    if raw is None:
+        _QF_CONFIG.write_text(
+            json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")
+    return cfg
+
+
+@app.put("/api/quota-failover/config")
+def api_quota_failover_config(body: dict):
+    """Сохранить конфиг лестницы из UI (вотчер перечитывает каждый цикл)."""
+    if not isinstance(body, dict) or not isinstance(body.get("ladder"), list):
+        raise HTTPException(400, "Ожидается объект с массивом ladder")
+    for rung in body["ladder"]:
+        if not isinstance(rung, dict) or not rung.get("executor"):
+            raise HTTPException(400, "У каждой смены должен быть исполнитель")
+    _QF_CONFIG.write_text(
+        json.dumps(body, ensure_ascii=False, indent=1), encoding="utf-8")
+    return {"ok": True, "rungs": len(body["ladder"])}
 
 
 @app.get("/api/herdr/agents")
@@ -1245,6 +1418,17 @@ def api_provider_create(p: ProviderCreate):
     return {"ok": True}
 
 
+@app.post("/api/providers/reorder")
+def api_providers_reorder(body: dict):
+    """Save the helper-card order (list of provider names, desired order)."""
+    from .config import set_providers_ui_order
+    names = body.get("names")
+    if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
+        raise HTTPException(400, "Ожидается {\"names\": [имена провайдеров по порядку]}")
+    set_providers_ui_order(names)
+    return {"ok": True}
+
+
 @app.delete("/api/providers/{name}")
 def api_provider_delete(name: str):
     from .config import remove_provider
@@ -1304,3 +1488,28 @@ def api_projects():
 @app.get("/")
 def index():
     return FileResponse(STATIC_DIR / "index.html")
+
+
+@app.get("/ui_shell.css", include_in_schema=False)
+def ui_shell_css():
+    """Serve the optional presentation layer from the existing same-origin UI."""
+    path = STATIC_DIR / "ui_shell.css"
+    if not path.is_file():
+        raise HTTPException(404, "UI shell stylesheet is not installed")
+    return FileResponse(path, media_type="text/css")
+
+
+@app.get("/ui_shell.js", include_in_schema=False)
+def ui_shell_js():
+    """Serve the optional presentation layer from the existing same-origin UI."""
+    path = STATIC_DIR / "ui_shell.js"
+    if not path.is_file():
+        raise HTTPException(404, "UI shell script is not installed")
+    return FileResponse(path, media_type="application/javascript")
+
+
+@app.get("/parallel")
+def parallel_addon_index():
+    if addon_index_path is None or not addon_index_path().is_file():
+        raise HTTPException(404, "Parallel add-on UI is not installed")
+    return FileResponse(addon_index_path())

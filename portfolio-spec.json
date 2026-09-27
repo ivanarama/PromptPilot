@@ -1,0 +1,22 @@
+{
+  "packages": [
+    {
+      "id": "reverso-m2",
+      "slug": "pkg-reverso-m2",
+      "title": "SECURITY_AUDIT M-2: кодирование слова в URL Reverso",
+      "objective": "Слово из книги вставляется в URL context.reverso.net без кодирования и лимита длины (../, ?, #, пробелы искажают путь; аудит M-2).",
+      "gate": ".\\gradlew.bat :feature:translation:test --console=plain --no-daemon",
+      "allowed_paths": ["feature/translation/src/main/java/com/bookapp/feature/translation/data/translators/ReversoTranslator.kt", "feature/translation/src/test/kotlin/com/bookapp/feature/translation/data/translators/ReversoTranslatorTest.kt"],
+      "prompt": "В feature/translation/src/main/java/com/bookapp/feature/translation/data/translators/ReversoTranslator.kt URL строится интерполяцией строки ~52: val url = \"https://context.reverso.net/translation/$fromCode-$toCode/$word\".toHttpUrl(). Слово приходит из текста книги и может содержать пробелы, '../', '?', '#', управляющие символы. Исправь: нормализуй слово перед вставкой (обрежь до 64 символов, выброси символы кроме букв/цифр/дефиса — java.text или regex) и вставляй в путь ТОЛЬКО через url-кодирование (okhttp addPathSegment или URLEncoder с заменой '+' на '%20'). Добавь в feature/translation/src/test/kotlin/com/bookapp/feature/translation/data/translators/ReversoTranslatorTest.kt юнит-тесты построения URL: слово с пробелом, слово с '../', слово с '#', слишком длинное слово (обрезается). Другие файлы не трогай. Доказательство: gradlew.bat :feature:translation:test --console=plain --no-daemon — зелёный."
+    },
+    {
+      "id": "backup-m3",
+      "slug": "pkg-backup-m3",
+      "title": "SECURITY_AUDIT M-3: dataExtractionRules вместо голого allowBackup",
+      "objective": "allowBackup=true без правил исключений: prefs покупок (EncryptedSharedPreferences) ломаются при restore, демо-триал переносится бэкапом (аудит M-3).",
+      "gate": ".\\gradlew.bat :app:assembleDebug --console=plain --no-daemon",
+      "allowed_paths": ["app/src/main/AndroidManifest.xml", "app/src/main/res/xml/backup_rules.xml", "app/src/main/res/xml/data_extraction_rules.xml"],
+      "prompt": "В app/src/main/AndroidManifest.xml у <application> стоит android:allowBackup=\"true\" без правил исключений. Сделай: (1) добавь атрибуты android:dataExtractionRules=\"@xml/data_extraction_rules\" и android:fullBackupContent=\"@xml/backup_rules\"; (2) создай app/src/main/res/xml/data_extraction_rules.xml — для cloud-backup и device-transfer исключи sharedpref 'monetization_prefs', 'reader_settings' и все database/файлы каталогов books/; (3) создай app/src/main/res/xml/backup_rules.xml (legacy <API31) с теми же исключениями (domen=\"file\" путями). Другие файлы не трогай. Доказательство: gradlew.bat :app:assembleDebug --console=plain --no-daemon — BUILD SUCCESSFUL."
+    }
+  ]
+}
