@@ -279,6 +279,24 @@ def escalate_platform(env: dict, iid: int, w: dict, reason: str) -> None:
 
 # --- merge ------------------------------------------------------------------
 
+def notify_author(env: dict, iid: int, w: dict, text: str) -> None:
+    """Уведомить автора задачи в TG (если задача пришла из Telegram)."""
+    token = env.get("TG_BOT_TOKEN", "")
+    chat_id = w.get("tg_chat_id", "")
+    if not (token and chat_id):
+        return
+    try:
+        subprocess.run(["curl", "-sS", "-m", "20", "-X", "POST",
+                        "-H", "Content-Type: application/json",
+                        "--data-binary",
+                        json.dumps({"chat_id": int(chat_id), "text": text},
+                                   ensure_ascii=False),
+                        f"https://api.telegram.org/bot{token}/sendMessage"],
+                       capture_output=True, timeout=30)
+    except Exception as exc:
+        print(f"  !! TG notify: {exc}", flush=True)
+
+
 def do_merge(env: dict, state: dict, iid: int) -> None:
     w = state["work"].get(str(iid)) or {}
     branch = w.get("branch") or f"task/{iid}"
@@ -300,6 +318,9 @@ def do_merge(env: dict, state: dict, iid: int) -> None:
     project_api(env, f"/issues/{iid}", "PUT", {"state_event": "close"})
     project_api(env, f"/issues/{iid}/notes", "POST", {
         "body": f"📦 Задача выполнена и влита в main (v-запись в CHANGELOG-TEAM)."})
+    notify_author(env, iid, w,
+                  f"🎉 Твоя задача «{w.get('title', '')}» выполнена и влита "
+                  f"в основную ветку. Спасибо за вклад!")
     state["work"][str(iid)]["stage"] = "в релизе"
     save_state(state)
     print(f"📦 issue #{iid}: смержено в main, закрыто")
