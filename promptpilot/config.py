@@ -1102,6 +1102,16 @@ def is_loopback_host(host: str) -> bool:
 # scripts — "Authorization: Bearer <token>" or curl -u x:<token>.
 API_TOKEN = os.environ.get("PP_API_TOKEN", "")
 
+# Without a token the server answers only to Host names a hostile web page
+# cannot make the browser send: localhost names and IP literals. Names used by
+# a reverse proxy or a tunnel go here (comma-separated); "*" turns the Host
+# check off entirely.
+ALLOWED_HOSTS = [
+    host.strip().lower().rstrip(".")
+    for host in os.environ.get("PP_ALLOWED_HOSTS", "").split(",")
+    if host.strip()
+]
+
 # Escape hatch for the loopback guard on `pp server`: inside a container binding
 # 0.0.0.0 is normal (the security boundary is the host port publish, not the
 # container's bind), so the image sets this. On bare metal leave it unset.

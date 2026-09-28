@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import ipaddress
 import secrets
 import subprocess
 import sys
@@ -10,6 +11,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.concurrency import run_in_threadpool
@@ -21,7 +23,7 @@ import re as _re
 
 from . import db, epf_tools, workflows
 from . import pipeline_insights
-from .config import API_TOKEN, DB_DIR, EFFORT_LEVELS, PIPELINE_SNAPSHOT_INTERVAL, get_provider_models, get_skills, load_providers, mask_secret_value, provider_available, PROJECTS_ROOT
+from .config import ALLOWED_HOSTS, API_TOKEN, DB_DIR, EFFORT_LEVELS, PIPELINE_SNAPSHOT_INTERVAL, get_provider_models, get_skills, load_providers, mask_secret_value, provider_available, PROJECTS_ROOT
 from .models import (
     CostStats,
     FindingStatus,
@@ -103,6 +105,57 @@ app = FastAPI(title="PromptPilot", version="0.1.0", lifespan=_lifespan)
 _SAFE_METHODS = ("GET", "HEAD", "OPTIONS")
 
 
+def _hostname(authority: str) -> str:
+    """Lowercased host part of a Host header or URL authority, without port."""
+    value = (authority or "").strip().lower()
+    if value.startswith("["):
+        end = value.find("]")
+        return value[1:end] if end > 0 else ""
+    if value.count(":") == 1:
+        value = value.split(":", 1)[0]
+    return value.rstrip(".")
+
+
+def _trusted_host(authority: str) -> bool:
+    """Whether a page served from elsewhere could have produced this Host.
+
+    DNS rebinding points an attacker's own hostname at 127.0.0.1, so the
+    browser treats the attacker's page as same-origin with this server and the
+    request carries the attacker's hostname. It cannot make the browser send a
+    localhost name (browsers resolve *.localhost themselves) or an IP literal,
+    so those stay allowed together with the names in PP_ALLOWED_HOSTS.
+    """
+    hostname = _hostname(authority)
+    if not hostname:
+        return False
+    if "*" in ALLOWED_HOSTS or hostname in ALLOWED_HOSTS:
+        return True
+    if hostname == "localhost" or hostname.endswith(".localhost"):
+        return True
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        return False
+    return True
+
+
+def _same_origin(origin: str, authority: str) -> bool:
+    """Whether a browser Origin header names this server.
+
+    A page on another port of the same machine is "same-site", not
+    same-origin: its Origin differs from the Host it sends. Names listed in
+    PP_ALLOWED_HOSTS are accepted too — behind a reverse proxy the Host header
+    names the upstream while Origin keeps the public name.
+    """
+    parts = urlsplit(origin or "")
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        return False
+    if parts.netloc.lower() == (authority or "").strip().lower():
+        return True
+    hostname = _hostname(parts.netloc)
+    return bool(hostname) and hostname in ALLOWED_HOSTS
+
+
 @app.middleware("http")
 async def _auth(request, call_next):
     """Optional auth: enabled by PP_API_TOKEN. Accepts Bearer <token> or
@@ -112,11 +165,28 @@ async def _auth(request, call_next):
     cross-site is refused: without this, a malicious page open in the user's
     browser could POST to the loopback server (no token by default) and queue a
     task that runs with --dangerously-skip-permissions. curl/scripts don't send
-    Sec-Fetch-Site, so they're unaffected."""
+    Sec-Fetch-Site, so they're unaffected.
+
+    Without a token the loopback bind is the only boundary, and "cross-site"
+    does not cover every way around it: DNS rebinding makes a hostile page
+    same-origin with this server, and a page on another localhost port is
+    "same-site". So a foreign Host is refused on every request, and a
+    state-changing request whose Origin is not this server is refused too.
+    Scripts send neither a foreign Host nor an Origin and keep working."""
     if request.method not in _SAFE_METHODS:
         if request.headers.get("sec-fetch-site") == "cross-site":
             return Response(status_code=403, content="cross-site request refused")
     if not API_TOKEN:
+        host = request.headers.get("host", "")
+        if not _trusted_host(host):
+            return Response(
+                status_code=403,
+                content="host not allowed: add it to PP_ALLOWED_HOSTS or set PP_API_TOKEN",
+            )
+        origin = request.headers.get("origin")
+        if (request.method not in _SAFE_METHODS and origin is not None
+                and not _same_origin(origin, host)):
+            return Response(status_code=403, content="cross-origin request refused")
         return await call_next(request)
     header = request.headers.get("authorization", "")
     ok = False

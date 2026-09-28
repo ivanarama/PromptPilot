@@ -28,7 +28,7 @@ def request(method, path, **kwargs):
     async def _run():
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(
-            transport=transport, base_url="http://testserver"
+            transport=transport, base_url="http://127.0.0.1:8420"
         ) as client:
             return await client.request(method, path, **kwargs)
 
