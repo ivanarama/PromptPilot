@@ -59,3 +59,14 @@ def test_bump_export_presets_sets_name_and_increments_code(release_kt):
     assert "version/code=8" in bumped
     assert 'version/name="0.1.1"' in bumped
     assert 'launcher_icons/main_192=""' in bumped
+
+
+def test_release_without_apk_uses_existing_gh_flag(release_kt, tmp_path, monkeypatch):
+    # gh не знает «--verify» (есть только --verify-tag): релиз без --export падал
+    calls = []
+    monkeypatch.setattr(release_kt, "GAME", tmp_path)
+    monkeypatch.setattr(release_kt, "run", lambda cmd, cwd=None, timeout=600: calls.append(cmd) or (0, ""))
+    release_kt.publish("0.1.1", do_export=False, do_release=True)
+    gh_call = next(cmd for cmd in calls if cmd[:3] == ["gh", "release", "create"])
+    assert "--verify-tag" in gh_call
+    assert "--verify" not in gh_call

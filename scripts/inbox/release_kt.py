@@ -42,7 +42,7 @@ FATAL_MARKERS = ("SCRIPT ERROR", "Parse Error", "Failed to load script",
 
 def run(cmd: list[str], cwd: pathlib.Path | None = None, timeout: int = 600) -> tuple[int, str]:
     try:
-        result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
+        result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, check=False,
                                 encoding="utf-8", errors="replace", timeout=timeout)
     except subprocess.TimeoutExpired as exc:
         # Зависший Godot (скрипт упал до quit()) — это провал гейта, а не трейсбек
@@ -110,9 +110,9 @@ def gate() -> None:
 
 def bump_export_presets(text: str, version: str) -> str:
     """Версия APK: versionName = VERSION, versionCode +1 (иначе все сборки — «1.0», код 1)."""
-    text = re.sub(r'^version/name=".*"$', f'version/name="{version}"', text, count=1, flags=re.M)
+    text = re.sub(r'^version/name=".*"$', f'version/name="{version}"', text, count=1, flags=re.MULTILINE)
     return re.sub(r"^version/code=(\d+)$", lambda m: f"version/code={int(m.group(1)) + 1}",
-                  text, count=1, flags=re.M)
+                  text, count=1, flags=re.MULTILINE)
 
 
 def bump(minor: bool) -> str:
@@ -148,8 +148,10 @@ def publish(version: str, do_export: bool, do_release: bool) -> None:
         if code != 0 or not apk.exists():
             sys.exit(f"экспорт APK не удался:\n{out[-2000:]}")
     if do_release:
+        # Без APK — релиз без файлов, но только для уже запушенного тега.
+        # Флаг называется --verify-tag: на «--verify» gh отвечает «unknown flag».
         code, out = run(["gh", "release", "create", f"v{version}",
-                         str(apk) if apk.exists() else "--verify",
+                         str(apk) if apk.exists() else "--verify-tag",
                          "--repo", repo,
                          "--title", f"v{version}",
                          "--notes", f"Релиз v{version}. Подробнее — в летописи на сайте."])
