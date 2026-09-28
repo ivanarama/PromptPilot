@@ -7,17 +7,18 @@
 Запуск: py -3.11 scripts/oneservice/os_dashboard.py [--out путь.html]
 """
 
+import html as html_lib
 import json
 import re
 import sys
 import time
+import urllib.parse
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from os_intake import load_env, project_api, ROOT  # noqa: E402
 
 OUT = ROOT / "os_iceberg.html"
-BG = Path(r"C:\Projects\localChat\frontend\static\iceberg-bg.png")
 
 
 def collect(env: dict) -> list[dict]:
@@ -25,7 +26,7 @@ def collect(env: dict) -> list[dict]:
     items = []
     for issue in issues:
         desc = issue.get("description") or ""
-        images = ["https://gitlab.icecorp.ru" + m
+        images = [env["GITLAB_URL"].rstrip("/") + m
                   for m in re.findall(r"!\[[^\]]*\]\((/uploads/[^)\s\"'<>]+)\)", desc)]
         items.append({
             "iid": issue["iid"],
@@ -121,7 +122,7 @@ TEMPLATE = """<!DOCTYPE html>
     <div class="layer" data-stage="отклонено"><div class="lt">⚓ Дно<span class="cnt" data-c="отклонено"></span><small>блокировано платформой · отклонено</small></div><div class="cards" data-stage="отклонено"></div></div>
   </div>
   <footer>oneservice-cc_v2 · конвейер: целесообразность → триаж → фикс → ревью → мерж ·
-    <a href="https://gitlab.icecorp.ru/1c/oneservice-cc_v2/-/issues">GitLab</a></footer>
+    <a href="__ISSUES_URL__">GitLab</a></footer>
 <script>
   const FEED = __FEED__;
   // Issue text is written by whoever sent the request: escape for attributes too.
@@ -181,14 +182,22 @@ def main() -> int:
     html = TEMPLATE.replace("__FEED__", json.dumps(
         {"updated": time.strftime("%Y-%m-%d %H:%M"), "items": items},
         ensure_ascii=False)).replace("__STAMP__", time.strftime("%Y-%m-%d %H:%M"))
+    html = html.replace("__ISSUES_URL__", issues_url(env))
     out = ROOT / "os_iceberg.html"
     out.write_text(html, encoding="utf-8")
     bg = ROOT / "assets" / "iceberg-bg.png"
-    if BG.exists() and not bg.exists():
+    custom_bg = Path(env["OS_DASHBOARD_BG"]) if env.get("OS_DASHBOARD_BG") else None
+    if custom_bg and custom_bg.exists() and not bg.exists():
         bg.parent.mkdir(parents=True, exist_ok=True)
-        bg.write_bytes(BG.read_bytes())
+        bg.write_bytes(custom_bg.read_bytes())
     print(f"Айсберг собран: {out} (задач: {total_of(items)})")
     return 0
+
+
+def issues_url(env: dict) -> str:
+    """Link to the project's issue list, from the same settings the API uses."""
+    project = urllib.parse.unquote(env.get("GITLAB_PROJECT", ""))
+    return html_lib.escape(f"{env.get('GITLAB_URL', '').rstrip('/')}/{project}/-/issues")
 
 
 def total_of(items):
