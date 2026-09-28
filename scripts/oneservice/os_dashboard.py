@@ -26,7 +26,7 @@ def collect(env: dict) -> list[dict]:
     for issue in issues:
         desc = issue.get("description") or ""
         images = ["https://gitlab.icecorp.ru" + m
-                  for m in re.findall(r"!\[[^\]]*\]\((/uploads/[^)]+)\)", desc)]
+                  for m in re.findall(r"!\[[^\]]*\]\((/uploads/[^)\s\"'<>]+)\)", desc)]
         items.append({
             "iid": issue["iid"],
             "title": issue["title"],
@@ -124,7 +124,9 @@ TEMPLATE = """<!DOCTYPE html>
     <a href="https://gitlab.icecorp.ru/1c/oneservice-cc_v2/-/issues">GitLab</a></footer>
 <script>
   const FEED = __FEED__;
-  const esc = x => (x || "").replace(/</g, "&lt;");
+  // Issue text is written by whoever sent the request: escape for attributes too.
+  const esc = x => String(x || "").replace(/&/g, "&amp;").replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
   const STAGE_OF = item => {
     const l = item.labels || [];
     const v = (item.verdict || "").toUpperCase();
@@ -141,7 +143,7 @@ TEMPLATE = """<!DOCTYPE html>
     (item.labels || []).forEach(x => chips.push('<span class="chip">' + esc(x) + "</span>"));
     chips.push('<span class="chip author">✍ ' + esc(item.author) + "</span>");
     const imgs = (item.images || []).map(u =>
-      '<img src="' + u + '" style="max-width:100%;border-radius:8px;margin:4px 0;">').join("");
+      '<img src="' + esc(u) + '" style="max-width:100%;border-radius:8px;margin:4px 0;">').join("");
     const open = 'window.open("' + item.web_url + '","_blank")';
     return `<div class="card" onclick="${open.replace(/"/g, "&quot;")}">
       <div class="t"><a href="${item.web_url}" target="_blank" rel="noopener">#${item.iid}</a> ${esc(item.title)}</div>
