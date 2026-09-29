@@ -6,6 +6,7 @@ from threading import Barrier
 
 import pytest
 
+from promptpilot import fix_handoff
 from promptpilot import project_pipeline as pipelinectl
 from promptpilot.models import TaskCreate
 
@@ -44,8 +45,8 @@ def test_fix_election_prioritizes_pr_rework_and_preserves_issue_order(
         isolated_db, monkeypatch):
     candidates = [
         {"stage": "fix-issue", "number": 3, "eligibility_digest": DIGEST},
-        {"stage": "review", "number": 12, "head": HEAD_B},
         {"stage": "review", "number": 10, "head": HEAD_A},
+        {"stage": "review", "number": 12, "head": HEAD_B},
     ]
     _attempt(isolated_db, monkeypatch, "first FIX")
     first, reservation = pipelinectl._elect_fix_candidate(CONFIG, candidates)
@@ -101,3 +102,71 @@ def test_fix_election_concurrent_attempts_do_not_duplicate_target(
         results = list(pool.map(elect, tasks))
     assert len([result for result in results if result is not None]) == 1
     assert pipelinectl._fix_candidate_key(candidate) == ("fix-pr", 10, HEAD_A)
+
+
+def _health(*candidates):
+    return {"state": "green", "findings": [],
+            "fix_candidates": list(candidates)}
+
+
+def _setup_handoff(isolated_db, monkeypatch, tmp_path, candidates):
+    monkeypatch.setenv("PP_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("PP_PIPELINE_REPLICAS", "2")
+    _attempt(isolated_db, monkeypatch, "parallel FIX")
+    health = _health(*candidates)
+    monkeypatch.setattr(pipelinectl, "run_health", lambda *_args, **_kwargs: health)
+    monkeypatch.setattr(pipelinectl, "ensure_identity", lambda *_args: None)
+    return health
+
+
+def test_fix_handoff_is_signed_and_gate_keeps_exact_target(
+        isolated_db, monkeypatch, tmp_path):
+    candidate = {"stage": "review", "number": 10, "head": HEAD_A}
+    _setup_handoff(isolated_db, monkeypatch, tmp_path, [candidate])
+    preflight = pipelinectl.next_fix(None, dict(CONFIG))
+    assert preflight["action"] == "fallback"
+    assert preflight["target"] == {
+        "stage": "fix-pr", "number": 10, "head": HEAD_A,
+    }
+    assert fix_handoff.validate(preflight)["target"] == preflight["target"]
+    gated = fix_handoff.gate(None, dict(CONFIG), preflight["handoff"]["lease"])
+    assert gated["action"] == "validated"
+    assert gated["mutation_authorized"] is False
+
+
+def test_fix_handoff_rejects_tampering_and_changed_health(
+        isolated_db, monkeypatch, tmp_path):
+    candidate = {"stage": "review", "number": 10, "head": HEAD_A}
+    _setup_handoff(isolated_db, monkeypatch, tmp_path, [candidate])
+    preflight = pipelinectl.next_fix(None, dict(CONFIG))
+    lease = preflight["handoff"]["lease"]
+    with pytest.raises(pipelinectl.PipelineError, match="signature"):
+        fix_handoff.gate(None, dict(CONFIG), lease[:-1] + ("A" if lease[-1] != "A" else "B"))
+    monkeypatch.setattr(pipelinectl, "run_health", lambda *_args, **_kwargs: _health(
+        {**candidate, "head": HEAD_B}))
+    with pytest.raises(pipelinectl.PipelineError, match="no longer in the executable queue"):
+        fix_handoff.gate(None, dict(CONFIG), lease)
+
+
+def test_fix_handoff_rejects_new_unreserved_priority_and_config_change(
+        isolated_db, monkeypatch, tmp_path):
+    candidate = {"stage": "review", "number": 10, "head": HEAD_A}
+    _setup_handoff(isolated_db, monkeypatch, tmp_path, [candidate])
+    preflight = pipelinectl.next_fix(None, dict(CONFIG))
+    lease = preflight["handoff"]["lease"]
+    with pytest.raises(pipelinectl.PipelineError, match="configuration changed"):
+        fix_handoff.gate(None, {**CONFIG, "parallel_fix_enabled": False}, lease)
+    monkeypatch.setattr(pipelinectl, "run_health", lambda *_args, **_kwargs: _health(
+        {"stage": "review", "number": 9, "head": HEAD_B}, candidate))
+    with pytest.raises(pipelinectl.PipelineError, match="higher-priority"):
+        fix_handoff.gate(None, dict(CONFIG), lease)
+
+
+def test_fix_next_requires_multiple_replicas_before_reserving(
+        isolated_db, monkeypatch, tmp_path):
+    candidate = {"stage": "review", "number": 10, "head": HEAD_A}
+    _setup_handoff(isolated_db, monkeypatch, tmp_path, [candidate])
+    monkeypatch.setenv("PP_PIPELINE_REPLICAS", "1")
+    with pytest.raises(pipelinectl.PipelineError, match="at least two replicas"):
+        pipelinectl.next_fix(None, dict(CONFIG))
+    assert isolated_db.list_pipeline_target_reservations(repository="owner/repo") == []

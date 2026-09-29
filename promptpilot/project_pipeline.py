@@ -279,6 +279,9 @@ def load_config(path: str) -> dict:
     data.setdefault("review_lease_seconds", 7200)
     data.setdefault("target_reservation_ttl_seconds", data["review_lease_seconds"])
     data.setdefault("fallback_handoff", "legacy")
+    data.setdefault("parallel_fix_enabled", False)
+    if type(data["parallel_fix_enabled"]) is not bool:
+        raise PipelineError("parallel_fix_enabled must be a boolean")
     if not isinstance(data["fallback_handoff"], str) or data["fallback_handoff"] not in {"legacy", "target-v1"}:
         raise PipelineError("fallback_handoff must be legacy or target-v1")
     if not isinstance(data.get("sync_base_before_health", False), bool):
@@ -1216,6 +1219,8 @@ def capabilities(config: dict) -> dict:
             "review_completion_gate": config.get("review_completion_gate", "health"),
             "fallback_handoff": config.get("fallback_handoff", "legacy"),
             "target_reservations": "sqlite-task-lease-v1",
+            "parallel_fix_election": "disabled-by-default" if not config.get(
+                "parallel_fix_enabled") else "signed-target-v1",
             "fallback": "repository skill"}
 
 
@@ -1373,7 +1378,7 @@ def _fix_candidate_key(candidate: dict) -> tuple[str, int, str]:
     if not isinstance(candidate, dict):
         raise PipelineError("pipeline health returned an invalid FIX candidate")
     raw_stage = candidate.get("stage")
-    if raw_stage == "review":
+    if raw_stage in {"review", "fix-pr"}:
         stage = "fix-pr"
         revision = candidate.get("head")
     elif raw_stage == "fix-issue":
@@ -1390,12 +1395,11 @@ def _fix_candidate_key(candidate: dict) -> tuple[str, int, str]:
 
 
 def _ordered_fix_candidates(candidates: list[dict]) -> list[dict]:
-    """Keep canonical FIX precedence: PR rework before any new issue."""
+    """Keep canonical FIX precedence and health's priority order within each kind."""
     if not isinstance(candidates, list):
         raise PipelineError("pipeline health returned invalid FIX candidates")
     keyed = [(_fix_candidate_key(item), item) for item in candidates]
-    prs = sorted((pair for pair in keyed if pair[0][0] == "fix-pr"),
-                 key=lambda pair: pair[0][1])
+    prs = [pair for pair in keyed if pair[0][0] == "fix-pr"]
     issues = [pair for pair in keyed if pair[0][0] == "fix-issue"]
     return [item for _key, item in (*prs, *issues)]
 
@@ -1438,6 +1442,26 @@ def _elect_fix_candidate(config: dict, candidates: list[dict]) -> tuple[dict | N
             raise PipelineError(
                 "existing FIX target reservation was lost; start a new task")
     return None, None
+
+
+def next_fix(gh: GitHub, config: dict, *, config_path: str | None = None) -> dict:
+    """Select one exact FIX target; never expose an untargeted skill fallback."""
+    if config.get("parallel_fix_enabled") is not True:
+        raise PipelineError("parallel FIX route is disabled")
+    if _configured_replica_count() < 2:
+        raise PipelineError("parallel FIX route requires at least two replicas")
+    from . import fix_handoff
+
+    health = run_health(config, config_path=config_path)
+    ordered = fix_handoff.ordered_health_candidates(health)
+    if not ordered:
+        return {"action": "empty", "stage": "fix", "verdict": "ПУСТО",
+                "reason": "no executable FIX target"}
+    candidate, reservation = _elect_fix_candidate(config, ordered)
+    if candidate is None:
+        return {"action": "wait", "stage": "fix", "verdict": "ПУСТО",
+                "reason": "all current FIX targets are reserved by other replicas"}
+    return fix_handoff.create(config, health, candidate, reservation)
 
 
 def _elect_review_candidate(config: dict, health: dict,
@@ -2005,9 +2029,9 @@ def run(argv=None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("capabilities")
     next_parser = sub.add_parser("next")
-    next_parser.add_argument("stage", choices=("review", "merge"))
+    next_parser.add_argument("stage", choices=("review", "merge", "fix"))
     gate_parser = sub.add_parser("gate-fallback")
-    gate_parser.add_argument("stage", choices=("review", "merge"))
+    gate_parser.add_argument("stage", choices=("review", "merge", "fix"))
     gate_parser.add_argument("--lease", required=True)
     complete_parser = sub.add_parser("complete")
     complete_parser.add_argument("stage", choices=("review", "merge", "merge-cleanup"))
@@ -2023,13 +2047,20 @@ def run(argv=None) -> int:
             if hasattr(gh, "timeout_seconds"):
                 gh.timeout_seconds = int(config.get("github_timeout_seconds", 120))
             if args.command == "next":
-                value = (next_review(gh, config, config_path=args.config)
-                         if args.stage == "review"
-                         else next_merge(gh, config, config_path=args.config))
+                if args.stage == "review":
+                    value = next_review(gh, config, config_path=args.config)
+                elif args.stage == "merge":
+                    value = next_merge(gh, config, config_path=args.config)
+                else:
+                    value = next_fix(gh, config, config_path=args.config)
             elif args.command == "gate-fallback":
-                from .fallback_handoff import gate
-
-                value = gate(gh, config, args.stage, args.lease, config_path=args.config)
+                if args.stage == "fix":
+                    from .fix_handoff import gate
+                    value = gate(gh, config, args.lease, config_path=args.config)
+                else:
+                    from .fallback_handoff import gate
+                    value = gate(gh, config, args.stage, args.lease,
+                                 config_path=args.config)
             elif args.stage == "review":
                 if not args.report:
                     raise PipelineError("complete review requires --report")
