@@ -1377,6 +1377,84 @@ def _review_health_without_targets(health: dict, unavailable: set[tuple]) -> dic
     return filtered
 
 
+def _fix_candidate_key(candidate: dict) -> tuple[str, int, str]:
+    """Normalize a FIX election candidate, without granting mutation authority.
+
+    The health report currently calls PR-rework candidates ``review``. An
+    issue has no commit HEAD: its 40-hex eligibility digest must be supplied
+    by a future versioned health contract, never inferred from display text or
+    ``updated_at`` alone. The live GitHub state still needs a separate gate.
+    """
+    if not isinstance(candidate, dict):
+        raise PipelineError("pipeline health returned an invalid FIX candidate")
+    raw_stage = candidate.get("stage")
+    if raw_stage == "review":
+        stage = "fix-pr"
+        revision = candidate.get("head")
+    elif raw_stage == "fix-issue":
+        stage = "fix-issue"
+        revision = candidate.get("eligibility_digest")
+    else:
+        raise PipelineError("pipeline health returned an unknown FIX target kind")
+    number = candidate.get("number")
+    if (type(number) is not int or number <= 0
+            or not isinstance(revision, str)
+            or not re.fullmatch(r"[0-9a-f]{40}", revision)):
+        raise PipelineError("pipeline health returned an unversioned FIX target")
+    return stage, number, revision
+
+
+def _ordered_fix_candidates(candidates: list[dict]) -> list[dict]:
+    """Keep canonical FIX precedence: PR rework before any new issue."""
+    if not isinstance(candidates, list):
+        raise PipelineError("pipeline health returned invalid FIX candidates")
+    keyed = [(_fix_candidate_key(item), item) for item in candidates]
+    prs = sorted((pair for pair in keyed if pair[0][0] == "fix-pr"),
+                 key=lambda pair: pair[0][1])
+    issues = [pair for pair in keyed if pair[0][0] == "fix-issue"]
+    return [item for _key, item in (*prs, *issues)]
+
+
+def _elect_fix_candidate(config: dict, candidates: list[dict]) -> tuple[dict | None, dict | None]:
+    """Atomically reserve one exact FIX target for a claimed task attempt.
+
+    This is a disabled-by-default building block. A signed handoff and a live
+    pre-mutation gate are required before exposing it as a runnable route.
+    """
+    if config.get("parallel_fix_enabled") is not True:
+        raise PipelineError("parallel FIX election is disabled")
+    ordered = _ordered_fix_candidates(candidates)
+    task_id = _pipeline_task_id(required=True)
+    task_started_at = _pipeline_task_started_at(required=True)
+    ownership_kind = _provider_ownership_kind(required=True)
+    from . import db as scheduler_db
+
+    keys = [_fix_candidate_key(item) for item in ordered]
+    own = next((item for item in scheduler_db.list_pipeline_target_reservations(
+        repository=config["repository"])
+                if int(item["task_id"]) == task_id), None)
+    if own is not None:
+        own_key = (own["stage"], int(own["number"]), own["head"])
+        if own_key not in keys:
+            raise PipelineError(
+                "existing FIX target reservation is no longer eligible; start a new task")
+        ordered = [ordered[keys.index(own_key)]]
+    for candidate in ordered:
+        stage, number, revision = _fix_candidate_key(candidate)
+        reservation = scheduler_db.reserve_pipeline_target(
+            config["repository"], stage, number, revision, task_id,
+            int(config.get("target_reservation_ttl_seconds", 7200)),
+            task_started_at=task_started_at,
+            ownership_kind=ownership_kind,
+        )
+        if reservation is not None:
+            return candidate, reservation
+        if own is not None:
+            raise PipelineError(
+                "existing FIX target reservation was lost; start a new task")
+    return None, None
+
+
 def _elect_review_candidate(config: dict, health: dict,
                             candidates: list[dict]) -> tuple[dict | None, dict | None, dict]:
     """Reserve the first free candidate and preserve queue order atomically."""
