@@ -37,10 +37,10 @@ GIT_ENV = {
 }
 
 
-def git(cwd, *args) -> str:
+def git(cwd, *args, env=None) -> str:
     result = subprocess.run(
         ["git", "-c", "core.autocrlf=false", "-c", "init.defaultBranch=main", *args],
-        cwd=cwd, capture_output=True, text=True, env={**os.environ, **GIT_ENV})
+        cwd=cwd, capture_output=True, text=True, env={**os.environ, **GIT_ENV, **(env or {})})
     if result.returncode:
         raise AssertionError(f"git {args}: {result.stderr or result.stdout}")
     return result.stdout.strip()
@@ -82,7 +82,7 @@ class World:
         self.work = root / "work"  # the automation checkout pipelinectl runs in
         git(root, "clone", "-q", str(self.origin), str(self.work))
         self.variants = {"evil": self._evil_merge(), "conflict": self._conflicting_sync(),
-                         "rewritten": self._rewritten_main()}
+                         "rewritten": self._rewritten_main(), "future": self._future_sync()}
 
     def clone_to(self, root: Path) -> "World":
         shutil.copytree(self.root, root, dirs_exist_ok=True)
@@ -102,6 +102,9 @@ class World:
 
     def rewritten_main(self) -> str:
         return self.variants["rewritten"]
+
+    def future_sync(self) -> str:
+        return self.variants["future"]
 
     def publish(self, sha: str, ref: str):
         git(self.seed, "push", "-q", "-f", "origin", f"{sha}:{ref}")
@@ -144,6 +147,16 @@ class World:
         git(self.seed, "checkout", "-q", "-B", "rewritten", self.m0)
         sha = commit(self.seed, "M2", **{"b.txt": "b2\n"})
         self.publish(sha, "refs/staging/rewritten")
+        return sha
+
+    def _future_sync(self) -> str:
+        """The same clean merge, made on a machine whose clock runs ahead."""
+        git(self.seed, "checkout", "-q", "-B", "future", self.a)
+        future = "2099-01-01T00:00:00Z"
+        git(self.seed, "merge", "-q", "--no-ff", "-m", "Merge branch 'main' into feature",
+            self.m1, env={"GIT_AUTHOR_DATE": future, "GIT_COMMITTER_DATE": future})
+        sha = git(self.seed, "rev-parse", "HEAD")
+        self.publish(sha, "refs/staging/future")
         return sha
 
     def parents(self, sha: str) -> list[str]:
@@ -648,6 +661,25 @@ def test_running_ci_waits_and_review_does_not_start(pipelinectl, world):
 
     assert merge == {"action": "wait", "number": NUMBER,
                      "reason": "base-sync carry pending: required CI checks are still running on HEAD"}
+    assert review["action"] == "wait" and review["verdict"] == "ПУСТО"
+    assert github.mutations == []
+
+
+def test_commit_dated_ahead_of_the_clock_waits(pipelinectl, world):
+    """GitHub would list it after the merge intent, where cleanup accepts no commit."""
+    github = FakeGitHub(world).synced()
+    sha = world.future_sync()
+    world.set_pr_head(sha)
+    github.head = sha
+    github.find("PRC_TO")["commit"]["oid"] = sha
+    github.candidate["to"] = sha
+
+    _code, merge, _ = pipelinectl(github, "next", "merge")
+    _code, review, _ = pipelinectl(github, "next", "review")
+
+    assert merge == {"action": "wait", "number": NUMBER,
+                     "reason": "base-sync carry pending: the base-sync commit is dated ahead "
+                               "of the clock; waiting until its date passes"}
     assert review["action"] == "wait" and review["verdict"] == "ПУСТО"
     assert github.mutations == []
 

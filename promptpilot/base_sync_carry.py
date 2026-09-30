@@ -41,11 +41,13 @@ from __future__ import annotations
 
 import re
 import subprocess
+import time
 
 from . import project_pipeline as pp
 from .pipeline_errors import PipelineError
 
 PROTOCOL = "base-sync-carry-v1"
+CLOCK_MARGIN_SECONDS = 60
 STAGES = frozenset({"integration-review", "legacy-integration-review"})
 CONSUMER_CHECKS = frozenset({"base_ancestry", "merge_tree", "required_checks",
                              "timeline_epoch"})
@@ -222,6 +224,11 @@ def parents_of(config: dict, sha: str) -> list[str]:
     return _git(config, "rev-list", "--parents", "-n", "1", sha)[1].split()[1:]
 
 
+def commit_date(config: dict, sha: str) -> int:
+    """The later of the author and committer dates, in seconds since the epoch."""
+    return max(int(value) for value in _git(config, "show", "-s", "--format=%at %ct", sha)[1].split())
+
+
 def git_facts(config: dict, number: int, from_sha: str, base_sha: str,
               to_sha: str, base_tip: str) -> dict:
     """Conditions 2 (commit shape, ancestry) and 3 (reproduced tree).
@@ -322,6 +329,12 @@ def verify(gh, config: dict, number: int, to_sha: str, *,
                                "on the review of the reviewed version")
         git_facts(config, number, from_sha, base_sha, to_sha, base_tip)
         status = live_state(gh, config, number, to_sha)
+        if commit_date(config, to_sha) > time.time() - CLOCK_MARGIN_SECONDS:
+            # GitHub lists a commit by its date (onebase#1561): one dated ahead
+            # of the clock would land after the merge intent, where the cleanup
+            # accepts no commit. Wait until the date has passed.
+            raise _Pending("the base-sync commit is dated ahead of the clock; "
+                           "waiting until its date passes")
         return {"verdict": "proven", "evidence": evidence_of(from_sha, base_sha, to_sha, facts),
                 "snapshot": pp.digest(snapshot), "status": status}
     except _Pending as exc:
