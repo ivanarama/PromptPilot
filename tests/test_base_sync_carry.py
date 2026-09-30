@@ -427,6 +427,35 @@ def test_update_conflict_publishes_nothing_and_carries_nothing(pipelinectl, worl
     assert pp.decode_lease(after["lease"])["mode"] == "update-branch"  # still only an update
 
 
+def test_merge_dated_before_the_review_is_carried_by_the_graph(pipelinectl, world, tmp_path):
+    """A merge made locally before the review and pushed after the ship.
+
+    GitHub lists its commit before the review, the claim and the ship
+    (onebase#1561). The graph still proves the one transition, with the same
+    evidence as for a commit listed last.
+    """
+    def evidence(github):
+        facts = base_sync_carry.timeline_facts({"edges": github.edges}, TRUSTED,
+                                               world.a, world.to, world.m1)
+        return base_sync_carry.evidence_of(world.a, world.m1, world.to, facts)
+
+    github = FakeGitHub(world).synced()
+    listed_last = evidence(github)
+    move_edge(github, "PRC_TO", 1)
+    assert evidence(github) == listed_last
+
+    code, election, _ = pipelinectl(github, "next", "merge")
+    assert code == 0 and election["carry"] == "proven", election
+    assert pp.decode_lease(election["lease"])["carry"] == listed_last
+    code, merged, _ = pipelinectl(github, "complete", "merge", "--lease-file",
+                                  lease_file(tmp_path, election))
+
+    assert code == 0 and merged["action"] == "completed", merged
+    assert merge_calls(github) == [("PUT", f"repos/{REPO}/pulls/{NUMBER}/merge",
+                                    {"merge_method": "merge", "sha": world.to})]
+    assert "ship" not in github.labels
+
+
 # --- every condition, broken one at a time ----------------------------------------------------
 
 def edited_review(github, world):
@@ -539,6 +568,33 @@ def contradicting_done_marker(github, world):
                         f"base={world.m0} previous=none ship-event=SHIP_1 -->")
 
 
+def move_edge(github, node_id: str, index: int):
+    """GitHub places a PullRequestCommit by the commit date, not the push."""
+    edge = next(edge for edge in github.edges if edge["node"].get("id") == node_id)
+    github.edges.remove(edge)
+    github.edges.insert(index if index >= 0 else len(github.edges) + index + 1, edge)
+
+
+def sync_commit_listed_twice(github, world):
+    github.edge("PullRequestCommit", id="PRC_TO_AGAIN", commit={"oid": world.to})
+
+
+def extra_commit_dated_before_the_sync(github, world):
+    github.edge("PullRequestCommit", id="PRC_X", commit={"oid": "e" * 40})
+    move_edge(github, "PRC_X", 1)
+
+
+def head_branch_restored(github, world):
+    github.edge("HeadRefDeletedEvent", id="HRD", createdAt=github.now())
+    github.edge("HeadRefRestoredEvent", id="HRR", createdAt=github.now())
+
+
+def sync_commit_reviewed_before_its_edge(github, world):
+    github.comment(703, f"**Ревью.**\nReviewed-SHA: {world.to}\nOutcome-Label: reviewed\n"
+                        "<!-- pp:review pp:tail=0 -->")
+    move_edge(github, "PRC_TO", -1)
+
+
 @pytest.mark.parametrize(("breaks", "reason"), [
     (edited_review, "trusted comment was edited"),
     (review_changes_requested, "is changes-requested"),
@@ -547,8 +603,12 @@ def contradicting_done_marker(github, world):
     (ship_by_stranger, "not a trusted ship"),
     (ship_before_review, "set before the review"),
     (hold_label, "routing label hold"),
-    (review_again_override, "no longer starts at the base-sync commit"),
-    (force_push_after_sync, "no longer starts at the base-sync commit"),
+    (review_again_override, "pp:review-again restarted the review epoch"),
+    (force_push_after_sync, "HeadRefForcePushedEvent"),
+    (head_branch_restored, "restored after the reviewed version"),
+    (sync_commit_listed_twice, "listed in the timeline more than once"),
+    (extra_commit_dated_before_the_sync, "unsupported epoch event: PullRequestCommit"),
+    (sync_commit_reviewed_before_its_edge, "has its own review transaction"),
     (base_branch_changed, "BaseRefChangedEvent"),
     (main_rewritten, "not an ancestor of the current base branch"),
     (candidate_names_another_base, "not exactly the two-parent merge"),

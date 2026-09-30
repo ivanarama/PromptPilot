@@ -29,7 +29,10 @@ owner stays on the ordinary integration REVIEW route.
 The project health snapshot's ``base_sync_candidate`` (onebase#1776) is a
 descriptive data source, never a proof: every fact is established here from
 the stable GraphQL timeline, local git and the live PR state, and the
-snapshot is only cross-checked against them. This module publishes nothing.
+snapshot is only cross-checked against them. The position of the base-sync
+commit in the timeline proves nothing (GitHub orders commits by their date,
+onebase#1561): the transition is proven by the graph. This module publishes
+nothing.
 The MERGE transaction re-proves the carry after reserving its intent and
 merges with GitHub's exact ``sha`` compare-and-swap.
 """
@@ -97,27 +100,44 @@ def timeline_facts(snapshot: dict, trusted: str, from_sha: str, to_sha: str,
                    base_sha: str, *, cut: int | None = None) -> dict:
     """Conditions 1 and the timeline half of 2, from the server timeline only.
 
+    Where the base-sync commit sits in the timeline is not evidence: GitHub
+    orders a ``PullRequestCommit`` by the commit date, not by the push
+    (onebase#1561, #1824), so a merge made locally before the review or the
+    ship lands among them. The transition is proven by the graph instead: the
+    timeline lists the commit of ``to`` exactly once, and with that edge set
+    aside the epoch of ``from`` runs to the end with no other commit,
+    force-push, restore, base change, deleted or edited trusted comment and no
+    later ``pp:review-again``. Git proves the parents (:func:`git_facts`).
+
     ``cut`` limits the history to the edges before a merge intent marker: after
     the merge the cleanup removes ``ship``, and the recovery must still derive
-    the same evidence.
+    the same evidence. The commit edge is looked up in the whole timeline.
     """
-    edges = list(snapshot["edges"] if cut is None else snapshot["edges"][:cut])
-    to_anchors = [index for index, edge in enumerate(edges)
-                  if _node(edge).get("__typename") == "PullRequestCommit"
-                  and (_node(edge).get("commit") or {}).get("oid") == to_sha]
-    if not to_anchors:
-        raise _Refused("the base-sync commit has no timeline anchor")
-    to_anchor = to_anchors[-1]
+    everything = snapshot["edges"]
+    listed = [index for index, edge in enumerate(everything)
+              if _node(edge).get("__typename") == "PullRequestCommit"
+              and (_node(edge).get("commit") or {}).get("oid") == to_sha]
+    if not listed:
+        raise _Refused("the base-sync commit is not in the timeline")
+    if len(listed) > 1:
+        raise _Refused("the base-sync commit is listed in the timeline more than once")
+    history = everything if cut is None else everything[:cut]
+    edges = [edge for index, edge in enumerate(history) if index != listed[0]]
 
-    # The reviewed version's epoch: everything before the base-sync commit.
-    before = dict(snapshot, headRefOid=from_sha, edges=edges[:to_anchor])
+    # The reviewed version's epoch, the base-sync commit set aside: nothing
+    # may have interrupted it since.
     try:
-        from_info = pp.epoch(before, trusted)
+        from_info = pp.epoch(dict(snapshot, headRefOid=from_sha, edges=edges), trusted)
         pp.validate_epoch_safety(from_info, trusted)
     except PipelineError as exc:
-        raise _Refused(f"reviewed version before the base-sync: {exc}") from exc
+        raise _Refused(f"after the reviewed version: {exc}") from exc
     established = pp.proof(from_info, from_sha, trusted)
     if not established:
+        anchor = _node(edges[from_info["anchor_index"]]).get("__typename")
+        if anchor == "IssueComment":
+            raise _Refused("a later pp:review-again restarted the review epoch")
+        if anchor == "HeadRefRestoredEvent":
+            raise _Refused("the head branch was restored after the reviewed version")
         raise _Refused("the reviewed version has no canonical committed review proof")
     if established.get("outcome") != "reviewed":
         raise _Refused(f"the review of the reviewed version is {established.get('outcome')}")
@@ -126,22 +146,12 @@ def timeline_facts(snapshot: dict, trusted: str, from_sha: str, to_sha: str,
     if review_at is None:
         raise _Refused("the review conclusion is not in the timeline")
 
-    # The current epoch must start at the base-sync commit and stay clean: no
-    # later override, push, force-push, base change or deleted/edited comment.
-    current = dict(snapshot, headRefOid=to_sha, edges=edges)
-    try:
-        to_info = pp.epoch(current, trusted)
-        pp.validate_epoch_safety(to_info, trusted)
-    except PipelineError as exc:
-        raise _Refused(f"after the base-sync commit: {exc}") from exc
-    if to_info["anchor_index"] != to_anchor:
-        raise _Refused("the review epoch no longer starts at the base-sync commit "
-                       "(a later pp:review-again, restore or force-push)")
-    if pp.proof(to_info, to_sha, trusted) or any(
-            (match := pp.CLAIM.fullmatch((node.get("body") or "").strip()))
-            and match.group(1) == to_sha
-            for _index, _edge, node in pp.comments(to_info, trusted)):
-        raise _Refused("the base-sync commit has its own review transaction: this is not a carry")
+    # A review of ``to`` itself, wherever it sits, belongs to the ordinary path.
+    for _index, _edge, node in pp.comments(from_info, trusted):
+        body = (node.get("body") or "").strip()
+        matches = (pp.REVIEW.search(body), pp.CLAIM.fullmatch(body), pp.COMPLETE.fullmatch(body))
+        if any(match and match.group(1) == to_sha for match in matches):
+            raise _Refused("the base-sync commit has its own review transaction: this is not a carry")
 
     # Markers are optional, but a marker that contradicts the graph is not.
     for edge in edges:
@@ -170,8 +180,7 @@ def timeline_facts(snapshot: dict, trusted: str, from_sha: str, to_sha: str,
         raise _Refused("trusted ship was set before the review of the reviewed version")
     if not latest.get("id"):
         raise _Refused("the ship event has no node id")
-    return {"to_anchor": to_anchor, "from_info": from_info,
-            "from_proof": established, "ship_event": latest["id"]}
+    return {"from_info": from_info, "from_proof": established, "ship_event": latest["id"]}
 
 
 def _git(config: dict, *args: str, allow=(0,)) -> tuple[int, str]:
