@@ -3,7 +3,8 @@
 The helper supports the ordinary REVIEW transaction and an already-clean
 ordinary MERGE, including durable post-merge cleanup recovery. Complicated
 base-sync/carry states return ``fallback`` so the repository's full skill
-remains the authority for them.
+remains the authority for them — except one mechanical base-sync proven by the
+opt-in ``base_sync_carry`` (issue #42, see :mod:`promptpilot.base_sync_carry`).
 """
 
 from __future__ import annotations
@@ -302,6 +303,13 @@ def load_config(path: str) -> dict:
                 f"{key} must be an integer from {minimum} to {maximum}")
     if data["review_completion_gate"] not in {"health", "target-v1"}:
         raise PipelineError("review_completion_gate must be health or target-v1")
+    if "base_sync_carry" in data:
+        if not isinstance(data["base_sync_carry"], bool):
+            raise PipelineError("base_sync_carry must be a boolean")
+        # "All required CI on exact to" needs a definition of required: an
+        # unreported check must count as missing, not as absent.
+        if data["base_sync_carry"] and not data.get("required_checks"):
+            raise PipelineError("base_sync_carry requires an explicit required_checks list")
     if (not isinstance(data["review_lease_seconds"], int) or
             isinstance(data["review_lease_seconds"], bool) or
             not 300 <= data["review_lease_seconds"] <= 28800):
@@ -1152,7 +1160,8 @@ def validate_merged_intent(gh: GitHub, config: dict, intent: dict) -> tuple[dict
     proof_snapshot["headRefOid"] = intent["head"]
     established = proof(epoch(proof_snapshot, config["trusted_account"]),
                         intent["head"], config["trusted_account"])
-    if not established or digest(established) != intent["proof_sha256"]:
+    if ((not established or digest(established) != intent["proof_sha256"])
+            and not _carry_intent_matches(gh, config, snapshot, intent, intent_index)):
         raise PipelineError("review proof no longer matches merge cleanup intent")
     return pr, merge_sha
 
@@ -1222,16 +1231,17 @@ def capabilities(config: dict) -> dict:
             "review_completion_gate": config.get("review_completion_gate", "health"),
             "fallback_handoff": config.get("fallback_handoff", "legacy"),
             "target_reservations": "sqlite-task-lease-v1",
-            # Opt-in but unfinished (issue #42): see _base_sync_owner_action.
+            # Opt-in, not yet enabled in production (issue #42).
             "base_sync_merge": "experimental" if config.get("base_sync_merge") else "off",
+            "base_sync_carry": "experimental" if config.get("base_sync_carry") else "off",
             "fallback": "repository skill"}
 
 
 BASE_SYNC_EXPERIMENTAL_NOTE = (
-    "base_sync_merge is EXPERIMENTAL and incomplete (issue #42): update-branch "
-    "publishes no pp:base-sync-intent/done, so the updated owner is routed to "
-    "legacy-integration-review and still needs the full skill; the mechanical "
-    "integration REVIEW (checks 1-6) is not implemented")
+    "base_sync_merge is EXPERIMENTAL (issue #42): update-branch publishes no "
+    "pp:base-sync-intent/done, so the updated owner is routed to "
+    "legacy-integration-review; only the opt-in base_sync_carry can merge it "
+    "without a new REVIEW, and only when all four carry conditions are proven")
 
 
 def _configured_replica_count() -> int:
@@ -1533,9 +1543,16 @@ def next_review(gh: GitHub, config: dict, *, config_path: str | None = None) -> 
             reservation=reservation,
         )
     if item.get("stage") != "review":
+        reason = "integration/base-sync state requires the full skill"
+        carry = _owner_carry(gh, config, health, item)
+        if carry and carry["verdict"] in {"proven", "pending"}:
+            return {"action": "wait", "verdict": "ПУСТО", "number": item["number"],
+                    "reason": "base-sync carry: MERGE merges this owner without a new "
+                              f"REVIEW ({carry['verdict']}: {carry.get('reason', 'all four conditions hold')})"}
+        if carry:
+            reason += f" (carry refused: {carry['reason']})"
         return fallback_target(
-            config, election_health, "review", item,
-            "integration/base-sync state requires the full skill",
+            config, election_health, "review", item, reason,
             reservation=reservation,
         )
     completion_gate = config.get("review_completion_gate", "health")
@@ -1831,6 +1848,9 @@ def pending_merge_action(gh: GitHub, config: dict, intent: dict) -> dict:
     validate_epoch_safety(info, config["trusted_account"])
     established = proof(info, intent["head"], config["trusted_account"])
     if not established or digest(established) != intent["proof_sha256"]:
+        carried = _pending_carry_action(gh, config, intent, snapshot)
+        if carried is not None:
+            return carried
         return {"action": "fallback", "reason": "merge cleanup intent review proof is stale"}
     if not trusted_ship_authorized(info, config["trusted_account"]):
         return {"action": "fallback", "reason": "merge cleanup intent lost trusted ship"}
@@ -1872,11 +1892,11 @@ def _base_sync_owner_action(gh: GitHub, config: dict, owner: dict) -> dict | Non
     EXPERIMENTAL — do not enable in production (issue #42). The update-branch
     lease publishes no ``pp:base-sync-intent/done`` markers, so after the
     update the old committed review does not cover the new two-parent HEAD:
-    health routes it to ``legacy-integration-review``, which needs a new
-    trusted ship and the full skill. BEHIND → update → autonomous REVIEW →
-    merge is therefore not complete; the mechanical integration REVIEW
-    (checks 1–6) needs provenance fields from the project's health checker.
-    tests/test_base_sync_public_path.py pins the current public behaviour.
+    health routes it to ``legacy-integration-review``. Only the separate
+    opt-in ``base_sync_carry`` can then merge it without a new REVIEW, when
+    all four carry conditions are proven (:mod:`promptpilot.base_sync_carry`).
+    tests/test_base_sync_public_path.py pins the behaviour without the carry,
+    tests/test_base_sync_carry.py the carried path.
     """
     number, head = int(owner["number"]), str(owner["head"])
     snapshot = stable_timeline(gh, config, number)
@@ -1960,6 +1980,134 @@ def _complete_base_sync_update(gh: GitHub, config: dict, lease: dict) -> dict:
             raise PipelineError(
                 f"branch update did not complete within {timeout}s; rerun next merge")
         time.sleep(2)
+
+
+def _owner_carry(gh: GitHub, config: dict, health: dict, item: dict) -> dict | None:
+    """Carry verdict for this exact integration owner, or None without the opt-in."""
+    if not config.get("base_sync_carry"):
+        return None
+    owner = health.get("integration_owner") or {}
+    if (owner.get("number"), owner.get("head")) != (item.get("number"), item.get("head")):
+        return None
+    from . import base_sync_carry
+    return base_sync_carry.owner_carry(gh, config, health)
+
+
+def _carry_merge_action(gh: GitHub, config: dict, health: dict) -> tuple[dict | None, str | None]:
+    """A MERGE lease for a proven carry; else (wait-or-None, refusal reason)."""
+    owner = health.get("integration_owner") or {}
+    carry = _owner_carry(gh, config, health, owner)
+    if carry is None:
+        return None, None
+    if carry["verdict"] == "pending":
+        return {"action": "wait", "number": owner["number"],
+                "reason": f"base-sync carry pending: {carry['reason']}"}, None
+    if carry["verdict"] != "proven":
+        return None, carry["reason"]
+    lease = {"version": 1, "stage": "merge", "mode": "carry",
+             "repository": config["repository"], "number": owner["number"],
+             "head": owner["head"], "snapshot": carry["snapshot"],
+             "carry": carry["evidence"]}
+    return {"action": "merge", "carry": "proven",
+            "target": {"number": owner["number"], "head": owner["head"],
+                       "stage": owner["stage"]},
+            "lease": encode_lease(lease),
+            "complete": "run the same command with: complete merge --lease <lease>"}, None
+
+
+def _pending_carry_action(gh: GitHub, config: dict, intent: dict, snapshot: dict) -> dict | None:
+    """Resume a carry whose intent is published but whose merge did not happen."""
+    if not config.get("base_sync_carry"):
+        return None
+    from . import base_sync_carry
+    carry = base_sync_carry.verify(gh, config, int(intent["number"]), intent["head"],
+                                   snapshot=snapshot)
+    if carry["verdict"] == "pending":
+        return {"action": "wait", "number": intent["number"],
+                "reason": f"base-sync carry pending: {carry['reason']}"}
+    if carry["verdict"] != "proven" or digest(carry["evidence"]) != intent["proof_sha256"]:
+        return None
+    lease = {"version": 1, "stage": "merge", "mode": "carry",
+             "repository": config["repository"], "number": intent["number"],
+             "head": intent["head"], "snapshot": carry["snapshot"],
+             "carry": carry["evidence"], "intent": intent}
+    return {"action": "merge", "carry": "proven",
+            "target": {"number": intent["number"], "head": intent["head"]},
+            "lease": encode_lease(lease),
+            "complete": "run the same command with: complete merge --lease <lease>"}
+
+
+def _carry_intent_matches(gh: GitHub, config: dict, snapshot: dict, intent: dict,
+                          intent_index: int) -> bool:
+    """Whether a merged intent bound a carry that the timeline still shows.
+
+    Independent of the opt-in flag: switching base_sync_carry off must not
+    strand the cleanup of a carry that was already merged.
+    """
+    from . import base_sync_carry
+    try:
+        evidence = base_sync_carry.evidence_after_merge(
+            gh, config, snapshot, intent, intent_index)
+    except PipelineError:
+        return False
+    return digest(evidence) == intent["proof_sha256"]
+
+
+def _complete_carry_merge(gh: GitHub, config: dict, lease: dict,
+                          *, config_path: str | None = None) -> dict:
+    """Merge a carried owner: every condition re-proven before and after the intent."""
+    from . import base_sync_carry
+    from .fallback_handoff import validate_health
+
+    ensure_identity(gh, config)
+    number, head = int(lease["number"]), str(lease["head"])
+    if not isinstance(lease.get("carry"), dict) or lease["carry"].get("to") != head:
+        raise PipelineError("carry lease does not describe its own HEAD")
+
+    def reprove() -> dict:
+        health = run_health(config, config_path=config_path)
+        validate_health(health)
+        owner = health.get("integration_owner") or {}
+        if (health.get("state") == "red" or owner.get("number") != number
+                or owner.get("head") != head or owner.get("stage") not in base_sync_carry.STAGES
+                or _barrier_blocks_merge(health, dict(lease, base_sync_owner=True))):
+            raise PipelineError("integration owner changed; rerun next merge")
+        carry = base_sync_carry.owner_carry(gh, config, health)
+        if not carry or carry["verdict"] != "proven":
+            reason = carry["reason"] if carry else "base_sync_carry is off"
+            raise PipelineError(f"base-sync carry is no longer proven: {reason}")
+        if carry["evidence"] != lease["carry"]:
+            raise PipelineError("base-sync carry evidence changed; rerun next merge")
+        return carry
+
+    first = reprove()
+    intent = lease.get("intent")
+    if intent is None:
+        if first["snapshot"] != lease["snapshot"]:
+            raise PipelineError("merge lease is stale; rerun next merge")
+        body = first["status"].get("body") or ""
+        marker = intent_body(head, lease["carry"], body,
+                             same_repo_closing_issues(body, config["repository"]))
+        intent, _ = reserve_merge_intent(gh, config, number, marker)
+        if intent is None:
+            return {"action": "wait", "stage": "merge", "number": number,
+                    "reason": "another merge cleanup intent won"}
+    if (int(intent.get("number", 0)) != number or intent.get("head") != head
+            or intent.get("proof_sha256") != digest(lease["carry"])):
+        raise PipelineError("merge intent does not bind this carry")
+
+    exact_merge_intent_index(stable_timeline(gh, config, number), config, intent)
+    second = reprove()
+    body = second["status"].get("body") or ""
+    if (hashlib.sha256(body.encode("utf-8")).hexdigest() != intent["body_sha256"] or
+            same_repo_closing_issues(body, config["repository"]) != intent["issues"]):
+        raise PipelineError("cleanup payload changed after intent")
+    result = gh.json("api", f"repos/{config['repository']}/pulls/{number}/merge",
+                     "--method", "PUT", "--input", "-",
+                     input_value={"merge_method": config["merge_method"], "sha": head})
+    if result.get("merged") is not True:
+        raise PipelineError(result.get("message") or "GitHub did not confirm merge")
+    return recover_merge_cleanup(gh, config, intent)
 
 
 def _barrier_blocks_merge(health: dict, lease: dict) -> bool:
@@ -2063,8 +2211,14 @@ def next_merge(gh: GitHub, config: dict, *, config_path: str | None = None) -> d
             except PipelineError:
                 return fallback_target(config, health, "merge", owner,
                                        "incomplete integration REVIEW wait requires the full skill")
-            return {"action": "wait", "number": owner["number"],
-                    "reason": "single-flight owner is waiting for integration REVIEW"}
+            carried, refusal = _carry_merge_action(gh, config, health)
+            if carried is not None:
+                return carried
+            waiting = {"action": "wait", "number": owner["number"],
+                       "reason": "single-flight owner is waiting for integration REVIEW"}
+            if refusal:
+                waiting["carry"] = f"refused: {refusal}"
+            return waiting
         if config.get("ready_owner_merge") is True and isinstance(owner, dict) and owner.get("number"):
             action = _ready_owner_action(gh, config, health)
             if action is not None:
@@ -2143,6 +2297,8 @@ def complete_merge(gh: GitHub, config: dict, lease_value: str,
         raise PipelineError("lease belongs to another stage or repository")
     if lease.get("mode") == "update-branch":
         return _complete_base_sync_update(gh, config, lease)
+    if lease.get("mode") == "carry":
+        return _complete_carry_merge(gh, config, lease, config_path=config_path)
     identity_contract = (config["repository"], config["trusted_account"])
     ensure_identity(gh, config)
     health = run_health(config, config_path=config_path)
