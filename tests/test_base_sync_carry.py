@@ -424,6 +424,37 @@ def test_behind_owner_is_updated_and_merged_without_a_new_review(pipelinectl, wo
     assert "ship" not in github.labels
 
 
+def test_lone_head_reviewed_marker_is_not_proof_of_a_current_review(pipelinectl, world, tmp_path):
+    """An orphan pp:head-reviewed of the new HEAD proves nothing on either side.
+
+    The snapshot reports current_head_reviewed only for a whole committed pair —
+    conclusion, its claim and the completion naming both, same SHA and epoch
+    (onebase#1776) — so a lone marker leaves the field false. The carry gate here
+    is stricter on purpose: ANY review transaction naming the new HEAD hands the
+    PR back to the ordinary path. Both readings agree on what must not happen —
+    the marker never becomes evidence, and no carry is built on it.
+    """
+    github = FakeGitHub(world)
+
+    code, update, _ = pipelinectl(github, "next", "merge")
+    assert code == 0, update
+    code, updated, _ = pipelinectl(github, "complete", "merge", "--lease-file",
+                                   lease_file(tmp_path, update))
+    assert code == 0 and updated["new_head"] == world.to
+
+    # Neither review comment 40 nor claim 45 exists anywhere in the thread.
+    github.comment(702, f"<!-- pp:head-reviewed {world.to} review-comment=40 claim=45 "
+                        f"epoch-sha256={'a' * 64} -->")
+    assert github.candidate["current_head_reviewed"] is False
+
+    code, election, _ = pipelinectl(github, "next", "merge")
+    assert code == 0, election
+    assert election["action"] == "wait", election
+    assert "has its own review transaction" in election["carry"], election
+    assert election.get("lease") is None, election
+    assert merge_calls(github) == []
+    assert github.published() == []
+
 def test_update_conflict_publishes_nothing_and_carries_nothing(pipelinectl, world, tmp_path):
     github = FakeGitHub(world)
     github.update_conflict = True
