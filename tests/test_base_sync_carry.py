@@ -20,6 +20,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -681,6 +682,93 @@ def test_unproven_condition_means_no_carry_and_nothing_published(pipelinectl, wo
     assert code_review == 0 and review["action"] == "fallback"  # the ordinary REVIEW route
     assert "carry refused" in review["reason"] and reason in review["reason"]
     assert github.mutations == []
+
+
+def apple_git_2_37(tmp_path) -> str:
+    """A git that answers like the pipeline Mac's /usr/bin/git.
+
+    `git --version` says 2.37.1 (Apple Git-137.1), `git merge-tree -h` lists
+    only the old three-argument form, and `--write-tree` is refused as an
+    unknown option — the same three answers the Mac gives. Everything else is
+    handed to the real git, so the stub replaces the capability and nothing
+    more.
+    """
+    script = tmp_path / "apple_git.py"
+    script.write_text(
+        "import subprocess, sys\n"
+        "args = sys.argv[1:]\n"
+        'usage = "usage: git merge-tree <base-tree> <branch1> <branch2>"\n'
+        'if "--version" in args:\n'
+        '    print("git version 2.37.1 (Apple Git-137.1)")\n'
+        "    sys.exit(0)\n"
+        'if "merge-tree" in args:\n'
+        '    if "-h" in args:\n'
+        "        print(usage)\n"
+        "        sys.exit(129)\n"
+        '    if "--write-tree" in args:\n'
+        '        sys.stderr.write("error: unknown option write-tree\\n" + usage + "\\n")\n'
+        "        sys.exit(129)\n"
+        f"sys.exit(subprocess.run([{shutil.which('git')!r}, *args]).returncode)\n",
+        encoding="utf-8")
+    if os.name == "nt":
+        launcher = tmp_path / "apple_git.cmd"
+        launcher.write_text(f'@"{sys.executable}" "{script}" %*\n', encoding="utf-8")
+    else:
+        launcher = tmp_path / "apple_git.sh"
+        launcher.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{script}" "$@"\n',
+                            encoding="utf-8")
+        launcher.chmod(0o755)
+    return str(launcher)
+
+
+def test_a_git_without_write_tree_refuses_the_carry_and_changes_nothing(
+        pipelinectl, world, tmp_path):
+    """Apple Git 2.37.1: the tree proof cannot even run.
+
+    `merge-tree --write-tree` arrived in git 2.38; the old form prints a diff
+    and no tree OID. Condition 3 is byte equality of the merged tree and
+    nothing weaker stands in for it, so the carry is refused with a
+    diagnosable reason and the PR takes the ordinary REVIEW route — a refusal,
+    not a wait: no git becomes newer on its own.
+    """
+    pipelinectl.configure(git_bin=apple_git_2_37(tmp_path))
+    github = FakeGitHub(world).synced()
+
+    code, merge, _ = pipelinectl(github, "next", "merge")
+    code_review, review, _ = pipelinectl(github, "next", "review")
+
+    assert code == 0 and merge["action"] == "wait", merge
+    assert merge["carry"].startswith("refused: "), merge["carry"]
+    assert "cannot prove the merged tree" in merge["carry"], merge["carry"]
+    assert "2.37.1" in merge["carry"] and "2.38" in merge["carry"], merge["carry"]
+    assert code_review == 0 and review["action"] == "fallback"  # the ordinary REVIEW route
+    assert "carry refused" in review["reason"]
+    assert github.mutations == []
+
+
+def test_a_git_named_by_the_setting_does_the_proof(pipelinectl, world, tmp_path):
+    """The Mac route: the proof runs on `git_bin`, not on whatever is on PATH.
+
+    Same world and same conditions as the positive path — only the binary is
+    named explicitly. This is what a pinned newer git next to an old system
+    git has to look like.
+    """
+    pipelinectl.configure(git_bin=shutil.which("git"))
+    github = FakeGitHub(world).synced()
+
+    code, election, _ = pipelinectl(github, "next", "merge")
+
+    assert code == 0 and election["carry"] == "proven", election
+
+
+def test_the_capability_check_reports_the_git_it_approved():
+    """What the preflight returns is what a report has to name."""
+    config = {"git_bin": shutil.which("git")}
+    approved = base_sync_carry.ensure_tree_proof_possible(config)
+
+    assert approved["git"] == config["git_bin"]
+    assert base_sync_carry.git_version(config) >= base_sync_carry.MERGE_TREE_GIT
+    assert approved["version"].startswith("2.")
 
 
 def test_running_ci_waits_and_review_does_not_start(pipelinectl, world):

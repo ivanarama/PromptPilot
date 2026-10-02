@@ -39,6 +39,7 @@ merges with GitHub's exact ``sha`` compare-and-swap.
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import time
@@ -185,16 +186,32 @@ def timeline_facts(snapshot: dict, trusted: str, from_sha: str, to_sha: str,
     return {"from_info": from_info, "from_proof": established, "ship_event": latest["id"]}
 
 
+MERGE_TREE_GIT = (2, 38)  # `merge-tree --write-tree` prints the merged tree's OID
+
+
+def git_bin(config: dict) -> str:
+    """The git the carry proof runs on.
+
+    A Mac's system git can be too old to prove a tree at all — Apple Git
+    2.37.1 ships only the old `merge-tree <base-tree> <branch1> <branch2>`,
+    which prints a human-readable diff and no OID. So the binary is a setting:
+    point `git_bin` (or PP_GIT_BIN) at a pinned newer git instead of replacing
+    the system one.
+    """
+    return str(config.get("git_bin") or os.environ.get("PP_GIT_BIN") or "git")
+
+
 def _git(config: dict, *args: str, allow=(0,)) -> tuple[int, str]:
     timeout = int(config.get("base_sync_timeout_seconds", 60))
+    binary = git_bin(config)
     try:
         result = subprocess.run(
-            ["git", "-c", "maintenance.auto=false", *args], capture_output=True,
+            [binary, "-c", "maintenance.auto=false", *args], capture_output=True,
             text=True, encoding="utf-8", errors="replace", timeout=timeout)
     except subprocess.TimeoutExpired as exc:
         raise PipelineError(f"git {args[0]} timed out after {timeout}s") from exc
     except OSError as exc:
-        raise PipelineError(f"git is not available: {exc}") from exc
+        raise PipelineError(f"git is not available at {binary!r}: {exc}") from exc
     if result.returncode not in allow:
         detail = (result.stderr or result.stdout or "git command failed").strip()
         raise PipelineError(f"git {args[0]}: {detail}")
@@ -229,12 +246,56 @@ def commit_date(config: dict, sha: str) -> int:
     return max(int(value) for value in _git(config, "show", "-s", "--format=%at %ct", sha)[1].split())
 
 
+def git_version(config: dict) -> tuple[int, ...]:
+    """Numeric version of the git in use.
+
+    "git version 2.37.1 (Apple Git-137.1)" → (2, 37, 1); the vendor suffix
+    carries no ordering and is left out.
+    """
+    _, output = _git(config, "--version")
+    match = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", output)
+    if not match:
+        raise PipelineError(f"git --version is unreadable: {output!r}")
+    return tuple(int(part) for part in match.groups() if part is not None)
+
+
+def _dotted(version) -> str:
+    return ".".join(str(part) for part in version)
+
+
+def ensure_tree_proof_possible(config: dict) -> dict:
+    """Capability preflight: can this git prove a tree at all?
+
+    Condition 3 is byte equality of the merged tree, and the only thing that
+    produces it is `merge-tree --write-tree`, which arrived in git 2.38. There
+    is no substitute: a file list, a diffstat or GitHub's mergeable flag say
+    nothing about content. So when the available git is older we refuse here —
+    before the carry is attempted — and the PR takes the ordinary REVIEW
+    route. A refusal, not a wait: no git gets newer on its own, and a carry
+    pending forever would hold the lane with no way out.
+
+    Checked in the only place that produces the proof, so every route — the
+    live verification and the post-merge recomputation — is covered.
+    """
+    binary = git_bin(config)
+    version = git_version(config)
+    _, usage = _git(config, "merge-tree", "-h", allow=(0, 1, 129))
+    if version < MERGE_TREE_GIT or "--write-tree" not in usage:
+        raise _Refused(
+            f"git {_dotted(version)} at {binary!r} cannot prove the merged tree: "
+            f"'merge-tree --write-tree' needs git {_dotted(MERGE_TREE_GIT)} or newer. "
+            "Point 'git_bin' (or PP_GIT_BIN) at a pinned newer git; until then the "
+            "carry is off and the ordinary REVIEW route applies")
+    return {"git": binary, "version": _dotted(version)}
+
+
 def git_facts(config: dict, number: int, from_sha: str, base_sha: str,
               to_sha: str, base_tip: str) -> dict:
     """Conditions 2 (commit shape, ancestry) and 3 (reproduced tree).
 
     ``base_tip`` is the base branch tip GitHub reports for this PR.
     """
+    ensure_tree_proof_possible(config)
     ensure_objects(config, number, to_sha, base_tip)
     if parents_of(config, to_sha) != [from_sha, base_sha]:
         raise _Refused("HEAD is not exactly the two-parent merge [from, base]")
