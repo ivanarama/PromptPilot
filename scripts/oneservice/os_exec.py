@@ -3,16 +3,20 @@
 Ведёт задачи, принятые хранителем (label «триаж-ТЗ»), через исполнение:
 
   claim    — берёт одну задачу: assignee = бот, метка «в работе», ветка
-             task/<iid>, запускает исполнителя (Gemini/agy через PromptPilot)
-             в этой ветке. Одновременно в работе только одна задача (MVP:
-             один чекаут репозитория).
+             task/<iid> от базовой ветки (OS_BASE_BRANCH или ветка по
+             умолчанию на origin), запускает исполнителя (через PromptPilot)
+             с ТЗ хранителя. Одновременно в работе и на ревью — одна задача
+             (MVP: один чекаут репозитория).
   watch    — завершённая задача исполнителя → ревью независимой моделью
-             (diff ветки с main). PASS → «готово-к-мержу»; замечания → назад
-             «в работе» (не более OS_MAX_ROUNDS, дальше «нужен человек»).
-             Вердикт ПЛАТФОРМА → issue в onebase + «блокирована платформой».
-  merge    --issue N — gate (OS_GATE_COMMAND, если задан) → merge ветки в
-             main → push → закрытие issue → запись в docs/CHANGELOG-TEAM.md
-             (кто предложил, кто исполнил, кто ревьюил).
+             (diff ветки с базовой). PASS → «готово-к-мержу»; замечания →
+             новый запуск исполнителя с этими замечаниями (не более
+             OS_MAX_ROUNDS раундов, дальше «нужен человек»). Эскалация на
+             платформу — только по явной строке «ПЛАТФОРМА: …» в ответе;
+             сбой исполнения — «нужен человек».
+  merge    --issue N — только для «готово-к-мержу» (иначе --force):
+             gate (OS_GATE_COMMAND) → merge ветки в базовую → push →
+             закрытие issue → запись в docs/CHANGELOG-TEAM.md → уведомление
+             автору в Telegram (чат запомнен при приёме заявки).
 
 Запуск: py -3.11 scripts/oneservice/os_exec.py claim|watch|merge ...
 """
@@ -20,7 +24,6 @@
 import argparse
 import datetime
 import json
-import os
 import re
 import subprocess
 import sys
@@ -30,11 +33,20 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 EXEC_STATE = ROOT / ".os_exec.json"
 
+sys.path.insert(0, str(ROOT))
 from os_intake import (  # noqa: E402
-    ATTACH_ROOT, ROOT as INTAKE_ROOT, load_env, project_api, pp_request,
+    LABEL_HUMAN, ROOT as INTAKE_ROOT, author_chat, load_env, project_api,
+    pp_request,
 )
 
-MAX_ROUNDS = 2
+# Stages that occupy the single shared checkout.
+BUSY_STAGES = ("в работе", "ревью")
+KEEPER_NOTE_MARK = "🧊 **Хранитель целесообразности**"
+META_CUT = "--- Meta ---"
+
+
+def max_rounds(env: dict) -> int:
+    return int(env.get("OS_MAX_ROUNDS", "2"))
 
 
 def load_state() -> dict:
@@ -60,6 +72,23 @@ def git(repo: Path, *args: str) -> tuple[int, str]:
                             capture_output=True, encoding="utf-8",
                             errors="replace", timeout=300)
     return result.returncode, (result.stdout or "") + (result.stderr or "")
+
+
+def base_branch(env: dict, repo_dir: Path) -> str:
+    """The branch tasks start from and merge into.
+
+    OS_BASE_BRANCH, else the default branch of origin. It used to be whatever
+    the shared checkout was on — after a claim that is the previous task's
+    branch, so tasks grew out of each other and merged into each other.
+    """
+    configured = env.get("OS_BASE_BRANCH", "").strip()
+    if configured:
+        return configured
+    code, out = git(repo_dir, "symbolic-ref", "--short", "refs/remotes/origin/HEAD")
+    ref = out.strip()
+    if code == 0 and ref.startswith("origin/"):
+        return ref.split("/", 1)[1]
+    return "main"
 
 
 def gate(env: dict, repo: Path) -> None:
@@ -89,13 +118,74 @@ def issue_spec(issue: dict) -> str:
     return issue.get("description") or ""
 
 
+def task_spec(env: dict, issue: dict) -> str:
+    """What the executor must build: the keeper's ТЗ, else the issue text.
+
+    The keeper posts its ТЗ as an issue note. The executor used to receive
+    only the original request, so the keeper's work never reached it — and
+    the raw request is exactly the text written by an outside person.
+    """
+    bot_id = str(env.get("GITLAB_BOT_USER_ID", "")).strip()
+    try:
+        notes = project_api(
+            env, f"/issues/{issue['iid']}/notes?sort=desc&order_by=created_at&per_page=50")
+    except Exception as exc:
+        print(f"  !! заметки issue #{issue['iid']}: {exc}")
+        notes = []
+    for note in notes or []:
+        body = note.get("body") or ""
+        author_id = str((note.get("author") or {}).get("id", ""))
+        if not body.startswith(KEEPER_NOTE_MARK) or (bot_id and author_id != bot_id):
+            continue
+        index = body.upper().find("ТЕХНИЧЕСКОЕ ЗАДАНИЕ:")
+        if index >= 0:
+            return body[index:].strip()
+    return issue_spec(issue)
+
+
+def executor_prompt(env: dict, issue: dict, branch: str,
+                    remarks: str = "", round_no: int = 1) -> str:
+    iid = issue["iid"]
+    prompt = (
+        f"Ты работаешь в репозитории oneservice-cc_v2 на ветке {branch}.\n"
+        f"Техническое задание (GitLab issue #{iid}):\n\n{task_spec(env, issue)}\n\n"
+    )
+    if remarks:
+        prompt += (
+            f"Раунд {round_no}. Независимое ревью вернуло замечания к тому, что "
+            "уже сделано в этой ветке. Исправь их:\n"
+            f"{remarks}\n\n"
+        )
+    prompt += (
+        "Правила:\n"
+        "- работай только в этой ветке; базовую ветку не трогай;\n"
+        "- внеси изменения по ТЗ и сделай git commit с сообщением "
+        f"\"task #{iid}: <кратко>\";\n"
+        "- ничего не пушь на remote;\n"
+        "- если задача упирается в ошибку/ограничение платформы — ничего "
+        "не коммить, а начни ответ со строки ПЛАТФОРМА: <что именно>.\n"
+        "Последней строкой ответа напиши: ИТОГ: ГОТОВО — изменения закоммичены."
+    )
+    return prompt
+
+
+def dispatch_executor(env: dict, prompt: str) -> int:
+    task = pp_request(env, "/api/tasks", "POST", {
+        "prompt": prompt,
+        "provider": env.get("OS_PROVIDER", "agy"),
+        "working_dir": str(repo()),
+        "priority": 2,
+    })
+    return int(task["id"])
+
+
 # --- claim ------------------------------------------------------------------
 
 def claim(env: dict, state: dict, issue_iid: int | None = None) -> None:
     repo_dir = repo()
-    busy = [iid for iid, w in state["work"].items() if w.get("stage") == "в работе"]
+    busy = [iid for iid, w in state["work"].items() if w.get("stage") in BUSY_STAGES]
     if busy:
-        print(f"Занято: issue #{', #'.join(busy)} — в работе (один чекаут)")
+        print(f"Занято: issue #{', #'.join(busy)} — в работе или на ревью (один чекаут)")
         return
     if issue_iid is None:
         issues = project_api(
@@ -116,15 +206,20 @@ def claim(env: dict, state: dict, issue_iid: int | None = None) -> None:
             print(f"issue #{issue_iid} уже назначен на @{issue['assignee']['username']}")
             return
 
-    code, base = git(repo_dir, "branch", "--show-current")
-    base = base.strip() or "master"
+    base = base_branch(env, repo_dir)
     branch = f"task/{issue_iid}"
-    code, out = git(repo_dir, "checkout", "-b", branch)
+    git(repo_dir, "fetch", "origin")  # offline is fine: the local base is used then
+    code, _ = git(repo_dir, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}")
+    if code == 0:
+        code, out = git(repo_dir, "checkout", branch)
+    else:
+        start = f"origin/{base}"
+        if git(repo_dir, "rev-parse", "--verify", "--quiet", start)[0] != 0:
+            start = base
+        code, out = git(repo_dir, "checkout", "-b", branch, start)
     if code != 0:
-        code2, out2 = git(repo_dir, "checkout", branch)
-        if code2 != 0:
-            raise RuntimeError(f"не могу перейти на ветку {branch}: {out2}")
-    code, _ = git(repo_dir, "push", "-u", "origin", branch)
+        raise RuntimeError(f"не могу перейти на ветку {branch}: {out}")
+    code, out = git(repo_dir, "push", "-u", "origin", branch)
     if code != 0:
         print(f"  (ветка не запушена: {out.strip()[:200]})")
 
@@ -132,44 +227,23 @@ def claim(env: dict, state: dict, issue_iid: int | None = None) -> None:
     if assignee:
         project_api(env, f"/issues/{issue_iid}", "PUT",
                     {"assignee_ids": [int(assignee)]})
-    project_api(env, f"/issues/{issue_iid}", "PUT",
-                {"labels": "в работе,триаж-ТЗ",
-                 "description": issue["description"]})
+    project_api(env, f"/issues/{issue_iid}", "PUT", {"labels": "в работе,триаж-ТЗ"})
 
-    spec = issue_spec(issue)
-    prompt = (
-        f"Ты работаешь в репозитории oneservice-cc_v2 на ветке {branch}.\n"
-        f"Техническое задание (GitLab issue #{issue_iid}):\n\n{spec}\n\n"
-        "Правила:\n"
-        "- работай только в этой ветке; main не трогай;\n"
-        "- внеси изменения по ТЗ и сделай git commit с сообщением "
-        f"\"task #{issue_iid}: <кратко>\";\n"
-        "- ничего не пушь на remote;\n"
-        "- если задача упирается в ошибку/ограничение платформы — ничего "
-        "не коммить, а начни ответ со строки ПЛАТФОРМА: <что именно>.\n"
-        "Последней строкой ответа напиши: ИТОГ: ГОТОВО — изменения закоммичены."
-    )
-    payload = {
-        "prompt": prompt,
-        "provider": env.get("OS_PROVIDER", "agy"),
-        "working_dir": str(repo_dir),
-        "priority": 2,
-    }
-    task = pp_request(env, "/api/tasks", "POST", payload)
+    task_id = dispatch_executor(env, executor_prompt(env, issue, branch))
     state["work"][str(issue_iid)] = {
         "stage": "в работе", "branch": branch, "base": base,
-        "pp_task": task["id"], "rounds": 1,
+        "pp_task": task_id, "rounds": 1,
         "author": issue_meta(issue), "title": issue["title"],
     }
     save_state(state)
-    print(f"🚀 issue #{issue_iid} в работе: ветка {branch}, задача #{task['id']}")
+    print(f"🚀 issue #{issue_iid} в работе: ветка {branch} от {base}, задача #{task_id}")
 
 
 # --- watch ------------------------------------------------------------------
 
 def parse_verdict(result: str) -> str:
-    match = re.search(r"^ИТОГ:\s*(.+)$", result or "", re.M)
-    return match.group(1).strip().upper() if match else ""
+    matches = re.findall(r"^ИТОГ:\s*(.+)$", result or "", re.M)
+    return matches[-1].strip().upper() if matches else ""
 
 
 def watch(env: dict, state: dict, config: dict) -> None:
@@ -184,27 +258,29 @@ def watch(env: dict, state: dict, config: dict) -> None:
         task = pp_request(env, f"/api/tasks/{w['pp_task']}")
         if task["status"] not in ("completed", "failed", "cancelled"):
             continue
-        result = task.get("result") or ""
-        if task["status"] != "completed" or "ПЛАТФОРМА" in result:
-            reason = re.search(r"^ПЛАТФОРМА:\s*(.+)$", result, re.M)
-            escalate_platform(env, int(iid), w,
-                              reason.group(1).strip() if reason else "исполнение не удалось")
+        if task["status"] != "completed":
+            # A quota or timeout failure says nothing about the platform: it
+            # used to open a «platform limitation» issue in onebase.
+            finish_human(env, int(iid), w, f"исполнитель не завершился (статус {task['status']})")
             continue
-        verdict = parse_verdict(result)
-        if verdict.startswith("ГОТОВО"):
+        result = (task.get("result") or "").split(META_CUT)[0]
+        platform = re.search(r"^ПЛАТФОРМА:\s*(.+)$", result, re.M)
+        if platform:
+            escalate_platform(env, int(iid), w, platform.group(1).strip())
+            continue
+        if parse_verdict(result).startswith("ГОТОВО"):
             start_review(env, state, int(iid), w)
-        elif verdict.startswith("ПЛАТФОРМА"):
-            escalate_platform(env, int(iid), w, result[-500:])
         else:
             finish_human(env, int(iid), w, "исполнитель не справился")
 
 
 def start_review(env: dict, state: dict, iid: int, w: dict) -> None:
     reviewer = env.get("OS_REVIEW_PROVIDER", "claude-z")
+    base = w.get("base") or "main"
     prompt = (
         f"Ты — ревьюер репозитория oneservice-cc_v2. Проверь изменения в ветке "
-        f"{w['branch']} относительно main.\n\n"
-        "Сначала выполни: git -C . diff main...HEAD\n"
+        f"{w['branch']} относительно {base}.\n\n"
+        f"Сначала выполни: git -C . diff {base}...HEAD\n"
         "Затем сверь изменения с ТЗ ниже и с духом проекта (ламповая "
         "практичность, без лишнего).\n\n"
         f"ТЗ (issue #{iid}):\n{issue_spec_of(env, iid)}\n\n"
@@ -224,38 +300,58 @@ def start_review(env: dict, state: dict, iid: int, w: dict) -> None:
 
 
 def review_verdict(task: dict, env: dict, state: dict, iid: int, w: dict) -> None:
-    result = (task.get("result") or "").split("--- Meta ---")[0]
-    match = re.search(r"^РЕШЕНИЕ:\s*(PASS|FAIL)", result, re.M | re.I)
-    passed = bool(match) and match.group(1).upper() == "PASS"
-    remarks = re.search(r"^ЗАМЕЧАНИЯ:\s*([\s\S]*?)(?:\nИТОГ:|$)", result, re.M | re.I)
+    result = (task.get("result") or "").split(META_CUT)[0]
+    decisions = re.findall(r"^РЕШЕНИЕ:\s*(PASS|FAIL)\b", result, re.M | re.I)
+    passed = bool(decisions) and decisions[-1].upper() == "PASS"
+    remarks_match = re.search(r"^ЗАМЕЧАНИЯ:\s*([\s\S]*?)(?:\nИТОГ:|$)", result, re.M | re.I)
+    remarks = remarks_match.group(1).strip() if remarks_match else ""
     note = (f"🔍 **Ревью** ({env.get('OS_REVIEW_PROVIDER', 'claude-z')}, задача #{w['review_task']})\n\n"
-            f"РЕШЕНИЕ: {'PASS' if passed else 'FAIL'}\n\n{remarks.group(1).strip() if remarks else ''}")
+            f"РЕШЕНИЕ: {'PASS' if passed else 'FAIL'}\n\n{remarks}")
     project_api(env, f"/issues/{iid}/notes", "POST", {"body": note})
-    if passed or int(w.get("rounds", 1)) >= MAX_ROUNDS:
-        label = "готово-к-мержу" if passed else "нужен человек"
+    if passed or int(w.get("rounds", 1)) >= max_rounds(env):
+        label = "готово-к-мержу" if passed else LABEL_HUMAN
         project_api(env, f"/issues/{iid}", "PUT", {"labels": f"в работе,{label}"})
-        w["stage"] = "готово-к-мержу" if passed else "нужен человек"
+        w["stage"] = label
         print(f"issue #{iid}: ревью {'PASS' if passed else 'FAIL (предел раундов)'}")
     else:
-        w["stage"] = "в работе"
-        w["rounds"] = int(w.get("rounds", 1)) + 1
-        w["review_task"] = None
+        redo(env, iid, w, remarks or "Ревью не прошло; замечания не сформулированы — "
+                                     "перечитай ТЗ и проверь результат целиком.")
         project_api(env, f"/issues/{iid}/notes", "POST", {
-            "body": f"↩ Замечания ревью вернули задачу в работу (раунд {w['rounds']})."})
-        print(f"issue #{iid}: замечания ревью — возврат в работу, раунд {w['rounds']}")
+            "body": f"↩ Замечания ревью вернули задачу исполнителю (раунд {w['rounds']})."})
+        print(f"issue #{iid}: замечания ревью — исполнитель, раунд {w['rounds']}")
     save_state(state)
+
+
+def redo(env: dict, iid: int, w: dict, remarks: str) -> None:
+    """Send the task back to the executor WITH the reviewer's remarks.
+
+    The loop used to flip the stage to «в работе» and wait for the old,
+    already finished executor task — the same diff went to review again and
+    nothing got fixed.
+    """
+    repo_dir = repo()
+    code, out = git(repo_dir, "checkout", w["branch"])
+    if code != 0:
+        raise RuntimeError(f"не могу вернуться на ветку {w['branch']}: {out}")
+    issue = project_api(env, f"/issues/{iid}")
+    w["rounds"] = int(w.get("rounds", 1)) + 1
+    w["pp_task"] = dispatch_executor(
+        env, executor_prompt(env, issue, w["branch"], remarks=remarks, round_no=w["rounds"]))
+    w["stage"] = "в работе"
+    w["review_task"] = None
+    project_api(env, f"/issues/{iid}", "PUT", {"labels": "в работе,триаж-ТЗ"})
 
 
 def issue_spec_of(env: dict, iid: int) -> str:
     issue = project_api(env, f"/issues/{iid}")
-    return (issue.get("description") or "")[:4000]
+    return task_spec(env, issue)[:4000]
 
 
 def finish_human(env: dict, iid: int, w: dict, reason: str) -> None:
     project_api(env, f"/issues/{iid}/notes", "POST", {
         "body": f"⚠ Автоматическое исполнение не удалось ({reason}). Нужен человек."})
-    project_api(env, f"/issues/{iid}", "PUT", {"labels": "нужен человек,в работе"})
-    w["stage"] = "нужен человек"
+    project_api(env, f"/issues/{iid}", "PUT", {"labels": f"{LABEL_HUMAN},в работе"})
+    w["stage"] = LABEL_HUMAN
     print(f"issue #{iid}: нужен человек ({reason})")
 
 
@@ -279,10 +375,14 @@ def escalate_platform(env: dict, iid: int, w: dict, reason: str) -> None:
 
 # --- merge ------------------------------------------------------------------
 
-def notify_author(env: dict, iid: int, w: dict, text: str) -> None:
-    """Уведомить автора задачи в TG (если задача пришла из Telegram)."""
+def notify_author(env: dict, iid: int, text: str) -> None:
+    """Уведомить автора задачи в TG — в чат, запомненный при приёме заявки.
+
+    Раньше чат искался в состоянии работы (tg_chat_id), куда его никто не
+    записывал, — уведомление не уходило никогда.
+    """
     token = env.get("TG_BOT_TOKEN", "")
-    chat_id = w.get("tg_chat_id", "")
+    chat_id = author_chat(iid)
     if not (token and chat_id):
         return
     try:
@@ -297,11 +397,15 @@ def notify_author(env: dict, iid: int, w: dict, text: str) -> None:
         print(f"  !! TG notify: {exc}", flush=True)
 
 
-def do_merge(env: dict, state: dict, iid: int) -> None:
+def do_merge(env: dict, state: dict, iid: int, force: bool = False) -> None:
     w = state["work"].get(str(iid)) or {}
+    if w.get("stage") != "готово-к-мержу" and not force:
+        raise RuntimeError(
+            f"issue #{iid} не прошёл ревью (стадия «{w.get('stage') or 'нет'}»); "
+            "влить всё равно — --force")
     branch = w.get("branch") or f"task/{iid}"
     repo_dir = repo()
-    base = w.get("base", "master")
+    base = w.get("base") or base_branch(env, repo_dir)
     gate(env, repo_dir)
     code, out = git(repo_dir, "checkout", base)
     if code != 0:
@@ -314,25 +418,25 @@ def do_merge(env: dict, state: dict, iid: int) -> None:
     if code != 0:
         raise RuntimeError(f"push: {out[-800:]}")
     git(repo_dir, "branch", "-d", branch)
-    changelog_entry(env, repo_dir, iid, w)
+    changelog_entry(env, repo_dir, iid, w, base)
     project_api(env, f"/issues/{iid}", "PUT", {"state_event": "close"})
     project_api(env, f"/issues/{iid}/notes", "POST", {
-        "body": f"📦 Задача выполнена и влита в main (v-запись в CHANGELOG-TEAM)."})
+        "body": f"📦 Задача выполнена и влита в {base} (запись в CHANGELOG-TEAM)."})
     # Автообновление дашборда и фида после мержа
     try:
         dash = Path(__file__).resolve().parent / "os_dashboard.py"
         run_shell(f'"{sys.executable}" "{dash}"', cwd=Path(__file__).resolve().parent.parent)
     except Exception as exc:
         print(f"  !! dashboard refresh: {exc}", flush=True)
-    notify_author(env, iid, w,
+    notify_author(env, iid,
                   f"🎉 Твоя задача «{w.get('title', '')}» выполнена и влита "
                   f"в основную ветку. Спасибо за вклад!")
-    state["work"][str(iid)]["stage"] = "в релизе"
+    state["work"].setdefault(str(iid), w)["stage"] = "в релизе"
     save_state(state)
-    print(f"📦 issue #{iid}: смержено в main, закрыто")
+    print(f"📦 issue #{iid}: смержено в {base}, закрыто")
 
 
-def changelog_entry(env: dict, repo_dir: Path, iid: int, w: dict) -> None:
+def changelog_entry(env: dict, repo_dir: Path, iid: int, w: dict, base: str) -> None:
     doc = repo_dir / "docs" / "CHANGELOG-TEAM.md"
     doc.parent.mkdir(parents=True, exist_ok=True)
     today = datetime.date.today().isoformat()
@@ -343,9 +447,15 @@ def changelog_entry(env: dict, repo_dir: Path, iid: int, w: dict) -> None:
              f"- Ветка: {w.get('branch', '—')}\n")
     with doc.open("a", encoding="utf-8") as fh:
         fh.write(entry)
-    git(repo_dir, "add", "docs/CHANGELOG-TEAM.md")
-    git(repo_dir, "commit", "-m", f"docs: changelog task #{iid}")
-    git(repo_dir, "push", "origin", "main")
+    for args in (("add", "docs/CHANGELOG-TEAM.md"),
+                 ("commit", "-m", f"docs: changelog task #{iid}"),
+                 # the base branch the merge went into — it used to push
+                 # «main» even when the base was another branch
+                 ("push", "origin", base)):
+        code, out = git(repo_dir, *args)
+        if code != 0:
+            print(f"  !! changelog: git {args[0]} не прошёл: {out.strip()[:300]}")
+            return
 
 
 # --- main -------------------------------------------------------------------
@@ -356,6 +466,8 @@ def main() -> int:
     parser.add_argument("--issue", type=int, default=None)
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--interval", type=int, default=120)
+    parser.add_argument("--force", action="store_true",
+                        help="merge: влить задачу, не прошедшую ревью")
     args = parser.parse_args()
 
     env = load_env(INTAKE_ROOT / ".env")
@@ -368,7 +480,7 @@ def main() -> int:
         if not args.issue:
             print("merge требует --issue N")
             return 2
-        do_merge(env, state, args.issue)
+        do_merge(env, state, args.issue, force=args.force)
         return 0
     while True:
         try:
