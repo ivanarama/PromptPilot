@@ -165,7 +165,7 @@ def test_plan_parser_rejects_forward_dependency():
 
 def test_stage_revision_limit_stops_autonomous_ping_pong(isolated_db):
     workflow = create(isolated_db, slug="revision-limit", max_revisions=1)
-    plan = workflows.dispatch_planner(
+    workflows.dispatch_planner(
         workflow.id, WorkflowPlanDispatch(expected_version=workflow.state_version)
     )
     finish_task(isolated_db, plan_result([
@@ -219,7 +219,7 @@ def test_llm_gate_commands_force_human_plan_approval(isolated_db):
     workflow = create(
         isolated_db, slug="unsafe-auto-plan", require_approval=False
     )
-    plan = workflows.dispatch_planner(
+    workflows.dispatch_planner(
         workflow.id, WorkflowPlanDispatch(expected_version=workflow.state_version)
     )
     finish_task(isolated_db, plan_result([{
@@ -235,7 +235,7 @@ def test_llm_gate_commands_force_human_plan_approval(isolated_db):
 
 def test_planned_workflow_honors_global_round_budget(isolated_db):
     workflow = create(isolated_db, slug="plan-round-budget", max_rounds=1)
-    plan = workflows.dispatch_planner(
+    workflows.dispatch_planner(
         workflow.id, WorkflowPlanDispatch(expected_version=workflow.state_version)
     )
     finish_task(isolated_db, plan_result([{

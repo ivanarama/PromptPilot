@@ -1222,7 +1222,16 @@ def capabilities(config: dict) -> dict:
             "review_completion_gate": config.get("review_completion_gate", "health"),
             "fallback_handoff": config.get("fallback_handoff", "legacy"),
             "target_reservations": "sqlite-task-lease-v1",
+            # Opt-in but unfinished (issue #42): see _base_sync_owner_action.
+            "base_sync_merge": "experimental" if config.get("base_sync_merge") else "off",
             "fallback": "repository skill"}
+
+
+BASE_SYNC_EXPERIMENTAL_NOTE = (
+    "base_sync_merge is EXPERIMENTAL and incomplete (issue #42): update-branch "
+    "publishes no pp:base-sync-intent/done, so the updated owner is routed to "
+    "legacy-integration-review and still needs the full skill; the mechanical "
+    "integration REVIEW (checks 1-6) is not implemented")
 
 
 def _configured_replica_count() -> int:
@@ -1859,6 +1868,15 @@ def _base_sync_owner_action(gh: GitHub, config: dict, owner: dict) -> dict | Non
     itself represents.
 
     Anything else keeps the full-skill fallback (return ``None``).
+
+    EXPERIMENTAL — do not enable in production (issue #42). The update-branch
+    lease publishes no ``pp:base-sync-intent/done`` markers, so after the
+    update the old committed review does not cover the new two-parent HEAD:
+    health routes it to ``legacy-integration-review``, which needs a new
+    trusted ship and the full skill. BEHIND → update → autonomous REVIEW →
+    merge is therefore not complete; the mechanical integration REVIEW
+    (checks 1–6) needs provenance fields from the project's health checker.
+    tests/test_base_sync_public_path.py pins the current public behaviour.
     """
     number, head = int(owner["number"]), str(owner["head"])
     snapshot = stable_timeline(gh, config, number)
@@ -1876,6 +1894,7 @@ def _base_sync_owner_action(gh: GitHub, config: dict, owner: dict) -> dict | Non
         lease = {"version": 1, "stage": "merge", "mode": "update-branch",
                  "repository": config["repository"], "number": number,
                  "head": head, "base_sync_owner": True}
+        print(BASE_SYNC_EXPERIMENTAL_NOTE, file=sys.stderr)
         return {"action": "merge", "target": {"number": number, "head": head},
                 "lease": encode_lease(lease),
                 "complete": "run the same command with: complete merge --lease <lease>"}
@@ -1899,6 +1918,7 @@ def _base_sync_owner_action(gh: GitHub, config: dict, owner: dict) -> dict | Non
     lease = {"version": 1, "stage": "merge", "repository": config["repository"],
              "number": number, "head": head, "snapshot": digest(snapshot),
              "proof": established, "intent": intent, "base_sync_owner": True}
+    print(BASE_SYNC_EXPERIMENTAL_NOTE, file=sys.stderr)
     return {"action": "merge", "target": {"number": number, "head": head},
             "lease": encode_lease(lease),
             "complete": "run the same command with: complete merge --lease <lease>"}
@@ -1913,6 +1933,10 @@ def _complete_base_sync_update(gh: GitHub, config: dict, lease: dict) -> dict:
     (issue #42: done was once published after a 422). The merge itself and
     the done marker happen on a subsequent ``next merge`` / ``complete
     merge`` against the updated HEAD, through the ordinary machinery.
+
+    EXPERIMENTAL (issue #42): that ordinary path does not happen yet — no
+    base-sync markers are published here, so the next run finds the owner in
+    legacy-integration-review (full skill), not ready to merge.
     """
     number, head = int(lease["number"]), str(lease["head"])
     pr = gh.json("api", f"repos/{config['repository']}/pulls/{number}")

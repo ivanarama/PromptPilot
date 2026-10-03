@@ -78,7 +78,7 @@ def _open_path(path):
     """Open a file with the OS default handler (Windows/macOS/Linux)."""
     try:
         if sys.platform == "win32":
-            os.startfile(str(path))  # noqa: only exists on Windows
+            os.startfile(str(path))  # only exists on Windows
         elif sys.platform == "darwin":
             subprocess.Popen(["open", str(path)])
         else:

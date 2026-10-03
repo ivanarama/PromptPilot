@@ -1,5 +1,6 @@
 import asyncio
 import io
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -314,10 +315,109 @@ def test_workflow_setup_preflight_accepts_repo_provider_and_gate(isolated_db, mo
     )
     assert response.status_code == 200
     result = response.json()
-    assert result["ready"] is True
+    # Name the check that objected: every probe here starts another program,
+    # and a bare "False is not True" says nothing about which one.
+    assert result["ready"] is True, result["checks"]
     assert {item["code"] for item in result["checks"]} >= {
         "repository", "branch", "provider", "gate",
     }
+
+
+def preflight_providers(monkeypatch):
+    monkeypatch.setattr("promptpilot.api.load_providers", lambda: {"test-provider": {"cmd": "test"}})
+    monkeypatch.setattr("promptpilot.api.provider_available", lambda info: True)
+
+
+def preflight_timeout_on(monkeypatch, programs):
+    """Make the named probes time out, leave every other git call real."""
+    real_run = subprocess.run
+
+    def run(cmd, **kwargs):
+        if cmd and cmd[0] in programs:
+            raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 0))
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr("promptpilot.api.subprocess.run", run)
+
+
+def preflight(gate_commands):
+    return request(
+        "POST", "/api/workflows/validate-setup", json={
+            "repository_path": str(Path(__file__).parents[1]),
+            "candidate_branch": "feature/workflow-wizard",
+            "providers": ["test-provider"],
+            "gate_commands": gate_commands,
+        },
+    )
+
+
+def test_workflow_setup_preflight_timeout_is_not_a_syntax_error(isolated_db, monkeypatch):
+    """A parser that did not answer has not proven the command wrong — nor right.
+
+    Starting powershell.exe cold on a loaded machine can outlast the probe
+    timeout. Calling that a syntax error made the wizard lie and the Windows CI
+    job flaky, so the status stays «warning» and the message says what was not
+    checked. But readiness is withheld: ready opens «Создать и запустить», and a
+    gate whose syntax nobody verified must not let an unattended run start.
+    """
+    preflight_providers(monkeypatch)
+    preflight_timeout_on(monkeypatch, ("powershell.exe", "/bin/sh"))
+
+    result = preflight(["python --version"]).json()
+
+    gate = [item for item in result["checks"] if item["code"] == "gate"]
+    assert [item["status"] for item in gate] == ["warning"], gate
+    assert "не проверен" in gate[0]["message"]
+    assert result["ready"] is False, result["checks"]
+
+
+def test_workflow_setup_preflight_timeout_of_a_git_probe_also_withholds_readiness(
+        isolated_db, monkeypatch):
+    """Same rule for the repository and branch probes: unchecked ≠ ready."""
+    preflight_providers(monkeypatch)
+    preflight_timeout_on(monkeypatch, ("git",))
+
+    result = preflight(["python --version"]).json()
+
+    withheld = {item["code"]: item["status"] for item in result["checks"]
+                if item["code"] in ("repository", "branch")}
+    assert withheld == {"repository": "warning", "branch": "warning"}, result["checks"]
+    assert result["ready"] is False, result["checks"]
+
+
+def test_workflow_setup_preflight_stays_ready_without_gate_commands(isolated_db, monkeypatch):
+    """A gate nobody specified is not an unchecked gate: nothing to check.
+
+    That warning has to stay non-blocking, or the wizard would refuse every
+    workflow that deliberately runs without a functional gate.
+    """
+    preflight_providers(monkeypatch)
+
+    result = preflight([]).json()
+
+    gate = [item for item in result["checks"] if item["code"] == "gate"]
+    assert [item["status"] for item in gate] == ["warning"], gate
+    assert "не заданы" in gate[0]["message"]
+    assert result["ready"] is True, result["checks"]
+
+
+def test_workflow_setup_preflight_still_rejects_broken_gate_syntax(isolated_db, monkeypatch):
+    """A parser that answered «no» is a real error — warning must not swallow it."""
+    monkeypatch.setattr("promptpilot.api.load_providers", lambda: {"test-provider": {"cmd": "test"}})
+    monkeypatch.setattr("promptpilot.api.provider_available", lambda info: True)
+    response = request(
+        "POST", "/api/workflows/validate-setup", json={
+            "repository_path": str(Path(__file__).parents[1]),
+            "candidate_branch": "feature/workflow-wizard",
+            "providers": ["test-provider"],
+            "gate_commands": ["if ("],
+        },
+    )
+    assert response.status_code == 200
+    result = response.json()
+    gate = [item for item in result["checks"] if item["code"] == "gate"]
+    assert [item["status"] for item in gate] == ["error"], gate
+    assert result["ready"] is False
 
 
 def test_workflow_setup_preflight_rejects_invalid_inputs(isolated_db, tmp_path):

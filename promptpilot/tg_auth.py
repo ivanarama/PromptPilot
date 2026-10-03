@@ -1,11 +1,10 @@
 """Telegram authorization — phone-based access control."""
 
-import json
 import os
 import sys
 from pathlib import Path
 
-from .config import DB_DIR, _atomic_write_json
+from .config import DB_DIR, _atomic_write_json, _read_json_file
 
 
 def _users_file() -> Path:
@@ -29,10 +28,11 @@ def load_allowed_phones() -> list:
     config_file = DB_DIR / "tg_config.json"
     if config_file.exists():
         try:
-            with open(config_file) as f:
-                data = json.load(f)
+            # tg_config.json also holds the 1С section with paths that are
+            # often Cyrillic — read it the way it was written.
+            data = _read_json_file(config_file)
             return data.get("allowed_phones", [])
-        except (json.JSONDecodeError, OSError):
+        except (ValueError, OSError):
             pass
     return []
 
@@ -42,9 +42,8 @@ def _load_users() -> dict:
     f = _users_file()
     if f.exists():
         try:
-            with open(f) as fp:
-                return json.load(fp)
-        except json.JSONDecodeError as e:
+            return _read_json_file(f)
+        except ValueError as e:
             # A truncated file used to be swallowed as {} — silently logging
             # everyone out. Surface it and keep no one authorized only for this
             # read, without overwriting the file.

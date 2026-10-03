@@ -47,3 +47,8 @@ packages = ["promptpilot"]
 # static/index.html and `pp server` serves a 404 at /.
 [tool.setuptools.package-data]
 promptpilot = ["static/*"]
+
+# CI runs `ruff check promptpilot tests tools main.py` with these rules.
+# Pyflakes-class only: real errors, not style.
+[tool.ruff.lint]
+select = ["F", "E9"]

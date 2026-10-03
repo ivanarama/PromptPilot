@@ -2230,7 +2230,8 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, 
       <div class="wf-round-summary">Не запускайте новый раунд. Дождитесь завершения фоновых build/pytest; экран агента показан ниже.</div>
     </div>`;
   } else if (wf.status === 'revision_required' || (wf.status === 'awaiting_human' && !reviewerDone)) {
-    action = `<div class="wf-form"><input class="wide" id="wfHumanText" value="Продолжить работу с учётом сохранённого состояния" required>
+    action = `<div class="wf-form"><textarea class="wide" id="wfHumanNote" rows="3"
+        placeholder="Что передать агенту (необязательно). Уйдёт в следующий запуск исполнителя и аудитора как указание, главнее инструкций раунда."></textarea>
       <button class="btn btn-sm btn-primary" onclick="wfResume()">Продолжить ${wf.status === 'revision_required' ? 'новым раундом' : 'текущий раунд'}</button></div>`;
   } else if (wf.status === 'awaiting_human' && reviewerDone) {
     const auditColor = auditVerdict === 'PASS' ? 'var(--green)' : 'var(--red)';
@@ -2537,7 +2538,15 @@ function wfDownloadReport(format) {
 
 function wfStart() { return wfPost('start', {expected_version: selectedWorkflowData.state_version}); }
 function wfSync() { return wfPost('sync', {}); }
-function wfResume() { return wfPost('human-input', {expected_version: selectedWorkflowData.state_version, text: document.getElementById('wfHumanText').value, resume: true}); }
+function wfResume() {
+  const note = (document.getElementById('wfHumanNote')?.value || '').trim();
+  return wfPost('human-input', {
+    expected_version: selectedWorkflowData.state_version,
+    text: note || 'Продолжить работу с учётом сохранённого состояния',
+    note,
+    resume: true,
+  });
+}
 function wfGate(verdict) { return wfPost('gate', {expected_version: selectedWorkflowData.state_version, verdict, gate_id: 'ui-manual-gate', summary: document.getElementById('wfDecisionSummary').value}); }
 function wfReview(verdict) { return wfPost('review', {expected_version: selectedWorkflowData.state_version, verdict, summary: document.getElementById('wfDecisionSummary').value, findings: []}); }
 function wfCancel() { if (confirm('Отменить workflow и все его активные задачи?')) return wfPost('cancel', {expected_version: selectedWorkflowData.state_version}); }
@@ -3028,7 +3037,7 @@ async function loadPipelineReport(profile, hours=24, refresh=false) {
       <div class="pipeline-metric"><div class="pipeline-metric-label">Стоимость</div><div class="pipeline-metric-value">${esc(costValue)}</div><div class="pipeline-metric-note">измерено запусков: ${pipelineReportNumber(cost.known_runs)} из ${pipelineReportNumber(runs.total)}</div></div>
     </div>
     <div class="pipeline-report-section"><h3>Движение по этапам</h3>
-      <div class="pipeline-report-meta">Узкое место: ${bottleneck}</div>
+      <div class="pipeline-report-meta">Этап, требующий внимания: ${bottleneck}</div>
       ${queueRows ? `<table class="pipeline-report-queues"><thead><tr><th>Этап</th><th class="num">Сейчас</th><th class="num">Δ</th><th class="num">Вышло</th></tr></thead><tbody>${queueRows}</tbody></table>` : '<div class="pipeline-report-meta">Нет данных об очередях.</div>'}
     </div>
     <div class="pipeline-report-section"><h3>Запуски</h3>
@@ -3042,6 +3051,20 @@ async function loadPipelineReport(profile, hours=24, refresh=false) {
     if (requestId !== pipelineReportRequestId) return;
     box.innerHTML = `<div style="color:var(--red);margin-bottom:10px">Отчёт недоступен: ${esc(e.message)}</div>`;
   }
+}
+
+function pipelineStageFocus(queues) {
+  const pending = (queues || []).filter(q => Number(q.backlog) > 0);
+  const stopped = pending.filter(q => q.parallel_capacity != null && Number(q.parallel_capacity) === 0);
+  const working = pending.filter(q => Number(q.parallel_capacity) > 0);
+  const pressure = q => {
+    const eta = Number(q.eta_hours);
+    if (q.eta_hours != null && Number.isFinite(eta)) return eta;
+    const work = Number(q.runs_needed ?? q.backlog);
+    return Number.isFinite(work) ? work / Number(q.parallel_capacity) : 0;
+  };
+  working.sort((a, b) => pressure(b) - pressure(a));
+  return {stopped, workingBottleneck: working[0] || null};
 }
 
 async function loadPipelineInsights(profile, refresh=false) {
@@ -3144,7 +3167,8 @@ async function loadPipelineInsights(profile, refresh=false) {
     const coreColor = coreShare == null ? 'var(--muted)' : coreShare <= 0.05 ? 'var(--red)' : coreShare <= 0.2 ? 'var(--yellow)' : '';
     const deltaRateByQueue = h5.queue_deltas_per_hour || {};
     const throughputRateByQueue = h5.queue_throughput_per_hour || {};
-    const bottleneckQueue = (data.queues || []).find(q => q.id === data.bottleneck);
+    const stageFocus = pipelineStageFocus(data.queues);
+    const workingBottleneck = stageFocus.workingBottleneck;
     const diagnostics = data.diagnostics;
     const runtime = data.runtime || {};
     const healthLabel = data.health.label === 'нужна проверка' ? 'есть ожидания' : data.health.label;
@@ -3181,9 +3205,10 @@ async function loadPipelineInsights(profile, refresh=false) {
         `#${replica.series_id} ${replica.task_status || (replica.paused ? 'paused' : replica.broken ? 'broken' : 'idle')} · ${replica.interval || 'без интервала'} · ${replica.working_dir || 'working_dir не задан'}`
       );
       const replicaLine = `${replicaSummary}${replicaIssues}${replicaLines.length ? ` · ${replicaLines.join(' | ')}` : ''}`;
-      const bottleneck = data.bottleneck===q.id ? 'bottleneck' : '';
+      const stopped = stageFocus.stopped.some(item => item.id === q.id);
+      const bottleneck = stopped || workingBottleneck?.id === q.id ? 'bottleneck' : '';
       const capacity = `${q.capacity} × ${q.replicas_active || 0} = ${q.parallel_capacity}`;
-      return `<tr class="${bottleneck}"><td class="insights-stage-title">${data.bottleneck===q.id?'⚠ ':''}${esc(q.title)}${q.replica_count>1?` ×${q.replica_count}`:''}</td><td class="num">${q.backlog == null ? '—' : q.backlog}</td><td class="num">${h5.complete?perHour(deltaRateByQueue[q.id] ?? 0):'—'}</td><td class="num">${capacity}</td><td class="num">${q.runs_needed == null ? '—' : q.runs_needed}</td><td>${duration(q.avg_duration_seconds)}</td><td>${q.eta_hours == null ? '—' : q.eta_hours+' ч'}</td><td>${age(q.age.oldest_hours)}</td><td>${esc(q.interval || 'нет серии')}</td><td class="insights-recommendation">${esc(q.recommendation || '—')}</td></tr>
+      return `<tr class="${bottleneck}"><td class="insights-stage-title">${stopped?'⏸ ':workingBottleneck?.id===q.id?'⚠ ':''}${esc(q.title)}${q.replica_count>1?` ×${q.replica_count}`:''}</td><td class="num">${q.backlog == null ? '—' : q.backlog}</td><td class="num">${h5.complete?perHour(deltaRateByQueue[q.id] ?? 0):'—'}</td><td class="num">${capacity}</td><td class="num">${q.runs_needed == null ? '—' : q.runs_needed}</td><td>${duration(q.avg_duration_seconds)}</td><td>${q.eta_hours == null ? '—' : q.eta_hours+' ч'}</td><td>${age(q.age.oldest_hours)}</td><td>${esc(q.interval || 'нет серии')}</td><td class="insights-recommendation">${esc(q.recommendation || '—')}</td></tr>
         <tr class="insights-stage-detail ${bottleneck}"><td colspan="10"><div class="insights-stage-meta"><span class="prov-cmd" title="${escAttr(last?.summary || '')}">${esc(lastLine)}</span><span class="prov-cmd">${esc(stageLine)}</span><span class="prov-cmd">${esc(routeLine)}</span><span class="prov-cmd" style="${replicaStatus.valid?'':'color:var(--red)'}">${esc(replicaLine)}</span>${wakeLine?`<span class="prov-cmd">${esc(wakeLine)}</span>`:''}${cadenceLine?`<span class="prov-cmd">${esc(cadenceLine)}</span>`:''}</div></td></tr>`;
     }).join('');
     const priorityHtml = data.priority_control ? `<details style="margin-top:12px" open>
@@ -3219,7 +3244,8 @@ async function loadPipelineInsights(profile, refresh=false) {
         <div class="pipeline-metric"><div class="pipeline-metric-label">Снимок GitHub</div><div class="pipeline-metric-value" style="${cacheColor ? `color:${cacheColor}` : ''}">${esc(cacheValue)}</div><div class="pipeline-metric-note">${esc(cacheNote)}</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Backlog сейчас</div><div class="pipeline-metric-value">${data.backlog_total == null ? '—' : data.backlog_total}</div><div class="pipeline-metric-note">Δ/ч: ${h5.complete?perHour(h5.backlog_delta_per_hour):'копится история'}</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Вход / выход</div><div class="pipeline-metric-value">${h5.complete?`${perHour(h5.entered_per_hour)} / ${perHour(h5.exited_per_hour)}`:'—'}</div><div class="pipeline-metric-note">фактическая скорость · ${historyNote}</div></div>
-        <div class="pipeline-metric"><div class="pipeline-metric-label">Узкое место</div><div class="pipeline-metric-value">${bottleneckQueue?esc(bottleneckQueue.title):'нет'}</div><div class="pipeline-metric-note">${bottleneckQueue&&bottleneckQueue.eta_hours!=null?`ETA ${bottleneckQueue.eta_hours} ч · очередь ${bottleneckQueue.backlog}`:'активной очереди нет'}</div></div>
+        <div class="pipeline-metric"><div class="pipeline-metric-label">Остановленные этапы</div><div class="pipeline-metric-value">${stageFocus.stopped.length ? stageFocus.stopped.map(q => esc(q.title)).join(', ') : 'нет'}</div><div class="pipeline-metric-note">${stageFocus.stopped.length ? `есть работа, но нет активных реплик: ${stageFocus.stopped.map(q => `${esc(q.title)} — ${q.backlog}`).join('; ')}` : 'все очереди с работой имеют рабочую ёмкость'}</div></div>
+        <div class="pipeline-metric"><div class="pipeline-metric-label">Узкое место работающих</div><div class="pipeline-metric-value">${workingBottleneck?esc(workingBottleneck.title):'нет'}</div><div class="pipeline-metric-note">${workingBottleneck ? `очередь ${workingBottleneck.backlog}${workingBottleneck.eta_hours != null ? ` · ETA ${workingBottleneck.eta_hours} ч` : ' · ETA пока неизвестно'}` : 'очередей с работой и активными репликами нет'}</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Переходы / churn</div><div class="pipeline-metric-value">${h5.complete?`${h5.transitions} / ${h5.churn_items}`:'—'}</div><div class="pipeline-metric-note">между очередями / 3+ состояний</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Возраст p90 / max</div><div class="pipeline-metric-value">${age(data.age.p90_hours)} / ${age(data.age.oldest_hours)}</div><div class="pipeline-metric-note">текущие элементы</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Прогоны 5 ч</div><div class="pipeline-metric-value">${runs.runs}</div><div class="pipeline-metric-note">с действием ${runs.ready} · без действий ${runs.no_change || 0} · пусто ${runs.empty} · перевыбор ${runs.stale || 0}</div></div>
