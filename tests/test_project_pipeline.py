@@ -608,6 +608,48 @@ def test_content_review_stays_executable_while_integration_owner_waits_merge(mon
     assert result["target"]["number"] == 42
 
 
+def test_opt_in_parallel_content_review_uses_native_target_gate(tmp_path, monkeypatch):
+    owner = {"number": 10, "head": "b" * 40, "stage": "integration-review"}
+    content = {"number": 42, "head": HEAD, "stage": "review", "review_depth": 0}
+    health = {
+        "state": "yellow", "integration_owner": owner,
+        "findings": [{"code": "single_flight_barrier", "severity": "yellow", "pr": 10}],
+        "review_candidates": [owner], "content_review_candidates": [content],
+        "parallel_review_candidates": [content], "merge_executable": [],
+    }
+    config = {
+        "repository": "owner/repo", "trusted_account": "owner", "base_branch": "main",
+        "review_completion_gate": "target-v1", "fallback_handoff": "target-v1",
+        "parallel_content_review": True,
+    }
+    monkeypatch.setenv("PP_PIPELINE_REPLICAS", "2")
+    monkeypatch.setenv("PP_PIPELINE_LEASE_KEY_FILE", str(tmp_path / "lease.key"))
+    monkeypatch.setattr(pp, "run_health", lambda *_args, **_kwargs: health)
+    monkeypatch.setattr(pp, "stable_timeline", lambda *_args: snapshot())
+
+    def elect(_config, _health, candidates):
+        assert [item["number"] for item in candidates] == [10, 42]
+        return content, {"token": "reserved"}, health
+
+    monkeypatch.setattr(pp, "_elect_review_candidate", elect)
+    result = pp.next_review(object(), config)
+    assert result["action"] == "audit"
+    assert result["target"] == content
+    lease = pp.decode_signed_lease(result["lease"])
+    assert (lease["number"], lease["head"], lease["pipeline_replicas"]) == (42, HEAD, 2)
+
+
+def test_parallel_content_review_fails_closed_without_checker_allowlist(monkeypatch):
+    monkeypatch.setenv("PP_PIPELINE_REPLICAS", "2")
+    config = {
+        "review_completion_gate": "target-v1", "fallback_handoff": "target-v1",
+        "parallel_content_review": True,
+    }
+    health = {"integration_owner": {"stage": "integration-review"}}
+    with pytest.raises(pp.PipelineError, match="checker allowlist"):
+        pp.parallel_content_candidates(config, health)
+
+
 def test_content_review_completion_ignores_unrelated_integration_owner():
     health = {
         "review_candidates": [
