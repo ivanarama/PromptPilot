@@ -28,6 +28,7 @@ def call(method, path, *, base_url="http://127.0.0.1:8420", headers=None, **kwar
 def no_token(monkeypatch, isolated_db):
     monkeypatch.setattr(api, "API_TOKEN", "")
     monkeypatch.setattr(api, "ALLOWED_HOSTS", [])
+    monkeypatch.setattr(api, "ALLOWED_ORIGINS", [])
     return isolated_db
 
 
@@ -85,14 +86,75 @@ def test_allowed_hosts_cover_reverse_proxy_names(no_token, monkeypatch):
     monkeypatch.setattr(api, "ALLOWED_HOSTS", ["pp.example.com"])
 
     direct = call("GET", "/api/tasks", headers={"Host": "pp.example.com"})
-    # The proxy talks to the loopback upstream; the browser keeps the public Origin.
-    proxied = call("POST", "/api/tasks", json={"prompt": "via proxy"},
-                   headers={"Origin": "https://pp.example.com"})
     other = call("GET", "/api/tasks", headers={"Host": "evil.example.com"})
 
     assert direct.status_code == 200
-    assert proxied.status_code == 201
     assert other.status_code == 403
+
+
+@pytest.mark.parametrize("origin", [
+    "http://pp.example.com:3000",    # another port of the allowed name
+    "http://pp.example.com",         # the allowed name, but not a listed origin
+    "https://pp.example.com",
+])
+def test_allowed_host_name_is_not_an_allowed_origin(no_token, monkeypatch, origin):
+    monkeypatch.setattr(api, "ALLOWED_HOSTS", ["pp.example.com"])
+
+    # The proxy talks to the loopback upstream; the browser sends its own Origin.
+    response = call("POST", "/api/tasks", json={"prompt": "x"},
+                    headers={"Origin": origin, "Host": "127.0.0.1:8420"})
+
+    assert response.status_code == 403
+    assert call("GET", "/api/tasks").json() == []
+
+
+@pytest.mark.parametrize("origin", [
+    "https://pp.example.com",
+    "https://pp.example.com:443",    # the default port is the same origin
+])
+def test_explicit_public_origin_can_post_through_proxy(no_token, monkeypatch, origin):
+    monkeypatch.setattr(api, "ALLOWED_ORIGINS", ["https://pp.example.com"])
+
+    response = call("POST", "/api/tasks", json={"prompt": "via proxy"},
+                    headers={"Origin": origin, "Host": "127.0.0.1:8420"})
+
+    assert response.status_code == 201
+
+
+@pytest.mark.parametrize("origin", [
+    "http://pp.example.com",          # another scheme
+    "https://pp.example.com:8443",    # another port
+    "https://evil.pp.example.com",    # another host
+    "https://pp.example.com.evil.net",
+])
+def test_explicit_origin_matches_exactly(no_token, monkeypatch, origin):
+    monkeypatch.setattr(api, "ALLOWED_HOSTS", ["pp.example.com"])
+    monkeypatch.setattr(api, "ALLOWED_ORIGINS", ["https://pp.example.com"])
+
+    response = call("POST", "/api/tasks", json={"prompt": "x"},
+                    headers={"Origin": origin, "Host": "127.0.0.1:8420"})
+
+    assert response.status_code == 403
+    assert call("GET", "/api/tasks").json() == []
+
+
+def test_own_origin_must_match_the_request_scheme(no_token):
+    response = call("POST", "/api/tasks", json={"prompt": "x"},
+                    headers={"Origin": "https://127.0.0.1:8420"})
+
+    assert response.status_code == 403
+
+
+def test_proxy_forwarding_host_and_scheme_is_same_origin(no_token, monkeypatch):
+    # A local TLS proxy that forwards Host and X-Forwarded-Proto: uvicorn trusts
+    # the scheme from 127.0.0.1, so the request itself is https://pp.example.com.
+    monkeypatch.setattr(api, "ALLOWED_HOSTS", ["pp.example.com"])
+
+    response = call("POST", "/api/tasks", json={"prompt": "via proxy"},
+                    base_url="https://pp.example.com",
+                    headers={"Origin": "https://pp.example.com"})
+
+    assert response.status_code == 201
 
 
 def test_wildcard_disables_only_the_host_check(no_token, monkeypatch):
@@ -139,3 +201,19 @@ def test_cross_site_post_is_refused_even_with_token(isolated_db, monkeypatch):
 ])
 def test_hostname_parsing(authority, expected):
     assert api._hostname(authority) == expected
+
+
+@pytest.mark.parametrize(("value", "expected"), [
+    ("https://pp.example.com", ("https", "pp.example.com", 443)),
+    ("HTTPS://PP.Example.com:443/", ("https", "pp.example.com", 443)),
+    ("http://pp.example.com.:8420", ("http", "pp.example.com", 8420)),
+    ("http://[::1]:8420", ("http", "::1", 8420)),
+    ("null", None),
+    ("", None),
+    ("ftp://pp.example.com", None),
+    ("https://pp.example.com/path", None),
+    ("https://user@pp.example.com", None),
+    ("https://pp.example.com:99999", None),
+])
+def test_origin_parsing(value, expected):
+    assert api._origin_key(value) == expected

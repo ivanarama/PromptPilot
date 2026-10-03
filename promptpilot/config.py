@@ -1126,6 +1126,16 @@ ALLOWED_HOSTS = [
     if host.strip()
 ]
 
+# Full browser origins (scheme://host[:port]) that may send state-changing
+# requests without a token besides the server's own origin: the public URL of
+# a reverse proxy or tunnel, e.g. https://pp.example.com. Matched exactly — a
+# name in PP_ALLOWED_HOSTS admits no other scheme or port of that name.
+ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get("PP_ALLOWED_ORIGINS", "").split(",")
+    if origin.strip()
+]
+
 # Escape hatch for the loopback guard on `pp server`: inside a container binding
 # 0.0.0.0 is normal (the security boundary is the host port publish, not the
 # container's bind), so the image sets this. On bare metal leave it unset.
