@@ -63,7 +63,7 @@ commits aebc992, 12f3664 и dac6bd0, локальная ветка
 
 Канонические изменения находятся в OneBase PR #1730, commit 748ab8cc и
 предыдущих commits той же ветки. На Mac установлен отдельный snapshot
-`/Users/ivantitov/PromptPilotBuild/onebase-procedures-748ab8cc`, на который
+`~/PromptPilotBuild/onebase-procedures-748ab8cc`, на который
 указывают prompts трёх production-серий REVIEW/REVIEW 2/MERGE. Это runtime
 hotfix, не независимое одобрение PR #1730. Checkout main остаётся чистым;
 первоначальные prompts сохранены в `series-before.json`. Обновление только
@@ -75,7 +75,7 @@ pipeline_replicas, merge_wait_dispatch, base_sync_merge, worker_admission и
 pipeline_watch прошли. Монитор `com.promptpilot.onebase-watch-20260927`
 работает read-only с 10:01 до примерно 11:01 UTC: API раз в минуту,
 подтверждение GitHub merges раз в 10 минут, без запуска модели. Отчёт:
-`/Users/ivantitov/.promptpilot/pipeline-watch-20260927.json`.
+`~/.promptpilot/pipeline-watch-20260927.json`.
 
 На 10:30 UTC новых merges в окне мониторинга ещё не подтверждено. #1505
 больше не держит ship-очередь, но нуждается в корректном новом исходном

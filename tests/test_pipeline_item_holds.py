@@ -50,6 +50,91 @@ def test_partial_snapshot_never_excludes_and_manual_run_clears_hold(isolated_db)
     assert holds.prepare(successor, queue, data) == []
 
 
+def test_review_candidate_outside_search_is_held_without_pausing_series(isolated_db):
+    task = isolated_db.create_task(TaskCreate(prompt="Example - REVIEW", recurrence="15m"))
+    queue = {"id": "review", "item_blockers": True}
+    data = {"cache": {"complete": True, "stale": False},
+            "queues": [{"id": "review", "membership_complete": True,
+                        "backlog": 0, "admission_items": []}],
+            "diagnostics": {"review_candidates": [
+                {"number": 1759, "stage": "review", "head": "a" * 40,
+                 "review_depth": 2}]}}
+    assert holds.prepare(task, queue, data) == []
+    isolated_db.mark_completed(
+        task.id, "ИТОГ: НУЖЕН ЧЕЛОВЕК (#1759 — требуется решение)",
+        verdict="НУЖЕН ЧЕЛОВЕК")
+    result = isolated_db.pause_pipeline_series_on_repeated_blocker(task.series_id, task.id)
+    assert not result["suppress_recurrence"]
+    assert not isolated_db.list_series()[0]["paused"]
+    successor = SimpleNamespace(id=task.id + 1, series_id=task.series_id)
+    assert holds.prepare(successor, queue, data) == [1759]
+    data["diagnostics"]["review_candidates"][0]["head"] = "b" * 40
+    assert holds.prepare(successor, queue, data) == []
+
+
+def test_review_hold_requires_fresh_exact_review_candidate(isolated_db):
+    isolated_db.create_task(TaskCreate(prompt="Example - REVIEW", recurrence="15m"))
+    queue = {"id": "review", "item_blockers": True}
+    data = {"cache": {"complete": True, "stale": False},
+            "queues": [{"id": "review", "membership_complete": True,
+                        "backlog": 0, "admission_items": []}],
+            "diagnostics": {"review_candidates": [
+                {"number": 7, "stage": "review", "head": "a" * 40}]}}
+    assert "7" in holds.fingerprints(data, queue)
+    for change in ({"cache": {"complete": False}},
+                   {"cache": {"stale": True}},
+                   {"diagnostics": {"checker_failed": True}},
+                   {"diagnostics": {"review_candidates": [
+                       {"number": 7, "stage": "integration-merge-ready", "head": "a" * 40}]}},
+                   {"diagnostics": {"review_candidates": [
+                       {"number": 7, "stage": "review", "head": "not-a-sha"}]}}):
+        changed = copy.deepcopy(data)
+        for key, value in change.items():
+            changed[key].update(value)
+        assert "7" not in (holds.fingerprints(changed, queue) or {})
+
+
+def test_exact_review_election_survives_stale_queue_snapshot(isolated_db):
+    task = isolated_db.create_task(TaskCreate(prompt="Example - REVIEW", recurrence="15m"))
+    queue = {"id": "review", "item_blockers": True}
+    stale = {"cache": {"complete": False, "stale": True}, "queues": [],
+             "diagnostics": None}
+    assert holds.prepare(task, queue, stale) == []
+    holds.register_review_target(task, 1759, "a" * 40)
+    isolated_db.mark_completed(
+        task.id, "ИТОГ: НУЖЕН ЧЕЛОВЕК (#1759 — решение владельца)",
+        verdict="НУЖЕН ЧЕЛОВЕК")
+    assert not isolated_db.pause_pipeline_series_on_repeated_blocker(
+        task.series_id, task.id)["suppress_recurrence"]
+    successor = SimpleNamespace(id=task.id + 1, series_id=task.series_id)
+    fresh = {"cache": {"complete": True, "stale": False},
+             "queues": [{"id": "review", "membership_complete": True,
+                         "backlog": 0, "admission_items": []}],
+             "diagnostics": {"review_candidates": [
+                 {"number": 1759, "stage": "review", "head": "a" * 40}]}}
+    assert holds.prepare(successor, queue, fresh) == [1759]
+    fresh["diagnostics"]["review_candidates"][0]["head"] = "b" * 40
+    assert holds.prepare(successor, queue, fresh) == []
+
+
+def test_exact_review_election_rejects_another_pr_in_human_result(isolated_db):
+    task = isolated_db.create_task(TaskCreate(prompt="Example - REVIEW", recurrence="15m"))
+    queue = {"id": "review", "item_blockers": True}
+    data = {"cache": {"complete": True, "stale": False},
+            "queues": [{"id": "review", "membership_complete": True,
+                        "backlog": 2, "admission_items": [
+                            {"number": number, "updated_at": "2026-09-30T00:00:00Z"}
+                            for number in (7, 8)]}]}
+    holds.prepare(task, queue, data)
+    holds.register_review_target(task, 7, "a" * 40)
+    isolated_db.mark_completed(
+        task.id, "ИТОГ: НУЖЕН ЧЕЛОВЕК (#8 — не та цель)",
+        verdict="НУЖЕН ЧЕЛОВЕК")
+    successor = SimpleNamespace(id=task.id + 1, series_id=task.series_id)
+    isolated_db.pause_pipeline_series_on_repeated_blocker(task.series_id, task.id)
+    assert holds.prepare(successor, queue, data) == []
+
+
 def test_excluded_integration_owner_is_not_skipped(monkeypatch):
     monkeypatch.setenv("PP_PIPELINE_EXCLUDED_NUMBERS", "[7]")
     monkeypatch.setattr(pp, "pending_merge_intents", lambda *_: [])

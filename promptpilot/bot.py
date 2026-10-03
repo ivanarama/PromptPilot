@@ -965,7 +965,7 @@ def _pipeline_text(data: dict) -> str:
              f"Вход / выход: {rate(entered_rate)} / {rate(exited_rate)}; "
              f"переходов {recent.get('transitions', 0)}; покрытие {coverage}",
              f"Тренд backlog: 7 дней {week_trend}; 30 дней {month_trend}",
-             f"Узкое место: " + (
+             "Узкое место: " + (
                  f"{bottleneck['title']} (ETA {bottleneck.get('eta_hours', '—')} ч)"
                  if bottleneck else "нет"),
              "Безопасные ожидания / ошибки: "

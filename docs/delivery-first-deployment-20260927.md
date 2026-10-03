@@ -4,7 +4,7 @@ Recorded at approximately 14:12 UTC / 17:12 Moscow time.
 
 ## Installed
 
-- Release: `/Users/ivantitov/PromptPilotBuild/delivery-first-20260927-v2`.
+- Release: `~/PromptPilotBuild/delivery-first-20260927-v2`.
 - PromptPilot source: `0506c23f3645d9de153fe5b29c1492cdee0b47a1`.
 - Procedure/project-policy snapshot: OneBase `2cbc452421b97c263851ed7b7c7516c67d65ef7c`
   from PR #1730, paired under the preceding immutable release directory.
@@ -47,7 +47,7 @@ model-free or claim a delivery speedup from installation checks alone.
 Read-only watch LaunchAgent:
 `com.promptpilot.onebase-watch-delivery-first-20260927`.
 Started 14:06 UTC for 24 hours; no automatic GitHub mutations or agent launches.
-Report: `/Users/ivantitov/.promptpilot/pipeline-watch-delivery-first-20260927.json`.
+Report: `~/.promptpilot/pipeline-watch-delivery-first-20260927.json`.
 At 14:11 UTC it was updating, worker online/unpaused, no alerts or current read
 errors. No merge had yet been confirmed in this short observation window;
 zero-denominator cost/run ratios were correctly unknown. A transient API outage

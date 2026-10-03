@@ -34,12 +34,10 @@ from .models import (
     WorkflowPlanReplace,
     WorkflowReviewDecision,
     WorkflowRole,
-    WorkflowRoundInDB,
     WorkflowRoundStatus,
     WorkflowRunInDB,
     WorkflowStageInDB,
     WorkflowStageSpec,
-    WorkflowStageStatus,
     WorkflowStartRequest,
     WorkflowStatus,
     WorkflowTaskDispatch,
@@ -1021,6 +1019,11 @@ def record_review(workflow_id: str,
 
 def human_input(workflow_id: str,
                 action: WorkflowHumanInput) -> WorkflowInDB:
+    # The note is recorded next to the decision text and later rendered into
+    # the next executor/reviewer prompt (see _operator_notes).
+    said = {"text": action.text}
+    if action.note.strip():
+        said["note"] = action.note.strip()
     with db._connect(immediate=True) as conn:
         workflow = _workflow_row(conn, workflow_id)
         _require_version(workflow, action.expected_version)
@@ -1039,7 +1042,7 @@ def human_input(workflow_id: str,
         if not action.resume:
             workflow = _touch(
                 conn, workflow, "human.input",
-                {"text": action.text, "resume": False},
+                {**said, "resume": False},
                 round_id=round_row["id"] if round_row else None,
             )
             return db._row_to_workflow(workflow)
@@ -1073,7 +1076,7 @@ def human_input(workflow_id: str,
                     (current_stage["id"],),
                 ).fetchone()[0]
                 revision_limit_reason = {
-                    "text": action.text, "stage_id": current_stage["id"],
+                    **said, "stage_id": current_stage["id"],
                     "stage_code": current_stage["code"],
                     "max_revision_rounds": int(configured_limit),
                 }
@@ -1093,12 +1096,13 @@ def human_input(workflow_id: str,
                     (workflow["id"],),
                 ).fetchone()[0]
                 revision_limit_reason = {
-                    "text": action.text,
+                    **said,
                     "max_revision_rounds": int(configured_limit),
                 }
             if revision_count >= int(configured_limit):
                 if state is WorkflowStatus.AWAITING_HUMAN:
-                    return db._row_to_workflow(workflow)
+                    return _keep_refused_note(
+                        conn, workflow, said, round_row, "stage_revisions")
                 workflow = _transition(
                     conn, workflow, WorkflowStatus.AWAITING_HUMAN,
                     "limit.stage_revisions",
@@ -1108,12 +1112,13 @@ def human_input(workflow_id: str,
                 return db._row_to_workflow(workflow)
             if not _check_round_budget(conn, workflow, next_round):
                 if state is WorkflowStatus.AWAITING_HUMAN:
-                    return db._row_to_workflow(workflow)
+                    return _keep_refused_note(
+                        conn, workflow, said, round_row, "max_rounds")
                 workflow = _transition(
                     conn, workflow, WorkflowStatus.AWAITING_HUMAN,
                     "limit.max_rounds",
                     {
-                        "text": action.text,
+                        **said,
                         "max_rounds": _max_automated_rounds(workflow),
                         "refused_round": next_round,
                     },
@@ -1129,7 +1134,7 @@ def human_input(workflow_id: str,
             workflow = _transition(
                 conn, workflow, WorkflowStatus.QUEUED, "human.resumed",
                 {
-                    "text": action.text,
+                    **said,
                     "new_round": next_round,
                     "previous_round": round_row["round_no"],
                 },
@@ -1143,10 +1148,28 @@ def human_input(workflow_id: str,
             )
             workflow = _transition(
                 conn, workflow, WorkflowStatus.QUEUED, "human.resumed",
-                {"text": action.text, "same_round": round_row["round_no"]},
+                {**said, "same_round": round_row["round_no"]},
                 round_id=round_row["id"],
             )
         return db._row_to_workflow(workflow)
+
+
+def _keep_refused_note(conn: sqlite3.Connection, workflow: sqlite3.Row,
+                       said: dict, round_row: sqlite3.Row,
+                       limit: str) -> WorkflowInDB:
+    """A resume refused by an exhausted limit must not swallow the note.
+
+    The workflow stays where it is, but the operator's words are journaled
+    so the run that eventually follows (after the limit is raised) gets them.
+    """
+    if "note" not in said:
+        return db._row_to_workflow(workflow)
+    workflow = _touch(
+        conn, workflow, "human.input",
+        {**said, "resume": True, "refused_by_limit": limit},
+        round_id=round_row["id"],
+    )
+    return db._row_to_workflow(workflow)
 
 
 def cancel_workflow(workflow_id: str,
@@ -1366,6 +1389,57 @@ def _latest_gate_evidence(workflow_id: str, *, before_round: int = None) -> str:
     return summary + ("\n" + "\n".join(evidence) if evidence else "")
 
 
+_ROLE_DISPATCH_EVENT = {
+    WorkflowRole.EXECUTOR: "executor.dispatched",
+    WorkflowRole.REVIEWER: "reviewer.dispatched",
+}
+# Events that journal a human decision and may carry a note for the agents.
+_OPERATOR_NOTE_EVENTS = (
+    "human.input", "human.resumed", "limit.stage_revisions", "limit.max_rounds",
+)
+
+
+def _latest_event_seq(conn: sqlite3.Connection, workflow_id: str,
+                      event_type: str, round_id: str = None) -> int:
+    """Newest seq of one event type, independent of how long the journal is."""
+    sql = """SELECT COALESCE(MAX(seq), 0) FROM workflow_events
+             WHERE workflow_id = ? AND event_type = ?"""
+    params = [workflow_id, event_type]
+    if round_id is not None:
+        sql += " AND round_id = ?"
+        params.append(round_id)
+    return int(conn.execute(sql, params).fetchone()[0])
+
+
+def _operator_notes(workflow_id: str, role: WorkflowRole) -> list[str]:
+    """Operator notes this role has not been shown yet, oldest first.
+
+    A note rides along with a human decision (human_input). Each role gets it
+    once, in its first run after the note was written: that run is where the
+    operator's correction applies, and repeating it forever would pile old
+    instructions onto every later round.
+    """
+    with db._connect() as conn:
+        since = _latest_event_seq(conn, workflow_id, _ROLE_DISPATCH_EVENT[role])
+        marks = ",".join("?" * len(_OPERATOR_NOTE_EVENTS))
+        rows = conn.execute(
+            f"""SELECT payload_json FROM workflow_events
+                WHERE workflow_id = ? AND seq > ? AND event_type IN ({marks})
+                ORDER BY seq""",
+            (workflow_id, since, *_OPERATOR_NOTE_EVENTS),
+        ).fetchall()
+    notes = []
+    for row in rows:
+        note = str(db._json_load(row["payload_json"], {}).get("note") or "").strip()
+        if note and note not in notes:
+            notes.append(note)
+    return notes
+
+
+def _operator_notes_block(notes: list[str]) -> str:
+    return "\n\n".join(notes) if notes else "(нет)"
+
+
 def _render_role_prompt(workflow: WorkflowInDB, role: WorkflowRole,
                         template: str) -> str:
     round_no = workflow.current_round
@@ -1409,6 +1483,8 @@ def _render_role_prompt(workflow: WorkflowInDB, role: WorkflowRole,
             if finding.status in {FindingStatus.OPEN, FindingStatus.REOPENED}
         ], ensure_ascii=False, indent=2),
     }
+    notes = _operator_notes(workflow.id, role)
+    values["human_input"] = _operator_notes_block(notes)
     rendered = template or (
         DEFAULT_EXECUTOR_PROMPT
         if role is WorkflowRole.EXECUTOR else DEFAULT_REVIEWER_PROMPT
@@ -1420,8 +1496,20 @@ def _render_role_prompt(workflow: WorkflowInDB, role: WorkflowRole,
         )
         if override:
             rendered = override
+    # A template may place the notes itself; otherwise they go last, marked
+    # as outranking the round's instructions — the same rule as a task note.
+    placed_by_template = "{{human_input}}" in rendered
     for name, value in values.items():
         rendered = rendered.replace("{{" + name + "}}", value)
+    if notes and not placed_by_template:
+        rendered = (
+            rendered.rstrip()
+            + "\n\n<указания-оператора>\n"
+            "Это написал человек, возобновляя работу, и это главнее инструкций "
+            "выше.\n"
+            + _operator_notes_block(notes)
+            + "\n</указания-оператора>"
+        )
     return rendered.strip()
 
 
@@ -1681,19 +1769,17 @@ def advance_workflow(workflow_id: str, max_actions: int = 12) -> WorkflowInDB:
                     item for item in db.list_workflow_rounds(workflow.id)
                     if item.round_no == workflow.current_round
                 )
-                events = db.list_workflow_events(workflow.id, limit=1000)
-                latest_gate_seq = max(
-                    (event.seq for event in events
-                     if event.round_id == current_round.id
-                     and event.event_type == "gate.passed"),
-                    default=0,
-                )
-                latest_reviewer_dispatch_seq = max(
-                    (event.seq for event in events
-                     if event.round_id == current_round.id
-                     and event.event_type == "reviewer.dispatched"),
-                    default=0,
-                )
+                # Ask for the newest seq directly: listing a capped number of
+                # events returns the OLDEST ones, so in a long workflow the
+                # current round's dispatch was invisible and a restart during
+                # review launched a second reviewer.
+                with db._connect() as conn:
+                    latest_gate_seq = _latest_event_seq(
+                        conn, workflow.id, "gate.passed",
+                        round_id=current_round.id)
+                    latest_reviewer_dispatch_seq = _latest_event_seq(
+                        conn, workflow.id, "reviewer.dispatched",
+                        round_id=current_round.id)
                 if latest_reviewer_dispatch_seq > latest_gate_seq:
                     return workflow
                 return _dispatch_configured_role(workflow, WorkflowRole.REVIEWER).workflow

@@ -3374,7 +3374,7 @@ def test_refresh_status_tombstone_wins_over_delayed_older_denial(isolated_db):
 
 
 def test_lease_release_linearizes_status_clear_before_next_owner(isolated_db):
-    owner = isolated_db.acquire_pipeline_scan_lease(
+    isolated_db.acquire_pipeline_scan_lease(
         "github-default", "owner", 30)
     contender = isolated_db.acquire_pipeline_scan_lease(
         "github-default", "contender", 30)

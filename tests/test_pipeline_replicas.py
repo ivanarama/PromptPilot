@@ -1,13 +1,10 @@
-import json
 import os
 import sqlite3
 import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -196,7 +193,7 @@ def test_deleting_task_releases_target_reservation(isolated_db):
 
 
 def test_running_task_cannot_be_deleted_or_release_reservation(isolated_db):
-    task = isolated_db.create_task(TaskCreate(prompt="running reserved task"))
+    isolated_db.create_task(TaskCreate(prompt="running reserved task"))
     running = isolated_db.get_next_runnable()
     isolated_db.reserve_pipeline_target(
         "owner/repo", "review", 10, HEAD_A, running.id, 300)
@@ -253,7 +250,7 @@ def test_reset_before_preflight_fences_old_attempt_from_new_claim(isolated_db):
     "failed", "rate_limited", "deferred", "cancelled", "attempt_failed",
 ])
 def test_every_attempt_exit_releases_target_reservation(isolated_db, transition):
-    task = isolated_db.create_task(TaskCreate(prompt=f"exit {transition}"))
+    isolated_db.create_task(TaskCreate(prompt=f"exit {transition}"))
     running = isolated_db.get_next_runnable()
     isolated_db.reserve_pipeline_target(
         "owner/repo", "review", 10, HEAD_A, running.id, 300)

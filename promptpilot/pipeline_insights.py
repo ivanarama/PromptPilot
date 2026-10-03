@@ -3399,6 +3399,9 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                         "pipeline target reservation contradicts task, repository, or target")
                 target_reservation = reservation
                 validated_target_stage = target_stage
+                if target_stage == "review" and queue.get("item_blockers") is True:
+                    from .pipeline_item_holds import register_review_target
+                    register_review_target(task, number, head)
             except (project_pipeline.PipelineError, TypeError, ValueError) as exc:
                 return {
                     "action": "block", "mode": "tool",
@@ -3868,6 +3871,9 @@ def _health(backlog: int, windows: dict, broken_series: int, paused_series: int 
         return {"state": "yellow", "label": "конвейер на паузе",
                 "reason": "включена общая пауза: активные серии не запускаются"}
     if paused_series:
+        if runtime and runtime.get("required") and not runtime.get("paused"):
+            return {"state": "yellow", "label": "часть этапов на паузе",
+                    "reason": f"приостановлено серий: {paused_series}; остальные могут работать"}
         return {"state": "yellow", "label": "конвейер на паузе",
                 "reason": f"приостановлено серий: {paused_series}"}
     if diagnostics and diagnostics.get("state") == "yellow":

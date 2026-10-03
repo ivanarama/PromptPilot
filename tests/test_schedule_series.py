@@ -897,6 +897,19 @@ def test_paused_series_is_visible_without_history():
     assert health["label"] == "конвейер на паузе"
 
 
+def test_partial_series_pause_does_not_claim_whole_pipeline_is_paused():
+    health = pipeline_insights._health(
+        10, {"5h": {"complete": False}}, 0, paused_series=2,
+        runtime={"required": True, "paused": False, "state": "online", "stalled": []},
+    )
+
+    assert health == {
+        "state": "yellow",
+        "label": "часть этапов на паузе",
+        "reason": "приостановлено серий: 2; остальные могут работать",
+    }
+
+
 def test_global_worker_pause_is_visible_for_active_pipeline(isolated_db, monkeypatch):
     profile = {
         "title": "Example", "repository": "owner/example",

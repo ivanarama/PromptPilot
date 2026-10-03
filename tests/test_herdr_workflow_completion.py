@@ -2,6 +2,8 @@ from types import SimpleNamespace
 import json
 import subprocess
 
+import pytest
+
 from promptpilot import api, herdr_exec
 from promptpilot.herdr_exec import (
     _closing_workflow_verdict,
