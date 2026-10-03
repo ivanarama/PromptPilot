@@ -126,6 +126,9 @@ class WorkflowStatus(str, Enum):
     REVIEWING = "reviewing"
     REVISION_REQUIRED = "revision_required"
     AWAITING_HUMAN = "awaiting_human"
+    # A planned wait: the stage is being done outside PromptPilot (issue #122).
+    # Unlike AWAITING_HUMAN nothing went wrong, and no process is held.
+    AWAITING_EXTERNAL = "awaiting_external"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
@@ -145,6 +148,7 @@ class WorkflowRoundStatus(str, Enum):
 class WorkflowRunStatus(str, Enum):
     PENDING = "pending"
     RUNNING = "running"
+    AWAITING_EXTERNAL = "awaiting_external"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
@@ -185,6 +189,12 @@ class WorkflowStageStatus(str, Enum):
 class WorkflowStageType(str, Enum):
     IMPLEMENTATION = "implementation"
     INTEGRATION = "integration"
+
+
+class WorkflowExecutionMode(str, Enum):
+    """Who does a stage: a PromptPilot agent, or someone outside (issue #122)."""
+    AUTOMATIC = "automatic"
+    EXTERNAL = "external"
 
 
 class WorkflowRoleConfig(BaseModel):
@@ -405,6 +415,7 @@ class WorkflowRunInDB(BaseModel):
     task_id: Optional[int] = None
     status: WorkflowRunStatus
     input_sha256: str
+    input: Optional[dict[str, Any]] = None
     output_sha256: Optional[str] = None
     output: Optional[dict[str, Any]] = None
     started_at: Optional[datetime] = None
@@ -425,6 +436,7 @@ class WorkflowStageSpec(BaseModel):
     executor_prompt: str = ""
     reviewer_prompt: str = ""
     max_revision_rounds: Optional[int] = Field(default=None, ge=1, le=20)
+    execution_mode: WorkflowExecutionMode = WorkflowExecutionMode.AUTOMATIC
 
 
 class WorkflowPlanReplace(BaseModel):
@@ -585,13 +597,39 @@ class WorkflowTaskDispatch(BaseModel):
     herdr_target: Optional[str] = None
     machine: Optional[str] = None
     task_timeout: Optional[int] = Field(default=None, ge=0)
+    # external: no queue task — the prompt becomes an assignment handed out
+    # of PromptPilot, and the workflow waits for its result (executor only)
+    execution_mode: WorkflowExecutionMode = WorkflowExecutionMode.AUTOMATIC
 
 
 class WorkflowDispatchResult(BaseModel):
     workflow: WorkflowInDB
     round: WorkflowRoundInDB
     run: WorkflowRunInDB
-    task: TaskInDB
+    task: Optional[TaskInDB] = None
+
+
+class WorkflowExternalRequest(BaseModel):
+    expected_version: int = Field(ge=0)
+
+
+class WorkflowExternalResult(BaseModel):
+    """The result of a stage done outside PromptPilot, handed in by a person."""
+    expected_version: int = Field(ge=0)
+    result: str = Field(min_length=1, max_length=200000)
+    comment: str = Field(default="", max_length=5000)
+    performer: str = Field(default="", max_length=200)
+
+
+class WorkflowExternalAssignment(BaseModel):
+    workflow_id: str
+    run_id: str
+    round_no: int
+    attempt_no: int
+    status: WorkflowRunStatus
+    stage_code: str = ""
+    stage_title: str = ""
+    assignment: str
 
 
 class GateVerdict(str, Enum):

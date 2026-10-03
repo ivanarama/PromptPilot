@@ -33,6 +33,9 @@ from .models import (
     WorkflowArtifactInDB,
     WorkflowCreate,
     WorkflowEventInDB,
+    WorkflowExternalAssignment,
+    WorkflowExternalRequest,
+    WorkflowExternalResult,
     WorkflowFindingInDB,
     WorkflowInDB,
     WorkflowPlanApproval,
@@ -786,6 +789,39 @@ def api_record_workflow_review(
     workflow_id: str, decision: WorkflowReviewDecision
 ):
     return _workflow_action(workflows.record_review, workflow_id, decision)
+
+
+@app.get(
+    "/api/workflows/{workflow_id}/external",
+    response_model=WorkflowExternalAssignment,
+)
+def api_workflow_external(workflow_id: str):
+    """The assignment of the current stage done outside PromptPilot (issue #122)."""
+    try:
+        assignment = workflows.external_assignment(workflow_id)
+    except db.WorkflowNotFoundError as exc:
+        raise HTTPException(404, "Workflow not found") from exc
+    if assignment is None:
+        raise HTTPException(404, "У текущего раунда нет внешнего задания")
+    return assignment
+
+
+@app.post(
+    "/api/workflows/{workflow_id}/external-request",
+    response_model=WorkflowInDB,
+)
+def api_workflow_external_request(workflow_id: str, request: WorkflowExternalRequest):
+    return _workflow_action(workflows.request_external, workflow_id,
+                            request.expected_version)
+
+
+@app.post(
+    "/api/workflows/{workflow_id}/external-result",
+    response_model=WorkflowInDB,
+)
+def api_workflow_external_result(workflow_id: str, submission: WorkflowExternalResult):
+    submitted = _workflow_action(workflows.submit_external_result, workflow_id, submission)
+    return workflows.advance_workflow(submitted.id)
 
 
 @app.post(

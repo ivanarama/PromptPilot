@@ -57,8 +57,9 @@
 - **SQLite** — данные хранятся локально в `~/.promptpilot/`
 - **Workflow Orchestrator (W3)** — planner разбивает большую задачу на
   утверждаемые этапы, затем автономный цикл «исполнитель → deterministic gate →
-  независимый аудитор» ведёт каждый этап до PASS; есть crash recovery, лимиты,
-  provenance и JSON/Markdown-экспорт для последующего анализа
+  независимый аудитор» ведёт каждый этап до PASS; этап можно отдать вовне —
+  человеку или внешнему инструменту — и принять его результат на то же ревью;
+  есть crash recovery, лимиты, provenance и JSON/Markdown-экспорт для анализа
 
 Обычный (не `detached`) запуск на Windows помещается в отдельный Job Object ещё
 до того, как начинает выполняться первая инструкция процесса. Поэтому при
@@ -2002,6 +2003,9 @@ POST   /api/workflows/{id}/dispatch — поставить executor/reviewer tas
 POST   /api/workflows/{id}/gate    — записать результат ручного W1-гейта
 POST   /api/workflows/{id}/review  — записать структурированный verdict аудитора
 POST   /api/workflows/{id}/human-input — решение человека/возобновление
+GET    /api/workflows/{id}/external — задание этапа вне PromptPilot
+POST   /api/workflows/{id}/external-request — выдать задание (ручной режим)
+POST   /api/workflows/{id}/external-result — сдать результат внешнего этапа
 POST   /api/workflows/{id}/cancel  — отменить workflow и связанные задачи
 POST   /api/workflows/{id}/sync    — восстановить проекцию из состояния tasks
 POST   /api/workflows/{id}/history/import — импортировать старые раунды и факты

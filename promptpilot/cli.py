@@ -615,11 +615,57 @@ def workflow_dispatch(reference, role, prompt, file_path, provider, model,
     )
     click.echo(
         click.style(
-            f"Task #{result.task.id}, run {result.run.id}, "
+            f"Task #{result.task.id if result.task else '—'}, run {result.run.id}, "
             f"workflow {result.workflow.status.value} v{result.workflow.state_version}",
             fg="green",
         )
     )
+
+
+@workflow_group.command("external")
+@click.argument("reference")
+@click.option("--request", "hand_out", is_flag=True,
+              help="Выдать задание сейчас (для ручного режима: workflow в queued)")
+def workflow_external(reference, hand_out):
+    """Задание стадии, которую выполняют вне PromptPilot (issue #122)."""
+    from . import workflows
+
+    item = _workflow_or_exit(reference)
+    if hand_out:
+        item = _workflow_call_cli(workflows.request_external, item.id, item.state_version)
+    assignment = workflows.external_assignment(item.id)
+    if assignment is None:
+        raise click.ClickException(
+            f"у текущего раунда нет внешнего задания (workflow {item.status.value})")
+    click.echo(f"# {assignment.stage_code} {assignment.stage_title} · раунд "
+               f"{assignment.round_no}, попытка {assignment.attempt_no} · {assignment.status.value}")
+    click.echo(assignment.assignment)
+
+
+@workflow_group.command("submit")
+@click.argument("reference")
+@click.option("-f", "--file", "file_path", type=click.Path(exists=True, dir_okay=False),
+              help="Результат из файла")
+@click.option("-t", "--text", default="", help="Результат текстом")
+@click.option("--comment", default="", help="Комментарий к результату")
+@click.option("--performer", default="", help="Кто выполнил: человек или инструмент")
+def workflow_submit(reference, file_path, text, comment, performer):
+    """Сдать результат внешней стадии: дальше gate и независимое ревью."""
+    from . import workflows
+    from .models import WorkflowExternalResult
+
+    if file_path:
+        with open(file_path, encoding="utf-8-sig") as handle:
+            text = handle.read()
+    if not text.strip():
+        raise click.ClickException("пустой результат: -f файл или -t текст")
+    item = _workflow_or_exit(reference)
+    submitted = _workflow_call_cli(workflows.submit_external_result, item.id,
+                                   WorkflowExternalResult(
+                                       expected_version=item.state_version, result=text,
+                                       comment=comment, performer=performer))
+    advanced = workflows.advance_workflow(submitted.id)
+    click.echo(f"Workflow {advanced.slug}: {advanced.status.value}")
 
 
 @workflow_group.command("gate")
