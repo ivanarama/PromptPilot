@@ -1317,6 +1317,144 @@ def api_provider_create(p: ProviderCreate):
     return {"ok": True}
 
 
+@app.get("/api/providers/{name}/models")
+def api_provider_models(name: str):
+    """U13: живой список моделей с эндпоинта провайдера (ключ не покидает сервер).
+
+    Работает для OpenAI-совместимых провайдеров: env провайдера ищет
+    OPENAI_BASE_URL/OPENAI_API_KEY или LLM_BASE_URL/LLM_API_KEY, дергает
+    GET {base}/models. Ответ содержит только id моделей и сам эндпоинт —
+    секреты не возвращаются никогда.
+    """
+    import urllib.request
+    import urllib.error
+
+    providers = load_providers()
+    cfg = providers.get(name)
+    if not cfg:
+        raise HTTPException(404, "Провайдер не найден")
+    env = cfg.get("env") or {}
+    base = env.get("OPENAI_BASE_URL") or env.get("LLM_BASE_URL") or ""
+    key = env.get("OPENAI_API_KEY") or env.get("LLM_API_KEY") or ""
+    if not base:
+        raise HTTPException(
+            400,
+            "У этого помощника нет OpenAI-совместимого эндпоинта в настройках "
+            "(OPENAI_BASE_URL/LLM_BASE_URL). Список моделей недоступен по запросу.",
+        )
+    req = urllib.request.Request(base.rstrip("/") + "/models")
+    if key:
+        req.add_header("Authorization", "Bearer " + key)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(req, timeout=25) as r:
+            data = json.loads(r.read().decode("utf-8", "replace") or "{}")
+    except urllib.error.HTTPError as exc:
+        raise HTTPException(502, f"Эндпоинт ответил {exc.code}: список моделей не получен") from exc
+    except Exception as exc:  # noqa: BLE001 - транспортные ошибки важны целиком
+        raise HTTPException(502, f"Эндпоинт недоступен: {type(exc).__name__}: {exc}") from exc
+    ids = sorted({
+        str(m.get("id")) for m in (data.get("data") or data.get("models") or [])
+        if isinstance(m, dict) and m.get("id")
+    })
+    return {"endpoint": base, "models": ids, "count": len(ids)}
+
+
+@app.post("/api/providers/{name}/probe")
+def api_provider_probe(name: str, body: dict | None = None):
+    """Проверка провайдера ДО включения в конвейер.
+
+    Зонд идёт тем же путём, что и реальные задачи (build_cmd + env +
+    stdin/argv по конфигу), и проверяет три вещи:
+      1) процесс вообще запускается (и не упёрся в лимит длины командной строки);
+      2) промпт ДОСТАВЛЕН — модель повторила контрольную строку со случайным
+         токеном (ловит «-» вместо промпта, неработающий stdin и т.п.);
+      3) модель держит контракт вердикта — в ответе есть строка «ИТОГ:».
+    long=True прогоняет промпт ~40К символов: argv-провайдеры без stdin
+    на нём честно падают — так заранее видно, тянет ли провайдер роль исполнителя.
+    """
+    from .config import build_cmd, get_provider_env
+    providers = load_providers()
+    cfg = providers.get(name)
+    if not cfg:
+        raise HTTPException(404, "Провайдер не найден")
+    long_mode = bool((body or {}).get("long"))
+    token = "ПРОБА-" + secrets.token_hex(3)
+    prompt = ("Это тестовая проверка связи. Напиши ровно две строки и ничего больше:\n"
+              f"{token}\nИТОГ: ГОТОВО — тест")
+    if long_mode:
+        prompt += ("\n\n(Далее длинный служебный текст для проверки доставки больших промптов; "
+                   "читать и повторять его не нужно:)\n" + ("наполнитель-пробы-доставки. " * 2400))
+    try:
+        cmd = build_cmd(name, prompt, guard=False)
+    except Exception as exc:
+        raise HTTPException(400, f"Не удалось собрать команду: {exc}")
+    env = get_provider_env(name)
+    use_stdin = bool(cfg.get("prompt_stdin"))
+    # .CMD-шимы (npm CLIs: qwen, opencode) не запускаются по «голому» имени —
+    # резолвим полный путь так же, как это делает воркер (worker.py:1786).
+    import shutil as _shutil
+    resolved = _shutil.which(cmd[0], path=env.get("PATH"))
+    if resolved:
+        cmd[0] = resolved
+    cwd = r"C:\Users\Nachfin\Desktop\Projets\BookApp"
+    if not os.path.isdir(cwd):
+        cwd = str(Path.home())
+    started = time.time()
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=300,
+            input=prompt if use_stdin else None,
+            env=env, cwd=cwd)
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "delivered": False, "verdict": False,
+                "issues": ["таймаут 300 с — провайдер не ответил"]}
+    except (FileNotFoundError, OSError) as exc:
+        issues = [f"процесс не запустился: {exc}"]
+        if long_mode and not use_stdin:
+            issues.append("длинный промпт (~40К) не прошёл: argv-провайдер упирается в лимит "
+                          "командной строки Windows 32К. Для роли исполнителя нужен провайдер "
+                          "с поддержкой stdin (codex/opencode/mcode) либо короткие промпты.")
+        return {"ok": False, "delivered": False, "verdict": False, "issues": issues}
+    out = (proc.stdout or "") + "\n" + (proc.stderr or "")
+    delivered = token in out
+    verdict = "ИТОГ" in out.upper()
+    issues = []
+    if not delivered:
+        issues.append("ПРОМПТ НЕ ДОСТАВЛЕН: ответ не содержит контрольную строку. "
+                      "Типичные причины: провайдер не читает stdin (символ «-» уходит в модель "
+                      "как текст), сломанный шаблон {prompt}, чужая ошибка авторизации.")
+    if not verdict:
+        issues.append("Нет строки «ИТОГ:» — контракт вердикта не соблюдён; для ролей конвейера "
+                      "это критично (задачи будут падать в ожидание человека).")
+    if delivered and verdict and long_mode and not use_stdin:
+        issues.append("Примечание: длинный тест прошёл, но провайдер работает через argv — "
+                      "промпты заметно длиннее 30К символов могут не пройти.")
+    return {
+        "ok": delivered and verdict,
+        "delivered": delivered,
+        "verdict": verdict,
+        "stdin_mode": use_stdin,
+        "long_mode": long_mode,
+        "exit_code": proc.returncode,
+        "latency_s": round(time.time() - started, 1),
+        "output_tail": out[-500:],
+        "issues": issues,
+    }
+
+
+@app.post("/api/providers/reorder")
+def api_providers_reorder(body: dict):
+    """Save the helper-card order (list of provider names, desired order)."""
+    from .config import set_providers_ui_order
+    names = body.get("names")
+    if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
+        raise HTTPException(400, "Ожидается {\"names\": [имена провайдеров по порядку]}")
+    set_providers_ui_order(names)
+    return {"ok": True}
+
+
 @app.delete("/api/providers/{name}")
 def api_provider_delete(name: str):
     from .config import remove_provider

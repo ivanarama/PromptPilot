@@ -931,6 +931,14 @@
         <label><input type="checkbox" id="pfKeep"> Оставлять сессию открытой после задачи (keep pane)</label>
       </div>
       <input id="pfModels" placeholder="модели для выбора (через запятую), например: opencode/big-pickle, opencode/mimo-v2.5-free">
+      <div class="cz-row" style="gap:6px;flex-wrap:wrap">
+        <button type="button" class="btn btn-sm btn-ghost" onclick="provFetchModels()" title="запросить живой список моделей с эндпоинта провайдера (ключ остаётся на сервере); сначала Сохраните помощника">📥 Запросить модели у провайдера</button>
+        <span class="cz-hint" id="pfModelsMsg"></span>
+      </div>
+      <b style="font-size:13px">🔌 Подключение (OpenAI-совместимое)</b>
+      <div class="cz-hint">Удобные поля вместо ручного редактирования переменных: эндпоинт уходит в OPENAI_BASE_URL, ключ — в OPENAI_API_KEY (не показывается обратно; пусто = не менять). Для иных переменных — textarea ниже.</div>
+      <input id="pfEndpoint" placeholder="эндпоинт, например https://api.z.ai/api/coding/paas/v4">
+      <input id="pfKey" type="password" placeholder="ключ API (сохранённый не отображается)">
       <label style="display:flex; align-items:center; gap:8px">Эффорт рассуждений
         <select id="pfEffort">
           <option value="">по умолчанию CLI</option>
@@ -941,7 +949,9 @@
           <option value="max">max</option>
         </select>
       </label>
-      <textarea id="pfEnv" rows="2" placeholder="переменные окружения, по одной на строку: KEY=VALUE"></textarea>
+      <b style="font-size:13px">🔑 Прочие ключи и переменные окружения</b>
+      <div class="cz-hint">По одной на строку в виде KEY=значение. Эндпоинт и ключ задавайте в полях «Подключение» выше. Секреты показываются маской *** — оставляйте их как есть или впишите новое значение.</div>
+      <textarea id="pfEnv" rows="3" placeholder="например:&#10;GOOSE_MODEL=glm-5.3-flash&#10;CODEX_HOME=C:/Users/FIREBAT/.codex"></textarea>
       <button class="btn btn-primary" type="submit" style="align-self:flex-start">Сохранить</button>
       <div id="pfError" style="color:var(--red); font-size:13px"></div>
     </form>
@@ -3565,14 +3575,40 @@ function provEdit(name) {
   document.getElementById('pfModels').value = (p.models || []).join(', ');
   document.getElementById('pfEffort').value = p.effort || '';
   window.pfSourceName = name;
-  document.getElementById('pfEnv').value = Object.entries(p.env || {})
+  // U13: подключение — эндпоинт показываем, ключ никогда (пусто = не менять)
+  const env = p.env || {};
+  document.getElementById('pfEndpoint').value = env.OPENAI_BASE_URL || env.LLM_BASE_URL || '';
+  const hasKey = !!(env.OPENAI_API_KEY || env.LLM_API_KEY);
+  document.getElementById('pfKey').value = '';
+  document.getElementById('pfKey').placeholder = hasKey
+    ? 'ключ сохранён (не отображается) — пусто = не менять'
+    : 'ключ API';
+  document.getElementById('pfEnv').value = Object.entries(env)
+    .filter(([k]) => !['OPENAI_BASE_URL', 'LLM_BASE_URL'].includes(k))
     .map(([k, v]) => `${k}=${v}`).join('\n');
-  const masked = Object.values(p.env || {}).includes('***');
+  const masked = Object.values(env).includes('***');
   document.getElementById('pfError').textContent =
     'Сохранение с этим именем перезапишет провайдера; смените имя — создастся копия.'
     + (masked ? ' Строки со значением *** — сохранённые секреты: оставьте как есть или впишите новое значение.' : '');
   document.getElementById('pfName').scrollIntoView({ behavior: 'smooth', block: 'center' });
   pfTypeChange();
+}
+
+// U13: живой список моделей с эндпоинта провайдера (ключ остаётся на сервере)
+async function provFetchModels() {
+  const msg = document.getElementById('pfModelsMsg');
+  const name = (window.pfSourceName || document.getElementById('pfName').value || '').trim();
+  if (!name) { msg.textContent = 'Сначала выберите/сохраните помощника.'; return; }
+  msg.textContent = '⏳ Запрашиваю у провайдера…';
+  try {
+    const r = await fetchJSON(`${API}/providers/${encodeURIComponent(name)}/models`);
+    const current = document.getElementById('pfModels').value.split(',').map(s => s.trim()).filter(Boolean);
+    const merged = [...new Set([...current, ...(r.models || [])])];
+    document.getElementById('pfModels').value = merged.join(', ');
+    msg.textContent = `✅ Получено ${r.count} моделей с ${r.endpoint} — список дополнен, нажмите «Сохранить».`;
+  } catch (e) {
+    msg.textContent = '❌ ' + e.message;
+  }
 }
 
 async function renderMachineList() {
@@ -3629,6 +3665,11 @@ async function provAdd(e) {
     const i = line.indexOf('=');
     if (i > 0) env[line.slice(0, i).trim()] = line.slice(i + 1).trim();
   });
+  // U13: поля «Подключение» главнее textarea (эндпоинт пусто = убрать, ключ пусто = не менять)
+  const endpoint = document.getElementById('pfEndpoint').value.trim();
+  const keyVal = document.getElementById('pfKey').value.trim();
+  if (endpoint) env.OPENAI_BASE_URL = endpoint; else delete env.OPENAI_BASE_URL;
+  if (keyVal) env.OPENAI_API_KEY = keyVal;
   const body = {
     name: document.getElementById('pfName').value.trim(),
     source_name: window.pfSourceName || null,
