@@ -70,6 +70,9 @@ def test_web_pipeline_report_labels_exact_and_incomplete_data_honestly():
     assert "ship, needs-decision или hold" in html
     assert "function pipelineReportUrl(value)" in html
     assert "Почему задачи ждут" in html
+    assert "У текущих запусков нет записанной причины ожидания." in html
+    assert "Итоги запусков" in html
+    assert "reportFlowSegments" in html
     assert "Ждём CI" in html
     assert "board.delivery_groups" in html
     assert "Запуски с итогом «готово»" in html

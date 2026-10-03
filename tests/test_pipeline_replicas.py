@@ -681,6 +681,21 @@ def test_replica_projection_keeps_per_run_capacity_separate(tmp_path):
     assert len(projection["series_replicas"]) == 2
 
 
+def test_replica_projection_exposes_only_current_pending_wait_reason(tmp_path):
+    queue = {"series_contains": "Project - REVIEW"}
+    pending = _replica_series(1, tmp_path)
+    pending["next_error"] = "GitHub API budget is reserved by another run"
+    projection = pipeline_insights._queue_replica_projection(
+        queue, [pending], capacity=1)
+    assert projection["series_replicas"][0]["task_error"] == pending["next_error"]
+
+    running = _replica_series(1, tmp_path, status="running")
+    running["next_error"] = pending["next_error"]
+    projection = pipeline_insights._queue_replica_projection(
+        queue, [running], capacity=1)
+    assert projection["series_replicas"][0]["task_error"] is None
+
+
 def test_replica_projection_has_no_capacity_without_active_series(tmp_path):
     first = tmp_path / "review-1"
     second = tmp_path / "review-2"
@@ -768,6 +783,7 @@ def test_cached_dashboard_health_is_red_for_invalid_replica_set(
         }},
     }
     series = [_replica_series(1, first)]
+    series[0]["next_error"] = "WIP: active PRs exceed the intake limit"
     monkeypatch.setattr(
         pipeline_insights, "_pipeline_runtime",
         lambda *_args, **_kwargs: {"required": True, "state": "online", "stalled": []},
@@ -780,6 +796,7 @@ def test_cached_dashboard_health_is_red_for_invalid_replica_set(
     assert result["health"]["state"] == "red"
     assert result["health"]["label"] == "невалидная конфигурация реплик"
     assert "review" in result["health"]["reason"]
+    assert result["queues"][0]["task_error"] == series[0]["next_error"]
 
 
 def test_replica_set_is_invalid_when_worker_has_too_few_slots(

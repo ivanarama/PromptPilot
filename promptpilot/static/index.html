@@ -439,10 +439,24 @@
   .pipeline-report-queues { width:100%; border-collapse:collapse; font-size:12px; }
   .pipeline-report-queues th, .pipeline-report-queues td { text-align:left; padding:5px 7px; border-top:1px solid var(--border); }
   .pipeline-report-queues th.num, .pipeline-report-queues td.num { text-align:right; font-variant-numeric:tabular-nums; }
+  .pipeline-flow-row { display:grid; grid-template-columns:115px minmax(0,1fr) 75px; gap:9px; align-items:center; margin:7px 0; font-size:12px; }
+  .pipeline-flow-bar { display:flex; height:12px; overflow:hidden; border-radius:5px; background:var(--surface2); border:1px solid var(--border); }
+  .pipeline-flow-bar span { display:block; height:100%; }
+  .pipeline-flow-bar .ready { background:var(--green); }
+  .pipeline-flow-bar .empty { background:var(--muted); }
+  .pipeline-flow-bar .no_change { background:var(--text2); }
+  .pipeline-flow-bar .stale { background:var(--accent); }
+  .pipeline-flow-bar .safe_refusal { background:var(--yellow); }
+  .pipeline-flow-bar .human { background:var(--yellow); }
+  .pipeline-flow-bar .error { background:var(--red); }
+  .pipeline-flow-bar .other { background:var(--text2); }
+  .pipeline-flow-legend { display:flex; flex-wrap:wrap; gap:5px 13px; color:var(--text2); font-size:11px; }
+  .pipeline-flow-legend span::before { content:''; display:inline-block; width:8px; height:8px; border-radius:2px; margin-right:4px; background:var(--legend-color); }
   #pipelineModal .modal { max-width:1120px; }
   @media (max-width: 720px) {
     .pipeline-summary { grid-template-columns:repeat(2,minmax(120px,1fr)); }
     .pipeline-report-grid { grid-template-columns:repeat(2,minmax(120px,1fr)); }
+    .pipeline-flow-row { grid-template-columns:75px minmax(0,1fr) 65px; gap:5px; font-size:11px; }
     .insights-table { table-layout:auto; display:block; overflow-x:auto; white-space:nowrap; }
     .insights-table th, .insights-table td { min-width:75px; }
     .insights-table th:first-child, .insights-table td:first-child { min-width:130px; }
@@ -2915,6 +2929,10 @@ async function loadPipelineReport(profile, hours=24, refresh=false) {
     const attention = data.attention || [];
     const runs = data.runs || {verdicts: {}, tokens: {}, errors: {}};
     const verdicts = runs.verdicts || {};
+    const reportFlow = pipelineRunBreakdown({runs_5h: {...verdicts, runs:runs.total}});
+    const reportFlowSegments = reportFlow.parts.filter(part => part.count).map(part =>
+      `<span class="${part.key}" style="width:${(100 * part.count / reportFlow.total).toFixed(2)}%" title="${escAttr(part.label)}: ${part.count}"></span>`).join('');
+    const reportFlowSummary = reportFlow.parts.filter(part => part.count).map(part => `${part.label} ${part.count}`).join(', ');
     const tokens = runs.tokens || {};
     const cost = runs.cost || {};
     const errors = runs.errors || {};
@@ -2988,6 +3006,8 @@ async function loadPipelineReport(profile, hours=24, refresh=false) {
       `<div class="pipeline-metric"><div class="pipeline-metric-label">${esc(group.title)}</div><div class="pipeline-metric-value">${pipelineReportNumber(group.count)}</div></div>`).join('');
     const blockedRows = (board.blocked || []).map(item =>
       `<li>${item.number == null ? '' : `#${pipelineReportNumber(item.number)} · `}${esc(item.message || item.code || 'Причина не указана')}</li>`).join('');
+    const currentWaitRows = pipelineWaitReasons(data).map(wait =>
+      `<li><b>${esc(wait.title || wait.id)}</b>: ${esc(wait.reason)}</li>`).join('');
     const ciRows = (board.waiting_ci || []).map(item =>
       `<li>${pipelineReportItem(item)} · ${esc(item.message || 'Проверки ещё выполняются')}</li>`).join('');
 
@@ -3010,6 +3030,9 @@ async function loadPipelineReport(profile, hours=24, refresh=false) {
       <div class="pipeline-metric"><div class="pipeline-metric-label">Влито PR / закрыто issues</div><div class="pipeline-metric-value">${deliveryExact ? `${pipelineReportNumber(merged.length)} / ${pipelineReportNumber(closed.length)}` : 'Ещё не проверено'}</div><div class="pipeline-metric-note">${deliveryExact ? `всего событий: ${pipelineReportNumber(delivered)}` : 'Нажмите «Уточнить результат в GitHub». Это не ноль выполненных работ.'}</div></div>
       ${categories}
     </div>
+    <div class="pipeline-flow-row"><b>Итоги запусков</b><div class="pipeline-flow-bar" role="img" aria-label="${escAttr(reportFlow.total ? reportFlowSummary : 'Завершённых запусков нет')}">${reportFlowSegments}</div><span class="num">${reportFlow.total} запусков</span></div>
+    <div class="pipeline-flow-legend"><span style="--legend-color:var(--green)">готово</span><span style="--legend-color:var(--muted)">пусто</span><span style="--legend-color:var(--text2)">без изменений</span><span style="--legend-color:var(--accent)">перевыбор</span><span style="--legend-color:var(--yellow)">нужен человек / безопасный отказ</span><span style="--legend-color:var(--red)">ошибка</span></div>
+    <div class="pipeline-report-meta">Зелёный сегмент означает результат этапа «готово», а не влитый PR. «Пусто» и ошибки сохраняются в локальной истории; ожидание WIP или API показано ниже как причина, а не как завершённый запуск.</div>
     <div class="pipeline-report-meta">Закрытые issues и влитые PR — отдельные события, не сумма выполненных задач. Категории относятся только к влитым PR; без подтверждённой классификации результат не записывается в продукт.</div>
     ${pipelineReportDeliveryNotice(delivery, periodLabel)}
     <div class="pipeline-report-section"><h3>Результат в GitHub</h3>${deliveryRows ? `<ul class="pipeline-report-list">${deliveryBody}</ul>` : deliveryBody}</div>
@@ -3022,6 +3045,7 @@ async function loadPipelineReport(profile, hours=24, refresh=false) {
       ${ciRows ? `<ul class="pipeline-report-list">${ciRows}</ul>` : '<div>Нет подтверждённого списка ожиданий CI. Это не означает, что все проверки зелёные.</div>'}
     </div>
     <div class="pipeline-report-section"><h3>Почему задачи ждут</h3>
+      ${currentWaitRows ? `<ul class="pipeline-report-list">${currentWaitRows}</ul>` : '<div>У текущих запусков нет записанной причины ожидания.</div>'}
       ${board.available ? (blockedRows ? `<ul class="pipeline-report-list">${blockedRows}</ul>` : '<div>В свежей диагностике нет дополнительных предупреждений.</div>') : '<div>Свежая полная диагностика недоступна; причины ожидания пока неизвестны.</div>'}
       <div class="pipeline-report-meta">Предупреждение не означает остановку всего конвейера. Решения человека перечислены отдельно выше.</div>
     </div>
@@ -3065,6 +3089,41 @@ function pipelineStageFocus(queues) {
   };
   working.sort((a, b) => pressure(b) - pressure(a));
   return {stopped, workingBottleneck: working[0] || null};
+}
+
+function pipelineWaitReasons(data) {
+  const waits = (data.queues || [])
+    .filter(q => Number(q.backlog) > 0 && q.task_status === 'pending' && q.task_error)
+    .map(q => ({id:q.id, title:q.title, reason:String(q.task_error)}));
+  for (const task of (data.current?.tasks || [])) {
+    if (task.status === 'pending' && task.error && !waits.some(wait => wait.reason === task.error)) {
+      waits.push({id:String(task.task_id || ''), title:task.title, reason:String(task.error)});
+    }
+  }
+  const owner = (data.diagnostics && data.diagnostics.integration_owner)
+    || (data.current && data.current.integration_owner);
+  if (owner && owner.stage === 'integration-review' && !data.cache?.stale && data.coverage?.fresh !== false && !waits.some(wait => wait.id === 'merge')) {
+    waits.push({id:'merge', title:'Слияние', reason:`PR #${owner.number} ожидает независимого ревью нового HEAD`});
+  }
+  return waits;
+}
+
+function pipelineRunBreakdown(queue) {
+  const runs = queue.runs_5h || {};
+  const count = key => Math.max(0, Number(runs[key] || 0));
+  const parts = [
+    {key:'ready', label:'Готово', count:count('ready')},
+    {key:'empty', label:'Пусто', count:count('empty')},
+    {key:'no_change', label:'Без изменений', count:count('no_change')},
+    {key:'stale', label:'Перевыбор', count:count('stale')},
+    {key:'safe_refusal', label:'Безопасный отказ', count:count('safe_refusal')},
+    {key:'human', label:'Нужен человек', count:count('human')},
+    {key:'error', label:'Не смог / упал', count:count('unable') + count('failed')},
+  ];
+  const known = parts.reduce((sum, part) => sum + part.count, 0);
+  const total = Math.max(known, count('runs'));
+  if (total > known) parts.push({key:'other', label:'Другой итог', count:total - known});
+  return {total, parts};
 }
 
 async function loadPipelineInsights(profile, refresh=false) {
@@ -3169,6 +3228,15 @@ async function loadPipelineInsights(profile, refresh=false) {
     const throughputRateByQueue = h5.queue_throughput_per_hour || {};
     const stageFocus = pipelineStageFocus(data.queues);
     const workingBottleneck = stageFocus.workingBottleneck;
+    const waits = pipelineWaitReasons(data);
+    const waitRows = waits.map(wait => `<li><b>${esc(wait.title)}</b> — ${esc(wait.reason)}</li>`).join('');
+    const flowRows = (data.queues || []).map(queue => {
+      const {total, parts} = pipelineRunBreakdown(queue);
+      const segments = parts.filter(part => part.count).map(part =>
+        `<span class="${part.key}" style="width:${(100 * part.count / total).toFixed(2)}%" title="${escAttr(part.label)}: ${part.count}"></span>`).join('');
+      const summary = parts.filter(part => part.count).map(part => `${part.label} ${part.count}`).join(', ');
+      return `<div class="pipeline-flow-row"><b>${esc(queue.title)}</b><div class="pipeline-flow-bar" role="img" aria-label="${escAttr(total ? summary : 'Завершённых запусков нет')}">${segments}</div><span class="num">${total ? `${total} запусков` : 'нет запусков'}</span></div>`;
+    }).join('');
     const diagnostics = data.diagnostics;
     const runtime = data.runtime || {};
     const healthLabel = data.health.label === 'нужна проверка' ? 'есть ожидания' : data.health.label;
@@ -3245,7 +3313,7 @@ async function loadPipelineInsights(profile, refresh=false) {
         <div class="pipeline-metric"><div class="pipeline-metric-label">Backlog сейчас</div><div class="pipeline-metric-value">${data.backlog_total == null ? '—' : data.backlog_total}</div><div class="pipeline-metric-note">Δ/ч: ${h5.complete?perHour(h5.backlog_delta_per_hour):'копится история'}</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Вход / выход</div><div class="pipeline-metric-value">${h5.complete?`${perHour(h5.entered_per_hour)} / ${perHour(h5.exited_per_hour)}`:'—'}</div><div class="pipeline-metric-note">фактическая скорость · ${historyNote}</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Остановленные этапы</div><div class="pipeline-metric-value">${stageFocus.stopped.length ? stageFocus.stopped.map(q => esc(q.title)).join(', ') : 'нет'}</div><div class="pipeline-metric-note">${stageFocus.stopped.length ? `есть работа, но нет активных реплик: ${stageFocus.stopped.map(q => `${esc(q.title)} — ${q.backlog}`).join('; ')}` : 'все очереди с работой имеют рабочую ёмкость'}</div></div>
-        <div class="pipeline-metric"><div class="pipeline-metric-label">Узкое место работающих</div><div class="pipeline-metric-value">${workingBottleneck?esc(workingBottleneck.title):'нет'}</div><div class="pipeline-metric-note">${workingBottleneck ? `очередь ${workingBottleneck.backlog}${workingBottleneck.eta_hours != null ? ` · ETA ${workingBottleneck.eta_hours} ч` : ' · ETA пока неизвестно'}` : 'очередей с работой и активными репликами нет'}</div></div>
+        <div class="pipeline-metric"><div class="pipeline-metric-label">Самая длинная очередь по ETA</div><div class="pipeline-metric-value">${workingBottleneck?esc(workingBottleneck.title):'нет'}</div><div class="pipeline-metric-note">${workingBottleneck ? `очередь ${workingBottleneck.backlog}${workingBottleneck.eta_hours != null ? ` · ETA ${workingBottleneck.eta_hours} ч` : ' · ETA пока неизвестно'}; причина ожидания показана ниже` : 'очередей с работой и активными репликами нет'}</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Переходы / churn</div><div class="pipeline-metric-value">${h5.complete?`${h5.transitions} / ${h5.churn_items}`:'—'}</div><div class="pipeline-metric-note">между очередями / 3+ состояний</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Возраст p90 / max</div><div class="pipeline-metric-value">${age(data.age.p90_hours)} / ${age(data.age.oldest_hours)}</div><div class="pipeline-metric-note">текущие элементы</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Прогоны 5 ч</div><div class="pipeline-metric-value">${runs.runs}</div><div class="pipeline-metric-note">с действием ${runs.ready} · без действий ${runs.no_change || 0} · пусто ${runs.empty} · перевыбор ${runs.stale || 0}</div></div>
@@ -3260,6 +3328,15 @@ async function loadPipelineInsights(profile, refresh=false) {
         <div class="pipeline-metric"><div class="pipeline-metric-label">Worker</div><div class="pipeline-metric-value">${runtime.state==='online'?'online':'offline'}</div><div class="pipeline-metric-note">${runtime.age_seconds == null ? 'heartbeat отсутствует' : 'heartbeat '+runtime.age_seconds+' сек назад'}</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">GitHub REST API</div><div class="pipeline-metric-value" style="${coreColor ? `color:${coreColor}` : ''}">${esc(githubLimitText('core'))}</div><div class="pipeline-metric-note">${esc(rateObserved)} · Search ${esc(githubLimitText('search'))} · GraphQL ${esc(githubLimitText('graphql'))}</div></div>
         ${budgetMetric}
+      </div>
+      <div class="pipeline-report-section"><h3>Почему этапы ждут прямо сейчас</h3>
+        ${waitRows ? `<ul class="pipeline-report-list">${waitRows}</ul>` : '<div class="pipeline-report-meta">Нет записанной причины ожидания. Это не означает, что очередь пуста.</div>'}
+        <div class="pipeline-report-meta">Здесь показана причина последней отложенной попытки, а не оценка размера очереди.</div>
+      </div>
+      <div class="pipeline-report-section"><h3>Итоги запусков по этапам · 5 часов</h3>
+        ${flowRows}
+        <div class="pipeline-flow-legend"><span style="--legend-color:var(--green)">готово</span><span style="--legend-color:var(--muted)">пусто</span><span style="--legend-color:var(--text2)">без изменений</span><span style="--legend-color:var(--accent)">перевыбор</span><span style="--legend-color:var(--yellow)">нужен человек / безопасный отказ</span><span style="--legend-color:var(--red)">ошибка</span></div>
+        <div class="pipeline-report-meta">«Готово» здесь — итог запуска, не обязательно влитый PR. Отложенные попытки (WIP, бюджет API) не становятся «ПУСТО» и показаны отдельно выше. Данные — из локальной базы PromptPilot.</div>
       </div>
       ${diagnosticHtml}
       <table class="insights-table"><colgroup><col class="insights-col-stage"><col class="insights-col-small"><col class="insights-col-small"><col class="insights-col-capacity"><col class="insights-col-capacity"><col class="insights-col-duration"><col class="insights-col-small"><col class="insights-col-oldest"><col class="insights-col-interval"><col class="insights-col-recommendation"></colgroup><thead><tr><th>Этап</th><th class="num">Очередь</th><th class="num">Δ/ч</th><th class="num">За реплику × активные</th><th class="num">Прогонов</th><th>Средний запуск</th><th>ETA</th><th>Самый старый</th><th>Интервал</th><th>Рекомендация</th></tr></thead><tbody>${rows}</tbody></table>
