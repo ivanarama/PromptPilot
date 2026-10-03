@@ -124,7 +124,11 @@ def cli(ctx):
 @click.option("-c", "--cli", "provider", default=None, help="CLI provider: claude, claude-z, or custom command")
 @click.option("-r", "--max-retries", default=5, type=int, help="Max retries on rate limit")
 @click.option("-w", "--worktree", is_flag=True, help="Run in a fresh git worktree of --dir (branch pp/t<id>)")
-def add(prompt, file_path, priority, scheduled_at, working_dir, provider, max_retries, worktree):
+@click.option("--rights", type=click.Choice(["none", "read", "write", "full"]), default=None,
+              help="What the agent may do: none (no tools), read, write (edit files in --dir, "
+                   "no commands), full")
+def add(prompt, file_path, priority, scheduled_at, working_dir, provider, max_retries, worktree,
+        rights):
     """Add a task (or multiple from file)."""
     from datetime import datetime
 
@@ -152,6 +156,13 @@ def add(prompt, file_path, priority, scheduled_at, working_dir, provider, max_re
         if provider not in load_providers() and not shutil.which(first):
             click.secho(f"⚠ Провайдер «{provider}» не найден среди известных и не в PATH — "
                         "задача, скорее всего, упадёт. Список: pp provider", fg="yellow")
+    if rights:
+        from .config import DEFAULT_CLI, load_providers, rights_supported
+        name = provider or DEFAULT_CLI
+        if not rights_supported(load_providers().get(name, {}), rights):
+            raise click.UsageError(
+                f"Провайдер «{name}» не умеет ограничивать права до «{rights}» "
+                "(задайте rights в providers.json)")
 
     for p in prompts:
         task = db.create_task(TaskCreate(
@@ -162,6 +173,7 @@ def add(prompt, file_path, priority, scheduled_at, working_dir, provider, max_re
             scheduled_at=dt,
             max_retries=max_retries,
             worktree=worktree,
+            rights=rights,
         ))
         cli_info = f" [{provider}]" if provider else ""
         time_info = f" at {dt}" if dt else ""

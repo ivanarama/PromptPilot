@@ -21,7 +21,7 @@ import re as _re
 
 from . import db, epf_tools, workflows
 from . import pipeline_insights
-from .config import API_TOKEN, DB_DIR, EFFORT_LEVELS, PIPELINE_SNAPSHOT_INTERVAL, get_provider_models, get_skills, load_providers, mask_secret_value, provider_available, PROJECTS_ROOT
+from .config import API_TOKEN, DB_DIR, DEFAULT_CLI, EFFORT_LEVELS, PIPELINE_SNAPSHOT_INTERVAL, get_provider_models, get_skills, load_providers, mask_secret_value, provider_available, RIGHTS_LEVELS, rights_supported, PROJECTS_ROOT
 from .models import (
     CostStats,
     FindingStatus,
@@ -174,6 +174,15 @@ def api_create_task(task: TaskCreate):
     # UI only ever offers registered providers, so this rejects nothing real.
     if task.provider and task.provider not in load_providers():
         raise HTTPException(400, f"Неизвестный провайдер «{task.provider}»")
+    if task.rights:
+        # Refuse up front what the worker would refuse at run time.
+        cfg = load_providers().get(task.provider or DEFAULT_CLI, {})
+        if not rights_supported(cfg, task.rights):
+            raise HTTPException(
+                400, f"Провайдер «{task.provider or DEFAULT_CLI}» не умеет ограничивать "
+                     f"права до «{task.rights}» (задайте rights в providers.json)")
+        if task.herdr_target and task.rights != "full":
+            raise HTTPException(400, "Задачу в открытую сессию herdr нельзя ограничить")
     return db.create_task(task)
 
 
@@ -1132,6 +1141,8 @@ def api_providers():
             "hidden": bool(info.get("hidden")),
             "executor": info.get("executor", ""),
             "session_target": bool(info.get("session_target")),
+            # rights levels this provider can be confined to (models.TaskRights)
+            "rights": [level for level in RIGHTS_LEVELS if rights_supported(info, level)],
         }
         for name, info in providers.items()
     }

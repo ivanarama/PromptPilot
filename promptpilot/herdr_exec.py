@@ -40,7 +40,7 @@ import time
 from . import worktree
 from .config import (HERDR_BIN, HERDR_KEEP_PANE, HERDR_READ_LINES, HERDR_START_TIMEOUT_MS,
                      HERDR_WORKTREE_TIMEOUT_SECONDS, guard_enabled,
-                     guard_settings_file, resolve_effort)
+                     guard_settings_file, resolve_effort, rights_args)
 from .process_tree import run_owned
 from .remote import (POWERSHELL, REMOTE_CALL_TIMEOUT, as_remote, ps_quote,
                      ssh_command, ssh_script)
@@ -848,10 +848,16 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
             agent_args += ["--effort", eff]
         if task.session_id:
             agent_args += ["--resume", task.session_id]
-        if (task.skip_permissions
+        rights = getattr(task, "rights", None)
+        if rights:
+            confine = rights_args(provider_cfg, rights)
+            if not (len(confine) == 1 and confine[0] in agent_args):
+                agent_args += confine
+        elif (task.skip_permissions
                 and "--dangerously-skip-permissions" not in agent_args):
             agent_args.append("--dangerously-skip-permissions")
-        if not host and guard_enabled(provider_cfg, task.skip_permissions):
+        autonomous = task.skip_permissions if not rights else rights in ("write", "full")
+        if not host and guard_enabled(provider_cfg, autonomous):
             # Local only: the settings file with the hook lives on this machine.
             settings = guard_settings_file()
             if settings:
