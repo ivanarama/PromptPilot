@@ -650,12 +650,79 @@ def resolve_effort(provider_cfg: dict, task_effort: str = None) -> str:
     return value if value in EFFORT_LEVELS else ""
 
 
+RIGHTS_LEVELS = ("none", "read", "write", "full")
+
+# How each rights level (models.TaskRights) is spelled by the CLIs PromptPilot
+# knows. Claude Code: --tools names the built-in tools the run may use, and
+# --restricted also confines file tools to the working directories and
+# refuses bypassPermissions. Codex: its OS sandbox via the sandbox_mode config
+# override, which `exec` and `exec resume` both accept. A provider can declare
+# its own map as "rights" in providers.json; without one, only "full" (the
+# command exactly as configured) is available and narrower levels fail closed.
+CLAUDE_RIGHTS = {
+    "none": ["--tools", ""],
+    "read": ["--restricted", "--tools", "Read,Glob,Grep"],
+    "write": ["--restricted", "--tools", "Read,Glob,Grep,Edit,Write",
+              "--permission-mode", "acceptEdits"],
+    "full": ["--dangerously-skip-permissions"],
+}
+CODEX_RIGHTS = {
+    # Codex has no "no tools" mode: a read-only sandbox can still run
+    # read-only commands, so "none" is not offered unless declared.
+    "read": ["-c", 'sandbox_mode="read-only"'],
+    "write": ["-c", 'sandbox_mode="workspace-write"'],
+    "full": ["--dangerously-bypass-approvals-and-sandbox"],
+}
+
+
+class RightsUnsupported(ValueError):
+    """The provider has no way to confine a run to the requested rights."""
+
+
+def rights_args(cfg: dict, rights: str) -> list:
+    """CLI arguments that confine a run of this provider to ``rights``.
+
+    Raises RightsUnsupported when the provider cannot be confined that way:
+    a run that asked for "read" must not quietly get full rights.
+    """
+    if rights not in RIGHTS_LEVELS:
+        raise ValueError(f"unknown rights level: {rights!r}")
+    declared = cfg.get("rights")
+    if isinstance(declared, dict) and rights in declared:
+        value = declared[rights]
+        if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+            raise RightsUnsupported(f"rights.{rights} must be a list of arguments")
+        return list(value)
+    if provider_is_claude(cfg):
+        return list(CLAUDE_RIGHTS[rights])
+    if provider_is_codex(cfg) and rights in CODEX_RIGHTS:
+        return list(CODEX_RIGHTS[rights])
+    if rights == "full":
+        return []  # the command as configured is the widest it gets
+    raise RightsUnsupported(
+        f"провайдер не умеет ограничивать права до «{rights}»: задайте "
+        f"\"rights\": {{\"{rights}\": [...]}} в providers.json или выберите "
+        "другого провайдера")
+
+
+def rights_supported(cfg: dict, rights: str) -> bool:
+    try:
+        rights_args(cfg, rights)
+    except (RightsUnsupported, ValueError):
+        return False
+    return True
+
+
 def build_cmd(provider: str, prompt: str, skip_permissions: bool = False, session_id: str = None,
-              model: str = None, guard: bool = True, effort: str = None):
+              model: str = None, guard: bool = True, effort: str = None,
+              rights: str = None):
     """Build the full command list for a provider + prompt.
 
     guard=False for a run that happens on another machine: the settings file
     with the hook lives here, and that path means nothing over there.
+
+    rights (models.TaskRights) wins over skip_permissions; RightsUnsupported
+    when the provider cannot honour it.
     """
     providers = load_providers()
     cfg = providers.get(provider, {})
@@ -694,12 +761,20 @@ def build_cmd(provider: str, prompt: str, skip_permissions: bool = False, sessio
         except ValueError:
             exec_idx = 0
         cmd.insert(exec_idx + 1, "resume")
-    if skip_permissions and is_claude:
-        extras.append("--dangerously-skip-permissions")
-    if skip_permissions and is_codex and \
-            "--dangerously-bypass-approvals-and-sandbox" not in cmd:
-        extras.append("--dangerously-bypass-approvals-and-sandbox")
-    if guard and guard_enabled(providers.get(provider, {}), skip_permissions):
+    if rights:
+        confine = rights_args(cfg, rights)
+        # A template that already spells the single flag (a hand-made clone
+        # with --dangerously-skip-permissions) must not get it twice.
+        if not (len(confine) == 1 and confine[0] in cmd):
+            extras += confine
+    else:
+        if skip_permissions and is_claude:
+            extras.append("--dangerously-skip-permissions")
+        if skip_permissions and is_codex and \
+                "--dangerously-bypass-approvals-and-sandbox" not in cmd:
+            extras.append("--dangerously-bypass-approvals-and-sandbox")
+    autonomous = skip_permissions if not rights else rights in ("write", "full")
+    if guard and guard_enabled(providers.get(provider, {}), autonomous):
         settings = guard_settings_file()
         if settings:
             extras += ["--settings", settings]

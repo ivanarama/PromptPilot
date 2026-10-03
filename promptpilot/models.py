@@ -2,9 +2,19 @@
 
 from datetime import datetime
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+
+# What an agent run may do, independent of the CLI (config.rights_args maps
+# each level to the provider's own flags):
+#   none  — no tools: text in, text out
+#   read  — may read files, changes nothing
+#   write — may read and edit files in its working directory, runs no commands
+#   full  — anything (what skip_permissions means)
+# None keeps the legacy behaviour: skip_permissions decides.
+TaskRights = Literal["none", "read", "write", "full"]
 
 
 class TaskStatus(str, Enum):
@@ -37,6 +47,7 @@ class TaskCreate(BaseModel):
     machine: Optional[str] = None  # run on a registered remote machine (machines.json) over ssh
     worktree: bool = False  # run in a fresh git worktree of working_dir (branch pp/t<id>)
     series_id: Optional[int] = None  # durable recurring-series identity (internal/API)
+    rights: Optional[TaskRights] = None  # see TaskRights; wins over skip_permissions
 
 
 class TaskUpdate(BaseModel):
@@ -84,6 +95,7 @@ class TaskInDB(BaseModel):
     herdr_target: Optional[str] = None
     machine: Optional[str] = None
     worktree: bool = False
+    rights: Optional[str] = None
     worktree_path: Optional[str] = None  # filled in once the checkout exists
     worktree_branch: Optional[str] = None
     herdr_pane: Optional[str] = None  # pane of a herdr-executor run (📺 in the bot)
@@ -203,6 +215,7 @@ class WorkflowRoleConfig(BaseModel):
     keep_pane: bool = True
     herdr_target: Optional[str] = None
     machine: Optional[str] = None
+    rights: Optional[TaskRights] = None
     prompt_template: str = ""
 
 
@@ -585,6 +598,7 @@ class WorkflowTaskDispatch(BaseModel):
     herdr_target: Optional[str] = None
     machine: Optional[str] = None
     task_timeout: Optional[int] = Field(default=None, ge=0)
+    rights: Optional[TaskRights] = None
 
 
 class WorkflowDispatchResult(BaseModel):

@@ -1,0 +1,86 @@
+{
+  "name": "client-letters",
+  "title": "Письма клиентов",
+  "description": "Замена inbox_poller.py + inbox_bot.py для клиентских писем: триаж выбирает проект из папок PROJECTS_ROOT и пишет ТЗ → решение владельца → исполнение в папке проекта → черновик ответа → решение владельца (можно вписать свой текст) → ответ письмом в ту же ветку переписки.",
+  "trust": "client",
+  "vars": {
+    "projects": "C:/Projects",
+    "signature": "С уважением,\nИван"
+  },
+  "input": {
+    "type": "email",
+    "host": "imap.mail.ru",
+    "user_env": "INBOX_IMAP_USER",
+    "password_env": "INBOX_IMAP_PASSWORD",
+    "folders": ["INBOX"],
+    "allow_from": ["client@example.com", "partner.ru"],
+    "save_attachments": true
+  },
+  "limits": {"per_day": 20, "per_author": 5},
+  "steps": [
+    {
+      "id": "triage",
+      "kind": "agent",
+      "title": "Триаж",
+      "provider": "claude",
+      "rights": "read",
+      "working_dir": "{{flow.attachments}}/{{item.id}}",
+      "prompt_file": "client-triage.md",
+      "material": {"catalog": {"tree": "{{flow.projects}}", "depth": 2, "max": 8000}},
+      "output": {
+        "project": {"enum": ["НЕТ"], "enum_dirs": "{{flow.projects}}", "dirs_depth": 2},
+        "type": {"enum": ["баг", "задача", "вопрос", "фича"]},
+        "priority": {"type": "integer", "min": 1, "max": 10},
+        "spec": {"type": "text", "max": 6000},
+        "questions": {"type": "text", "max": 1500, "required": false}
+      },
+      "retries": 1
+    },
+    {
+      "id": "approve",
+      "kind": "human",
+      "title": "Запускать ли",
+      "text": "Письмо «{{item.title}}» от {{input.from}}: проект {{steps.triage.project}}, {{steps.triage.type}}, приоритет {{steps.triage.priority}}. Запустить исполнение?",
+      "show": ["input.body", "steps.triage.spec", "steps.triage.questions", "input.attachments"]
+    },
+    {
+      "id": "execute",
+      "kind": "agent",
+      "title": "Исполнение",
+      "provider": "claude",
+      "rights": "write",
+      "when": {"step": "triage", "field": "project", "not_in": ["НЕТ"]},
+      "working_dir": "{{flow.projects}}/{{steps.triage.project}}",
+      "prompt_file": "client-execute.md",
+      "output": {"summary": {"type": "text", "max": 3000}},
+      "timeout": 7200
+    },
+    {
+      "id": "draft",
+      "kind": "agent",
+      "title": "Черновик ответа",
+      "provider": "claude",
+      "rights": "none",
+      "prompt_file": "client-reply.md",
+      "output": {"reply": {"type": "text", "max": 4000}}
+    },
+    {
+      "id": "reply_ok",
+      "kind": "human",
+      "title": "Отправлять ли ответ",
+      "text": "Ответить автору письма «{{item.title}}»? Одобрите как есть — или впишите в пометку свой текст ответа.",
+      "show": ["steps.draft.reply"],
+      "on_reject": "continue"
+    },
+    {
+      "id": "reply",
+      "kind": "email_reply",
+      "when": {"step": "reply_ok", "field": "decision", "in": ["approve"]},
+      "text": "{{steps.draft.reply}}\n\n{{flow.signature}}",
+      "text_override": "{{steps.reply_ok.note}}",
+      "smtp_host": "smtp.mail.ru",
+      "from_name": "PromptPilot"
+    },
+    {"id": "done", "kind": "finish", "status": "done"}
+  ]
+}

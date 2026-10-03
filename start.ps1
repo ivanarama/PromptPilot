@@ -1,7 +1,9 @@
-# Start PromptPilot services (worker + server + optional bot)
+# Start PromptPilot services (worker + server + optional bot and flows)
 # Usage:
 #   .\start.ps1           - worker + server
 #   .\start.ps1 -Bot      - worker + server + bot (requires PP_TG_TOKEN)
+# The flows runner (pp flows run) starts by itself when flow files exist
+# (~\.promptpilot\flows\*.json or PP_FLOWS_DIR, see docs\FLOWS.md).
 
 param(
     [switch]$Bot
@@ -80,6 +82,23 @@ if ($Bot -or $env:PP_TG_TOKEN) {
         $pids.bot = $b.Id
         Write-Host "  Bot     PID $($b.Id)   logs\bot.log" -ForegroundColor Green
     }
+}
+
+# Flows runner: only when there are flows to run.
+if ($env:PP_FLOWS_DIR) {
+    $flowsDir = $env:PP_FLOWS_DIR
+} elseif ($env:PP_DATA_DIR) {
+    $flowsDir = Join-Path $env:PP_DATA_DIR "flows"
+} else {
+    $flowsDir = Join-Path $HOME ".promptpilot\flows"
+}
+if (Test-Path -Path (Join-Path $flowsDir "*.json")) {
+    $f = Start-Process $exe -ArgumentList "flows", "run" `
+        -RedirectStandardOutput "$logDir\flows.log" `
+        -RedirectStandardError  "$logDir\flows.err" `
+        -WindowStyle Hidden -PassThru
+    $pids.flows = $f.Id
+    Write-Host "  Flows   PID $($f.Id)   logs\flows.log" -ForegroundColor Green
 }
 
 $pids | ConvertTo-Json | Set-Content -LiteralPath $pidFile -Encoding UTF8

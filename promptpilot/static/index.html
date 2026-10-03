@@ -459,6 +459,22 @@
   .wf-meta { color: var(--text2); font-size: 11px; margin-top: 3px; }
   .wf-panel { border: 1px solid var(--border); border-radius: 8px; padding: 12px; min-height: 220px; }
   .wf-actions { display: flex; flex-wrap: wrap; gap: 7px; margin: 10px 0; }
+  .flows-bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 10px 0; }
+  .flows-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr); gap: 14px; }
+  @media (max-width: 860px) { .flows-layout { grid-template-columns: 1fr; } }
+  .flow-row { padding: 4px 0; font-size: 13px; }
+  .flow-item { padding: 7px 9px; border-bottom: 1px solid var(--border); cursor: pointer; font-size: 13px; }
+  .flow-item:hover, .flow-item.selected { background: var(--surface2); }
+  .flow-status { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 11px; background: var(--surface2); margin: 0 4px; }
+  .flow-waiting_human, .flow-needs_human { background: rgba(251,191,36,.18); color: var(--yellow); }
+  .flow-done { color: var(--green); }
+  .flow-rejected, .flow-failed { color: var(--red); }
+  .flow-muted { color: var(--text2); font-size: 12px; }
+  .flow-error { color: var(--yellow); font-size: 12px; margin-top: 3px; white-space: pre-wrap; }
+  .flow-box { border: 1px solid var(--border); border-radius: var(--radius); padding: 10px; margin: 8px 0; }
+  .flow-box pre, .flow-detail pre { white-space: pre-wrap; word-break: break-word; font-family: var(--mono); font-size: 12px; background: var(--bg); padding: 8px; border-radius: 6px; max-height: 320px; overflow: auto; }
+  .flow-box textarea { width: 100%; min-height: 60px; margin: 6px 0; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 6px; }
+  .flow-event { font-size: 12px; padding: 2px 0; border-bottom: 1px dashed var(--border); word-break: break-word; }
   .wf-form { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 10px; }
   .wf-form .wide { grid-column: 1 / -1; }
   .wf-form input, .wf-form select, .wf-form textarea {
@@ -689,6 +705,15 @@
         <input type="checkbox" id="skipPermissions" style="width:auto;margin:0">
         <span style="font-size:13px;color:var(--yellow)" title="Claude: --dangerously-skip-permissions; Codex: --dangerously-bypass-approvals-and-sandbox">⚠ не спрашивать разрешения</span>
       </label>
+      <label id="rightsLabel" style="display:none" title="Что агенту можно. Без инструментов — только текст; чтение — смотреть файлы; правка — менять файлы в папке задачи, не запуская команд; полные — всё. «Как обычно» — решает галочка «не спрашивать разрешения». Недоступное для провайдера неактивно.">Права
+        <select id="rightsInput">
+          <option value="">как обычно</option>
+          <option value="none">без инструментов</option>
+          <option value="read">только чтение</option>
+          <option value="write">правка файлов</option>
+          <option value="full">полные</option>
+        </select>
+      </label>
       <label id="keepPaneLabel" style="flex-direction:row;align-items:center;gap:8px;cursor:pointer;display:none">
         <input type="checkbox" id="keepPane" checked style="width:auto;margin:0">
         <span style="font-size:13px" title="Панель herdr останется открытой — можно вернуться и продолжить диалог">🖥 оставить сессию открытой</span>
@@ -713,6 +738,7 @@
     <button class="btn-pause" onclick="openPipelines()" style="margin-left:8px">📈 Конвейеры</button>
     <button class="btn-pause" onclick="openSchedule()" style="margin-left:8px">🗓 Расписание</button>
     <button class="btn-pause" onclick="openWorkflows()" style="margin-left:8px">Workflows</button>
+    <button class="btn-pause" onclick="openFlows()" style="margin-left:8px" title="Маршруты заявок: входы, согласования, журнал">📨 Заявки</button>
     <button class="btn-pause" onclick="openProviders()" style="margin-left:8px">⚙ Providers</button>
     <button class="btn-pause" onclick="openEpf()" style="margin-left:8px" title="Доработка внешних обработок 1С">🔧 1С</button>
   </div>
@@ -757,6 +783,30 @@
         <div id="epfSetMsg" style="font-size:13px"></div>
       </form>
     </details>
+  </div>
+</div>
+
+<div class="modal-overlay" id="flowsModal" onclick="if(event.target===this)closeFlows()">
+  <div class="modal" style="max-width:1160px">
+    <h2>Заявки по маршрутам <button class="btn btn-sm btn-ghost" style="margin-left:auto" onclick="closeFlows()">Закрыть</button></h2>
+    <div id="flowsHead"></div>
+    <div class="flows-bar">
+      <select id="flowsStatus" onchange="loadFlowItems()">
+        <option value="">все заявки</option>
+        <option value="waiting_human">ждут решения</option>
+        <option value="needs_human">нужен человек</option>
+        <option value="active">в работе</option>
+        <option value="done">готово</option>
+        <option value="rejected">отклонено</option>
+        <option value="failed">не вышло</option>
+        <option value="cancelled">снято</option>
+      </select>
+      <button class="btn btn-sm btn-ghost" onclick="loadFlows()">Обновить</button>
+    </div>
+    <div class="flows-layout">
+      <div id="flowsItems"></div>
+      <div id="flowsDetail" class="flow-detail"><div class="flow-muted">Выберите заявку слева.</div></div>
+    </div>
   </div>
 </div>
 
@@ -1317,6 +1367,7 @@ async function addTask() {
         priority,
         working_dir: workdir,
         skip_permissions: skipPermissions,
+        rights: document.getElementById('rightsInput').value || null,
         keep_pane: document.getElementById('keepPane').checked,
         worktree: document.getElementById('worktree').checked,
         herdr_target: herdrTarget,
@@ -1503,6 +1554,129 @@ document.getElementById('filterBar').addEventListener('click', e => {
 // --- Providers settings modal ---
 const STATUS_RU = { completed: 'успех', failed: 'падение', cancelled: 'отменена',
                     pending: 'в очереди', running: 'идёт', rate_limited: 'ждёт лимита' };
+
+// --- Flows (маршруты заявок) ---
+const FLOW_STATUS_RU = { active: 'в работе', waiting_human: 'ждёт решения', needs_human: 'нужен человек',
+                         done: 'готово', rejected: 'отклонено', failed: 'не вышло', cancelled: 'снято' };
+let flowSelected = null;
+
+function openFlows() {
+  document.getElementById('flowsModal').classList.add('open');
+  loadFlows();
+}
+
+function closeFlows() { document.getElementById('flowsModal').classList.remove('open'); }
+
+function flowText(value) {
+  return typeof value === 'string' ? value : JSON.stringify(value, null, 1);
+}
+
+async function loadFlows() {
+  const head = document.getElementById('flowsHead');
+  try {
+    const data = await fetchJSON(`${API}/flows`);
+    const rows = data.flows.map(flow => {
+      const counts = Object.entries(flow.counts)
+        .map(([status, n]) => `${esc(FLOW_STATUS_RU[status] || status)}: ${n}`).join(', ');
+      return `<div class="flow-row"><b>${esc(flow.name)}</b> <span class="flow-muted">[${esc(flow.trust)}]</span> `
+        + `${esc(flow.title || '')} — ${counts || 'заявок нет'}</div>`;
+    });
+    const errors = Object.entries(data.errors)
+      .map(([file, error]) => `<div class="flow-error">✗ ${esc(file)} не принят: ${esc(error)}</div>`);
+    head.innerHTML = (rows.join('')
+      || `<div class="flow-muted">Маршрутов нет. Положите *.json в ${esc(data.dir)} (docs/FLOWS.md).</div>`)
+      + errors.join('');
+  } catch (err) {
+    head.textContent = err.message;
+  }
+  await loadFlowItems();
+}
+
+async function loadFlowItems() {
+  const status = document.getElementById('flowsStatus').value;
+  const box = document.getElementById('flowsItems');
+  try {
+    const query = status ? `&status=${encodeURIComponent(status)}` : '';
+    const items = await fetchJSON(`${API}/flows/items?limit=100${query}`);
+    box.innerHTML = items.length ? items.map(item => `
+      <div class="flow-item${item.id === flowSelected ? ' selected' : ''}" onclick="showFlowItem(${item.id})">
+        <b>#${item.id}</b> <span class="flow-muted">${esc(item.flow)}</span>
+        <span class="flow-status flow-${esc(item.status)}">${esc(FLOW_STATUS_RU[item.status] || item.status)}</span>
+        ${item.step_id ? `<span class="flow-muted">· ${esc(item.step_id)}</span>` : ''}
+        <div>${esc(item.title || '(без названия)')}</div>
+        ${item.error ? `<div class="flow-error">${esc(item.error.slice(0, 240))}</div>` : ''}
+      </div>`).join('') : '<div class="flow-muted">Заявок нет.</div>';
+  } catch (err) {
+    box.textContent = err.message;
+  }
+}
+
+async function showFlowItem(id) {
+  flowSelected = id;
+  const box = document.getElementById('flowsDetail');
+  try {
+    const item = await fetchJSON(`${API}/flows/items/${id}`);
+    const wait = item.wait || {};
+    let actions = '';
+    if (item.status === 'waiting_human' && wait.approval) {
+      const shown = Object.entries(wait.show || {})
+        .map(([ref, value]) => `<div class="flow-muted">${esc(ref)}</div><pre>${esc(flowText(value))}</pre>`).join('');
+      actions = `<div class="flow-box"><b>${esc(wait.text || 'Решение')}</b>${shown}
+        <textarea id="flowNote" placeholder="Указание к решению или причина — необязательно"></textarea>
+        <button class="btn btn-sm btn-primary" onclick="decideFlowItem(${id}, 'approve')">Одобрить</button>
+        <button class="btn btn-sm btn-danger" onclick="decideFlowItem(${id}, 'reject')">Отклонить</button></div>`;
+    } else if (item.status === 'needs_human') {
+      actions = `<div class="flow-box"><b>Нужен человек.</b><div class="flow-error">${esc(item.error || '')}</div>
+        <button class="btn btn-sm btn-primary" onclick="flowItemAction(${id}, 'retry')">Повторить шаг</button>
+        <button class="btn btn-sm btn-ghost" onclick="flowItemAction(${id}, 'skip')">Пропустить шаг</button>
+        <button class="btn btn-sm btn-danger" onclick="flowItemAction(${id}, 'cancel')">Снять</button></div>`;
+    } else if (item.status === 'active') {
+      actions = `<div class="flow-box"><button class="btn btn-sm btn-danger" onclick="flowItemAction(${id}, 'cancel')">Снять</button></div>`;
+    }
+    const events = item.events.map(event => {
+      const payload = Object.keys(event.payload || {}).length ? esc(JSON.stringify(event.payload).slice(0, 300)) : '';
+      return `<div class="flow-event"><span class="flow-muted">${esc(event.created_at.slice(0, 19).replace('T', ' '))}</span> `
+        + `${esc(event.step_id || '—')} · ${esc(event.event_type)} ${payload}</div>`;
+    }).join('');
+    box.innerHTML = `<h3>#${item.id} ${esc(item.title || '')}</h3>
+      <div class="flow-muted">${esc(item.flow)} · ${esc(FLOW_STATUS_RU[item.status] || item.status)}${item.author ? ' · ' + esc(item.author) : ''}</div>
+      ${actions}
+      <details><summary>Заявка</summary><pre>${esc(flowText(item.data.input || {}))}</pre></details>
+      <details><summary>Результаты шагов</summary><pre>${esc(flowText(item.data.steps || {}))}</pre></details>
+      <details open><summary>Журнал</summary>${events}</details>`;
+    const approval = wait.approval || null;
+    box.dataset.approval = approval || '';
+  } catch (err) {
+    box.textContent = err.message;
+  }
+  loadFlowItems();
+}
+
+async function decideFlowItem(id, decision) {
+  const box = document.getElementById('flowsDetail');
+  const note = (document.getElementById('flowNote') || {}).value || '';
+  try {
+    await fetchJSON(`${API}/flows/items/${id}/decision`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ decision, note, step: box.dataset.approval || null }),
+    });
+    toast(decision === 'approve' ? 'Одобрено — заявка пойдёт дальше' : 'Отклонено', false);
+  } catch (err) {
+    toast(err.message);
+  }
+  showFlowItem(id);
+}
+
+async function flowItemAction(id, action) {
+  if (action === 'cancel' && !confirm(`Снять заявку #${id}?`)) return;
+  try {
+    await fetchJSON(`${API}/flows/items/${id}/${action}`, { method: 'POST' });
+    toast({ retry: 'Шаг повторится', skip: 'Шаг пропущен', cancel: 'Заявка снята' }[action], false);
+  } catch (err) {
+    toast(err.message);
+  }
+  showFlowItem(id);
+}
 
 // --- Workflow orchestrator ---
 function openWorkflows() {
@@ -3722,6 +3896,12 @@ function updateKeepPane() {
   // в target-режиме директория и permissions не применимы — прячем
   document.getElementById('workdirLabel').style.display = prov.session_target ? 'none' : 'flex';
   document.getElementById('skipPermsLabel').style.display = prov.session_target ? 'none' : 'flex';
+  // Only the rights this provider can actually be confined to are offered.
+  const rightsSel = document.getElementById('rightsInput');
+  const supportedRights = prov.rights || [];
+  [...rightsSel.options].forEach(o => { o.disabled = o.value !== '' && !supportedRights.includes(o.value); });
+  if (rightsSel.selectedOptions[0] && rightsSel.selectedOptions[0].disabled) rightsSel.value = '';
+  document.getElementById('rightsLabel').style.display = prov.session_target ? 'none' : 'flex';
   document.getElementById('providerModeHint').style.display = prov.session_target ? '' : 'none';
   updateWorktree();
   if (prov.session_target) loadHerdrAgents();
