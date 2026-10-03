@@ -1496,6 +1496,21 @@ def _render_role_prompt(workflow: WorkflowInDB, role: WorkflowRole,
         )
         if override:
             rendered = override
+    previous_executor = values["executor_report"]
+    if (role is WorkflowRole.EXECUTOR
+            and previous_executor != "(нет: это первый раунд)"
+            and "{{executor_report}}" not in rendered):
+        # A resumed executor may run in a fresh CLI session. Give it the prior
+        # result as context; the repository remains the source of truth.
+        if len(previous_executor) > 12000:
+            previous_executor = "[Начало отчёта опущено]\n" + previous_executor[-12000:]
+        rendered = rendered.rstrip() + (
+            "\n\n<предыдущий-запуск-исполнителя>\n"
+            "Это отчёт предыдущей сессии того же workflow. Проверь его выводы "
+            "по Git и фактическому состоянию проекта.\n"
+            + previous_executor
+            + "\n</предыдущий-запуск-исполнителя>"
+        )
     # A template may place the notes itself; otherwise they go last, marked
     # as outranking the round's instructions — the same rule as a task note.
     placed_by_template = "{{human_input}}" in rendered
