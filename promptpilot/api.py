@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import ipaddress
 import secrets
 import subprocess
 import sys
@@ -10,6 +11,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.concurrency import run_in_threadpool
@@ -21,7 +23,7 @@ import re as _re
 
 from . import db, epf_tools, workflows
 from . import pipeline_insights
-from .config import API_TOKEN, DB_DIR, EFFORT_LEVELS, PIPELINE_SNAPSHOT_INTERVAL, get_provider_models, get_skills, load_providers, mask_secret_value, provider_available, PROJECTS_ROOT
+from .config import ALLOWED_HOSTS, ALLOWED_ORIGINS, API_TOKEN, DB_DIR, EFFORT_LEVELS, PIPELINE_SNAPSHOT_INTERVAL, get_provider_models, get_skills, load_providers, mask_secret_value, provider_available, PROJECTS_ROOT
 from .models import (
     CostStats,
     FindingStatus,
@@ -103,6 +105,80 @@ app = FastAPI(title="PromptPilot", version="0.1.0", lifespan=_lifespan)
 _SAFE_METHODS = ("GET", "HEAD", "OPTIONS")
 
 
+def _hostname(authority: str) -> str:
+    """Lowercased host part of a Host header or URL authority, without port."""
+    value = (authority or "").strip().lower()
+    if value.startswith("["):
+        end = value.find("]")
+        return value[1:end] if end > 0 else ""
+    if value.count(":") == 1:
+        value = value.split(":", 1)[0]
+    return value.rstrip(".")
+
+
+def _trusted_host(authority: str) -> bool:
+    """Whether a page served from elsewhere could have produced this Host.
+
+    DNS rebinding points an attacker's own hostname at 127.0.0.1, so the
+    browser treats the attacker's page as same-origin with this server and the
+    request carries the attacker's hostname. It cannot make the browser send a
+    localhost name (browsers resolve *.localhost themselves) or an IP literal,
+    so those stay allowed together with the names in PP_ALLOWED_HOSTS.
+    """
+    hostname = _hostname(authority)
+    if not hostname:
+        return False
+    if "*" in ALLOWED_HOSTS or hostname in ALLOWED_HOSTS:
+        return True
+    if hostname == "localhost" or hostname.endswith(".localhost"):
+        return True
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        return False
+    return True
+
+
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _origin_key(value: str) -> tuple[str, str, int] | None:
+    """(scheme, host, port) of a serialized origin, or None if it is not one.
+
+    Default ports are filled in: https://pp.example.com and
+    https://pp.example.com:443 are one origin, another scheme or port of the
+    same name is not.
+    """
+    parts = urlsplit((value or "").strip())
+    if (parts.scheme not in _DEFAULT_PORTS or not parts.hostname
+            or parts.username is not None or parts.password is not None
+            or parts.path not in ("", "/") or parts.query or parts.fragment):
+        return None
+    try:
+        port = parts.port
+    except ValueError:
+        return None
+    return parts.scheme, parts.hostname.rstrip("."), port or _DEFAULT_PORTS[parts.scheme]
+
+
+def _same_origin(origin: str, authority: str, scheme: str) -> bool:
+    """Whether a browser Origin header is this server or an allowed origin.
+
+    Origins compare as (scheme, host, port). A page on another port of the
+    same machine is "same-site", not same-origin, and so is another scheme or
+    port of a proxied name. Behind a reverse proxy the request reaches the
+    upstream address while Origin keeps the public URL: that URL must be
+    listed in full in PP_ALLOWED_ORIGINS — PP_ALLOWED_HOSTS only admits a
+    Host name.
+    """
+    key = _origin_key(origin)
+    if key is None:
+        return False
+    if key == _origin_key(f"{scheme}://{(authority or '').strip()}"):
+        return True
+    return any(key == _origin_key(allowed) for allowed in ALLOWED_ORIGINS)
+
+
 @app.middleware("http")
 async def _auth(request, call_next):
     """Optional auth: enabled by PP_API_TOKEN. Accepts Bearer <token> or
@@ -112,11 +188,34 @@ async def _auth(request, call_next):
     cross-site is refused: without this, a malicious page open in the user's
     browser could POST to the loopback server (no token by default) and queue a
     task that runs with --dangerously-skip-permissions. curl/scripts don't send
-    Sec-Fetch-Site, so they're unaffected."""
+    Sec-Fetch-Site, so they're unaffected.
+
+    Without a token the loopback bind is the only boundary, and "cross-site"
+    does not cover every way around it: DNS rebinding makes a hostile page
+    same-origin with this server, and a page on another localhost port is
+    "same-site". So a foreign Host is refused on every request, and a
+    state-changing request whose Origin is neither this server nor an origin
+    listed in PP_ALLOWED_ORIGINS — compared as scheme, host and port — is
+    refused too. Scripts send neither a foreign Host nor an Origin and keep
+    working."""
     if request.method not in _SAFE_METHODS:
         if request.headers.get("sec-fetch-site") == "cross-site":
             return Response(status_code=403, content="cross-site request refused")
     if not API_TOKEN:
+        host = request.headers.get("host", "")
+        if not _trusted_host(host):
+            return Response(
+                status_code=403,
+                content="host not allowed: add it to PP_ALLOWED_HOSTS or set PP_API_TOKEN",
+            )
+        origin = request.headers.get("origin")
+        if (request.method not in _SAFE_METHODS and origin is not None
+                and not _same_origin(origin, host, request.url.scheme)):
+            return Response(
+                status_code=403,
+                content="cross-origin request refused: add the page origin to "
+                        "PP_ALLOWED_ORIGINS or set PP_API_TOKEN",
+            )
         return await call_next(request)
     header = request.headers.get("authorization", "")
     ok = False
