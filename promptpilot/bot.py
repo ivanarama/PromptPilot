@@ -752,6 +752,7 @@ async def cb_rerun_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keep_pane=task.keep_pane,
         machine=task.machine,
         worktree=task.worktree,
+        rights=task.rights,
     ))
     await query.answer(f"Задача #{new.id} добавлена.")
     await query.message.reply_text(
@@ -3606,6 +3607,55 @@ def _silent_completion(task) -> bool:
     )
 
 
+def _flow_keyboard(flow_ref: str) -> InlineKeyboardMarkup:
+    """Buttons of a flow notification: an approval ("<item>:<step>") or a stuck item ("<item>:")."""
+    item_id, _, step_id = flow_ref.partition(":")
+    if step_id:
+        return InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Одобрить", callback_data=f"flowdec:{item_id}:{step_id}:a"),
+            InlineKeyboardButton("✖ Отклонить", callback_data=f"flowdec:{item_id}:{step_id}:r"),
+        ]])
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔁 Повторить", callback_data=f"flowact:{item_id}:retry"),
+        InlineKeyboardButton("⏭ Пропустить", callback_data=f"flowact:{item_id}:skip"),
+        InlineKeyboardButton("✖ Снять", callback_data=f"flowact:{item_id}:cancel"),
+    ]])
+
+
+FLOW_ACTION_WORDS = {"retry": "шаг повторяется", "skip": "шаг пропущен", "cancel": "заявка снята"}
+
+
+@require_auth
+async def cb_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """A button under a flow notification: decide an approval, or move a stuck item."""
+    from . import flows
+
+    query = update.callback_query
+    parts = query.data.split(":")
+    user = update.effective_user
+    who = f"telegram:{user.username or user.id}"
+    try:
+        if parts[0] == "flowdec":
+            _, item_id, step_id, verdict = parts
+            decision = "approve" if verdict == "a" else "reject"
+            await asyncio.to_thread(flows.decide, int(item_id), decision, "", who, step_id)
+            word = "одобрено" if decision == "approve" else "отклонено"
+        else:
+            _, item_id, action = parts
+            call = {"retry": flows.retry, "skip": flows.skip, "cancel": flows.cancel}[action]
+            await asyncio.to_thread(call, int(item_id), who)
+            word = FLOW_ACTION_WORDS[action]
+    except flows.FlowError as exc:
+        await query.answer(str(exc)[:190], show_alert=True)
+        return
+    await query.answer(word.capitalize())
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text(f"Заявка #{item_id}: {word}.")
+    except BadRequest:
+        pass
+
+
 async def _notify_loop(bot):
     """Background loop: send notifications for completed/failed tasks every 10s.
 
@@ -3628,7 +3678,9 @@ async def _notify_loop(bot):
         for note in notes:
             try:
                 kb = None
-                if note.get("pane_id"):
+                if note.get("flow_ref"):
+                    kb = _flow_keyboard(note["flow_ref"])
+                elif note.get("pane_id"):
                     # A blocked own task: same confirm/screen/reply buttons the
                     # foreign-agent watcher gets — not just an ssh suggestion.
                     ref = f"{note.get('machine') or ''}:{note['pane_id']}"
@@ -4351,6 +4403,9 @@ def run_bot():
     app.add_handler(CallbackQueryHandler(
         cb_report_refresh,
         pattern=r"^report:refresh:(24|168|720):[A-Za-z0-9_.-]+$"), group=-1)
+    app.add_handler(CallbackQueryHandler(
+        cb_flow, pattern=r"^(flowdec:\d+:[a-z0-9_]+:[ar]|flowact:\d+:(retry|skip|cancel))$"),
+        group=-1)
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))

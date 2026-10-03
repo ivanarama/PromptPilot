@@ -35,8 +35,8 @@ function Add-PromptPilotTarget([string]$name, [int]$processId) {
     }
     $command = [string]$process.CommandLine
     $looksLikePromptPilot =
-        $command -match '(?i)-m\s+promptpilot\s+(worker|server|bot)\b' -or
-        ($command -match '(?i)[\\/]pp(?:\.exe)?["'']?\s+(worker|server|bot)\b' -and
+        $command -match '(?i)-m\s+promptpilot\s+(worker|server|bot|flows)\b' -or
+        ($command -match '(?i)[\\/]pp(?:\.exe)?["'']?\s+(worker|server|bot|flows)\b' -and
          $command.IndexOf($PSScriptRoot, [StringComparison]::OrdinalIgnoreCase) -ge 0)
     if (-not $looksLikePromptPilot) {
         Write-Host "Skip stale $name PID $processId (command is not PromptPilot)." -ForegroundColor Yellow

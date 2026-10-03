@@ -1,0 +1,187 @@
+{
+  "name": "kt-proposals",
+  "title": "Сказки Королевства — предложения игроков",
+  "description": "Предложения с формы сайта: триаж хранителем концепции → стена на сайте → решение владельца → реализация в отдельной ветке → тесты Godot → ревью → решение о слиянии. Пути в vars — заменить на свои.",
+  "trust": "public",
+  "vars": {
+    "game": "C:/Projects/kt-game",
+    "worktrees": "C:/Projects/kt-worktrees",
+    "godot": "C:/Tools/godot/Godot_console.exe",
+    "concept": "C:/Projects/kt-game/CONCEPT.md",
+    "site_feed": "C:/Projects/site/kt/feed.json",
+    "triage_dir": "C:/PromptPilot/kt-triage"
+  },
+  "input": {
+    "type": "email",
+    "host": "imap.mail.ru",
+    "user_env": "KT_IMAP_USER",
+    "password_env": "KT_IMAP_PASSWORD",
+    "folders": ["INBOX", "INBOX/ToMyself"],
+    "subject_marker": "KT",
+    "require_from_domain": "formsubmit.co",
+    "dkim_authserv": "mxs.mail.ru",
+    "author_pattern": "(?mi)^\\s*name\\s*:\\s*(.+)$",
+    "generic_subjects": ["Предложение по игре"],
+    "body_limit": 5000
+  },
+  "limits": {"per_day": 20, "per_author": 3},
+  "steps": [
+    {
+      "id": "triage",
+      "kind": "agent",
+      "title": "Триаж хранителем концепции",
+      "provider": "claude",
+      "rights": "none",
+      "working_dir": "{{flow.triage_dir}}",
+      "prompt_file": "kt-triage.md",
+      "material": {
+        "concept": {"file": "{{flow.concept}}", "max": 8000},
+        "outline": {"tree": "{{flow.game}}", "depth": 2, "max": 4000}
+      },
+      "output": {
+        "verdict": {"enum": ["ПРИНЯТЬ", "ОТКЛОНИТЬ", "УТОЧНИТЬ"]},
+        "reason": {"type": "text", "max": 300},
+        "category": {"enum": ["баг", "фича", "баланс", "контент", "ux"]},
+        "priority": {"type": "integer", "min": 1, "max": 10},
+        "spec": {"type": "text", "max": 4000}
+      },
+      "retries": 1
+    },
+    {
+      "id": "declined",
+      "kind": "finish",
+      "status": "rejected",
+      "when": {"step": "triage", "field": "verdict", "in": ["ОТКЛОНИТЬ"]},
+      "note": "{{steps.triage.reason}}"
+    },
+    {
+      "id": "wall",
+      "kind": "publish",
+      "title": "Стена предложений на сайте",
+      "path": "{{flow.site_feed}}",
+      "fields": {
+        "task_id": "{{item.id}}",
+        "author": "{{item.author|Анонимный странник}}",
+        "title": "{{item.title}}",
+        "subject": "{{input.subject}}",
+        "verdict": "{{steps.triage.verdict}}",
+        "reason": "{{steps.triage.reason}}",
+        "category": "{{steps.triage.category}}",
+        "priority": "{{steps.triage.priority}}",
+        "spec": "{{steps.triage.spec}}"
+      },
+      "caps": {"author": 30, "title": 80, "subject": 120, "reason": 300, "spec": 1500},
+      "stages": {
+        "wall": "принято",
+        "clarify": "нужны уточнения",
+        "implement": "в работе",
+        "review": "на проверке",
+        "done": "готово"
+      }
+    },
+    {
+      "id": "clarify",
+      "kind": "finish",
+      "status": "done",
+      "when": {"step": "triage", "field": "verdict", "in": ["УТОЧНИТЬ"]},
+      "note": "ждёт уточнений игрока"
+    },
+    {
+      "id": "approve",
+      "kind": "human",
+      "title": "Брать ли в работу",
+      "text": "Взять в работу предложение «{{item.title}}» ({{item.author|Анонимный странник}})? Приоритет {{steps.triage.priority}}, {{steps.triage.category}}.",
+      "show": ["steps.triage.reason", "steps.triage.spec"]
+    },
+    {
+      "id": "branch",
+      "kind": "command",
+      "title": "Отдельная ветка и папка",
+      "run": ["git", "-C", "{{flow.game}}", "worktree", "add", "-b", "kt/{{item.id}}",
+              "{{flow.worktrees}}/kt-{{item.id}}", "main"]
+    },
+    {
+      "id": "implement",
+      "kind": "agent",
+      "title": "Реализация",
+      "provider": "claude",
+      "rights": "write",
+      "working_dir": "{{flow.worktrees}}/kt-{{item.id}}",
+      "prompt_file": "kt-implement.md",
+      "timeout": 3600
+    },
+    {
+      "id": "import",
+      "kind": "command",
+      "title": "Godot: импорт",
+      "run": ["{{flow.godot}}", "--headless", "--path", "{{flow.worktrees}}/kt-{{item.id}}", "--import"],
+      "timeout": 900,
+      "on_error": "continue"
+    },
+    {
+      "id": "check",
+      "kind": "command",
+      "title": "Godot: тесты",
+      "run": ["{{flow.godot}}", "--headless", "--path", "{{flow.worktrees}}/kt-{{item.id}}",
+              "res://tests/test_runner.tscn"],
+      "timeout": 900,
+      "require_output": "(?i)passed",
+      "on_error": "continue",
+      "repeat": {"from": "implement", "when": {"step": "check", "field": "ok", "in": [false]}, "max": 2}
+    },
+    {
+      "id": "stage",
+      "kind": "command",
+      "run": ["git", "-C", "{{flow.worktrees}}/kt-{{item.id}}", "add", "-A"]
+    },
+    {
+      "id": "diff",
+      "kind": "command",
+      "run": ["git", "-C", "{{flow.worktrees}}/kt-{{item.id}}", "diff", "--cached", "--stat", "--patch"],
+      "output_limit": 60000
+    },
+    {
+      "id": "review",
+      "kind": "agent",
+      "title": "Ревью",
+      "provider": "claude",
+      "rights": "read",
+      "working_dir": "{{flow.worktrees}}/kt-{{item.id}}",
+      "prompt_file": "kt-review.md",
+      "material": {"concept": {"file": "{{flow.concept}}", "max": 8000}},
+      "output": {
+        "verdict": {"enum": ["ПРИНЯТО", "ДОРАБОТАТЬ"]},
+        "summary": {"type": "text", "max": 1500}
+      },
+      "repeat": {"from": "implement", "when": {"step": "review", "field": "verdict", "in": ["ДОРАБОТАТЬ"]}, "max": 2}
+    },
+    {
+      "id": "merge_ok",
+      "kind": "human",
+      "title": "Вливать ли",
+      "text": "Влить ветку kt/{{item.id}} («{{item.title}}») в main? Отклонение вернёт заявку исполнителю — с вашей пометкой.",
+      "show": ["steps.review.summary", "steps.check.ok", "steps.diff.output"],
+      "on_reject": "continue",
+      "repeat": {"from": "implement", "when": {"step": "merge_ok", "field": "decision", "in": ["reject"]}, "max": 3}
+    },
+    {
+      "id": "commit",
+      "kind": "command",
+      "when": {"step": "merge_ok", "field": "decision", "in": ["approve"]},
+      "run": ["git", "-C", "{{flow.worktrees}}/kt-{{item.id}}", "commit", "-m", "КТ-заявка #{{item.id}}"]
+    },
+    {
+      "id": "merge",
+      "kind": "command",
+      "when": {"step": "merge_ok", "field": "decision", "in": ["approve"]},
+      "run": ["git", "-C", "{{flow.game}}", "merge", "--no-ff", "kt/{{item.id}}", "-m", "КТ-заявка #{{item.id}}"]
+    },
+    {
+      "id": "done",
+      "kind": "finish",
+      "status": "done",
+      "notify": true,
+      "note": "влито в main; в релиз попадёт через release_kt.py --closes {{item.id}}"
+    }
+  ]
+}

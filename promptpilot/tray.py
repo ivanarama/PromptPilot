@@ -57,11 +57,25 @@ def _status_color() -> str:
 # Process management
 # ---------------------------------------------------------------------------
 
+# Services whose command is not just their name.
+_SERVICE_ARGS = {"flows": ["flows", "run"]}
+
+
 def _cmd(service: str):
     """Build command for a service using the current executable."""
+    args = _SERVICE_ARGS.get(service, [service])
     if getattr(sys, "frozen", False):
-        return [sys.executable, service]
-    return [sys.executable, "-m", "promptpilot", service]
+        return [sys.executable, *args]
+    return [sys.executable, "-m", "promptpilot", *args]
+
+
+def _flows_configured() -> bool:
+    """The flows runner is started only when there are flow files to run."""
+    try:
+        from .flows import has_flow_files
+        return has_flow_files()
+    except Exception:
+        return False
 
 
 def _is_running(service: str) -> bool:
@@ -195,6 +209,8 @@ def _build_menu(icon: pystray.Icon) -> pystray.Menu:
         _start("server")
         if os.environ.get("PP_TG_TOKEN"):
             _start("bot")
+        if _flows_configured():
+            _start("flows")
         _refresh(i)
 
     def stop_all(i, it):
@@ -219,6 +235,7 @@ def _build_menu(icon: pystray.Icon) -> pystray.Menu:
         pystray.MenuItem(_label("worker"), toggle_fn("worker")),
         pystray.MenuItem(_label("server"), toggle_fn("server")),
         pystray.MenuItem(_label("bot"),    toggle_bot),
+        pystray.MenuItem(_label("flows"),  toggle_fn("flows")),
         pystray.MenuItem("  Лог бота...", open_bot_log),
     ]
 
@@ -259,6 +276,8 @@ def run_tray():
     _start("server")
     if os.environ.get("PP_TG_TOKEN"):
         _start("bot")
+    if _flows_configured():
+        _start("flows")
 
     _refresh(icon)
     threading.Thread(
