@@ -686,7 +686,7 @@
         <input type="number" id="timeoutInput" placeholder="0 = no limit" min="0" style="width:80px" title="Per-task timeout in seconds (0 = no limit, empty = default)">
       </label>
       <label id="skipPermsLabel" style="flex-direction:row;align-items:center;gap:8px;cursor:pointer;display:none">
-        <input type="checkbox" id="skipPermissions" style="width:auto;margin:0">
+        <input type="checkbox" id="skipPermissions" checked style="width:auto;margin:0">
         <span style="font-size:13px;color:var(--yellow)" title="Claude: --dangerously-skip-permissions; Codex: --dangerously-bypass-approvals-and-sandbox">⚠ не спрашивать разрешения</span>
       </label>
       <label id="keepPaneLabel" style="flex-direction:row;align-items:center;gap:8px;cursor:pointer;display:none">
@@ -1331,6 +1331,8 @@ async function addTask() {
     toast('Не удалось создать задачу: ' + e.message);
     return;
   }
+
+  if (workdir) await rememberWorkdir(workdir);
 
   document.getElementById('promptInput').value = '';
   document.getElementById('recurrenceInput').value = '';
@@ -3872,22 +3874,64 @@ function selectSkill(name) {
 }
 
 // --- Load projects into dir select ---
+const RECENT_WORKDIRS_KEY = 'promptpilot.recent-workdirs';
+
+function recentWorkdirs() {
+  try {
+    const paths = JSON.parse(localStorage.getItem(RECENT_WORKDIRS_KEY) || '[]');
+    return Array.isArray(paths) ? paths.filter(p => typeof p === 'string' && p.trim()).slice(0, 10) : [];
+  } catch (_) { return []; }
+}
+
+async function rememberWorkdir(path) {
+  try {
+    const recent = [path, ...recentWorkdirs().filter(p => p.toLowerCase() !== path.toLowerCase())].slice(0, 10);
+    localStorage.setItem(RECENT_WORKDIRS_KEY, JSON.stringify(recent));
+    await loadProjects();
+    document.getElementById('workdirSelect').value = path;
+    onProjectSelect();
+  } catch (_) { /* Task was created; browser history is optional. */ }
+}
+
 async function loadProjects() {
   const projects = await fetchJSON(`${API}/projects`);
   const sel = document.getElementById('workdirSelect');
-  const inp = document.getElementById('workdirInput');
-  if (!projects || !projects.length) return;
+  let recent = recentWorkdirs();
+  if (!localStorage.getItem(RECENT_WORKDIRS_KEY)) {
+    try {
+      const tasks = await fetchJSON(`${API}/tasks?limit=100`);
+      const seen = new Set();
+      recent = tasks.map(t => t.working_dir).filter(path => {
+        if (!path || seen.has(path.toLowerCase())) return false;
+        seen.add(path.toLowerCase());
+        return true;
+      }).slice(0, 10);
+      localStorage.setItem(RECENT_WORKDIRS_KEY, JSON.stringify(recent));
+    } catch (_) { /* Project picker still works without task history. */ }
+  }
+  if ((!projects || !projects.length) && !recent.length) return;
 
-  projectsByPath = Object.fromEntries(projects.map(p => [p.path, p]));
+  projectsByPath = Object.fromEntries((projects || []).map(p => [p.path, p]));
+  const recentSet = new Set(recent.map(p => p.toLowerCase()));
+  const previous = sel.value;
   sel.innerHTML = [
     '<option value="">— Select project —</option>',
-    ...projects.map(p => `<option value="${escAttr(p.path)}">${esc(p.name)}${p.git ? '' : ' (не git)'}</option>`),
+    ...(recent.length ? ['<optgroup label="Недавние">',
+      ...recent.map(path => `<option value="${escAttr(path)}">${esc(path)}</option>`),
+      '</optgroup>'] : []),
+    ...((projects || []).length ? ['<optgroup label="Другие проекты">',
+      ...projects.filter(p => !recentSet.has(p.path.toLowerCase()))
+        .map(p => `<option value="${escAttr(p.path)}">${esc(p.name)}${p.git ? '' : ' (не git)'}</option>`),
+      '</optgroup>'] : []),
     '<option value="__custom__">✏️ Custom path...</option>',
   ].join('');
 
+  if (previous && [...sel.options].some(option => option.value === previous)) sel.value = previous;
   sel.style.display = '';
-  inp.style.display = 'none';
-  inp.placeholder = '';
+  if (sel.value !== '__custom__') {
+    document.getElementById('workdirInput').style.display = 'none';
+    document.getElementById('workdirInput').value = '';
+  }
   updateWorktree();
 }
 
