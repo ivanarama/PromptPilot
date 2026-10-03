@@ -14,9 +14,9 @@ deliberate change:
   published;
 * a 422 conflict fails the command with nothing published;
 * after the update the owner is a two-parent HEAD without a done marker, which
-  health routes to ``legacy-integration-review``: MERGE waits and REVIEW falls
-  back to the full skill. BEHIND → update → autonomous REVIEW → merge is NOT
-  complete — see BASE_SYNC_EXPERIMENTAL_NOTE.
+  health routes to ``legacy-integration-review``: without the separate
+  ``base_sync_carry`` opt-in, MERGE waits and REVIEW falls back to the full
+  skill (the carried path is pinned in tests/test_base_sync_carry.py).
 """
 
 import json
