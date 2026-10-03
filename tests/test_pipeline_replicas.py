@@ -473,6 +473,44 @@ def test_review_election_reserves_then_selects_next_candidate(
     assert exhausted is None
 
 
+def test_integration_owner_and_content_review_use_distinct_replica_reservations(
+        isolated_db, monkeypatch):
+    config = {
+        "repository": "owner/repo", "review_completion_gate": "target-v1",
+        "fallback_handoff": "target-v1", "parallel_content_review": True,
+        "review_lease_seconds": 300, "target_reservation_ttl_seconds": 300,
+    }
+    owner = {"number": 10, "head": HEAD_A, "stage": "integration-review"}
+    content = _candidate(11, HEAD_B)
+    health = {
+        "state": "yellow",
+        "findings": [{"code": "single_flight_barrier", "severity": "yellow", "pr": 10}],
+        "integration_owner": owner, "review_candidates": [owner],
+        "content_review_candidates": [content],
+        "parallel_review_candidates": [content], "merge_executable": [],
+    }
+    fallback_handoff.validate_health(health)
+    monkeypatch.setenv("PP_PIPELINE_REPLICAS", "2")
+    attempts = []
+    for index in range(2):
+        isolated_db.create_task(TaskCreate(prompt=f"parallel replica {index}"))
+        attempts.append(isolated_db.get_next_runnable())
+
+    candidates = health["review_candidates"] + pipelinectl.parallel_content_candidates(
+        config, health)
+    _set_replica_attempt_env(monkeypatch, attempts[0])
+    first, first_reservation, _ = pipelinectl._elect_review_candidate(
+        config, health, candidates)
+    _set_replica_attempt_env(monkeypatch, attempts[1])
+    second, second_reservation, _ = pipelinectl._elect_review_candidate(
+        config, health, candidates)
+
+    assert (first["number"], second["number"]) == (10, 11)
+    assert first_reservation["task_id"] == attempts[0].id
+    assert second_reservation["task_id"] == attempts[1].id
+    assert health["merge_executable"] == []
+
+
 def test_expired_owned_reservation_fails_without_retargeting(
         isolated_db, monkeypatch):
     config = {

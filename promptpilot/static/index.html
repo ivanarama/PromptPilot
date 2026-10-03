@@ -2767,7 +2767,7 @@ function aggregateDiagnosticFindings(findings) {
 
 function diagnosticFindingMessage(finding) {
   const messages = {
-    single_flight_barrier: 'Интеграционная полоса занята этим PR; обычное содержательное ревью других PR продолжает работать.',
+    single_flight_barrier: 'Слияние других PR ждёт завершения интеграции; обычное ревью идёт параллельно только при разрешённом маршруте.',
     legacy_ship_waiting_review_validation: 'Переход со старого формата: очередь безопасно перепроверит эти PR перед слиянием.',
     base_sync_base_advanced: 'Ветка main обновилась после подготовки PR; перед слиянием нужна повторная синхронизация.',
     ship_waiting_initial_review: 'Разрешение ship сохранено; этот HEAD сначала пройдёт обычное содержательное ревью.',

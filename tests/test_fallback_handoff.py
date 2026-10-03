@@ -59,6 +59,41 @@ def health(target_stage="integration-review"):
             "merge_executable": [] if reviewing else [target]}
 
 
+@pytest.mark.parametrize("change", [
+    {"number": 99}, {"head": "b" * 40}, {"review_depth": 2},
+    {"stage": "integration-review"},
+])
+def test_parallel_review_allowlist_cannot_expand_content_authority(change):
+    value = health()
+    content = {"number": 43, "head": "c" * 40,
+               "stage": "review", "review_depth": 0}
+    value["content_review_candidates"] = [content]
+    value["parallel_review_candidates"] = [dict(content, **change)]
+    with pytest.raises(pp.PipelineError, match="parallel REVIEW"):
+        handoff.validate_health(value)
+
+
+def test_parallel_review_allowlist_requires_integration_review_owner():
+    value = health("integration-merge-ready")
+    content = {"number": 43, "head": "c" * 40,
+               "stage": "review", "review_depth": 0}
+    value["content_review_candidates"] = [content]
+    value["review_candidates"] = [content]
+    value["parallel_review_candidates"] = [content]
+    with pytest.raises(pp.PipelineError, match="no integration-review owner"):
+        handoff.validate_health(value)
+
+
+def test_parallel_review_cannot_duplicate_integration_owner():
+    value = health()
+    duplicate = {"number": 42, "head": HEAD,
+                 "stage": "review", "review_depth": 0}
+    value["content_review_candidates"] = [duplicate]
+    value["parallel_review_candidates"] = [duplicate]
+    with pytest.raises(pp.PipelineError, match="includes its integration owner"):
+        handoff.validate_health(value)
+
+
 def invoke(argv):
     output = io.StringIO()
     with redirect_stdout(output):
