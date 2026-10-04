@@ -1684,24 +1684,31 @@ def _run_gate_commands(workflow: WorkflowInDB) -> WorkflowGateDecision:
 
 
 def parse_reviewer_report(report: str) -> WorkflowReviewDecision | None:
-    """Parse the strict reviewer tail while retaining a safe human fallback."""
-    match = re.search(
+    """Parse the strict reviewer tail while retaining a safe human fallback.
+
+    P24: отчёты ревью цитируют прошлые аудиты и вывод гейта — в них
+    встречаются ЧУЖИЕ строки AUDIT_VERDICT/AUDIT_FINDINGS_JSON. Решающее
+    значение имеет ПОСЛЕДНЯЯ пара строк (финал отчёта), а не первый матч
+    (инциденты 2026-10-04: цитированный PASS порождал ложный
+    «PASS + открытый blocker» и человеческий блокер при фактической
+    REVISION_REQUIRED)."""
+    verdict_matches = re.findall(
         r"(?mi)^AUDIT_VERDICT:\s*(PASS|REVISION_REQUIRED|HUMAN_REQUIRED)\s*$",
         report or "",
     )
-    if not match:
-        return None
+    if not verdict_matches:
+        return _parse_reviewer_itog_fallback(report)
     findings: list[ReviewFindingInput] = []
-    findings_match = re.search(
+    findings_matches = re.findall(
         r"(?mi)^AUDIT_FINDINGS_JSON:\s*(\[.*\])\s*$", report or ""
     )
-    if findings_match:
+    if findings_matches:
         try:
-            raw_findings = json.loads(findings_match.group(1))
+            raw_findings = json.loads(findings_matches[-1])
             findings = [ReviewFindingInput.model_validate(item) for item in raw_findings]
         except (json.JSONDecodeError, ValueError, TypeError):
             return None
-    verdict = ReviewVerdict(match.group(1).upper())
+    verdict = ReviewVerdict(verdict_matches[-1].upper())
     if verdict is ReviewVerdict.REVISION_REQUIRED and not findings:
         digest = hashlib.sha256((report or "").encode("utf-8")).hexdigest()[:16]
         findings = [ReviewFindingInput(
