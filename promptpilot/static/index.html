@@ -1795,6 +1795,42 @@ async function helperConfigure(name) {
 }
 
 let helperDragIdx = -1;
+let helperBusyMap = {};
+
+// 🗑 Убрать помощника: занятых (роль/ступень/смена) не удаляем — это сломало бы
+// конфиг воркфлоу; встроенных нельзя удалить — предлагаем скрыть.
+async function helperRemove(name) {
+  const uses = helperBusyMap[name] || [];
+  if (uses.length) {
+    toast(`«${name}» сейчас работает: ${uses.join(' · ')} — сначала замените его там`);
+    return;
+  }
+  try {
+    const qf = await fetchJSON(`${API}/quota-failover/config`);
+    const rung = (qf.ladder || []).find(r => r.executor === name);
+    if (rung) {
+      toast(`«${name}» стоит в смене «${rung.name || rung.executor}» (вкладка 🔁 Смены) — сначала уберите его оттуда`);
+      return;
+    }
+  } catch (e) { /* нет конфига смен — не блокируем */ }
+  if (!confirm(`Убрать помощника «${name}» из списка?`)) return;
+  try {
+    await fetchJSON(`${API}/providers/${encodeURIComponent(name)}`, { method: 'DELETE' });
+    toast(`Помощник «${name}» убран`);
+  } catch (e) {
+    if (String(e.message).includes('встроенные')) {
+      if (!confirm(`«${name}» — встроенный помощник, удалить нельзя. Скрыть его из списков?`)) return;
+      try {
+        await fetchJSON(`${API}/providers/${encodeURIComponent(name)}/hide`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+        });
+        toast(`«${name}» скрыт из списков`);
+      } catch (e2) { toast('Не получилось: ' + e2.message); return; }
+    } else { toast('❌ ' + e.message); return; }
+  }
+  await loadProviders();
+  renderHelpersTab();
+}
 
 // ── Каталог известных CLI: визард «Установить → Настроить → Подобрать модель» ──
 let catData = null;
@@ -1948,6 +1984,7 @@ function renderHelpersTab() {
     const pp = wf.config?.roles?.planner?.provider; if (pp) busy[pp] = busy[pp] || [];
     busy[pp].push('планировщик');
   }
+  helperBusyMap = busy;
   list.innerHTML = entries.map(([name, p], i) => {
     const h = p.human || {};
     const label = h.label || name;
@@ -1966,6 +2003,7 @@ function renderHelpersTab() {
           <button class="btn btn-sm btn-ghost" onclick="event.stopPropagation();probeProvider('${escAttr(name)}', this)" title="короткая проверка: запуск, доставка промпта, строка ИТОГ">🧪 Тест</button>
           <button class="btn btn-sm btn-ghost" onclick="event.stopPropagation();probeProvider('${escAttr(name)}', this, true)" title="длинный промпт ~40К: проверка argv-лимита — нужно для роли исполнителя">🧪+ Длинный</button>
           <button class="btn btn-sm btn-ghost" onclick="event.stopPropagation();helperConfigure('${escAttr(name)}')">⚙ Свойства</button>
+          <button class="btn btn-sm btn-danger" onclick="event.stopPropagation();helperRemove('${escAttr(name)}')" title="убрать помощника из списка (занятые и встроенные защищены)">🗑 Убрать</button>
         </span>
       </div>
       <div class="cz-hint" id="probe-${escAttr(name)}" style="display:none"></div>
@@ -1976,7 +2014,7 @@ function renderHelpersTab() {
   }).join('');
   if (!entries.length) list.innerHTML = '<div class="cz-hint">Помощников нет — добавьте в ⚙ Providers.</div>';
   else list.insertAdjacentHTML('beforeend',
-    '<div class="cz-hint" style="margin-top:8px">Карточку можно перетащить за ⠿ — порядок сохранится и появится в выпадающих списках «Проверки кода». Клик по карточке — свойства (команда запуска, ключи, модель).</div>');
+    '<div class="cz-hint" style="margin-top:8px">Карточку можно перетащить за ⠿ — порядок сохранится и появится в выпадающих списках «Проверки кода». Клик по карточке — свойства (команда запуска, ключи, модель). Список не растёт бесконечно: «🗑 Убрать» удаляет ненужного помощника — а занятые в ролях и сменах защищены от случайного удаления.</div>');
 }
 
 function helperDragStart(ev, i) {
