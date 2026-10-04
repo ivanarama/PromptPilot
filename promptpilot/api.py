@@ -23,6 +23,7 @@ from . import db, epf_tools, workflows
 from . import pipeline_insights
 from .config import API_TOKEN, DB_DIR, EFFORT_LEVELS, PIPELINE_SNAPSHOT_INTERVAL, get_provider_models, get_skills, load_providers, mask_secret_value, provider_available, PROJECTS_ROOT
 from .models import (
+    WorkflowPlanAmend,
     CostStats,
     FindingStatus,
     Stats,
@@ -733,6 +734,20 @@ def api_dispatch_workflow_planner(
     if dispatch.provider and dispatch.provider not in load_providers():
         raise HTTPException(400, f"Неизвестный провайдер «{dispatch.provider}»")
     return _workflow_action(workflows.dispatch_planner, workflow_id, dispatch)
+
+
+@app.post(
+    "/api/workflows/{workflow_id}/plan/amend",
+    response_model=List[WorkflowStageInDB],
+)
+def api_amend_workflow_plan(
+    workflow_id: str, amendment: WorkflowPlanAmend,
+):
+    """F5: правка хвоста утверждённого плана (opt-in, замороженный префикс
+    неприкосновенен, событие plan.amended с причиной)."""
+    if not db.get_workflow(workflow_id):
+        raise HTTPException(404, "Workflow not found")
+    return _workflow_action(workflows.amend_plan, workflow_id, amendment)
 
 
 @app.put(
