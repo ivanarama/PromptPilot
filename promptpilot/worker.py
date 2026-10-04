@@ -983,6 +983,30 @@ def _close_registered_provider_tree(task_id: int) -> bool:
     return True
 
 
+SPAWN_RETRY_DELAY_S = 20.0
+
+
+def _start_owned_with_spawn_retry(build, cmd, attempts=2,
+                                  delay_s=None, sleep=None, exists=None):
+    """U16: FileNotFoundError у СУЩЕСТВУЮЩЕГО исполняемого файла — транзиентное
+    давление ресурсов (255MB Electron-бинарник goose.exe при параллельных
+    тяжёлых задачах; инцидент 2026-10-03: ревью-слоты падали «CLI not found»,
+    одиночный запуск того же провайдера проходил). Один повтор через паузу;
+    действительно отсутствующий CLI падает сразу, без ожидания."""
+    import os as _os
+    delay_s = SPAWN_RETRY_DELAY_S if delay_s is None else delay_s
+    sleep = time.sleep if sleep is None else sleep
+    exists = _os.path.isfile if exists is None else exists
+    try:
+        return build()
+    except FileNotFoundError:
+        exe = str(cmd[0]) if cmd else ""
+        if attempts <= 1 or not exe or not exists(exe):
+            raise
+        sleep(delay_s)
+        return build()
+
+
 def _effective_timeout(task):
     """Per-task timeout in seconds; None = no limit (0 disables the global one)."""
     if task.task_timeout == 0:
@@ -1801,16 +1825,19 @@ def _execute_task_body(task, admission_complete=None):
     if callable(target_heartbeat):
         target_heartbeat(force=True)
     try:
-        tree = OwnedProcess.start(
+        tree = _start_owned_with_spawn_retry(
+            lambda: OwnedProcess.start(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                cwd=run_dir,
+                stdin=subprocess.PIPE if prompt_stdin is not None else subprocess.DEVNULL,
+                env=env,
+            ),
             cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            cwd=run_dir,
-            stdin=subprocess.PIPE if prompt_stdin is not None else subprocess.DEVNULL,
-            env=env,
         )
     except FileNotFoundError:
         _mark_failed(task, f"CLI '{provider}' not found. Is it installed and in PATH?", exit_code=-1)

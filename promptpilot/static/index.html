@@ -2064,7 +2064,7 @@ function workflowStatusInfo(status, reviewerDone = false) {
     awaiting_plan_approval: ['План ожидает утверждения', 'Проверьте порядок, scope и gate каждого этапа, затем утвердите план.'],
     queued: ['Готов к запуску', 'Следующее действие: выбрать исполнителя и отправить промпт.'],
     executing: ['Исполнитель работает', 'Следующее действие: наблюдать за агентом; после успешного ответа начнутся проверки.'],
-    gating: ['Автоматические проверки', 'Следующее действие: зафиксировать результат gate.'],
+    gating: ['Автоматические проверки', 'Проверки идут сами — ничего нажимать не нужно; результат применится автоматически.'],
     reviewing: ['Независимое ревью', 'Следующее действие: запустить проверяющего.'],
     revision_required: ['Нужны исправления', 'Следующее действие: открыть новый раунд доработок.'],
     awaiting_human: reviewerDone
@@ -2077,7 +2077,45 @@ function workflowStatusInfo(status, reviewerDone = false) {
   return info[status] || [status, ''];
 }
 
-function workflowOwnerInfo(wf, activeRun, reviewerDone) {
+function workflowNeedsHuman(wf) {
+  // U16b: gating в АВТО-режиме (auto_gate включён — наш дефолт) никого не
+  // ждёт: заголовок «НУЖНО ДЕЙСТВИЕ» врёт и рождал ложные тревоги владельца.
+  // Человека ждёт только ручной gate (auto_gate === false).
+  const s = wf?.status;
+  if (s === 'gating') return wf?.config?.automation?.auto_gate === false;
+  return ['awaiting_human', 'revision_required', 'awaiting_plan_approval'].includes(s);
+}
+
+function workflowHumanAlertCopy(status, reviewerDone, decisionState = {}) {
+  if (status === 'awaiting_human' && reviewerDone && decisionState.budgetExhausted) {
+    return ['Каскад остановлен по лимиту попыток',
+      'Ревью уже завершено, но автоматическая ступень исчерпала свои попытки. Сначала нужно выбрать новую политику или явно принять риск вручную.'];
+  }
+  if (status === 'revision_required' && decisionState.budgetExhausted) {
+    return ['Лимит попыток исчерпан',
+      'Новый раунд сейчас заблокирован защитным лимитом. Измените политику попыток или создайте новый этап после проверки замечаний.'];
+  }
+  if (status === 'awaiting_human' && reviewerDone) {
+    return ['Требуется ваше решение по ревью',
+      'Проверяющий уже закончил. Выберите один из вариантов ниже — после этого PromptPilot продолжит или завершит workflow.'];
+  }
+  if (status === 'revision_required') {
+    return ['Нужны исправления',
+      'Ревью вернуло текущий этап на доработку. Проверьте отчёт и нажмите «Продолжить пайплайн».'];
+  }
+  if (status === 'awaiting_plan_approval') {
+    return ['Нужно утвердить план',
+      'Проверьте порядок этапов и gate-команды, затем нажмите «Сохранить и утвердить».'];
+  }
+  if (status === 'gating') {
+    return ['Gate в ручном режиме',
+      'Автоматический gate выключен для этого воркфлоу. По завершении проверок выберите PASS или FAIL.'];
+  }
+  return ['Пайплайн остановлен: требуется действие человека',
+    'Проверьте причину остановки и нажмите «Продолжить пайплайн», чтобы передать управление обратно оркестратору.'];
+}
+
+function workflowOwnerInfo(wf, activeRun, reviewerDone, decisionState = {}) {
   if (wf.status === 'planning') return {
     who: 'Планировщик', detail: activeRun?.task_id ? `task #${activeRun.task_id} · разбивает задачу на этапы` : 'запускается',
     next: 'Дальше: ваше однократное утверждение плана', color: 'var(--accent)',

@@ -2,6 +2,7 @@
 
 import json
 import os
+import time
 import sys
 from pathlib import Path
 
@@ -321,7 +322,8 @@ BUILTIN_PROVIDERS = {
 
 
 def _providers_file() -> Path:
-    return DB_DIR / "providers.json"
+    # PP_DATA_DIR в момент вызова — тесты изолируют файл tmp-каталогом (U14)
+    return Path(os.environ.get("PP_DATA_DIR") or DB_DIR) / "providers.json"
 
 
 def load_providers() -> dict:
@@ -333,18 +335,29 @@ def load_providers() -> dict:
     providers = dict(BUILTIN_PROVIDERS)
     user_file = _providers_file()
     if user_file.exists():
-        try:
-            custom = _read_json_file(user_file)
+        # U14: внешний редактор может писать файл неатомарно (open("w") —
+        # усечение на лету). Один повтор чтения закрывает гонку: воркер,
+        # прочитавший обрывок, не терял кастомных провайдеров на задачу
+        # (инцидент 2026-10-03: ревью-ступень goose-zi падала «CLI not found»).
+        custom = None
+        for attempt in (1, 2):
+            try:
+                custom = _read_json_file(user_file)
+                break
+            except ValueError as e:
+                if attempt == 2:
+                    _warn_once("providers.json",
+                               f"⚠ {user_file} не читается ({e}) — кастомные провайдеры игнорируются")
+                else:
+                    time.sleep(0.25)
+            except OSError:
+                break
+        if isinstance(custom, dict):
             for name, info in custom.items():
                 if name in providers:
                     providers[name] = {**providers[name], **info}
                 else:
                     providers[name] = info
-        except ValueError as e:
-            _warn_once("providers.json",
-                       f"⚠ {user_file} не читается ({e}) — кастомные провайдеры игнорируются")
-        except OSError:
-            pass
     return providers
 
 
