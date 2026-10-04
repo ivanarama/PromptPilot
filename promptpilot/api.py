@@ -21,7 +21,8 @@ import re as _re
 
 from . import db, epf_tools, workflows
 from . import pipeline_insights
-from .config import API_TOKEN, DB_DIR, EFFORT_LEVELS, PIPELINE_SNAPSHOT_INTERVAL, get_provider_models, get_skills, load_providers, mask_secret_value, provider_available, PROJECTS_ROOT
+from .config import API_TOKEN, DB_DIR, EFFORT_LEVELS, PIPELINE_SNAPSHOT_INTERVAL, get_provider_models, get_skills, load_providers, mask_secret_value, provider_available, save_catalog_provider, PROJECTS_ROOT
+from .provider_catalog import CATALOG, catalog_entry, slugify, build_provider_entry
 from .models import (
     CostStats,
     FindingStatus,
@@ -1358,6 +1359,115 @@ def api_provider_models(name: str):
         if isinstance(m, dict) and m.get("id")
     })
     return {"endpoint": base, "models": ids, "count": len(ids)}
+
+
+# ── Каталог известных CLI: визард «Установить → Настроить → Подобрать модель» ──
+
+class CatalogConfig(_BaseModel):
+    base: str = ""
+    key: str = ""
+    model: str = ""
+    title: str = ""
+
+
+@app.get("/api/provider-catalog")
+def api_provider_catalog():
+    """Каталог известных CLI-агентов + статус установки + уже подключённые."""
+    import shutil
+    providers = load_providers()
+    items = []
+    for e in CATALOG:
+        configured = [name for name, p in providers.items()
+                      if p.get("catalog_id") == e["id"]]
+        items.append({
+            "id": e["id"], "title": e["title"], "icon": e["icon"],
+            "desc": e["desc"], "default_base": e.get("default_base", ""),
+            "install_hint": e.get("install_hint", ""),
+            "installed": bool(shutil.which(e["exe"])),
+            "configured": configured,
+        })
+    return {"items": items}
+
+
+@app.post("/api/provider-catalog/{cid}/install")
+def api_provider_catalog_install(cid: str):
+    """Поставить CLI в систему (npm-пакет или официальный zip)."""
+    import shutil
+    import subprocess
+    entry = catalog_entry(cid)
+    if not entry:
+        raise HTTPException(404, "Нет в каталоге")
+    argv = list(entry["install"])
+    resolved = shutil.which(argv[0])
+    if not resolved:
+        raise HTTPException(400, f"«{argv[0]}» не найден в системе — {entry.get('install_hint', 'установите вручную')}")
+    argv[0] = resolved
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=900,
+                              check=False)
+    except subprocess.TimeoutExpired:
+        raise HTTPException(504, "Установка не успела за 15 минут — проверьте сеть и повторите")
+    tail = "\n".join(((proc.stdout or "") + "\n" + (proc.stderr or "")).splitlines()[-15:])
+    return {"ok": proc.returncode == 0, "returncode": proc.returncode, "output": tail}
+
+
+@app.post("/api/provider-catalog/{cid}/models")
+def api_provider_catalog_models(cid: str, body: CatalogConfig):
+    """Подобрать известные модели: запрос идёт с сервера, ключ не возвращается."""
+    import json as _json
+    import urllib.error
+    import urllib.request
+    entry = catalog_entry(cid)
+    if not entry:
+        raise HTTPException(404, "Нет в каталоге")
+    base = (body.base or "").strip()
+    if not base:
+        raise HTTPException(400, "Вставьте адрес (endpoint) — без него список моделей не узнать")
+    if entry.get("api") == "anthropic":
+        url = base.rstrip("/") + "/v1/models"
+        req = urllib.request.Request(url)
+        req.add_header("x-api-key", body.key or "")
+        req.add_header("anthropic-version", "2023-06-01")
+    else:
+        url = base.rstrip("/") + "/models"
+        req = urllib.request.Request(url)
+        if body.key:
+            req.add_header("Authorization", "Bearer " + body.key)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(req, timeout=25) as r:
+            data = _json.loads(r.read().decode("utf-8", "replace") or "{}")
+    except urllib.error.HTTPError as exc:
+        raise HTTPException(502, f"Адрес ответил {exc.code}: проверьте адрес и ключ") from exc
+    except Exception as exc:  # транспортные ошибки важны целиком
+        raise HTTPException(502, f"Адрес недоступен: {type(exc).__name__}: {exc}") from exc
+    ids = sorted({
+        str(m.get("id")) for m in (data.get("data") or data.get("models") or [])
+        if isinstance(m, dict) and m.get("id")
+    })
+    if not ids:
+        raise HTTPException(502, "Адрес ответил, но моделей не вернул — проверьте адрес")
+    return {"models": ids, "count": len(ids)}
+
+
+@app.post("/api/provider-catalog/{cid}/create")
+def api_provider_catalog_create(cid: str, body: CatalogConfig):
+    """Создать помощника по выбору: короткое имя «CLI · Модель», cmd уже с моделью."""
+    entry = catalog_entry(cid)
+    if not entry:
+        raise HTTPException(404, "Нет в каталоге")
+    if not body.model:
+        raise HTTPException(400, "Сначала подберите модель")
+    providers = load_providers()
+    slug = f"{cid}-{slugify(body.model) or 'model'}"
+    name, n = slug, 2
+    while name in providers:
+        name = f"{slug}-{n}"
+        n += 1
+    prov = build_provider_entry(entry, body.base, body.key, body.model, body.title)
+    save_catalog_provider(name, prov)
+    return {"ok": True, "name": name, "label": prov["human"]["label"]}
 
 
 @app.post("/api/providers/{name}/probe")
