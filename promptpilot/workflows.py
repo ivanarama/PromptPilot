@@ -599,6 +599,110 @@ def replace_plan(workflow_id: str,
         return stages
 
 
+def amend_plan(workflow_id: str,
+               amendment) -> list:
+    """F5: динамическая перепланировка хвоста утверждённого плана (opt-in).
+
+    planning.allow_editing_approved_plan=true разрешает менять ТОЛЬКО
+    будущие карточки: замороженный префикс (завершённые этапы + текущий)
+    сохраняет свои id/статусы/времена как git-коммиты; финал обязан
+    остаться integration; deps хвоста — только на существующие коды.
+    Каждая правка пишет событие plan.amended с причиной (append-only)."""
+    with db._connect(immediate=True) as conn:
+        workflow = _workflow_row(conn, workflow_id)
+        _require_version(workflow, amendment.expected_version)
+        status = WorkflowStatus(workflow["status"])
+        live = status in {
+            WorkflowStatus.QUEUED, WorkflowStatus.EXECUTING,
+            WorkflowStatus.GATING, WorkflowStatus.REVIEWING,
+            WorkflowStatus.REVISION_REQUIRED, WorkflowStatus.AWAITING_HUMAN,
+        }
+        if not live:
+            raise db.WorkflowConflictError(
+                "amend доступен только живому воркфлоу после утверждения "
+                f"(статус {status.value}); до утверждения используйте обычную правку плана")
+        planning = _config_for(db._row_to_workflow(workflow)).planning
+        if not planning.allow_editing_approved_plan:
+            raise db.WorkflowConflictError(
+                "planning.allow_editing_approved_plan выключен — "
+                "утверждённый план неизменяем (поведение по умолчанию)")
+
+        existing = conn.execute(
+            "SELECT * FROM workflow_stages WHERE workflow_id=? ORDER BY position",
+            (workflow_id,)).fetchall()
+        if not existing:
+            raise db.WorkflowConflictError("workflow plan has no stages")
+        # замороженный префикс: все до и включая текущий этап
+        frozen_n = 0
+        for row in existing:
+            frozen_n += 1
+            if row["id"] == workflow["current_stage_id"]:
+                break
+        else:
+            frozen_n = 0
+        frozen_codes = [row["code"] for row in existing[:frozen_n]]
+        incoming_codes = [stage.code for stage in amendment.stages]
+        if incoming_codes[:frozen_n] != frozen_codes:
+            raise db.WorkflowConflictError(
+                "замороженный префикс плана неприкосновенен (завершённые + "
+                f"текущий этап): ожидались коды {frozen_codes}, получено "
+                f"{incoming_codes[:frozen_n]}")
+        if len(amendment.stages) > planning.max_stages:
+            raise db.WorkflowConflictError(
+                f"plan exceeds max_stages={planning.max_stages}")
+        if amendment.stages[-1].stage_type.value != "integration":
+            raise db.WorkflowConflictError(
+                "the final workflow stage must have stage_type=integration")
+        # зависимости хвоста — на замороженные коды или предыдущие хвостовые
+        known = set(frozen_codes)
+        for stage in amendment.stages[frozen_n:]:
+            unknown = set(stage.dependencies) - known
+            if unknown:
+                raise db.WorkflowConflictError(
+                    f"stage {stage.code} dependencies must reference earlier stages: "
+                    + ", ".join(sorted(unknown)))
+            known.add(stage.code)
+
+        # пересобрать ТОЛЬКО хвост: замороженный префикс не трогаем вовсе
+        # (id/статусы/времена и FK от workflow_rounds остаются целыми)
+        frozen_ids = [row["id"] for row in existing[:frozen_n]]
+        placeholders = ",".join("?" * len(frozen_ids))
+        conn.execute(
+            f"DELETE FROM workflow_stages WHERE workflow_id=? AND id NOT IN ({placeholders})",
+            [workflow_id, *frozen_ids])
+        now = db._now()
+        for position, stage in enumerate(amendment.stages[frozen_n:], start=frozen_n + 1):
+            spec = stage.model_dump(
+                mode="json", exclude={"code", "title", "objective", "stage_type"})
+            conn.execute(
+                """INSERT INTO workflow_stages
+                   (id, workflow_id, position, code, title, objective, stage_type,
+                    status, spec_json, created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (db._new_id("stage"), workflow_id, position, stage.code,
+                 stage.title, stage.objective, stage.stage_type.value,
+                 "pending", db._json_dump(spec), now))
+        conn.execute(
+            "UPDATE workflow_plans SET updated_at=? WHERE workflow_id=?",
+            (now, workflow_id))
+        old_codes = [row["code"] for row in existing]
+        _touch(
+            conn, workflow, "plan.amended",
+            {
+                "reason": amendment.reason,
+                "frozen_codes": frozen_codes,
+                "old_codes": old_codes,
+                "new_codes": incoming_codes,
+                "added": [c for c in incoming_codes if c not in old_codes],
+                "removed": [c for c in old_codes if c not in incoming_codes],
+            },
+        )
+        rows = conn.execute(
+            "SELECT * FROM workflow_stages WHERE workflow_id=? ORDER BY position",
+            (workflow_id,)).fetchall()
+        return [db._row_to_workflow_stage(r) for r in rows]
+
+
 def approve_plan(workflow_id: str,
                  approval: WorkflowPlanApproval) -> WorkflowInDB:
     with db._connect(immediate=True) as conn:
