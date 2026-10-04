@@ -4,7 +4,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools" / "addons"))
-from plan_pilot import validate_amendment, DEFAULT_GATE_CANON
+from plan_pilot import validate_amendment
 
 
 def test_gate_canon_missing_check_blocks():

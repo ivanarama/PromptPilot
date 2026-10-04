@@ -39,7 +39,6 @@ def test_custom_provider_survives_truncated_read(isolated_providers, monkeypatch
 def test_permanently_broken_file_falls_back_to_builtins(isolated_providers, monkeypatch):
     (isolated_providers / "providers.json").write_text("{broken", encoding="utf-8")
     calls = {"n": 0}
-    real_read = cfg._read_json_file
 
     def always_broken(path):
         calls["n"] += 1

@@ -1801,7 +1801,7 @@ def parse_reviewer_report(report: str) -> WorkflowReviewDecision | None:
         report or "",
     )
     if not verdict_matches:
-        return _parse_reviewer_itog_fallback(report)
+        return None
     findings: list[ReviewFindingInput] = []
     findings_matches = re.findall(
         r"(?mi)^AUDIT_FINDINGS_JSON:\s*(\[.*\])\s*$", report or ""
