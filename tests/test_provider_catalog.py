@@ -76,7 +76,13 @@ class _FakeOpener:
 
 @pytest.fixture()
 def isolated_providers(tmp_path, monkeypatch):
+    from promptpilot import config
+
+    monkeypatch.setattr(config, "DB_DIR", tmp_path)
     monkeypatch.setenv("PP_DATA_DIR", str(tmp_path))
+    get_cache = getattr(config, "_providers_cache", None)
+    if isinstance(get_cache, dict):
+        get_cache.clear()
     yield tmp_path
 
 
