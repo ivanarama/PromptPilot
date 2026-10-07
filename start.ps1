@@ -25,10 +25,23 @@ if (Test-Path -LiteralPath $envFile -PathType Leaf) {
     Write-Host "Loaded .env" -ForegroundColor DarkGray
 }
 
+function Test-PromptPilotCommandLine([string]$Pattern) {
+    [bool](Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='pythonw.exe'" |
+        Where-Object { $_.CommandLine -match $Pattern })
+}
+
 # Check if already running
 if (Test-Path $pidFile) {
     $old = Get-Content $pidFile | ConvertFrom-Json
     $alive = $old.PSObject.Properties | Where-Object {
+        # A watcher may survive a crashed core process.  It is discovered by
+        # command line in stop.ps1, but must not make a fresh core start look
+        # healthy or block recovery from a stale PID file.
+        if ($_.Name -eq 'verdict_watcher') { return $false }
+        # pid=0 means "not launched" (long-dead Telegram bot); Get-Process -Id 0
+        # succeeds on the System Idle process and made a fully dead stack look
+        # "already running" (incident 07.10: start-all refused to revive it).
+        if (-not $_.Value -or [int]$_.Value -le 0) { return $false }
         try { Get-Process -Id $_.Value -ErrorAction Stop; $true } catch { $false }
     }
     if ($alive) {
@@ -69,6 +82,31 @@ $pids = [ordered]@{ worker = $w.Id; server = $s.Id }
 Write-Host "  Worker  PID $($w.Id)   logs\worker.log" -ForegroundColor Green
 Write-Host "  Server  PID $($s.Id)   http://127.0.0.1:8420" -ForegroundColor Green
 
+# The review-chain controller is an additive companion.  It uses the same
+# PromptPilot DB and port, and stays idle for workflows without review_chain.
+$cascadePython = if (Test-Path 'C:\Python314\python.exe') { 'C:\Python314\python.exe' } elseif (Test-Path "$PSScriptRoot\.venv\Scripts\python.exe") { "$PSScriptRoot\.venv\Scripts\python.exe" } else { 'python' }
+$cascade = Start-Process $cascadePython -ArgumentList @('-X', 'utf8', "$PSScriptRoot\cascade-review.py") `
+    -WorkingDirectory $PSScriptRoot -RedirectStandardOutput "$logDir\cascade-review.log" `
+    -RedirectStandardError "$logDir\cascade-review.err" -WindowStyle Hidden -PassThru
+$pids.cascade = $cascade.Id
+Write-Host "  Cascade PID $($cascade.Id)   ~/.promptpilot/cascade-review.log" -ForegroundColor Green
+
+# The verdict-repair watcher is part of the local autonomous workflow.  It
+# consumes ELICIT events and auto-resolves the narrow capability question
+# (helper-agent) when the workflow is explicitly automated.  start-all.ps1
+# also knows how to start it; the command-line guard keeps both entry points
+# idempotent and prevents two watchers from consuming the same event stream.
+if (Test-PromptPilotCommandLine 'verdict-repair-watcher\.py') {
+    Write-Host "  Verdict watcher already running" -ForegroundColor DarkGray
+} else {
+    $watcherPython = if (Test-Path 'C:\Python314\pythonw.exe') { 'C:\Python314\pythonw.exe' } elseif (Test-Path "$PSScriptRoot\.venv\Scripts\pythonw.exe") { "$PSScriptRoot\.venv\Scripts\pythonw.exe" } else { 'pythonw' }
+    $watcher = Start-Process $watcherPython -ArgumentList @('-X', 'utf8', "$PSScriptRoot\verdict-repair-watcher.py") `
+        -WorkingDirectory $PSScriptRoot -RedirectStandardOutput "$logDir\verdict-repair-watcher.stdout.log" `
+        -RedirectStandardError "$logDir\verdict-repair-watcher.stderr.log" -WindowStyle Hidden -PassThru
+    $pids.verdict_watcher = $watcher.Id
+    Write-Host "  Verdict watcher PID $($watcher.Id)   ~/.promptpilot/verdict-repair.log" -ForegroundColor Green
+}
+
 if ($Bot -or $env:PP_TG_TOKEN) {
     if (-not $env:PP_TG_TOKEN) {
         Write-Host "PP_TG_TOKEN is not set, skipping bot." -ForegroundColor Yellow
@@ -82,6 +120,7 @@ if ($Bot -or $env:PP_TG_TOKEN) {
     }
 }
 
-$pids | ConvertTo-Json | Set-Content -LiteralPath $pidFile -Encoding UTF8
+# ASCII: без BOM — PowerShell-UTF8 пишет BOM и ломает json-читателей
+$pids | ConvertTo-Json | Set-Content -LiteralPath $pidFile -Encoding Ascii
 
 Write-Host "`nAll logs in .\logs\   Stop with: .\stop.ps1" -ForegroundColor DarkGray

@@ -1,13 +1,14 @@
 """FastAPI web API + static file serving."""
 
 import asyncio
+import json
 import base64
 import secrets
 import subprocess
 import sys
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
 
@@ -637,6 +638,95 @@ def api_list_workflow_runs(workflow_id: str, round_id: str):
     if not round_data or round_data.workflow_id != workflow_id:
         raise HTTPException(404, "Workflow round not found")
     return db.list_workflow_runs(round_id)
+
+
+def api_token_stats():
+    """Токены конвейера из реальных источников: Meta-блоки задач (codex и
+    прочие stream-json CLI) + журнал qwen. Панель показывает это, пока
+    ни один раннер не пишет Cost-строки."""
+    from . import usage_conveyor
+
+    return usage_conveyor.summary()
+
+
+class NoteBody(BaseModel):
+    text: str = ""
+
+
+HEALTH_PROCESS_NAMES = (
+    "server", "worker", "cascade", "verdict_watcher",
+    "bot", "bot_vk", "quota_failover",
+)
+HEALTH_LABELS = {
+    "server": "сервер API", "worker": "воркер задач",
+    "cascade": "каскад ревью", "verdict_watcher": "вотчер вердиктов",
+    "bot": "Telegram-бот", "bot_vk": "VK-бот",
+    "quota_failover": "вотчер лестницы смен",
+}
+HEALTH_PIDS_PATH = Path(__file__).resolve().parent.parent / ".pp-pids.json"
+# квен-H3: якорь = корень репозитория (тот же, что у лаунчеров);
+# DB_DIR.parent в frozen/Docker расползается с этим путём
+
+
+def _pid_alive(pid: int):
+    """True/False/None(не знаем). Квен-L11: ACCESS_DENIED — не «смерть»;
+    прототипы ctypes заданы явно, HANDLE не урезается."""
+    if not pid or pid <= 0:
+        return False
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32  # noqa: N806 - win api
+        kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int,
+                                         ctypes.c_uint32]
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.GetLastError.restype = ctypes.c_uint32
+        handle = kernel32.OpenProcess(0x1000, 0, int(pid))
+        if not handle:
+            # 5 = ERROR_ACCESS_DENIED: процесс чужой/элевированный — жив
+            return None if kernel32.GetLastError() == 5 else False
+        kernel32.CloseHandle(handle)
+        return True
+    except Exception:  # noqa: BLE001 - не-Windows или без прав: не знаем
+        return None
+
+
+@app.get("/api/health/processes")
+def api_health_processes():
+    try:
+        pids = json.loads(HEALTH_PIDS_PATH.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        pids = {}
+    if not isinstance(pids, dict):
+        pids = {}
+    processes = []
+    known = False
+    for name in HEALTH_PROCESS_NAMES:
+        try:
+            pid = int(pids.get(name) or 0)
+        except (TypeError, ValueError):
+            pid = 0
+        known = known or pid > 0
+        # pid=0 — «не запущен» (давно выключенный Telegram-бот): не смерть
+        # и не тревога; тревога — только был жив и умер (квен-H4)
+        alive = _pid_alive(pid)
+        if not pid:
+            state = "off"
+        elif alive is None:
+            state = "unknown"
+        else:
+            state = "alive" if alive else "dead"
+        processes.append({
+            "name": name, "label": HEALTH_LABELS.get(name, name),
+            "pid": pid, "state": state, "alive": state != "dead",
+        })
+    # квен-H4: нет данных вообще — честное «не знаем», не зелёная панель
+    ok = known and all(p["state"] != "dead" for p in processes)
+    return {
+        "ok": ok,
+        "processes": processes,
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 @app.get(
