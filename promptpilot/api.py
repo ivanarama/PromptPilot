@@ -2,6 +2,9 @@
 
 import asyncio
 import base64
+import json
+import os
+import time
 import secrets
 import subprocess
 import sys
@@ -16,12 +19,12 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import Response
 from pydantic import BaseModel
 
-import os
 import re as _re
 
 from . import db, epf_tools, workflows
 from . import pipeline_insights
-from .config import API_TOKEN, DB_DIR, EFFORT_LEVELS, PIPELINE_SNAPSHOT_INTERVAL, get_provider_models, get_skills, load_providers, mask_secret_value, provider_available, PROJECTS_ROOT
+from .config import API_TOKEN, DB_DIR, EFFORT_LEVELS, PIPELINE_SNAPSHOT_INTERVAL, get_provider_models, get_skills, load_providers, mask_secret_value, provider_available, save_catalog_provider, PROJECTS_ROOT
+from .provider_catalog import CATALOG, catalog_entry, slugify, build_provider_entry
 from .models import (
     CostStats,
     FindingStatus,
@@ -1314,6 +1317,253 @@ def api_provider_create(p: ProviderCreate):
         # он единственный, который приходится менять от этапа к этапу.
         save_provider(p.name, p.cmd, p.description, env=p.env or None,
                       models=p.models or None, effort=p.effort)
+    return {"ok": True}
+
+
+@app.get("/api/providers/{name}/models")
+def api_provider_models(name: str):
+    """U13: живой список моделей с эндпоинта провайдера (ключ не покидает сервер).
+
+    Работает для OpenAI-совместимых провайдеров: env провайдера ищет
+    OPENAI_BASE_URL/OPENAI_API_KEY или LLM_BASE_URL/LLM_API_KEY, дергает
+    GET {base}/models. Ответ содержит только id моделей и сам эндпоинт —
+    секреты не возвращаются никогда.
+    """
+    import urllib.request
+    import urllib.error
+
+    providers = load_providers()
+    cfg = providers.get(name)
+    if not cfg:
+        raise HTTPException(404, "Провайдер не найден")
+    env = cfg.get("env") or {}
+    base = env.get("OPENAI_BASE_URL") or env.get("LLM_BASE_URL") or ""
+    key = env.get("OPENAI_API_KEY") or env.get("LLM_API_KEY") or ""
+    if not base:
+        raise HTTPException(
+            400,
+            "У этого помощника нет OpenAI-совместимого эндпоинта в настройках "
+            "(OPENAI_BASE_URL/LLM_BASE_URL). Список моделей недоступен по запросу.",
+        )
+    req = urllib.request.Request(base.rstrip("/") + "/models")
+    if key:
+        req.add_header("Authorization", "Bearer " + key)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(req, timeout=25) as r:
+            data = json.loads(r.read().decode("utf-8", "replace") or "{}")
+    except urllib.error.HTTPError as exc:
+        raise HTTPException(502, f"Эндпоинт ответил {exc.code}: список моделей не получен") from exc
+    except Exception as exc:  # noqa: BLE001 - транспортные ошибки важны целиком
+        raise HTTPException(502, f"Эндпоинт недоступен: {type(exc).__name__}: {exc}") from exc
+    ids = sorted({
+        str(m.get("id")) for m in (data.get("data") or data.get("models") or [])
+        if isinstance(m, dict) and m.get("id")
+    })
+    return {"endpoint": base, "models": ids, "count": len(ids)}
+
+
+# ── Каталог известных CLI: визард «Установить → Настроить → Подобрать модель» ──
+
+class CatalogConfig(_BaseModel):
+    base: str = ""
+    key: str = ""
+    model: str = ""
+    title: str = ""
+
+
+@app.get("/api/provider-catalog")
+def api_provider_catalog():
+    """Каталог известных CLI-агентов + статус установки + уже подключённые."""
+    import shutil
+    providers = load_providers()
+    items = []
+    for e in CATALOG:
+        configured = [name for name, p in providers.items()
+                      if p.get("catalog_id") == e["id"]]
+        items.append({
+            "id": e["id"], "title": e["title"], "icon": e["icon"],
+            "desc": e["desc"], "default_base": e.get("default_base", ""),
+            "install_hint": e.get("install_hint", ""),
+            "installed": bool(shutil.which(e["exe"])),
+            "configured": configured,
+        })
+    return {"items": items}
+
+
+@app.post("/api/provider-catalog/{cid}/install")
+def api_provider_catalog_install(cid: str):
+    """Поставить CLI в систему (npm-пакет или официальный zip)."""
+    import shutil
+    import subprocess
+    entry = catalog_entry(cid)
+    if not entry:
+        raise HTTPException(404, "Нет в каталоге")
+    argv = list(entry["install"])
+    resolved = shutil.which(argv[0])
+    if not resolved:
+        raise HTTPException(400, f"«{argv[0]}» не найден в системе — {entry.get('install_hint', 'установите вручную')}")
+    argv[0] = resolved
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=900,
+                              check=False)
+    except subprocess.TimeoutExpired:
+        raise HTTPException(504, "Установка не успела за 15 минут — проверьте сеть и повторите")
+    tail = "\n".join(((proc.stdout or "") + "\n" + (proc.stderr or "")).splitlines()[-15:])
+    return {"ok": proc.returncode == 0, "returncode": proc.returncode, "output": tail}
+
+
+@app.post("/api/provider-catalog/{cid}/models")
+def api_provider_catalog_models(cid: str, body: CatalogConfig):
+    """Подобрать известные модели: запрос идёт с сервера, ключ не возвращается."""
+    import json as _json
+    import urllib.error
+    import urllib.request
+    entry = catalog_entry(cid)
+    if not entry:
+        raise HTTPException(404, "Нет в каталоге")
+    base = (body.base or "").strip()
+    if not base:
+        raise HTTPException(400, "Вставьте адрес (endpoint) — без него список моделей не узнать")
+    if entry.get("api") == "anthropic":
+        url = base.rstrip("/") + "/v1/models"
+        req = urllib.request.Request(url)
+        req.add_header("x-api-key", body.key or "")
+        req.add_header("anthropic-version", "2023-06-01")
+    else:
+        url = base.rstrip("/") + "/models"
+        req = urllib.request.Request(url)
+        if body.key:
+            req.add_header("Authorization", "Bearer " + body.key)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(req, timeout=25) as r:
+            data = _json.loads(r.read().decode("utf-8", "replace") or "{}")
+    except urllib.error.HTTPError as exc:
+        raise HTTPException(502, f"Адрес ответил {exc.code}: проверьте адрес и ключ") from exc
+    except Exception as exc:  # транспортные ошибки важны целиком
+        raise HTTPException(502, f"Адрес недоступен: {type(exc).__name__}: {exc}") from exc
+    ids = sorted({
+        str(m.get("id")) for m in (data.get("data") or data.get("models") or [])
+        if isinstance(m, dict) and m.get("id")
+    })
+    if not ids:
+        raise HTTPException(502, "Адрес ответил, но моделей не вернул — проверьте адрес")
+    return {"models": ids, "count": len(ids)}
+
+
+@app.post("/api/provider-catalog/{cid}/create")
+def api_provider_catalog_create(cid: str, body: CatalogConfig):
+    """Создать помощника по выбору: короткое имя «CLI · Модель», cmd уже с моделью."""
+    entry = catalog_entry(cid)
+    if not entry:
+        raise HTTPException(404, "Нет в каталоге")
+    if not body.model:
+        raise HTTPException(400, "Сначала подберите модель")
+    providers = load_providers()
+    slug = f"{cid}-{slugify(body.model) or 'model'}"
+    name, n = slug, 2
+    while name in providers:
+        name = f"{slug}-{n}"
+        n += 1
+    prov = build_provider_entry(entry, body.base, body.key, body.model, body.title)
+    save_catalog_provider(name, prov)
+    return {"ok": True, "name": name, "label": prov["human"]["label"]}
+
+
+@app.post("/api/providers/{name}/probe")
+def api_provider_probe(name: str, body: dict | None = None):
+    """Проверка провайдера ДО включения в конвейер.
+
+    Зонд идёт тем же путём, что и реальные задачи (build_cmd + env +
+    stdin/argv по конфигу), и проверяет три вещи:
+      1) процесс вообще запускается (и не упёрся в лимит длины командной строки);
+      2) промпт ДОСТАВЛЕН — модель повторила контрольную строку со случайным
+         токеном (ловит «-» вместо промпта, неработающий stdin и т.п.);
+      3) модель держит контракт вердикта — в ответе есть строка «ИТОГ:».
+    long=True прогоняет промпт ~40К символов: argv-провайдеры без stdin
+    на нём честно падают — так заранее видно, тянет ли провайдер роль исполнителя.
+    """
+    from .config import build_cmd, get_provider_env
+    providers = load_providers()
+    cfg = providers.get(name)
+    if not cfg:
+        raise HTTPException(404, "Провайдер не найден")
+    long_mode = bool((body or {}).get("long"))
+    token = "ПРОБА-" + secrets.token_hex(3)
+    prompt = ("Это тестовая проверка связи. Напиши ровно две строки и ничего больше:\n"
+              f"{token}\nИТОГ: ГОТОВО — тест")
+    if long_mode:
+        prompt += ("\n\n(Далее длинный служебный текст для проверки доставки больших промптов; "
+                   "читать и повторять его не нужно:)\n" + ("наполнитель-пробы-доставки. " * 2400))
+    try:
+        cmd = build_cmd(name, prompt, guard=False)
+    except Exception as exc:
+        raise HTTPException(400, f"Не удалось собрать команду: {exc}")
+    env = get_provider_env(name)
+    use_stdin = bool(cfg.get("prompt_stdin"))
+    # .CMD-шимы (npm CLIs: qwen, opencode) не запускаются по «голому» имени —
+    # резолвим полный путь так же, как это делает воркер (worker.py:1786).
+    import shutil as _shutil
+    resolved = _shutil.which(cmd[0], path=env.get("PATH"))
+    if resolved:
+        cmd[0] = resolved
+    cwd = r"C:\Users\Nachfin\Desktop\Projets\BookApp"
+    if not os.path.isdir(cwd):
+        cwd = str(Path.home())
+    started = time.time()
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=300,
+            input=prompt if use_stdin else None,
+            env=env, cwd=cwd)
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "delivered": False, "verdict": False,
+                "issues": ["таймаут 300 с — провайдер не ответил"]}
+    except (FileNotFoundError, OSError) as exc:
+        issues = [f"процесс не запустился: {exc}"]
+        if long_mode and not use_stdin:
+            issues.append("длинный промпт (~40К) не прошёл: argv-провайдер упирается в лимит "
+                          "командной строки Windows 32К. Для роли исполнителя нужен провайдер "
+                          "с поддержкой stdin (codex/opencode/mcode) либо короткие промпты.")
+        return {"ok": False, "delivered": False, "verdict": False, "issues": issues}
+    out = (proc.stdout or "") + "\n" + (proc.stderr or "")
+    delivered = token in out
+    verdict = "ИТОГ" in out.upper()
+    issues = []
+    if not delivered:
+        issues.append("ПРОМПТ НЕ ДОСТАВЛЕН: ответ не содержит контрольную строку. "
+                      "Типичные причины: провайдер не читает stdin (символ «-» уходит в модель "
+                      "как текст), сломанный шаблон {prompt}, чужая ошибка авторизации.")
+    if not verdict:
+        issues.append("Нет строки «ИТОГ:» — контракт вердикта не соблюдён; для ролей конвейера "
+                      "это критично (задачи будут падать в ожидание человека).")
+    if delivered and verdict and long_mode and not use_stdin:
+        issues.append("Примечание: длинный тест прошёл, но провайдер работает через argv — "
+                      "промпты заметно длиннее 30К символов могут не пройти.")
+    return {
+        "ok": delivered and verdict,
+        "delivered": delivered,
+        "verdict": verdict,
+        "stdin_mode": use_stdin,
+        "long_mode": long_mode,
+        "exit_code": proc.returncode,
+        "latency_s": round(time.time() - started, 1),
+        "output_tail": out[-500:],
+        "issues": issues,
+    }
+
+
+@app.post("/api/providers/reorder")
+def api_providers_reorder(body: dict):
+    """Save the helper-card order (list of provider names, desired order)."""
+    from .config import set_providers_ui_order
+    names = body.get("names")
+    if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
+        raise HTTPException(400, "Ожидается {\"names\": [имена провайдеров по порядку]}")
+    set_providers_ui_order(names)
     return {"ok": True}
 
 

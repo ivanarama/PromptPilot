@@ -734,6 +734,49 @@
   <div class="task-list" id="taskList"></div>
 </div>
 
+<div class="modal-overlay" id="settingsModal">
+  <!-- U10: окно настроек НЕ закрывается кликом в соседнюю область (директива
+       владельца 2026-10-03) — только явной кнопкой Close или Esc. -->
+  <div class="modal" style="max-width:820px">
+    <h2>⚙ Настройки <button class="btn btn-sm btn-ghost" style="margin-left:auto" onclick="closeSettings()">Закрыть</button></h2>
+    <div class="set-tabs">
+      <button class="set-tab active" data-tab="appearance" onclick="setTab('appearance')">🎨 Оформление</button>
+      <button class="set-tab" data-tab="review" onclick="setTab('review')">🛡 Проверка кода</button>
+      <button class="set-tab" data-tab="helpers" onclick="setTab('helpers')">🤖 Помощники</button>
+      <button class="set-tab" data-tab="auto" onclick="setTab('auto')">🩺 Автопилот</button>
+      <button class="set-tab" data-tab="perms" onclick="setTab('perms')">🛂 Права</button>
+    </div>
+
+    <div class="set-pane" id="set-appearance">
+      <p class="cz-hint" style="margin-bottom:10px">Тема применяется сразу и запоминается.</p>
+      <div class="cz-row">
+        <label class="cz-inline"><input type="radio" name="set-theme" value="dark" onchange="applyThemeChoice()"> 🌙 Тёмная</label>
+        <label class="cz-inline"><input type="radio" name="set-theme" value="light" onchange="applyThemeChoice()"> ☀ Светлая (белый фон, чёрный текст)</label>
+      </div>
+      <div class="cz-hint" style="margin-top:8px">Светлая палитра — GitHub-Light: белые карточки, мягкие границы, чёрный текст.</div>
+    </div>
+
+    <div class="set-pane" id="set-review" style="display:none">
+      <div class="cz-row">
+        <span class="cz-label">Воркфлоу:</span>
+        <select id="set-wf" class="cz-prov" onchange="setReviewLoad()" style="max-width:280px"></select>
+      </div>
+      <div id="set-review-body"><div class="cz-hint">Загрузка…</div></div>
+    </div>
+
+    <div class="set-pane" id="set-helpers" style="display:none">
+      <p class="cz-hint" style="margin-bottom:10px">Помощники — это разные модели ИИ. Настраиваются один раз (команды запуска и ключи — для опытных), назначаются на работу во вкладке «Проверка кода».</p>
+      <div class="cz-card" id="set-helpers-catalog" style="margin-bottom:10px"></div>
+      <div id="set-helpers-list"></div>
+    </div>
+
+    <div class="set-pane" id="set-auto" style="display:none"></div>
+
+
+    <div class="set-pane" id="set-perms" style="display:none"></div>
+  </div>
+</div>
+
 <div class="modal-overlay" id="epfModal" onclick="if(event.target===this)closeEpf()">
   <div class="modal" style="max-width:720px">
     <h2>🔧 1С: доработка обработок <button class="btn btn-sm btn-ghost" style="margin-left:auto" onclick="closeEpf()">✕ Закрыть</button></h2>
@@ -931,6 +974,14 @@
         <label><input type="checkbox" id="pfKeep"> Оставлять сессию открытой после задачи (keep pane)</label>
       </div>
       <input id="pfModels" placeholder="модели для выбора (через запятую), например: opencode/big-pickle, opencode/mimo-v2.5-free">
+      <div class="cz-row" style="gap:6px;flex-wrap:wrap">
+        <button type="button" class="btn btn-sm btn-ghost" onclick="provFetchModels()" title="запросить живой список моделей с эндпоинта провайдера (ключ остаётся на сервере); сначала Сохраните помощника">📥 Запросить модели у провайдера</button>
+        <span class="cz-hint" id="pfModelsMsg"></span>
+      </div>
+      <b style="font-size:13px">🔌 Подключение (OpenAI-совместимое)</b>
+      <div class="cz-hint">Удобные поля вместо ручного редактирования переменных: эндпоинт уходит в OPENAI_BASE_URL, ключ — в OPENAI_API_KEY (не показывается обратно; пусто = не менять). Для иных переменных — textarea ниже.</div>
+      <input id="pfEndpoint" placeholder="эндпоинт, например https://api.z.ai/api/coding/paas/v4">
+      <input id="pfKey" type="password" placeholder="ключ API (сохранённый не отображается)">
       <label style="display:flex; align-items:center; gap:8px">Эффорт рассуждений
         <select id="pfEffort">
           <option value="">по умолчанию CLI</option>
@@ -941,7 +992,9 @@
           <option value="max">max</option>
         </select>
       </label>
-      <textarea id="pfEnv" rows="2" placeholder="переменные окружения, по одной на строку: KEY=VALUE"></textarea>
+      <b style="font-size:13px">🔑 Прочие ключи и переменные окружения</b>
+      <div class="cz-hint">По одной на строку в виде KEY=значение. Эндпоинт и ключ задавайте в полях «Подключение» выше. Секреты показываются маской *** — оставляйте их как есть или впишите новое значение.</div>
+      <textarea id="pfEnv" rows="3" placeholder="например:&#10;GOOSE_MODEL=glm-5.3-flash&#10;CODEX_HOME=C:/Users/FIREBAT/.codex"></textarea>
       <button class="btn btn-primary" type="submit" style="align-self:flex-start">Сохранить</button>
       <div id="pfError" style="color:var(--red); font-size:13px"></div>
     </form>
@@ -1099,6 +1152,1219 @@ function taskDisplayTitle(t) {
   if (t.series_title) return t.series_title;
   const firstLine = String(t.prompt || '').split(/\r?\n/).find(line => line.trim());
   return firstLine ? firstLine.trim() : `Task #${t.id}`;
+}
+
+// Workflow chip: deterministic color per workflow slug + dir→slug lookup.
+function wfSlugColor(slug) {
+  let h = 0;
+  for (let i = 0; i < slug.length; i++) h = (h * 31 + slug.charCodeAt(i)) % 360;
+  return `hsl(${h}, 70%, 62%)`;
+}
+
+
+// ── ⚙ Настройки: единое окно (Оформление / Проверка кода / Помощники) ──
+
+function openSettings() { document.getElementById('settingsModal').classList.add('open'); setTab('appearance'); }
+function openReviewSettingsFor(workflowId) {
+  setReviewWf = workflowId || setReviewWf;
+  openSettings();
+  setTab('review');
+}
+function closeSettings() { document.getElementById('settingsModal').classList.remove('open'); }
+
+function setTab(name) {
+  document.querySelectorAll('.set-tab').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
+  document.querySelectorAll('.set-pane').forEach(p => p.style.display = p.id === 'set-' + name ? '' : 'none');
+  if (name === 'helpers') renderHelpersTab();
+  if (name === 'review') renderReviewTab();
+  if (name === 'auto') renderAutoTab();
+  if (name === 'perms') renderPermsTab();
+}
+
+// ── U12: вкладка «🛂 Права» — что конвейеру можно без вопросов владельца ──
+const PERM_MODE_LABELS = { allow: 'Разрешено', ask: 'Спрашивать', deny: 'Запрещено' };
+async function renderPermsTab() {
+  const pane = document.getElementById('set-perms');
+  pane.innerHTML = '<div class="cz-hint">Загрузка…</div>';
+  let data;
+  try { data = await fetchJSON(`${API}/permissions`); }
+  catch (e) { pane.innerHTML = `<div class="cz-hint" style="color:var(--red)">Не удалось загрузить: ${esc(e.message)}</div>`; return; }
+  const rows = (data.actions || []).map(a => `
+    <div class="cz-row" style="margin-top:6px;flex-wrap:wrap;align-items:center">
+      <span style="flex:1;min-width:260px">${esc(a.label)}${a.mode !== a.default ? ` <span class="cz-hint">(по умолчанию: ${PERM_MODE_LABELS[a.default] || a.default})</span>` : ''}</span>
+      ${['allow','ask','deny'].map(m => `
+        <label class="cz-inline" style="margin-left:10px;cursor:pointer" title="${m === 'allow' ? 'делать без вопросов' : m === 'ask' ? 'задать вопрос владельцу (ELICIT)' : 'не делать ни при каких условиях'}">
+          <input type="radio" name="perm-${escAttr(a.key)}" value="${m}" ${a.mode === m ? 'checked' : ''} onchange="permPresetRow('${escAttr(a.key)}','${m}',this)"> ${PERM_MODE_LABELS[m]}
+        </label>`).join('')}
+    </div>`).join('');
+  pane.innerHTML = `
+    <div class="cz-row"><b>🛂 Права конвейера — что можно без вопросов человеку</b></div>
+    <div class="cz-hint" style="margin:6px 0 10px">Глобальная политика для всех воркфлоу: «Разрешено» — исполнитель делает сам, молча; «Спрашивать» — задаст вам вопрос (ELICIT) и будет ждать; «Запрещено» — не делает ни при каких условиях. Политика вшивается в каждый промпт исполнителя, и автовыбор вопросов ей следует: класс в режиме «Спрашивать» автовыбором не закрывается. По умолчанию вся локальная работа разрешена, внешние необратимые действия — спрашиваются.</div>
+    ${rows}
+    <div class="cz-row" style="margin-top:10px;gap:8px">
+      <button class="btn btn-sm btn-primary" onclick="savePerms()">Сохранить</button>
+      <button class="btn btn-sm btn-ghost" onclick="permPresetAll('allow')" title="всё разрешить — максимум автономии">Всё разрешить</button>
+      <button class="btn btn-sm btn-ghost" onclick="permPresetAll('default')" title="вернуть заводские значения">Сбросить к стандартным</button>
+      <span class="cz-hint" id="perms-msg">действует с ближайшего диспетча исполнителя — сразу</span>
+    </div>`;
+}
+function permPresetRow(key, mode, radio) { radio.checked = true; }
+function permPresetAll(mode) {
+  document.querySelectorAll('#set-perms input[type="radio"]').forEach(r => {
+    if (mode === 'allow') { if (r.value === 'allow') r.checked = true; }
+  });
+  if (mode === 'default') renderPermsTab();  // перерисовать с серверными дефолтами не сохраняя
+}
+async function savePerms() {
+  const msg = document.getElementById('perms-msg');
+  const settings = {};
+  document.querySelectorAll('#set-perms input[type="radio"]:checked').forEach(r => {
+    const key = r.name.replace(/^perm-/, '');
+    settings[key] = r.value;
+  });
+  try {
+    await fetchJSON(`${API}/permissions`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ settings }),
+    });
+    msg.textContent = '✅ Сохранено — политика уже действует.';
+    setTimeout(renderPermsTab, 600);
+  } catch (e) { msg.textContent = '❌ ' + e.message; }
+}
+
+// ── Тема ──
+function applyThemeChoice() {
+  const val = document.querySelector('input[name="set-theme"]:checked')?.value || 'dark';
+  document.body.classList.toggle('theme-light', val === 'light');
+  localStorage.setItem('pp-theme', val);
+  const btn = document.getElementById('themeBtn');
+  if (btn) btn.textContent = val === 'light' ? '🌙 Тёмная' : '☀ Светлая';
+}
+function toggleTheme() {
+  const cur = localStorage.getItem('pp-theme') || 'dark';
+  const next = cur === 'light' ? 'dark' : 'light';
+  localStorage.setItem('pp-theme', next);
+  document.body.classList.toggle('theme-light', next === 'light');
+  const btn = document.getElementById('themeBtn');
+  if (btn) btn.textContent = next === 'light' ? '🌙 Тёмная' : '☀ Светлая';
+  const radio = document.querySelector('input[name="set-theme"][value="' + next + '"]');
+  if (radio) radio.checked = true;
+}
+// Применить сохранённую тему сразу при загрузке страницы
+if (localStorage.getItem('pp-theme') === 'light') {
+  document.body.classList.add('theme-light');
+  document.addEventListener('DOMContentLoaded', () => {
+    const r = document.querySelector('input[name="set-theme"][value="light"]');
+    if (r) r.checked = true;
+    const btn = document.getElementById('themeBtn');
+    if (btn) btn.textContent = '🌙 Тёмная';
+  });
+}
+
+// ── Вкладка «Проверка кода»: пресеты + РЕДАКТИРУЕМЫЕ ступени ──
+let setReviewWf = null;
+let setReviewSteps = [];   // источник истины для карточек ступеней
+let setExecWins = [];      // U10: тарифные окна исполнителя (provider_windows)
+let setDragIdx = -1;
+
+function setProvOpts(sel) {
+  // человеческие имена в дропдаунах настроек; порядок — как во вкладке
+  // «Помощники» (ui_order), служебные (живые сессии) скрыты
+  const opts = Object.entries(providersData || {})
+    .filter(([, p]) => !p.hidden && !p.session_target)
+    .sort((a, b) => ((a[1].ui_order ?? 9999) - (b[1].ui_order ?? 9999)) || a[0].localeCompare(b[0]))
+    .map(([name, p]) => {
+      const label = (p.human && p.human.label) || name;
+      return `<option value="${escAttr(name)}"${name === sel ? ' selected' : ''}>${esc(label)}</option>`;
+    });
+  if (sel && !(providersData || {})[sel]) {
+    opts.push(`<option value="${escAttr(sel)}" selected>${esc(sel)} · недоступен</option>`);
+  }
+  return (sel ? '' : '<option value="">— выбрать —</option>') + opts.join('');
+}
+function setHumanName(pid) {
+  const h = (providersData[pid] || {}).human || {};
+  return h.label || pid;
+}
+// Кто чинит находки ступени — человеческая подпись
+function setFixerHuman(s) {
+  if (s.fixer === 'self') return 'сам проверяющий';
+  if (s.fixer === 'executor' || !s.fixer) return 'исполнитель (пишет код)';
+  return setHumanName(s.fixer);
+}
+function setStepHint(s) {
+  const autoAttempts = document.getElementById('set-attempt-mode')?.value === 'auto';
+  const bits = [`исправляет: ${setFixerHuman(s)}`, autoAttempts ? 'попыток: авто (1/2/3)' : `раундов: ${s.max_rounds || 2}`];
+  if (s.window) bits.push(`🌙 ждёт окна ${s.window.from || '22:00'}–${s.window.to || '04:00'} (МСК)`);
+  if (s.blocking === false) bits.push('не блокирующая');
+  return bits.join(' · ');
+}
+
+function attemptNumber(id, fallback) {
+  const parsed = parseInt(document.getElementById(id)?.value, 10);
+  return Number.isFinite(parsed) ? Math.max(1, Math.min(10, parsed)) : fallback;
+}
+
+async function renderReviewTab() {
+  const sel = document.getElementById('set-wf');
+  if (!sel.options.length && !(workflowCache || []).length) {
+    // U9: список воркфлоу мог ещё не загрузиться — пустой дропдаун «Воркфлоу»
+    // выглядел как «нажимаешь, а он пропадает». Догружаем и заполняем.
+    try { await loadWorkflows(); } catch (e) { /* следующий тик повторит */ }
+  }
+  if (!sel.options.length) {
+    (workflowCache || []).forEach(w => {
+      const o = document.createElement('option');
+      o.value = w.id; o.textContent = w.slug;
+      sel.appendChild(o);
+    });
+  }
+  if (setReviewWf && [...sel.options].some(o => o.value === setReviewWf)) sel.value = setReviewWf;
+  setReviewLoad();
+}
+
+function setReviewLoad() {
+  setReviewWf = document.getElementById('set-wf').value;
+  const wf = (workflowCache || []).find(x => x.id === setReviewWf);
+  const body = document.getElementById('set-review-body');
+  if (!wf) { body.innerHTML = '<div class="cz-hint">Воркфлоу не найден.</div>'; return; }
+  const chain = (wf.config && wf.config.review_chain) || { enabled: false, steps: [] };
+  setReviewSteps = JSON.parse(JSON.stringify(chain.steps || []));
+  const execProv = wf.config?.roles?.executor?.provider || '';
+  const revProv = wf.config?.roles?.reviewer?.provider || '';
+  const automation = wf.config?.automation || {};
+  const attemptPolicy = chain.attempt_policy || {};
+  const attemptBySeverity = attemptPolicy.by_severity || {};
+  const cascadeOwnsReview = chain.enabled &&
+    automation.auto_dispatch_reviewer === false &&
+    automation.auto_apply_review === false &&
+    automation.auto_resume_revision === false;
+  const preset = setDetectPreset(setReviewSteps, chain.enabled);
+  // U10 (тарифные окна v2): несколько окон с днями недели — пик/льгота/выходные.
+  setExecWins = JSON.parse(JSON.stringify(wf.config?.roles?.executor?.provider_windows || []));
+  body.innerHTML = `
+    <div class="cz-row">
+      <span class="cz-label">Кто пишет код:</span>
+      <select id="set-exec" class="cz-prov" style="max-width:300px">${setProvOpts(execProv)}</select>
+      <span class="cz-hint" id="set-exec-note">${execProv && !(providersData[execProv] || {}).human ? 'у этого помощника нет человеческого имени — задать можно в Помощниках' : ''}</span>
+    </div>
+    <div class="cz-row" style="margin-top:6px;flex-wrap:wrap;align-items:flex-start">
+      <span class="cz-label-sm" style="cursor:help" title="несколько исполнителей по расписанию: в каждое окно — свой помощник и свои дни недели + часы (МСК); вне всех окон работает основной «Кто пишет код». Ночное окно считается от дня старта (ночь с пятницы покрывает субботу до 04:00). Пример тарифа GLM: будни 09:00–13:00 — пик ×3 (лучше дешёвый помощник); будни 13:00 и позже — льгота ×1; выходные — круглосуточно льгота">👥 Несколько исполнителей по расписанию:</span>
+      <span class="cz-hint">первое подходящее окно выигрывает; вне окон — основной исполнитель</span>
+    </div>
+    <div id="set-execwins"></div>
+    <div class="cz-row" style="margin-top:4px;flex-wrap:wrap;align-items:center">
+      <button class="btn btn-sm btn-ghost" onclick="setExecWinAdd()">+ Добавить исполнителя по расписанию</button>
+    </div>
+    <div class="cz-row" style="margin-top:10px"><span class="cz-label">Как проверяют код:</span></div>
+    <div class="cz-row">
+      <label class="cz-inline"><input type="radio" name="set-preset" value="standard" ${preset === 'standard' ? 'checked' : ''} onchange="setPreset('standard')"> 🛡 Обычная</label>
+      <label class="cz-inline"><input type="radio" name="set-preset" value="strict" ${preset === 'strict' ? 'checked' : ''} onchange="setPreset('strict')"> 🛡🛡 Строгая (двойная)</label>
+      <label class="cz-inline"><input type="radio" name="set-preset" value="none" ${preset === 'none' ? 'checked' : ''} onchange="setPreset('none')"> ⏭ Без каскада</label>
+    </div>
+    <div class="cz-hint">Пресет заполняет ступени ниже — после этого любую ступень можно поменять вручную и сохранить.
+      ${chain.enabled && (chain.steps || []).length ? `<br>При включённом каскаде ревьюер из каждой ступени получает отдельный аудит; его провайдер получает и задачу исправления, если выбран «сам проверяющий».<br><b style="color:${cascadeOwnsReview ? 'var(--green)' : 'var(--yellow)'}">${cascadeOwnsReview ? '✓ Каскадный контроллер управляет переходами' : '⚠ Нажмите «Сохранить»: старые автоматические переходы ещё не переданы каскаду'}</b>` : ''}
+      ${preset === 'none' ? `Сейчас работает обычный ревьюер воркфлоу${revProv ? ': ' + esc(setHumanName(revProv)) : ''}.` : ''}</div>
+    <details style="margin-top:10px"><summary class="cz-hint" style="cursor:pointer">❓ Что значат все эти настройки — подробное объяснение для не-программиста</summary>
+      <div class="cz-hint" style="margin-top:8px;line-height:1.6">
+        <b>Ступень</b> — один круг проверки кода. «Строгая» проверка = две ступени подряд: сначала первый помощник, затем второй. Каждая ступень — карточка ниже.<br><br>
+        <b>🛡 Кто пишет код</b> — помощник, который делает основную работу (пишет и правит код по заданию этапа).<br><br>
+        <b>Находки чинит</b> — кто исправляет замечания проверяющего:<br>
+        • «сам проверяющий» — кто нашёл, тот и чинит. Быстрее и дешевле, подходит для мелких правок.<br>
+        • «исполнитель» — замечание уходит тому, кто писал код. Надёжнее для крупных переделок.<br>
+        <i>Пример: ГЛМ нашёл ошибку → МиниМакс чинит → ГЛМ перепроверяет.</i><br><br>
+        <b>Раундов</b> (в карточке ступени) — сколько раз может повториться круг «нашли → починили → перепроверили» для этой ступени. Кончились попытки → действует правило исчерпания (в редакторе каскада в карточке воркфлоу: планер решает / принять при зелёных тестах / спросить вас).<br><br>
+        <b>Блокирующая</b> — строгость ступени:<br>
+        • <b>Включена</b> — пока есть незакрытые замечания, следующий этап НЕ начинается. Ошибки не проезжают в проект, но конвейер может стоять пока чинят.<br>
+        • <b>Выключена</b> — замечания пишутся в «лист долга», конвейер едет дальше. Быстрее, но долг копится и всплывёт на финальной проверке.<br><br>
+        <b>🌙 Ночное окно</b> — ступень работает только в указанные часы (ночью тариф проверяющего часто в разы дешевле). Вне окна ступень пропускается, конвейер не ждёт.<br>
+        <i>Пример: окно 22:00–04:00 — вечером этап едет без этой ступени, а к утру Квен ночью всё проверил.</i><br><br>
+        <b>Попытки исправления</b> — сколько раз конвейер пробует починить замечание, прежде чем звать человека:<br>
+        • «Авто по тяжести» — число попыток выбирается само по серьёзности замечания: low (мелочь — форматирование, опечатка) → 1 попытка; medium (среднее — некорректная логика в узком месте) → 2; high (серьёзное — ошибка в основной функции) и blocker (пропускать нельзя — краш, потеря данных) → 3.<br>
+        • «Вручную» — вы сами задаёте «раундов» в каждой карточке ступени.<br>
+        • «Правила авто» (по умолчанию / максимум / low / medium / high / blocker) — точные числа попыток для каждого случая; «максимум» — потолок для любого правила. <i>Пример: blocker = 4, максимум = 3 → серьёзное замечание получит 3 попытки, не 4.</i><br><br>
+        <b>Пресеты</b> — готовые наборы:<br>
+        • 🛡 Обычная — один проверяющий (ГЛМ), сам чинит. Баланс цены и качества на каждый день.<br>
+        • 🛡🛡 Строгая — двойная проверка (ГЛМ + Квен ночью) для важных этапов.<br>
+        • ⏭ Без каскада — ступеней нет, проверяет штатный ревьюер воркфлоу (его назначение — в карточке воркфлоу, раздел настроек роли).
+      </div>
+    </details>
+    <div class="cz-row" style="margin-top:8px">
+      <span class="cz-label">Попытки исправления:</span>
+      <select id="set-attempt-mode" class="cz-prov" style="max-width:300px">
+        <option value="auto" ${(chain.attempt_policy?.mode || 'manual') === 'auto' ? 'selected' : ''}>Авто по тяжести замечаний (1/2/3)</option>
+        <option value="manual" ${(chain.attempt_policy?.mode || 'manual') !== 'auto' ? 'selected' : ''}>Вручную по каждой ступени</option>
+      </select>
+      <span class="cz-hint">low → 1, medium → 2, high/blocker → 3; число в карточке используется в ручном режиме.</span>
+    </div>
+    <div class="cz-row" style="margin-top:6px;gap:6px;flex-wrap:wrap">
+      <span class="cz-label-sm">Правила авто:</span>
+      <label class="cz-inline">по умолчанию <input id="set-attempt-default" type="number" min="1" max="10" value="${attemptPolicy.default || 2}" style="width:44px"></label>
+      <label class="cz-inline">максимум <input id="set-attempt-max" type="number" min="1" max="10" value="${attemptPolicy.max || 3}" style="width:44px"></label>
+      <label class="cz-inline">low <input id="set-attempt-low" type="number" min="1" max="10" value="${attemptBySeverity.low || 1}" style="width:44px"></label>
+      <label class="cz-inline">medium <input id="set-attempt-medium" type="number" min="1" max="10" value="${attemptBySeverity.medium || 2}" style="width:44px"></label>
+      <label class="cz-inline">high <input id="set-attempt-high" type="number" min="1" max="10" value="${attemptBySeverity.high || 3}" style="width:44px"></label>
+      <label class="cz-inline">blocker <input id="set-attempt-blocker" type="number" min="1" max="10" value="${attemptBySeverity.blocker || 3}" style="width:44px"></label>
+    </div>
+    <div class="cz-hint">Эти числа работают только в режиме «Авто»; общий максимум ограничивает каждое правило.</div>
+    <div id="set-slots" style="margin-top:8px"></div>
+    <div class="cz-row" style="margin-top:6px">
+      <button class="btn btn-sm btn-ghost" onclick="setAddStep()">+ Добавить ступень</button>
+      <span class="cz-hint">ступени идут по порядку сверху вниз; карточку можно перетащить мышью за ⠿ или стрелками ↑↓</span>
+    </div>
+    <div class="cz-row" style="margin-top:10px">
+      <button class="btn btn-sm btn-primary" onclick="setReviewSave()">Сохранить</button>
+      <span class="cz-hint">действует с ближайшего диспетча</span>
+    </div>`;
+  renderSetSlots();
+  renderExecWins();
+}
+
+function setDetectPreset(steps, enabled) {
+  if (!steps.length) return enabled ? 'custom' : 'none';
+  const one = steps.length === 1 && steps[0].provider === 'goose-zai' && steps[0].fixer === 'self' && !steps[0].window;
+  const two = steps.length === 2 && steps[1].provider === 'qwen-review' && !!(steps[1].window);
+  if (one && !two) return 'standard';
+  if (one && two) return 'strict';
+  return 'custom';
+}
+
+// U9: показать/скрыть поля окна дешёвых часов исполнителя
+function setExecWinToggle(on) {
+  const fields = document.getElementById('set-execwin-fields');
+  if (fields) fields.style.display = on ? 'inline-flex' : 'none';
+}
+
+// ── U10: тарифные окна исполнителя (несколько, с днями недели) ──
+const EXEC_WIN_DAYS = [['mon','Пн'],['tue','Вт'],['wed','Ср'],['thu','Чт'],['fri','Пт'],['sat','Сб'],['sun','Вс']];
+function _winDaysSet(days) {
+  const all = EXEC_WIN_DAYS.map(d => d[0]);
+  if (!days) return new Set(all);
+  if (days === 'weekdays') return new Set(['mon','tue','wed','thu','fri']);
+  if (days === 'weekend') return new Set(['sat','sun']);
+  if (Array.isArray(days)) { const s = new Set(days.map(d => String(d).toLowerCase().slice(0,3))); return s.size ? s : new Set(all); }
+  return new Set(all);
+}
+function setExecWinDay(i, day) {
+  const row = setExecWins[i]; if (!row) return;
+  const w = row.window = row.window || {};
+  const s = _winDaysSet(w.days);
+  s.has(day) ? s.delete(day) : s.add(day);
+  w.days = [...s].sort((a,b) => EXEC_WIN_DAYS.findIndex(d=>d[0]===a) - EXEC_WIN_DAYS.findIndex(d=>d[0]===b));
+  renderExecWins();
+}
+function setExecWinPreset(i, kind) {
+  const row = setExecWins[i]; if (!row) return;
+  const w = row.window = row.window || {};
+  w.days = kind;   // 'all' | 'weekdays' | 'weekend'
+  renderExecWins();
+}
+function setExecWinAdd() {
+  setExecWins.push({ provider: '', window: { from: '09:00', to: '13:00', tz_offset_hours: 3, days: 'weekdays' } });
+  renderExecWins();
+}
+function setExecWinRemove(i) {
+  setExecWins.splice(i, 1);
+  renderExecWins();
+}
+function renderExecWins() {
+  const box = document.getElementById('set-execwins');
+  if (!box) return;
+  // U10-фикс: перед перерисовкой (клик по чипу дня/пресету) забрать текущие
+  // значения из DOM — иначе выбранный помощник и время сбрасывались.
+  setExecWins.forEach((row, i) => {
+    const prov = document.getElementById(`set-ew-prov-${i}`);
+    const from = document.getElementById(`set-ew-from-${i}`);
+    const to = document.getElementById(`set-ew-to-${i}`);
+    const tariff = document.getElementById(`set-ew-tariff-${i}`);
+    if (prov) row.provider = prov.value || row.provider || '';
+    const w = row.window = row.window || {};
+    if (from) w.from = from.value || w.from;
+    if (to) w.to = to.value || w.to;
+    if (tariff) w.tariff = tariff.value || '';
+  });
+  if (!setExecWins.length) {
+    box.innerHTML = '<div class="cz-hint" style="margin:2px 0 4px">Сейчас работает один исполнитель — основной «Кто пишет код», без расписания. «+ Добавить исполнителя по расписанию» — и в выбранные дни недели и часы код пишет другой помощник (например, ГЛМ ночами и в выходные, дешёвый — в пик, флагман — по субботам).</div>';
+    return;
+  }
+  box.innerHTML = setExecWins.map((row, i) => {
+    const w = row.window || {};
+    const days = _winDaysSet(w.days);
+    const chips = EXEC_WIN_DAYS.map(([d, label]) =>
+      `<button type="button" class="day-chip${days.has(d) ? ' on' : ''}" onclick="setExecWinDay(${i},'${d}')" title="${days.has(d) ? 'в этом дне окно активно' : 'в этом дне окно неактивно'}">${label}</button>`).join('');
+    const presetLabel = p => {
+      const s = _winDaysSet(p);
+      const isAll = s.size === 7, isWd = s.size === 5 && !s.has('sat') && !s.has('sun'), isWe = s.size === 2 && s.has('sat') && s.has('sun');
+      return isAll ? 'все' : isWd ? 'будни' : isWe ? 'выходные' : `${s.size} дн.`;
+    };
+    return `<div class="cz-card" style="margin-top:4px">
+      <div class="cz-row" style="flex-wrap:wrap;align-items:center">
+        <select class="cz-prov" id="set-ew-prov-${i}" style="max-width:200px">${setProvOpts(row.provider || '')}</select>
+        с <input type="time" id="set-ew-from-${i}" value="${w.from || '09:00'}" style="width:74px">
+        до <input type="time" id="set-ew-to-${i}" value="${w.to || '13:00'}" style="width:74px"> МСК
+        <input type="text" id="set-ew-tariff-${i}" value="${(w.tariff || '').toString().replace(/"/g,'&quot;')}" placeholder="тариф: ×3 пик / ×1" style="width:110px" title="просто подпись для планирования — на выбор исполнителя не влияет">
+        <button class="btn btn-sm btn-danger" onclick="setExecWinRemove(${i})" title="убрать окно">✕</button>
+      </div>
+      <div class="cz-row" style="margin-top:4px;flex-wrap:wrap;align-items:center">
+        <span class="cz-hint">дни:</span> ${chips}
+        <button type="button" class="day-chip" onclick="setExecWinPreset(${i},'all')" title="все дни недели">все</button>
+        <button type="button" class="day-chip" onclick="setExecWinPreset(${i},'weekdays')" title="понедельник–пятница">будни</button>
+        <button type="button" class="day-chip" onclick="setExecWinPreset(${i},'weekend')" title="суббота–воскресенье">выходные</button>
+        <span class="cz-hint">(${presetLabel(w.days)}${w.from > (w.to || '00:00') ? '; ночь считается от дня старта' : ''})</span>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function renderSetSlots() {
+  const box = document.getElementById('set-slots');
+  if (!box) return;
+  box.innerHTML = setReviewSteps.map((s, i) => {
+    const win = s.window || {};
+    const fixer = s.fixer || 'executor';
+    const customFixer = !['executor', 'self'].includes(fixer);
+    return `<div class="cz-card" draggable="true" data-set-slot="${i}"
+        ondragstart="setDragStart(event,${i})" ondragover="setDragOver(event,${i})"
+        ondrop="setDrop(event,${i})" ondragend="setDragEnd(event)">
+      <div class="cz-row">
+        <span class="cz-label" style="cursor:grab" title="перетащить, чтобы поменять порядок">⠿</span>
+        <span class="cz-label">Ступень ${i + 1}:</span>
+        <select class="cz-prov" onchange="setProvChanged(${i}, this.value)">${setProvOpts(s.provider)}</select>
+        <button class="btn btn-sm btn-ghost" onclick="setMove(${i},-1)" ${i === 0 ? 'disabled' : ''} title="поднять ступень">↑</button>
+        <button class="btn btn-sm btn-ghost" onclick="setMove(${i},1)" ${i === setReviewSteps.length - 1 ? 'disabled' : ''} title="опустить ступень">↓</button>
+        <button class="btn btn-sm btn-danger" onclick="setRemoveStep(${i})" title="убрать ступень">✕</button>
+      </div>
+      <div class="cz-row">
+        <span class="cz-label-sm" title="кто будет исправлять замечания, которые найдёт этот проверяющий">Находки чинит:</span>
+        <select class="cz-fixer" onchange="setFixerChanged(${i}, this.value)" title="сам проверяющий = быстрее и дешевле; исполнитель = надёжнее для крупных правок">
+          <option value="self" ${fixer === 'self' ? 'selected' : ''}>сам проверяющий</option>
+          <option value="executor" ${fixer === 'executor' ? 'selected' : ''}>исполнитель (кто пишет код)</option>
+          <option value="custom" ${customFixer ? 'selected' : ''}>указать помощника</option>
+        </select>
+        <select class="cz-fixer-custom" style="display:${customFixer ? '' : 'none'}" onchange="setFixerCustomChanged(${i}, this.value)">${setProvOpts(customFixer ? fixer : '')}</select>
+        <label class="cz-inline" style="margin-left:10px" title="сколько раз повторится круг «нашли → починили → перепроверили», пока не сработает правило исчерпания">раундов:
+          <input type="number" min="1" max="10" value="${s.max_rounds || 2}" onchange="setNumChanged(${i}, this.value)" style="width:44px">
+        </label>
+      </div>
+      <div class="cz-row">
+        <label class="cz-inline" title="ВКЛ: пока есть незакрытые замечания — следующий этап не начинается. ВЫКЛ: замечания копятся в лист долга, конвейер едет дальше" style="cursor:help"><input type="checkbox" ${s.blocking !== false ? 'checked' : ''} onchange="setBlockingChanged(${i}, this.checked)"> блокирующая</label>
+        <label class="cz-inline" style="margin-left:10px;cursor:help" title="ступень работает только в эти часы (ночью тариф часто дешевле); вне окна ступень пропускается"><input type="checkbox" ${win.from ? 'checked' : ''} onchange="setWindowChanged(${i}, this.checked)"> 🌙 ночное окно</label>
+        <span ${win.from ? '' : 'style="display:none"'}>с
+          <input type="time" value="${win.from || '22:00'}" onchange="setWindowTime(${i},'from',this.value)" style="width:74px">
+          до
+          <input type="time" value="${win.to || '04:00'}" onchange="setWindowTime(${i},'to',this.value)" style="width:74px">
+          МСК</span>
+        <select class="cz-exhaust" style="margin-left:10px" title="что делать со ступенью, когда круги «нашли → починили → перепроверили» кончились, а замечания открыты">
+          ${['arbitrate_planner', 'accept_if_gate_green', 'human'].map(p =>
+            `<option value="${p}" ${(s.on_exhaust || 'human') === p ? 'selected' : ''}>${{arbitrate_planner:'исчерпан → человеку (арбитраж не включён)', accept_if_gate_green:'исчерпан → принять при зелёном гейте', human:'исчерпан → человеку'}[p]}</option>`).join('')}
+        </select>
+      </div>
+      <div class="cz-row">
+        <span class="cz-hint">${setStepHint(s)}</span>
+      </div>
+    </div>`;
+  }).join('') ||
+    `<div class="cz-hint">Ступеней нет. «Сохранить» выключит каскад — проверки уйдут обычному ревьюеру из настроек воркфлоу.</div>`;
+}
+
+function setReadSlots() {
+  // перенести текущие значения DOM в массив (перед мутирующими операциями)
+  document.querySelectorAll('#set-slots .cz-card').forEach(card => {
+    const i = parseInt(card.dataset.setSlot, 10);
+    const s = setReviewSteps[i];
+    if (!s) return;
+    s.provider = card.querySelector('.cz-prov').value || s.provider;
+    const fixerSelect = card.querySelector('.cz-fixer');
+    const customFixer = card.querySelector('.cz-fixer-custom');
+    s.fixer = fixerSelect.value === 'custom'
+      ? (customFixer?.value || s.fixer || 'executor')
+      : (fixerSelect.value || 'executor');
+    s.max_rounds = parseInt(card.querySelector('input[type="number"]').value, 10) || 2;
+    s.blocking = card.querySelector('input[type="checkbox"]:not([onchange*="setWindowChanged"])').checked;
+    // U15: правило исчерпания ступени (раньше было только в карточном редакторе)
+    const exhaustSelect = card.querySelector('select.cz-exhaust');
+    if (exhaustSelect) s.on_exhaust = exhaustSelect.value;
+    s.window = card.querySelector('input[onchange*="setWindowChanged"]').checked
+      ? { ...(s.window || {}),
+          from: card.querySelector('input[type="time"]').value || '22:00',
+          to: card.querySelectorAll('input[type="time"]')[1]?.value || '04:00',
+          tz_offset_hours: 3 } : undefined;
+  });
+}
+
+function setPreset(name) {
+  const builders = {
+    standard: () => [{ provider: 'goose-zai', fixer: 'executor', blocking: true, max_rounds: 2 }],
+    strict: () => [
+      { provider: 'goose-zai', fixer: 'executor', blocking: true, max_rounds: 2 },
+      { provider: 'qwen-review', fixer: 'goose-zai', blocking: true, max_rounds: 3,
+        window: { from: '22:00', to: '04:00', tz_offset_hours: 3 } },
+    ],
+    none: () => [],
+  };
+  setReviewSteps = (builders[name] || (() => []))();
+  const attemptMode = document.getElementById('set-attempt-mode');
+  if (attemptMode) attemptMode.value = name === 'none' ? 'manual' : 'auto';
+  renderSetSlots();
+}
+
+function setAddStep() {
+  setReadSlots();
+  setReviewSteps.push({ provider: 'goose-zai', fixer: 'executor', blocking: true, max_rounds: 2 });
+  renderSetSlots();
+}
+function setRemoveStep(i) {
+  setReadSlots();
+  setReviewSteps.splice(i, 1);
+  renderSetSlots();
+}
+function setMove(i, dir) {
+  setReadSlots();
+  const j = i + dir;
+  if (j < 0 || j >= setReviewSteps.length) return;
+  [setReviewSteps[i], setReviewSteps[j]] = [setReviewSteps[j], setReviewSteps[i]];
+  renderSetSlots();
+}
+function setProvChanged(i, v) { setReviewSteps[i].provider = v; refreshSetHints(); }
+function setFixerChanged(i, v) {
+  if (v === 'custom') {
+    const current = setReviewSteps[i].fixer;
+    if (!current || ['custom', 'self', 'executor'].includes(current)) {
+      setReviewSteps[i].fixer = Object.keys(providersData || {}).find(name =>
+        !['self', 'executor'].includes(name) && !(providersData[name] || {}).hidden
+      ) || 'executor';
+    }
+  } else {
+    setReviewSteps[i].fixer = v;
+  }
+  renderSetSlots();
+}
+function setFixerCustomChanged(i, v) {
+  setReviewSteps[i].fixer = v || 'executor';
+  refreshSetHints();
+}
+function setNumChanged(i, v) { setReviewSteps[i].max_rounds = parseInt(v, 10) || 2; refreshSetHints(); }
+function setBlockingChanged(i, checked) { setReviewSteps[i].blocking = checked; refreshSetHints(); }
+function setWindowChanged(i, checked) {
+  // U15: не терять дни/тариф окна при переключении чекбокса
+  const cur = setReviewSteps[i].window;
+  setReviewSteps[i].window = checked
+    ? { ...(cur || {}), from: (cur && cur.from) || '22:00', to: (cur && cur.to) || '04:00', tz_offset_hours: (cur && cur.tz_offset_hours) || 3 }
+    : undefined;
+  renderSetSlots();
+}
+function setWindowTime(i, key, v) {
+  if (setReviewSteps[i].window) { setReviewSteps[i].window[key] = v; refreshSetHints(); }
+}
+function refreshSetHints() {
+  document.querySelectorAll('#set-slots .cz-card').forEach(card => {
+    const s = setReviewSteps[parseInt(card.dataset.setSlot, 10)];
+    if (s) card.querySelector('.cz-hint').textContent = setStepHint(s);
+  });
+}
+
+// Drag-and-drop порядка ступеней
+function setDragStart(ev, i) { setDragIdx = i; ev.dataTransfer.effectAllowed = 'move'; }
+function setDragOver(ev, i) { ev.preventDefault(); ev.dataTransfer.dropEffect = 'move'; }
+function setDrop(ev, i) {
+  ev.preventDefault();
+  if (setDragIdx < 0 || setDragIdx === i) return;
+  setReadSlots();
+  const [moved] = setReviewSteps.splice(setDragIdx, 1);
+  setReviewSteps.splice(i, 0, moved);
+  setDragIdx = -1;
+  renderSetSlots();
+}
+function setDragEnd() { setDragIdx = -1; }
+
+async function setReviewSave() {
+  const wfId = document.getElementById('set-wf').value;
+  setReadSlots();
+  const steps = setReviewSteps.filter(s => s.provider);
+  const exec = document.getElementById('set-exec')?.value || '';
+  if (steps.length && steps.some(s => !s.provider)) { toast('У ступени не выбран помощник'); return; }
+  // Конвейер живой: за время, пока окно открыто, версия конфига уходит вперёд.
+  // При конфликте версий перечитываем СВЕЖИЙ конфиг, вливаем в него наши
+  // изменения и пробуем снова — до 3 раз.
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const wf = (workflowCache || []).find(x => x.id === wfId)
+      || await fetchJSON(`${API}/workflows/${wfId}`);
+    const cfg = JSON.parse(JSON.stringify(wf.config));
+    const oldChain = cfg.review_chain || {};
+    const oldRoles = cfg.roles || {};
+    const oldAutomation = cfg.automation || {};
+    const chainEnabled = steps.length > 0;
+    const baseExecutor = oldChain.base_executor_provider ?? oldRoles.executor?.provider ?? exec ?? null;
+    const baseReviewer = oldChain.base_reviewer_provider ?? oldRoles.reviewer?.provider ?? null;
+    const baseReviewerPrompt = oldChain.base_reviewer_prompt_template ?? oldRoles.reviewer?.prompt_template ?? '';
+    const attemptMode = document.getElementById('set-attempt-mode')?.value || oldChain.attempt_policy?.mode || 'manual';
+    const attemptDefault = attemptNumber('set-attempt-default', 2);
+    const attemptMax = Math.max(attemptDefault, attemptNumber('set-attempt-max', 3));
+    const boundedAttempt = id => Math.min(attemptMax, attemptNumber(id, attemptDefault));
+    const attemptPolicy = {
+      ...(oldChain.attempt_policy || {}),
+      mode: attemptMode,
+      default: attemptDefault,
+      max: attemptMax,
+      by_severity: {
+        low: boundedAttempt('set-attempt-low'),
+        medium: boundedAttempt('set-attempt-medium'),
+        high: boundedAttempt('set-attempt-high'),
+        blocker: boundedAttempt('set-attempt-blocker'),
+      },
+    };
+    cfg.review_chain = {
+      ...oldChain,
+      enabled: chainEnabled,
+      steps: steps.map((s, i) => ({ ...s, slot: i + 1 })),
+      attempt_policy: attemptPolicy,
+      base_executor_provider: baseExecutor,
+      base_reviewer_provider: baseReviewer,
+      base_reviewer_prompt_template: baseReviewerPrompt,
+    };
+    if (exec) {
+      cfg.roles = cfg.roles || {};
+      cfg.roles.executor = { ...(cfg.roles.executor || {}), provider: exec };
+    }
+    // U10: тарифные окна исполнителя (несколько, с днями) из вкладки «Проверка кода»
+    const execWinsBox = document.getElementById('set-execwins');
+    if (execWinsBox && execWinsBox.closest('#settingsModal')) {
+      const rows = [];
+      for (let i = 0; i < setExecWins.length; i++) {
+        const prov = document.getElementById(`set-ew-prov-${i}`)?.value?.trim() || '';
+        const from = document.getElementById(`set-ew-from-${i}`)?.value || '09:00';
+        const to = document.getElementById(`set-ew-to-${i}`)?.value || '13:00';
+        const tariff = document.getElementById(`set-ew-tariff-${i}`)?.value?.trim() || '';
+        if (!prov) continue;   // пустые строки не сохраняем
+        const w = { from, to, tz_offset_hours: 3 };
+        const days = (setExecWins[i].window || {}).days;
+        if (days) w.days = days;
+        if (tariff) w.tariff = tariff;
+        rows.push({ provider: prov, window: w });
+      }
+      cfg.roles.executor = { ...(cfg.roles.executor || {}) };
+      if (rows.length) cfg.roles.executor.provider_windows = rows;
+      else delete cfg.roles.executor.provider_windows;
+    }
+    cfg.roles = cfg.roles || {};
+    cfg.roles.reviewer = { ...(cfg.roles.reviewer || {}) };
+    cfg.automation = { ...oldAutomation };
+    if (chainEnabled) {
+      cfg.roles.reviewer.provider = steps[0].provider;
+      cfg.automation.auto_dispatch_reviewer = false;
+      cfg.automation.auto_apply_review = false;
+      cfg.automation.auto_resume_revision = false;
+    } else {
+      if (baseReviewer) cfg.roles.reviewer.provider = baseReviewer;
+      if (Object.prototype.hasOwnProperty.call(cfg.review_chain, 'base_reviewer_prompt_template')) {
+        cfg.roles.reviewer.prompt_template = baseReviewerPrompt;
+      }
+      cfg.automation.auto_dispatch_reviewer = true;
+      cfg.automation.auto_apply_review = true;
+      cfg.automation.auto_resume_revision = true;
+    }
+    try {
+      await fetchJSON(`${API}/workflows/${wfId}`, {
+        method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ config: cfg, expected_version: wf.state_version }),
+      });
+      toast(steps.length ? 'Проверка кода сохранена — каскад управляет ближайшим ревью-этапом.' : 'Каскад выключен — работает обычный ревьюер.', false);
+      await loadWorkflows();
+      setReviewLoad();
+      return;
+    } catch (e) {
+      const conflict = /version/i.test(e.message || '');
+      if (conflict && attempt < 3) {
+        await loadWorkflows();   // свежий снимок — и по новой
+        continue;
+      }
+      toast('Сохранение: ' + e.message);
+      return;
+    }
+  }
+}
+
+// ── Вкладка «Помощники»: кликабельные карточки → свойства провайдера ──
+async function helperConfigure(name) {
+  await openProviders();          // загружает provManageData
+  provEdit(name);                 // заполняет форму свойств этого провайдера
+}
+
+let helperDragIdx = -1;
+let helperBusyMap = {};
+
+// 🗑 Убрать помощника: занятых (роль/ступень/смена) не удаляем — это сломало бы
+// конфиг воркфлоу; встроенных нельзя удалить — предлагаем скрыть.
+async function helperRemove(name) {
+  const uses = helperBusyMap[name] || [];
+  if (uses.length) {
+    toast(`«${name}» сейчас работает: ${uses.join(' · ')} — сначала замените его там`);
+    return;
+  }
+  try {
+    const qf = await fetchJSON(`${API}/quota-failover/config`);
+    const rung = (qf.ladder || []).find(r => r.executor === name);
+    if (rung) {
+      toast(`«${name}» стоит в смене «${rung.name || rung.executor}» (вкладка 🔁 Смены) — сначала уберите его оттуда`);
+      return;
+    }
+  } catch (e) { /* нет конфига смен — не блокируем */ }
+  if (!confirm(`Убрать помощника «${name}» из списка?`)) return;
+  try {
+    await fetchJSON(`${API}/providers/${encodeURIComponent(name)}`, { method: 'DELETE' });
+    toast(`Помощник «${name}» убран`);
+  } catch (e) {
+    if (String(e.message).includes('встроенные')) {
+      if (!confirm(`«${name}» — встроенный помощник, удалить нельзя. Скрыть его из списков?`)) return;
+      try {
+        await fetchJSON(`${API}/providers/${encodeURIComponent(name)}/hide`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+        });
+        toast(`«${name}» скрыт из списков`);
+      } catch (e2) { toast('Не получилось: ' + e2.message); return; }
+    } else { toast('❌ ' + e.message); return; }
+  }
+  await loadProviders();
+  renderHelpersTab();
+}
+
+// ── Каталог известных CLI: визард «Установить → Настроить → Подобрать модель» ──
+let catData = null;
+const catState = {};
+
+function catPrettyModel(id) {
+  return (id || '').split(/[-_ ]+/).filter(Boolean)
+    .map(w => w.slice(0, 1).toUpperCase() + w.slice(1)).join(' ') || id;
+}
+
+function catCard(it) {
+  const conf = (it.configured || []).length
+    ? `<span class="cz-hint" style="color:var(--green)">· подключено: ${esc(it.configured.join(', '))}</span>` : '';
+  return `<div class="cz-card" style="margin-top:4px">
+    <div class="cz-row" style="flex-wrap:wrap;align-items:center">
+      <span style="font-size:18px">${it.icon}</span><b>${esc(it.title)}</b>
+      <span class="cz-hint">${esc(it.desc)}</span>
+      ${it.installed ? '<span class="cz-hint" style="color:var(--green)">✓ установлен</span>'
+                     : '<span class="cz-hint" style="color:var(--yellow)">не установлен</span>'}
+      ${conf}
+      <span style="margin-left:auto;display:flex;gap:6px">
+        ${it.installed ? '' : `<button class="btn btn-sm btn-ghost" onclick="catInstall('${escAttr(it.id)}', this)">⬇ Установить</button>`}
+        <button class="btn btn-sm btn-primary" onclick="catForm('${escAttr(it.id)}')">⚙ Настроить и подключить</button>
+      </span>
+    </div>
+    <div class="cz-hint" id="cat-inst-${escAttr(it.id)}"></div>
+    <div id="cat-form-${escAttr(it.id)}"></div>
+  </div>`;
+}
+
+async function renderProviderCatalog() {
+  const box = document.getElementById('set-helpers-catalog');
+  if (!box) return;
+  try { catData = await fetchJSON(`${API}/provider-catalog`); } catch (e) { box.innerHTML = ''; return; }
+  box.innerHTML = `
+    <div class="cz-row"><b>➕ Подключить нового помощника</b></div>
+    <div class="cz-hint" style="margin:4px 0 6px">Четыре шага без технических полей: ① «Установить» — инструмент поставится сам → ② вставить ключ и адрес → ③ «Подобрать модели» → ④ кликнуть по модели. Помощник появится в списках «Кто пишет код» под коротким именем «Инструмент · Модель».</div>
+    <div id="cat-cards">${(catData.items || []).map(catCard).join('')}</div>`;
+}
+
+async function catInstall(id, btn) {
+  const out = document.getElementById('cat-inst-' + id);
+  btn.disabled = true; const label = btn.textContent; btn.textContent = '⏳ Устанавливаю…';
+  if (out) { out.style.color = 'var(--text2)'; out.textContent = 'Установка идёт (npm или скачивание с GitHub) — до пары минут…'; }
+  try {
+    const r = await fetchJSON(`${API}/provider-catalog/${encodeURIComponent(id)}/install`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    if (out) {
+      out.style.color = r.ok ? 'var(--green)' : 'var(--red)';
+      out.textContent = (r.ok ? '✅ Установлено. ' : '❌ Не получилось. ') + (r.output || '').slice(-300);
+    }
+    if (r.ok) setTimeout(renderProviderCatalog, 800);
+  } catch (e) {
+    if (out) { out.style.color = 'var(--red)'; out.textContent = '❌ ' + e.message; }
+  } finally { btn.disabled = false; btn.textContent = label; }
+}
+
+function catForm(id) {
+  const box = document.getElementById('cat-form-' + id);
+  const it = (catData?.items || []).find(x => x.id === id);
+  if (!box || !it) return;
+  const st = catState[id] = catState[id] || { open: false, base: it.default_base || '', key: '', models: null, picked: '', title: '' };
+  st.open = !st.open;
+  if (!st.open) { box.innerHTML = ''; return; }
+  box.innerHTML = `
+    <div class="cz-row" style="margin-top:6px;flex-wrap:wrap;align-items:center">
+      <span class="cz-label-sm">Адрес (endpoint):</span>
+      <input type="text" id="cat-base-${escAttr(id)}" value="${escAttr(st.base)}" placeholder="https://…" style="width:230px" oninput="catState['${escAttr(id)}'].base=this.value">
+      <span class="cz-label-sm">Ключ:</span>
+      <input type="password" id="cat-key-${escAttr(id)}" value="${escAttr(st.key)}" placeholder="sk-…" style="width:190px" oninput="catState['${escAttr(id)}'].key=this.value">
+      <button class="btn btn-sm btn-ghost" onclick="catModels('${escAttr(id)}', this)">🔍 Подобрать модели</button>
+    </div>
+    <div class="cz-hint" id="cat-models-${escAttr(id)}" style="margin-top:4px"></div>`;
+}
+
+async function catModels(id, btn) {
+  const st = catState[id]; const out = document.getElementById('cat-models-' + id);
+  btn.disabled = true; const label = btn.textContent; btn.textContent = '⏳…';
+  if (out) { out.style.color = 'var(--text2)'; out.textContent = 'Спрашиваю список моделей у адреса…'; }
+  try {
+    const r = await fetchJSON(`${API}/provider-catalog/${encodeURIComponent(id)}/models`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ base: st.base, key: st.key }),
+    });
+    st.models = r.models; st.picked = '';
+    const chips = r.models.map(m =>
+      `<button type="button" class="day-chip" onclick="catPick('${escAttr(id)}','${escAttr(m)}',this)" title="${escAttr(m)}">${esc(m.length > 26 ? m.slice(0, 25) + '…' : m)}</button>`).join('');
+    if (out) { out.style.color = ''; out.innerHTML = `Модели (${r.count}) — кликните одну: ${chips}`; }
+  } catch (e) {
+    if (out) { out.style.color = 'var(--red)'; out.textContent = '❌ ' + e.message; }
+  } finally { btn.disabled = false; btn.textContent = label; }
+}
+
+function catPick(id, model, chipEl) {
+  const st = catState[id];
+  st.picked = model;
+  const it = (catData?.items || []).find(x => x.id === id);
+  st.title = `${it.title} · ${catPrettyModel(model)}`;
+  document.querySelectorAll(`#cat-models-${CSS.escape(id)} .day-chip`).forEach(c => c.classList.remove('on'));
+  if (chipEl) chipEl.classList.add('on');
+  const out = document.getElementById('cat-models-' + id);
+  if (out) out.insertAdjacentHTML('beforeend', `
+    <div class="cz-row" style="margin-top:6px;flex-wrap:wrap;align-items:center">
+      <span class="cz-label-sm">Имя помощника:</span>
+      <input type="text" id="cat-title-${escAttr(id)}" value="${escAttr(st.title)}" style="width:220px" oninput="catState['${escAttr(id)}'].title=this.value">
+      <button class="btn btn-sm btn-primary" onclick="catCreate('${escAttr(id)}', this)">✓ Подключить помощника</button>
+    </div>`);
+}
+
+async function catCreate(id, btn) {
+  const st = catState[id];
+  if (!st.picked) { toast('Сначала кликните по модели'); return; }
+  btn.disabled = true; const label = btn.textContent; btn.textContent = '⏳…';
+  try {
+    const r = await fetchJSON(`${API}/provider-catalog/${encodeURIComponent(id)}/create`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ base: st.base, key: st.key, model: st.picked, title: st.title }),
+    });
+    toast(`✅ Помощник «${r.label}» подключён — он уже в списках «Кто пишет код»`);
+    catState[id] = { open: false };
+    await loadProviders();
+    renderHelpersTab();
+  } catch (e) {
+    toast('❌ ' + e.message);
+  } finally { btn.disabled = false; btn.textContent = label; }
+}
+
+function renderHelpersTab() {
+  renderProviderCatalog();
+  const list = document.getElementById('set-helpers-list');
+  const humanLen = (p) => (p.human && Object.keys(p.human).length) ? 1 : 0;
+  const entries = Object.entries(providersData || {}).filter(([n, p]) => !p.hidden)
+    .sort((a, b) => ((a[1].ui_order ?? 9999) - (b[1].ui_order ?? 9999)) ||
+      (humanLen(b[1]) - humanLen(a[1])) || a[0].localeCompare(b[0]));
+  const roleLabel = { writer: 'пишет код', reviewer: 'проверяет код', planner: 'планирует', both: 'пишет и проверяет' };
+  // где помощник сейчас задействован (по воркфлоу из вкладки «Проверка кода»)
+  const wf = (workflowCache || []).find(x => x.id === setReviewWf) || (workflowCache || [])[0];
+  const busy = {};
+  if (wf) {
+    const ep = wf.config?.roles?.executor?.provider; if (ep) busy[ep] = busy[ep] || [];
+    busy[ep].push(`пишет код в «${wf.slug}»`);
+    const rp = wf.config?.roles?.reviewer?.provider; if (rp) busy[rp] = busy[rp] || [];
+    busy[rp].push(`обычный ревьюер в «${wf.slug}»`);
+    ((wf.config?.review_chain || {}).steps || []).forEach((s, i) => {
+      busy[s.provider] = busy[s.provider] || [];
+      busy[s.provider].push(`ступень ${i + 1} проверки`);
+      if (s.fixer && !['self', 'executor'].includes(s.fixer)) {
+        busy[s.fixer] = busy[s.fixer] || [];
+        busy[s.fixer].push(`чинит за ступень ${i + 1}`);
+      }
+    });
+    const pp = wf.config?.roles?.planner?.provider; if (pp) busy[pp] = busy[pp] || [];
+    busy[pp].push('планировщик');
+  }
+  helperBusyMap = busy;
+  list.innerHTML = entries.map(([name, p], i) => {
+    const h = p.human || {};
+    const label = h.label || name;
+    const role = h.role ? (roleLabel[h.role] || h.role) : '';
+    const now = (busy[name] || []).join(' · ');
+    return `<div class="cz-card" draggable="true" data-helper-idx="${i}" style="cursor:pointer"
+        onclick="helperConfigure('${escAttr(name)}')" title="нажмите, чтобы открыть свойства помощника"
+        ondragstart="helperDragStart(event,${i})" ondragover="helperDragOver(event,${i})"
+        ondrop="helperDrop(event,${i})" ondragend="helperDragIdx = -1">
+      <div class="cz-row">
+        <span class="cz-label" style="cursor:grab" title="перетащите карточку, чтобы изменить порядок помощников">⠿</span>
+        <b>${esc(label)}</b>
+        ${role ? `<span class="cz-hint">· ${esc(role)}</span>` : ''}
+        ${p.available === false ? '<span class="cz-hint" style="color:var(--red)">· недоступен</span>' : ''}
+        <span style="margin-left:auto;display:flex;gap:6px">
+          <button class="btn btn-sm btn-ghost" onclick="event.stopPropagation();probeProvider('${escAttr(name)}', this)" title="короткая проверка: запуск, доставка промпта, строка ИТОГ">🧪 Тест</button>
+          <button class="btn btn-sm btn-ghost" onclick="event.stopPropagation();probeProvider('${escAttr(name)}', this, true)" title="длинный промпт ~40К: проверка argv-лимита — нужно для роли исполнителя">🧪+ Длинный</button>
+          <button class="btn btn-sm btn-ghost" onclick="event.stopPropagation();helperConfigure('${escAttr(name)}')">⚙ Свойства</button>
+          <button class="btn btn-sm btn-danger" onclick="event.stopPropagation();helperRemove('${escAttr(name)}')" title="убрать помощника из списка (занятые и встроенные защищены)">🗑 Убрать</button>
+        </span>
+      </div>
+      <div class="cz-hint" id="probe-${escAttr(name)}" style="display:none"></div>
+      ${h.desc ? `<div class="cz-hint">${esc(h.desc)}</div>` : ''}
+      ${now ? `<div class="cz-hint" style="color:var(--cyan)">сейчас: ${esc(now)}</div>` : '<div class="cz-hint" style="color:var(--text2)">сейчас нигде не задействован</div>'}
+      <div class="cz-hint">технически: ${esc(name)}</div>
+    </div>`;
+  }).join('');
+  if (!entries.length) list.innerHTML = '<div class="cz-hint">Помощников нет — добавьте в ⚙ Providers.</div>';
+  else list.insertAdjacentHTML('beforeend',
+    '<div class="cz-hint" style="margin-top:8px">Карточку можно перетащить за ⠿ — порядок сохранится и появится в выпадающих списках «Проверки кода». Клик по карточке — свойства (команда запуска, ключи, модель). Список не растёт бесконечно: «🗑 Убрать» удаляет ненужного помощника — а занятые в ролях и сменах защищены от случайного удаления.</div>');
+}
+
+function helperDragStart(ev, i) {
+  // тянем только за маркер ⠿, чтобы клик по карточке открывал свойства
+  if (!ev.target.closest || !ev.target.closest('.cz-label[style*="cursor:grab"]')) {
+    ev.preventDefault(); return;
+  }
+  helperDragIdx = i;
+  ev.dataTransfer.effectAllowed = 'move';
+}
+
+// 🧪 Тест провайдера: зонд с контрольной строкой через тот же путь, что и задачи.
+// long=true проверяет доставку большого промпта (~40К) — выявляет argv-лимит.
+async function probeProvider(name, btn, long = false) {
+  const out = document.getElementById('probe-' + name);
+  const label = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '⏳…';
+  if (out) { out.style.display = ''; out.style.color = 'var(--text2)';
+    out.textContent = long ? 'Идёт длинный тест (~40К символов), может занять пару минут…'
+                           : 'Идёт тестовая задача…'; }
+  try {
+    const r = await fetchJSON(`${API}/providers/${encodeURIComponent(name)}/probe`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ long }),
+    });
+    const color = r.ok ? 'var(--green)' : 'var(--red)';
+    const verdict = r.ok
+      ? (long ? '✅ Длинный промпт доставлен, вердикт на месте — тянет роль исполнителя.'
+              : '✅ Связь есть, промпт доставлен, «ИТОГ» на месте.')
+      : '❌ ' + (r.issues || ['не прошёл']).join(' · ');
+    if (out) { out.style.color = color; out.textContent = `${verdict}${r.latency_s ? ' (${r.latency_s}с)' : ''}`; }
+    if (r.ok && !long) {
+      // сразу подскажем про длинные промпты, если это argv-провайдер
+      if (r.stdin_mode === false) {
+        if (out) out.textContent += ' argv-режим: длинные промпты (>30К) лучше проверить отдельным длинным тестом.';
+      }
+    }
+  } catch (e) {
+    if (out) { out.style.color = 'var(--red)'; out.textContent = '❌ ' + e.message; }
+  } finally {
+    btn.disabled = false;
+    btn.textContent = label;
+  }
+}
+function helperDragOver(ev, i) { ev.preventDefault(); ev.dataTransfer.dropEffect = 'move'; }
+async function helperDrop(ev, i) {
+  ev.preventDefault();
+  if (helperDragIdx < 0 || helperDragIdx === i) return;
+  const humanLen = (p) => (p.human && Object.keys(p.human).length) ? 1 : 0;
+  const entries = Object.entries(providersData || {}).filter(([n, p]) => !p.hidden)
+    .sort((a, b) => ((a[1].ui_order ?? 9999) - (b[1].ui_order ?? 9999)) ||
+      (humanLen(b[1]) - humanLen(a[1])) || a[0].localeCompare(b[0]));
+  const [moved] = entries.splice(helperDragIdx, 1);
+  entries.splice(i, 0, moved);
+  helperDragIdx = -1;
+  try {
+    await fetchJSON(`${API}/providers/reorder`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ names: entries.map(([n]) => n) }),
+    });
+    await loadProviders();          // обновит ui_order в providersData
+    renderHelpersTab();
+  } catch (e) { toast('Порядок не сохранён: ' + e.message); }
+}
+
+// ── Вкладка «Автопилот»: Jev (TypeSafe) — решатель самопочинки ──
+async function renderAutoTab() {
+  const pane = document.getElementById('set-auto');
+  let st = {};
+  try { st = await fetchJSON(`${API}/typesafe`); }
+  catch (e) {
+    pane.innerHTML = `<div class="cz-hint">Служба самопочинки недоступна (${esc(e.message)}). Обновите страницу после перезапуска сервера.</div>`;
+    return;
+  }
+  const statusLine = st.active === 'env'
+    ? '✅ Ключ задан и активен (через переменную окружения — она приоритетнее файла).'
+    : st.active === 'file'
+      ? '✅ Ключ задан и активен.'
+      : '❌ Ключ не задан — авто-решения Jev работать не будут (будет только уведомление вам).';
+  pane.innerHTML = `
+    <div class="cz-row"><b>🧠 Jev (TypeSafe) — решает «продолжить самому или позвать вас»</b></div>
+    <div class="cz-hint" style="margin:6px 0 10px">Когда исполнитель теряет итоговую строку отчёта или зависает, вотчер самопочинки показывает отчёт решателю Jev. Однозначное «работа сделана» — конвейер продолжается сам; сомнение — остановка и уведомление вам. Jev — не языковая модель и код не пишет.</div>
+    <div class="cz-row"><span id="ts-status">${statusLine}</span></div>
+    <div class="cz-row" style="margin-top:10px">
+      <input type="password" id="ts-key" placeholder="вставьте ключ TypeSafe" style="flex:1;min-width:220px">
+      <button class="btn btn-sm btn-primary" onclick="tsSaveKey()">Сохранить ключ</button>
+      <button class="btn btn-sm btn-ghost" onclick="tsTest()">Проверить связь</button>
+    </div>
+    <div class="cz-hint" id="ts-msg" style="margin-top:6px">Ключ хранится только на этом компьютере и начинает действовать сразу, без перезапуска. ${st.env_set ? 'Внимание: сейчас активен ключ из переменной окружения — файл будет запасным.' : ''}</div>
+    <div id="qf-block"></div>`;
+  try {
+    const qf = await fetchJSON(`${API}/quota-failover`);
+    const el = document.getElementById('qf-block');
+    if (!qf.available) {
+      el.innerHTML = '<div class="cz-hint" style="margin-top:10px">🪫 Лестница смен: вотчер ещё не сделал ни одного замера (запускается вместе с системой).</div>';
+    } else {
+      const modeLine = (qf.rung ?? 0) > 0
+        ? `<b style="color:var(--yellow)">⚠ смена ${(qf.rung ?? 0) + 1}</b> — работает исполнитель ${esc(qf.run_executor || '')}${qf.switch_reason ? ', причина: ' + esc(qf.switch_reason) : ''}`
+        : '<b style="color:var(--green)">✓ основная смена</b>';
+      el.innerHTML = `
+        <div class="cz-row" style="margin-top:14px"><b>🪫 Лестница смен (авто-переключение при исчерпании квот)</b></div>
+        <div class="cz-row">${modeLine}</div>
+        <div class="cz-row"><span class="cz-hint">${qf.info ? esc(qf.info) + ' · ' : ''}${qf.last_check ? 'замер ' + esc(String(qf.last_check).replace('T', ' ')) : ''}</span></div>`;
+    }
+  } catch (e) { /* блок не критичен */ }
+}
+
+
+async function tsSaveKey() {
+  const msg = document.getElementById('ts-msg');
+  const key = document.getElementById('ts-key').value.trim();
+  if (!key) { msg.textContent = 'Сначала вставьте ключ в поле.'; return; }
+  try {
+    await fetchJSON(`${API}/typesafe`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key }),
+    });
+    document.getElementById('ts-key').value = '';
+    msg.textContent = '✅ Ключ сохранён и уже действует.';
+    renderAutoTab();
+  } catch (e) { msg.textContent = '❌ ' + e.message; }
+}
+async function tsTest() {
+  const msg = document.getElementById('ts-msg');
+  msg.textContent = '⏳ Опрашиваю Jev…';
+  try {
+    await fetchJSON(`${API}/typesafe/test`, { method: 'POST' });
+    msg.textContent = '✅ Связь есть — Jev ответил.';
+  } catch (e) { msg.textContent = '❌ ' + e.message; }
+}
+
+// ── Каскад ревью: визуальный редактор цепочки (config.review_chain) ──
+
+function cascadeEditorHTML(wf) {
+  // U15: единый редактор настроек проверки кода. В карточке воркфлоу больше
+  // НЕТ второго расходящегося редактора: здесь только сводка текущей цепочки
+  // и кнопка, открывающая ТОТ ЖЕ экран настроек (Настройки -> Проверка кода),
+  // привязанный к этому воркфлоу. Правит одно место, поле-в-поле одно и то же.
+  const chain = (wf.config && wf.config.review_chain) || { enabled: false, steps: [] };
+  const steps = chain.steps || [];
+  const exec = (wf.config && wf.config.roles && wf.config.roles.executor) || {};
+  const wins = exec.provider_windows || [];
+  const exhaustLabel = {
+    arbitrate_planner: 'человеку (арбитраж не включён)',
+    accept_if_gate_green: 'принять при зелёном гейте',
+    human: 'человеку',
+  };
+  const stepRows = steps.map((st, i) => {
+    const w = st.window || {};
+    return `<div class="cz-row" style="flex-wrap:wrap">
+      <b>Ступень ${i + 1}:</b> <span>${esc(setHumanName(st.provider || '?'))}</span>
+      ${st.blocking === false ? '<span class="cz-hint">· совещательная</span>' : '<span class="cz-hint">· блокирующая</span>'}
+      <span class="cz-hint">· раундов ${st.max_rounds || 2}</span>
+      <span class="cz-hint">· исчерпан → ${esc(exhaustLabel[st.on_exhaust || 'human'])}</span>
+      ${w.from ? `<span class="cz-hint">· окно ${esc(w.from)}–${esc(w.to)} МСК</span>` : ''}
+    </div>`;
+  }).join('') || '<div class="cz-hint">Ступеней нет — проверяет обычный ревьюер воркфлоу.</div>';
+  const winRows = wins.map((row, i) => {
+    const w = row.window || {};
+    return `<div class="cz-hint">окно ${i + 1}: ${esc(setHumanName(row.provider || '?'))} · ${esc(w.from || '?')}–${esc(w.to || '?')} МСК${w.days ? ' · ' + esc(String(w.days)) : ''}${w.tariff ? ' · ' + esc(w.tariff) : ''}</div>`;
+  }).join('');
+  return `<div class="cz-editor">
+    <div class="cz-row"><b>Исполнитель кода:</b> <span>${esc(setHumanName(exec.provider || '?'))}</span>
+      ${wins.length ? '' : '<span class="cz-hint">· тарифных окон нет</span>'}</div>
+    ${winRows}
+    <div class="cz-row" style="margin-top:6px"><b>Цепочка проверки:</b>
+      <span class="cz-hint">${chain.enabled ? 'каскад включён' : 'каскад выключен'}</span></div>
+    ${stepRows}
+    <div class="cz-row" style="margin-top:10px">
+      <button class="btn btn-sm btn-primary" onclick="openReviewSettingsFor('${escAttr(wf.id)}')">⚙ Открыть настройки проверки кода</button>
+      <span class="cz-hint">тот же экран, что и в основных Настройках — поля идентичны, хранится в этом воркфлоу</span>
+    </div>
+  </div>`;
+}
+
+function czCollectSteps() {
+  const steps = [];
+  document.querySelectorAll('#cz-steps .cz-card').forEach(card => {
+    const i = card.dataset.czSlot;
+    const provider = document.getElementById(`cz-prov-${i}`)?.value || '';
+    if (!provider) return;
+    const fixerSel = document.getElementById(`cz-fixer-${i}`);
+    const fixerCustom = document.getElementById(`cz-fixer-custom-${i}`);
+    let fixer = fixerSel ? fixerSel.value : 'executor';
+    if (fixer === 'custom' && fixerCustom) fixer = fixerCustom.value || 'executor';
+    const step = {
+      slot: steps.length + 1,
+      provider,
+      fixer,
+      blocking: document.getElementById(`cz-blocking-${i}`)?.checked !== false,
+      max_rounds: parseInt(document.getElementById(`cz-rounds-${i}`)?.value, 10) || 2,
+      on_exhaust: document.getElementById(`cz-exhaust-${i}`)?.value || 'arbitrate_planner',
+    };
+    if (document.getElementById(`cz-window-en-${i}`)?.checked) {
+      step.window = {
+        from: document.getElementById(`cz-from-${i}`)?.value || '22:00',
+        to: document.getElementById(`cz-to-${i}`)?.value || '04:00',
+        tz_offset_hours: 3,
+      };
+    }
+    steps.push(step);
+  });
+  return steps;
+}
+
+async function czSave() {
+  const attemptDefault = attemptNumber('cz-attempt-default', 2);
+  const attemptMax = Math.max(attemptDefault, attemptNumber('cz-attempt-max', 3));
+  const boundedAttempt = id => Math.min(attemptMax, attemptNumber(id, attemptDefault));
+  const chain = {
+    enabled: document.getElementById('cz-enabled')?.checked !== false,
+    steps: czCollectSteps(),
+    attempt_policy: {
+      ...((selectedWorkflowData.config || {}).review_chain?.attempt_policy || {}),
+      mode: document.getElementById('cz-attempt-mode')?.value || 'manual',
+      default: attemptDefault,
+      max: attemptMax,
+      by_severity: {
+        low: boundedAttempt('cz-attempt-low'),
+        medium: boundedAttempt('cz-attempt-medium'),
+        high: boundedAttempt('cz-attempt-high'),
+        blocker: boundedAttempt('cz-attempt-blocker'),
+      },
+    },
+  };
+  if (chain.enabled && !chain.steps.length) {
+    toast('Каскад включён, но ступеней нет — добавьте ступень или снимите галочку.');
+    return;
+  }
+  // Конфликт версий (живой конвейер) — перечитываем свежий конфиг и перепробуем.
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const wf = await fetchJSON(`${API}/workflows/${selectedWorkflowId}`);
+    const cfg = JSON.parse(JSON.stringify(wf.config));
+    const oldChain = cfg.review_chain || {};
+    const oldRoles = cfg.roles || {};
+    const oldReviewer = oldRoles.reviewer || {};
+    chain.base_executor_provider = oldChain.base_executor_provider ?? oldRoles.executor?.provider ?? null;
+    chain.base_reviewer_provider = oldChain.base_reviewer_provider ?? oldReviewer.provider ?? null;
+    chain.base_reviewer_prompt_template = oldChain.base_reviewer_prompt_template ?? oldReviewer.prompt_template ?? '';
+    cfg.review_chain = chain;
+    cfg.roles = cfg.roles || {};
+    cfg.roles.reviewer = { ...(cfg.roles.reviewer || {}) };
+    cfg.automation = { ...(cfg.automation || {}) };
+    if (chain.enabled && chain.steps.length) {
+      cfg.roles.reviewer.provider = chain.steps[0].provider;
+      cfg.automation.auto_dispatch_reviewer = false;
+      cfg.automation.auto_apply_review = false;
+      cfg.automation.auto_resume_revision = false;
+    } else {
+      if (chain.base_reviewer_provider) cfg.roles.reviewer.provider = chain.base_reviewer_provider;
+      cfg.roles.reviewer.prompt_template = chain.base_reviewer_prompt_template;
+      cfg.automation.auto_dispatch_reviewer = true;
+      cfg.automation.auto_apply_review = true;
+      cfg.automation.auto_resume_revision = true;
+    }
+    try {
+      await fetchJSON(`${API}/workflows/${selectedWorkflowId}`, {
+        method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ config: cfg, expected_version: wf.state_version }),
+      });
+      toast('Каскад сохранён — действует с ближайшего диспетча.', false);
+      await loadWorkflows();
+      return;
+    } catch (e) {
+      if (/version/i.test(e.message || '') && attempt < 3) continue;
+      toast('Сохранение каскада: ' + e.message);
+      return;
+    }
+  }
+}
+
+function czAddStep() {
+  const stepsBox = document.getElementById('cz-steps');
+  if (!stepsBox) return;
+  const i = stepsBox.querySelectorAll('.cz-card').length;
+  stepsBox.insertAdjacentHTML('beforeend', cascadeStepCardBlank(i));
+}
+
+function cascadeStepCardBlank(i) {
+  const provOpts = workflowProviderOptions('', false)
+    .replace('<option value="" selected>', '<option value="" selected>— выберите провайдера —</option>');
+  return `<div class="cz-card" data-cz-slot="${i}">
+    <div class="cz-row">
+      <span class="cz-label">Ревью-ступень ${i + 1}</span>
+      <select id="cz-prov-${i}" class="cz-prov">${provOpts}</select>
+      <button class="btn btn-sm btn-danger" onclick="czRemoveStep(${i})">✕</button>
+    </div>
+    <div class="cz-row">
+      <label class="cz-inline"><input type="checkbox" id="cz-blocking-${i}" checked> блокирующая</label>
+      <label class="cz-inline">раунды: <input type="number" id="cz-rounds-${i}" min="1" max="10" value="2" style="width:44px"></label>
+      <select id="cz-exhaust-${i}" class="cz-exhaust">
+        <option value="arbitrate_planner">исчерпан → арбитраж планером</option>
+        <option value="accept_if_gate_green">исчерпан → принять при зелёном гейте</option>
+        <option value="human">исчерпан → человеку</option>
+      </select>
+    </div>
+    <div class="cz-row">
+      <span class="cz-label-sm">Находки чинит:</span>
+      <select id="cz-fixer-${i}" class="cz-fixer">
+        <option value="executor">исполнитель воркфлоу</option>
+        <option value="self">этот же провайдер</option>
+      </select>
+    </div>
+    <div class="cz-row">
+      <label class="cz-inline"><input type="checkbox" id="cz-window-en-${i}"> ⏰ только в окне</label>
+      <span id="cz-window-times-${i}" style="display:none">
+        с <input type="time" id="cz-from-${i}" value="22:00" style="width:70px">
+        до <input type="time" id="cz-to-${i}" value="04:00" style="width:70px">
+      </span>
+    </div>
+  </div>`;
+}
+
+function czRemoveStep(i) {
+  const card = document.querySelector(`#cz-steps .cz-card[data-cz-slot="${i}"]`);
+  if (card) card.remove();
+  // Перенумеровать data-cz-slot, чтобы czCollectSteps читал актуальный порядок
+  document.querySelectorAll('#cz-steps .cz-card').forEach((c, idx) => c.dataset.czSlot = idx);
+}
+
+function czFixerChanged(i) {
+  const sel = document.getElementById(`cz-fixer-custom-${i}`);
+  if (sel) sel.style.display = document.getElementById(`cz-fixer-${i}`).value === 'custom' ? '' : 'none';
+}
+
+function czWindowChanged(i) {
+  const box = document.getElementById(`cz-window-times-${i}`);
+  if (box) box.style.display = document.getElementById(`cz-window-en-${i}`).checked ? '' : 'none';
+}
+
+// ── Каскад ревью: конец ──
+
+// ── Этапы воркфлоу для строки задачи: бейдж этапа + прогресс ──
+// Кэш wfStagesCache[wfId] = {version, list, byId, done, total, pct}.
+const wfStagesCache = {};
+async function ensureWfStages(wf) {
+  if (!wf || !wf.id) return;
+  const cached = wfStagesCache[wf.id];
+  if (cached && cached.version === wf.state_version) return;
+  try {
+    const list = await fetchJSON(`${API}/workflows/${wf.id}/stages`);
+    const byId = {};
+    let done = 0;
+    (list || []).forEach(s => {
+      byId[s.id] = s;
+      if (s.status === 'completed') done++;
+    });
+    wfStagesCache[wf.id] = {
+      version: wf.state_version, list: list || [], byId,
+      done, total: (list || []).length,
+      pct: (list || []).length ? Math.round(done * 100 / list.length) : 0,
+    };
+  } catch (e) { /* не критично: без бейджа */ }
 }
 
 async function loadTasks() {
@@ -3565,14 +4831,40 @@ function provEdit(name) {
   document.getElementById('pfModels').value = (p.models || []).join(', ');
   document.getElementById('pfEffort').value = p.effort || '';
   window.pfSourceName = name;
-  document.getElementById('pfEnv').value = Object.entries(p.env || {})
+  // U13: подключение — эндпоинт показываем, ключ никогда (пусто = не менять)
+  const env = p.env || {};
+  document.getElementById('pfEndpoint').value = env.OPENAI_BASE_URL || env.LLM_BASE_URL || '';
+  const hasKey = !!(env.OPENAI_API_KEY || env.LLM_API_KEY);
+  document.getElementById('pfKey').value = '';
+  document.getElementById('pfKey').placeholder = hasKey
+    ? 'ключ сохранён (не отображается) — пусто = не менять'
+    : 'ключ API';
+  document.getElementById('pfEnv').value = Object.entries(env)
+    .filter(([k]) => !['OPENAI_BASE_URL', 'LLM_BASE_URL'].includes(k))
     .map(([k, v]) => `${k}=${v}`).join('\n');
-  const masked = Object.values(p.env || {}).includes('***');
+  const masked = Object.values(env).includes('***');
   document.getElementById('pfError').textContent =
     'Сохранение с этим именем перезапишет провайдера; смените имя — создастся копия.'
     + (masked ? ' Строки со значением *** — сохранённые секреты: оставьте как есть или впишите новое значение.' : '');
   document.getElementById('pfName').scrollIntoView({ behavior: 'smooth', block: 'center' });
   pfTypeChange();
+}
+
+// U13: живой список моделей с эндпоинта провайдера (ключ остаётся на сервере)
+async function provFetchModels() {
+  const msg = document.getElementById('pfModelsMsg');
+  const name = (window.pfSourceName || document.getElementById('pfName').value || '').trim();
+  if (!name) { msg.textContent = 'Сначала выберите/сохраните помощника.'; return; }
+  msg.textContent = '⏳ Запрашиваю у провайдера…';
+  try {
+    const r = await fetchJSON(`${API}/providers/${encodeURIComponent(name)}/models`);
+    const current = document.getElementById('pfModels').value.split(',').map(s => s.trim()).filter(Boolean);
+    const merged = [...new Set([...current, ...(r.models || [])])];
+    document.getElementById('pfModels').value = merged.join(', ');
+    msg.textContent = `✅ Получено ${r.count} моделей с ${r.endpoint} — список дополнен, нажмите «Сохранить».`;
+  } catch (e) {
+    msg.textContent = '❌ ' + e.message;
+  }
 }
 
 async function renderMachineList() {
@@ -3629,6 +4921,11 @@ async function provAdd(e) {
     const i = line.indexOf('=');
     if (i > 0) env[line.slice(0, i).trim()] = line.slice(i + 1).trim();
   });
+  // U13: поля «Подключение» главнее textarea (эндпоинт пусто = убрать, ключ пусто = не менять)
+  const endpoint = document.getElementById('pfEndpoint').value.trim();
+  const keyVal = document.getElementById('pfKey').value.trim();
+  if (endpoint) env.OPENAI_BASE_URL = endpoint; else delete env.OPENAI_BASE_URL;
+  if (keyVal) env.OPENAI_API_KEY = keyVal;
   const body = {
     name: document.getElementById('pfName').value.trim(),
     source_name: window.pfSourceName || null,
