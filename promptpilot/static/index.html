@@ -642,6 +642,7 @@
   </div>
 
   <div class="cost-bar" id="costBar"></div>
+  <div class="cost-bar" id="healthBar" title="живы ли фоновые процессы конвейера (воркер, каскад, вотчеры, боты)"></div>
 
   <div class="add-form">
     <textarea id="promptInput" placeholder="Enter your prompt here..."></textarea>
@@ -4093,19 +4094,62 @@ async function loadCosts() {
     }
   } catch (_) {}
 
-  if (!items.length) return;
+  // Токены конвейера из реальных источников (Meta-блоки codex + журнал qwen);
+  // goose/mmx одноразовые и юзаж не оставляют — не выдумываем.
+  try {
+    const t = await fetchJSON(`${API}/stats/tokens`);
+    if (t && t.total && t.total.total > 0) {
+      const fmtTok = n => (n / 1e6).toFixed(1) + 'M';
+      const dollars = (t.pricing_configured && t.total.cost > 0)
+        ? ` · $${t.total.cost.toFixed(2)}` : '';
+      const provBits = Object.entries(t.by_provider)
+        .filter(([, v]) => v.measured)
+        .map(([p, v]) =>
+          `<div class="cost-item" title="${esc(v.model || p)}: ${Number(v.input).toLocaleString('ru')} in / ${Number(v.output).toLocaleString('ru')} out, кэш ${fmtTok(v.cached)} · задач: ${v.tasks}">${esc(p)}: <span>${fmtTok(v.total)}</span></div>`)
+        .join('');
+      items.push(
+        `<div class="cost-item" title="токены конвейера по исполнителям, отдающим юзаж; доллары появятся после заполнения pricing.json">Ток. сегодня: <span>${fmtTok(t.today.total)}</span> · неделя: <span>${fmtTok(t.week.total)}</span> · всего: <span>${fmtTok(t.total.total)}${dollars}</span></div>`,
+        provBits);
+    }
+  } catch (_) {}
+
+  if (!items.length) return;  if (!items.length) return;
   const bar = document.getElementById('costBar');
   bar.innerHTML = items.join('');
   bar.classList.add('visible');
 }
 
-// --- Init ---
+// --- Health: живы ли процессы конвейера ---
+async function loadHealth() {
+  let h;
+  try { h = await fetchJSON(`${API}/health/processes`); } catch (e) { return; }
+  const bar = document.getElementById('healthBar');
+  if (!bar) return;
+  if (!h || !h.processes || !h.processes.length) {
+    bar.classList.remove('visible');
+    return;
+  }
+  const dead = h.processes.filter(p => p.state === 'dead');
+  const unknown = h.processes.filter(p => p.state === 'unknown');
+  if (dead.length) {
+    bar.innerHTML = '<div class="cost-item" style="color:var(--red)">🚨 Мертвы: ' +
+      dead.map(p => `${esc(p.label)}${p.pid ? ` (pid ${p.pid})` : ''}`).join(', ') + '</div>';
+  } else if (unknown.length || !h.ok) {
+    bar.innerHTML = '<div class="cost-item" style="color:var(--yellow)" title="pid-файл недоступен или права не дают проверить процессы">⚠️ Конвейер: нет данных о процессах</div>';
+  } else {
+    bar.innerHTML = '<div class="cost-item" title="все фоновые процессы живы">❤️ Конвейер: все процессы живы</div>';
+  }
+  bar.classList.add('visible');
+}
+
+
 setDefaultSchedule();
 loadProviders();
 loadProjects();
 loadWorkerStatus();
 loadVersion();
 loadCosts();
+loadHealth();
 refresh();
 if (location.hash === '#pipelines') openPipelines();
 setInterval(refresh, 5000);
