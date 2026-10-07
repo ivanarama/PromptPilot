@@ -19,7 +19,6 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import Response
 from pydantic import BaseModel
 
-import os
 import re as _re
 
 from . import db, epf_tools, workflows
