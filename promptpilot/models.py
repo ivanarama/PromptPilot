@@ -19,7 +19,7 @@ class TaskStatus(str, Enum):
 class TaskCreate(BaseModel):
     prompt: str
     working_dir: Optional[str] = None
-    provider: Optional[str] = None  # e.g. "claude", "claude-z", or raw command
+    provider: Optional[str] = None
     priority: int = Field(default=5, ge=1, le=10)
     scheduled_at: Optional[datetime] = None
     max_retries: int = Field(default=5, ge=0, le=50)
@@ -203,6 +203,9 @@ class WorkflowRoleConfig(BaseModel):
     keep_pane: bool = True
     herdr_target: Optional[str] = None
     machine: Optional[str] = None
+    # Дешёвые часы: [{provider, window{from,to,tz_offset_hours,days}}];
+    # активное окно задаёт провайдера роли, вне окон — фолбэк на provider
+    provider_windows: Optional[list[dict]] = None
     prompt_template: str = ""
 
 
