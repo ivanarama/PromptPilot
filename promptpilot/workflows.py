@@ -1447,6 +1447,84 @@ def _operator_notes_block(notes: list[str]) -> str:
     return "\n\n".join(notes) if notes else "(нет)"
 
 
+def resolve_role_provider(workflow, role_name: str, now=None) -> str | None:
+    """Провайдер роли по окнам времени и дням недели («дешёвые часы»).
+
+    roles.<role>.provider_windows = [{"provider": str,
+        "window": {"from": "HH:MM", "to": "HH:MM", "tz_offset_hours": int,
+                   "days": "weekdays"|"weekend"|"all"|["mon".."sun"]}}].
+    Активное окно (учитывая переход через полночь) определяет провайдера;
+    ночное окно принадлежит дню СТАРТА (раннее утро до `to` засчитывается,
+    если в days есть вчерашний день). Первое совпавшее окно по порядку
+    выигрывает; вне всех окон и без окон — обычный roles.<role>.provider.
+    """
+    from datetime import datetime, timedelta
+    from datetime import timezone as _tz
+
+    role = (workflow.config or {}).get("roles", {}).get(role_name) or {}
+    windows = role.get("provider_windows") or []
+    fallback = role.get("provider")
+    if not windows:
+        return fallback
+    now = now or datetime.now(_tz.utc)
+    local_dt = now + timedelta(minutes=_tz_offset_minutes(now, windows))
+    day_names = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+    today = day_names[local_dt.weekday()]
+    yesterday = day_names[(local_dt.weekday() - 1) % 7]
+    local = local_dt.hour * 60 + local_dt.minute
+    for item in windows:
+        if not isinstance(item, dict):
+            continue
+        window = item.get("window") or {}
+        try:
+            fh, fm = str(window.get("from", "0:0")).split(":")[:2]
+            th, tm = str(window.get("to", "0:0")).split(":")[:2]
+        except (ValueError, TypeError):
+            continue
+        allowed = _window_days(window.get("days"))
+        start = int(fh) * 60 + int(fm)
+        end = int(th) * 60 + int(tm)
+        if start <= end:
+            inside = start <= local < end and today in allowed
+        else:
+            inside = ((today in allowed and local >= start)
+                      or (yesterday in allowed and local < end))
+        if inside and item.get("provider"):
+            return item["provider"]
+    return fallback
+
+
+def _tz_offset_minutes(now, windows) -> int:
+    """Смещение окна из первой записи с валидным tz_offset_hours (МСК=180)."""
+    for item in windows:
+        if not isinstance(item, dict):
+            continue
+        try:
+            return int((item.get("window") or {}).get("tz_offset_hours", 3)) * 60
+        except (ValueError, TypeError):
+            continue
+    return 180
+
+
+def _window_days(raw) -> set:
+    """Дни окна: "weekdays"/"будни", "weekend"/"выходные", "all"/нет = все;
+    иначе список имён mon..sun (посторонние игнорируются, пусто = все дни)."""
+    all_days = {"mon", "tue", "wed", "thu", "fri", "sat", "sun"}
+    if raw is None:
+        return all_days
+    if isinstance(raw, str):
+        s = raw.strip().lower()
+        if s in ("weekdays", "будни", "будни (пн–пт)"):
+            return {"mon", "tue", "wed", "thu", "fri"}
+        if s in ("weekend", "выходные", "выходные (сб–вс)"):
+            return {"sat", "sun"}
+        return all_days
+    if isinstance(raw, (list, tuple, set)):
+        allowed = {str(d).strip().lower()[:3] for d in raw} & all_days
+        return allowed or all_days
+    return all_days
+
+
 def _render_role_prompt(workflow: WorkflowInDB, role: WorkflowRole,
                         template: str) -> str:
     round_no = workflow.current_round

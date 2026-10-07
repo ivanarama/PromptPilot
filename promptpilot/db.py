@@ -289,6 +289,15 @@ CREATE TABLE IF NOT EXISTS workflow_events (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS workflow_memory (
+    workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    content TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    updated_by_task INTEGER,
+    PRIMARY KEY (workflow_id, name)
+);
+
 CREATE TRIGGER IF NOT EXISTS workflow_events_no_update
 BEFORE UPDATE ON workflow_events
 BEGIN
@@ -344,6 +353,7 @@ MIGRATIONS = [
     "ALTER TABLE notifications ADD COLUMN pane_id TEXT",
     "ALTER TABLE notifications ADD COLUMN machine TEXT",
     "ALTER TABLE workflows ADD COLUMN current_stage_id TEXT",
+    "ALTER TABLE workflow_memory ADD COLUMN scope_stage TEXT",
     """CREATE TABLE IF NOT EXISTS workflow_plans (
         workflow_id TEXT PRIMARY KEY REFERENCES workflows(id) ON DELETE RESTRICT,
         status TEXT NOT NULL DEFAULT 'draft', planner_task_id INTEGER,
@@ -5341,6 +5351,55 @@ def list_workflow_findings(workflow_id: str,
         return [_row_to_workflow_finding(row) for row in rows]
 
 
+MEMORY_MAX_BYTES = 16 * 1024
+
+
+def list_memory(workflow_id: str) -> list[dict]:
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM workflow_memory WHERE workflow_id = ? ORDER BY name",
+            (workflow_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def save_memory(workflow_id: str, name: str, content: str,
+                updated_by_task: int = None,
+                scope_stage: str = None) -> tuple[bool, str]:
+    """Сохранить заметку миссии (замена целиком). Лимит 16КБ — ОТКАЗ, не
+    обрезка: агент должен знать, что не влезло, и разбить сам.
+    scope_stage привязывает заметку к этапу — конвейер удалит её при
+    закрытии этапа (уборка — работа пайплайна)."""
+    name = (name or "memory.md").strip().lower()[:64]
+    if not name:
+        return False, "пустое имя заметки"
+    if len(content.encode("utf-8")) > MEMORY_MAX_BYTES:
+        return False, (f"заметка {name} больше {MEMORY_MAX_BYTES} байт — "
+                       f"сократи или раздели на несколько заметок")
+    with _connect() as conn:
+        conn.execute(
+            """INSERT INTO workflow_memory (workflow_id, name, content, updated_at, updated_by_task, scope_stage)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(workflow_id, name) DO UPDATE SET
+                   content = excluded.content,
+                   updated_at = excluded.updated_at,
+                   updated_by_task = excluded.updated_by_task,
+                   scope_stage = excluded.scope_stage""",
+            (workflow_id, name, content, _now(), updated_by_task,
+             (scope_stage or None)),
+        )
+    return True, "сохранено"
+
+
+def delete_memory(workflow_id: str, name: str) -> bool:
+    with _connect() as conn:
+        cur = conn.execute(
+            "DELETE FROM workflow_memory WHERE workflow_id = ? AND name = ?",
+            (workflow_id, name),
+        )
+        return cur.rowcount > 0
+
+
 def create_workflow_artifact(data: WorkflowArtifactCreate,
                              artifact_id: str = None) -> WorkflowArtifactInDB:
     artifact_id = artifact_id or _new_id("artifact")
@@ -5429,14 +5488,20 @@ def list_workflow_artifacts(workflow_id: str,
 
 
 def list_workflow_events(workflow_id: str, after_seq: int = 0,
-                         limit: int = 200) -> list[WorkflowEventInDB]:
+                         limit: int = 200,
+                         tail: bool = False) -> list[WorkflowEventInDB]:
+    """tail=True — последние `limit` событий в хронологическом порядке:
+    дешевле страницы «всё и отрезать» для длинных миссий."""
     with _connect() as conn:
+        order = "DESC" if tail else "ASC"
         rows = conn.execute(
-            """SELECT * FROM workflow_events
+            f"""SELECT * FROM workflow_events
                WHERE workflow_id = ? AND seq > ?
-               ORDER BY seq LIMIT ?""",
+               ORDER BY seq {order} LIMIT ?""",
             (workflow_id, after_seq, limit),
         ).fetchall()
+        if tail:
+            rows = list(reversed(rows))
         return [_row_to_workflow_event(row) for row in rows]
 
 

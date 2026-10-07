@@ -668,6 +668,33 @@ def api_list_workflow_findings(
     )
 
 
+@app.get("/api/workflows/{workflow_id}/memory")
+def api_get_memory(workflow_id: str):
+    return db.list_memory(workflow_id)
+
+
+@app.put("/api/workflows/{workflow_id}/memory")
+def api_put_memory(workflow_id: str, body: dict):
+    """Заметки памяти миссии (например memory.md). Замена целиком;
+    лимит 16КБ на заметку — осознанный отказ, не обрезка."""
+    if not db.get_workflow(workflow_id):
+        raise HTTPException(404, "Workflow not found")
+    name = str(body.get("name") or "memory.md")
+    content = str(body.get("content") or "")
+    ok, msg = db.save_memory(workflow_id, name, content,
+                             scope_stage=body.get("scope_stage"))
+    if not ok:
+        raise HTTPException(400, msg)
+    return {"ok": True, "name": name}
+
+
+@app.delete("/api/workflows/{workflow_id}/memory/{name}")
+def api_delete_memory(workflow_id: str, name: str):
+    if not db.delete_memory(workflow_id, name):
+        raise HTTPException(404, "Note not found")
+    return {"ok": True}
+
+
 @app.get(
     "/api/workflows/{workflow_id}/artifacts",
     response_model=List[WorkflowArtifactInDB],
