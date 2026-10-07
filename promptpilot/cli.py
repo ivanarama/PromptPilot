@@ -900,6 +900,16 @@ def pipelinectl(args):
     raise SystemExit(run(list(args)))
 
 
+@cli.command(name="bot-vk")
+def bot_vk():
+    """Start the VK community bot (requires PP_VK_TOKEN and PP_VK_GROUP_ID)."""
+    from .bot_vk import run_vk_bot
+    try:
+        run_vk_bot()
+    except SystemExit as e:
+        raise click.ClickException(str(e))
+
+
 @cli.command()
 def bot():
     """Start the Telegram bot (requires PP_TG_TOKEN env var)."""
