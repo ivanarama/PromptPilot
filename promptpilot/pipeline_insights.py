@@ -3575,6 +3575,10 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                         "preflight": preflight,
                     }
             if mode == "auto":
+                if stage == "merge" and queue.get("item_blockers") is True:
+                    from .pipeline_item_holds import register_target
+                    target = fallback_lease["target"]
+                    register_target(task, target["number"], target["head"], "merge")
                 gate_command = [*command[:-2], "gate-fallback", stage,
                                 *_lease_argument(task, preflight["handoff"]["lease"], "gate")]
                 envelope = {"protocol": "promptpilot-fallback-target-v1",

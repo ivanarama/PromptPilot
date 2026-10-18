@@ -76,6 +76,29 @@ def fingerprints(data, queue_config=None):
                                        "updated_at": head.lower(), "head": head.lower()})
             for key in ambiguous:
                 items.pop(key, None)
+    if stage in {"fix", "merge"} and not diagnostics.get("checker_failed"):
+        # A completed handoff can move a PR out of this stage's search before
+        # the next attempt. Measure all versioned diagnostic PRs as negative
+        # admission evidence, including human_waiting and review_candidates.
+        # This cannot add a PR to any executable allowlist.
+        versions = {}
+        for field in ("review_candidates", "content_review_candidates", "review_backlog",
+                      "fix_candidates", "merge_candidates", "merge_executable",
+                      "human_waiting", "reviewed_waiting_ship"):
+            for candidate in diagnostics.get(field) or []:
+                if not isinstance(candidate, dict):
+                    continue
+                number, head = candidate.get("number"), candidate.get("head")
+                if (type(number) is int and number > 0 and isinstance(head, str)
+                        and re.fullmatch(r"[0-9a-fA-F]{40}", head)):
+                    versions.setdefault(str(number), set()).add(head.lower())
+        for key, heads in versions.items():
+            if len(heads) != 1:
+                items.pop(key, None)
+                continue
+            head = next(iter(heads))
+            items.setdefault(key, {"number": int(key), "kind": "pr",
+                                   "updated_at": head, "head": head})
     result = {}
     for number, item in items.items():
         witnesses = []
@@ -109,7 +132,7 @@ def prepare(task, queue, data):
     for number, hold in holds.items():
         if not isinstance(number, str) or not number.isdigit() or not isinstance(hold, dict):
             continue
-        current_head = _review_candidate_head(data, int(number)) if number.isdigit() else None
+        current_head = _candidate_head(data, int(number), hold.get("stage", "review"))
         unchanged = (hold.get("fingerprint") == states.get(number)
                      if "fingerprint" in hold else
                      current_head is not None and hold.get("head") == current_head)
@@ -121,15 +144,16 @@ def prepare(task, queue, data):
     return sorted(excluded)
 
 
-def _review_candidate_head(data, number):
+def _candidate_head(data, number, stage):
     diagnostics = data.get("diagnostics") or {}
     if diagnostics.get("checker_failed"):
         return None
-    candidates = diagnostics.get("review_candidates")
+    candidates = diagnostics.get("review_candidates" if stage == "review" else "merge_executable")
     if not isinstance(candidates, list):
         return None
     matching = [item.get("head", "").lower() for item in candidates
-                if isinstance(item, dict) and item.get("stage") == "review"
+                if isinstance(item, dict) and (item.get("stage") == "review"
+                                               if stage == "review" else True)
                 and item.get("number") == number and isinstance(item.get("head"), str)
                 and re.fullmatch(r"[0-9a-fA-F]{40}", item["head"])]
     return matching[0] if len(matching) == 1 else None
@@ -141,7 +165,13 @@ def register_review_target(task, number, head):
     This only enables a negative admission hold. It never grants review or
     mutation authority, and future dispatch still requires a fresh candidate.
     """
-    if (not getattr(task, "series_id", None) or type(number) is not int or number <= 0
+    register_target(task, number, head, "review")
+
+
+def register_target(task, number, head, stage):
+    """Remember a validated tool election, never an executor's claimed target."""
+    if (stage not in {"review", "merge"}
+            or not getattr(task, "series_id", None) or type(number) is not int or number <= 0
             or not isinstance(head, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", head)):
         return
     key = BASELINE + str(task.series_id)
@@ -151,7 +181,7 @@ def register_review_target(task, number, head):
         baseline = {}
     if baseline.get("task_id") != task.id:
         baseline = {"task_id": task.id, "states": {}, "at": time.time()}
-    baseline["review_target"] = {"number": number, "head": head.lower()}
+    baseline["review_target"] = {"number": number, "head": head.lower(), "stage": stage}
     db.set_setting(MODE + str(task.series_id), "1")
     db.set_setting(key, json.dumps(baseline))
 
@@ -159,10 +189,11 @@ def register_review_target(task, number, head):
 def record(conn, series_id, task_id, verdict, result):
     """Called inside recurrence's existing transaction; return True if held.
 
-    Only explicit unambiguous HUMAN targets with a measured pre-launch state
-    qualify. UNABLE and unmeasured/ambiguous failures retain the series guard.
+    Explicit HUMAN targets require measured state. UNABLE additionally requires
+    an exact validated tool election. Unscoped failures retain the series guard.
     """
-    if str(verdict or "").strip().upper() != "НУЖЕН ЧЕЛОВЕК":
+    outcome = str(verdict or "").strip().upper()
+    if outcome not in {"НУЖЕН ЧЕЛОВЕК", "НЕ СМОГ"}:
         return False
     mode = conn.execute("SELECT value FROM settings WHERE key=?", (MODE + str(series_id),)).fetchone()
     baseline = conn.execute("SELECT value FROM settings WHERE key=?", (BASELINE + str(series_id),)).fetchone()
@@ -192,6 +223,8 @@ def record(conn, series_id, task_id, verdict, result):
                         and re.fullmatch(r"[0-9a-f]{40}", target["head"]))
         if target and not exact_target:
             return False
+        if outcome == "НЕ СМОГ" and not exact_target:
+            return False
         if not all(number in states for number in numbers) and not exact_target:
             return False
         row = conn.execute("SELECT value FROM settings WHERE key=?", (PREFIX + str(series_id),)).fetchone()
@@ -203,7 +236,7 @@ def record(conn, series_id, task_id, verdict, result):
     # Preserve the initial timestamp: recurrence repair must not extend a hold.
     for number in numbers:
         old = holds.get(number) or {}
-        identity = ({"head": target["head"]} if exact_target else
+        identity = ({"head": target["head"], "stage": target.get("stage", "review")} if exact_target else
                     {"fingerprint": states[number]})
         if any(old.get(key) != value for key, value in identity.items()):
             holds[number] = {**identity, "at": time.time(),

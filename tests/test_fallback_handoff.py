@@ -14,6 +14,7 @@ import pytest
 
 from promptpilot import fallback_handoff as handoff
 from promptpilot import pipeline_insights, project_pipeline as pp
+from promptpilot.models import TaskCreate
 
 
 HEAD = "a" * 40
@@ -649,3 +650,28 @@ def test_module_cli_helper_errors_are_json_and_visible_without_tracebacks(config
     assert payload["error"]
     assert result.stderr.strip() == f"pipelinectl gate-fallback: {payload['error']}"
     assert "Traceback" not in result.stderr
+
+
+def test_validated_merge_fallback_parks_exact_target_with_stale_dashboard(
+        config, isolated_db, monkeypatch):
+    source = health("merge")
+    target = source["merge_executable"][0]
+    preflight = handoff.create(config, source, "merge", target, "full skill required")
+    queue = {"id": "merge", "item_blockers": True,
+             "execution": {"mode": "auto", "command": ["pp", "next", "merge"]}}
+    monkeypatch.setattr(pipeline_insights, "_matching_queue", lambda _: ("p", {}, queue))
+    monkeypatch.setattr(pipeline_insights, "_tool_available", lambda *_: (True, ""))
+    monkeypatch.setattr(pipeline_insights, "_tool_preflight", lambda *_: preflight)
+    monkeypatch.setattr(pipeline_insights, "read_cached", lambda *_: {"cache": {"stale": True}})
+    task = isolated_db.create_task(TaskCreate(prompt="merge", recurrence="15m"))
+    route = pipeline_insights.execution_route(task, "canonical skill")
+    assert route["action"] == "prompt"
+    isolated_db.mark_completed(
+        task.id, f'ИТОГ: НУЖЕН ЧЕЛОВЕК (#{target["number"]} — conflict requires owner)',
+        verdict="НУЖЕН ЧЕЛОВЕК")
+    assert not isolated_db.pause_pipeline_series_on_repeated_blocker(
+        task.series_id, task.id)["suppress_recurrence"]
+    from promptpilot.pipeline_item_holds import prepare
+    fresh = {"cache": {"complete": True}, "diagnostics": source}
+    successor = SimpleNamespace(id=task.id + 1, series_id=task.series_id)
+    assert prepare(successor, queue, fresh) == [target["number"]]
