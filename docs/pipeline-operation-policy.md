@@ -151,8 +151,10 @@ event in that current epoch, all required CI checks, and an unchanged exact
 owner/HEAD/stage/allowlist. These are checked again at completion and after the
 cleanup intent before SHA compare-and-merge. Pending CI waits without a model.
 Historical carry without current-epoch ship, conflicts and ambiguous recovery
-remain in the full canonical lineage procedure. `base_sync_merge` is not enabled
-by the installer. Direct completion also recovers a pending cleanup intent only
+remain in the full canonical lineage procedure — except one proven mechanical
+base-sync under the separate opt-in `base_sync_carry` (issue #42; all four carry
+conditions re-proven before and after the cleanup intent, see README).
+`base_sync_merge` and `base_sync_carry` are not enabled by the installer. Direct completion also recovers a pending cleanup intent only
 after the same owner checks.
 
 REVIEW and MERGE now use the existing adaptive cadence (30-minute idle,
