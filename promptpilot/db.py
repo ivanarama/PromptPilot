@@ -372,6 +372,12 @@ MIGRATIONS = [
         created_at TEXT NOT NULL, updated_at TEXT NOT NULL
     )""",
     "CREATE INDEX IF NOT EXISTS idx_tasks_series ON tasks(series_id, id)",
+    # Schedule refreshes scan narrow health columns for every occurrence. A
+    # covering index avoids visiting task rows containing large result payloads.
+    "CREATE INDEX IF NOT EXISTS idx_tasks_series_summary ON tasks(series_id, id, status, started_at, completed_at, verdict)",
+    # The covering index also supports every lookup using this older prefix.
+    # Keeping both can make SQLite prefer the narrow, table-reading scan.
+    "DROP INDEX IF EXISTS idx_tasks_series",
     """CREATE TABLE IF NOT EXISTS pipeline_snapshots (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         profile_id TEXT NOT NULL, repository TEXT NOT NULL,
