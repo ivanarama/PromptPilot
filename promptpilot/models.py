@@ -92,6 +92,14 @@ class TaskInDB(BaseModel):
     series_id: Optional[int] = None
     series_title: Optional[str] = None
     series_paused: bool = False
+    # Атрибуция задач (очередь/миссия): None = задача вне воркфлоу / не в ожидании.
+    workflow_id: Optional[str] = None
+    role: Optional[str] = None
+    # Позиция — ранг СРЕДИ ГОТОВЫХ по правилам допуска воркера; не-готовые
+    # несут wait_reason (paused_series | scheduled_future | busy_working_dir |
+    # busy_session), None у готовых.
+    queue_position: Optional[int] = None
+    wait_reason: Optional[str] = None
 
 
 class Stats(BaseModel):

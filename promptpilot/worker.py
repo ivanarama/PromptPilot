@@ -2410,6 +2410,77 @@ def _occupied_worker_slots(in_flight: dict, recoveries: dict) -> int:
     return len(in_flight) + len(recoveries)
 
 
+def admission_snapshot():
+    """Честная диагностика очереди — read-only повтор правил допуска воркера.
+
+    Повторяет фильтры get_next_runnable (pending/rate_limited,
+    scheduled_at/next_run_at наступили, серия не на паузе и не завершена)
+    плюс занятость lock_key RUNNING-задачами и более ранними готовыми
+    кандидатами. Никаких мутаций: claim-алгоритм не меняется, это только
+    проекция для /api/tasks и панели. Позиция — ранг среди ГОТОВЫХ;
+    не-готовые получают wait_reason. Относительно опциональной lane-политики
+    проекта позиция базовая: lane-переключение меняет выбор слота, но не
+    факт готовности. Возвращает {task_id: dict(queue_position, wait_reason,
+    ready)}.
+    """
+    from datetime import datetime, timezone
+
+    from . import db as _db
+
+    now = datetime.now(timezone.utc).isoformat()
+    snapshot = {}
+    with _db._connect() as conn:
+        running_keys = set()
+        for row in conn.execute(
+                """SELECT id FROM tasks WHERE status = 'running'"""):
+            task = _db.get_task(row["id"], conn=conn)
+            if task is not None:
+                running_keys.add(lock_key(task))
+        rows = conn.execute(
+            """SELECT t.id,
+                      (t.scheduled_at IS NULL OR t.scheduled_at <= ?) AS sched_ok,
+                      (t.next_run_at IS NULL OR t.next_run_at <= ?) AS next_ok,
+                      (t.series_id IS NULL OR EXISTS (
+                         SELECT 1 FROM task_series s WHERE s.id = t.series_id
+                           AND s.paused = 0 AND s.ended_at IS NULL)) AS series_ok
+               FROM tasks t
+               WHERE t.status IN ('pending', 'rate_limited')
+               ORDER BY t.priority ASC, t.created_at ASC, t.id ASC""",
+            (now, now)).fetchall()
+        tasks_by_id = {row["id"]: _db.get_task(row["id"], conn=conn)
+                       for row in rows}
+    taken = set(running_keys)
+    position = 0
+    for row in rows:
+        task = tasks_by_id.get(row["id"])
+        if task is None:
+            continue
+        if not row["series_ok"]:
+            snapshot[task.id] = {"queue_position": None,
+                                 "wait_reason": "paused_series", "ready": False}
+            continue
+        if not row["sched_ok"] or not row["next_ok"]:
+            snapshot[task.id] = {"queue_position": None,
+                                 "wait_reason": "scheduled_future",
+                                 "ready": False}
+            continue
+        key = lock_key(task)
+        if key and key in taken:
+            snapshot[task.id] = {
+                "queue_position": None,
+                "wait_reason": ("busy_session" if task.herdr_target
+                                else "busy_working_dir"),
+                "ready": False,
+            }
+            continue
+        position += 1
+        snapshot[task.id] = {"queue_position": position,
+                             "wait_reason": None, "ready": True}
+        if key:
+            taken.add(key)
+    return snapshot
+
+
 def lock_key(task) -> str:
     """What a task must not share with another task running at the same time.
 
