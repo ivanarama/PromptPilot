@@ -255,13 +255,17 @@ BUILTIN_PROVIDERS = {
         "description": "Промпт в открытую сессию herdr",
     },
     "claude": {
+        # stdin preserves multiline prompts and avoids cmd.exe's command-line
+        # limit when Windows resolves Claude to an npm .cmd wrapper.
         "cmd": f"{_q(CLAUDE_EXE)} -p --verbose --output-format stream-json {{prompt}}",
+        "prompt_stdin": True,
         "description": "Claude Code (Anthropic)",
         "supports_skills": True,
         "supports_effort": True,
     },
     "claude-z": {
         "cmd": f"{_q(CLAUDE_EXE)} -p --verbose --output-format stream-json {{prompt}}",
+        "prompt_stdin": True,
         "description": "Claude Code (GLM)",
         "supports_skills": True,
         "supports_effort": True,
@@ -338,6 +342,10 @@ def load_providers() -> dict:
             for name, info in custom.items():
                 if name in providers:
                     providers[name] = {**providers[name], **info}
+                    # An existing argv template must not also receive the
+                    # prompt on stdin just because the built-in changed.
+                    if "{prompt}" in info.get("cmd", "") and "prompt_stdin" not in info:
+                        providers[name]["prompt_stdin"] = False
                 else:
                     providers[name] = info
         except ValueError as e:
@@ -665,7 +673,10 @@ def build_cmd(provider: str, prompt: str, skip_permissions: bool = False, sessio
         template = f"{provider} {{prompt}}"
     marker = "\x00PROMPT\x00"
     parts = _split_cmd(template.replace("{prompt}", marker))
-    cmd = [prompt if p == marker else p for p in parts]
+    # Retain the placeholder in editable templates for custom argv providers,
+    # but never put the prompt on the command line when stdin carries it.
+    cmd = [prompt if p == marker else p for p in parts
+           if not (p == marker and cfg.get("prompt_stdin"))]
     # Claude and Codex spell autonomous mode differently; qwen/opencode do not
     # receive either flag. --model is shared by several CLIs and stays general.
     is_claude = provider_is_claude(cfg)
