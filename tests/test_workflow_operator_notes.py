@@ -107,6 +107,30 @@ def test_decision_text_and_automation_boilerplate_are_not_delivered(isolated_db)
     assert "Продолжить работу с учётом" not in prompt
 
 
+def test_resumed_executor_receives_previous_run_report(isolated_db):
+    workflow = create(isolated_db, slug="handoff")
+    workflows.start_workflow(workflow.id, WorkflowStartRequest(expected_version=0))
+    workflows.advance_workflow(workflow.id)
+    assert "Коммит abc123 и ожидающий CI" not in pending_prompt(isolated_db)
+
+    task = isolated_db.get_next_runnable()
+    workflows.sync_task(task.id)
+    isolated_db.mark_completed(
+        task.id, "Коммит abc123 и ожидающий CI\nИТОГ: НУЖЕН ЧЕЛОВЕК", exit_code=0,
+    )
+    isolated_db.set_verdict(task.id, "НУЖЕН ЧЕЛОВЕК")
+    workflows.sync_task(task.id)
+    workflows.advance_linked_task(task.id)
+    stopped = isolated_db.get_workflow(workflow.id)
+    assert stopped.status.value == "awaiting_human"
+
+    resume(stopped)
+    prompt = pending_prompt(isolated_db)
+    assert "Коммит abc123 и ожидающий CI" in prompt
+    assert "ИТОГ: НУЖЕН ЧЕЛОВЕК" in prompt
+    assert "Продолжить работу с учётом" not in prompt
+
+
 def test_automatic_resume_carries_no_note(isolated_db):
     workflow = create(isolated_db, slug="auto", auto_resume=True)
     workflows.start_workflow(workflow.id, WorkflowStartRequest(expected_version=0))

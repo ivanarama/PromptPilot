@@ -3997,6 +3997,8 @@ def _queue_replica_status(queue: dict, series: list[dict]) -> dict:
             "working_dir": working_dir or None,
             "task_id": item.get("next_task_id"),
             "task_status": item.get("next_status"),
+            "task_error": (item.get("next_error")
+                           if item.get("next_status") == "pending" else None),
             "interval": item.get("effective_recurrence"),
             "paused": bool(item.get("paused")),
             "broken": bool(item.get("broken")),
@@ -4171,6 +4173,9 @@ def _refresh_local_state(result: dict, profile: dict, series: list[dict], *,
             "series_id": matching["id"] if matching else None,
             "task_id": matching.get("next_task_id") if matching else None,
             "task_status": matching.get("next_status") if matching else None,
+            "task_error": (matching.get("next_error")
+                           if matching and matching.get("next_status") == "pending"
+                           else None),
             **projection,
         })
         backlog = queue.get("backlog")
@@ -5455,6 +5460,8 @@ def build_period_report(profile_id: str, series: list[dict], *, hours: int = 24,
     current_tasks = [{
         "task_id": item.get("next_task_id"), "title": item.get("title"),
         "status": item.get("next_status"),
+        "error": (item.get("next_error")
+                  if item.get("next_status") == "pending" else None),
         "started_at": item.get("next_started_at"),
         "scheduled_at": item.get("next_run_at"),
         "paused": bool(item.get("paused")),
@@ -5496,7 +5503,11 @@ def build_period_report(profile_id: str, series: list[dict], *, hours: int = 24,
         "queues": queues, "runs": run_report,
         "attention": attention, "delivery": delivery, "cache": cache,
         "board": board,
-        "current": {"observed_at": now.isoformat(), "tasks": current_tasks},
+        "current": {
+            "observed_at": now.isoformat(), "tasks": current_tasks,
+            "integration_owner": (copy.deepcopy(diagnostics.get("integration_owner"))
+                                  if fresh else None),
+        },
         "decisions": {
             "waiting_ship": copy.deepcopy(diagnostics.get("reviewed_waiting_ship") or []),
             "human_waiting": copy.deepcopy(diagnostics.get("human_waiting") or []),

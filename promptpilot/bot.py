@@ -3214,15 +3214,16 @@ def _herdr_watch_targets():
 async def _herdr_watch_loop(bot):
     import asyncio
     notified = {}  # (machine, pane_id) -> status already notified about
+    initialized = set()  # machines whose existing agents were already observed
     while True:
         await asyncio.sleep(HERDR_WATCH_INTERVAL)
         try:
-            await _herdr_watch_tick(bot, notified)
+            await _herdr_watch_tick(bot, notified, initialized)
         except Exception as e:  # one bad poll must not stop the whole watcher
             logger.warning("herdr watch tick упал: %s", e)
 
 
-async def _herdr_watch_tick(bot, notified):
+async def _herdr_watch_tick(bot, notified, initialized):
         seen = set()
         for machine, host in _herdr_watch_targets():
             data = await _herdr_json("agent", "list", host=host)
@@ -3242,20 +3243,37 @@ async def _herdr_watch_tick(bot, notified):
                 key = (machine, pane)
                 status = a.get("agent_status")
                 if status in ("blocked", "done"):
-                    prev = notified.get(key)  # (status, screen tail, когда видели)
-                    if prev and prev[0] == status and now - prev[2] < HERDR_WATCH_INTERVAL * 3:
+                    prev = notified.get(key)  # (status, screen tail, seen at, completion seq)
+                    completion_seq = (
+                        a.get("completion_seq") or a.get("state_change_seq")
+                    ) if status == "done" else None
+                    if status == "done" and machine not in initialized:
+                        # On bot startup, old kept sessions are already done.
+                        # Remember them without re-announcing every task.
+                        notified[key] = (status, "", now, completion_seq)
+                        continue
+                    if (status == "done" and prev and prev[0] == "done"
+                            and completion_seq is not None
+                            and prev[3] == completion_seq):
+                        notified[key] = (status, prev[1], now, completion_seq)
+                        continue
+                    if (prev and prev[0] == status
+                            and (status != "done" or completion_seq is None)
+                            and now - prev[2] < HERDR_WATCH_INTERVAL * 3):
                         # Висит непрерывно (или статус мигнул working на
                         # один-два опроса — датчик herdr не идеален): уже
                         # сказано, только освежаем время наблюдения. Экран
                         # ради этого не перечитываем.
-                        notified[key] = (prev[0], prev[1], now)
+                        notified[key] = (prev[0], prev[1], now, completion_seq)
                         continue
                     tail = await _herdr_screen_tail(pane, machine) if status == "blocked" else ""
                     dup = (prev and prev[0] == status and prev[1] == tail
+                           and (status != "done" or completion_seq is None
+                                or prev[3] == completion_seq)
                            and now - prev[2] < HERDR_RENOTIFY_COOLDOWN)
                     if not dup:
                         await _herdr_notify(bot, pane, status, a, machine, tail=tail)
-                    notified[key] = (status, tail, now)
+                    notified[key] = (status, tail, now, completion_seq)
                 # Состояние ушло из blocked/done — запись НЕ удаляем: раньше
                 # мигание статуса стирало её, и следующий же blocked давал
                 # дубль уведомления. Тот же диалог в течение cooldown молчит,
@@ -3264,6 +3282,7 @@ async def _herdr_watch_tick(bot, notified):
             # panes on machines we DID reach may be forgotten.
             for key in [k for k in notified if k[0] == machine and k not in seen]:
                 notified.pop(key)
+            initialized.add(machine)
 
 
 def _parse_hd_ref(ref: str):

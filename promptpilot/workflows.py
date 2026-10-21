@@ -1344,14 +1344,21 @@ def _config_for(workflow: WorkflowInDB | sqlite3.Row) -> WorkflowConfig:
     return WorkflowConfig.model_validate(raw or {})
 
 
+_ANY_STAGE = object()
+
+
 def _latest_run_output(workflow_id: str, role: WorkflowRole,
-                       *, before_round: int = None) -> str:
+                       *, before_round: int = None, stage_id=_ANY_STAGE) -> str:
     with db._connect() as conn:
         params: list[object] = [workflow_id, role.value]
         round_filter = ""
         if before_round is not None:
             round_filter = " AND rd.round_no < ?"
             params.append(before_round)
+        if stage_id is not _ANY_STAGE:
+            # IS also matches a workflow without a plan, whose rounds have no stage.
+            round_filter += " AND rd.stage_id IS ?"
+            params.append(stage_id)
         row = conn.execute(
             f"""SELECT r.output_json FROM workflow_runs r
                 JOIN workflow_rounds rd ON rd.id = r.round_id
@@ -1496,6 +1503,25 @@ def _render_role_prompt(workflow: WorkflowInDB, role: WorkflowRole,
         )
         if override:
             rendered = override
+    # Only a run of this same stage: the first round of the next stage has
+    # another goal and other allowed paths, so its predecessor's report is
+    # not a session to resume.
+    previous_executor = _latest_run_output(
+        workflow.id, WorkflowRole.EXECUTOR, stage_id=workflow.current_stage_id)
+    if (role is WorkflowRole.EXECUTOR
+            and previous_executor != "(нет: это первый раунд)"
+            and "{{executor_report}}" not in rendered):
+        # A resumed executor may run in a fresh CLI session. Give it the prior
+        # result as context; the repository remains the source of truth.
+        if len(previous_executor) > 12000:
+            previous_executor = "[Начало отчёта опущено]\n" + previous_executor[-12000:]
+        rendered = rendered.rstrip() + (
+            "\n\n<предыдущий-запуск-исполнителя>\n"
+            "Это отчёт предыдущей сессии того же workflow. Проверь его выводы "
+            "по Git и фактическому состоянию проекта.\n"
+            + previous_executor
+            + "\n</предыдущий-запуск-исполнителя>"
+        )
     # A template may place the notes itself; otherwise they go last, marked
     # as outranking the round's instructions — the same rule as a task note.
     placed_by_template = "{{human_input}}" in rendered

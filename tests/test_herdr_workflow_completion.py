@@ -314,8 +314,12 @@ def test_cancel_before_herdr_creation_never_opens_a_tab(monkeypatch):
     assert "before the herdr session was created" in outcome["cancel_note"]
 
 
+@pytest.mark.parametrize("kind,args,expected_flag", [
+    ("agy", ["--dangerously-skip-permissions"], "--dangerously-skip-permissions"),
+    ("codex", [], "--dangerously-bypass-approvals-and-sandbox"),
+])
 def test_herdr_deduplicates_permission_flag_and_forwards_pipeline_paths(
-        monkeypatch, tmp_path):
+        monkeypatch, tmp_path, kind, args, expected_flag):
     calls = []
 
     def fake_run(args, host=None, timeout=None):
@@ -354,12 +358,14 @@ def test_herdr_deduplicates_permission_flag_and_forwards_pipeline_paths(
 
     outcome = herdr_exec.run_in_herdr(
         task,
-        {"kind": "agy", "args": ["--dangerously-skip-permissions"]},
+        {"kind": kind, "args": args},
         prompt_override="test prompt",
     )
 
     start = next(call for call in calls if call[:2] == ["agent", "start"])
-    assert start.count("--dangerously-skip-permissions") == 1
+    assert start.count(expected_flag) == 1
+    if kind == "codex":
+        assert "--dangerously-skip-permissions" not in start
     tab = next(call for call in calls if call[:2] == ["tab", "create"])
     assert f"PP_DATA_DIR={tmp_path}" in tab
     assert (
@@ -484,6 +490,76 @@ def test_trim_transcript_uses_agy_greater_than_prompt_marker():
     assert "Проверка завершена" in cleaned
     assert "Вторая секция отчёта" in cleaned
     assert cleaned.endswith("ИТОГ: ГОТОВО — задача выполнена")
+
+
+def test_trim_transcript_drops_codex_input_chrome_after_workflow_verdict():
+    prompt = ensure_closing_verdict_contract("Fix the three PR findings.")
+    transcript = (
+        "› Fix the three PR findings.\n"
+        "  </promptpilot-workflow-contract>\n"
+        "\n• Work is blocked by the command runner.\n"
+        "ИТОГ: НЕ СМОГ — команды не запускаются\n"
+        "\n  11:58\n\n"
+        "  Tip: Use /permissions to control when Codex asks for confirmation.\n"
+        "› Ask Codex to do anything\n"
+        "  gpt-6.1-sol medium · F:\\Projects\\App · Fix the three PR findings.\n"
+    )
+
+    cleaned = _trim_transcript(transcript, prompt)
+
+    assert cleaned.endswith("ИТОГ: НЕ СМОГ — команды не запускаются")
+    assert _closing_workflow_verdict(cleaned) == "НЕ СМОГ"
+
+
+def test_trim_transcript_returns_only_codex_reply_without_workflow_contract():
+    prompt = "Reply with exactly READY."
+    transcript = (
+        "› Reply with exactly READY.\n\n"
+        "• READY\n\n  11:34\n\n"
+        "  Tip: Use /permissions to control when Codex asks for confirmation.\n"
+        "› Ask Codex to do anything\n"
+        "  gpt-6.1-sol medium · F:\\Projects\\App · Reply with exactly READY.\n"
+    )
+
+    assert _trim_transcript(transcript, prompt) == "› Reply with exactly READY.\n\n• READY"
+
+
+def test_trim_transcript_drops_codex_completion_status_after_verdict():
+    prompt = ensure_closing_verdict_contract("Run git status.")
+    transcript = (
+        "› Run git status.\n"
+        "</promptpilot-workflow-contract>\n"
+        "• Exit code: 0\n"
+        "  ИТОГ: ГОТОВО — команда выполнена\n\n"
+        "  Worked for 16s • 12:16\n"
+        "  ⚠ 5h limit: 34% left · resets at 14:34 · /status\n"
+    )
+
+    cleaned = _trim_transcript(transcript, prompt)
+
+    assert cleaned.endswith("ИТОГ: ГОТОВО — команда выполнена")
+    assert _closing_workflow_verdict(cleaned) == "ГОТОВО"
+
+
+def test_trim_transcript_drops_codex_model_switch_prompt_after_verdict():
+    prompt = ensure_closing_verdict_contract("Verify the candidate CI.")
+    transcript = (
+        "› Verify the candidate CI.\n"
+        "</promptpilot-workflow-contract>\n"
+        "• CI passed.\n"
+        "  ИТОГ: ГОТОВО — проверки завершены\n\n"
+        "  Worked for 17m 31s • 13:12\n\n"
+        "  Approaching rate limits\n"
+        "  Switch to gpt-6-luna for lower credit usage?\n\n"
+        "› 1. Switch to gpt-6-luna\n"
+        "  2. Keep current model\n"
+        "  3. Keep current model (never show again)\n"
+        "  enter select · esc back\n"
+    )
+
+    cleaned = _trim_transcript(transcript, prompt)
+    assert cleaned.endswith("ИТОГ: ГОТОВО — проверки завершены")
+    assert _closing_workflow_verdict(cleaned) == "ГОТОВО"
 
 
 def test_trim_transcript_drops_wrapped_workflow_contract_examples():

@@ -142,6 +142,31 @@ def test_planner_approval_and_two_stage_autonomous_lifecycle(isolated_db):
     assert "## Stage plan" in workflows.workflow_report_markdown(workflow.id)
 
 
+def test_next_stage_executor_gets_no_report_of_the_previous_stage(isolated_db):
+    workflow = create(isolated_db, slug="stage-handoff")
+    workflows.dispatch_planner(
+        workflow.id, WorkflowPlanDispatch(expected_version=workflow.state_version))
+    finish_task(isolated_db, plan_result([
+        {"code": "S1", "title": "Контракт", "objective": "Зафиксировать контракт",
+         "acceptance_gates": []},
+        {"code": "FINAL", "title": "Интеграция", "objective": "Проверить результат целиком",
+         "stage_type": "integration", "dependencies": ["S1"], "acceptance_gates": []},
+    ]))
+    waiting = isolated_db.get_workflow(workflow.id)
+    workflows.approve_plan(
+        workflow.id, WorkflowPlanApproval(expected_version=waiting.state_version))
+    workflows.advance_workflow(workflow.id)
+    finish_task(isolated_db, "S1-ONLY-REPORT: правил только контракт")
+    finish_task(isolated_db, reviewer_pass())
+
+    final = isolated_db.list_tasks(status=TaskStatus.PENDING)[0].prompt
+
+    assert "Текущий этап: FINAL" in final
+    # Another stage is not a session to resume.
+    assert "<предыдущий-запуск-исполнителя>" not in final
+    assert "S1-ONLY-REPORT" not in final
+
+
 def test_invalid_planner_output_stops_for_human(isolated_db):
     workflow = create(isolated_db, slug="invalid-plan")
     workflows.dispatch_planner(

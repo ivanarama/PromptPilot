@@ -6,11 +6,18 @@ const html = fs.readFileSync('promptpilot/static/index.html', 'utf8');
 const start = html.indexOf('async function loadPipelineReport(');
 const end = html.indexOf('\nfunction ', start);
 const renderer = html.slice(start, end);
+const helpersStart = html.indexOf('function pipelineWaitReasons(');
+const helpersEnd = html.indexOf('\nasync function loadPipelineInsights(', helpersStart);
+assert.ok(helpersStart >= 0 && helpersEnd > helpersStart, 'report helpers are present');
 const box = {innerHTML: ''};
 const data = {
   hours: 24, title: 'Example', summary: {errors: 0},
   coverage: {fresh: false, complete: false, data_through: new Date().toISOString()},
-  current: {tasks: [{status: 'running', title: '<unsafe>', task_id: 42, started_at: new Date().toISOString()}]},
+  current: {tasks: [
+    {status: 'running', title: '<unsafe>', task_id: 42, started_at: new Date().toISOString()},
+    {status: 'pending', title: 'MERGE', task_id: 43, error: 'waiting for integration <REVIEW>'},
+  ]},
+  runs: {total: 3, verdicts: {ready: 1, empty: 2}},
   decisions: {available: true, waiting_ship: [{number: 99, title: 'Ready PR'}]},
   attention: [{number: 10, title: 'Old merged PR', queues: ['tail'], labels: ['ship']}],
 };
@@ -24,11 +31,15 @@ const context = {
   pipelineReportItem: item => `#${item.number} ${item.title}`,
 };
 vm.createContext(context);
+vm.runInContext(html.slice(helpersStart, helpersEnd), context);
 vm.runInContext(renderer, context);
 (async () => {
   await context.loadPipelineReport('example');
   assert.match(box.innerHTML, /Что происходит сейчас/);
   assert.match(box.innerHTML, /&lt;unsafe&gt;/);
+  assert.match(box.innerHTML, /Итоги запусков/);
+  assert.match(box.innerHTML, /3 запусков/);
+  assert.match(box.innerHTML, /MERGE<\/b>: waiting for integration &lt;REVIEW&gt;/);
   assert.match(box.innerHTML, /данные устарели/);
   assert.match(box.innerHTML, /Ещё не проверено/);
   assert.match(box.innerHTML, /Стоимость не измеряется/);
