@@ -2422,22 +2422,39 @@ def admission_snapshot():
     проекта позиция базовая: lane-переключение меняет выбор слота, но не
     факт готовности. Возвращает {task_id: dict(queue_position, wait_reason,
     ready)}.
+
+    Ровно два SELECT (running + кандидаты) независимо от длины очереди:
+    колонки lock_key приезжают в тех же строках. Прежняя версия звала
+    get_task на каждую строку — N+1, измерение на очереди в 500 задач
+    давало ~600 запросов и ~1.2 с на каждый GET /api/tasks.
     """
     from datetime import datetime, timezone
+    from types import SimpleNamespace
 
     from . import db as _db
+
+    def _lock_view(row):
+        # Только поля lock_key: работаем со строкой, без get_task на задачу
+        return SimpleNamespace(
+            id=row["id"],
+            machine=row["machine"],
+            herdr_target=row["herdr_target"],
+            worktree=row["worktree"],
+            working_dir=row["working_dir"],
+        )
 
     now = datetime.now(timezone.utc).isoformat()
     snapshot = {}
     with _db._connect() as conn:
-        running_keys = set()
-        for row in conn.execute(
-                """SELECT id FROM tasks WHERE status = 'running'"""):
-            task = _db.get_task(row["id"], conn=conn)
-            if task is not None:
-                running_keys.add(lock_key(task))
+        running_keys = {
+            lock_key(_lock_view(row))
+            for row in conn.execute(
+                """SELECT id, machine, herdr_target, worktree, working_dir
+                   FROM tasks WHERE status = 'running'""")
+        }
         rows = conn.execute(
-            """SELECT t.id,
+            """SELECT t.id, t.machine, t.herdr_target, t.worktree,
+                      t.working_dir,
                       (t.scheduled_at IS NULL OR t.scheduled_at <= ?) AS sched_ok,
                       (t.next_run_at IS NULL OR t.next_run_at <= ?) AS next_ok,
                       (t.series_id IS NULL OR EXISTS (
@@ -2447,14 +2464,10 @@ def admission_snapshot():
                WHERE t.status IN ('pending', 'rate_limited')
                ORDER BY t.priority ASC, t.created_at ASC, t.id ASC""",
             (now, now)).fetchall()
-        tasks_by_id = {row["id"]: _db.get_task(row["id"], conn=conn)
-                       for row in rows}
     taken = set(running_keys)
     position = 0
     for row in rows:
-        task = tasks_by_id.get(row["id"])
-        if task is None:
-            continue
+        task = _lock_view(row)
         if not row["series_ok"]:
             snapshot[task.id] = {"queue_position": None,
                                  "wait_reason": "paused_series", "ready": False}

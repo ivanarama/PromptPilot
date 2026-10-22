@@ -102,3 +102,39 @@ def test_api_tasks_expose_wait_reason(isolated_db, tmp_path):
     assert tasks[t_paused.id]["queue_position"] is None
     assert tasks[t_ready.id]["queue_position"] == 1
     assert tasks[t_ready.id]["wait_reason"] is None
+
+
+def test_admission_snapshot_query_count_is_constant(isolated_db, tmp_path,
+                                                    monkeypatch):
+    """Регрессия N+1: число SQL-запросов admission_snapshot не растёт с
+    длиной очереди (замер на ревизии adde138: ~3 запроса на задачу,
+    500 задач ≈ 600 запросов и ~1.2 с на каждый GET /api/tasks)."""
+    import sqlite3
+
+    counts = []
+    real_connect = sqlite3.connect
+
+    def counting_connect(*args, **kwargs):
+        conn = real_connect(*args, **kwargs)
+        conn.set_trace_callback(lambda _sql: counts.append(1))
+        return conn
+
+    def seed(n):
+        for i in range(n):
+            db.create_task(TaskCreate(
+                prompt=f"q{i}", working_dir=str(tmp_path / f"d{i}")))
+
+    def measure():
+        counts.clear()
+        admission_snapshot()
+        return len(counts)
+
+    monkeypatch.setattr(sqlite3, "connect", counting_connect)
+    seed(10)
+    small = measure()
+    seed(50)  # +40 задач в очереди
+    large = measure()
+    assert small == large, (
+        f"число SQL-запросов должно быть константой, а не расти с очередью: "
+        f"{small} при 10 задачах против {large} при 60"
+    )
