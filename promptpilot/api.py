@@ -162,9 +162,48 @@ def _task_with_epf(task: TaskInDB) -> dict:
     return d
 
 
+def _attach_workflow_attribution(tasks: list) -> list:
+    """Атрибуция и честная позиция для карточек задач.
+
+    Принадлежность задачи к миссии (workflow_id/role из workflow_runs) и
+    позиция в очереди. Позиция — ранг СРЕДИ ГОТОВЫХ по правилам допуска
+    воркера (paused-серии, отложенные scheduled/next_run_at и занятые
+    рабочие деревья позиций не занимают); не-готовые получают wait_reason.
+    Расчёт read-only (worker.admission_snapshot), claim не меняется.
+    """
+    if not tasks:
+        return tasks
+    task_ids = [t.id for t in tasks]
+    marks = ",".join("?" * len(task_ids))
+    runs = {}
+    with db._connect() as conn:
+        for row in conn.execute(
+            f"""SELECT task_id, workflow_id, role FROM workflow_runs
+                WHERE task_id IN ({marks})""", task_ids,
+        ):
+            runs[row["task_id"]] = (row["workflow_id"], row["role"])
+    try:
+        from .worker import admission_snapshot
+        admission = admission_snapshot()
+    except Exception as exc:  # noqa: BLE001 - проекция не должна ронять API
+        print(f"  !! admission_snapshot недоступен: {exc}", flush=True)
+        admission = {}
+    for task in tasks:
+        attribution = runs.get(task.id)
+        if attribution:
+            task.workflow_id, task.role = attribution
+        info = admission.get(task.id)
+        if info is not None:
+            task.queue_position = info["queue_position"]
+            task.wait_reason = info["wait_reason"]
+    return tasks
+
+
 @app.get("/api/tasks")
 def api_list_tasks(status: Optional[TaskStatus] = None, limit: int = 50, offset: int = 0):
-    return [_task_with_epf(t) for t in db.list_tasks(status=status, limit=limit, offset=offset)]
+    tasks = _attach_workflow_attribution(
+        db.list_tasks(status=status, limit=limit, offset=offset))
+    return [_task_with_epf(t) for t in tasks]
 
 
 @app.post("/api/tasks", response_model=TaskInDB, status_code=201)
