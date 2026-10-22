@@ -36,7 +36,7 @@ def create(isolated_db, *, slug="notes", auto_resume=False, max_rounds=5,
                 "executor": {"provider": None, "prompt_template": executor_template},
                 "reviewer": {"provider": None},
             },
-            "gate": {"commands": []},
+            "gate": {"enabled": False, "commands": []},
             "limits": {"max_rounds": max_rounds},
         },
     ))

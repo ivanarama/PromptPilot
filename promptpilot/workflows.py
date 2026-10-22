@@ -50,6 +50,8 @@ ALLOWED_TRANSITIONS = {
     WorkflowStatus.DRAFT: {
         WorkflowStatus.PLANNING,
         WorkflowStatus.QUEUED,
+        # старт с неконфигурированным гейтом останавливается сразу
+        WorkflowStatus.AWAITING_HUMAN,
         WorkflowStatus.CANCELLED,
     },
     WorkflowStatus.PLANNING: {
@@ -60,6 +62,8 @@ ALLOWED_TRANSITIONS = {
     WorkflowStatus.AWAITING_PLAN_APPROVAL: {
         WorkflowStatus.PLANNING,
         WorkflowStatus.QUEUED,
+        # утверждение плана с неконфигурированным гейтом стадии
+        WorkflowStatus.AWAITING_HUMAN,
         WorkflowStatus.CANCELLED,
     },
     WorkflowStatus.QUEUED: {
@@ -101,7 +105,11 @@ ALLOWED_TRANSITIONS = {
         WorkflowStatus.COMPLETED,
         WorkflowStatus.CANCELLED,
     },
-    WorkflowStatus.COMPLETED: set(),
+    WorkflowStatus.COMPLETED: {
+        # неудавшийся чекпоинт финальной стадии откатывает завершение к
+        # человеку тем же ребром, что и reopen
+        WorkflowStatus.AWAITING_HUMAN,
+    },
     WorkflowStatus.FAILED: set(),
     WorkflowStatus.CANCELLED: set(),
 }
@@ -317,6 +325,22 @@ def _insert_round(conn: sqlite3.Connection, workflow_id: str, round_no: int,
                   historical: bool = False, stage_id: str = None) -> sqlite3.Row:
     round_id = db._new_id("round")
     now = db._now()
+    if not base_sha and not historical:
+        # Базовый HEAD раунда — чтобы no-diff ревью видел и закоммиченные
+        # изменения исполнителя, а не только рабочее дерево (best effort).
+        try:
+            repo = conn.execute(
+                "SELECT repository_path FROM workflows WHERE id = ?",
+                (workflow_id,),
+            ).fetchone()["repository_path"]
+            head = subprocess.run(
+                ["git", "-C", repo, "rev-parse", "HEAD"],
+                capture_output=True, text=True, timeout=15, errors="replace",
+            )
+            if head.returncode == 0:
+                base_sha = head.stdout.strip()
+        except (OSError, subprocess.TimeoutExpired, TypeError, KeyError):
+            pass
     completed_at = now if status in {
         WorkflowRoundStatus.COMPLETED,
         WorkflowRoundStatus.FAILED,
@@ -632,6 +656,32 @@ def approve_plan(workflow_id: str,
             "UPDATE workflows SET current_stage_id=? WHERE id=?",
             (first["id"], workflow_id),
         )
+        # Валидация гейта первой стадии ДО запуска исполнителя:
+        # «включён, но без команд» ловим сразу, а не после пустого раунда.
+        config = _config_for(db._row_to_workflow(workflow))
+        if config.gate.enabled and not config.gate.commands:
+            first_spec = db._json_load(first["spec_json"]) or {}
+            if not (first_spec.get("acceptance_gates") or []):
+                round_row_mis = _insert_round(
+                    conn, workflow_id, workflow["current_round"] + 1,
+                    base_sha=approval.base_sha, stage_id=first["id"],
+                )
+                workflow = _workflow_row(conn, workflow_id)
+                _transition(
+                    conn, workflow, WorkflowStatus.AWAITING_HUMAN,
+                    "gate.misconfigured",
+                    {
+                        "reason": (
+                            "Гейт включён (gate.enabled=true), но нет ни "
+                            "одной deterministic-команды: ни gate.commands, "
+                            "ни acceptance_gates у стадии. Настройте команды "
+                            "или выключите gate.enabled"
+                        ),
+                        "stage_code": first["code"],
+                    },
+                    round_id=round_row_mis["id"],
+                )
+                return db._row_to_workflow(workflow)
         round_no = workflow["current_round"] + 1
         round_row = _insert_round(
             conn, workflow_id, round_no, base_sha=approval.base_sha,
@@ -649,6 +699,21 @@ def approve_plan(workflow_id: str,
 
 def start_workflow(workflow_id: str,
                    request: WorkflowStartRequest) -> WorkflowInDB:
+    with db._connect() as conn:
+        workflow_row = _workflow_row(conn, workflow_id)
+        planning_cfg = _config_for(workflow_row).planning
+    if planning_cfg.enabled:
+        # Старт миссии с включённым планированием — это запуск
+        # планировщика, а не исполнителя: исполнитель не должен получить
+        # путь в gating/review мимо утверждения плана.
+        if WorkflowStatus(workflow_row["status"]) is not WorkflowStatus.DRAFT:
+            _require_version(workflow_row, request.expected_version)
+            return db._row_to_workflow(workflow_row)
+        dispatch_planner(
+            workflow_id,
+            WorkflowPlanDispatch(expected_version=request.expected_version),
+        )
+        return db.get_workflow(workflow_id)
     with db._connect(immediate=True) as conn:
         workflow = _workflow_row(conn, workflow_id)
         _require_version(workflow, request.expected_version)
@@ -755,10 +820,17 @@ def dispatch_task(workflow_id: str,
                 "UPDATE workflow_rounds SET status = 'executing' WHERE id = ?",
                 (round_row["id"],),
             )
+            # Снимок дерева ДО запуска — база доказательства «этот запуск
+            # изменил именно эти файлы» для no-diff проверки и безопасного
+            # stage checkpoint.
+            tree_snapshot = _executor_tree_snapshot(working_dir)
+            dispatch_payload = {"task_id": task.id, "run_id": run_id}
+            if tree_snapshot is not None:
+                dispatch_payload["tree_snapshot"] = tree_snapshot
             workflow = _transition(
                 conn, workflow, WorkflowStatus.EXECUTING,
                 "executor.dispatched",
-                {"task_id": task.id, "run_id": run_id},
+                dispatch_payload,
                 round_id=round_row["id"],
             )
         else:
@@ -881,6 +953,9 @@ def _upsert_review_finding(conn: sqlite3.Connection, workflow_id: str,
 
 def record_review(workflow_id: str,
                   decision: WorkflowReviewDecision) -> WorkflowInDB:
+    # чекпоинт ПОСЛЕ транзакции; при неудаче миссия останавливается до
+    # человека — следующая стадия не стартует
+    pending_checkpoint = None  # dict(workflow_id, stage_code, check_dir, changed, allowed)
     with db._connect(immediate=True) as conn:
         workflow = _workflow_row(conn, workflow_id)
         _require_version(workflow, decision.expected_version)
@@ -928,6 +1003,61 @@ def record_review(workflow_id: str,
                 raise db.WorkflowConflictError(
                     f"review cannot pass with {blockers} open blocker/high findings"
                 )
+            # No-diff привязан к конкретному executor run: PASS без
+            # доказанных изменений данного запуска — холостой исход; чужая
+            # заранее существовавшая грязь автопассом не считается.
+            executor_task = _latest_completed_executor_with_run(
+                conn, round_row["id"])
+            check_dir = (
+                (executor_task["worktree_path"]
+                 or executor_task["working_dir"])
+                if executor_task else workflow["repository_path"])
+            snapshot = (
+                _executor_dispatch_snapshot(
+                    conn, round_row["id"], executor_task["run_id"])
+                if executor_task else None)
+            run_changes = None
+            if not decision.allow_no_diff:
+                run_changes = _executor_run_changes(
+                    check_dir, snapshot, round_row["base_sha"])
+                if run_changes["available"] and not run_changes["changed"]:
+                    workflow = _touch(
+                        conn, workflow, "review.no_diff",
+                        {
+                            "reason": (
+                                "Ревьюер дал PASS, но данный запуск "
+                                "исполнителя не изменил ни одного файла "
+                                "(сравнение с снимком до запуска: diff пуст). "
+                                "Холостой PASS запрещён: проверьте работу "
+                                "исполнителя или подтвердите приём без "
+                                "изменений явно (allow_no_diff)"
+                            ),
+                            "round_no": round_row["round_no"],
+                        },
+                        round_id=round_row["id"],
+                        run_id=reviewer["id"],
+                    )
+                    return db._row_to_workflow(workflow)
+                if run_changes["available"] and run_changes["unknown"]:
+                    workflow = _touch(
+                        conn, workflow, "review.diff_origin_unknown",
+                        {
+                            "reason": (
+                                "Ревьюер дал PASS, в дереве есть изменения "
+                                f"({len(run_changes['changed'])} путей), но "
+                                "доказать, что их сделал именно этот запуск "
+                                "исполнителя, нельзя (снимок до запуска "
+                                "отсутствует/обрезан). Неизвестное "
+                                "происхождение требует человека; подтвердить "
+                                "приём можно явно (allow_no_diff)"
+                            ),
+                            "round_no": round_row["round_no"],
+                            "changed_sample": run_changes["changed"][:20],
+                        },
+                        round_id=round_row["id"],
+                        run_id=reviewer["id"],
+                    )
+                    return db._row_to_workflow(workflow)
             conn.execute(
                 """UPDATE workflow_rounds SET status = 'completed',
                    completed_at = ?, summary_json = ? WHERE id = ?""",
@@ -954,6 +1084,21 @@ def record_review(workflow_id: str,
                     payload={"stage_id": current_stage["id"],
                              "stage_code": current_stage["code"], **common},
                 ))
+                # Stage checkpoint — коммит ТОЛЬКО доказанно изменённых
+                # данным run'ом файлов этапа (без add -A), до старта
+                # следующего исполнителя; неудача останавливает миссию.
+                # Флаг automation.stage_checkpoint, по умолчанию ВЫКЛ.
+                if (_config_for(db._row_to_workflow(workflow))
+                        .automation.stage_checkpoint):
+                    spec = db._json_load(current_stage["spec_json"]) or {}
+                    pending_checkpoint = {
+                        "workflow_id": workflow["id"],
+                        "stage_code": current_stage["code"],
+                        "check_dir": check_dir,
+                        "changed": list(
+                            run_changes["changed"] if run_changes else []),
+                        "allowed": list(spec.get("allowed_paths") or []),
+                    }
                 next_stage = conn.execute(
                     """SELECT * FROM workflow_stages
                        WHERE workflow_id=? AND position>? AND status='pending'
@@ -1014,7 +1159,33 @@ def record_review(workflow_id: str,
                 conn, workflow, "review.human_required", common,
                 round_id=round_row["id"], run_id=reviewer["id"],
             )
-        return db._row_to_workflow(workflow)
+        result = db._row_to_workflow(workflow)
+    if pending_checkpoint is not None:
+        checkpoint_ok = _stage_checkpoint_commit(
+            pending_checkpoint["workflow_id"],
+            pending_checkpoint["stage_code"],
+            pending_checkpoint["check_dir"],
+            pending_checkpoint["changed"],
+            pending_checkpoint["allowed"],
+        )
+        if not checkpoint_ok:
+            # Неудача видима и восстанавливаема: миссия — к человеку;
+            # финальная стадия откатывается тем же ребром, что и reopen.
+            with db._connect(immediate=True) as conn:
+                workflow_row = _workflow_row(
+                    conn, pending_checkpoint["workflow_id"])
+                state = WorkflowStatus(workflow_row["status"])
+                if state in (WorkflowStatus.QUEUED,
+                             WorkflowStatus.COMPLETED):
+                    _transition(
+                        conn, workflow_row, WorkflowStatus.AWAITING_HUMAN,
+                        "stage.checkpoint_failed",
+                        {"stage_code": pending_checkpoint["stage_code"],
+                         "reason": "чекпоинт стадии не завершён — следующая "
+                                   "стадия не стартует (или завершение "
+                                   "отложено) до починки"},
+                    )
+    return result
 
 
 def human_input(workflow_id: str,
@@ -1406,6 +1577,238 @@ _OPERATOR_NOTE_EVENTS = (
 )
 
 
+_SNAPSHOT_MAX_PATHS = 2000
+
+
+def _file_sig(path: str) -> str:
+    """Сигнатура содержимого файла для снимка: md5 первых 1 МиБ + размер."""
+    import hashlib
+    h = hashlib.md5()
+    size = 0
+    try:
+        with open(path, "rb") as fh:
+            while True:
+                chunk = fh.read(1 << 20)
+                if not chunk:
+                    break
+                size += len(chunk)
+                h.update(chunk)
+    except OSError:
+        return "unreadable"
+    return f"{h.hexdigest()}:{size}"
+
+
+def _porcelain_dirty(check_dir: str):
+    """(dict путь→сигнатура, truncated) незакоммиченного по git status."""
+    def run_git(args):
+        try:
+            return subprocess.run(
+                ["git", "-C", check_dir, *args],
+                capture_output=True, text=True, timeout=30,
+                errors="replace",
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+
+    status = run_git(["status", "--porcelain"])
+    if status is None or status.returncode != 0:
+        return None, False
+    dirty = {}
+    truncated = False
+    for line in (status.stdout or "").splitlines():
+        if len(line) < 4:
+            continue
+        xy, rest = line[:2], line[3:]
+        path = rest.split(" -> ")[-1].strip().strip('"')
+        if not path:
+            continue
+        if len(dirty) >= _SNAPSHOT_MAX_PATHS:
+            truncated = True
+            break
+        if xy[1] == "D" or xy == "D " or xy == "DD":
+            dirty[path] = "D"
+            continue
+        try:
+            dirty[path] = _file_sig(os.path.join(check_dir, path))
+        except OSError:
+            dirty[path] = "unreadable"
+    return dirty, truncated
+
+
+def _git_head(check_dir: str):
+    try:
+        out = subprocess.run(
+            ["git", "-C", check_dir, "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=15, errors="replace",
+        )
+        return out.stdout.strip() if out.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def _executor_tree_snapshot(check_dir: str):
+    """Снимок дерева ДО запуска исполнителя: HEAD + сигнатуры грязи.
+
+    Доказательная база no-diff: после рана сравнение показывает, что изменил
+    ИМЕННО этот запуск; чужая заранее существовавшая грязь работой
+    исполнителя не считается. None — каталог не git (проверка неприменима).
+    """
+    dirty, truncated = _porcelain_dirty(check_dir)
+    if dirty is None:
+        return None
+    return {"head": _git_head(check_dir), "dirty": dirty,
+            "truncated": truncated}
+
+
+def _executor_run_changes(check_dir: str, snapshot, base_sha=None):
+    """Что доказанно изменил данный запуск исполнителя (снимок до/после).
+
+    Возвращает dict:
+      available=False — не git: проверка неприменима;
+      changed=[paths] — изменённые/новые пути + файлы коммитов после головы
+        снимка;
+      unknown=True — изменения есть, но приписать их именно этому запуску
+        нельзя (легаси-раунд без снимка или обрезанный снимок) → человек.
+    """
+    def run_git(args):
+        try:
+            return subprocess.run(
+                ["git", "-C", check_dir, *args],
+                capture_output=True, text=True, timeout=30,
+                errors="replace",
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+
+    dirty_now, _truncated = _porcelain_dirty(check_dir)
+    if dirty_now is None:
+        return {"available": False, "changed": [], "unknown": False}
+    head_now = _git_head(check_dir)
+
+    if snapshot is None:
+        changed = set(dirty_now)
+        from_sha = base_sha or head_now
+        committed = (run_git(["diff", "--name-only", f"{from_sha}...HEAD"])
+                     if from_sha else None)
+        if committed is not None and committed.returncode == 0:
+            changed.update(l.strip() for l in committed.stdout.splitlines()
+                           if l.strip())
+        return {"available": True, "changed": sorted(changed),
+                "unknown": bool(changed)}
+
+    changed = {p for p, sig in dirty_now.items()
+               if snapshot.get("dirty", {}).get(p) != sig}
+    snap_head = snapshot.get("head")
+    if snap_head and head_now and snap_head != head_now:
+        committed = run_git(["diff", "--name-only",
+                             f"{snap_head}...{head_now}"])
+        if committed is not None and committed.returncode == 0:
+            changed.update(l.strip() for l in committed.stdout.splitlines()
+                           if l.strip())
+    unknown = bool(snapshot.get("truncated")) and bool(changed)
+    return {"available": True, "changed": sorted(changed), "unknown": unknown}
+
+
+def _executor_dispatch_snapshot(conn, round_id: str, run_id: str):
+    """Снимок дерева из события диспатча рана (run_id лежит в payload)."""
+    rows = conn.execute(
+        """SELECT payload_json FROM workflow_events
+           WHERE round_id = ? AND event_type = 'executor.dispatched'
+           ORDER BY seq DESC LIMIT 20""",
+        (round_id,),
+    ).fetchall()
+    for row in rows:
+        payload = db._json_load(row["payload_json"], {})
+        if payload.get("run_id") == run_id:
+            return payload.get("tree_snapshot")
+    return None
+
+
+def _latest_completed_executor_with_run(conn, round_id: str):
+    """(worktree_path, working_dir, run_id) последнего завершённого рана."""
+    return conn.execute(
+        """SELECT t.worktree_path AS worktree_path, t.working_dir AS working_dir,
+                  r.id AS run_id
+           FROM workflow_runs r JOIN tasks t ON t.id = r.task_id
+           WHERE r.round_id = ? AND r.role = 'executor'
+             AND r.status = 'completed'
+           ORDER BY r.attempt_no DESC LIMIT 1""",
+        (round_id,),
+    ).fetchone()
+
+
+def _paths_within(path: str, allowed: list) -> bool:
+    """Путь принадлежит allowed_paths стадии (префикс по границе каталога)."""
+    p = (path or "").replace(chr(92), "/").rstrip("/")
+    for prefix in allowed or []:
+        a = (prefix or "").replace(chr(92), "/").rstrip("/")
+        if not a:
+            continue
+        if p == a or p.startswith(a + "/"):
+            return True
+    return False
+
+
+def _stage_checkpoint_commit(workflow_id: str, stage_code: str,
+                             check_dir: str, changed_paths: list,
+                             allowed_paths: list) -> bool:
+    """Безопасный чекпоинт стадии: коммит ТОЛЬКО файлов, доказанно
+    изменённых данным executor run'ом и входящих в allowed_paths, в
+    фактическом дереве исполнителя. Никакого add -A по всему репозиторию.
+
+    True — успех (или фиксировать нечего). Любая неудача — False: событие
+    stage.checkpoint_failed с причиной; вызывающий останавливает миссию —
+    следующая стадия не стартует, пока чекпоинт не завершён успешно.
+    """
+    def git(*args):
+        return subprocess.run(
+            ["git", "-C", check_dir, *args], capture_output=True, text=True,
+            timeout=60, errors="replace",
+        )
+
+    def fail(error: str, detail: str = "") -> bool:
+        with db._connect(immediate=True) as conn:
+            db._append_workflow_event(conn, WorkflowEventCreate(
+                workflow_id=workflow_id,
+                event_type="stage.checkpoint_failed",
+                idempotency_key=(
+                    f"stage.checkpoint_failed:{stage_code}:{db._now()}"),
+                payload={"stage_code": stage_code, "error": error[:400],
+                         "detail": detail[:400]},
+            ))
+        return False
+
+    stage_files = sorted({
+        path for path in changed_paths or []
+        if not allowed_paths or _paths_within(path, allowed_paths)
+    })
+    if not stage_files:
+        return True
+    add = git("add", "--", *stage_files)
+    if add.returncode != 0:
+        return fail(f"git add не удался ({add.returncode})", add.stderr or "")
+    committed = git(
+        "commit", "-m",
+        f"stage {stage_code}: checkpoint by PromptPilot "
+        f"(ворота зелёные + PASS, {len(stage_files)} путей этапа)",
+    )
+    if committed.returncode != 0:
+        out = (committed.stdout or "") + (committed.stderr or "")
+        if "nothing to commit" in out:
+            return True  # уже зафиксировано — не неудача
+        return fail("git commit не удался", out)
+    sha = git("rev-parse", "HEAD").stdout.strip()
+    with db._connect() as conn:
+        db._append_workflow_event(conn, WorkflowEventCreate(
+            workflow_id=workflow_id,
+            event_type="stage.checkpoint",
+            idempotency_key=f"stage.checkpoint:{stage_code}:{db._now()}",
+            payload={"stage_code": stage_code, "sha": sha,
+                     "files": stage_files[:50]},
+        ))
+    return True
+
+
 def _latest_event_seq(conn: sqlite3.Connection, workflow_id: str,
                       event_type: str, round_id: str = None) -> int:
     """Newest seq of one event type, independent of how long the journal is."""
@@ -1614,16 +2017,28 @@ def _run_gate_commands(workflow: WorkflowInDB) -> WorkflowGateDecision:
             if command not in commands
         )
     evidence: list[str] = []
-    if not gate.enabled or not commands:
+    if not gate.enabled:
         return WorkflowGateDecision(
             expected_version=workflow.state_version,
             verdict=GateVerdict.PASS,
             gate_id="automatic-gate",
-            summary=(
-                "Gate отключён настройками"
-                if not gate.enabled else "Настроенных deterministic-команд нет"
-            ),
+            summary="Gate отключён настройками",
             evidence=[],
+        )
+    if not commands:
+        # Включённый гейт без единой команды раньше «проходил» автоматически.
+        # Это конфигурационная ошибка, а не успех.
+        return WorkflowGateDecision(
+            expected_version=workflow.state_version,
+            verdict=GateVerdict.HUMAN_REQUIRED,
+            gate_id="automatic-gate",
+            summary=(
+                "Гейт включён, но не настроено ни одной deterministic-команды"
+            ),
+            evidence=[
+                "Добавьте gate.commands (или acceptance_gates в стадии плана) "
+                "— либо явно выключите gate.enabled, если проверки не нужны",
+            ],
         )
     for index, command in enumerate(commands, start=1):
         argv = (
@@ -1777,6 +2192,32 @@ def advance_workflow(workflow_id: str, max_actions: int = 12) -> WorkflowInDB:
             if workflow.status is WorkflowStatus.QUEUED:
                 if not config.automation.auto_dispatch_executor:
                     return workflow
+                if config.planning.enabled and config.planning.require_approval:
+                    with db._connect() as conn:
+                        approved = conn.execute(
+                            "SELECT status FROM workflow_plans "
+                            "WHERE workflow_id = ?",
+                            (workflow.id,),
+                        ).fetchone()
+                    if not (approved and approved["status"] == "approved"):
+                        # resume с любой инструкцией не открывает путь в
+                        # executing/review/completed мимо утверждения плана
+                        with db._connect(immediate=True) as conn:
+                            workflow_row = _workflow_row(conn, workflow.id)
+                            round_row = (
+                                _current_round_row(conn, workflow_row)
+                                if workflow_row["current_round"] else None
+                            )
+                            _touch(
+                                conn, workflow_row, "automation.paused",
+                                {"reason": (
+                                    "исполнитель заблокирован: план не "
+                                    "утверждён (planning.require_approval) "
+                                    "— утвердите план или перезапустите "
+                                    "планировщик")},
+                                round_id=round_row["id"] if round_row else None,
+                            )
+                        return db.get_workflow(workflow.id)
                 return _dispatch_configured_role(workflow, WorkflowRole.EXECUTOR).workflow
 
             if workflow.status is WorkflowStatus.GATING:
@@ -1834,6 +2275,27 @@ def advance_workflow(workflow_id: str, max_actions: int = 12) -> WorkflowInDB:
                 reviewer = _latest_completed_reviewer(workflow)
                 if not reviewer:
                     return workflow
+                # no-diff или неизвестное происхождение уже превратили это
+                # ревью в ожидание человека — не применяем тот же вердикт
+                # повторно (touch-спам).
+                with db._connect() as conn:
+                    blocked_seq = conn.execute(
+                        """SELECT MAX(e.seq) FROM workflow_events e
+                           JOIN workflow_runs r ON r.id = e.run_id
+                           WHERE e.workflow_id = ?
+                             AND e.event_type IN ('review.no_diff',
+                                                  'review.diff_origin_unknown')
+                             AND r.id = ?""",
+                        (workflow.id, reviewer.id),
+                    ).fetchone()[0]
+                    reviewer_done_seq = conn.execute(
+                        """SELECT COALESCE(MAX(seq), 0) FROM workflow_events
+                           WHERE workflow_id = ? AND run_id = ?
+                             AND event_type = 'review.awaiting_decision'""",
+                        (workflow.id, reviewer.id),
+                    ).fetchone()[0]
+                if blocked_seq and blocked_seq >= reviewer_done_seq:
+                    return workflow  # уже превращено в ожидание человека
                 report = (reviewer.output or {}).get("result") or ""
                 decision = parse_reviewer_report(report)
                 if not decision:
