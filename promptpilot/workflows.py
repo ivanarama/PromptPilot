@@ -951,11 +951,75 @@ def _upsert_review_finding(conn: sqlite3.Connection, workflow_id: str,
     return db._row_to_workflow_finding(row)
 
 
+def _advance_after_stage(conn, workflow, round_row, common,
+                         extra: dict = None):
+    """Перевод завершённой стадии дальше: следующая — в executing с новым
+    раундом (миссия queued), иначе миссия завершается.
+
+    Вызывается ТОЛЬКО после успешного чекпоинта (когда он был назначен):
+    переход следующей стадии становится виден воркеру лишь за барьером.
+    Параллельный актор, уже проведший миссию дальше, не дублируется.
+    """
+    workflow = _workflow_row(conn, workflow["id"])
+    if WorkflowStatus(workflow["status"]) is not WorkflowStatus.AWAITING_HUMAN:
+        return workflow  # барьер уже завершён, миссия проведена дальше
+    extra = extra or {}
+    current_stage = None
+    if workflow["current_stage_id"]:
+        current_stage = conn.execute(
+            "SELECT * FROM workflow_stages WHERE id=?",
+            (workflow["current_stage_id"],),
+        ).fetchone()
+    if not current_stage:
+        return _transition(
+            conn, workflow, WorkflowStatus.COMPLETED, "review.passed",
+            {**common, **extra}, round_id=round_row["id"],
+        )
+    next_stage = conn.execute(
+        """SELECT * FROM workflow_stages
+           WHERE workflow_id=? AND position>? AND status='pending'
+           ORDER BY position LIMIT 1""",
+        (workflow["id"], current_stage["position"]),
+    ).fetchone()
+    if next_stage:
+        conn.execute(
+            """UPDATE workflow_stages SET status='executing',
+               started_at=? WHERE id=?""",
+            (db._now(), next_stage["id"]),
+        )
+        conn.execute(
+            "UPDATE workflows SET current_stage_id=? WHERE id=?",
+            (next_stage["id"], workflow["id"]),
+        )
+        new_round = _insert_round(
+            conn, workflow["id"], workflow["current_round"] + 1,
+            base_sha=round_row["candidate_sha"],
+            stage_id=next_stage["id"],
+        )
+        workflow = _workflow_row(conn, workflow["id"])
+        return _transition(
+            conn, workflow, WorkflowStatus.QUEUED,
+            "stage.advanced",
+            {"completed_stage_id": current_stage["id"],
+             "completed_stage_code": current_stage["code"],
+             "next_stage_id": next_stage["id"],
+             "next_stage_code": next_stage["code"], **extra},
+            round_id=new_round["id"],
+        )
+    return _transition(
+        conn, workflow, WorkflowStatus.COMPLETED,
+        "review.passed",
+        {**common, "final_stage_id": current_stage["id"],
+         "final_stage_code": current_stage["code"], **extra},
+        round_id=round_row["id"],
+    )
+
+
 def record_review(workflow_id: str,
                   decision: WorkflowReviewDecision) -> WorkflowInDB:
-    # чекпоинт ПОСЛЕ транзакции; при неудаче миссия останавливается до
-    # человека — следующая стадия не стартует
-    pending_checkpoint = None  # dict(workflow_id, stage_code, check_dir, changed, allowed)
+    # Чекпоинт — барьер: пока он не завершён, следующая стадия недоступна
+    # (миссия остаётся у человека), вердикт повторно не применяется.
+    checkpoint_deferred = None
     with db._connect(immediate=True) as conn:
         workflow = _workflow_row(conn, workflow_id)
         _require_version(workflow, decision.expected_version)
@@ -981,6 +1045,11 @@ def record_review(workflow_id: str,
         ).fetchone()
         if not gate:
             raise db.WorkflowConflictError("current round has no passed gate")
+        if _pending_stage_checkpoint(conn, workflow_id):
+            raise db.WorkflowConflictError(
+                "stage checkpoint is pending — complete it via human "
+                "resume before applying another verdict"
+            )
 
         for finding in decision.findings:
             _upsert_review_finding(
@@ -1006,6 +1075,9 @@ def record_review(workflow_id: str,
             # No-diff привязан к конкретному executor run: PASS без
             # доказанных изменений данного запуска — холостой исход; чужая
             # заранее существовавшая грязь автопассом не считается.
+            # Проверки происхождения выполняются и при allow_no_diff:
+            # явное подтверждение «принимаю без изменений» не может
+            # подтверждать НЕИЗВЕСТНУЮ базу рана.
             executor_task = _latest_completed_executor_with_run(
                 conn, round_row["id"])
             check_dir = (
@@ -1013,51 +1085,69 @@ def record_review(workflow_id: str,
                  or executor_task["working_dir"])
                 if executor_task else workflow["repository_path"])
             snapshot = (
-                _executor_dispatch_snapshot(
+                _executor_before_snapshot(
                     conn, round_row["id"], executor_task["run_id"])
                 if executor_task else None)
-            run_changes = None
-            if not decision.allow_no_diff:
-                run_changes = _executor_run_changes(
-                    check_dir, snapshot, round_row["base_sha"])
-                if run_changes["available"] and not run_changes["changed"]:
-                    workflow = _touch(
-                        conn, workflow, "review.no_diff",
-                        {
-                            "reason": (
-                                "Ревьюер дал PASS, но данный запуск "
-                                "исполнителя не изменил ни одного файла "
-                                "(сравнение с снимком до запуска: diff пуст). "
-                                "Холостой PASS запрещён: проверьте работу "
-                                "исполнителя или подтвердите приём без "
-                                "изменений явно (allow_no_diff)"
-                            ),
-                            "round_no": round_row["round_no"],
-                        },
-                        round_id=round_row["id"],
-                        run_id=reviewer["id"],
-                    )
-                    return db._row_to_workflow(workflow)
-                if run_changes["available"] and run_changes["unknown"]:
-                    workflow = _touch(
-                        conn, workflow, "review.diff_origin_unknown",
-                        {
-                            "reason": (
-                                "Ревьюер дал PASS, в дереве есть изменения "
-                                f"({len(run_changes['changed'])} путей), но "
-                                "доказать, что их сделал именно этот запуск "
-                                "исполнителя, нельзя (снимок до запуска "
-                                "отсутствует/обрезан). Неизвестное "
-                                "происхождение требует человека; подтвердить "
-                                "приём можно явно (allow_no_diff)"
-                            ),
-                            "round_no": round_row["round_no"],
-                            "changed_sample": run_changes["changed"][:20],
-                        },
-                        round_id=round_row["id"],
-                        run_id=reviewer["id"],
-                    )
-                    return db._row_to_workflow(workflow)
+            run_changes = _executor_run_changes(
+                check_dir, snapshot, round_row["base_sha"])
+            if run_changes["available"] and snapshot is None:
+                workflow = _touch(
+                    conn, workflow, "review.diff_origin_unknown",
+                    {
+                        "reason": (
+                            "База рана неизвестна: снимок дерева до запуска "
+                            "исполнителя отсутствует (легаси-раунд), "
+                            "доказать ни отсутствие изменений, ни их "
+                            "происхождение нельзя. Авто-PASS запрещён; "
+                            "явное allow_no_diff неизвестное не "
+                            "подтверждает. Перезапустите раунд (resume) — "
+                            "новый запуск получит снимок старта"
+                        ),
+                        "round_no": round_row["round_no"],
+                        "changed_sample": run_changes["changed"][:20],
+                    },
+                    round_id=round_row["id"],
+                    run_id=reviewer["id"],
+                )
+                return db._row_to_workflow(workflow)
+            if run_changes["available"] and run_changes["unknown"]:
+                workflow = _touch(
+                    conn, workflow, "review.diff_origin_unknown",
+                    {
+                        "reason": (
+                            "Ревьюер дал PASS, в дереве есть изменения "
+                            f"({len(run_changes['changed'])} путей), но "
+                            "доказать, что их сделал именно этот запуск "
+                            "исполнителя, нельзя (снимок до запуска "
+                            "обрезан). Неизвестное происхождение требует "
+                            "человека; перезапустите раунд (resume)"
+                        ),
+                        "round_no": round_row["round_no"],
+                        "changed_sample": run_changes["changed"][:20],
+                    },
+                    round_id=round_row["id"],
+                    run_id=reviewer["id"],
+                )
+                return db._row_to_workflow(workflow)
+            if (run_changes["available"] and not run_changes["changed"]
+                    and not decision.allow_no_diff):
+                workflow = _touch(
+                    conn, workflow, "review.no_diff",
+                    {
+                        "reason": (
+                            "Ревьюер дал PASS, но данный запуск "
+                            "исполнителя не изменил ни одного файла "
+                            "(сравнение с снимком до запуска: diff пуст). "
+                            "Холостой PASS запрещён: проверьте работу "
+                            "исполнителя или подтвердите приём без "
+                            "изменений явно (allow_no_diff)"
+                        ),
+                        "round_no": round_row["round_no"],
+                    },
+                    round_id=round_row["id"],
+                    run_id=reviewer["id"],
+                )
+                return db._row_to_workflow(workflow)
             conn.execute(
                 """UPDATE workflow_rounds SET status = 'completed',
                    completed_at = ?, summary_json = ? WHERE id = ?""",
@@ -1070,11 +1160,10 @@ def record_review(workflow_id: str,
                     (workflow["current_stage_id"],),
                 ).fetchone()
             if current_stage:
-                now = db._now()
                 conn.execute(
                     """UPDATE workflow_stages SET status='completed',
                        completed_at=?, summary_json=? WHERE id=?""",
-                    (now, db._json_dump(common), current_stage["id"]),
+                    (db._now(), db._json_dump(common), current_stage["id"]),
                 )
                 db._append_workflow_event(conn, WorkflowEventCreate(
                     workflow_id=workflow_id,
@@ -1084,65 +1173,39 @@ def record_review(workflow_id: str,
                     payload={"stage_id": current_stage["id"],
                              "stage_code": current_stage["code"], **common},
                 ))
-                # Stage checkpoint — коммит ТОЛЬКО доказанно изменённых
-                # данным run'ом файлов этапа (без add -A), до старта
-                # следующего исполнителя; неудача останавливает миссию.
-                # Флаг automation.stage_checkpoint, по умолчанию ВЫКЛ.
+                # Stage checkpoint — барьер: коммит ТОЛЬКО доказанно
+                # изменённых данным run'ом файлов этапа (частичный коммит
+                # с pathspec, без add -A). Пока барьер не завершён,
+                # миссия НЕ уходит в очередь: следующая стадия недоступна
+                # воркеру, вердикт повторно не применяется. Флаг
+                # automation.stage_checkpoint, по умолчанию ВЫКЛ.
                 if (_config_for(db._row_to_workflow(workflow))
                         .automation.stage_checkpoint):
                     spec = db._json_load(current_stage["spec_json"]) or {}
-                    pending_checkpoint = {
+                    checkpoint_deferred = {
                         "workflow_id": workflow["id"],
+                        "stage_id": current_stage["id"],
                         "stage_code": current_stage["code"],
                         "check_dir": check_dir,
-                        "changed": list(
-                            run_changes["changed"] if run_changes else []),
+                        "changed": list(run_changes["changed"]),
                         "allowed": list(spec.get("allowed_paths") or []),
+                        "common": common,
                     }
-                next_stage = conn.execute(
-                    """SELECT * FROM workflow_stages
-                       WHERE workflow_id=? AND position>? AND status='pending'
-                       ORDER BY position LIMIT 1""",
-                    (workflow_id, current_stage["position"]),
-                ).fetchone()
-                if next_stage:
-                    conn.execute(
-                        """UPDATE workflow_stages SET status='executing',
-                           started_at=? WHERE id=?""",
-                        (now, next_stage["id"]),
-                    )
-                    conn.execute(
-                        "UPDATE workflows SET current_stage_id=? WHERE id=?",
-                        (next_stage["id"], workflow_id),
-                    )
-                    new_round = _insert_round(
-                        conn, workflow_id, workflow["current_round"] + 1,
-                        base_sha=round_row["candidate_sha"],
-                        stage_id=next_stage["id"],
-                    )
-                    workflow = _workflow_row(conn, workflow_id)
-                    workflow = _transition(
-                        conn, workflow, WorkflowStatus.QUEUED,
-                        "stage.advanced",
-                        {"completed_stage_id": current_stage["id"],
-                         "completed_stage_code": current_stage["code"],
-                         "next_stage_id": next_stage["id"],
-                         "next_stage_code": next_stage["code"]},
-                        round_id=new_round["id"],
-                    )
-                else:
-                    workflow = _transition(
-                        conn, workflow, WorkflowStatus.COMPLETED,
-                        "review.passed",
-                        {**common, "final_stage_id": current_stage["id"],
-                         "final_stage_code": current_stage["code"]},
+                    db._append_workflow_event(conn, WorkflowEventCreate(
+                        workflow_id=workflow_id,
                         round_id=round_row["id"],
-                    )
-            else:
-                workflow = _transition(
-                    conn, workflow, WorkflowStatus.COMPLETED, "review.passed",
-                    common, round_id=round_row["id"],
-                )
+                        run_id=reviewer["id"],
+                        event_type="stage.checkpoint_pending",
+                        idempotency_key=(
+                            f"stage.checkpoint_pending:{current_stage['id']}"
+                            f":{db._now()}"),
+                        payload=dict(checkpoint_deferred,
+                                      run_id=reviewer["id"]),
+                    ))
+                    workflow = _workflow_row(conn, workflow_id)
+            if checkpoint_deferred is None:
+                workflow = _advance_after_stage(
+                    conn, workflow, round_row, common)
         elif decision.verdict is ReviewVerdict.REVISION_REQUIRED:
             conn.execute(
                 """UPDATE workflow_rounds SET status = 'revision_required',
@@ -1160,31 +1223,51 @@ def record_review(workflow_id: str,
                 round_id=round_row["id"], run_id=reviewer["id"],
             )
         result = db._row_to_workflow(workflow)
-    if pending_checkpoint is not None:
+    if checkpoint_deferred is not None:
+        # Барьер: git-операции чекпоинта — вне транзакции. Дальнейший
+        # переход (следующая стадия/завершение) становится виден воркеру
+        # только здесь, после успешного чекпоинта. Возвращаемый статус —
+        # фактический, после исхода барьера.
         checkpoint_ok = _stage_checkpoint_commit(
-            pending_checkpoint["workflow_id"],
-            pending_checkpoint["stage_code"],
-            pending_checkpoint["check_dir"],
-            pending_checkpoint["changed"],
-            pending_checkpoint["allowed"],
+            checkpoint_deferred["workflow_id"],
+            checkpoint_deferred["stage_code"],
+            checkpoint_deferred["check_dir"],
+            checkpoint_deferred["changed"],
+            checkpoint_deferred["allowed"],
         )
-        if not checkpoint_ok:
-            # Неудача видима и восстанавливаема: миссия — к человеку;
-            # финальная стадия откатывается тем же ребром, что и reopen.
-            with db._connect(immediate=True) as conn:
-                workflow_row = _workflow_row(
-                    conn, pending_checkpoint["workflow_id"])
-                state = WorkflowStatus(workflow_row["status"])
-                if state in (WorkflowStatus.QUEUED,
-                             WorkflowStatus.COMPLETED):
-                    _transition(
-                        conn, workflow_row, WorkflowStatus.AWAITING_HUMAN,
-                        "stage.checkpoint_failed",
-                        {"stage_code": pending_checkpoint["stage_code"],
-                         "reason": "чекпоинт стадии не завершён — следующая "
-                                   "стадия не стартует (или завершение "
-                                   "отложено) до починки"},
-                    )
+        with db._connect(immediate=True) as conn:
+            workflow = _workflow_row(
+                conn, checkpoint_deferred["workflow_id"])
+            state = WorkflowStatus(workflow["status"])
+            if state is not WorkflowStatus.AWAITING_HUMAN:
+                # параллельный resume уже завершил барьер и провёл миссию
+                result = db._row_to_workflow(workflow)
+            elif checkpoint_ok:
+                round_done = (
+                    _current_round_row(conn, workflow)
+                    if workflow["current_round"] else None)
+                workflow = _advance_after_stage(
+                    conn, workflow, round_done,
+                    checkpoint_deferred["common"],
+                    extra={"after_checkpoint": True},
+                )
+                result = db._row_to_workflow(workflow)
+            else:
+                # Неудача видима и восстанавливаема: миссия — у человека;
+                # выход — resume, который повторит чекпоинт.
+                round_done = (
+                    _current_round_row(conn, workflow)
+                    if workflow["current_round"] else None)
+                workflow = _touch(
+                    conn, workflow, "stage.checkpoint_failed",
+                    {"stage_code": checkpoint_deferred["stage_code"],
+                     "reason": "чекпоинт стадии не завершён — следующая "
+                               "стадия не стартует (или завершение "
+                               "отложено) до починки; resume повторит "
+                               "чекпоинт"},
+                    round_id=round_done["id"] if round_done else None,
+                )
+                result = db._row_to_workflow(workflow)
     return result
 
 
@@ -1195,6 +1278,16 @@ def human_input(workflow_id: str,
     said = {"text": action.text}
     if action.note.strip():
         said["note"] = action.note.strip()
+    # Барьер чекпоинта: resume при висящем чекпоинте сначала ПОВТОРЯЕТ его
+    # (git-операции вне транзакции) и только после успеха проводит миссию
+    # дальше; иначе миссия остаётся у человека. Обычный resume мимо
+    # незавершённого чекпоинта запрещён.
+    if action.resume:
+        with db._connect() as conn:
+            probe = _pending_stage_checkpoint(conn, workflow_id)
+        if probe is not None:
+            return _resume_pending_checkpoint(workflow_id, action, said,
+                                              probe)
     with db._connect(immediate=True) as conn:
         workflow = _workflow_row(conn, workflow_id)
         _require_version(workflow, action.expected_version)
@@ -1322,6 +1415,54 @@ def human_input(workflow_id: str,
                 {**said, "same_round": round_row["round_no"]},
                 round_id=round_row["id"],
             )
+        return db._row_to_workflow(workflow)
+
+
+def _resume_pending_checkpoint(workflow_id: str,
+                               action: WorkflowHumanInput,
+                               said: dict, pending: dict) -> WorkflowInDB:
+    """Повтор висящего чекпоинта стадии по resume оператора.
+
+    Чекпоинт выполняется вне транзакции; дальнейший переход (следующая
+    стадия/завершение) — только после успеха. Неудача оставляет миссию у
+    человека с новой причиной. Параллельный актор, уже проведший миссию
+    дальше, не дублируется.
+    """
+    ok = _stage_checkpoint_commit(
+        workflow_id, pending.get("stage_code") or "",
+        pending.get("check_dir") or "",
+        list(pending.get("changed") or []),
+        list(pending.get("allowed") or []),
+    )
+    with db._connect(immediate=True) as conn:
+        workflow = _workflow_row(conn, workflow_id)
+        _require_version(workflow, action.expected_version)
+        if WorkflowStatus(workflow["status"]) is not WorkflowStatus.AWAITING_HUMAN:
+            # параллельный актор уже завершил барьер и провёл миссию
+            return db._row_to_workflow(workflow)
+        round_row = (
+            _current_round_row(conn, workflow)
+            if workflow["current_round"] else None)
+        if not ok:
+            workflow = _touch(
+                conn, workflow, "stage.checkpoint_failed",
+                {**said,
+                 "stage_code": pending.get("stage_code"),
+                 "reason": "чекпоинт стадии по-прежнему не завершён — "
+                           "следующая стадия не стартует до починки"},
+                round_id=round_row["id"] if round_row else None,
+            )
+            return db._row_to_workflow(workflow)
+        workflow = _touch(
+            conn, workflow, "human.resumed",
+            {**said, "checkpoint_resumed": True,
+             "stage_code": pending.get("stage_code")},
+            round_id=round_row["id"] if round_row else None,
+        )
+        workflow = _advance_after_stage(
+            conn, workflow, round_row, pending.get("common") or {},
+            extra={"after_checkpoint": True, "checkpoint_resumed": True},
+        )
         return db._row_to_workflow(workflow)
 
 
@@ -1709,19 +1850,100 @@ def _executor_run_changes(check_dir: str, snapshot, base_sha=None):
     return {"available": True, "changed": sorted(changed), "unknown": unknown}
 
 
-def _executor_dispatch_snapshot(conn, round_id: str, run_id: str):
-    """Снимок дерева из события диспатча рана (run_id лежит в payload)."""
-    rows = conn.execute(
-        """SELECT payload_json FROM workflow_events
-           WHERE round_id = ? AND event_type = 'executor.dispatched'
-           ORDER BY seq DESC LIMIT 20""",
-        (round_id,),
-    ).fetchall()
-    for row in rows:
-        payload = db._json_load(row["payload_json"], {})
-        if payload.get("run_id") == run_id:
-            return payload.get("tree_snapshot")
+def _executor_before_snapshot(conn, round_id: str, run_id: str):
+    """Снимок дерева ДО рана (run_id в payload события).
+
+    Приоритет — снимок фактического старта рана (run.snapshot: воркер
+    пишет его в уже созданном worktree непосредственно перед запуском
+    агента). Диспатч-снимок старше и может не описывать дерево старта:
+    между диспатчем и стартом воркера ветка успела уйти. Легаси-раунды
+    без run.snapshot продолжают сравниваться с диспатч-снимком.
+    """
+    for event_type in ("run.snapshot", "executor.dispatched"):
+        rows = conn.execute(
+            """SELECT payload_json FROM workflow_events
+               WHERE round_id = ? AND event_type = ?
+               ORDER BY seq DESC LIMIT 20""",
+            (round_id, event_type),
+        ).fetchall()
+        for row in rows:
+            payload = db._json_load(row["payload_json"], {})
+            if payload.get("run_id") == run_id:
+                snap = payload.get("tree_snapshot")
+                if snap is not None:
+                    return snap
     return None
+
+
+def record_run_snapshot(task_id: int, run_dir: str) -> None:
+    """Снимок дерева на фактическом старте рана — доказательная база
+    no-diff/чекпоинта. Вызывает воркер после создания worktree, ДО
+    запуска агента. Телеметрия: любая неудача не ломает запуск рана.
+    """
+    try:
+        with db._connect() as conn:
+            run = conn.execute(
+                """SELECT id, round_id, workflow_id FROM workflow_runs
+                   WHERE task_id = ? AND role = 'executor'
+                     AND status IN ('pending', 'running')
+                   ORDER BY attempt_no DESC LIMIT 1""",
+                (task_id,),
+            ).fetchone()
+            if not run:
+                return
+            snap = _executor_tree_snapshot(run_dir)
+            if snap is None:
+                return
+            db._append_workflow_event(conn, WorkflowEventCreate(
+                workflow_id=run["workflow_id"],
+                round_id=run["round_id"],
+                run_id=run["id"],
+                event_type="run.snapshot",
+                idempotency_key=f"run.snapshot:{run['id']}:{db._now()}",
+                payload={"task_id": task_id, "run_id": run["id"],
+                         "run_dir": run_dir, "tree_snapshot": snap},
+            ))
+    except Exception as exc:  # noqa: BLE001 — не вносить падение в запуск
+        print(f"  !! run.snapshot #{task_id}: {exc}", flush=True)
+
+
+def _pending_stage_checkpoint(conn, workflow_id: str):
+    """Висящий чекпоинт стадии: stage.checkpoint_pending для текущей
+    стадии, после которого нет успешного stage.checkpoint того же кода.
+
+    Пока он есть, следующая стадия недоступна (барьер): миссия не уходит
+    в очередь, вердикт повторно не применяется; выход — resume, который
+    повторяет чекпоинт.
+    """
+    workflow = conn.execute(
+        "SELECT current_stage_id FROM workflows WHERE id = ?",
+        (workflow_id,),
+    ).fetchone()
+    if not workflow or not workflow["current_stage_id"]:
+        return None
+    pending = conn.execute(
+        """SELECT seq, payload_json FROM workflow_events
+           WHERE workflow_id = ? AND event_type = 'stage.checkpoint_pending'
+           ORDER BY seq DESC LIMIT 1""",
+        (workflow_id,),
+    ).fetchone()
+    if not pending:
+        return None
+    payload = db._json_load(pending["payload_json"], {})
+    if payload.get("stage_id") != workflow["current_stage_id"]:
+        return None
+    done = conn.execute(
+        """SELECT payload_json FROM workflow_events
+           WHERE workflow_id = ? AND event_type = 'stage.checkpoint'
+             AND seq > ?
+           ORDER BY seq""",
+        (workflow_id, pending["seq"]),
+    ).fetchall()
+    for row in done:
+        if (db._json_load(row["payload_json"], {}).get("stage_code")
+                == payload.get("stage_code")):
+            return None
+    return payload
 
 
 def _latest_completed_executor_with_run(conn, round_id: str):
@@ -1784,6 +2006,10 @@ def _stage_checkpoint_commit(workflow_id: str, stage_code: str,
     })
     if not stage_files:
         return True
+    # add нужен только ради untracked-файлов этапа; сам коммит — ЧАСТИЧНЫЙ
+    # с pathspec (git commit -- <пути>): в него попадают ровно эти пути, а
+    # остальное подготовленное в индексе (чужой staged-файл) остаётся
+    # staged и в коммит чекпоинта не попадает.
     add = git("add", "--", *stage_files)
     if add.returncode != 0:
         return fail(f"git add не удался ({add.returncode})", add.stderr or "")
@@ -1791,6 +2017,7 @@ def _stage_checkpoint_commit(workflow_id: str, stage_code: str,
         "commit", "-m",
         f"stage {stage_code}: checkpoint by PromptPilot "
         f"(ворота зелёные + PASS, {len(stage_files)} путей этапа)",
+        "--", *stage_files,
     )
     if committed.returncode != 0:
         out = (committed.stdout or "") + (committed.stderr or "")
@@ -2258,6 +2485,12 @@ def advance_workflow(workflow_id: str, max_actions: int = 12) -> WorkflowInDB:
                     item for item in db.list_workflow_rounds(workflow.id)
                     if item.round_no == workflow.current_round
                 )
+                with db._connect() as conn:
+                    if _pending_stage_checkpoint(conn, workflow.id):
+                        # Барьер чекпоинта: вердикт повторно не применяется,
+                        # следующая стадия недоступна до успешного повтора
+                        # (human resume).
+                        return workflow
                 if (
                     current_round.status is WorkflowRoundStatus.REVISION_REQUIRED
                     and config.automation.auto_resume_revision

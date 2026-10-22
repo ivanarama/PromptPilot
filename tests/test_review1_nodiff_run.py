@@ -151,7 +151,7 @@ def test_legacy_round_without_snapshot_requires_human(isolated_db, tmp_path, mon
             "print('v2')", encoding="utf-8"),
     )(isolated_db)
     # события append-only: имитируем легаси-раунд отключением поиска снимка
-    monkeypatch.setattr(workflows, "_executor_dispatch_snapshot",
+    monkeypatch.setattr(workflows, "_executor_before_snapshot",
                         lambda *a, **k: None)
     _finish_reviewer(isolated_db)
 
@@ -173,19 +173,16 @@ def test_truncated_snapshot_unknown_origin(isolated_db, tmp_path, monkeypatch):
     )(isolated_db)
 
     def truncated_snapshot(conn, round_id, run_id):
-        real = workflows._executor_dispatch_snapshot.__wrapped__             if hasattr(workflows._executor_dispatch_snapshot, "__wrapped__")             else None
-        snap = dict(real(conn, round_id, run_id)) if real else {}
-        # достаём настоящий снимок через оригинальную функцию нельзя
-        # (monkeypatch уже подменяет) — читаем событие напрямую
+        # monkeypatch уже подменяет поиск снимков — читаем событие напрямую
         row = conn.execute(
             """SELECT payload_json FROM workflow_events
                WHERE round_id = ? AND event_type = 'executor.dispatched'
                ORDER BY seq DESC LIMIT 1""", (round_id,)).fetchone()
-        snap = db._json_load(row["payload_json"], {}).get("tree_snapshot") or {}
+        snap = dict(db._json_load(row["payload_json"], {}).get("tree_snapshot") or {})
         snap["truncated"] = True
         return snap
 
-    monkeypatch.setattr(workflows, "_executor_dispatch_snapshot",
+    monkeypatch.setattr(workflows, "_executor_before_snapshot",
                         truncated_snapshot)
     _finish_reviewer(isolated_db)
 
@@ -193,9 +190,10 @@ def test_truncated_snapshot_unknown_origin(isolated_db, tmp_path, monkeypatch):
     assert "review.diff_origin_unknown" in _events(isolated_db, wf)
 
 
-def test_allow_no_diff_still_overrides_both_blocks(isolated_db, tmp_path):
-    """Явное человеческое allow_no_diff принимает PASS и при пустом diff,
-    и при неизвестном происхождении (подтверждение на свой страх)."""
+def test_allow_no_diff_overrides_proven_empty_diff(isolated_db, tmp_path):
+    """Явное человеческое allow_no_diff принимает PASS при ДОКАЗАННО пустом
+    diff (база рана известна, сравнение до/после пусто). Неизвестная база
+    allow_no_diff не подтверждает — см. test_checkpoint_hardening."""
     from promptpilot.models import ReviewVerdict, WorkflowReviewDecision
     repo = _git_repo(tmp_path)
     (repo / "foreign.txt").write_text("чужое", encoding="utf-8")
