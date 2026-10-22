@@ -1336,6 +1336,13 @@ def _execute_herdr_task(task, provider_cfg, host=None, machine=None, prompt_over
             lambda: db.set_worktree(task.id, path, branch),
             f"сохранение worktree задачи #{task.id}",
         )
+        # Снимок фактического дерева старта рана (см. _execute_task_body):
+        # база доказательств no-diff/чекпоинта — дерево, где работает агент.
+        try:
+            from . import workflows as _workflows
+            _workflows.record_run_snapshot(task.id, path)
+        except Exception as exc:  # noqa: BLE001 — телеметрия
+            print(f"  !! run.snapshot #{task.id}: {exc}", flush=True)
         print(f"  -> Worktree {path} ({branch})")
 
     def on_started(_pane_id):
@@ -1740,6 +1747,17 @@ def _execute_task_body(task, admission_complete=None):
         db.set_worktree(task.id, wt["path"], wt["branch"])
         wt_note = "\n\n" + worktree.summary(wt["path"], wt["branch"], wt["copied"])
         print(f"  -> Worktree {wt['path']} ({wt['branch']})")
+
+    # Доказательная база рана (no-diff/чекпоинт): снимок ФАКТИЧЕСКОГО дерева
+    # старта — в worktree, если он создан. Диспатч-снимок берётся раньше, из
+    # working_dir: между диспатчем и стартом воркера ветка успела уйти, и
+    # сравнение «до/после» без снимка старта приписывало сдвиг ветки
+    # исполнителю.
+    try:
+        from . import workflows as _workflows
+        _workflows.record_run_snapshot(task.id, run_dir)
+    except Exception as exc:  # noqa: BLE001 — телеметрия, не ломать запуск
+        print(f"  !! run.snapshot #{task.id}: {exc}", flush=True)
 
     cmd = build_cmd(provider, agent_prompt, skip_permissions=task.skip_permissions,
                     session_id=task.session_id, model=task.model, guard=not machine,

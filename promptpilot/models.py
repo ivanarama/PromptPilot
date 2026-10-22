@@ -249,6 +249,11 @@ class WorkflowAutomationConfig(BaseModel):
     auto_apply_review: bool = True
     auto_resume_revision: bool = True
     stop_on_human_required: bool = True
+    # Stage checkpoint: после stage.completed (ворота зелёные + PASS)
+    # автоматический коммит ИМЕННО файлов этапа, доказанно изменённых данным
+    # executor run'ом; неудача останавливает миссию до человека. Выключен
+    # по умолчанию.
+    stage_checkpoint: bool = False
 
 
 class WorkflowLimitsConfig(BaseModel):
@@ -628,6 +633,10 @@ class WorkflowReviewDecision(BaseModel):
     expected_version: int = Field(ge=0)
     summary: str = ""
     findings: list[ReviewFindingInput] = Field(default_factory=list)
+    # Явное человеческое подтверждение PASS без доказанных изменений
+    # исполнителя (no-diff или неизвестное происхождение). Автоприменение
+    # вердикта этот флаг не ставит.
+    allow_no_diff: bool = False
 
 
 class WorkflowHumanInput(BaseModel):
