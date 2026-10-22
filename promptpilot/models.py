@@ -204,6 +204,11 @@ class WorkflowRoleConfig(BaseModel):
     herdr_target: Optional[str] = None
     machine: Optional[str] = None
     prompt_template: str = ""
+    # Окно ДИСПАТЧА роли: [{"from":"22:00","to":"06:00","tz_offset_hours":0,
+    # "days":"weekdays"}] (по умолчанию 0 = UTC). Вне окна авто-диспетчер
+    # ждёт и пишет событие review.deferred — вместо ручного тоггла
+    # auto_dispatch_reviewer в часы пиковой нагрузки.
+    dispatch_window: Optional[list[dict]] = None
 
 
 class WorkflowRolesConfig(BaseModel):
@@ -319,6 +324,9 @@ class WorkflowCreate(BaseModel):
     repository_path: str = Field(min_length=1)
     candidate_branch: str = Field(min_length=1)
     config: dict[str, Any] = Field(default_factory=normalize_workflow_config)
+    # Готовый план дежурного: миссия создаётся сразу в awaiting_plan_approval,
+    # минуя запуск планировщика; невалидный план не занимает slug (атомарно).
+    plan: Optional[list["WorkflowStageSpec"]] = None
 
     @field_validator("config", mode="before")
     @classmethod
@@ -338,6 +346,10 @@ class WorkflowUpdate(BaseModel):
     repository_path: Optional[str] = Field(default=None, min_length=1)
     candidate_branch: Optional[str] = Field(default=None, min_length=1)
     config: Optional[dict[str, Any]] = None
+    # Явная семантика правки КОНФИГА терминальной миссии: разрешает менять
+    # ТОЛЬКО config (на выполнение терминальной миссии не влияет —
+    # история/шаблоны/гигиена), иначе frozen.
+    allow_terminal_config: bool = False
     expected_version: int = Field(ge=0)
 
     @field_validator("config", mode="before")

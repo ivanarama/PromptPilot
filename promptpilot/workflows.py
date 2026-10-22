@@ -50,6 +50,8 @@ ALLOWED_TRANSITIONS = {
     WorkflowStatus.DRAFT: {
         WorkflowStatus.PLANNING,
         WorkflowStatus.QUEUED,
+        # готовый план дежурного при создании миссии
+        WorkflowStatus.AWAITING_PLAN_APPROVAL,
         WorkflowStatus.CANCELLED,
     },
     WorkflowStatus.PLANNING: {
@@ -577,13 +579,99 @@ def sync_planner_task(task_id: int) -> Optional[WorkflowPlanInDB]:
     return result
 
 
+def provide_plan(workflow_id: str,
+                  replacement: WorkflowPlanReplace) -> list[WorkflowStageInDB]:
+    """Готовый план дежурного при создании миссии.
+
+    Миссия сразу попадает в awaiting_plan_approval — планировщик не
+    запускается вообще. Утверждение (approve_plan) остаётся обязательным
+    переходом, даже если план написал человек.
+    """
+    with db._connect(immediate=True) as conn:
+        workflow = _workflow_row(conn, workflow_id)
+        _require_version(workflow, replacement.expected_version)
+        if WorkflowStatus(workflow["status"]) is not WorkflowStatus.DRAFT:
+            raise db.WorkflowConflictError(
+                "plan can only be provided for a draft workflow"
+            )
+        now = db._now()
+        conn.execute(
+            """INSERT INTO workflow_plans
+               (workflow_id, status, input_sha256, created_at, updated_at)
+               VALUES (?, 'awaiting_approval', ?, ?, ?)
+               ON CONFLICT(workflow_id) DO UPDATE SET
+                 status='awaiting_approval', planner_task_id=NULL,
+                 output_sha256=NULL, output_json=NULL,
+                 updated_at=excluded.updated_at, approved_at=NULL""",
+            (workflow_id, "human-provided", now, now),
+        )
+        stages = db._replace_workflow_stages(
+            conn, workflow_id, replacement.stages)
+        _transition(
+            conn, workflow, WorkflowStatus.AWAITING_PLAN_APPROVAL,
+            "plan.provided",
+            {"stage_count": len(stages),
+             "stage_codes": [stage.code for stage in stages],
+             "source": "human"},
+        )
+        return stages
+
+
 def replace_plan(workflow_id: str,
                  replacement: WorkflowPlanReplace) -> list[WorkflowStageInDB]:
     with db._connect(immediate=True) as conn:
         workflow = _workflow_row(conn, workflow_id)
         _require_version(workflow, replacement.expected_version)
-        if WorkflowStatus(workflow["status"]) is not WorkflowStatus.AWAITING_PLAN_APPROVAL:
+        state = WorkflowStatus(workflow["status"])
+        if state not in {
+            WorkflowStatus.AWAITING_PLAN_APPROVAL,
+            WorkflowStatus.PLANNING,
+        }:
             raise db.WorkflowConflictError("plan can only be edited before approval")
+        if state is WorkflowStatus.PLANNING:
+            # Замена зависшего планировщика готовым планом: его задачи
+            # отменяются, поздние sync упавшего трака игнорируются
+            # (planner_task_id обнуляется).
+            plan_row = conn.execute(
+                "SELECT planner_task_id FROM workflow_plans WHERE workflow_id = ?",
+                (workflow_id,),
+            ).fetchone()
+            if plan_row and plan_row["planner_task_id"]:
+                task_id = plan_row["planner_task_id"]
+                cur = conn.execute(
+                    """UPDATE tasks SET status='cancelled', completed_at=?,
+                       error=COALESCE(error, ?)
+                       WHERE id=? AND status IN ('pending', 'rate_limited')""",
+                    (db._now(),
+                     "Отменена: план положен вручную (замена планировщика)",
+                     task_id),
+                )
+                if not cur.rowcount:
+                    task_status = conn.execute(
+                        "SELECT status FROM tasks WHERE id = ?", (task_id,),
+                    ).fetchone()
+                    if task_status and task_status["status"] == "running":
+                        conn.execute(
+                            "INSERT OR REPLACE INTO settings (key, value) "
+                            "VALUES (?, '1')",
+                            (f"cancel_task:{task_id}",),
+                        )
+                conn.execute(
+                    """UPDATE workflow_plans SET status='awaiting_approval',
+                       planner_task_id=NULL, output_sha256=NULL,
+                       output_json=NULL, updated_at=? WHERE workflow_id=?""",
+                    (db._now(), workflow_id),
+                )
+                stages = db._replace_workflow_stages(
+                    conn, workflow_id, replacement.stages)
+                _transition(
+                    conn, workflow, WorkflowStatus.AWAITING_PLAN_APPROVAL,
+                    "plan.replaced_hanging_planner",
+                    {"stage_count": len(stages),
+                     "stage_codes": [stage.code for stage in stages],
+                     "cancelled_planner_task": plan_row["planner_task_id"]},
+                )
+                return stages
         limit = _config_for(db._row_to_workflow(workflow)).planning.max_stages
         if len(replacement.stages) > limit:
             raise db.WorkflowConflictError(f"plan exceeds max_stages={limit}")
@@ -1406,6 +1494,130 @@ _OPERATOR_NOTE_EVENTS = (
 )
 
 
+_WINDOW_ALL_DAYS = {"mon", "tue", "wed", "thu", "fri", "sat", "sun"}
+
+
+def _utcnow():
+    """Единая точка времени для окон/бэкоффов — мокается в тестах."""
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc)
+
+
+def _window_days(raw) -> set:
+    """Дни окна: "weekdays"/"будни", "weekend"/"выходные", нет = все дни;
+    иначе список mon..sun (посторонние игнорируются, пусто = все дни)."""
+    if raw is None:
+        return set(_WINDOW_ALL_DAYS)
+    if isinstance(raw, str):
+        low = raw.strip().lower()
+        if low in ("weekdays", "будни", "будни (пн–пт)"):
+            return {"mon", "tue", "wed", "thu", "fri"}
+        if low in ("weekend", "выходные", "выходные (сб–вс)"):
+            return {"sat", "sun"}
+        return set(_WINDOW_ALL_DAYS)
+    if isinstance(raw, (list, tuple, set)):
+        allowed = {str(d).strip().lower()[:3] for d in raw} & _WINDOW_ALL_DAYS
+        return allowed or set(_WINDOW_ALL_DAYS)
+    return set(_WINDOW_ALL_DAYS)
+
+
+def _parse_window_item(item: dict):
+    """Разобрать запись dispatch_window: (from_min, to_min, allowed_days,
+    tz_offset_minutes) или None при кривом формате."""
+    if not isinstance(item, dict):
+        return None
+    try:
+        fh, fm = str(item.get("from", "0:0")).split(":")[:2]
+        th, tm = str(item.get("to", "0:0")).split(":")[:2]
+        offset = int(item.get("tz_offset_hours", 0)) * 60
+    except (ValueError, TypeError):
+        return None
+    return (
+        int(fh) * 60 + int(fm),
+        int(th) * 60 + int(tm),
+        _window_days(item.get("days")),
+        offset,
+    )
+
+
+def _dispatch_window_allows(role_config, now=None) -> "tuple[bool, str | None]":
+    """Можно ли диспатчить роль сейчас.
+
+    Возвращает (внутри_окна, "HH:MM UTC" следующего открытия). Окна без
+    записей не ограничивают; tz_offset_hours=0 (дефолт) — интервалы UTC.
+    Поиск ближайшего открытия — полный недельный цикл (0..7 дней): окно
+    «понедельник 09:00–17:00» в пятницу вечером обязано ЗАПРЕЩАТЬ до
+    понедельника, а не разворачиваться в «разрешено».
+    """
+    windows = getattr(role_config, "dispatch_window", None)
+    if not windows:
+        return True, None
+    from datetime import timedelta
+    now = now or _utcnow()
+    best_open = None
+    day_names = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+    parsed = [w for w in (_parse_window_item(item) for item in windows) if w]
+    if not parsed:
+        return True, None
+    for start, end, allowed, offset in parsed:
+        local = now + timedelta(minutes=offset)
+        local_min = local.hour * 60 + local.minute
+        today = day_names[local.weekday()]
+        yesterday = day_names[(local.weekday() - 1) % 7]
+        if start <= end:
+            if start <= local_min < end and today in allowed:
+                return True, None
+        elif ((today in allowed and local_min >= start)
+              or (yesterday in allowed and local_min < end)):
+            return True, None
+        for day_shift in range(0, 8):
+            candidate_local = (local + timedelta(days=day_shift)).replace(
+                hour=start // 60, minute=start % 60, second=0, microsecond=0)
+            if day_shift == 0 and local_min >= start:
+                continue
+            if day_names[candidate_local.weekday()] not in allowed:
+                continue
+            candidate_utc = candidate_local - timedelta(minutes=offset)
+            if best_open is None or candidate_utc < best_open:
+                best_open = candidate_utc
+            break
+    if best_open is None:
+        return True, None  # за 7 дней нет разрешённого дня — кривой конфиг
+    return False, best_open.strftime("%H:%M UTC")
+
+
+def _defer_review_until_window(workflow, until: str) -> bool:
+    """Записать review.deferred (один раз на момент until) и вернуть True."""
+    with db._connect(immediate=True) as conn:
+        row = conn.execute(
+            """SELECT payload_json FROM workflow_events
+               WHERE workflow_id = ? AND event_type = 'review.deferred'
+               ORDER BY seq DESC LIMIT 1""",
+            (workflow.id,),
+        ).fetchone()
+        payload = db._json_load(row["payload_json"], {}) if row else {}
+        if payload.get("until") == until:
+            return True
+        workflow_row = _workflow_row(conn, workflow.id)
+        round_row = (
+            _current_round_row(conn, workflow_row)
+            if workflow_row["current_round"] else None
+        )
+        _touch(
+            conn, workflow_row, "review.deferred",
+            {
+                "until": until,
+                "reason": (
+                    "Текущее время вне окна диспатча ревьюера "
+                    "(roles.reviewer.dispatch_window) — ревью отложено до "
+                    f"{until} вместо ручного тоггла auto_dispatch_reviewer"
+                ),
+            },
+            round_id=round_row["id"] if round_row else None,
+        )
+    return True
+
+
 def _latest_event_seq(conn: sqlite3.Connection, workflow_id: str,
                       event_type: str, round_id: str = None) -> int:
     """Newest seq of one event type, independent of how long the journal is."""
@@ -1807,6 +2019,13 @@ def advance_workflow(workflow_id: str, max_actions: int = 12) -> WorkflowInDB:
                         conn, workflow.id, "reviewer.dispatched",
                         round_id=current_round.id)
                 if latest_reviewer_dispatch_seq > latest_gate_seq:
+                    return workflow
+                # Окно диспатча ревьюера — вместо ручного тоггла
+                # auto_dispatch_reviewer в часы пиковой нагрузки.
+                inside, next_open = _dispatch_window_allows(
+                    config.roles.reviewer)
+                if not inside:
+                    _defer_review_until_window(workflow, next_open)
                     return workflow
                 return _dispatch_configured_role(workflow, WorkflowRole.REVIEWER).workflow
 
