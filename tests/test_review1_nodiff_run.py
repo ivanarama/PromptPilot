@@ -12,8 +12,6 @@ import subprocess
 from promptpilot import db, workflows
 from promptpilot.models import (
     WorkflowCreate,
-    WorkflowPlanApproval,
-    WorkflowPlanReplace,
     WorkflowStartRequest,
 )
 

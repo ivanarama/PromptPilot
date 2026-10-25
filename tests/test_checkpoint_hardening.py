@@ -18,7 +18,7 @@
 import subprocess
 import threading
 
-from promptpilot import db, workflows
+from promptpilot import workflows
 from promptpilot.models import (
     ReviewVerdict,
     WorkflowCreate,
