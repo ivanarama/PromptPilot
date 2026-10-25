@@ -14,7 +14,6 @@ from promptpilot.worker import admission_snapshot
 
 
 def _paused_series_task(isolated_db, tmp):
-    future = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()
     with db._connect(immediate=True) as conn:
         conn.execute(
             """INSERT INTO task_series
