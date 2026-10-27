@@ -53,6 +53,22 @@ assert.equal(breakdown.total, 6);
 assert.equal(breakdown.parts.find(part => part.key === 'empty').count, 3);
 assert.equal(context.pipelineRunBreakdown({runs_5h:{runs:0}}).total, 0);
 
+// Legacy integration REVIEW blocks MERGE the same way as the current one.
+const legacy = context.pipelineWaitReasons({
+  queues: [], diagnostics:{integration_owner:{number:1763, stage:'legacy-integration-review'}},
+});
+assert.equal(legacy.length, 1);
+assert.match(legacy[0].reason, /#1763.*ревью/);
+assert.equal(context.pipelineWaitReasons({
+  queues: [], diagnostics:{integration_owner:{number:1764, stage:'integration-merge-ready'}},
+}).length, 0);
+
+for (const [count, label] of [[0, '0 запусков'], [1, '1 запуск'], [2, '2 запуска'],
+    [4, '4 запуска'], [5, '5 запусков'], [11, '11 запусков'], [14, '14 запусков'],
+    [21, '21 запуск'], [22, '22 запуска'], [111, '111 запусков'], [101, '101 запуск']]) {
+  assert.equal(context.runsLabel(count), label);
+}
+
 assert.match(html, /Остановленные этапы/);
 assert.match(html, /Самая длинная очередь по ETA/);
 assert.match(html, /Почему этапы ждут прямо сейчас/);

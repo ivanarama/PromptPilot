@@ -92,7 +92,7 @@ def test_api_tasks_expose_wait_reason(isolated_db, tmp_path):
     async def run():
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(
-            transport=transport, base_url="http://t",
+            transport=transport, base_url="http://127.0.0.1:8420",
         ) as client:
             return await client.get("/api/tasks")
 

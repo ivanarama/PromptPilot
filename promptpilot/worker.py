@@ -9,6 +9,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -202,6 +203,7 @@ def _repair_verdict(task, provider: str, provider_cfg: dict,
             input=prompt_stdin,
             capture_output=True,
             text=True,
+            encoding="utf-8",
             errors="replace",
             timeout=VERDICT_REPAIR_TIMEOUT,
         )
@@ -707,10 +709,44 @@ def _remember_stream_session(task_id: int, line: str) -> None:
         db.set_session_id(task_id, session_id)
 
 
-def _read_process_pipe(pipe, chunks: list[str], task_id: int | None = None) -> None:
+def _windows_output_encoding() -> str | None:
+    """cmd.exe uses the console/OEM code page even when the CLI uses UTF-8."""
+    if os.name != "nt":
+        return None
+    import ctypes
+    code_page = (ctypes.windll.kernel32.GetConsoleOutputCP()
+                 or ctypes.windll.kernel32.GetOEMCP())
+    return f"cp{code_page}"
+
+
+def _decode_process_line(line: str, fallback_encoding: str | None) -> str:
+    # The pipe uses surrogateescape so malformed UTF-8 is still recoverable.
+    raw = line.encode("utf-8", errors="surrogateescape")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode(fallback_encoding or "utf-8", errors="replace")
+
+
+def _write_process_input(pipe, prompt: str) -> None:
+    """Keep a provider that does not read stdin from blocking cancellation."""
+    try:
+        pipe.write(prompt)
+    except (BrokenPipeError, OSError, ValueError):
+        pass
+    finally:
+        try:
+            pipe.close()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+
+
+def _read_process_pipe(pipe, chunks: list[str], task_id: int | None = None,
+                       fallback_encoding: str | None = None) -> None:
     """Drain one provider pipe without blocking the cancellation poll loop."""
     try:
         for line in iter(pipe.readline, ""):
+            line = _decode_process_line(line, fallback_encoding)
             chunks.append(line)
             if task_id is not None:
                 # HOTFIX: исключение здесь (напр. sqlite 'database is locked' из
@@ -1789,7 +1825,25 @@ def _execute_task_body(task, admission_complete=None):
         else:
             kwargs["start_new_session"] = True
         try:
-            proc = subprocess.Popen(cmd, **kwargs)
+            # A detached CLI must also receive its prompt, without a pipe writer
+            # that would be lost when the worker exits. The child inherits this
+            # temporary file handle; closing the parent's copy is safe.
+            with tempfile.TemporaryFile() as input_file:
+                if prompt_stdin is not None:
+                    input_file.write(prompt_stdin.encode("utf-8"))
+                    input_file.seek(0)
+                    kwargs["stdin"] = input_file
+                    # Supplying stdin makes Windows inherit all three handles.
+                    # A detached CLI must not keep or block the worker's pipes.
+                    kwargs["stdout"] = subprocess.DEVNULL
+                    kwargs["stderr"] = subprocess.DEVNULL
+                    if os.name == "nt":
+                        # DETACHED_PROCESS lets cmd.exe allocate a console and
+                        # replace redirected stdin. CREATE_NO_WINDOW preserves
+                        # the inherited file while keeping the CLI independent.
+                        kwargs["creationflags"] = (subprocess.CREATE_NO_WINDOW
+                                                   | subprocess.CREATE_NEW_PROCESS_GROUP)
+                proc = subprocess.Popen(cmd, **kwargs)
             _mark_completed(task, f"Запущен в фоне (PID {proc.pid}){wt_note}", exit_code=0)
             print(f"  -> Detached (PID {proc.pid})")
         except FileNotFoundError:
@@ -1807,7 +1861,7 @@ def _execute_task_body(task, admission_complete=None):
             stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
-            errors="replace",
+            errors="surrogateescape",
             cwd=run_dir,
             stdin=subprocess.PIPE if prompt_stdin is not None else subprocess.DEVNULL,
             env=env,
@@ -1823,30 +1877,26 @@ def _execute_task_body(task, admission_complete=None):
     _register_provider_tree(task.id, tree)
     proc = tree.process
 
-    if prompt_stdin is not None:
-        # Write once and detach the handle before polling communicate(). This
-        # avoids resending after TimeoutExpired and preserves newlines through
-        # Windows .CMD provider shims.
-        try:
-            proc.stdin.write(prompt_stdin)
-            proc.stdin.close()
-        except (BrokenPipeError, OSError, ValueError):
-            pass
-        finally:
-            proc.stdin = None
-
     # Drain both pipes while polling. Besides avoiding pipe deadlocks, the
     # stdout reader persists Codex/Claude session ids immediately, so a worker
     # crash can resume the same conversation instead of mistaking its own dirty
     # checkout for foreign work on a fresh run.
     stdout_parts: list[str] = []
     stderr_parts: list[str] = []
+    fallback_encoding = _windows_output_encoding() if not machine else None
     stdout_thread = threading.Thread(
-        target=_read_process_pipe, args=(proc.stdout, stdout_parts, task.id), daemon=True)
+        target=_read_process_pipe,
+        args=(proc.stdout, stdout_parts, task.id, fallback_encoding), daemon=True)
     stderr_thread = threading.Thread(
-        target=_read_process_pipe, args=(proc.stderr, stderr_parts), daemon=True)
+        target=_read_process_pipe,
+        args=(proc.stderr, stderr_parts, None, fallback_encoding), daemon=True)
     stdout_thread.start()
     stderr_thread.start()
+    stdin_thread = None
+    if prompt_stdin is not None:
+        stdin_thread = threading.Thread(
+            target=_write_process_input, args=(proc.stdin, prompt_stdin), daemon=True)
+        stdin_thread.start()
 
     # Poll instead of blocking: allows user-requested cancellation of a
     # RUNNING task (Web UI/bot) and the per-task timeout.
@@ -1876,6 +1926,8 @@ def _execute_task_body(task, admission_complete=None):
                     pass
                 stdout_thread.join(timeout=10)
                 stderr_thread.join(timeout=10)
+                if stdin_thread is not None:
+                    stdin_thread.join(timeout=10)
                 changed = _commit_terminal_or_defer(
                     task,
                     "headless cancellation",
@@ -1903,6 +1955,8 @@ def _execute_task_body(task, admission_complete=None):
                     pass
                 stdout_thread.join(timeout=10)
                 stderr_thread.join(timeout=10)
+                if stdin_thread is not None:
+                    stdin_thread.join(timeout=10)
                 _commit_terminal_or_defer(
                     task,
                     "headless timeout",
@@ -1917,6 +1971,8 @@ def _execute_task_body(task, admission_complete=None):
     _forget_provider_tree(task.id, tree)
     stdout_thread.join(timeout=10)
     stderr_thread.join(timeout=10)
+    if stdin_thread is not None:
+        stdin_thread.join(timeout=10)
     stdout = "".join(stdout_parts)
     stderr = "".join(stderr_parts)
 
