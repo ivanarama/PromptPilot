@@ -3096,13 +3096,27 @@ function pipelineStageFocus(queues) {
 }
 
 function pipelineWaitReasons(data) {
-  const waits = (data.queues || [])
-    .filter(q => Number(q.backlog) > 0 && q.task_status === 'pending' && q.task_error)
-    .map(q => ({id:q.id, title:q.title, reason:String(q.task_error)}));
-  for (const task of (data.current?.tasks || [])) {
-    if (task.status === 'pending' && task.error && !waits.some(wait => wait.reason === task.error)) {
-      waits.push({id:String(task.task_id || ''), title:task.title, reason:String(task.error)});
+  const waits = [];
+  const add = (id, title, status, error, retryAt, taskId) => {
+    if (!['pending', 'rate_limited'].includes(status) || !error) return;
+    const reason = String(error) + (status === 'rate_limited' && retryAt
+      ? ` · следующая попытка: ${retryAt}` : '');
+    if (waits.some(wait => taskId && wait.task_id === taskId
+        || wait.title === title && wait.reason === reason)) return;
+    waits.push({id, title, reason, task_id:taskId});
+  };
+  for (const queue of (data.queues || [])) {
+    const replicas = queue.series_replicas?.length ? queue.series_replicas : [queue];
+    for (const task of replicas) {
+      if (Number(queue.backlog) > 0 || task.task_status === 'rate_limited') {
+        add(queue.id, task.title || queue.title, task.task_status,
+          task.task_error, task.task_next_run_at, task.task_id);
+      }
     }
+  }
+  for (const task of (data.current?.tasks || [])) {
+    add(String(task.task_id || ''), task.title, task.status,
+      task.error, task.scheduled_at, task.task_id);
   }
   const owner = (data.diagnostics && data.diagnostics.integration_owner)
     || (data.current && data.current.integration_owner);
