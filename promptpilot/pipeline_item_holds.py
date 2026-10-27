@@ -233,6 +233,17 @@ def record(conn, series_id, task_id, verdict, result):
             return False
     except (TypeError, ValueError, KeyError):
         return False
+    if exact_target:
+        old = holds.get(next(iter(numbers))) or {}
+        if (isinstance(old, dict)
+                and old.get("head") == target["head"]
+                and old.get("stage", "review") == target.get("stage", "review")
+                and old.get("task_id") not in (None, task_id)
+                and type(old.get("at")) in {int, float}
+                and 0 <= time.time() - old["at"] < TTL):
+            # A different occurrence re-elected this still-held target.
+            # Its hold did not exclude it; retain the series repeat guard.
+            return False
     # Preserve the initial timestamp: recurrence repair must not extend a hold.
     for number in numbers:
         old = holds.get(number) or {}

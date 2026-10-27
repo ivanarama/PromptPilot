@@ -710,3 +710,33 @@ def test_validated_merge_fallback_parks_exact_target_with_stale_dashboard(
     fresh = {"cache": {"complete": True}, "diagnostics": source}
     successor = SimpleNamespace(id=task.id + 1, series_id=task.series_id)
     assert prepare(successor, queue, fresh) == [target["number"]]
+
+
+@pytest.mark.parametrize("verdict", ["НЕ СМОГ", "НУЖЕН ЧЕЛОВЕК"])
+def test_repeated_merge_target_with_stale_snapshot_keeps_series_guard(
+        config, isolated_db, monkeypatch, verdict):
+    source = health("merge")
+    target = source["merge_executable"][0]
+    preflight = handoff.create(config, source, "merge", target, "full skill required")
+    queue = {"id": "merge", "item_blockers": True,
+             "execution": {"mode": "auto", "command": ["pp", "next", "merge"]}}
+    monkeypatch.setattr(pipeline_insights, "_matching_queue", lambda _: ("p", {}, queue))
+    monkeypatch.setattr(pipeline_insights, "_tool_available", lambda *_: (True, ""))
+    monkeypatch.setattr(pipeline_insights, "_tool_preflight", lambda *_a, **_k: preflight)
+    monkeypatch.setattr(pipeline_insights, "read_cached", lambda *_: {"cache": {"stale": True}})
+    result = f'ИТОГ: {verdict} (#{target["number"]} — conflict requires owner)'
+    first = isolated_db.create_task(TaskCreate(prompt="merge", recurrence="15m"))
+    assert pipeline_insights.execution_route(first, "canonical skill")["action"] == "prompt"
+    isolated_db.mark_completed(first.id, result, verdict=verdict)
+    assert not isolated_db.pause_pipeline_series_on_repeated_blocker(
+        first.series_id, first.id)["suppress_recurrence"]
+    # Repairing the same occurrence remains idempotent.
+    assert not isolated_db.pause_pipeline_series_on_repeated_blocker(
+        first.series_id, first.id)["suppress_recurrence"]
+    second = isolated_db.create_task(TaskCreate(
+        prompt="merge", recurrence="15m", series_id=first.series_id))
+    assert pipeline_insights.execution_route(second, "canonical skill")["action"] == "prompt"
+    isolated_db.mark_completed(second.id, result, verdict=verdict)
+    guard = isolated_db.pause_pipeline_series_on_repeated_blocker(second.series_id, second.id)
+    assert guard["suppress_recurrence"] and guard["previous_task_id"] == first.id
+    assert isolated_db.list_series()[0]["paused"]
