@@ -128,6 +128,13 @@ WORKFLOW_VERDICT_INSTRUCTION = """
 
 SUCCESS_VERDICTS = {"ГОТОВО", "УЖЕ СДЕЛАНО"}
 
+STAGE_PROMPTS_NOTE = (
+    "executor_prompt и reviewer_prompt необязательны и содержат только указания "
+    "этого этапа: код, название и проверяемую цель этапа (objective), разрешённые "
+    "пути, ожидаемые результаты, отчёты, замечания аудита, результаты gate и формат "
+    "ответа аудитора PromptPilot добавляет к ним сам."
+)
+
 DEFAULT_PLANNER_PROMPT = """Ты — ведущий инженер-планировщик PromptPilot.
 Изучи репозиторий и разложи общую задачу на короткие последовательные этапы,
 которые сможет надёжно выполнить более слабый исполнитель.
@@ -148,7 +155,7 @@ DEFAULT_PLANNER_PROMPT = """Ты — ведущий инженер-планир�
 Для каждого этапа обязательны code, title, objective; доступны stage_type
 (implementation/integration), dependencies, allowed_paths, deliverables,
 acceptance_gates, executor_prompt, reviewer_prompt, max_revision_rounds.
-"""
+""" + STAGE_PROMPTS_NOTE + "\n"
 
 PLAN_OUTPUT_CONTRACT = """
 <promptpilot-plan-contract version="stage-plan-v1">
@@ -181,6 +188,25 @@ DEFAULT_EXECUTOR_PROMPT = """Ты — исполнитель в автономн
 commit SHA, незакрытые ограничения и пути к evidence.
 """
 
+# The auditor's answer format. Every reviewer prompt carries it exactly once,
+# whatever the role template or stage text says (``{{audit_contract}}``).
+AUDIT_RESPONSE_CONTRACT = """В конце отчёта обязательно выведи
+две машинно-читаемые строки (каждая целиком на одной строке):
+AUDIT_FINDINGS_JSON: []
+AUDIT_VERDICT: PASS
+
+Для замечаний верни JSON-массив объектов с полями fingerprint, severity
+(blocker/high/medium/low/info), category, title, status (open/resolved/reopened/
+accepted_risk), payload. AUDIT_VERDICT допускает только PASS,
+REVISION_REQUIRED или HUMAN_REQUIRED.
+
+Если список незакрытых замечаний выше не пуст, верни в AUDIT_FINDINGS_JSON
+каждый прежний fingerprint: со status=resolved, когда исправление проверено, либо
+со status=open/reopened и вердиктом REVISION_REQUIRED. Не возвращай PASS с
+пустым массивом, пока в реестре есть незакрытые замечания.
+"""
+AUDIT_CONTRACT_PLACEHOLDER = "{{audit_contract}}"
+
 DEFAULT_REVIEWER_PROMPT = """Ты — независимый аудитор в автономном workflow PromptPilot.
 Не исправляй код и не принимай заявления исполнителя на веру.
 
@@ -200,21 +226,32 @@ Deterministic gate:
 Незакрытые замечания предыдущих аудитов:
 {{open_findings}}
 
-Проверь diff, историю Git, тесты и evidence. В конце отчёта обязательно выведи
-две машинно-читаемые строки (каждая целиком на одной строке):
-AUDIT_FINDINGS_JSON: []
-AUDIT_VERDICT: PASS
+Проверь diff, историю Git, тесты и evidence. """ + AUDIT_RESPONSE_CONTRACT
 
-Для замечаний верни JSON-массив объектов с полями fingerprint, severity
-(blocker/high/medium/low/info), category, title, status (open/resolved/reopened/
-accepted_risk), payload. AUDIT_VERDICT допускает только PASS,
-REVISION_REQUIRED или HUMAN_REQUIRED.
-
-Если список незакрытых замечаний выше не пуст, верни в AUDIT_FINDINGS_JSON
-каждый прежний fingerprint: со status=resolved, когда исправление проверено, либо
-со status=open/reopened и вердиктом REVISION_REQUIRED. Не возвращай PASS с
-пустым массивом, пока в реестре есть незакрытые замечания.
-"""
+# Context a stage text or a custom role template must not lose: the placeholders
+# that already place a section, and the section added when none of them is in
+# the text.
+_CONTEXT_SECTIONS = {
+    # The card's verifiable goal must reach the agent even when the stage text
+    # only says how to work, and an edited goal must not be silently ignored.
+    "stage_goal": (("stage_goal",),
+                   "Этап: {{stage_label}}\nПроверяемая цель этапа:\n{{stage_goal}}"),
+    "executor_report": (("executor_report",), "Отчёт исполнителя:\n{{executor_report}}"),
+    "gate_evidence": (("gate_evidence",),
+                      "Результаты автоматических проверок (gate):\n{{gate_evidence}}"),
+    "open_findings": (("open_findings",),
+                      "Незакрытые замечания предыдущих аудитов:\n{{open_findings}}"),
+    "allowed_paths": (("allowed_paths",), "Разрешённые пути:\n{{allowed_paths}}"),
+    "deliverables": (("deliverables",), "Ожидаемые результаты:\n{{deliverables}}"),
+    "previous_review": (("previous_review",),
+                        "Замечания предыдущего независимого аудита:\n{{previous_review}}"),
+}
+_ROLE_CONTEXT = {
+    "reviewer": ("stage_goal", "executor_report", "gate_evidence", "open_findings",
+                 "allowed_paths", "deliverables"),
+    "executor": ("stage_goal", "allowed_paths", "deliverables", "previous_review",
+                 "gate_evidence"),
+}
 
 
 def _workflow_row(conn: sqlite3.Connection, workflow_id: str) -> sqlite3.Row:
@@ -1447,6 +1484,37 @@ def _operator_notes_block(notes: list[str]) -> str:
     return "\n\n".join(notes) if notes else "(нет)"
 
 
+def _context_block(text: str, kind: str) -> str:
+    """Sections of the role context that ``text`` does not place itself."""
+    parts = []
+    for name in _ROLE_CONTEXT[kind]:
+        placeholders, section = _CONTEXT_SECTIONS[name]
+        if not any("{{" + item + "}}" in text for item in placeholders):
+            parts.append(section)
+    if kind == "reviewer" and not _has_audit_contract(text):
+        parts.append(AUDIT_CONTRACT_PLACEHOLDER)
+    if not parts:
+        return ""
+    return ("<контекст-этапа>\nЭти разделы добавил PromptPilot к заданию этапа.\n\n"
+            + "\n\n".join(parts) + "\n</контекст-этапа>")
+
+
+def _has_audit_contract(text: str) -> bool:
+    return (AUDIT_CONTRACT_PLACEHOLDER in text
+            or AUDIT_RESPONSE_CONTRACT.strip() in text)
+
+
+def _place_audit_contract(text: str, role: WorkflowRole) -> str:
+    """Put the auditor's answer format into a reviewer prompt exactly once."""
+    if role is not WorkflowRole.REVIEWER or AUDIT_RESPONSE_CONTRACT.strip() in text:
+        return text.replace(AUDIT_CONTRACT_PLACEHOLDER, "")
+    head, placed, tail = text.partition(AUDIT_CONTRACT_PLACEHOLDER)
+    if not placed:
+        return text
+    return (head + AUDIT_RESPONSE_CONTRACT.strip()
+            + tail.replace(AUDIT_CONTRACT_PLACEHOLDER, ""))
+
+
 def _render_role_prompt(workflow: WorkflowInDB, role: WorkflowRole,
                         template: str) -> str:
     round_no = workflow.current_round
@@ -1466,6 +1534,8 @@ def _render_role_prompt(workflow: WorkflowInDB, role: WorkflowRole,
         "stage_code": str(stage.get("code") or ""),
         "stage_title": str(stage.get("title") or ""),
         "stage_goal": str(stage.get("objective") or stage.get("goal") or workflow.objective),
+        "stage_label": (f"{stage.get('code') or ''} {stage.get('title') or ''}".strip()
+                        or "единственный этап workflow"),
         "allowed_paths": "\n".join(stage.get("allowed_paths") or []) or "(не ограничены планом)",
         "deliverables": "\n".join(stage.get("deliverables") or []) or "(см. цель этапа)",
         "previous_review": _latest_run_output(
@@ -1492,17 +1562,29 @@ def _render_role_prompt(workflow: WorkflowInDB, role: WorkflowRole,
     }
     notes = _operator_notes(workflow.id, role)
     values["human_input"] = _operator_notes_block(notes)
-    rendered = template or (
+    stage_text = ""
+    if stage_row:
+        stage_text = (
+            stage_row.executor_prompt
+            if role is WorkflowRole.EXECUTOR else stage_row.reviewer_prompt
+        ) or ""
+    base = stage_text or template or (
         DEFAULT_EXECUTOR_PROMPT
         if role is WorkflowRole.EXECUTOR else DEFAULT_REVIEWER_PROMPT
     )
-    if stage_row:
-        override = (
-            stage_row.executor_prompt
-            if role is WorkflowRole.EXECUTOR else stage_row.reviewer_prompt
-        )
-        if override:
-            rendered = override
+    builtin = not (stage_text or template)
+    # A stage text or custom template supplements the role: PromptPilot adds
+    # the context and answer format it does not place itself. The built-in
+    # templates already carry every section.
+    block = "" if builtin else _context_block(base, role.value)
+    rendered = base.rstrip() + "\n\n" + block if block else base
+    rendered = _place_audit_contract(rendered, role)
+    # Placeholders are filled in one pass, so a report quoting "{{...}}" is
+    # left as written.
+    placed_by_template = "{{human_input}}" in rendered
+    places_executor_report = "{{executor_report}}" in rendered
+    rendered = re.sub(r"\{\{([a-z_]+)\}\}",
+                      lambda match: values.get(match.group(1), match.group(0)), rendered)
     # Only a run of this same stage: the first round of the next stage has
     # another goal and other allowed paths, so its predecessor's report is
     # not a session to resume.
@@ -1510,7 +1592,7 @@ def _render_role_prompt(workflow: WorkflowInDB, role: WorkflowRole,
         workflow.id, WorkflowRole.EXECUTOR, stage_id=workflow.current_stage_id)
     if (role is WorkflowRole.EXECUTOR
             and previous_executor != "(нет: это первый раунд)"
-            and "{{executor_report}}" not in rendered):
+            and not places_executor_report):
         # A resumed executor may run in a fresh CLI session. Give it the prior
         # result as context; the repository remains the source of truth.
         if len(previous_executor) > 12000:
@@ -1524,9 +1606,6 @@ def _render_role_prompt(workflow: WorkflowInDB, role: WorkflowRole,
         )
     # A template may place the notes itself; otherwise they go last, marked
     # as outranking the round's instructions — the same rule as a task note.
-    placed_by_template = "{{human_input}}" in rendered
-    for name, value in values.items():
-        rendered = rendered.replace("{{" + name + "}}", value)
     if notes and not placed_by_template:
         rendered = (
             rendered.rstrip()
