@@ -673,6 +673,14 @@ def _pid_alive(pid: int):
     прототипы ctypes заданы явно, HANDLE не урезается."""
     if not pid or pid <= 0:
         return False
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except (PermissionError, OSError, OverflowError):
+            return None
+        return True
     try:
         import ctypes
 
@@ -681,6 +689,8 @@ def _pid_alive(pid: int):
                                          ctypes.c_uint32]
         kernel32.OpenProcess.restype = ctypes.c_void_p
         kernel32.GetLastError.restype = ctypes.c_uint32
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = ctypes.c_int
         handle = kernel32.OpenProcess(0x1000, 0, int(pid))
         if not handle:
             # 5 = ERROR_ACCESS_DENIED: процесс чужой/элевированный — жив

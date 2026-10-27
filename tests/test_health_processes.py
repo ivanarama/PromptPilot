@@ -3,6 +3,8 @@
 import json
 import os
 
+import pytest
+
 from promptpilot.api import _pid_alive, api_health_processes
 
 
@@ -34,3 +36,18 @@ def test_health_endpoint_reports_dead(tmp_path, monkeypatch):
     assert by_name["cascade"] == "dead"        # pid есть, процесс мёртв
     assert by_name["bot_vk"] == "off"          # pid=0 — не запущен, не тревога
     assert result["ok"] is False
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process probe")
+@pytest.mark.parametrize("error, expected", [
+    (None, True), (ProcessLookupError(), False), (PermissionError(), None),
+    (OSError(), None), (OverflowError(), None),
+])
+def test_posix_probe_distinguishes_alive_dead_and_unknown(monkeypatch, error, expected):
+    def probe(pid, signal):
+        assert pid == 12345 and signal == 0
+        if error is not None:
+            raise error
+
+    monkeypatch.setattr(os, "kill", probe)
+    assert _pid_alive(12345) is expected
