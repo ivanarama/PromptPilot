@@ -1501,8 +1501,11 @@ def parallel_content_candidates(config: dict, health: dict) -> list[dict]:
     """Opt-in native-only REVIEW beside an exclusively owned integration REVIEW."""
     if not config.get("parallel_content_review", False):
         return []
-    if (_configured_replica_count() < 2
-            or config.get("review_completion_gate") != "target-v1"
+    # Missing optional capacity disables only the parallel lane. The ordinary
+    # queue and the integration owner's established fallback remain executable.
+    if _configured_replica_count() < 2:
+        return []
+    if (config.get("review_completion_gate") != "target-v1"
             or config.get("fallback_handoff") != "target-v1"):
         raise PipelineError("parallel content REVIEW requires replicated target-v1 gates")
     from .fallback_handoff import INTEGRATION_REVIEW_STAGES
@@ -1510,7 +1513,11 @@ def parallel_content_candidates(config: dict, health: dict) -> list[dict]:
     owner = health.get("integration_owner") or {}
     if owner.get("stage") not in INTEGRATION_REVIEW_STAGES:
         return []
-    candidates = health.get("parallel_review_candidates")
+    # An older checker has no parallel allowlist: it grants no parallel target,
+    # but must not prevent the integration owner from entering normal REVIEW.
+    if "parallel_review_candidates" not in health:
+        return []
+    candidates = health["parallel_review_candidates"]
     if not isinstance(candidates, list):
         raise PipelineError("parallel content REVIEW requires a checker allowlist")
     return candidates
