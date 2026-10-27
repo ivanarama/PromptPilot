@@ -38,7 +38,7 @@ vm.runInContext(renderer, context);
   assert.match(box.innerHTML, /Что происходит сейчас/);
   assert.match(box.innerHTML, /&lt;unsafe&gt;/);
   assert.match(box.innerHTML, /Итоги запусков/);
-  assert.match(box.innerHTML, /3 запусков/);
+  assert.match(box.innerHTML, /3 запуска</);
   assert.match(box.innerHTML, /MERGE<\/b>: waiting for integration &lt;REVIEW&gt;/);
   assert.match(box.innerHTML, /данные устарели/);
   assert.match(box.innerHTML, /Ещё не проверено/);
