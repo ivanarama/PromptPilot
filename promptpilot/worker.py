@@ -2470,16 +2470,18 @@ def admission_snapshot():
     """Честная диагностика очереди — read-only повтор правил допуска воркера.
 
     Повторяет фильтры get_next_runnable (pending/rate_limited,
-    scheduled_at/next_run_at наступили, серия не на паузе и не завершена)
-    плюс занятость lock_key RUNNING-задачами и более ранними готовыми
-    кандидатами. Никаких мутаций: claim-алгоритм не меняется, это только
-    проекция для /api/tasks и панели. Позиция — ранг среди ГОТОВЫХ;
+    scheduled_at/next_run_at наступили, серия не на паузе и не завершена).
+    При CONCURRENCY > 1 учитывает занятость lock_key RUNNING-задачами и
+    более ранними готовыми кандидатами; последовательный воркер не
+    исключает повторяющиеся каталоги. Никаких мутаций: claim не меняется.
+    Проекция для /api/tasks и панели. Позиция — ранг среди ГОТОВЫХ;
     не-готовые получают wait_reason. Относительно опциональной lane-политики
-    проекта позиция базовая: lane-переключение меняет выбор слота, но не
-    факт готовности. Возвращает {task_id: dict(queue_position, wait_reason,
-    ready)}.
+    проекта позиция базовая: lanes могут как менять порядок, так и запрещать
+    допуск. Lane-политика, бюджетная fairness, свободные слоты и глобальная
+    пауза не моделируются. ready означает только базовый допуск по указанным
+    фильтрам. Возвращает {task_id: dict(queue_position, wait_reason, ready)}.
 
-    Ровно два SELECT (running + кандидаты) независимо от длины очереди:
+    Не более двух SELECT (running + кандидаты) независимо от длины очереди:
     колонки lock_key приезжают в тех же строках. Прежняя версия звала
     get_task на каждую строку — N+1, измерение на очереди в 500 задач
     давало ~600 запросов и ~1.2 с на каждый GET /api/tasks.
@@ -2499,15 +2501,25 @@ def admission_snapshot():
             working_dir=row["working_dir"],
         )
 
+    parallel = CONCURRENCY > 1
+    keys = {}
+
+    def _key(row):
+        identity = (row["machine"], row["herdr_target"],
+                    row["worktree"], row["working_dir"])
+        if identity not in keys:
+            keys[identity] = lock_key(_lock_view(row))
+        return keys[identity]
+
     now = datetime.now(timezone.utc).isoformat()
     snapshot = {}
     with _db._connect() as conn:
         running_keys = {
-            lock_key(_lock_view(row))
+            _key(row)
             for row in conn.execute(
                 """SELECT id, machine, herdr_target, worktree, working_dir
                    FROM tasks WHERE status = 'running'""")
-        }
+        } if parallel else set()
         rows = conn.execute(
             """SELECT t.id, t.machine, t.herdr_target, t.worktree,
                       t.working_dir,
@@ -2533,7 +2545,7 @@ def admission_snapshot():
                                  "wait_reason": "scheduled_future",
                                  "ready": False}
             continue
-        key = lock_key(task)
+        key = _key(row) if parallel else ""
         if key and key in taken:
             snapshot[task.id] = {
                 "queue_position": None,

@@ -265,9 +265,10 @@ def _attach_workflow_attribution(tasks: list) -> list:
     """Атрибуция и честная позиция для карточек задач.
 
     Принадлежность задачи к миссии (workflow_id/role из workflow_runs) и
-    позиция в очереди. Позиция — ранг СРЕДИ ГОТОВЫХ по правилам допуска
-    воркера (paused-серии, отложенные scheduled/next_run_at и занятые
-    рабочие деревья позиций не занимают); не-готовые получают wait_reason.
+    позиция в очереди. Базовый ранг учитывает paused-серии, отложенные
+    scheduled/next_run_at и, в параллельном режиме, занятые рабочие деревья.
+    Lanes, budget fairness, слоты и глобальная пауза не моделируются;
+    исключённые базовыми фильтрами задачи получают wait_reason.
     Расчёт read-only (worker.admission_snapshot), claim не меняется.
     """
     if not tasks:
@@ -283,7 +284,9 @@ def _attach_workflow_attribution(tasks: list) -> list:
             runs[row["task_id"]] = (row["workflow_id"], row["role"])
     try:
         from .worker import admission_snapshot
-        admission = admission_snapshot()
+        admission = (admission_snapshot() if any(
+            task.status in {TaskStatus.PENDING, TaskStatus.RATE_LIMITED}
+            for task in tasks) else {})
     except Exception as exc:  # noqa: BLE001 - проекция не должна ронять API
         print(f"  !! admission_snapshot недоступен: {exc}", flush=True)
         admission = {}
