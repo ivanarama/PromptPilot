@@ -149,7 +149,10 @@ def _origin_key(value: str) -> tuple[str, str, int] | None:
     https://pp.example.com:443 are one origin, another scheme or port of the
     same name is not.
     """
-    parts = urlsplit((value or "").strip())
+    try:
+        parts = urlsplit((value or "").strip())
+    except ValueError:
+        return None
     if (parts.scheme not in _DEFAULT_PORTS or not parts.hostname
             or parts.username is not None or parts.password is not None
             or parts.path not in ("", "/") or parts.query or parts.fragment):

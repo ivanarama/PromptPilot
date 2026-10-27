@@ -217,3 +217,13 @@ def test_hostname_parsing(authority, expected):
 ])
 def test_origin_parsing(value, expected):
     assert api._origin_key(value) == expected
+
+
+
+@pytest.mark.parametrize("origin", ["http://[::1", "https://[g]"])
+def test_malformed_ipv6_origin_is_refused_without_server_error(no_token, origin):
+    response = call("POST", "/api/tasks", json={"prompt": "must not run"},
+                    headers={"Origin": origin})
+
+    assert response.status_code == 403
+    assert call("GET", "/api/tasks").json() == []
