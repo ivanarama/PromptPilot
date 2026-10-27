@@ -1722,14 +1722,14 @@ def list_series() -> list:
                        GROUP BY series_id
                    )
                    SELECT 'active' AS kind, t.series_id, t.id, t.machine,
-                          t.scheduled_at, t.error, t.worktree, t.detached,
+                          t.scheduled_at, t.next_run_at, t.error, t.worktree, t.detached,
                           t.herdr_target
                    FROM tasks AS t
                    INNER JOIN picked ON picked.active_id = t.id
                    INNER JOIN task_series AS s ON s.id = t.series_id
                    UNION ALL
                    SELECT 'last' AS kind, t.series_id, t.id, t.machine,
-                          NULL AS scheduled_at, NULL AS error,
+                          NULL AS scheduled_at, NULL AS next_run_at, NULL AS error,
                           NULL AS worktree, NULL AS detached,
                           NULL AS herdr_target
                    FROM tasks AS t
@@ -1783,7 +1783,12 @@ def list_series() -> list:
                 "auto_pause_reason": auto_pause_reason if s["paused"] else None,
                 "next_task_id": active["id"] if active else None,
                 "next_status": active["status"] if active else None,
-                "next_run_at": active_detail["scheduled_at"] if active_detail else None,
+                # The worker requires both the schedule and retry deadline.
+                # Showing only scheduled_at hides a rate-limited retry entirely.
+                "next_run_at": max(
+                    (value for value in (active_detail["scheduled_at"],
+                                         active_detail["next_run_at"]) if value),
+                    key=_parse_dt, default=None) if active_detail else None,
                 "next_error": active_detail["error"] if active_detail else None,
                 "next_started_at": active["started_at"] if active else None,
                 "last_task_id": last["id"] if last else None,
