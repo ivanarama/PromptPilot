@@ -634,6 +634,10 @@ class WorkflowHumanInput(BaseModel):
     text: str = Field(min_length=1)
     expected_version: int = Field(ge=0)
     resume: bool = False
+    # What the next agent run must be told. `text` is the journal record of
+    # the decision (automation writes its own boilerplate there); only `note`
+    # is delivered into the next executor/reviewer prompt.
+    note: str = Field(default="", max_length=20000)
 
 
 class HistoricalFactStatus(str, Enum):

@@ -177,7 +177,7 @@ def test_full_manual_w1_cycle_revision_then_pass(isolated_db):
 
 def test_review_cannot_pass_with_open_blocker(isolated_db):
     workflow = create_workflow(isolated_db, slug="open-blocker")
-    started = workflows.start_workflow(workflow.id, WorkflowStartRequest(
+    workflows.start_workflow(workflow.id, WorkflowStartRequest(
         expected_version=0,
     ))
     dispatch(isolated_db, workflow.id, WorkflowRole.EXECUTOR, "execute")
@@ -234,7 +234,7 @@ def test_invalid_transitions_stale_version_and_reviewer_permissions(isolated_db)
 
 def test_round_budget_moves_control_to_human(isolated_db):
     workflow = create_workflow(isolated_db, slug="round-budget", max_rounds=1)
-    started = workflows.start_workflow(workflow.id, WorkflowStartRequest(
+    workflows.start_workflow(workflow.id, WorkflowStartRequest(
         expected_version=0,
     ))
     dispatch(isolated_db, workflow.id, WorkflowRole.EXECUTOR, "execute")

@@ -73,7 +73,7 @@ def test_review_candidate_outside_search_is_held_without_pausing_series(isolated
 
 
 def test_review_hold_requires_fresh_exact_review_candidate(isolated_db):
-    task = isolated_db.create_task(TaskCreate(prompt="Example - REVIEW", recurrence="15m"))
+    isolated_db.create_task(TaskCreate(prompt="Example - REVIEW", recurrence="15m"))
     queue = {"id": "review", "item_blockers": True}
     data = {"cache": {"complete": True, "stale": False},
             "queues": [{"id": "review", "membership_complete": True,

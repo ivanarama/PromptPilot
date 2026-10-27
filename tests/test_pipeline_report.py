@@ -64,6 +64,26 @@ def test_report_snapshot_query_uses_selected_window_plus_one_day(
     ]
 
 
+def test_period_report_shows_current_pending_deferral(isolated_db, monkeypatch):
+    profile = _profile()
+    monkeypatch.setattr(
+        pipeline_insights, "_profiles", lambda: {"example": profile})
+    task = isolated_db.create_task(TaskCreate(
+        prompt="Example - MERGE", recurrence="1h"))
+    claimed = isolated_db.get_next_runnable()
+    assert claimed.id == task.id
+    assert isolated_db.defer_task(
+        task.id, datetime.now(timezone.utc) + timedelta(minutes=10),
+        "waiting for integration REVIEW")
+
+    report = pipeline_insights.build_period_report(
+        "example", isolated_db.list_series(), hours=24)
+
+    assert report["current"]["tasks"][0]["error"] == (
+        "waiting for integration REVIEW")
+    assert report["current"]["tasks"][0]["status"] == "pending"
+
+
 def test_period_report_uses_only_local_history_and_deduplicates_attention(
         isolated_db, monkeypatch):
     profile = _profile()
