@@ -2,10 +2,12 @@
 подбор моделей с сервера (ключ не светится), создание помощника с
 коротким именем «Инструмент · Модель», уникальность имени."""
 
+import asyncio
 import json
 
+import httpx
+
 import pytest
-from fastapi.testclient import TestClient
 
 from promptpilot.api import app
 from promptpilot.provider_catalog import (
@@ -15,6 +17,16 @@ from promptpilot.provider_catalog import (
     pretty_model,
     slugify,
 )
+
+
+def _request(method, path, **kwargs):
+    async def request():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+                transport=transport, base_url="http://127.0.0.1:8420") as client:
+            return await client.request(method, path, **kwargs)
+
+    return asyncio.run(request())
 
 
 def test_catalog_entries_are_complete():
@@ -88,8 +100,7 @@ def isolated_providers(tmp_path, monkeypatch):
 
 def test_catalog_listing_marks_installed(isolated_providers, monkeypatch):
     monkeypatch.setattr("shutil.which", lambda exe: exe == "codex" and "codex.CMD" or None)
-    client = TestClient(app)
-    r = client.get("/api/provider-catalog")
+    r = _request("GET", "/api/provider-catalog")
     assert r.status_code == 200
     by_id = {it["id"]: it for it in r.json()["items"]}
     assert by_id["codex"]["installed"] is True
@@ -101,8 +112,7 @@ def test_models_fetch_openai_style_key_stays_server_side(isolated_providers, mon
     payload = {"data": [{"id": "astra-3.1-pro"}, {"id": "zeta"}, {"id": "astra-3.1-pro"}]}
     monkeypatch.setattr("urllib.request.build_opener",
                         lambda *a, **k: _FakeOpener(payload, captured))
-    client = TestClient(app)
-    r = client.post("/api/provider-catalog/codex/models",
+    r = _request("POST", "/api/provider-catalog/codex/models",
                     json={"base": "https://api.example.com/v1", "key": "sk-secret"})
     assert r.status_code == 200
     body = r.json()
@@ -117,8 +127,7 @@ def test_models_fetch_anthropic_style(isolated_providers, monkeypatch):
     payload = {"data": [{"id": "claude-sonnet-5"}]}
     monkeypatch.setattr("urllib.request.build_opener",
                         lambda *a, **k: _FakeOpener(payload, captured))
-    client = TestClient(app)
-    r = client.post("/api/provider-catalog/claude/models",
+    r = _request("POST", "/api/provider-catalog/claude/models",
                     json={"base": "https://api.anthropic.com", "key": "sk-ant"})
     assert r.status_code == 200
     assert r.json()["models"] == ["claude-sonnet-5"]
@@ -129,15 +138,13 @@ def test_models_fetch_anthropic_style(isolated_providers, monkeypatch):
 def test_models_fetch_empty_answer_is_error(isolated_providers, monkeypatch):
     monkeypatch.setattr("urllib.request.build_opener",
                         lambda *a, **k: _FakeOpener({"data": []}, {}))
-    client = TestClient(app)
-    r = client.post("/api/provider-catalog/codex/models",
+    r = _request("POST", "/api/provider-catalog/codex/models",
                     json={"base": "https://api.example.com/v1", "key": "k"})
     assert r.status_code == 502
 
 
 def test_create_provider_short_name_and_uniqueness(isolated_providers):
-    client = TestClient(app)
-    r = client.post("/api/provider-catalog/goose/create",
+    r = _request("POST", "/api/provider-catalog/goose/create",
                     json={"base": "https://z.example/v1", "key": "sk-1",
                           "model": "glm-5.3"})
     assert r.status_code == 200
@@ -152,7 +159,7 @@ def test_create_provider_short_name_and_uniqueness(isolated_providers):
     assert prov["env"]["GOOSE_PROVIDER"] == "openai"
     assert prov["env"]["OPENAI_API_KEY"] == "sk-1"
 
-    r2 = client.post("/api/provider-catalog/goose/create",
+    r2 = _request("POST", "/api/provider-catalog/goose/create",
                      json={"base": "https://z.example/v1", "key": "sk-2",
                            "model": "glm-5.3"})
     assert r2.status_code == 200
@@ -160,6 +167,5 @@ def test_create_provider_short_name_and_uniqueness(isolated_providers):
 
 
 def test_create_requires_model(isolated_providers):
-    client = TestClient(app)
-    r = client.post("/api/provider-catalog/codex/create", json={"base": "b", "key": "k"})
+    r = _request("POST", "/api/provider-catalog/codex/create", json={"base": "b", "key": "k"})
     assert r.status_code == 400
