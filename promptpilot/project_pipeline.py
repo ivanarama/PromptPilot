@@ -279,6 +279,13 @@ def load_config(path: str) -> dict:
     data.setdefault("review_lease_seconds", 7200)
     data.setdefault("target_reservation_ttl_seconds", data["review_lease_seconds"])
     data.setdefault("fallback_handoff", "legacy")
+    data.setdefault("parallel_content_review", False)
+    if not isinstance(data["parallel_content_review"], bool):
+        raise PipelineError("parallel_content_review must be a boolean")
+    if data["parallel_content_review"] and (
+            data["fallback_handoff"] != "target-v1"
+            or data["review_completion_gate"] != "target-v1"):
+        raise PipelineError("parallel_content_review requires both target-v1 gates")
     if not isinstance(data["fallback_handoff"], str) or data["fallback_handoff"] not in {"legacy", "target-v1"}:
         raise PipelineError("fallback_handoff must be legacy or target-v1")
     if not isinstance(data.get("sync_base_before_health", False), bool):
@@ -1369,7 +1376,8 @@ def _target_key(value: dict) -> tuple[str, int, str]:
 
 def _review_health_without_targets(health: dict, unavailable: set[tuple]) -> dict:
     filtered = dict(health)
-    for field in ("review_candidates", "content_review_candidates"):
+    for field in ("review_candidates", "content_review_candidates",
+                  "parallel_review_candidates"):
         values = health.get(field)
         if isinstance(values, list):
             filtered[field] = [value for value in values
@@ -1489,6 +1497,25 @@ def admission_exclusions() -> set[int]:
     return set(raw)
 
 
+def parallel_content_candidates(config: dict, health: dict) -> list[dict]:
+    """Opt-in native-only REVIEW beside an exclusively owned integration REVIEW."""
+    if not config.get("parallel_content_review", False):
+        return []
+    if (_configured_replica_count() < 2
+            or config.get("review_completion_gate") != "target-v1"
+            or config.get("fallback_handoff") != "target-v1"):
+        raise PipelineError("parallel content REVIEW requires replicated target-v1 gates")
+    from .fallback_handoff import INTEGRATION_REVIEW_STAGES
+
+    owner = health.get("integration_owner") or {}
+    if owner.get("stage") not in INTEGRATION_REVIEW_STAGES:
+        return []
+    candidates = health.get("parallel_review_candidates")
+    if not isinstance(candidates, list):
+        raise PipelineError("parallel content REVIEW requires a checker allowlist")
+    return candidates
+
+
 def next_review(gh: GitHub, config: dict, *, config_path: str | None = None) -> dict:
     health = run_health(config, config_path=config_path)
     if config.get("fallback_handoff") == "target-v1":
@@ -1498,11 +1525,14 @@ def next_review(gh: GitHub, config: dict, *, config_path: str | None = None) -> 
     if health.get("state") == "red":
         return {"action": "fallback", "reason": "health check is red"}
     candidates = health.get("review_candidates") or []
+    parallel = parallel_content_candidates(config, health)
     excluded = admission_exclusions()
     owner = health.get("integration_owner") or {}
     if candidates and candidates[0].get("stage") != "review" and candidates[0].get("number") in excluded:
-        return {"action": "wait", "reason": "integration target awaits human resolution",
-                "number": candidates[0]["number"]}
+        if not parallel:
+            return {"action": "wait", "reason": "integration target awaits human resolution",
+                    "number": candidates[0]["number"]}
+        candidates = []
     # Ordinary content reviews are independent. Never skip an owner in order
     # to begin the next integration target behind its single-flight barrier.
     unavailable = {_target_key(item) for item in candidates
@@ -1511,6 +1541,9 @@ def next_review(gh: GitHub, config: dict, *, config_path: str | None = None) -> 
     if unavailable:
         health = _review_health_without_targets(health, unavailable)
         candidates = health.get("review_candidates") or []
+        parallel = parallel_content_candidates(config, health)
+    parallel = [item for item in parallel if item.get("number") not in excluded]
+    candidates = candidates + parallel
     if not candidates:
         return {"action": "empty", "verdict": "ПУСТО", "reason": review_empty_reason(health)}
     item, reservation, election_health = _elect_review_candidate(
@@ -1523,6 +1556,8 @@ def next_review(gh: GitHub, config: dict, *, config_path: str | None = None) -> 
     replica_count = _configured_replica_count()
     if replica_count > 1 and reservation is None:
         raise PipelineError("replicated REVIEW election did not reserve its target")
+    parallel_selected = any(_target_key(item) == _target_key(selected)
+                            for selected in parallel)
     if item.get("stage") == "pre-review-validation":
         if config.get("fallback_handoff") != "target-v1":
             raise PipelineError(
@@ -1545,6 +1580,8 @@ def next_review(gh: GitHub, config: dict, *, config_path: str | None = None) -> 
             raise PipelineError("health election did not prove the exact content target")
         return {"action": "fallback", "reason": "health election did not prove the exact content target"}
     if int(item.get("review_depth", 0)) >= 2:
+        if parallel_selected:
+            raise PipelineError("parallel content REVIEW cannot use full-skill fallback")
         return fallback_target(
             config, election_health, "review", item,
             "third review round requires human-escalation rules",
@@ -1577,6 +1614,8 @@ def next_review(gh: GitHub, config: dict, *, config_path: str | None = None) -> 
     try:
         content_review_target_gate(snapshot, config, lease)
     except PipelineError as exc:
+        if parallel_selected:
+            return {"action": "wait", "reason": str(exc), "target": item}
         if config.get("fallback_handoff") == "target-v1":
             return fallback_target(
                 config, election_health, "review", item, str(exc),
