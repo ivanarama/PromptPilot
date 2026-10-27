@@ -2785,7 +2785,7 @@ function aggregateDiagnosticFindings(findings) {
 
 function diagnosticFindingMessage(finding) {
   const messages = {
-    single_flight_barrier: 'Интеграционная полоса занята этим PR; обычное содержательное ревью других PR продолжает работать.',
+    single_flight_barrier: 'Слияние других PR ждёт завершения интеграции; обычное ревью идёт параллельно только при разрешённом маршруте.',
     legacy_ship_waiting_review_validation: 'Переход со старого формата: очередь безопасно перепроверит эти PR перед слиянием.',
     base_sync_base_advanced: 'Ветка main обновилась после подготовки PR; перед слиянием нужна повторная синхронизация.',
     ship_waiting_initial_review: 'Разрешение ship сохранено; этот HEAD сначала пройдёт обычное содержательное ревью.',
@@ -3034,7 +3034,7 @@ async function loadPipelineReport(profile, hours=24, refresh=false) {
       <div class="pipeline-metric"><div class="pipeline-metric-label">Влито PR / закрыто issues</div><div class="pipeline-metric-value">${deliveryExact ? `${pipelineReportNumber(merged.length)} / ${pipelineReportNumber(closed.length)}` : 'Ещё не проверено'}</div><div class="pipeline-metric-note">${deliveryExact ? `всего событий: ${pipelineReportNumber(delivered)}` : 'Нажмите «Уточнить результат в GitHub». Это не ноль выполненных работ.'}</div></div>
       ${categories}
     </div>
-    <div class="pipeline-flow-row"><b>Итоги запусков</b><div class="pipeline-flow-bar" role="img" aria-label="${escAttr(reportFlow.total ? reportFlowSummary : 'Завершённых запусков нет')}">${reportFlowSegments}</div><span class="num">${reportFlow.total} запусков</span></div>
+    <div class="pipeline-flow-row"><b>Итоги запусков</b><div class="pipeline-flow-bar" role="img" aria-label="${escAttr(reportFlow.total ? reportFlowSummary : 'Завершённых запусков нет')}">${reportFlowSegments}</div><span class="num">${runsLabel(reportFlow.total)}</span></div>
     <div class="pipeline-flow-legend"><span style="--legend-color:var(--green)">готово</span><span style="--legend-color:var(--muted)">пусто</span><span style="--legend-color:var(--text2)">без изменений</span><span style="--legend-color:var(--accent)">перевыбор</span><span style="--legend-color:var(--yellow)">нужен человек / безопасный отказ</span><span style="--legend-color:var(--red)">ошибка</span></div>
     <div class="pipeline-report-meta">Зелёный сегмент означает результат этапа «готово», а не влитый PR. «Пусто» и ошибки сохраняются в локальной истории; ожидание WIP или API показано ниже как причина, а не как завершённый запуск.</div>
     <div class="pipeline-report-meta">Закрытые issues и влитые PR — отдельные события, не сумма выполненных задач. Категории относятся только к влитым PR; без подтверждённой классификации результат не записывается в продукт.</div>
@@ -3106,7 +3106,8 @@ function pipelineWaitReasons(data) {
   }
   const owner = (data.diagnostics && data.diagnostics.integration_owner)
     || (data.current && data.current.integration_owner);
-  if (owner && owner.stage === 'integration-review' && !data.cache?.stale && data.coverage?.fresh !== false && !waits.some(wait => wait.id === 'merge')) {
+  const reviewStages = ['integration-review', 'legacy-integration-review'];
+  if (owner && reviewStages.includes(owner.stage) && !data.cache?.stale && data.coverage?.fresh !== false && !waits.some(wait => wait.id === 'merge')) {
     waits.push({id:'merge', title:'Слияние', reason:`PR #${owner.number} ожидает независимого ревью нового HEAD`});
   }
   return waits;
@@ -3128,6 +3129,16 @@ function pipelineRunBreakdown(queue) {
   const total = Math.max(known, count('runs'));
   if (total > known) parts.push({key:'other', label:'Другой итог', count:total - known});
   return {total, parts};
+}
+
+function runsLabel(count) {
+  const n = Math.abs(Number(count) || 0);
+  const tens = n % 100;
+  const last = n % 10;
+  const word = tens >= 11 && tens <= 14 ? 'запусков'
+    : last === 1 ? 'запуск'
+    : last >= 2 && last <= 4 ? 'запуска' : 'запусков';
+  return `${n} ${word}`;
 }
 
 async function loadPipelineInsights(profile, refresh=false) {
@@ -3239,7 +3250,7 @@ async function loadPipelineInsights(profile, refresh=false) {
       const segments = parts.filter(part => part.count).map(part =>
         `<span class="${part.key}" style="width:${(100 * part.count / total).toFixed(2)}%" title="${escAttr(part.label)}: ${part.count}"></span>`).join('');
       const summary = parts.filter(part => part.count).map(part => `${part.label} ${part.count}`).join(', ');
-      return `<div class="pipeline-flow-row"><b>${esc(queue.title)}</b><div class="pipeline-flow-bar" role="img" aria-label="${escAttr(total ? summary : 'Завершённых запусков нет')}">${segments}</div><span class="num">${total ? `${total} запусков` : 'нет запусков'}</span></div>`;
+      return `<div class="pipeline-flow-row"><b>${esc(queue.title)}</b><div class="pipeline-flow-bar" role="img" aria-label="${escAttr(total ? summary : 'Завершённых запусков нет')}">${segments}</div><span class="num">${total ? runsLabel(total) : 'нет запусков'}</span></div>`;
     }).join('');
     const diagnostics = data.diagnostics;
     const runtime = data.runtime || {};
@@ -3259,7 +3270,7 @@ async function loadPipelineInsights(profile, refresh=false) {
       const lastLine = last && last.at
         ? `последний #${last.task_id}: ${timeAgo(last.at)} · ${last.verdict || last.status}${lastTokens}`
         : 'завершённых запусков нет';
-      const stageLine = `5 ч: ${stageRuns.runs || 0} запусков · действий ${stageRuns.ready || 0} · холостых ${stageRuns.no_change || 0} · фактический выход ${perHour(throughputRateByQueue[q.id])}`;
+      const stageLine = `5 ч: ${runsLabel(stageRuns.runs || 0)} · действий ${stageRuns.ready || 0} · холостых ${stageRuns.no_change || 0} · фактический выход ${perHour(throughputRateByQueue[q.id])}`;
       const route = q.execution || {configured:'skill',effective:'skill'};
       const routeLine = `маршрут: ${route.configured}${route.configured!==route.effective ? ` → ${route.effective}` : ''}${route.reason && route.effective!=='tool' ? ` · ${route.reason}` : ''}`;
       const wake = q.wake;

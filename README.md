@@ -990,6 +990,7 @@ admission-эстафету навсегда.
 {
   "review_completion_gate": "target-v1",
   "fallback_handoff": "target-v1",
+  "parallel_content_review": false,
   "review_lease_seconds": 7200,
   "target_reservation_ttl_seconds": 7200
 }
@@ -1008,6 +1009,19 @@ startup recovery сначала по сохранённому ownership descript
 освобождает fence. Если остановку доказать нельзя, задача и PR остаются в
 quarantine; вручную удалять такую резервацию небезопасно. Резервация — только
 локальный scheduling fence и не заменяет GraphQL/HEAD/timeline/CAS-гейты.
+
+`parallel_content_review: true` — отдельный opt-in для двух REVIEW-реплик.
+Если checker публикует `parallel_review_candidates`, свободная реплика может
+взять обычный PR, пока первая проверяет интеграционную дельту. В этом списке
+допустимы только обычные REVIEW до третьего круга: полный skill/fallback и
+следующий интеграционный PR по-прежнему ждут владельца. Каждый параллельный PR
+получает свою атомарную резервацию PR/HEAD и подписанный target-v1 lease;
+перед публикацией повторно проверяется его собственная timeline. Старый checker
+или отсутствие второй реплики закрывают opt-in без GitHub-мутаций. MERGE остаётся
+single-flight и не берёт PR из этого списка.
+После включения opt-in у REVIEW-очереди `wake_when.field` можно переключить
+с `review_candidates` на `review_dispatch_candidates`: это только сигнал
+пробуждения для владельца и свободной реплики, а не разрешение на запись.
 
 `run_now`, `wake_when`, `wake_after_success` и `adaptive_cadence` применяются ко
 всем совпавшим репликам. Дашборд показывает каждую серию, её каталог и состояние,
@@ -1213,7 +1227,8 @@ PromptPilot по умолчанию переиспользует результ�
 намеренно не исключает stale-метку `reviewed`, а checker уже различает новый
 HEAD, актуально проверенный HEAD и интеграционный handoff. Для REVIEW используйте
 `review_backlog` (вся ожидающая работа), а `wake_when` оставьте на
-`review_candidates` (только исполняемая сейчас работа). Для MERGE аналогично:
+`review_candidates` (только исполняемая сейчас работа) либо, после включения
+параллельного opt-in, на `review_dispatch_candidates`. Для MERGE аналогично:
 `merge_candidates` показывает весь backlog, а `merge_executable` содержит только
 PR, который разрешено сливать прямо сейчас с учётом single-flight barrier.
 
@@ -1222,8 +1237,11 @@ HEAD и после нового push может остаться. Канонич
 актуальное ревью (`reviewed_waiting_ship`) от устаревшей метки и возвращает новый
 HEAD в `review_candidates`. Для двухполосной схемы он также публикует
 `content_review_candidates`, `integration_owner`, `merge_candidates` и
-`merge_executable`: single-flight сериализует интеграцию, но не останавливает
-содержательные ревью. Уже взятый содержательный REVIEW остаётся валиден, если
+`merge_executable`: single-flight сериализует интеграцию. Пока владелец в
+интеграционном REVIEW, обычные PR остаются backlog; opt-in
+`parallel_content_review` позволяет второй реплике брать только явно указанные
+checker'ом `parallel_review_candidates`. Уже взятый содержательный REVIEW
+остаётся валиден, если
 параллельно появился или сменил состояние несвязанный `integration_owner`;
 завершение всё равно проверяет собственные HEAD и timeline lease этого PR.
 
