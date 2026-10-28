@@ -225,6 +225,35 @@ class WorkflowRoleConfig(BaseModel):
     machine: Optional[str] = None
     rights: Optional[TaskRights] = None
     prompt_template: str = ""
+    # Окно ДИСПАТЧА роли: [{"from":"22:00","to":"06:00","tz_offset_hours":0,
+    # "days":"weekdays"}] (по умолчанию 0 = UTC). Вне окна авто-диспетчер
+    # ждёт и пишет событие review.deferred — вместо ручного тоггла
+    # auto_dispatch_reviewer в часы пиковой нагрузки.
+    dispatch_window: Optional[list[dict]] = None
+
+    @field_validator("dispatch_window")
+    @classmethod
+    def validate_dispatch_windows(cls, windows):
+        import re
+        names = {"mon", "tue", "wed", "thu", "fri", "sat", "sun"}
+        for window in windows or []:
+            if set(window) - {"from", "to", "tz_offset_hours", "days"}:
+                raise ValueError("unknown dispatch window field")
+            for key in ("from", "to"):
+                if not isinstance(window.get(key), str) or not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", window[key]):
+                    raise ValueError("dispatch window time must be HH:MM (00:00..23:59)")
+            offset = window.get("tz_offset_hours", 0)
+            if type(offset) is not int or not -23 <= offset <= 23:
+                raise ValueError("dispatch window timezone offset must be an integer between -23 and 23")
+            days = window.get("days")
+            if days is None:
+                continue
+            if isinstance(days, str) and days.strip().lower() in {"all", "weekdays", "будни", "будни (пн–пт)", "weekend", "выходные", "выходные (сб–вс)"}:
+                continue
+            if isinstance(days, list) and days and all(isinstance(day, str) and day.lower() in names for day in days):
+                continue
+            raise ValueError("dispatch window days must name valid weekdays")
+        return windows
 
 
 class WorkflowRolesConfig(BaseModel):
@@ -342,11 +371,20 @@ class WorkflowCreate(BaseModel):
     repository_path: str = Field(min_length=1)
     candidate_branch: str = Field(min_length=1)
     config: dict[str, Any] = Field(default_factory=normalize_workflow_config)
+    # Готовый план дежурного: миссия создаётся сразу в awaiting_plan_approval,
+    # минуя запуск планировщика; невалидный план не занимает slug (атомарно).
+    plan: Optional[list["WorkflowStageSpec"]] = Field(default=None, min_length=1)
 
     @field_validator("config", mode="before")
     @classmethod
     def validate_config(cls, value):
         return normalize_workflow_config(value)
+
+    @model_validator(mode="after")
+    def plan_within_configured_limit(self):
+        if self.plan is not None and len(self.plan) > self.config["planning"]["max_stages"]:
+            raise ValueError("plan exceeds planning.max_stages")
+        return self
 
 
 class WorkflowUpdate(BaseModel):
@@ -361,6 +399,10 @@ class WorkflowUpdate(BaseModel):
     repository_path: Optional[str] = Field(default=None, min_length=1)
     candidate_branch: Optional[str] = Field(default=None, min_length=1)
     config: Optional[dict[str, Any]] = None
+    # Явная семантика правки КОНФИГА терминальной миссии: разрешает менять
+    # ТОЛЬКО config (на выполнение терминальной миссии не влияет —
+    # история/шаблоны/гигиена), иначе frozen.
+    allow_terminal_config: bool = False
     expected_version: int = Field(ge=0)
 
     @field_validator("config", mode="before")
