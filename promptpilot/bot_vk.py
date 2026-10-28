@@ -978,12 +978,8 @@ class _NotifyLoop(threading.Thread):
         return True
 
     def _load_last_seq(self) -> int:
-        seq = 0
-        for workflow in db.list_workflows():
-            events = _events_tail(workflow.id, 1)
-            for event in events:
-                seq = max(seq, int(event.seq or 0))
-        return seq
+        latest = db.list_workflow_notification_events(tail=True, limit=1)
+        return int(latest[0][1].seq) if latest else 0
 
     def run(self) -> None:
         while True:
@@ -1001,21 +997,10 @@ class _NotifyLoop(threading.Thread):
             self._check_processes()
             self._check_stands()
         self._maybe_morning_digest()
-        pending = []
-        ceilings = []
-        floor = self._last_seq
-        for workflow in db.list_workflows():
-            events = db.list_workflow_events(
-                workflow.id, after_seq=floor, limit=100)
-            if len(events) == 100:
-                ceilings.append(events[-1].seq)
-            for event in events:
-                pending.append((int(event.seq), workflow.slug, event))
-        # Full pages may hide earlier events than another workflow's tail.
-        ceiling = min(ceilings) if ceilings else float("inf")
-        for seq, slug, event in sorted(pending, key=lambda item: item[0]):
-            if seq > ceiling:
-                break
+        # One SQL snapshot of the global stream. Enumerating workflows first
+        # can omit a newly created workflow or older entries beyond LIMIT50.
+        for slug, event in db.list_workflow_notification_events(after_seq=self._last_seq):
+            seq = int(event.seq)
             if event.event_type in NOTIFY_EVENT_TYPES:
                 title, needs_actions = _RU_EVENTS.get(
                     event.event_type, (event.event_type, False))

@@ -5447,6 +5447,20 @@ def list_workflow_artifacts(workflow_id: str,
         return [_row_to_workflow_artifact(row) for row in rows]
 
 
+def list_workflow_notification_events(after_seq: int = 0, limit: int = 500,
+                                      *, tail: bool = False):
+    """One global event snapshot, including workflows beyond UI list limits."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT e.*, w.slug AS workflow_slug FROM workflow_events e "
+            "JOIN workflows w ON w.id=e.workflow_id WHERE e.seq>? ORDER BY e.seq "
+            + ("DESC" if tail else "ASC") + " LIMIT ?", (after_seq, limit),
+        ).fetchall()
+    if tail:
+        rows.reverse()
+    return [(row["workflow_slug"], _row_to_workflow_event(row)) for row in rows]
+
+
 def list_workflow_events(workflow_id: str, after_seq: int = 0,
                          limit: int = 200) -> list[WorkflowEventInDB]:
     with _connect() as conn:

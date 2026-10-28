@@ -206,6 +206,30 @@ def test_revoked_peer_receives_no_autonomous_private_data(isolated_db, tmp_path,
     assert fake.sent and all(message[0] == 8 for message in fake.sent)
 
 
+def test_notifications_use_one_global_stream_beyond_workflow_list_limits(isolated_db, tmp_path, monkeypatch):
+    from promptpilot.models import WorkflowEventCreate
+    fake = _FakeTransport()
+    loop = bot_vk._NotifyLoop(fake, {7: None})
+    for i in range(61):
+        workflow = isolated_db.create_workflow(WorkflowCreate(
+            slug=f"global-{i}", objective="goal", repository_path=str(tmp_path),
+            candidate_branch="b", config={}))
+        isolated_db.append_workflow_event(WorkflowEventCreate(
+            workflow_id=workflow.id, round_id=None, run_id=None,
+            event_type="cascade.open_blocker", idempotency_key=f"global-{i}",
+            payload={"reason": f"unique-{i}"}))
+    # The old per-workflow reads are intentionally unavailable. A newly
+    # created workflow still appears in the very next global snapshot.
+    monkeypatch.setattr(isolated_db, "list_workflow_events", lambda *a, **k: pytest.fail("partial stream"))
+    monkeypatch.setattr(bot_vk, "_reply_keyboard", lambda **kwargs: None)
+    loop._drain()
+    assert len(fake.sent) == 61
+    assert any("global-0\n" in message[1] for message in fake.sent)
+    assert any("global-60\n" in message[1] for message in fake.sent)
+    loop._drain()
+    assert len(fake.sent) == 61
+
+
 def test_transport_keyboard_json(isolated_db, tmp_path):
     kb = bot_vk.main_keyboard()
     payload = json.dumps({"inline": False, "buttons": kb}, ensure_ascii=False)
