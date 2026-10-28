@@ -381,7 +381,15 @@ MIGRATIONS = [
         task_timeout INTEGER, paused INTEGER NOT NULL DEFAULT 0, ended_at TEXT,
         created_at TEXT NOT NULL, updated_at TEXT NOT NULL
     )""",
-    "CREATE INDEX IF NOT EXISTS idx_tasks_series ON tasks(series_id, id)",
+    # Schedule refreshes scan narrow health columns for every occurrence. A
+    # covering index avoids visiting task rows containing large result payloads.
+    "CREATE INDEX IF NOT EXISTS idx_tasks_series_summary ON tasks(series_id, id, status, started_at, completed_at, verdict)",
+    # The covering index also supports every lookup using the older
+    # idx_tasks_series(series_id, id) prefix. Keeping both can make SQLite
+    # prefer the narrow, table-reading scan, so the old one is only dropped:
+    # migrations replay on every start, and creating it here first would
+    # rebuild it over the whole task table each time just to drop it again.
+    "DROP INDEX IF EXISTS idx_tasks_series",
     """CREATE TABLE IF NOT EXISTS pipeline_snapshots (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         profile_id TEXT NOT NULL, repository TEXT NOT NULL,
@@ -1724,14 +1732,14 @@ def list_series() -> list:
                        GROUP BY series_id
                    )
                    SELECT 'active' AS kind, t.series_id, t.id, t.machine,
-                          t.scheduled_at, t.error, t.worktree, t.detached,
+                          t.scheduled_at, t.next_run_at, t.error, t.worktree, t.detached,
                           t.herdr_target
                    FROM tasks AS t
                    INNER JOIN picked ON picked.active_id = t.id
                    INNER JOIN task_series AS s ON s.id = t.series_id
                    UNION ALL
                    SELECT 'last' AS kind, t.series_id, t.id, t.machine,
-                          NULL AS scheduled_at, NULL AS error,
+                          NULL AS scheduled_at, NULL AS next_run_at, NULL AS error,
                           NULL AS worktree, NULL AS detached,
                           NULL AS herdr_target
                    FROM tasks AS t
@@ -1785,7 +1793,12 @@ def list_series() -> list:
                 "auto_pause_reason": auto_pause_reason if s["paused"] else None,
                 "next_task_id": active["id"] if active else None,
                 "next_status": active["status"] if active else None,
-                "next_run_at": active_detail["scheduled_at"] if active_detail else None,
+                # The worker requires both the schedule and retry deadline.
+                # Showing only scheduled_at hides a rate-limited retry entirely.
+                "next_run_at": max(
+                    (value for value in (active_detail["scheduled_at"],
+                                         active_detail["next_run_at"]) if value),
+                    key=_parse_dt, default=None) if active_detail else None,
                 "next_error": active_detail["error"] if active_detail else None,
                 "next_started_at": active["started_at"] if active else None,
                 "last_task_id": last["id"] if last else None,
@@ -3191,11 +3204,17 @@ def pipeline_series_activity(series_ids: list[int]) -> dict[int, dict]:
     marks = ",".join("?" for _ in ids)
     with _connect() as conn:
         rows = conn.execute(
-            f"""SELECT id, series_id, status, verdict, started_at, completed_at,
-                       result
-                FROM tasks WHERE series_id IN ({marks})
-                  AND status IN ('completed', 'failed', 'cancelled')
-                ORDER BY id DESC""",
+            f"""WITH latest AS (
+                    SELECT series_id, MAX(id) AS id
+                    FROM tasks WHERE series_id IN ({marks})
+                      AND status IN ('completed', 'failed', 'cancelled')
+                    GROUP BY series_id
+                )
+                SELECT t.id, t.series_id, t.status, t.verdict,
+                       t.started_at, t.completed_at, t.result
+                FROM tasks AS t
+                INNER JOIN latest ON latest.id = t.id
+                ORDER BY t.id DESC""",
             ids,
         ).fetchall()
     activity = {}
@@ -5376,7 +5395,16 @@ def save_memory(workflow_id: str, name: str, content: str,
     if len(content.encode("utf-8")) > MEMORY_MAX_BYTES:
         return False, (f"заметка {name} больше {MEMORY_MAX_BYTES} байт — "
                        f"сократи или раздели на несколько заметок")
-    with _connect() as conn:
+    with _connect(immediate=True) as conn:
+        if scope_stage:
+            rows = conn.execute(
+                """SELECT id FROM workflow_stages WHERE workflow_id=?
+                   AND (id=? OR code=?) AND status NOT IN ('completed','skipped')""",
+                (workflow_id, scope_stage, scope_stage),
+            ).fetchall()
+            if len(rows) != 1:
+                return False, "scope_stage должен указывать на открытый этап этой миссии"
+            scope_stage = rows[0]["id"]
         conn.execute(
             """INSERT INTO workflow_memory (workflow_id, name, content, updated_at, updated_by_task, scope_stage)
                VALUES (?, ?, ?, ?, ?, ?)

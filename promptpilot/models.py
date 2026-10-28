@@ -92,6 +92,14 @@ class TaskInDB(BaseModel):
     series_id: Optional[int] = None
     series_title: Optional[str] = None
     series_paused: bool = False
+    # Атрибуция задач (очередь/миссия): None = задача вне воркфлоу / не в ожидании.
+    workflow_id: Optional[str] = None
+    role: Optional[str] = None
+    # Базовый ранг по времени, состоянию серии и параллельным lock_key.
+    # Lanes, fairness, слоты и глобальная пауза не моделируются. Исключённые
+    # задачи несут wait_reason; у кандидатов базового допуска он None.
+    queue_position: Optional[int] = None
+    wait_reason: Optional[str] = None
 
 
 class Stats(BaseModel):
@@ -207,6 +215,33 @@ class WorkflowRoleConfig(BaseModel):
     # активное окно задаёт провайдера роли, вне окон — фолбэк на provider
     provider_windows: Optional[list[dict]] = None
     prompt_template: str = ""
+
+    @field_validator("provider_windows")
+    @classmethod
+    def valid_provider_windows(cls, windows):
+        import re
+        day_names = {"mon", "tue", "wed", "thu", "fri", "sat", "sun"}
+        for item in windows or []:
+            if set(item) - {"provider", "window"} or not isinstance(item.get("provider"), str) or not item["provider"].strip():
+                raise ValueError("provider_windows requires a provider and window")
+            window = item.get("window")
+            if not isinstance(window, dict) or set(window) - {"from", "to", "tz_offset_hours", "days"}:
+                raise ValueError("invalid provider window fields")
+            for key in ("from", "to"):
+                if not isinstance(window.get(key), str) or not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", window[key]):
+                    raise ValueError("provider window time must be HH:MM (00:00..23:59)")
+            offset = window.get("tz_offset_hours", 3)
+            if type(offset) is not int or not -23 <= offset <= 23:
+                raise ValueError("tz_offset_hours must be an integer between -23 and 23")
+            days = window.get("days")
+            if days is None:
+                continue
+            if isinstance(days, str) and days.strip().lower() in {"all", "weekdays", "будни", "будни (пн–пт)", "weekend", "выходные", "выходные (сб–вс)"}:
+                continue
+            if isinstance(days, list) and days and all(isinstance(d, str) and d.lower() in day_names for d in days):
+                continue
+            raise ValueError("provider window days must name valid weekdays")
+        return windows
 
 
 class WorkflowRolesConfig(BaseModel):

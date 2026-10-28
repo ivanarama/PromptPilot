@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
 """Ядро: провайдеры-по-расписанию, память миссии, tail-пейджинг событий."""
 from datetime import datetime, timezone
+import asyncio
+import httpx
+import pytest
 
-from promptpilot import db, workflows
-from promptpilot.models import WorkflowCreate, WorkflowEventCreate
+from promptpilot import api, db, workflows
+from promptpilot.models import WorkflowCreate, WorkflowEventCreate, WorkflowPlanDispatch, WorkflowStartRequest, TaskStatus
 
 
 def _wf(db, tmp_path, config=None):
@@ -33,6 +36,58 @@ def test_resolve_role_provider_windows(isolated_db, tmp_path):
 def test_resolve_role_provider_no_windows_fallback(isolated_db, tmp_path):
     workflow = _wf(isolated_db, tmp_path, {"roles": {"executor": {"provider": "p1"}}})
     assert workflows.resolve_role_provider(workflow, "executor") == "p1"
+
+
+@pytest.mark.parametrize("role", ["executor", "reviewer", "planner"])
+def test_actual_dispatch_selects_each_windows_own_timezone(isolated_db, tmp_path, monkeypatch, role):
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 10, 5, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(workflows, "datetime", Clock)
+    windows = [
+        {"provider": "inactive", "window": {"from": "00:00", "to": "01:00", "tz_offset_hours": 0}},
+        {"provider": "selected", "window": {"from": "14:00", "to": "16:00", "tz_offset_hours": 3}},
+    ]
+    config = {"automation": {"enabled": True}, "roles": {role: {"provider": "fallback", "provider_windows": windows}}}
+    workflow = _wf(isolated_db, tmp_path, config)
+    if role == "planner":
+        workflows.dispatch_planner(workflow.id, WorkflowPlanDispatch(expected_version=0))
+    else:
+        workflows.start_workflow(workflow.id, WorkflowStartRequest(expected_version=0))
+        workflows.advance_workflow(workflow.id)
+        if role == "reviewer":
+            executor = isolated_db.get_next_runnable()
+            workflows.sync_task(executor.id)
+            isolated_db.mark_completed(executor.id, "done", exit_code=0)
+            isolated_db.set_verdict(executor.id, "ГОТОВО")
+            workflows.sync_task(executor.id)
+            workflows.advance_linked_task(executor.id)
+    tasks = isolated_db.list_tasks(status=TaskStatus.PENDING)
+    assert len(tasks) == 1 and tasks[0].provider == "selected"
+
+
+@pytest.mark.parametrize("bad", [
+    {"from": "aa:bb"}, {"from": "25:00"}, {"to": "26:00"},
+    {"from": "12:60"}, {"days": ["bogus"]}, {"days": []},
+    {"tz_offset_hours": "3"}, {"tz_offset_hours": True}, {"tz_offset_hours": 24},
+])
+def test_invalid_windows_are_rejected_by_http_before_persistence(isolated_db, tmp_path, bad):
+    window = {"from": "01:00", "to": "02:00", **bad}
+    async def request():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=api.app), base_url="http://127.0.0.1:8420") as client:
+            return await client.post("/api/workflows", json={"slug": "invalid-window", "objective": "x", "repository_path": str(tmp_path), "candidate_branch": "main", "config": {"roles": {"executor": {"provider_windows": [{"provider": "p", "window": window}]}}}})
+    assert asyncio.run(request()).status_code == 422
+    assert isolated_db.list_workflows() == []
+
+
+def test_overnight_window_uses_start_weekday_with_its_own_offset(isolated_db, tmp_path):
+    config = {"roles": {"executor": {"provider": "fallback", "provider_windows": [
+        {"provider": "friday", "window": {"from": "22:00", "to": "04:00", "tz_offset_hours": 3, "days": ["fri"]}},
+    ]}}}
+    workflow = _wf(isolated_db, tmp_path, config)
+    # Saturday 02:00 at UTC+3 belongs to the Friday night window.
+    assert workflows.resolve_role_provider(workflow, "executor", datetime(2026, 10, 9, 23, tzinfo=timezone.utc)) == "friday"
 
 
 def test_memory_save_list_delete_roundtrip(isolated_db, tmp_path):
