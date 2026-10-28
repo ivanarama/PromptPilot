@@ -9,6 +9,7 @@ queue task.
 
 import asyncio
 import json
+import subprocess
 
 import httpx
 import pytest
@@ -26,14 +27,16 @@ from promptpilot.models import (
 )
 
 
-def config(auto_dispatch_executor=True):
+def config(auto_dispatch_executor=True, stage_checkpoint=False, allow_editing_approved_plan=False):
     return {
         "planning": {"enabled": True, "require_approval": True, "max_stages": 10,
-                     "max_revisions_per_stage": 3},
-        "automation": {"enabled": True, "auto_dispatch_executor": auto_dispatch_executor},
+                     "max_revisions_per_stage": 3,
+                     "allow_editing_approved_plan": allow_editing_approved_plan},
+        "automation": {"enabled": True, "auto_dispatch_executor": auto_dispatch_executor,
+                       "stage_checkpoint": stage_checkpoint},
         "roles": {"planner": {"provider": None}, "executor": {"provider": None},
                   "reviewer": {"provider": None}},
-        "gate": {"commands": []},
+        "gate": {"enabled": False, "commands": []},
         "limits": {"max_rounds": 10},
     }
 
@@ -62,10 +65,10 @@ RESOLVED = (
 )
 
 
-def planned(isolated_db, stages, **kwargs):
+def planned(isolated_db, stages, *, repository_path=None, **kwargs):
     workflow = isolated_db.create_workflow(WorkflowCreate(
         slug="external", objective="Выбрать библиотеку и встроить её",
-        repository_path=str(isolated_db.DB_DIR), candidate_branch="feature/lib",
+        repository_path=repository_path or str(isolated_db.DB_DIR), candidate_branch="feature/lib",
         config=config(**kwargs)))
     workflows.dispatch_planner(workflow.id, workflows.WorkflowPlanDispatch(
         expected_version=workflow.state_version))
@@ -95,8 +98,11 @@ THREE_STAGES = [
 
 def submit(workflow_id, text, **kwargs):
     workflow = workflows.db.get_workflow(workflow_id)
+    assignment = workflows.external_assignment(workflow_id)
     submitted = workflows.submit_external_result(workflow_id, WorkflowExternalResult(
-        expected_version=workflow.state_version, result=text, **kwargs))
+        expected_version=workflow.state_version, result=text,
+        run_id=assignment.run_id if assignment else "none",
+        input_sha256=assignment.input_sha256 if assignment else "0" * 64, **kwargs))
     return workflows.advance_workflow(submitted.id)
 
 
@@ -179,7 +185,7 @@ def test_result_is_refused_when_nothing_waits(isolated_db):
     stale = isolated_db.get_workflow(workflow.id).state_version - 1
     with pytest.raises(isolated_db.WorkflowConflictError, match="version"):
         workflows.submit_external_result(workflow.id, WorkflowExternalResult(
-            expected_version=stale, result="x"))
+            expected_version=stale, run_id="stale-run", input_sha256="0" * 64, result="x"))
 
 
 def test_cancel_closes_the_open_assignment(isolated_db):
@@ -234,7 +240,9 @@ def test_api_hands_out_and_takes_in(isolated_db):
 
     assignment = call("GET", f"/api/workflows/{workflow.id}/external")
     submitted = call("POST", f"/api/workflows/{workflow.id}/external-result",
-                     json={"expected_version": current.state_version, "result": "готово",
+                     json={"expected_version": current.state_version,
+                           "run_id": assignment.json()["run_id"],
+                           "input_sha256": assignment.json()["input_sha256"], "result": "готово",
                            "performer": "API"})
     missing = call("GET", "/api/workflows/nope/external")
 
@@ -251,8 +259,94 @@ def test_cli_prints_the_assignment_and_submits(isolated_db, tmp_path):
     runner = CliRunner()
 
     shown = runner.invoke(cli, ["workflow", "external", workflow.id])
-    submitted = runner.invoke(cli, ["workflow", "submit", workflow.id, "-f", str(result_file),
+    assignment = runner.invoke(cli, ["workflow", "external", workflow.id, "--json"])
+    assignment_file = tmp_path / "assignment.json"
+    assignment_file.write_text(assignment.output, encoding="utf-8")
+    submitted = runner.invoke(cli, ["workflow", "submit", workflow.id, "--assignment", str(assignment_file), "-f", str(result_file),
                                     "--performer", "cli"])
 
     assert shown.exit_code == 0 and "Сравнить три библиотеки" in shown.output
     assert submitted.exit_code == 0 and "reviewing" in submitted.output
+
+
+@pytest.mark.parametrize("checkpoint", [False, True])
+@pytest.mark.parametrize("dirty", [False, True])
+def test_external_text_in_git_accepts_review_without_committing_files(isolated_db, tmp_path, checkpoint, dirty):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    def git(*args):
+        return subprocess.run(["git", "-C", str(repo), *args], capture_output=True,
+                              text=True, check=True).stdout.strip()
+    git("init")
+    (repo / "base.txt").write_text("base", encoding="utf-8")
+    git("add", "base.txt")
+    git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "base")
+    original = git("rev-parse", "HEAD")
+    if dirty:
+        (repo / "base.txt").write_text("operator work", encoding="utf-8")
+        (repo / "untracked.txt").write_text("keep", encoding="utf-8")
+    before = git("status", "--porcelain")
+    workflow = planned(isolated_db, [dict(THREE_STAGES[1], dependencies=[], stage_type="integration")],
+                       repository_path=str(repo), stage_checkpoint=checkpoint)
+    waiting = workflows.advance_workflow(workflow.id)
+    assert waiting.status.value == "awaiting_external"
+    reviewed = submit(workflow.id, "Research with sources; no repository changes claimed")
+    assert reviewed.status.value == "reviewing"
+    finish_task(isolated_db, PASS)
+    done = isolated_db.get_workflow(workflow.id)
+    assert done.status.value == "completed"
+    assert git("rev-parse", "HEAD") == original
+    assert git("status", "--porcelain") == before
+    report = workflows.workflow_report(workflow.id)
+    assert not any(event["event_type"] == "stage.checkpoint_pending" for event in report["events"])
+    passed = next(event for event in report["events"] if event["event_type"] == "review.passed")
+    external = next(run for run in report["runs"] if (run.get("input") or {}).get("execution_mode") == "external")
+    assert passed["payload"]["external_result_run_id"] == external["id"]
+    assert passed["payload"]["external_result_sha256"] == external["output_sha256"]
+
+
+def test_old_external_assignment_cannot_submit_into_new_attempt(isolated_db, tmp_path):
+    workflow = planned(isolated_db, [dict(THREE_STAGES[1], dependencies=[], stage_type="integration")])
+    workflows.advance_workflow(workflow.id)
+    first = workflows.external_assignment(workflow.id)
+    submit(workflow.id, "Initial research")
+    finish_task(isolated_db, REVISION)
+    current = isolated_db.get_workflow(workflow.id)
+    second = workflows.external_assignment(workflow.id)
+    assert current.status.value == "awaiting_external" and first.run_id != second.run_id
+    payload = {"expected_version": current.state_version, "run_id": first.run_id,
+               "input_sha256": first.input_sha256, "result": "Old draft"}
+    response = call("POST", f"/api/workflows/{workflow.id}/external-result", json=payload)
+    assert response.status_code == 409
+    assert workflows.external_assignment(workflow.id).run_id == second.run_id
+    assert isolated_db.get_workflow(workflow.id).status.value == "awaiting_external"
+    assignment_file = tmp_path / "assignment.json"
+    assignment_file.write_text(first.model_dump_json(), encoding="utf-8")
+    runner = CliRunner()
+    rejected = runner.invoke(cli, ["workflow", "submit", workflow.id,
+                                  "--assignment", str(assignment_file), "-t", "Old file"])
+    assert rejected.exit_code != 0
+    assert workflows.external_assignment(workflow.id).run_id == second.run_id
+
+
+@pytest.mark.parametrize("bad", [True, "1", -1])
+def test_external_result_requires_strict_version(isolated_db, bad):
+    from pydantic import ValidationError
+    with pytest.raises(ValidationError):
+        WorkflowExternalResult(expected_version=bad, run_id="run", input_sha256="0" * 64, result="x")
+
+
+def test_tail_amendment_during_external_wait_preserves_assignment(isolated_db):
+    stages = [dict(THREE_STAGES[1], dependencies=[]), THREE_STAGES[2]]
+    workflow = planned(isolated_db, stages, allow_editing_approved_plan=True)
+    workflows.advance_workflow(workflow.id)
+    before = workflows.external_assignment(workflow.id)
+    replacement = [dict(stages[0]), dict(stages[1], title="Updated tail", execution_mode="external")]
+    response = call("POST", f"/api/workflows/{workflow.id}/plan/amend", json={
+        "expected_version": before.expected_version, "reason": "Update pending tail only", "stages": replacement})
+    assert response.status_code == 200, response.text
+    after = workflows.external_assignment(workflow.id)
+    assert after.run_id == before.run_id and after.input_sha256 == before.input_sha256
+    assert after.assignment == before.assignment and after.expected_version > before.expected_version
+    assert after.status.value == "awaiting_external"
+    assert isolated_db.list_workflow_stages(workflow.id)[1].execution_mode.value == "external"

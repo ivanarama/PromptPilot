@@ -12,7 +12,16 @@
 Авто-проекты: секция "auto" в projects.json
   {"auto": {"Обмены/Пилот_ЕдиныйЗагрузчик": {"types": ["баг"], "min_confidence": 0.85}}}
 — совпало (тип + уверенность) -> исполнение запускается без кнопки,
-ограничение AUTO_MAX_PER_DAY.
+ограничение AUTO_MAX_PER_DAY. Только для известных отправителей (явный
+ALLOW_FROM или sender_map): решение «запускать» принимает модель по тексту
+письма, и от незнакомца оно не должно запускать агента без человека.
+
+Игровые заявки ([KT], открыты всем): никакого автозапуска; папка — всегда
+KT_WORKING_DIR, что бы ни написал триаж; отклонённое хранителем концепции
+кнопку «Запустить» не получает.
+
+Карточка показывает ТЗ целиком — ровно то, что уйдёт исполнителю. Папка
+обычного обращения должна лежать внутри PROJECTS_ROOT.
 
 Токен: INBOX_BOT_TOKEN в .env (свой бот от @BotFather, чтобы не делить
 long-polling с основным ботом PromptPilot). Запуск:
@@ -20,7 +29,9 @@ long-polling с основным ботом PromptPilot). Запуск:
 """
 
 import email.message
+import html
 import json
+import os
 import re
 import smtplib
 import sys
@@ -28,6 +39,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+from email.utils import parseaddr
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -114,13 +126,68 @@ def parse_triage(result: str) -> dict:
     if index >= 0:
         text = text[index:]
     fields = {}
-    for key in ("ПРОЕКТ", "УВЕРЕННОСТЬ", "ТИП", "ПРИОРИТЕТ", "РАБОЧАЯ ПАПКА"):
-        match = re.search(rf"^{key}:\s*(.+)$", text, re.M | re.I)
-        fields[key.lower()] = match.group(1).strip() if match else ""
+    for key in ("ПРОЕКТ", "УВЕРЕННОСТЬ", "ТИП", "ПРИОРИТЕТ", "РАБОЧАЯ ПАПКА",
+                "ВЕРДИКТ", "КАТЕГОРИЯ"):
+        # The last line wins: a model may echo the answer format first.
+        matches = re.findall(rf"^{key}:\s*(.+)$", text, re.M | re.I)
+        fields[key.lower()] = matches[-1].strip() if matches else ""
+    head = re.split(r"\s+[—–-]\s+|[,(.;!]", fields["вердикт"], maxsplit=1)[0]
+    head = head.strip().strip("*").strip().upper()
+    fields["вердикт"] = head if head in ("ПРИНЯТЬ", "ОТКЛОНИТЬ", "УТОЧНИТЬ") else ""
     spec_index = text.upper().find("ТЕХНИЧЕСКОЕ ЗАДАНИЕ:")
     spec = text[spec_index + len("ТЕХНИЧЕСКОЕ ЗАДАНИЕ:"):].strip() \
         if spec_index >= 0 else text.strip()
     return {"fields": fields, "spec": spec}
+
+
+def _address(raw: str) -> str:
+    return parseaddr(raw or "")[1].strip().lower()
+
+
+def sender_known(env: dict, config: dict, sender: str) -> bool:
+    """Named explicitly: an ALLOW_FROM entry or a sender_map rule.
+
+    An empty ALLOW_FROM lets every letter in, so it cannot vouch for anyone.
+    """
+    address = _address(sender)
+    if not address:
+        return False
+    domain = address.rpartition("@")[2]
+    entries = [item.strip().lower() for item in env.get("ALLOW_FROM", "").split(",")
+               if item.strip()]
+    if any(address == item or domain == item for item in entries):
+        return True
+    sender_map = {str(key).lower() for key in (config.get("sender_map") or {})}
+    return address in sender_map or f"*@{domain}" in sender_map
+
+
+def execution_dir(env: dict, parsed: dict, meta: dict) -> str:
+    """Folder for the execution task; ValueError if it may not be used.
+
+    The folder comes from the triage answer, i.e. from a model that read a
+    stranger's letter. A game proposal always runs in KT_WORKING_DIR; any
+    other request must stay inside PROJECTS_ROOT.
+    """
+    if meta.get("kt"):
+        path = env.get("KT_WORKING_DIR", "")
+        if not path or not Path(path).is_dir():
+            raise ValueError("KT_WORKING_DIR не задан или не существует")
+        return path
+    path = parsed["fields"].get("рабочая папка", "")
+    root = env.get("PROJECTS_ROOT", "")
+    if not path or not Path(path).is_dir():
+        raise ValueError(f"папка «{path or '—'}» не найдена")
+    if not root:
+        raise ValueError("PROJECTS_ROOT не задан — папку из триажа не с чем сверить")
+    real_path = os.path.normcase(os.path.realpath(path))
+    real_root = os.path.normcase(os.path.realpath(root))
+    try:
+        inside = os.path.commonpath([real_path, real_root]) == real_root
+    except ValueError:  # different drives on Windows
+        inside = False
+    if not inside:
+        raise ValueError(f"папка «{path}» вне PROJECTS_ROOT")
+    return path
 
 
 def auto_matches(config: dict, parsed: dict) -> bool:
@@ -152,15 +219,19 @@ VERDICT_CONTRACT = (
 
 
 def create_execution(env: dict, parsed: dict, meta: dict, state: dict) -> int:
-    path = parsed["fields"].get("рабочая папка", "")
-    project = parsed["fields"].get("проект", "")
+    path = execution_dir(env, parsed, meta)
+    project = ("Сказки Королевства" if meta.get("kt")
+               else parsed["fields"].get("проект", ""))
     prompt = (f"Проект: {project}\nРабочая папка: {path}\n\n"
               f"Техническое задание:\n{parsed['spec']}" + VERDICT_CONTRACT)
+    provider = env.get("EXEC_PROVIDER", env.get("PP_PROVIDER", "claude-z"))
+    if meta.get("kt"):
+        provider = env.get("KT_EXEC_PROVIDER") or provider
     payload = {
         "prompt": prompt,
-        "provider": env.get("EXEC_PROVIDER", env.get("PP_PROVIDER", "claude-z")),
+        "provider": provider,
         "priority": int(env.get("EXEC_PRIORITY", "3")),
-        "working_dir": path if Path(path).is_dir() else env.get("PP_WORKING_DIR", str(ROOT)),
+        "working_dir": path,
         "skip_permissions": env.get("EXEC_SKIP_PERMISSIONS", "1") == "1",
         "tg_chat_id": int(env["TG_CHAT_ID"]) if env.get("TG_CHAT_ID") else None,
     }
@@ -172,17 +243,15 @@ def create_execution(env: dict, parsed: dict, meta: dict, state: dict) -> int:
         state["execs"][str(task["id"])] = {
             "triage_task_id": meta.get("triage_task_id"),
             "from": meta.get("from", ""),
+            "reply_to": meta.get("reply_to", ""),
             "subject": meta.get("subject", ""),
             "message_id": meta.get("message_id", ""),
+            "kt": bool(meta.get("kt")),
         }
     return int(task["id"])
 
 
 # --- SMTP-ответ -------------------------------------------------------------
-
-def sender_address(raw: str) -> str:
-    return raw.split("<")[-1].strip("> ").strip() if "<" in raw else raw.strip()
-
 
 def base_subject(subject: str) -> str:
     cleaned = subject.strip()
@@ -194,21 +263,36 @@ def base_subject(subject: str) -> str:
     return re.sub(r"\s+", " ", cleaned).strip()
 
 
+def reply_address(env: dict, meta: dict) -> str:
+    """Where a reply to the author goes, or "" when there is nobody to answer.
+
+    A letter from the site form comes FROM the form service; the player's
+    own address, if the form asked for it, is in Reply-To. Answering From
+    would send the draft to the form service.
+    """
+    if meta.get("reply_to"):
+        return _address(meta["reply_to"])
+    sender = _address(meta.get("from", ""))
+    form_domain = env.get("KT_FORM_DOMAIN", "formsubmit.co").strip().lower()
+    host = sender.rpartition("@")[2]
+    if host == form_domain or host.endswith("." + form_domain):
+        return ""
+    return sender
+
+
 def send_reply(env: dict, meta: dict, reply_text: str) -> None:
+    recipient = reply_address(env, meta)
+    if not recipient:
+        raise ValueError("у заявки нет адреса автора (форма не передала Reply-To)")
     message = email.message.EmailMessage()
     message["From"] = (f"{env.get('SMTP_FROM_NAME', 'PromptPilot')} "
                        f"<{env['IMAP_USER']}>" if env.get("SMTP_FROM_NAME")
                        else env["IMAP_USER"])
-    message["To"] = sender_address(meta["from"])
+    message["To"] = recipient
     message["Subject"] = "Re: " + base_subject(meta["subject"])
     if meta.get("message_id") and meta["message_id"].startswith("<"):
         message["In-Reply-To"] = meta["message_id"]
         message["References"] = meta["message_id"]
-    signature = env.get("REPLY_SIGNATURE", "")
-    body = reply_text.strip()
-    if signature:
-        body += "\n\n" + signature
-    message.set_content(body)
     signature = env.get("REPLY_SIGNATURE", "")
     body = reply_text.strip()
     if signature:
@@ -233,19 +317,101 @@ def send_reply(env: dict, meta: dict, reply_text: str) -> None:
 
 # --- карточки ---------------------------------------------------------------
 
-def spec_card_text(meta: dict, parsed: dict, task_id: int) -> str:
+SPEC_CHUNK = 3000  # Telegram caps a message at 4096 characters after parsing
+
+
+def _esc(value) -> str:
+    return html.escape(str(value)) if value not in (None, "") else "—"
+
+
+def card_messages(env: dict, meta: dict, parsed: dict, task_id: int) -> list[str]:
+    """A finished triage as Telegram messages: header, then the WHOLE spec.
+
+    The executor gets exactly this spec. The card used to show its first 1200
+    characters, so an instruction placed further down went to the agent
+    unseen. Everything is HTML-escaped: a sender like «Имя <a@b.c>» or a "<"
+    in the spec made Telegram reject the card, and the card was lost.
+    """
     fields = parsed["fields"]
-    return (
-        f"<b>Новое обращение</b> · задача #{task_id}\n"
-        f"От: {meta['from']}\n"
-        f"Тема: {meta['subject']}\n\n"
-        f"Проект: <b>{fields.get('проект', '—')}</b>"
-        f" · уверенность {fields.get('уверенность', '—')}"
-        f" · {fields.get('тип', '—')} · приоритет {fields.get('приоритет', '—')}\n"
-        f"Папка: <code>{fields.get('рабочая папка', '—')}</code>\n\n"
-        f"<pre>{parsed['spec'][:1200]}</pre>\n\n"
-        "▶ Запустить — автономное исполнение в папке проекта"
-    )
+    if meta.get("kt"):
+        header = (
+            f"<b>🎲 Заявка в игру</b> · задача #{task_id}\n"
+            f"Тема: {_esc(meta.get('subject'))}\n"
+            f"Хранитель концепции: <b>{_esc(fields.get('вердикт'))}</b>"
+            f" · {_esc(fields.get('категория'))} · приоритет {_esc(fields.get('приоритет'))}\n"
+            f"Папка: <code>{_esc(env.get('KT_WORKING_DIR'))}</code>"
+        )
+    else:
+        header = (
+            f"<b>Новое обращение</b> · задача #{task_id}\n"
+            f"От: {_esc(meta.get('from'))}\n"
+            f"Тема: {_esc(meta.get('subject'))}\n\n"
+            f"Проект: <b>{_esc(fields.get('проект'))}</b>"
+            f" · уверенность {_esc(fields.get('уверенность'))}"
+            f" · {_esc(fields.get('тип'))} · приоритет {_esc(fields.get('приоритет'))}\n"
+            f"Папка: <code>{_esc(fields.get('рабочая папка'))}</code>"
+        )
+    spec = parsed["spec"] or ""
+    parts = [spec[i:i + SPEC_CHUNK] for i in range(0, len(spec), SPEC_CHUNK)] or [""]
+    messages = []
+    for index, part in enumerate(parts, start=1):
+        label = f"ТЗ, часть {index}/{len(parts)}" if len(parts) > 1 else "ТЗ"
+        body = f"<b>{label}</b>\n<pre>{html.escape(part)}</pre>"
+        messages.append(f"{header}\n\n{body}" if index == 1 else body)
+    messages[-1] += ("\n\n▶ Запустить — автономное исполнение ровно этого ТЗ"
+                     + (" в папке игры" if meta.get("kt") else " в папке проекта"))
+    return messages
+
+
+def draft_messages(meta: dict, exec_id, reply: str, has_address: bool) -> list[str]:
+    """The reply draft, whole: «📤 Отправить» mails exactly this text.
+
+    Only its first 2500 characters used to be shown while the whole result
+    was mailed to an outside address.
+    """
+    header = (f"<b>Черновик ответа</b> по «{_esc(meta.get('subject'))}» "
+              f"(задача #{exec_id})")
+    parts = [reply[i:i + SPEC_CHUNK] for i in range(0, len(reply), SPEC_CHUNK)] or [""]
+    messages = []
+    for index, part in enumerate(parts, start=1):
+        label = f", часть {index}/{len(parts)}" if len(parts) > 1 else ""
+        body = f"<pre>{html.escape(part)}</pre>"
+        messages.append(f"{header}{label}:\n\n{body}" if index == 1
+                        else f"<b>Черновик{label}</b>\n{body}")
+    if not has_address:
+        messages[-1] += "\n\nУ заявки нет адреса автора — отправить некуда."
+    return messages
+
+
+def send_messages(token: str, chat_id, messages: list[str], keyboard=None) -> dict:
+    """Send in order; the keyboard goes on the last message, which is returned."""
+    sent = None
+    for index, text in enumerate(messages):
+        extra = {"reply_markup": keyboard} if keyboard and index == len(messages) - 1 else {}
+        sent = tg("sendMessage", token, chat_id=chat_id, text=text,
+                  parse_mode="HTML", **extra)
+    return sent
+
+
+MAX_SEND_ATTEMPTS = 5
+
+
+def deliver(record: dict, flag: str, send, *args, **kwargs) -> None:
+    """Call send(*args, **kwargs) and set the flag only once it went through.
+
+    The flag used to be set before sending, so a message Telegram refused was
+    lost for good. A message that keeps failing is given up after
+    MAX_SEND_ATTEMPTS passes instead of being retried forever.
+    """
+    try:
+        send(*args, **kwargs)
+    except Exception as exc:
+        record["send_errors"] = record.get("send_errors", 0) + 1
+        print(f"!! Telegram: попытка {record['send_errors']} не удалась: "
+              f"{type(exc).__name__}: {exc}", flush=True)
+        if record["send_errors"] < MAX_SEND_ATTEMPTS:
+            return
+    record[flag] = True
 
 
 def watch_keyboard() -> dict:
@@ -321,12 +487,11 @@ def handle_callback(env: dict, state: dict, config: dict, callback: dict) -> Non
             exec_id = data.split(":", 1)[1]
             meta = state["execs"].get(exec_id, {})
             task = pp_request(env, f"/api/tasks/{exec_id}")
-            reply_text = (task.get("result") or "").split(META_CUT)[0]
-            reply_text = re.sub(r"^⚠️.*\n?", "", reply_text)
+            reply_text = draft_text(task)
             send_reply(env, meta, reply_text)
             tg("editMessageText", token, chat_id=chat_id,
                message_id=callback["message"]["message_id"],
-               text=f"📤 Ответ отправлен автору ({meta.get('from', '?')}).")
+               text=f"📤 Ответ отправлен автору ({reply_address(env, meta)}).")
             save_state(state)
         elif data.startswith("dis:"):
             tg("editMessageText", token, chat_id=chat_id,
@@ -342,6 +507,15 @@ def handle_callback(env: dict, state: dict, config: dict, callback: dict) -> Non
         print(f"!! callback {data}: {type(exc).__name__}: {exc}", flush=True)
 
 
+TERMINAL_STATUSES = ("completed", "failed", "cancelled")
+
+
+def draft_text(task: dict) -> str:
+    """The reply as it is shown and as it is mailed — one function for both."""
+    text = (task.get("result") or "").split(META_CUT)[0]
+    return re.sub(r"^⚠️.*\n?", "", text).strip()
+
+
 def watch_progress(env: dict, state: dict, config: dict, token: str) -> None:
     """Триаж завершился -> карточка; исполнение завершилось -> черновик ответа."""
     chat_id = env.get("TG_CHAT_ID")
@@ -351,52 +525,68 @@ def watch_progress(env: dict, state: dict, config: dict, token: str) -> None:
         if card.get("sent"):
             continue
         task = pp_request(env, f"/api/tasks/{triage_id}")
-        if task["status"] not in ("completed", "failed", "cancelled"):
+        if task["status"] not in TERMINAL_STATUSES:
             continue
-        card["sent"] = True
+        meta = card["meta"]
         if task["status"] != "completed":
-            tg("sendMessage", token, chat_id=chat_id,
-               text=f"Триаж #{triage_id} завершился со статусом {task['status']}.")
+            deliver(card, "sent", tg, "sendMessage", token, chat_id=chat_id,
+                    text=f"Триаж #{triage_id} завершился со статусом {task['status']}.")
             continue
-        parsed = parse_triage(task.get("result") or "")
-        if auto_matches(config, parsed):
-            if auto_today(state) < int(env.get("AUTO_MAX_PER_DAY", "3")):
-                exec_id = create_execution(env, parsed, card["meta"], state)
-                note_auto(state)
-                tg("sendMessage", token, chat_id=chat_id,
-                   text=f"🤖 Авто-проект: обращение «{card['meta']['subject']}» "
-                        f"запущено как задача #{exec_id}.")
+        result = task.get("result") or ""
+        parsed = parse_triage(result)
+        if meta.get("kt") and parsed["fields"].get("вердикт") == "ОТКЛОНИТЬ":
+            deliver(card, "sent", tg, "sendMessage", token, chat_id=chat_id,
+                    text=f"🎲 Заявка «{meta.get('subject', '')}» (задача #{triage_id}) "
+                         "отклонена хранителем концепции — запускать нечего.")
+            continue
+        warning = ""
+        # Game proposals never start on their own: anyone can send one.
+        if not meta.get("kt") and auto_matches(config, parsed):
+            if not sender_known(env, config, meta.get("from", "")):
+                warning = ("Авто-правило совпало, но отправителя нет в ALLOW_FROM "
+                           "или sender_map — нужен ручной запуск.")
+            elif auto_today(state) >= int(env.get("AUTO_MAX_PER_DAY", "3")):
+                warning = "Авто-лимит на сегодня исчерпан — нужен ручной запуск."
             else:
-                tg("sendMessage", token, chat_id=chat_id,
-                   text=f"Авто-лимит исчерпан, обращение «{card['meta']['subject']}» "
-                        "ждёт ручного запуска.")
-            continue
-        sent = tg("sendMessage", token, chat_id=chat_id,
-                  text=spec_card_text(card["meta"], parsed, int(triage_id)),
-                  parse_mode="HTML", reply_markup=watch_keyboard())
-        card["spec"] = task.get("result") or ""
-        card["tg_message_id"] = sent["message_id"]
-        state["cards"][triage_id] = card
+                try:
+                    exec_id = create_execution(env, parsed, meta, state)
+                except ValueError as exc:
+                    warning = f"Автозапуск отменён: {exc}."
+                else:
+                    note_auto(state)
+                    deliver(card, "sent", tg, "sendMessage", token, chat_id=chat_id,
+                            text=f"🤖 Авто-проект: обращение «{meta.get('subject', '')}» "
+                                 f"запущено как задача #{exec_id}.")
+                    continue
+        messages = card_messages(env, meta, parsed, int(triage_id))
+        if warning:
+            messages[0] = f"⚠ {html.escape(warning)}\n\n{messages[0]}"
+        deliver(card, "sent", send_card, token, chat_id, messages, card, result)
     for exec_id, meta in list(state["execs"].items()):
         if meta.get("drafted"):
             continue
         task = pp_request(env, f"/api/tasks/{exec_id}")
-        if task["status"] not in ("completed", "failed", "cancelled"):
+        if task["status"] not in TERMINAL_STATUSES:
             continue
-        meta["drafted"] = True
         if task["status"] != "completed" or (task.get("verdict") or "").upper() \
                 in ("НЕ СМОГ", "НУЖЕН ЧЕЛОВЕК"):
-            tg("sendMessage", token, chat_id=chat_id,
-               text=f"Задача #{exec_id} не готова к отправке "
-                    f"(статус {task['status']}, вердикт {task.get('verdict') or '—'}). "
-                    "Ответ автору не формирую.")
+            deliver(meta, "drafted", tg, "sendMessage", token, chat_id=chat_id,
+                    text=f"Задача #{exec_id} не готова к отправке "
+                         f"(статус {task['status']}, вердикт {task.get('verdict') or '—'}). "
+                         "Ответ автору не формирую.")
             continue
-        reply = (task.get("result") or "").split(META_CUT)[0][:3500]
-        tg("sendMessage", token, chat_id=chat_id,
-           text=f"<b>Черновик ответа</b> по «{meta['subject']}» "
-                f"(задача #{exec_id}):\n\n<pre>{reply[:2500]}</pre>",
-           parse_mode="HTML", reply_markup=reply_keyboard(int(exec_id)))
+        has_address = bool(reply_address(env, meta))
+        messages = draft_messages(meta, exec_id, draft_text(task), has_address)
+        keyboard = reply_keyboard(int(exec_id)) if has_address else None
+        deliver(meta, "drafted", send_messages, token, chat_id, messages, keyboard)
     save_state(state)
+
+
+def send_card(token: str, chat_id, messages: list[str], card: dict, result: str) -> None:
+    """Send a triage card and remember what the ▶ button will run."""
+    sent = send_messages(token, chat_id, messages, watch_keyboard())
+    card["spec"] = result
+    card["tg_message_id"] = sent["message_id"]
 
 
 def tail_events(state: dict, token: str, chat_id: str) -> None:
@@ -418,8 +608,12 @@ def tail_events(state: dict, token: str, chat_id: str) -> None:
                 "meta": {
                     "triage_task_id": event["task_id"],
                     "from": event["from"],
+                    "reply_to": event.get("reply_to", ""),
                     "subject": event["subject"],
                     "message_id": event.get("message_id", ""),
+                    # The bot must know a game proposal from a client request:
+                    # different trust, different folder, no autostart.
+                    "kt": bool(event.get("kt")),
                 },
             }
     if fresh:

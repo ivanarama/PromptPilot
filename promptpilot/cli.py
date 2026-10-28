@@ -124,7 +124,11 @@ def cli(ctx):
 @click.option("-c", "--cli", "provider", default=None, help="CLI provider: claude, claude-z, or custom command")
 @click.option("-r", "--max-retries", default=5, type=int, help="Max retries on rate limit")
 @click.option("-w", "--worktree", is_flag=True, help="Run in a fresh git worktree of --dir (branch pp/t<id>)")
-def add(prompt, file_path, priority, scheduled_at, working_dir, provider, max_retries, worktree):
+@click.option("--rights", type=click.Choice(["none", "read", "write", "full"]), default=None,
+              help="What the agent may do: none (no tools), read, write (edit files in --dir, "
+                   "no commands), full")
+def add(prompt, file_path, priority, scheduled_at, working_dir, provider, max_retries, worktree,
+        rights):
     """Add a task (or multiple from file)."""
     from datetime import datetime
 
@@ -152,6 +156,13 @@ def add(prompt, file_path, priority, scheduled_at, working_dir, provider, max_re
         if provider not in load_providers() and not shutil.which(first):
             click.secho(f"⚠ Провайдер «{provider}» не найден среди известных и не в PATH — "
                         "задача, скорее всего, упадёт. Список: pp provider", fg="yellow")
+    if rights:
+        from .config import DEFAULT_CLI, load_providers, rights_supported
+        name = provider or DEFAULT_CLI
+        if not rights_supported(load_providers().get(name, {}), rights):
+            raise click.UsageError(
+                f"Провайдер «{name}» не умеет ограничивать права до «{rights}» "
+                "(задайте rights в providers.json)")
 
     for p in prompts:
         task = db.create_task(TaskCreate(
@@ -162,6 +173,7 @@ def add(prompt, file_path, priority, scheduled_at, working_dir, provider, max_re
             scheduled_at=dt,
             max_retries=max_retries,
             worktree=worktree,
+            rights=rights,
         ))
         cli_info = f" [{provider}]" if provider else ""
         time_info = f" at {dt}" if dt else ""
@@ -626,7 +638,8 @@ def workflow_dispatch(reference, role, prompt, file_path, provider, model,
 @click.argument("reference")
 @click.option("--request", "hand_out", is_flag=True,
               help="Выдать задание сейчас (для ручного режима: workflow в queued)")
-def workflow_external(reference, hand_out):
+@click.option("--json", "as_json", is_flag=True, help="Save the assignment and its immutable submission token as JSON")
+def workflow_external(reference, hand_out, as_json):
     """Задание стадии, которую выполняют вне PromptPilot (issue #122)."""
     from . import workflows
 
@@ -637,6 +650,9 @@ def workflow_external(reference, hand_out):
     if assignment is None:
         raise click.ClickException(
             f"у текущего раунда нет внешнего задания (workflow {item.status.value})")
+    if as_json:
+        click.echo(assignment.model_dump_json(indent=2))
+        return
     click.echo(f"# {assignment.stage_code} {assignment.stage_title} · раунд "
                f"{assignment.round_no}, попытка {assignment.attempt_no} · {assignment.status.value}")
     click.echo(assignment.assignment)
@@ -649,10 +665,12 @@ def workflow_external(reference, hand_out):
 @click.option("-t", "--text", default="", help="Результат текстом")
 @click.option("--comment", default="", help="Комментарий к результату")
 @click.option("--performer", default="", help="Кто выполнил: человек или инструмент")
-def workflow_submit(reference, file_path, text, comment, performer):
+@click.option("--assignment", "assignment_path", required=True,
+              type=click.Path(exists=True, dir_okay=False), help="JSON saved with workflow external --json")
+def workflow_submit(reference, file_path, text, comment, performer, assignment_path):
     """Сдать результат внешней стадии: дальше gate и независимое ревью."""
     from . import workflows
-    from .models import WorkflowExternalResult
+    from .models import WorkflowExternalAssignment, WorkflowExternalResult
 
     if file_path:
         with open(file_path, encoding="utf-8-sig") as handle:
@@ -660,9 +678,17 @@ def workflow_submit(reference, file_path, text, comment, performer):
     if not text.strip():
         raise click.ClickException("пустой результат: -f файл или -t текст")
     item = _workflow_or_exit(reference)
+    try:
+        with open(assignment_path, encoding="utf-8-sig") as handle:
+            assignment = WorkflowExternalAssignment.model_validate_json(handle.read())
+    except (OSError, ValueError) as exc:
+        raise click.ClickException(f"Invalid assignment file: {exc}") from exc
+    if assignment.workflow_id != item.id:
+        raise click.ClickException("Assignment belongs to another workflow")
     submitted = _workflow_call_cli(workflows.submit_external_result, item.id,
                                    WorkflowExternalResult(
-                                       expected_version=item.state_version, result=text,
+                                       expected_version=assignment.expected_version, run_id=assignment.run_id,
+                                       input_sha256=assignment.input_sha256, result=text,
                                        comment=comment, performer=performer))
     advanced = workflows.advance_workflow(submitted.id)
     click.echo(f"Workflow {advanced.slug}: {advanced.status.value}")
@@ -742,7 +768,9 @@ def workflow_review(reference, verdict, summary, findings_file):
 @click.argument("reference")
 @click.argument("text")
 @click.option("--resume", is_flag=True)
-def workflow_input(reference, text, resume):
+@click.option("--note", default="",
+              help="Указание агенту: уйдёт в следующий запуск исполнителя и аудитора")
+def workflow_input(reference, text, resume, note):
     """Append a human decision and optionally resume the workflow."""
     from . import workflows
     from .models import WorkflowHumanInput
@@ -755,6 +783,7 @@ def workflow_input(reference, text, resume):
             expected_version=item.state_version,
             text=text,
             resume=resume,
+            note=note,
         ),
     )
     click.echo(f"Workflow {updated.slug}: {updated.status.value}")
@@ -941,6 +970,16 @@ def pipelinectl(args):
     """Run the bundled project pipeline adapter."""
     from .project_pipeline import run
     raise SystemExit(run(list(args)))
+
+
+@cli.command(name="bot-vk")
+def bot_vk():
+    """Start the VK community bot (requires PP_VK_TOKEN and PP_VK_GROUP_ID)."""
+    from .bot_vk import run_vk_bot
+    try:
+        run_vk_bot()
+    except SystemExit as e:
+        raise click.ClickException(str(e))
 
 
 @cli.command()
