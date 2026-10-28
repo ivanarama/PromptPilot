@@ -148,3 +148,92 @@ def test_epf_rechecks_after_awaited_preparation(isolated_db, tmp_path, monkeypat
     assert asyncio.run(bot.epf_base_cb(update, context)) == bot.ConversationHandler.END
     assert prepared == [True] and len(isolated_db.list_tasks()) == 1
     assert "Задача не создана" in query.message.replies[-1]
+
+
+def _herdr_conversation(monkeypatch):
+    allowed, calls = {7}, []
+    monkeypatch.setattr(bot, "is_authorized", lambda uid: uid in allowed)
+    monkeypatch.setattr(bot, "LOG_PROMPTS", False)
+
+    async def rpc(*args, **kwargs):
+        calls.append((args, kwargs))
+        return {"result": {"agent": {"terminal_id": "test-terminal"}}}
+
+    monkeypatch.setattr(bot, "_herdr_json", rpc)
+    user, chat = SimpleNamespace(id=7), SimpleNamespace(id=7, type="private")
+    query = Query(1, user)
+    query.data = "hd_reply::w1:p1"
+    context = SimpleNamespace(user_data={})
+    entry = SimpleNamespace(callback_query=query, message=None,
+                            effective_user=user, effective_chat=chat)
+    final = SimpleNamespace(callback_query=None, message=Message("continue safely"),
+                            effective_user=user, effective_chat=chat)
+    return context, entry, final, allowed, calls
+
+
+@pytest.mark.parametrize("denial", ["revoked", "group", "no_chat", "no_user"])
+def test_herdr_reply_rechecks_access_before_live_prompt(monkeypatch, denial):
+    context, entry, final, allowed, calls = _herdr_conversation(monkeypatch)
+    assert asyncio.run(bot.cb_herdr_reply_start(entry, context)) == bot.ASK_HERDR_REPLY
+    if denial == "revoked":
+        allowed.clear()
+    elif denial == "group":
+        final.effective_chat.type = "group"
+    elif denial == "no_chat":
+        final.effective_chat = None
+    else:
+        final.effective_user = None
+    assert asyncio.run(bot.herdr_reply_got_text(final, context)) == bot.ConversationHandler.END
+    assert calls == []
+    assert context.user_data == {}
+    assert final.message.replies
+
+
+def test_herdr_reply_authorized_final_sends_once_and_clears_dialog(monkeypatch):
+    context, entry, final, _, calls = _herdr_conversation(monkeypatch)
+    assert asyncio.run(bot.cb_herdr_reply_start(entry, context)) == bot.ASK_HERDR_REPLY
+    assert asyncio.run(bot.herdr_reply_got_text(final, context)) == bot.ConversationHandler.END
+    assert calls == [(("agent", "prompt", "w1:p1", "continue safely"), {"host": None})]
+    assert context.user_data == {}
+    asyncio.run(bot.herdr_reply_got_text(final, context))
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("denial", ["revoked", "group", "no_chat", "no_user"])
+def test_herdr_reply_entry_denial_clears_stale_controls(monkeypatch, denial):
+    context, entry, _, allowed, calls = _herdr_conversation(monkeypatch)
+    context.user_data.update(herdr_reply_pane="stale:pane", herdr_reply_host="old",
+                             herdr_reply_machine="old")
+    if denial == "revoked":
+        allowed.clear()
+    elif denial == "group":
+        entry.effective_chat.type = "group"
+    elif denial == "no_chat":
+        entry.effective_chat = None
+    else:
+        entry.effective_user = None
+    assert asyncio.run(bot.cb_herdr_reply_start(entry, context)) == bot.ConversationHandler.END
+    assert context.user_data == {} and calls == []
+    assert entry.callback_query.message.replies
+
+
+@pytest.mark.parametrize("during", ["reference_lookup", "callback_answer"])
+def test_herdr_reply_entry_rechecks_after_awaits(monkeypatch, during):
+    context, entry, final, allowed, calls = _herdr_conversation(monkeypatch)
+    context.user_data.update(herdr_reply_pane="stale:pane", herdr_reply_host="old",
+                             herdr_reply_machine="old")
+    if during == "callback_answer":
+        entry.callback_query.on_answer = allowed.clear
+    else:
+        original = bot._hd_ref_or_alert
+
+        async def lookup(*args, **kwargs):
+            result = await original(*args, **kwargs)
+            allowed.clear()
+            return result
+
+        monkeypatch.setattr(bot, "_hd_ref_or_alert", lookup)
+    assert asyncio.run(bot.cb_herdr_reply_start(entry, context)) == bot.ConversationHandler.END
+    assert context.user_data == {}
+    asyncio.run(bot.herdr_reply_got_text(final, context))
+    assert calls == []

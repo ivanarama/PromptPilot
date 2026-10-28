@@ -36,6 +36,7 @@ import os
 import re
 import subprocess
 import time
+import uuid
 
 from . import worktree
 from .config import (HERDR_BIN, HERDR_KEEP_PANE, HERDR_READ_LINES, HERDR_START_TIMEOUT_MS,
@@ -384,34 +385,82 @@ def _open_worktree(task, cwd, label, host=None) -> dict:
     return wt
 
 
+def _with_turn_marker(prompt: str) -> str:
+    # Short ASCII footer stays in narrow terminals and is not a shared role
+    # heading or a guessable marker copied from a previous task.
+    return prompt.rstrip() + "\n\nPP-TURN-END:" + uuid.uuid4().hex
+
+
+def _turn_marker(prompt: str) -> str | None:
+    match = re.search(r"(?:^|\n)(PP-TURN-END:[0-9a-f]{32})\s*\Z", prompt)
+    return match.group(1) if match else None
+
+
+def _turn_body(raw: str, prompt: str) -> str | None:
+    marker = _turn_marker(prompt)
+    if marker is None:
+        return None
+    lines = raw.splitlines()
+    for index, line in enumerate(lines):
+        if line.strip().lstrip("\u276f>\u203a").strip() == marker:
+            return "\n".join(lines[index + 1:])
+    return None
+
+
+def _read_turn_screen(name, prompt, host=None):
+    limit = max(1, min(HERDR_READ_LINES, 1000))
+    result = _run(["agent", "read", name, "--source", "recent-unwrapped",
+                   "--lines", str(limit), "--format", "text"], host=host)
+    if result[0] == 0 and _turn_marker(prompt) and _turn_body(result[2], prompt) is None and limit < 1000:
+        # Current herdr caps reads at 1000 rendered rows; larger values do not
+        # provide more history. Missing/evicted correlation remains unknown.
+        return _run(["agent", "read", name, "--source", "recent-unwrapped",
+                     "--lines", "1000", "--format", "text"], host=host)
+    return result
+
+
 def _trim_transcript(raw: str, prompt: str) -> str:
     """Keep the transcript from the last echo of our prompt on, drop UI chrome."""
-    lines = raw.splitlines()
+    marker = _turn_marker(prompt)
+    if marker:
+        body = _turn_body(raw, prompt)
+        if body is None:
+            return ""
+        lines = body.splitlines()
+        start = 0
+        contract_boundary_found = True
+    else:
+        lines = raw.splitlines()
 
-    start = 0
-    # Keep the probe shorter than the narrowest supported terminal.  agy wraps
-    # an echoed prompt at roughly 50 columns; a 60-character probe can never
-    # occur on one physical transcript line.
-    probe = prompt.strip().splitlines()[0][:24] if prompt.strip() else ""
-    for i, line in enumerate(lines):
-        # Different agents/themes render the submitted prompt with either ❯
-        # or >.  Requiring only ❯ made an attached agy session start trimming
-        # at the previous turn; the first separator then cut the real answer
-        # down to its heading even though the closing verdict was visible.
-        prompt_line = line.lstrip().lstrip("❯>›").lstrip()
-        if (probe and line.lstrip().startswith(("❯", ">", "›"))
-                and probe in prompt_line):
-            start = i
+        start = None
+        # Keep the probe shorter than the narrowest supported terminal.  agy wraps
+        # an echoed prompt at roughly 50 columns; a 60-character probe can never
+        # occur on one physical transcript line.
+        probe = prompt.strip().splitlines()[0][:24] if prompt.strip() else ""
+        for i, line in enumerate(lines):
+            # Different agents/themes render the submitted prompt with either ❯
+            # or >.  Requiring only ❯ made an attached agy session start trimming
+            # at the previous turn; the first separator then cut the real answer
+            # down to its heading even though the closing verdict was visible.
+            prompt_line = line.lstrip().lstrip("❯>›").lstrip()
+            if (probe and line.lstrip().startswith(("❯", ">", "›"))
+                    and probe in prompt_line):
+                start = i
 
-    # Workflow prompts contain verdict examples.  Do not return those examples
-    # as task output (the generic verdict parser would otherwise accept the
-    # echoed ГОТОВО).  The actual assistant turn begins after the closing tag.
-    contract_boundary_found = False
-    if WORKFLOW_CONTRACT_MARKER in prompt:
-        for i in range(start, len(lines)):
-            if WORKFLOW_CONTRACT_END in lines[i]:
-                start = i + 1
-                contract_boundary_found = True
+        if start is None:
+            # Without a recognized current-prompt boundary an old visible screen
+            # is not evidence of this attempt's answer or a current quota failure.
+            return ""
+
+        # Workflow prompts contain verdict examples.  Do not return those examples
+        # as task output (the generic verdict parser would otherwise accept the
+        # echoed ГОТОВО).  The actual assistant turn begins after the closing tag.
+        contract_boundary_found = False
+        if WORKFLOW_CONTRACT_MARKER in prompt:
+            for i in range(start, len(lines)):
+                if WORKFLOW_CONTRACT_END in lines[i]:
+                    start = i + 1
+                    contract_boundary_found = True
 
     # The bottom input box begins at the first *full-width* ─ separator after
     # start.  Markdown horizontal rules rendered inside an agy report are only
@@ -545,15 +594,12 @@ def _stabilize_workflow_completion(name, prompt, state, raw, deadline,
         if deadline and blocked_since is None and time.monotonic() > deadline:
             return "__timeout__", raw
 
-        rc, _, recent = _run(
-            ["agent", "read", name, "--source", "recent-unwrapped",
-             "--lines", str(HERDR_READ_LINES), "--format", "text"],
-            host=host,
-        )
+        rc, _, recent = _read_turn_screen(name, prompt, host)
         background_running = False
         if rc == 0:
             raw = recent
-            background_running = _has_running_background_task(recent)
+            background_running = _has_running_background_task(
+                (_turn_body(recent, prompt) or "") if _turn_marker(prompt) else recent)
             if (state in {"idle", "done"} and not background_running
                     and _closing_workflow_verdict(
                         _trim_transcript(recent, prompt),
@@ -660,6 +706,8 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
     if require_closing_verdict:
         prompt = ensure_closing_verdict_contract(
             prompt, allow_targeted_stale=allow_targeted_stale)
+    if not getattr(task, "detached", False):
+        prompt = _with_turn_marker(prompt)
     if strict_ownership and getattr(task, "herdr_target", None):
         outcome["error"] = (
             "strict pipeline ownership is incompatible with herdr_target")
@@ -1001,11 +1049,13 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
         if state == "__error__":
             return fail(f"herdr agent wait failed: {raw}")
 
-        rc, _, raw = _run(["agent", "read", name, "--source", "recent-unwrapped",
-                           "--lines", str(HERDR_READ_LINES), "--format", "text"],
-                          host=host)
+        rc, _, raw = _read_turn_screen(name, prompt, host)
         if rc != 0:
             return fail(f"herdr agent read failed: {raw}")
+
+        if _turn_marker(prompt) and _turn_body(raw, prompt) is None:
+            return fail("herdr response is not correlated to this attempt: its owned turn marker is absent "
+                        "from the available history (maximum 1000 rendered rows)", keep_pane=False)
 
         cleaned = _trim_transcript(raw, prompt)
 
