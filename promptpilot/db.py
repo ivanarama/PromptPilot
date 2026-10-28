@@ -129,7 +129,8 @@ CREATE TABLE IF NOT EXISTS notifications (
     created_at TEXT NOT NULL,
     sent_at TEXT,
     pane_id TEXT,
-    machine TEXT
+    machine TEXT,
+    kind TEXT
 );
 
 CREATE TABLE IF NOT EXISTS prompt_log (
@@ -365,6 +366,7 @@ MIGRATIONS = [
     "ALTER TABLE tasks ADD COLUMN effort TEXT",
     "ALTER TABLE notifications ADD COLUMN pane_id TEXT",
     "ALTER TABLE notifications ADD COLUMN machine TEXT",
+    "ALTER TABLE notifications ADD COLUMN kind TEXT",
     "ALTER TABLE workflows ADD COLUMN current_stage_id TEXT",
     "ALTER TABLE workflow_memory ADD COLUMN scope_stage TEXT",
     """CREATE TABLE IF NOT EXISTS workflow_plans (
@@ -4673,6 +4675,38 @@ def update_epf_job(job_id: int, fields: dict):
             f"UPDATE epf_jobs SET {cols} WHERE id = ?",
             (*sets.values(), job_id),
         )
+
+
+def queue_herdr_completions(source_key: str, completions: list[dict], chat_ids: list[int], *, machine: str = "") -> int:
+    """Atomically observe completion identities and enqueue durable delivery.
+
+    First successful observation baselines old sessions. Later observations,
+    including the first after a restart, enqueue every visible new identity.
+    Delivery uses the existing persistent notification outbox.
+    """
+    key = "herdr_watch_completion_v1:" + source_key
+    queued = 0
+    with _connect(immediate=True) as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        state = _json_load(row["value"], {}) if row else {}
+        initialized = state.get("initialized", False)
+        observed = state.setdefault("observed", {})
+        for completion in completions:
+            pane = completion["pane"]
+            identity = {"name": completion["name"], "sequence": completion["sequence"]}
+            if observed.get(pane) == identity:
+                continue
+            if initialized:
+                for chat_id in chat_ids:
+                    conn.execute(
+                        "INSERT INTO notifications(tg_chat_id,message,created_at,pane_id,machine,kind) VALUES(?,?,?,?,?,?)",
+                        (int(chat_id), completion["message"], _now(), pane, machine, "herdr.done"),
+                    )
+                    queued += 1
+            observed[pane] = identity
+        state["initialized"] = True
+        conn.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (key, _json_dump(state)))
+    return queued
 
 
 def add_notification(tg_chat_id: int, message: str, task_id: int = None,

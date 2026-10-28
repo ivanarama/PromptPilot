@@ -6,6 +6,7 @@ update is committed in the same SQLite transaction as its append-only event.
 """
 
 import hashlib
+import html
 from contextlib import nullcontext
 import json
 import os
@@ -466,6 +467,11 @@ def _check_round_budget(conn: sqlite3.Connection, workflow: sqlite3.Row,
     return used_after_create <= _max_automated_rounds(workflow)
 
 
+def _context_text(value) -> str:
+    """Dynamic data cannot close any of the surrounding context frames."""
+    return html.escape(str(value), quote=False)
+
+
 def _render_planner_prompt(workflow: WorkflowInDB, custom_prompt: str = "") -> str:
     rendered = _config_for(workflow).planning.prompt_template or DEFAULT_PLANNER_PROMPT
     values = {
@@ -473,10 +479,10 @@ def _render_planner_prompt(workflow: WorkflowInDB, custom_prompt: str = "") -> s
         "repository_path": workflow.repository_path,
         "candidate_branch": workflow.candidate_branch,
     }
-    for name, value in values.items():
-        rendered = rendered.replace("{{" + name + "}}", value)
+    rendered = re.sub(r"\{\{([a-z_]+)\}\}",
+                      lambda match: _context_text(values.get(match.group(1), match.group(0))), rendered)
     if custom_prompt.strip():
-        rendered += "\n\nДополнительные указания пользователя:\n" + custom_prompt.strip()
+        rendered += "\n\nДополнительные указания пользователя:\n" + _context_text(custom_prompt.strip())
     return rendered.strip() + "\n\n" + PLAN_OUTPUT_CONTRACT.strip()
 
 
@@ -2659,6 +2665,7 @@ def _render_role_prompt(workflow: WorkflowInDB, role: WorkflowRole,
     }
     notes = _operator_notes(workflow.id, role)
     values["human_input"] = _operator_notes_block(notes)
+    values = {name: _context_text(value) for name, value in values.items()}
     stage_text = ""
     if stage_row:
         stage_text = (
@@ -2698,7 +2705,7 @@ def _render_role_prompt(workflow: WorkflowInDB, role: WorkflowRole,
             "\n\n<предыдущий-запуск-исполнителя>\n"
             "Это отчёт предыдущей сессии того же workflow. Проверь его выводы "
             "по Git и фактическому состоянию проекта.\n"
-            + previous_executor
+            + _context_text(previous_executor)
             + "\n</предыдущий-запуск-исполнителя>"
         )
     # A template may place the notes itself; otherwise they go last, marked
@@ -2709,7 +2716,7 @@ def _render_role_prompt(workflow: WorkflowInDB, role: WorkflowRole,
             + "\n\n<указания-оператора>\n"
             "Это написал человек, возобновляя работу, и это главнее инструкций "
             "выше.\n"
-            + _operator_notes_block(notes)
+            + _context_text(_operator_notes_block(notes))
             + "\n</указания-оператора>"
         )
     return rendered.strip()

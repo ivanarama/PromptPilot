@@ -3162,6 +3162,11 @@ def _herdr_blocked_keyboard(ref: str) -> list:
     ]
 
 
+def _herdr_done_keyboard(ref: str):
+    return [[InlineKeyboardButton("\U0001f4fa \u042d\u043a\u0440\u0430\u043d", callback_data=f"hd_screen:{ref}"),
+             InlineKeyboardButton(REPLY_LABEL, callback_data=f"hd_reply:{ref}")]]
+
+
 def _screen_chrome(line: str) -> bool:
     """Terminal-UI furniture worth dropping on a phone: the full-width rules
     Claude Code draws around its input box eat a third of the message and wrap
@@ -3207,10 +3212,7 @@ async def _herdr_notify(bot, pane_id: str, status: str, agent: dict, machine: st
             text += f"\n\n{tail}"
     else:
         text = f"✅ herdr{where}: {label} в панели {pane_id} завершил работу"
-        buttons = [
-            [InlineKeyboardButton("📺 Экран", callback_data=f"hd_screen:{ref}"),
-             InlineKeyboardButton(REPLY_LABEL, callback_data=f"hd_reply:{ref}")],
-        ]
+        buttons = _herdr_done_keyboard(ref)
     title = (agent.get("terminal_title_stripped") or "").strip()
     if title and status != "blocked":
         text += f"\n{title[:120]}"
@@ -3257,13 +3259,32 @@ async def _herdr_watch_loop(bot):
             logger.warning("herdr watch tick упал: %s", e)
 
 
+def _herdr_completion_sequence(agent):
+    value = agent.get("completion_seq")
+    return agent.get("state_change_seq") if value is None else value
+
+
+def _herdr_watch_source(machine, host):
+    import hashlib
+    return hashlib.sha256(json.dumps([machine, host], sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+
+def _herdr_completion_notice(machine, pane, agent):
+    where = f" \u043d\u0430 {machine}" if machine else ""
+    title = str(agent.get("terminal_title_stripped") or "").strip()[:120]
+    return f"\u2705 herdr{where}: {_herdr_agent_label(agent)} \u0432 \u043f\u0430\u043d\u0435\u043b\u0438 {pane} \u0437\u0430\u0432\u0435\u0440\u0448\u0438\u043b \u0440\u0430\u0431\u043e\u0442\u0443" + (f"\n{title}" if title else "")
+
+
 async def _herdr_watch_tick(bot, notified, initialized):
         seen = set()
         for machine, host in _herdr_watch_targets():
             data = await _herdr_json("agent", "list", host=host)
             if data is None:
                 continue  # herdr not installed / server down / ssh — stay quiet
-            agents = ((data.get("result") or {}).get("agents")) or []
+            agents = (data.get("result") or {}).get("agents")
+            if not isinstance(agents, list):
+                continue  # A failed/unknown response cannot establish a baseline.
+
             current = {}
             for a in agents:
                 pane = a.get("pane_id")
@@ -3271,6 +3292,15 @@ async def _herdr_watch_tick(bot, notified, initialized):
                 if not pane or name.startswith("pp-t"):
                     continue  # PromptPilot's own tasks notify via the worker
                 current[pane] = a
+            completions = [
+                {"pane": pane, "name": agent.get("name") or "",
+                 "sequence": _herdr_completion_sequence(agent),
+                 "message": _herdr_completion_notice(machine, pane, agent)}
+                for pane, agent in current.items()
+                if agent.get("agent_status") == "done" and _herdr_completion_sequence(agent) is not None
+            ]
+            db.queue_herdr_completions(_herdr_watch_source(machine, host), completions,
+                                      [int(chat) for chat in list_authorized()], machine=machine)
             seen.update((machine, pane) for pane in current)
             now = time.monotonic()
             for pane, a in current.items():
@@ -3278,9 +3308,10 @@ async def _herdr_watch_tick(bot, notified, initialized):
                 status = a.get("agent_status")
                 if status in ("blocked", "done"):
                     prev = notified.get(key)  # (status, screen tail, seen at, completion seq)
-                    completion_seq = (
-                        a.get("completion_seq") or a.get("state_change_seq")
-                    ) if status == "done" else None
+                    completion_seq = _herdr_completion_sequence(a) if status == "done" else None
+                    if status == "done" and completion_seq is not None:
+                        notified[key] = (status, "", now, completion_seq)
+                        continue  # Delivery was durably queued with the cursor above.
                     if status == "done" and machine not in initialized:
                         # On bot startup, old kept sessions are already done.
                         # Remember them without re-announcing every task.
@@ -3685,7 +3716,8 @@ async def _notify_loop(bot):
                     # A blocked own task: same confirm/screen/reply buttons the
                     # foreign-agent watcher gets — not just an ssh suggestion.
                     ref = f"{note.get('machine') or ''}:{note['pane_id']}"
-                    kb = InlineKeyboardMarkup(_herdr_blocked_keyboard(ref))
+                    kb = InlineKeyboardMarkup(_herdr_done_keyboard(ref) if note.get("kind") == "herdr.done"
+                                              else _herdr_blocked_keyboard(ref))
                 await bot.send_message(chat_id=note["tg_chat_id"], text=_clip(note["message"]),
                                        reply_markup=kb)
                 db.mark_notification_sent(note["id"])

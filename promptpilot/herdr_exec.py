@@ -388,7 +388,7 @@ def _trim_transcript(raw: str, prompt: str) -> str:
     """Keep the transcript from the last echo of our prompt on, drop UI chrome."""
     lines = raw.splitlines()
 
-    start = 0
+    start = None
     # Keep the probe shorter than the narrowest supported terminal.  agy wraps
     # an echoed prompt at roughly 50 columns; a 60-character probe can never
     # occur on one physical transcript line.
@@ -402,6 +402,11 @@ def _trim_transcript(raw: str, prompt: str) -> str:
         if (probe and line.lstrip().startswith(("❯", ">", "›"))
                 and probe in prompt_line):
             start = i
+
+    if start is None:
+        # Without a recognized current-prompt boundary an old visible screen
+        # is not evidence of this attempt's answer or a current quota failure.
+        return ""
 
     # Workflow prompts contain verdict examples.  Do not return those examples
     # as task output (the generic verdict parser would otherwise accept the

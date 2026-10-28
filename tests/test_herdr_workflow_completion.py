@@ -14,6 +14,10 @@ from promptpilot.herdr_exec import (
 )
 
 
+def _current_review_screen(text):
+    return "> OneBase - REVIEW\n</promptpilot-workflow-contract>\n" + text
+
+
 def test_closing_workflow_verdict_ignores_echoed_contract_examples():
     transcript = """Prompt:
 ИТОГ: ГОТОВО — example
@@ -105,7 +109,7 @@ def test_pipeline_completion_survives_transient_idle_until_closing_verdict(
     def fake_run(args, host=None, timeout=None):
         calls.append(args[:2])
         if args[:2] == ["agent", "read"]:
-            return 0, None, next(reads)
+            return 0, None, _current_review_screen(next(reads))
         if args[:2] == ["agent", "get"]:
             status = next(statuses)
             return 0, {"result": {"agent": {"agent_status": status}}}, ""
@@ -141,7 +145,7 @@ def test_closing_verdict_does_not_finish_while_background_bar_is_running(
     def fake_run(args, host=None, timeout=None):
         calls.append(args[:2])
         if args[:2] == ["agent", "read"]:
-            return 0, None, next(reads)
+            return 0, None, _current_review_screen(next(reads))
         if args[:2] == ["agent", "get"]:
             return 0, {"result": {"agent": {"agent_status": "done"}}}, ""
         raise AssertionError(args)
@@ -155,7 +159,7 @@ def test_closing_verdict_does_not_finish_while_background_bar_is_running(
     )
 
     assert state == "done"
-    assert raw == "ИТОГ: ГОТОВО (команда завершена)"
+    assert raw.endswith("ИТОГ: ГОТОВО (команда завершена)")
     assert calls == [
         ["agent", "read"], ["agent", "get"], ["agent", "read"],
     ]
@@ -173,7 +177,7 @@ def test_required_completion_excludes_blocked_time_from_deadline(monkeypatch):
 
     def fake_run(args, host=None, timeout=None):
         if args[:2] == ["agent", "read"]:
-            return 0, None, next(reads)
+            return 0, None, _current_review_screen(next(reads))
         if args[:2] == ["agent", "get"]:
             status = next(statuses)
             return 0, {"result": {"agent": {
@@ -249,7 +253,7 @@ def test_run_in_herdr_requires_pipeline_verdict_end_to_end(monkeypatch):
                 4: "Проверки завершены.\nИТОГ: ГОТОВО (reviewed #1414)",
                 5: "Проверки завершены.\nИТОГ: ГОТОВО (reviewed #1414)",
             }
-            return 0, None, values[read_count]
+            return 0, None, _current_review_screen(values[read_count])
         if args[:2] == ["agent", "get"]:
             get_count += 1
             status = {1: "done", 2: "working", 3: "done"}[get_count]
@@ -660,3 +664,12 @@ def test_required_completion_without_verdict_fails_and_closes_owned_tab(
     assert len(closed) == 1
     assert closed[0][0].startswith("pp-t603-")
     assert closed[0][1:] == (["tab", "close", "tab-603"], None)
+
+
+def test_unknown_terminal_without_current_prompt_cannot_replay_screen():
+    from promptpilot.herdr_exec import _retry_reason
+    raw = "Old response: rate limit exceeded\n" + "\u0418\u0422\u041e\u0413: \u0413\u041e\u0422\u041e\u0412\u041e"
+    cleaned = _trim_transcript(raw, "A different current prompt")
+    assert cleaned == ""
+    assert _closing_workflow_verdict(cleaned) == ""
+    assert _retry_reason(cleaned) is None
