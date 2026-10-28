@@ -98,8 +98,10 @@ def configure(profiles, config, binary, health, procedures, release_id):
         else:
             command.extend(["-contract", str(procedures / ".claude/skills/review-queue/SKILL.md")])
     for queue in profile["queues"]:
-        if queue["id"] in {"triage", "review", "merge"}:
+        if queue["id"] in {"triage", "review", "merge", "fix"}:
             queue["item_blockers"] = True
+        if queue["id"] == "fix":
+            queue["item_error_holds"] = True
         if queue["id"] in {"review", "merge"}:
             # Empty/unchanged queues need no provider. A fresh work fingerprint
             # or successful predecessor still wakes the existing schedule.
