@@ -1358,6 +1358,12 @@ stderr, а текущее поведение закреплено `tests/test_ba
 budget-defer, снимается при смене маршрута, а следующий запуск повторяющейся
 REVIEW-серии снова получает её настроенный приоритет.
 
+Для подготовки типизированных REVIEW-отчётов доступна локальная команда
+`pp pipelinectl validate-routing-report --report report.json --head <SHA>`.
+Она проверяет только формат и hash; техническая передача остаётся выключенной.
+Формат, общие fixtures и оставшаяся парная приёмка описаны в
+[`docs/REVIEW_ROUTING_V1.md`](docs/REVIEW_ROUTING_V1.md).
+
 Встроенный `promptpilot.project_pipeline` реализует общий protocol v1. Проект
 задаёт `repository`, доверенный аккаунт, health-команду, base branch и required
 checks в `pipelinectl.json`. Обычный REVIEW получает ровно один кандидат и
