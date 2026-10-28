@@ -202,6 +202,12 @@ def register_target(task, number, head, stage):
     db.set_setting(key, json.dumps(baseline))
 
 
+def _hold_matches_identity(hold, identity):
+    # Older exact REVIEW holds omitted stage; prepare() treats them as review.
+    return all(hold.get(key, "review" if key == "stage" else None) == value
+               for key, value in identity.items())
+
+
 def record(conn, series_id, task_id, verdict, result):
     """Called inside recurrence's existing transaction; return True if held.
 
@@ -254,23 +260,28 @@ def record(conn, series_id, task_id, verdict, result):
             return False
     except (TypeError, ValueError, KeyError):
         return False
-    if exact_target:
-        old = holds.get(next(iter(numbers))) or {}
+    for number in numbers:
+        old = holds.get(number) or {}
+        identity = ({"head": target["head"], "stage": target.get("stage", "review")}
+                    if exact_target else {"fingerprint": states[number]})
         if (isinstance(old, dict)
-                and old.get("head") == target["head"]
-                and old.get("stage", "review") == target.get("stage", "review")
+                and _hold_matches_identity(old, identity)
                 and old.get("task_id") not in (None, task_id)
                 and type(old.get("at")) in {int, float}
                 and 0 <= time.time() - old["at"] < TTL):
-            # A different occurrence re-elected this still-held target.
-            # Its hold did not exclude it; retain the series repeat guard.
+            # A different occurrence re-elected a still-held measured target.
+            # Exact elections and fingerprint exclusions retain the same guard.
             return False
     # Preserve the initial timestamp: recurrence repair must not extend a hold.
     for number in numbers:
         old = holds.get(number) or {}
         identity = ({"head": target["head"], "stage": target.get("stage", "review")} if exact_target else
                     {"fingerprint": states[number]})
-        if any(old.get(key) != value for key, value in identity.items()):
+        live = (isinstance(old, dict) and type(old.get("at")) in {int, float}
+                and 0 <= time.time() - old["at"] < TTL)
+        old = old if isinstance(old, dict) else {}
+        if (not _hold_matches_identity(old, identity)
+                or (old.get("task_id") != task_id and not live)):
             holds[number] = {**identity, "at": time.time(),
                              "reason": reason, "task_id": task_id}
     holds = {number: hold for number, hold in holds.items()
