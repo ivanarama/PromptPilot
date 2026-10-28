@@ -39,6 +39,27 @@ def env(isolated_db, tmp_path, monkeypatch):
     return SimpleNamespace(db=isolated_db, root=tmp_path, flows=flows_home)
 
 
+def _current_call(call, item_id, *args, **kwargs):
+    kwargs.setdefault("expected_version", flows.get_item(item_id)["version"])
+    return call(item_id, *args, **kwargs)
+
+
+def decide_current(item_id, *args, **kwargs):
+    return _current_call(flows.decide, item_id, *args, **kwargs)
+
+
+def retry_current(item_id, *args, **kwargs):
+    return _current_call(flows.retry, item_id, *args, **kwargs)
+
+
+def skip_current(item_id, *args, **kwargs):
+    return _current_call(flows.skip, item_id, *args, **kwargs)
+
+
+def cancel_current(item_id, *args, **kwargs):
+    return _current_call(flows.cancel, item_id, *args, **kwargs)
+
+
 def game_flow(root: Path, **overrides) -> dict:
     flow = {
         "name": "game",
@@ -152,10 +173,10 @@ def test_request_goes_from_triage_to_merge_with_people_deciding(env):
                               "title": "Дракон", "reason": "Годно [ссылка]", "stage": "принято"}]
     approval = [note for note in notes(env) if note["flow_ref"]]
     assert [(note["tg_chat_id"], note["flow_ref"]) for note in approval] == [
-        (111, f"{item['id']}:approve")]
+        (111, f"{item['id']}:approval:{flows.get_item(item['id'])['version']}")]
     assert "Годно http://evil.example" in approval[0]["message"]  # the person sees it all
 
-    flows.decide(item["id"], "approve", note="Только без огня", by="test")
+    decide_current(item["id"], "approve", note="Только без огня", by="test")
     advance(flow, item["id"])
     implement = pending_task(env, item["id"])
     assert implement.rights == "write"
@@ -173,7 +194,7 @@ def test_request_goes_from_triage_to_merge_with_people_deciding(env):
     merge = advance(flow, item["id"])
     assert merge["status"] == "waiting_human" and merge["wait"]["approval"] == "merge_ok"
 
-    flows.decide(item["id"], "approve", by="test")
+    decide_current(item["id"], "approve", by="test")
     done = advance(flow, item["id"])
     assert done["status"] == "done"
     flows.refresh_publications({flow.name: flow})
@@ -204,11 +225,11 @@ def test_owner_rejection_ends_the_item(env):
     finish_task(env, item["id"], answer(verdict="ПРИНЯТЬ", reason="ок", priority=5))
     advance(flow, item["id"])
 
-    flows.decide(item["id"], "reject", note="не сейчас", by="test")
+    decide_current(item["id"], "reject", note="не сейчас", by="test")
 
     assert advance(flow, item["id"])["status"] == "rejected"
     with pytest.raises(flows.FlowError):
-        flows.decide(item["id"], "approve")
+        decide_current(item["id"], "approve")
     flows.refresh_publications({flow.name: flow})
     feed = json.loads((env.root / "site" / "feed.json").read_text(encoding="utf-8"))
     assert feed["items"][0]["stage"] == "отклонено"
@@ -237,7 +258,7 @@ def test_stale_button_is_refused(env):
     advance(flow, item["id"])
 
     with pytest.raises(flows.FlowError, match="неактуально"):
-        flows.decide(item["id"], "approve", step_id="merge_ok")
+        decide_current(item["id"], "approve", step_id="merge_ok")
     assert flows.get_item(item["id"])["status"] == "waiting_human"
 
 
@@ -256,9 +277,9 @@ def test_bad_answer_is_retried_then_handed_to_a_person(env):
     stuck = advance(flow, item["id"])
     assert stuck["status"] == "needs_human"
     assert "МОЖЕТ БЫТЬ" in stuck["error"]
-    assert [note["flow_ref"] for note in notes(env)] == [f"{item['id']}:"]
+    assert [note["flow_ref"] for note in notes(env)] == [f"{item['id']}:action:{flows.get_item(item['id'])['version']}"]
 
-    flows.retry(item["id"], by="test")
+    retry_current(item["id"], by="test")
     advance(flow, item["id"])
     assert pending_task(env, item["id"]).id not in (first.id, retried.id)
 
@@ -269,22 +290,22 @@ def test_failed_task_can_be_skipped_but_an_approval_cannot(env):
     advance(flow, item["id"])
     finish_task(env, item["id"], answer(verdict="ПРИНЯТЬ", reason="ок", priority=5))
     advance(flow, item["id"])
-    flows.decide(item["id"], "approve")
+    decide_current(item["id"], "approve")
     advance(flow, item["id"])
     finish_task(env, item["id"], "упал", fail=True)
     assert advance(flow, item["id"])["status"] == "needs_human"
 
-    flows.skip(item["id"], by="test")
+    skip_current(item["id"], by="test")
     after = advance(flow, item["id"])  # check fails (nothing done) → back to implement
     assert after["step_id"] == "implement"
     with pytest.raises(flows.FlowError):
-        flows.skip(item["id"])  # not stuck
+        skip_current(item["id"])  # not stuck
 
     at_approval = flows.get_item(item["id"])
     flows._goto(flow, at_approval, 3)
     flows._stop(flow, at_approval, "что-то сломалось")
     with pytest.raises(flows.FlowError, match="согласование"):
-        flows.skip(item["id"])
+        skip_current(item["id"])
 
 
 @pytest.mark.parametrize(("text", "error"), [
@@ -455,7 +476,7 @@ def test_cancel_stops_the_task_of_the_step(env):
     advance(flow, item["id"])
     task = pending_task(env, item["id"])
 
-    flows.cancel(item["id"], by="test")
+    cancel_current(item["id"], by="test")
 
     assert env.db.get_task(task.id).status.value == "cancelled"
     assert advance(flow, item["id"])["status"] == "cancelled"
@@ -467,7 +488,7 @@ def test_exhausted_repeat_asks_a_person_and_retry_gives_one_more_round(env):
     advance(flow, item["id"])
     finish_task(env, item["id"], answer(verdict="ПРИНЯТЬ", reason="ок", priority=5))
     advance(flow, item["id"])
-    flows.decide(item["id"], "approve")
+    decide_current(item["id"], "approve")
     advance(flow, item["id"])
     finish_task(env, item["id"], "раз")
     advance(flow, item["id"])  # check fails → round 1
@@ -476,7 +497,7 @@ def test_exhausted_repeat_asks_a_person_and_retry_gives_one_more_round(env):
     stuck = advance(flow, item["id"])  # check fails again; max 1 round
     assert stuck["status"] == "needs_human" and stuck["wait"] == {"exhausted": "check"}
 
-    flows.retry(item["id"])
+    retry_current(item["id"])
     again = advance(flow, item["id"])
     assert again["step_id"] == "implement" and again["wait"]["task_id"]
 
@@ -494,7 +515,13 @@ def test_items_follow_their_step_when_the_flow_file_changes(env):
     changed["steps"].insert(1, {"id": "note", "kind": "finish", "status": "failed",
                                 "when": {"step": "triage", "field": "priority", "in": [10]}})
     flow = install(env, changed)
-    flows.decide(item["id"], "approve", flows={flow.name: flow})
+    old_question = flows.get_item(item["id"])
+    with pytest.raises(flows.FlowError, match="context changed"):
+        decide_current(item["id"], "approve", flows={flow.name: flow})
+    refreshed = advance(flow, item["id"])
+    assert refreshed["version"] > old_question["version"]
+    assert refreshed["wait"]["flow_revision"] != old_question["wait"]["flow_revision"]
+    decide_current(item["id"], "approve", flows={flow.name: flow})
 
     assert advance(flow, item["id"])["step_id"] == "implement"
 
@@ -542,6 +569,16 @@ class FakeIMAP:
     def select(self, folder, readonly=False):
         assert readonly, "the mailbox is read without marking letters read"
         return "OK", [str(len(self.raw)).encode()]
+
+    def response(self, key):
+        assert key == "UIDVALIDITY"
+        return "UIDVALIDITY", [b"1"]
+
+    def uid(self, command, *args):
+        if command == "search":
+            return self.search(*args)
+        assert command == "fetch"
+        return self.fetch(*args)
 
     def search(self, charset, *criteria):
         return "OK", [" ".join(str(i + 1) for i in range(len(self.raw))).encode()]
@@ -674,10 +711,10 @@ def test_api_lists_flows_and_decides(env):
     items = call("GET", "/api/flows/items?status=waiting_human").json()
     detail = call("GET", f"/api/flows/items/{item['id']}").json()
     wrong = call("POST", f"/api/flows/items/{item['id']}/decision",
-                 json={"decision": "approve", "step": "merge_ok"})
+                 json={"decision": "approve", "step": "merge_ok", "expected_version": detail["version"]})
     decided = call("POST", f"/api/flows/items/{item['id']}/decision",
-                   json={"decision": "approve", "note": "ок", "step": "approve"})
-    again = call("POST", f"/api/flows/items/{item['id']}/decision", json={"decision": "approve"})
+                   json={"decision": "approve", "note": "ок", "step": "approve", "expected_version": detail["version"]})
+    again = call("POST", f"/api/flows/items/{item['id']}/decision", json={"decision": "approve", "expected_version": detail["version"]})
 
     assert [entry["name"] for entry in listed["flows"]] == ["game"] and "bad.json" in listed["errors"]
     assert [entry["id"] for entry in items] == [item["id"]] and "data" not in items[0]
@@ -729,13 +766,13 @@ def test_example_kt_flow_is_valid():
 
 
 def test_bot_buttons_for_approvals_and_stuck_items():
-    approval = bot._flow_keyboard("7:approve").inline_keyboard[0]
-    stuck = bot._flow_keyboard("7:").inline_keyboard[0]
+    approval = bot._flow_keyboard("7:approval:12").inline_keyboard[0]
+    stuck = bot._flow_keyboard("7:action:12").inline_keyboard[0]
 
-    assert [button.callback_data for button in approval] == ["flowdec:7:approve:a",
-                                                             "flowdec:7:approve:r"]
-    assert [button.callback_data for button in stuck] == ["flowact:7:retry", "flowact:7:skip",
-                                                          "flowact:7:cancel"]
+    assert [button.callback_data for button in approval] == ["flowdec2:7:12:a",
+                                                             "flowdec2:7:12:r"]
+    assert [button.callback_data for button in stuck] == ["flowact2:7:12:retry", "flowact2:7:12:skip",
+                                                          "flowact2:7:12:cancel"]
 
 
 def test_bot_button_decides_the_approval(env, monkeypatch):
@@ -745,7 +782,7 @@ def test_bot_button_decides_the_approval(env, monkeypatch):
     finish_task(env, item["id"], answer(verdict="ПРИНЯТЬ", reason="ок", priority=5))
     advance(flow, item["id"])
     monkeypatch.setattr(bot, "is_authorized", lambda _user_id: True)
-    query = SimpleNamespace(data=f"flowdec:{item['id']}:approve:a", answer=AsyncMock(),
+    query = SimpleNamespace(data=f"flowdec2:{item['id']}:{flows.get_item(item['id'])['version']}:a", answer=AsyncMock(),
                             edit_message_reply_markup=AsyncMock(),
                             message=SimpleNamespace(reply_text=AsyncMock()))
     update = SimpleNamespace(effective_user=SimpleNamespace(id=5, username="owner"),
@@ -755,8 +792,11 @@ def test_bot_button_decides_the_approval(env, monkeypatch):
     asyncio.run(bot.cb_flow(update, None))  # pressed twice
 
     decided = flows.get_item(item["id"])
-    assert decided["data"]["steps"]["approve"] == {"decision": "approve", "note": "",
-                                                   "by": "telegram:owner"}
+    approval = decided["data"]["steps"]["approve"]
+    assert {key: approval[key] for key in ("decision", "note", "by")} == {
+        "decision": "approve", "note": "", "by": "telegram:owner"}
+    assert approval["approval_version"] == int(query.data.split(":")[2])
+    assert len(approval["flow_revision"]) == 64
     assert query.answer.await_args_list[-1].kwargs.get("show_alert") is True
 
 

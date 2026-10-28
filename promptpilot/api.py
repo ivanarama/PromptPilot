@@ -19,7 +19,7 @@ from urllib.parse import urlsplit
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 import re as _re
 
@@ -1928,7 +1928,13 @@ def api_projects():
 
 # --- Flows (маршруты заявок) ---
 
-class FlowDecisionRequest(BaseModel):
+class FlowActionRequest(BaseModel):
+    expected_version: int = Field(ge=0, strict=True)
+    confirm_command_stopped: bool = False
+    note: str = ""
+
+
+class FlowDecisionRequest(FlowActionRequest):
     decision: str
     note: str = ""
     step: Optional[str] = None  # the approval the caller saw; stale buttons are refused
@@ -1987,16 +1993,19 @@ def api_flow_item(item_id: int):
 def api_flow_decision(item_id: int, body: FlowDecisionRequest):
     if body.decision not in ("approve", "reject"):
         raise HTTPException(400, "decision: approve | reject")
-    item = _flow_call(flows.decide, item_id, body.decision, body.note, "web", step_id=body.step)
+    item = _flow_call(flows.decide, item_id, body.decision, body.note, "web", step_id=body.step,
+                      expected_version=body.expected_version)
     return flows.summary(item)
 
 
 @app.post("/api/flows/items/{item_id}/{action}")
-def api_flow_action(item_id: int, action: str):
+def api_flow_action(item_id: int, action: str, body: FlowActionRequest):
     calls = {"retry": flows.retry, "skip": flows.skip, "cancel": flows.cancel}
     if action not in calls:
         raise HTTPException(404, "Действие: retry | skip | cancel")
-    return flows.summary(_flow_call(calls[action], item_id, "web"))
+    return flows.summary(_flow_call(calls[action], item_id, "web",
+                                    expected_version=body.expected_version,
+                                    confirm_command_stopped=body.confirm_command_stopped, note=body.note))
 
 
 @app.post("/api/flows/{name}/items", status_code=201)

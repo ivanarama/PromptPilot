@@ -28,20 +28,26 @@ twice.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import shutil
+import signal
+import threading
+import uuid
 import subprocess
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from types import MappingProxyType
 from typing import Annotated, Any, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from . import config, db
 from .models import TaskCreate, TaskRights
+from .process_tree import OwnedProcess
 
 RIGHTS_ORDER = {"none": 0, "read": 1, "write": 2, "full": 3}
 # Widest rights of an agent step (before, after) a human approval.
@@ -53,7 +59,7 @@ TRUST_LIMITS = {
 }
 FINISHED = ("done", "rejected", "failed", "cancelled")
 STATUS_WORDS = {
-    "active": "в работе", "waiting_human": "ждёт решения", "needs_human": "нужен человек",
+    "cancelling": "останавливается", "active": "в работе", "waiting_human": "ждёт решения", "needs_human": "нужен человек",
     "done": "готово", "rejected": "отклонено", "failed": "не вышло", "cancelled": "снято",
 }
 RESULT_BEGIN = "PP_RESULT_JSON_BEGIN"
@@ -643,13 +649,17 @@ def read_material(flow: FlowDef, material: Material, context: dict) -> str:
     return _outline(root, material.depth, material.max)
 
 
-def agent_prompt(flow: FlowDef, step: AgentStep, item: dict) -> str:
+def agent_prompt(flow: FlowDef, step: AgentStep, item: dict, *, prompt_buffers=None) -> str:
     context = _context(flow, item)
     context["material"] = {name: read_material(flow, material, context)
                            for name, material in step.material.items()}
     template = step.prompt
     if step.prompt_file:
-        template = (Path(flow.source_dir) / step.prompt_file).read_text(encoding="utf-8-sig")
+        buffers = _prompt_buffers(flow) if prompt_buffers is None else prompt_buffers
+        try:
+            template = buffers[step.id].decode("utf-8-sig")
+        except (KeyError, UnicodeError) as exc:
+            raise FlowError("The frozen prompt template is missing or invalid UTF-8") from exc
     frame, framed = None, []
     if flow.trust != "owner":
         steps = {candidate.id: candidate for candidate in flow.steps}
@@ -751,7 +761,7 @@ def summary(item: dict) -> dict:
     wait = item["wait"] or {}
     return {
         **{key: item[key] for key in ("id", "flow", "status", "step_id", "title", "author",
-                                      "error", "created_at", "updated_at")},
+                                      "error", "created_at", "updated_at", "version")},
         "approval": wait.get("approval"),
         "task_id": wait.get("task_id"),
     }
@@ -773,26 +783,46 @@ def item_exists(flow: str, dedup_key: str) -> bool:
                             (flow, dedup_key)).fetchone() is not None
 
 
+class _AdmissionDeferred(FlowError):
+    pass
+
+
 def create_item(flow: FlowDef, request: dict, *, dedup_key: str | None = None,
-                title: str = "", author: str = "", by: str = "") -> dict | None:
-    """Queue one request; None when this dedup key was already taken."""
+                title: str = "", author: str = "", by: str = "", conn=None,
+                enforce_limits: bool = False, today: date | None = None) -> dict | None:
+    """Deduplication, limits and insertion share the caller's write transaction."""
+    if conn is None:
+        with db._connect(immediate=True) as owned:
+            return create_item(flow, request, dedup_key=dedup_key, title=title, author=author,
+                               by=by, conn=owned, enforce_limits=enforce_limits, today=today)
+    if dedup_key is not None and conn.execute(
+            "SELECT 1 FROM flow_items WHERE flow=? AND dedup_key=?",
+            (flow.name, dedup_key)).fetchone():
+        return None
+    if enforce_limits:
+        over_day = (flow.limits.per_day
+                    and created_today(flow.name, today=today, conn=conn) >= flow.limits.per_day)
+        over_author = (flow.limits.per_author and author
+                       and created_today(flow.name, author, today=today, conn=conn) >= flow.limits.per_author)
+        if over_day or over_author:
+            raise _AdmissionDeferred("Incoming request remains deferred by its admission limit")
     data = {"input": request, "steps": {}, "rounds": {}}
-    with db._connect(immediate=True) as conn:
-        cursor = conn.execute(
-            """INSERT OR IGNORE INTO flow_items
-               (flow, status, step_index, step_id, trust, dedup_key, author, title, data_json,
-                created_at, updated_at)
-               VALUES (?, 'active', 0, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (flow.name, flow.steps[0].id, flow.trust, dedup_key, author[:60], title[:200],
-             json.dumps(data, ensure_ascii=False), _now(), _now()))
-        if not cursor.rowcount:
-            return None
-        item_id = cursor.lastrowid
-        _event(conn, item_id, "item.created", {"by": by or "input"}, None)
-        return get_item(item_id, conn=conn)
+    cursor = conn.execute(
+        """INSERT OR IGNORE INTO flow_items
+           (flow, status, step_index, step_id, trust, dedup_key, author, title, data_json,
+            created_at, updated_at)
+           VALUES (?, 'active', 0, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (flow.name, flow.steps[0].id, flow.trust, dedup_key, author[:60], title[:200],
+         json.dumps(data, ensure_ascii=False), _now(), _now()))
+    if not cursor.rowcount:
+        return None
+    item_id = cursor.lastrowid
+    _event(conn, item_id, "item.created", {"by": by or "input"}, None)
+    return get_item(item_id, conn=conn)
 
 
-def created_today(flow: str, author: str | None = None, today: date | None = None) -> int:
+def created_today(flow: str, author: str | None = None, today: date | None = None,
+                  *, conn=None) -> int:
     day = today or date.today()
     start = datetime.combine(day, datetime.min.time()).astimezone(timezone.utc).isoformat()
     end = datetime.combine(day + timedelta(days=1),
@@ -802,8 +832,10 @@ def created_today(flow: str, author: str | None = None, today: date | None = Non
     if author is not None:
         query += " AND author = ?"
         params.append(author[:60])
-    with db._connect() as conn:
+    if conn is not None:
         return int(conn.execute(query, params).fetchone()[0])
+    with db._connect() as owned:
+        return int(owned.execute(query, params).fetchone()[0])
 
 
 def _flow_context(flow: FlowDef) -> dict:
@@ -848,13 +880,44 @@ def advance_item(item_id: int, flows: dict[str, FlowDef] | None = None,
         flows, _errors = load_flows()
     for _ in range(max_steps):
         item = get_item(item_id)
-        if item is None or item["status"] != "active" or item["flow"] not in flows:
+        if item is None or item["flow"] not in flows:
+            return item
+        if item["status"] == "waiting_human":
+            flow = flows[item["flow"]]
+            if (item["wait"] or {}).get("flow_revision") == _flow_revision(flow):
+                return item
+            index = _position(flow, item)
+            if index is None or index >= len(flow.steps) or not isinstance(flow.steps[index], HumanStep):
+                _stop(flow, item, "Route changed; the previous approval no longer applies")
+            else:
+                _ask_human(flow, item, flow.steps[index])
+            return get_item(item_id)
+        if item["status"] == "cancelling":
+            wait = item["wait"] or {}
+            if wait.get("command"):
+                _command_abandoned(flows[item["flow"]], item, None)
+            elif wait.get("task_id"):
+                task = db.get_task(wait["task_id"])
+                if task and task.status.value in ("completed", "failed", "cancelled"):
+                    item["status"], item["wait"] = "cancelled", None
+                    _commit(item, [("item.cancelled", {"task_stopped": True}, item["step_id"])])
+                elif task is None:
+                    _stop(flows[item["flow"]], item, "Previous task termination is unverified",
+                          wait={**wait, "ambiguous_task": True})
+            return get_item(item_id)
+        if item["status"] != "active":
             return item
         try:
             if not _step_once(flows[item["flow"]], item):
                 return get_item(item_id)
         except _Stale:
             continue
+        except FlowError as exc:
+            try:
+                _stop(flows[item["flow"]], item, str(exc))
+            except _Stale:
+                continue
+            return get_item(item_id)
     item = get_item(item_id)
     if item and item["status"] == "active":
         try:
@@ -933,6 +996,16 @@ def _after_step(flow: FlowDef, item: dict, index: int, step, payload: dict | Non
 
 def _stop(flow: FlowDef, item: dict, reason: str, wait: dict | None = None) -> None:
     """The item needs a person: retry, skip or cancel it (UI, bot, CLI)."""
+    previous = item["wait"] or {}
+    if wait is None and previous.get("command"):
+        wait = {**previous, "ambiguous": True}
+    if wait is None and previous.get("task_id"):
+        task_id = previous["task_id"]
+        task = db.get_task(task_id)
+        if task and task.status.value not in ("completed", "failed", "cancelled"):
+            if not db.cancel_task(task_id):
+                db.request_cancel(task_id)
+                wait = {"task_id": task_id, "stopping": True}
     item["status"], item["wait"], item["error"] = "needs_human", wait, reason[:2000]
     _commit(item, [("item.needs_human", {"reason": reason[:2000]}, item["step_id"])])
     _notify_stuck(flow, item)
@@ -947,7 +1020,62 @@ def _end(flow: FlowDef, item: dict, status: str, step, note: str = "") -> None:
                     + (f"\n{note}" if note else ""))
 
 
+def _prompt_buffers(flow: FlowDef):
+    frozen = {}
+    for step in flow.steps:
+        if isinstance(step, AgentStep) and step.prompt_file:
+            path = Path(flow.source_dir or ".") / step.prompt_file
+            try:
+                frozen[step.id] = path.read_bytes()
+            except OSError as exc:
+                raise FlowError(f"Cannot read route prompt template: {path}") from exc
+    return MappingProxyType(frozen)
+
+
+def _flow_revision(flow: FlowDef, *, prompt_buffers=None) -> str:
+    buffers = _prompt_buffers(flow) if prompt_buffers is None else prompt_buffers
+    templates = {step_id: hashlib.sha256(data).hexdigest() for step_id, data in buffers.items()}
+    context = {"source_dir": str(Path(flow.source_dir or ".").resolve()),
+               "literal_flow_dir": flow.source_dir}
+    payload = json.dumps(["pp-flow-approval-context-v1", flow.model_dump(mode="json"), context, templates],
+                         sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _check_agent_admission(conn, flow: FlowDef, item: dict, step: AgentStep, *, prompt_buffers) -> None:
+    # The item's original trust cannot be raised by a later route edit.
+    if item["trust"] not in TRUST_LIMITS:
+        raise FlowError("Unknown persisted request trust; execution refused")
+    if step.rights is None:
+        if item["trust"] == flow.trust == "owner":
+            return
+        raise FlowError("Explicit agent rights are required for this request")
+    position = flow.index_of(step.id)
+    qualifying = {candidate.id for candidate in flow.steps[:position]
+                  if isinstance(candidate, HumanStep) and candidate.when is None
+                  and candidate.on_reject == "reject"}
+    revision = _flow_revision(flow, prompt_buffers=prompt_buffers)
+    approved = False
+    for event in conn.execute(
+            "SELECT step_id, payload_json FROM flow_events "
+            "WHERE item_id=? AND event_type='approval.decided' ORDER BY seq DESC",
+            (item["id"],)).fetchall():
+        payload = db._json_load(event["payload_json"])
+        if (event["step_id"] in qualifying and payload.get("decision") == "approve"
+                and payload.get("flow_revision") == revision):
+            approved = True
+            break
+    phase = 1 if approved else 0
+    ceiling = min(RIGHTS_ORDER[TRUST_LIMITS[item["trust"]][phase]],
+                  RIGHTS_ORDER[TRUST_LIMITS[flow.trust][phase]])
+    if RIGHTS_ORDER[step.rights] > ceiling:
+        raise FlowError("Current route and request require a new human approval before these rights")
+
+
 def _start_agent(flow: FlowDef, item: dict, step: AgentStep) -> bool:
+    buffers = _prompt_buffers(flow)
+    with db._connect() as conn:
+        _check_agent_admission(conn, flow, item, step, prompt_buffers=buffers)
     provider = step.provider or config.DEFAULT_CLI
     if step.rights and not config.rights_supported(config.load_providers().get(provider, {}),
                                                    step.rights):
@@ -955,7 +1083,7 @@ def _start_agent(flow: FlowDef, item: dict, step: AgentStep) -> bool:
                           f"«{step.rights}»")
         return False
     try:
-        prompt = agent_prompt(flow, step, item)
+        prompt = agent_prompt(flow, step, item, prompt_buffers=buffers)
         working_dir = render(step.working_dir, _context(flow, item)) or None
         if working_dir:
             Path(working_dir).mkdir(parents=True, exist_ok=True)
@@ -963,6 +1091,10 @@ def _start_agent(flow: FlowDef, item: dict, step: AgentStep) -> bool:
         _stop(flow, item, f"шаг «{step.id}»: {type(exc).__name__}: {exc}")
         return False
     with db._connect(immediate=True) as conn:
+        current = get_item(item["id"], conn=conn)
+        if current is None or current["version"] != item["version"] or current["status"] != "active":
+            raise _Stale(item["id"])
+        _check_agent_admission(conn, flow, current, step, prompt_buffers=buffers)
         task = db._insert_task(conn, TaskCreate(
             prompt=prompt, provider=step.provider, model=step.model, effort=step.effort,
             rights=step.rights, working_dir=working_dir, priority=step.priority,
@@ -1015,7 +1147,8 @@ def _ask_human(flow: FlowDef, item: dict, step: HumanStep) -> bool:
     text = render(step.text, context)
     shown = {reference: _lookup(context, reference) for reference in step.show}
     item["status"] = "waiting_human"
-    item["wait"] = {"approval": step.id, "text": text, "show": shown}
+    item["wait"] = {"approval": step.id, "text": text, "show": shown,
+                    "flow_revision": _flow_revision(flow)}
     _commit(item, [("approval.requested", {}, step.id)])
     if step.notify:
         body = [f"📋 {_label(flow, item)}", text]
@@ -1025,68 +1158,135 @@ def _ask_human(flow: FlowDef, item: dict, step: HumanStep) -> bool:
                 shown_text = (shown_text[:SHOW_IN_CHAT] + f"\n… целиком — «📨 Заявки» в веб-интерфейсе"
                               f" или pp flows show {item['id']}")
             body.append(f"— {reference}:\n{shown_text}")
-        _send(flow, "\n\n".join(part for part in body if part), f"{item['id']}:{step.id}")
+        _send(flow, "\n\n".join(part for part in body if part), f"{item['id']}:approval:{item['version']}")
     return False
+
+
+class _CommandCleanupUncertain(FlowError):
+    pass
+
+
+def _command_claim(item_id, owner, *, conn=None):
+    item = get_item(item_id, conn=conn)
+    if item is None or (item["wait"] or {}).get("owner") != owner:
+        raise _Stale(item_id)
+    return item
+
+
+def _park_command(flow, item_id, owner, reason, *, ambiguous):
+    with db._connect(immediate=True) as conn:
+        current = _command_claim(item_id, owner, conn=conn)
+        wait = dict(current["wait"] or {}) if ambiguous else {"command_cleanup_confirmed": True}
+        if ambiguous:
+            wait["ambiguous"] = True
+        current["status"], current["wait"], current["error"] = "needs_human", wait, reason
+        _commit(current, [("command.cleanup_uncertain" if ambiguous else "command.interrupted",
+                           {"reason": reason}, current["step_id"])], conn)
+    _notify_stuck(flow, current)
 
 
 def _run_command(flow: FlowDef, item: dict, index: int, step: CommandStep) -> bool:
     context = _context(flow, item)
     argv = [render(part, context) for part in step.run]
     cwd = render(step.cwd, context) or None
+    owner = uuid.uuid4().hex
     until = datetime.now(timezone.utc) + timedelta(seconds=step.timeout + 120)
-    # Claim the step first: whoever wins the compare-and-set runs the command.
-    item["wait"] = {"command": step.id, "until": until.isoformat()}
+    item["wait"] = {"command": step.id, "owner": owner, "until": until.isoformat()}
     _commit(item, [("command.started", {"argv": argv}, step.id)])
     env = {**os.environ, "PP_FLOW": flow.name, "PP_FLOW_ITEM": str(item["id"])}
-    code, stdout, output = _execute(argv, cwd, step.timeout, env)
-    ok = code in step.ok_codes and (not step.require_output
-                                    or re.search(step.require_output, output) is not None)
-    result: dict[str, Any] = {"exit_code": code, "ok": ok, "output": output[-step.output_limit:]}
-    if step.output_json and code in step.ok_codes:
-        try:
-            parsed = json.loads(stdout)
-        except ValueError:
-            parsed = None
-        if isinstance(parsed, dict):
-            result.update({key: value for key, value in parsed.items() if key not in result})
-    item["data"]["steps"][step.id] = result
-    if not ok and step.on_error != "continue":
-        reason = f"шаг «{step.id}»: команда вернула {code}: {output[-300:]}"
-        if step.on_error == "fail":
-            _end(flow, item, "failed", step, note=reason)
-        else:
-            _stop(flow, item, reason)
-        return False
-    _after_step(flow, item, index, step, {"exit_code": code, "ok": ok})
-    return True
 
+    def keep_running():
+        current = _command_claim(item["id"], owner)
+        return current["status"] == "active" and not (current["wait"] or {}).get("ambiguous")
 
-def _execute(argv: list[str], cwd: str | None, timeout: int, env: dict) -> tuple[int, str, str]:
-    program = shutil.which(argv[0]) or argv[0]
     try:
-        completed = subprocess.run(
-            [program, *argv[1:]], cwd=cwd, env=env, capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=timeout, stdin=subprocess.DEVNULL)
-    except subprocess.TimeoutExpired as exc:
-        partial = "".join(part.decode("utf-8", "replace") if isinstance(part, bytes) else part
-                          for part in (exc.stdout, exc.stderr) if part)
-        return 124, "", f"(прервано: дольше {timeout} с)\n{partial}"
+        code, stdout, output = _execute(argv, cwd, step.timeout, env, keep_running=keep_running)
+    except _CommandCleanupUncertain as exc:
+        _park_command(flow, item["id"], owner, str(exc), ambiguous=True)
+        return False
+    except (KeyboardInterrupt, SystemExit):
+        # _execute has already terminated/reaped its owned tree in finally.
+        _park_command(flow, item["id"], owner, "Command interrupted; owned processes stopped", ambiguous=False)
+        raise
+    with db._connect(immediate=True) as conn:
+        item = _command_claim(item["id"], owner, conn=conn)
+        if item["status"] == "cancelling":
+            item["status"], item["wait"], item["error"] = "cancelled", None, None
+            _commit(item, [("item.cancelled", {"command_stopped": True}, step.id)], conn)
+            return False
+        if item["status"] != "active":
+            item["wait"] = {"command_cleanup_confirmed": True}
+            _commit(item, [("command.cleanup_confirmed", {}, step.id)], conn)
+            return False
+        ok = code in step.ok_codes and (not step.require_output
+                                       or re.search(step.require_output, output) is not None)
+        result: dict[str, Any] = {"exit_code": code, "ok": ok, "output": output[-step.output_limit:]}
+        if step.output_json and code in step.ok_codes:
+            try:
+                parsed = json.loads(stdout)
+            except ValueError:
+                parsed = None
+            if isinstance(parsed, dict):
+                result.update({key: value for key, value in parsed.items() if key not in result})
+        item["data"]["steps"][step.id] = result
+        if not ok and step.on_error != "continue":
+            reason = f"Command {step.id} returned {code}: {output[-300:]}"
+            item["status"] = "failed" if step.on_error == "fail" else "needs_human"
+            item["wait"], item["error"] = None, reason
+            _commit(item, [("item.failed" if step.on_error == "fail" else "item.needs_human",
+                           {"reason": reason}, step.id)], conn)
+        else:
+            _after_step(flow, item, index, step, {"exit_code": code, "ok": ok}, conn=conn)
+    if item["status"] == "needs_human":
+        _notify_stuck(flow, item)
+    return item["status"] == "active"
+
+
+def _execute(argv: list[str], cwd: str | None, timeout: int, env: dict,
+             *, keep_running=None) -> tuple[int, str, str]:
+    program = shutil.which(argv[0]) or argv[0]
+    tree = None
+    deadline = time.monotonic() + timeout
+    try:
+        tree = OwnedProcess.start(
+            [program, *argv[1:]], cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+        process = tree.process
+        while True:
+            remaining = deadline - time.monotonic()
+            cancelled = keep_running is not None and not keep_running()
+            if cancelled or remaining <= 0:
+                tree.terminate()
+                try:
+                    stdout, stderr = process.communicate(timeout=10)
+                except subprocess.TimeoutExpired as exc:
+                    raise _CommandCleanupUncertain("Owned command termination could not be verified") from exc
+                return (130 if cancelled else 124), stdout or "", (stdout or "") + (stderr or "")
+            try:
+                stdout, stderr = process.communicate(timeout=min(0.2, remaining))
+                return process.returncode, stdout or "", (stdout or "") + (stderr or "")
+            except subprocess.TimeoutExpired:
+                continue
     except OSError as exc:
         return 127, "", f"{type(exc).__name__}: {exc}"
-    stdout = completed.stdout or ""
-    return completed.returncode, stdout, stdout + (completed.stderr or "")
+    finally:
+        if tree is not None:
+            try:
+                tree.close()
+                tree.process.wait(timeout=10)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                raise _CommandCleanupUncertain("Owned command cleanup is unverified; manual inspection required") from exc
 
 
 def _command_abandoned(flow: FlowDef, item: dict, step) -> bool:
-    """A claimed command whose runner died never reports back: hand it to a person."""
+    """An unknown old owner never permits an ordinary retry or skip."""
     until = datetime.fromisoformat(item["wait"].get("until") or _now())
     if datetime.now(timezone.utc) > until:
-        _stop(flow, item, f"шаг «{step.id}»: команда не завершилась — процесс, который её "
-                          "запускал, прервался")
+        wait = {**item["wait"], "ambiguous": True}
+        _stop(flow, item, f"Command {item['step_id']}: process прервался; verify termination before recovery", wait=wait)
     return False
 
-
-# --- people ------------------------------------------------------------------------------------
 
 def _label(flow: FlowDef, item: dict) -> str:
     return f"{flow.title or flow.name} · заявка #{item['id']}: {item['title'] or '(без названия)'}"
@@ -1116,7 +1316,7 @@ def _send(flow: FlowDef, text: str, flow_ref: str | None = None) -> None:
 
 def _notify_stuck(flow: FlowDef, item: dict) -> None:
     _send(flow, f"⚠️ {_label(flow, item)}\nНужен человек: {item.get('error') or ''}",
-          f"{item['id']}:")
+          f"{item['id']}:action:{item['version']}")
 
 
 def _flow_of(item: dict, flows: dict | None) -> FlowDef:
@@ -1128,15 +1328,18 @@ def _flow_of(item: dict, flows: dict | None) -> FlowDef:
     return flow
 
 
-def _locked_item(conn, item_id: int) -> dict:
+def _locked_item(conn, item_id: int, expected_version: int) -> dict:
     item = get_item(item_id, conn=conn)
     if item is None:
         raise FlowError("заявка не найдена")
+    if type(expected_version) is not int or item["version"] != expected_version:
+        raise FlowError("Решение уже неактуально: обновите карточку заявки")
     return item
 
 
 def decide(item_id: int, decision: str, note: str = "", by: str = "",
-           step_id: str | None = None, flows: dict | None = None) -> dict:
+           step_id: str | None = None, flows: dict | None = None, *,
+           expected_version: int) -> dict:
     """A person's answer to the approval the item waits for.
 
     The item moves on at the runner's next pass: an approval may be followed
@@ -1145,7 +1348,7 @@ def decide(item_id: int, decision: str, note: str = "", by: str = "",
     if decision not in ("approve", "reject"):
         raise FlowError("решение — approve или reject")
     with db._connect(immediate=True) as conn:
-        item = _locked_item(conn, item_id)
+        item = _locked_item(conn, item_id, expected_version)
         waiting = (item["wait"] or {}).get("approval")
         if item["status"] != "waiting_human" or waiting is None:
             raise FlowError("заявка сейчас не ждёт решения")
@@ -1156,7 +1359,11 @@ def decide(item_id: int, decision: str, note: str = "", by: str = "",
         step = flow.steps[index] if index is not None and index < len(flow.steps) else None
         if not isinstance(step, HumanStep) or step.id != waiting:
             raise FlowError("маршрут изменился: такого согласования в нём больше нет")
-        record = {"decision": decision, "note": note.strip()[:2000], "by": by[:80]}
+        revision = _flow_revision(flow)
+        if (item["wait"] or {}).get("flow_revision") != revision:
+            raise FlowError("Route approval context changed; wait for the refreshed question")
+        record = {"decision": decision, "note": note.strip()[:2000], "by": by[:80],
+                  "flow_revision": revision, "approval_version": item["version"]}
         item["data"]["steps"][step.id] = record
         item["wait"] = None
         if decision == "reject" and step.on_reject == "reject":
@@ -1172,12 +1379,38 @@ def decide(item_id: int, decision: str, note: str = "", by: str = "",
     return item
 
 
-def retry(item_id: int, by: str = "", flows: dict | None = None) -> dict:
+def _verify_recovery(conn, item, by, confirmed, note):
+    wait = item["wait"] or {}
+    task_id = wait.get("task_id")
+    if task_id:
+        task = db.get_task(task_id)
+        if task is None:
+            if not confirmed or not note.strip():
+                raise FlowError("Previous task termination is unverified; inspect and confirm before recovery")
+            _event(conn, item["id"], "task.stop_verified",
+                   {"by": by[:80], "note": note.strip()[:2000], "observed_version": item["version"]},
+                   item["step_id"])
+            item["wait"] = None
+        elif task.status.value not in ("completed", "failed", "cancelled"):
+            raise FlowError("The previous task is still stopping; recovery is not admitted")
+    if not wait.get("command"):
+        return
+    if not confirmed or not note.strip():
+        raise FlowError("Previous command termination is unverified; inspect it and explicitly confirm with a reason")
+    _event(conn, item["id"], "command.stop_verified",
+           {"by": by[:80], "note": note.strip()[:2000], "observed_version": item["version"],
+            "previous_owner": wait.get("owner")}, item["step_id"])
+    item["wait"] = None
+
+
+def retry(item_id: int, by: str = "", flows: dict | None = None, *,
+          expected_version: int, confirm_command_stopped: bool = False, note: str = "") -> dict:
     """Run the step the item stopped at once more (after an exhausted repeat: one more round)."""
     with db._connect(immediate=True) as conn:
-        item = _locked_item(conn, item_id)
+        item = _locked_item(conn, item_id, expected_version)
         if item["status"] != "needs_human":
             raise FlowError("повторить можно только заявку, которой нужен человек")
+        _verify_recovery(conn, item, by, confirm_command_stopped, note)
         flow = _flow_of(item, flows)
         payload = {"by": by[:80]}
         exhausted = (item["wait"] or {}).get("exhausted")
@@ -1191,12 +1424,14 @@ def retry(item_id: int, by: str = "", flows: dict | None = None) -> dict:
     return item
 
 
-def skip(item_id: int, by: str = "", flows: dict | None = None) -> dict:
+def skip(item_id: int, by: str = "", flows: dict | None = None, *,
+          expected_version: int, confirm_command_stopped: bool = False, note: str = "") -> dict:
     """Go past the step the item stopped at, as if it succeeded without a result."""
     with db._connect(immediate=True) as conn:
-        item = _locked_item(conn, item_id)
+        item = _locked_item(conn, item_id, expected_version)
         if item["status"] != "needs_human":
             raise FlowError("пропустить шаг можно только у заявки, которой нужен человек")
+        _verify_recovery(conn, item, by, confirm_command_stopped, note)
         flow = _flow_of(item, flows)
         index = _position(flow, item)
         if index is None or index >= len(flow.steps):
@@ -1210,16 +1445,46 @@ def skip(item_id: int, by: str = "", flows: dict | None = None) -> dict:
     return item
 
 
-def cancel(item_id: int, by: str = "") -> dict:
+def cancel(item_id: int, by: str = "", *, expected_version: int,
+           confirm_command_stopped: bool = False, note: str = "") -> dict:
     with db._connect(immediate=True) as conn:
-        item = _locked_item(conn, item_id)
+        item = _locked_item(conn, item_id, expected_version)
         if item["status"] in FINISHED:
-            raise FlowError("заявка уже завершена")
+            raise FlowError("Request already finished")
+        wait = item["wait"] or {}
+        if wait.get("command"):
+            if wait.get("ambiguous") or item["status"] == "needs_human":
+                _verify_recovery(conn, item, by, confirm_command_stopped, note)
+            else:
+                if item["status"] != "cancelling":
+                    item["status"] = "cancelling"
+                    _commit(item, [("command.cancel_requested", {"by": by[:80]}, item["step_id"])], conn)
+                return item
         task_id = (item["wait"] or {}).get("task_id")
-        item["status"], item["wait"] = "cancelled", None
-        _commit(item, [("item.cancelled", {"by": by[:80]}, item["step_id"])], conn)
-    if task_id and not db.cancel_task(task_id):
-        db.request_cancel(task_id)
+        if task_id:
+            task = db.get_task(task_id)
+            if task is None:
+                _verify_recovery(conn, item, by, confirm_command_stopped, note)
+                task_id = None
+        if task_id:
+            item["status"] = "cancelling"
+            _commit(item, [("task.cancel_requested", {"by": by[:80]}, item["step_id"])], conn)
+        else:
+            item["status"], item["wait"] = "cancelled", None
+            _commit(item, [("item.cancelled", {"by": by[:80]}, item["step_id"])], conn)
+    if task_id:
+        if not db.cancel_task(task_id):
+            db.request_cancel(task_id)
+        # Pending cancellation may be synchronous; running tasks are finalized
+        # by the regular runner only after the ordinary worker stops them.
+        task = db.get_task(task_id)
+        if task and task.status.value in ("completed", "failed", "cancelled"):
+            with db._connect(immediate=True) as conn:
+                current = get_item(item_id, conn=conn)
+                if current and current["status"] == "cancelling" and (current["wait"] or {}).get("task_id") == task_id:
+                    current["status"], current["wait"] = "cancelled", None
+                    _commit(current, [("item.cancelled", {"task_stopped": True}, current["step_id"])], conn)
+                    item = current
     return item
 
 
@@ -1282,64 +1547,65 @@ def _input_key(flow: FlowDef) -> str:
     return f"flow_input:v1:{flow.name}"
 
 
-def _input_state(flow: FlowDef) -> dict:
+def _input_state(flow: FlowDef, conn=None) -> dict:
+    if conn is None:
+        value = db.get_setting(_input_key(flow))
+    else:
+        row = conn.execute("SELECT value FROM settings WHERE key=?", (_input_key(flow),)).fetchone()
+        value = row["value"] if row else None
     try:
-        state = json.loads(db.get_setting(_input_key(flow)) or "{}")
+        state = json.loads(value or "{}")
     except ValueError:
         state = {}
     return {"seen": list(state.get("seen", [])), "later": dict(state.get("later", {}))}
 
 
 def poll_input(flow: FlowDef, *, connect=None, today: date | None = None) -> list[dict]:
-    """Turn new letters of the flow's mailbox into items, within the flow's limits.
-
-    A letter over a limit is not lost: it waits in the mailbox and is taken on
-    a later day. A letter judged not to be a request is not read again.
-    """
+    """Poll outside the writer, then atomically admit and merge the intake ledger."""
     from .flow_connectors import poll_mailbox
-
     source = flow.input
     if source is None:
         return []
     user = os.environ.get(source.user_env, "")
     password = os.environ.get(source.password_env, "")
     if not user or not password:
-        raise FlowError(f"не заданы {source.user_env} / {source.password_env}")
+        raise FlowError(f"Missing credentials: {source.user_env} / {source.password_env}")
     day = (today or date.today()).isoformat()
-    state = _input_state(flow)
-    later = {key: when for key, when in state["later"].items() if when >= day}
-    requests, judged = poll_mailbox(source, set(state["seen"]) | set(later),
+    observed = _input_state(flow)
+    initial_later = {key for key, when in observed["later"].items() if when >= day}
+    requests, judged = poll_mailbox(source, set(observed["seen"]) | initial_later,
                                     (user, password), connect=connect)
-    accepted = {request["message_id"] for request in requests}
-    seen = state["seen"] + [key for key in judged if key not in accepted]
     created = []
-    for request in requests:
-        key = request["message_id"]
-        author = request.get("author") or request.get("reply_to") or request.get("from") or ""
-        if item_exists(flow.name, key):
+    # Fresh state prevents two runners from overwriting each other's ledger.
+    with db._connect(immediate=True) as conn:
+        state = _input_state(flow, conn=conn)
+        later = {key: when for key, when in state["later"].items() if when >= day}
+        accepted = {request["message_id"] for request in requests}
+        seen = state["seen"] + [key for key in judged if key not in accepted]
+        for request in requests:
+            key = request["message_id"]
+            author = request.get("author") or request.get("reply_to") or request.get("from") or ""
+            try:
+                item = create_item(flow, request, dedup_key=key,
+                                   title=request.get("title") or request.get("subject") or "",
+                                   author=author, conn=conn, enforce_limits=True, today=today)
+            except _AdmissionDeferred:
+                later[key] = day
+                continue
+            if item:
+                created.append(item)
             seen.append(key)
-            continue
-        over_day = flow.limits.per_day and created_today(flow.name, today=today) >= flow.limits.per_day
-        over_author = (flow.limits.per_author and author and
-                       created_today(flow.name, author, today=today) >= flow.limits.per_author)
-        if over_day or over_author:
-            later[key] = day
-            continue
-        item = create_item(flow, request, dedup_key=key,
-                           title=request.get("title") or request.get("subject") or "",
-                           author=author)
-        if item:
-            created.append(item)
-        seen.append(key)
-    db.set_setting(_input_key(flow), json.dumps(
-        {"seen": list(dict.fromkeys(seen))[-5000:], "later": later}, ensure_ascii=False))
+            later.pop(key, None)
+        conn.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)",
+                     (_input_key(flow), json.dumps(
+                         {"seen": list(dict.fromkeys(seen))[-5000:], "later": later}, ensure_ascii=False)))
     return created
 
 
 def active_item_ids() -> list[int]:
     with db._connect() as conn:
         rows = conn.execute(
-            "SELECT id FROM flow_items WHERE status = 'active' ORDER BY id").fetchall()
+            "SELECT id FROM flow_items WHERE status IN ('active', 'waiting_human', 'cancelling') ORDER BY id").fetchall()
     return [row["id"] for row in rows]
 
 
@@ -1382,11 +1648,21 @@ def run_once(log=print, *, polled: dict | None = None, connect=None) -> dict:
 
 def run_forever(interval: int | None = None, log=print) -> None:
     interval = interval or int(os.environ.get("PP_FLOWS_INTERVAL", "15"))
-    log(f"PromptPilot flows: маршруты из {flows_dir()}, проход каждые {interval} с")
+    log(f"PromptPilot flows: {flows_dir()}, interval {interval}s")
+    old_handler = None
+    if threading.current_thread() is threading.main_thread():
+        old_handler = signal.getsignal(signal.SIGTERM)
+        def terminate(signum, frame):
+            raise SystemExit(128 + signum)
+        signal.signal(signal.SIGTERM, terminate)
     polled: dict = {}
-    while True:
-        try:
-            run_once(log, polled=polled)
-        except Exception as exc:
-            log(f"!! проход упал: {type(exc).__name__}: {exc}")
-        time.sleep(interval)
+    try:
+        while True:
+            try:
+                run_once(log, polled=polled)
+            except Exception as exc:
+                log(f"Flow runner pass failed: {type(exc).__name__}: {exc}")
+            time.sleep(interval)
+    finally:
+        if old_handler is not None:
+            signal.signal(signal.SIGTERM, old_handler)

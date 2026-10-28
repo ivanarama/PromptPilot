@@ -3659,18 +3659,22 @@ def _silent_completion(task) -> bool:
     )
 
 
-def _flow_keyboard(flow_ref: str) -> InlineKeyboardMarkup:
-    """Buttons of a flow notification: an approval ("<item>:<step>") or a stuck item ("<item>:")."""
-    item_id, _, step_id = flow_ref.partition(":")
-    if step_id:
+def _flow_keyboard(flow_ref: str) -> InlineKeyboardMarkup | None:
+    parts = flow_ref.split(":")
+    if len(parts) != 3 or not parts[0].isdigit() or not parts[2].isdigit():
+        return None  # Old notifications cannot acquire a new occurrence token.
+    item_id, kind, version = parts
+    if kind == "approval":
         return InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Одобрить", callback_data=f"flowdec:{item_id}:{step_id}:a"),
-            InlineKeyboardButton("✖ Отклонить", callback_data=f"flowdec:{item_id}:{step_id}:r"),
+            InlineKeyboardButton("✅ Одобрить", callback_data=f"flowdec2:{item_id}:{version}:a"),
+            InlineKeyboardButton("✖ Отклонить", callback_data=f"flowdec2:{item_id}:{version}:r"),
         ]])
+    if kind != "action":
+        return None
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("🔁 Повторить", callback_data=f"flowact:{item_id}:retry"),
-        InlineKeyboardButton("⏭ Пропустить", callback_data=f"flowact:{item_id}:skip"),
-        InlineKeyboardButton("✖ Снять", callback_data=f"flowact:{item_id}:cancel"),
+        InlineKeyboardButton("🔁 Повторить", callback_data=f"flowact2:{item_id}:{version}:retry"),
+        InlineKeyboardButton("⏭ Пропустить", callback_data=f"flowact2:{item_id}:{version}:skip"),
+        InlineKeyboardButton("✖ Снять", callback_data=f"flowact2:{item_id}:{version}:cancel"),
     ]])
 
 
@@ -3687,16 +3691,20 @@ async def cb_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     who = f"telegram:{user.username or user.id}"
     try:
-        if parts[0] == "flowdec":
-            _, item_id, step_id, verdict = parts
+        if parts[0] in {"flowdec", "flowact"}:
+            raise flows.FlowError("Кнопка устарела. Откройте заявку заново.")
+        if parts[0] == "flowdec2":
+            _, item_id, version, verdict = parts
             decision = "approve" if verdict == "a" else "reject"
-            await asyncio.to_thread(flows.decide, int(item_id), decision, "", who, step_id)
+            await asyncio.to_thread(flows.decide, int(item_id), decision, "", who,
+                                    expected_version=int(version))
             word = "одобрено" if decision == "approve" else "отклонено"
         else:
-            _, item_id, action = parts
+            _, item_id, version, action = parts
             call = {"retry": flows.retry, "skip": flows.skip, "cancel": flows.cancel}[action]
-            await asyncio.to_thread(call, int(item_id), who)
-            word = FLOW_ACTION_WORDS[action]
+            action_result = await asyncio.to_thread(call, int(item_id), who, expected_version=int(version))
+            word = ("остановка запрошена" if action == "cancel" and action_result["status"] == "cancelling"
+                    else FLOW_ACTION_WORDS[action])
     except flows.FlowError as exc:
         await query.answer(str(exc)[:190], show_alert=True)
         return
@@ -4459,7 +4467,7 @@ def run_bot():
         cb_report_refresh,
         pattern=r"^report:refresh:(24|168|720):[A-Za-z0-9_.-]+$"), group=-1)
     app.add_handler(CallbackQueryHandler(
-        cb_flow, pattern=r"^(flowdec:\d+:[a-z0-9_]+:[ar]|flowact:\d+:(retry|skip|cancel))$"),
+        cb_flow, pattern=r"^(flowdec2:\d+:\d+:[ar]|flowact2:\d+:\d+:(retry|skip|cancel)|flowdec:\d+:[a-z0-9_]+:[ar]|flowact:\d+:(retry|skip|cancel))$"),
         group=-1)
 
     app.add_handler(CommandHandler("start", cmd_start))
