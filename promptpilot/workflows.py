@@ -508,6 +508,7 @@ def dispatch_planner(workflow_id: str,
                 dispatch.max_retries if dispatch.max_retries != 5 else role.max_retries
             ),
             skip_permissions=False,
+            rights=role.rights,
             model=dispatch.model or role.model,
             effort=dispatch.effort or role.effort,
             task_timeout=(
@@ -820,6 +821,9 @@ def dispatch_task(workflow_id: str,
         raise db.WorkflowConflictError(
             "reviewer cannot use skip_permissions in the W1 manual pilot"
         )
+    if dispatch.role is WorkflowRole.REVIEWER and dispatch.rights == "full":
+        # Same rule as skip_permissions: an auditor judges, it does not act.
+        raise db.WorkflowConflictError("reviewer cannot run with full rights")
 
     with db._connect(immediate=True) as conn:
         workflow = _workflow_row(conn, workflow_id)
@@ -850,6 +854,7 @@ def dispatch_task(workflow_id: str,
             keep_pane=dispatch.keep_pane,
             herdr_target=dispatch.herdr_target,
             machine=dispatch.machine,
+            rights=dispatch.rights,
         ))
         attempt_no = conn.execute(
             """SELECT COALESCE(MAX(attempt_no), 0) + 1
@@ -1869,6 +1874,7 @@ def _dispatch_configured_role(workflow: WorkflowInDB,
         herdr_target=role_config.herdr_target,
         machine=role_config.machine,
         task_timeout=role_config.task_timeout,
+        rights=role_config.rights,
     ))
 
 
