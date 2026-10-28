@@ -1207,7 +1207,7 @@ def record_review(workflow_id: str,
                     workflow_id=workflow_id,
                     round_id=round_row["id"],
                     event_type="stage.completed",
-                    idempotency_key=f"stage.completed:{current_stage['id']}",
+                    idempotency_key=f"stage.completed:{current_stage['id']}:{round_row['id']}",
                     payload={"stage_id": current_stage["id"],
                              "stage_code": current_stage["code"], **common},
                 ))
@@ -1293,12 +1293,18 @@ def human_input(workflow_id: str,
     # (git-операции вне транзакции) и только после успеха проводит миссию
     # дальше; иначе миссия остаётся у человека. Обычный resume мимо
     # незавершённого чекпоинта запрещён.
-    if action.resume:
+    if action.restart_checkpoint and action.resume:
+        raise db.WorkflowConflictError("restart_checkpoint and resume are mutually exclusive")
+    if action.resume or action.restart_checkpoint:
         with db._connect() as conn:
             probe = _pending_stage_checkpoint(conn, workflow_id)
         if probe is not None:
+            if action.restart_checkpoint:
+                return _restart_pending_checkpoint(workflow_id, action, said, probe)
             return _resume_pending_checkpoint(workflow_id, action, said,
                                               probe)
+        if action.restart_checkpoint:
+            raise db.WorkflowConflictError("workflow has no pending checkpoint")
     with db._connect(immediate=True) as conn:
         workflow = _workflow_row(conn, workflow_id)
         _require_version(workflow, action.expected_version)
@@ -1427,6 +1433,55 @@ def human_input(workflow_id: str,
                 round_id=round_row["id"],
             )
         return db._row_to_workflow(workflow)
+
+
+def _restart_pending_checkpoint(workflow_id, action, said, pending):
+    if not action.checkpoint_head or not action.text.strip():
+        raise db.WorkflowConflictError("checkpoint restart requires observed HEAD and reason")
+    owned = {}
+
+    def validate(conn):
+        workflow = _workflow_row(conn, workflow_id)
+        _require_version(workflow, action.expected_version)
+        if (WorkflowStatus(workflow["status"]) is not WorkflowStatus.AWAITING_HUMAN
+                or _pending_stage_checkpoint(conn, workflow_id) != pending):
+            raise db.WorkflowConflictError("checkpoint restart state/identity changed")
+        return workflow
+
+    with db._connect() as conn:
+        validate(conn)
+
+    @contextmanager
+    def admit():
+        with db._connect(immediate=True) as conn:
+            owned.update(conn=conn, workflow=validate(conn))
+            yield
+
+    try:
+        with stage_checkpoint.restart(pending, action.checkpoint_head, admit) as proof:
+            conn, workflow = owned["conn"], owned["workflow"]
+            round_row = _current_round_row(conn, workflow)
+            conn.execute("UPDATE workflow_rounds SET status='revision_required' WHERE id=?",
+                         (round_row["id"],))
+            conn.execute("""UPDATE workflow_stages SET status='executing',
+                            completed_at=NULL, summary_json=NULL WHERE id=?""",
+                         (pending["stage_id"],))
+            workflow = _transition(conn, workflow, WorkflowStatus.REVISION_REQUIRED,
+                "stage.checkpoint_invalidated", {
+                    **said, **proof, "pending_seq": pending["pending_seq"],
+                    "stage_code": pending["stage_code"], "old_pass_revoked": True,
+                }, round_id=round_row["id"])
+            if said.get("note"):
+                db._append_workflow_event(conn, WorkflowEventCreate(
+                    workflow_id=workflow_id, round_id=round_row["id"],
+                    event_type="human.input",
+                    idempotency_key=f"human.input:checkpoint-restart:{pending['pending_seq']}",
+                    payload={**said, "checkpoint_restart": True},
+                ))
+            result = db._row_to_workflow(workflow)
+        return result
+    except stage_checkpoint.CheckpointError as exc:
+        raise db.WorkflowConflictError(str(exc)) from exc
 
 
 def _resume_pending_checkpoint(workflow_id: str,
@@ -2008,7 +2063,7 @@ def _pending_stage_checkpoint(conn, workflow_id: str):
         return None
     done = conn.execute(
         """SELECT payload_json FROM workflow_events
-           WHERE workflow_id = ? AND event_type = 'stage.checkpoint'
+           WHERE workflow_id = ? AND event_type IN ('stage.checkpoint', 'stage.checkpoint_invalidated')
              AND seq > ?
            ORDER BY seq""",
         (workflow_id, pending["seq"]),

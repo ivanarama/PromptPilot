@@ -651,6 +651,9 @@ class WorkflowHumanInput(BaseModel):
     text: str = Field(min_length=1)
     expected_version: int = Field(ge=0)
     resume: bool = False
+    restart_checkpoint: bool = False
+    checkpoint_head: Optional[str] = Field(
+        default=None, pattern=r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
     # What the next agent run must be told. `text` is the journal record of
     # the decision (automation writes its own boilerplate there); only `note`
     # is delivered into the next executor/reviewer prompt.

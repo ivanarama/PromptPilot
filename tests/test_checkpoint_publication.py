@@ -57,6 +57,24 @@ def test_changed_reviewed_bytes_require_new_acceptance(isolated_db, tmp_path, mo
     assert "stage.checkpoint" not in _types(isolated_db, wf)
 
 
+def test_transient_read_buffer_cannot_bypass_reviewed_hash(isolated_db, tmp_path, monkeypatch):
+    from pathlib import Path
+    repo, wf = _pending(isolated_db, tmp_path, monkeypatch)
+    head = _git(repo, "rev-parse", "HEAD")
+    read = Path.read_bytes
+    def swapped_read(path):
+        if path == repo / "app.py":
+            # Models an ABA writer: independent signature reads see reviewed
+            # bytes, while the buffer read in between sees transient content.
+            return b"UNREVIEWED-TRANSIENT-BYTES"
+        return read(path)
+    monkeypatch.setattr(Path, "read_bytes", swapped_read)
+    assert _resume(wf).status.value == "awaiting_human"
+    assert _git(repo, "rev-parse", "HEAD") == head
+    assert (repo / "app.py").read_text() == "reviewed"
+    assert "stage.checkpoint" not in _types(isolated_db, wf)
+
+
 @pytest.mark.parametrize("point", ["after_index_before_ref", "after_ref_before_database"])
 def test_known_partial_publication_recovers_once(isolated_db, tmp_path, monkeypatch, point):
     repo, wf = _pending(isolated_db, tmp_path, monkeypatch)
@@ -134,3 +152,91 @@ def test_cancellation_during_preparation_is_responsive_and_prevents_publication(
     assert (repo / ".git/index").read_bytes() == index
     assert isolated_db.get_workflow(wf.id).status.value == "cancelled"
     assert "stage.advanced" not in _types(isolated_db, wf)
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_explicit_restart_revokes_old_pass_and_requires_fresh_execution_and_review(
+        isolated_db, tmp_path, monkeypatch, legacy):
+    from promptpilot.models import WorkflowEventCreate, TaskStatus
+    repo, wf = _pending(isolated_db, tmp_path, monkeypatch)
+    head = _git(repo, "rev-parse", "HEAD")
+    if legacy:
+        with isolated_db._connect() as conn:
+            pending = workflows._pending_stage_checkpoint(conn, wf.id)
+        pending.pop("reviewed")
+        pending.pop("checkpoint_paths")
+        pending.pop("pending_seq")
+        isolated_db.append_workflow_event(WorkflowEventCreate(
+            workflow_id=wf.id, event_type="stage.checkpoint_pending",
+            idempotency_key="legacy-pending", payload=pending))
+    (repo / "app.py").write_text("new unreviewed bytes")
+    current = isolated_db.get_workflow(wf.id)
+    result = workflows.human_input(wf.id, WorkflowHumanInput(
+        expected_version=current.state_version, text="review changed files again",
+        restart_checkpoint=True, checkpoint_head=head, note="retain this correction"))
+    assert result.status.value == "revision_required"
+    assert _git(repo, "rev-parse", "HEAD") == head
+    assert "stage.checkpoint" not in _types(isolated_db, wf)
+    invalidated = [e for e in isolated_db.list_workflow_events(wf.id, limit=200)
+                   if e.event_type == "stage.checkpoint_invalidated"]
+    assert len(invalidated) == 1 and invalidated[0].payload["legacy_ambiguous"] is legacy
+    assert _resume(wf).status.value in {"queued", "executing"}
+    workflows.advance_workflow(wf.id)
+    tasks = isolated_db.list_tasks(status=TaskStatus.PENDING)
+    assert len(tasks) == 1 and "retain this correction" in tasks[0].prompt
+    assert isolated_db.get_workflow(wf.id).current_round == 2
+    _claim_and_finish(isolated_db, "executor", write=lambda: (repo / "app.py").write_text("fresh execution"))
+    _claim_and_finish(isolated_db, REVIEWER_PASS)
+    assert _git(repo, "show", "HEAD:app.py") == "fresh execution"
+    assert _types(isolated_db, wf).count("stage.checkpoint") == 1
+
+
+@pytest.mark.parametrize("point", ["after_index_before_ref", "after_ref_before_database"])
+def test_restart_only_rolls_back_a_proven_unpublished_index(isolated_db, tmp_path, monkeypatch, point):
+    repo, wf = _pending(isolated_db, tmp_path, monkeypatch)
+    original_head = _git(repo, "rev-parse", "HEAD")
+    original_index = (repo / ".git/index").read_bytes()
+    def crash(here):
+        if here == point:
+            raise RuntimeError("crash")
+    with monkeypatch.context() as patch:
+        patch.setattr(stage_checkpoint, "_fault", crash)
+        with pytest.raises(RuntimeError, match="crash"):
+            _resume(wf)
+    current = isolated_db.get_workflow(wf.id)
+    action = WorkflowHumanInput(expected_version=current.state_version, text="restart safely",
+        restart_checkpoint=True, checkpoint_head=_git(repo, "rev-parse", "HEAD"))
+    if point == "after_ref_before_database":
+        with pytest.raises(db.WorkflowConflictError, match="published"):
+            workflows.human_input(wf.id, action)
+        assert _resume(wf).status.value == "queued"
+    else:
+        (repo / "app.py").write_text("changed after crash")
+        assert workflows.human_input(wf.id, action).status.value == "revision_required"
+        assert _git(repo, "rev-parse", "HEAD") == original_head
+        assert (repo / ".git/index").read_bytes() == original_index
+        assert (repo / "app.py").read_text() == "changed after crash"
+
+
+def test_restart_http_contract_rejects_stale_head_and_requires_explicit_action(isolated_db, tmp_path, monkeypatch):
+    import asyncio
+    import httpx
+    from promptpilot.api import app
+    repo, wf = _pending(isolated_db, tmp_path, monkeypatch)
+    version = isolated_db.get_workflow(wf.id).state_version
+    head = _git(repo, "rev-parse", "HEAD")
+    async def request():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                    base_url="http://127.0.0.1:8420") as client:
+            path = f"/api/workflows/{wf.id}/human-input"
+            body = {"expected_version": version, "restart_checkpoint": True,
+                    "text": "new acceptance cycle", "checkpoint_head": "0" * 40}
+            assert (await client.post(path, json=body)).status_code == 409
+            body["checkpoint_head"] = head
+            body["resume"] = True
+            assert (await client.post(path, json=body)).status_code == 409
+            body["resume"] = False
+            result = await client.post(path, json=body)
+            assert result.status_code == 200 and result.json()["status"] == "revision_required"
+    asyncio.run(request())
+    assert _git(repo, "rev-parse", "HEAD") == head

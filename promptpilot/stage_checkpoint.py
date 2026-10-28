@@ -46,19 +46,17 @@ def _text(repo, *args, **kwargs):
 
 
 def _atomic(path, data):
-    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as stream:
-        temp = Path(stream.name)
-        try:
+    temp = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as stream:
+            temp = Path(stream.name)
             stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
-        except BaseException:
-            temp.unlink(missing_ok=True)
-            raise
-    try:
         os.replace(temp, path)
     finally:
-        temp.unlink(missing_ok=True)
+        if temp is not None:
+            temp.unlink(missing_ok=True)
 
 
 def reviewed(repo, paths, signature):
@@ -212,6 +210,71 @@ def _fault(point):
 
 
 @contextmanager
+def restart(pending, observed_head, admit):
+    """Revoke acceptance; never infer a successful checkpoint from a legacy ref."""
+    repo = Path(pending["check_dir"]).resolve()
+    gitdir = Path(_text(repo, "rev-parse", "--absolute-git-dir"))
+    index = Path(_text(repo, "rev-parse", "--path-format=absolute", "--git-path", "index"))
+    operation = _digest((pending["workflow_id"] + ":" + pending["stage_id"]
+                         + ":" + pending["run_id"]).encode())
+    folder = gitdir / "promptpilot-checkpoints" / operation
+    hooks = folder / "empty-hooks"
+    hooks.mkdir(parents=True, exist_ok=True)
+    lock = Path(str(index) + ".lock")
+    try:
+        descriptor = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        raise CheckpointBusyError("checkpoint index is locked; restart cannot steal an active operation") from None
+    identity = os.fstat(descriptor)
+    marker = json.dumps({"checkpoint_restart": operation, "pid": os.getpid()}).encode()
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(marker)
+            stream.flush()
+            os.fsync(stream.fileno())
+        branch = _text(repo, "symbolic-ref", "--no-recurse", "HEAD")
+        evidence = pending.get("reviewed")
+        if evidence and (evidence["repo"] != str(repo) or evidence["branch"] != branch):
+            raise CheckpointError("restart repository/branch differs from reviewed identity")
+        current_index = index.read_bytes()
+        digest = _digest(current_index)
+        intent_path = folder / "intent.json"
+        intent = json.loads(intent_path.read_text()) if intent_path.exists() else None
+        rollback = None
+        if intent:
+            if (intent["evidence"] != evidence or intent["index"] != str(index)
+                    or intent["branch"] != branch):
+                raise CheckpointError("restart intent identity mismatch")
+            if observed_head == intent["commit"]:
+                raise CheckpointError("checkpoint was published; complete normal resume recovery first")
+            if observed_head != intent["head"] or digest not in {intent["before"], intent["after"]}:
+                raise CheckpointError("unknown checkpoint state; operator inspection required")
+            if digest == intent["after"]:
+                rollback = (folder / "index.before").read_bytes()
+                if _digest(rollback) != intent["before"]:
+                    raise CheckpointError("restart index backup damaged")
+        elif evidence and observed_head != evidence["head"]:
+            raise CheckpointError("unknown HEAD drift; inspect before restarting checkpoint")
+        with ExitStack() as fences:
+            with admit():
+                fences.enter_context(_RefTransaction(repo, branch, observed_head, None, hooks))
+                if index.read_bytes() != current_index:
+                    raise CheckpointError("index changed while acquiring restart admission")
+                if rollback is not None:
+                    _atomic(index, rollback)
+                yield {"legacy_ambiguous": not bool(evidence), "observed_head": observed_head,
+                       "branch": branch, "index_sha256": digest,
+                       "index_rollback": rollback is not None}
+    finally:
+        try:
+            current = lock.stat()
+            if (current.st_dev, current.st_ino) == (identity.st_dev, identity.st_ino) and lock.read_bytes() == marker:
+                lock.unlink()
+        except FileNotFoundError:
+            pass
+
+
+@contextmanager
 def publish(pending, signature, claim, admit):
     evidence = pending.get("reviewed")
     if not evidence:
@@ -290,13 +353,19 @@ def publish(pending, signature, claim, admit):
                         raise CheckpointError("reviewed file mode changed")
                     if path.is_symlink():
                         mode = "120000"
-                        blob = _text(repo, "hash-object", "-w", "--stdin",
-                                     data=os.fsencode(os.readlink(path)))
+                        data = os.fsencode(os.readlink(path))
+                        frozen_sig = "sha256:" + _digest(data) + ":link"
                     else:
                         if not path.is_file() or mode not in {"100644", "100755"}:
                             raise CheckpointError("non-regular checkpoint entry")
-                        blob = _text(repo, "hash-object", "-w", "--path=" + name,
-                                     "--stdin", data=path.read_bytes())
+                        data = path.read_bytes()
+                        frozen_sig = f"sha256:{_digest(data)}:{len(data)}"
+                    # The proof must describe the exact immutable buffer fed
+                    # to Git, not two separate filesystem reads around it.
+                    if frozen_sig != evidence["signatures"][name]:
+                        raise CheckpointError("frozen bytes differ from reviewed content")
+                    args = ("--stdin",) if mode == "120000" else ("--path=" + name, "--stdin")
+                    blob = _text(repo, "hash-object", "-w", *args, data=data)
                     if signature(str(path)) != sig:
                         raise CheckpointError("file changed while freezing reviewed content")
                     entry = (mode, blob)
