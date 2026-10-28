@@ -49,7 +49,9 @@ def test_actual_dispatch_selects_each_windows_own_timezone(isolated_db, tmp_path
         {"provider": "inactive", "window": {"from": "00:00", "to": "01:00", "tz_offset_hours": 0}},
         {"provider": "selected", "window": {"from": "14:00", "to": "16:00", "tz_offset_hours": 3}},
     ]
-    config = {"automation": {"enabled": True}, "roles": {role: {"provider": "fallback", "provider_windows": windows}}}
+    # Dispatch scheduling is independent of deterministic gate execution.
+    config = {"automation": {"enabled": True}, "gate": {"enabled": False},
+              "roles": {role: {"provider": "fallback", "provider_windows": windows}}}
     workflow = _wf(isolated_db, tmp_path, config)
     if role == "planner":
         workflows.dispatch_planner(workflow.id, WorkflowPlanDispatch(expected_version=0))

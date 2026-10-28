@@ -843,6 +843,20 @@ def amend_plan(workflow_id: str,
                     + ", ".join(sorted(unknown)))
             known.add(stage.code)
 
+        tail_by_code = {row["code"]: row for row in existing[frozen_n:]}
+        # Stage-scoped memory is optional (introduced independently). A future
+        # stage keeps its identity when its code survives an amendment. Removing
+        # a stage with notes requires an explicit note deletion/reassignment.
+        if any(column["name"] == "scope_stage" for column in conn.execute(
+                "PRAGMA table_info(workflow_memory)")):
+            for code, row in tail_by_code.items():
+                if code not in incoming_codes and conn.execute(
+                    "SELECT 1 FROM workflow_memory WHERE workflow_id=? AND scope_stage=? LIMIT 1",
+                    (workflow_id, row["id"]),
+                ).fetchone():
+                    raise db.WorkflowConflictError(
+                        f"stage {code} has scoped memory; delete or reassign its notes before removing it")
+
         # пересобрать ТОЛЬКО хвост: замороженный префикс не трогаем вовсе
         # (id/статусы/времена и FK от workflow_rounds остаются целыми)
         frozen_ids = [row["id"] for row in existing[:frozen_n]]
@@ -852,6 +866,7 @@ def amend_plan(workflow_id: str,
             [workflow_id, *frozen_ids])
         now = db._now()
         for position, stage in enumerate(amendment.stages[frozen_n:], start=frozen_n + 1):
+            previous = tail_by_code.get(stage.code)
             spec = stage.model_dump(
                 mode="json", exclude={"code", "title", "objective", "stage_type"})
             conn.execute(
@@ -859,9 +874,9 @@ def amend_plan(workflow_id: str,
                    (id, workflow_id, position, code, title, objective, stage_type,
                     status, spec_json, created_at)
                    VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                (db._new_id("stage"), workflow_id, position, stage.code,
+                (previous["id"] if previous else db._new_id("stage"), workflow_id, position, stage.code,
                  stage.title, stage.objective, stage.stage_type.value,
-                 "pending", db._json_dump(spec), now))
+                 "pending", db._json_dump(spec), previous["created_at"] if previous else now))
         conn.execute(
             "UPDATE workflow_plans SET updated_at=? WHERE workflow_id=?",
             (now, workflow_id))

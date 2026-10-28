@@ -245,3 +245,15 @@ def test_http_success_keeps_history_and_records_full_tail(approved):
     assert event.payload["old_tail"][0]["code"] == "S03"
     assert event.payload["new_tail"][0] == body["stages"][-1]
     assert pdb.get_workflow(wid).state_version == body["expected_version"] + 1
+
+
+def test_http_retained_pending_stage_keeps_identity(approved):
+    wid, body = approved
+    original = pdb.list_workflow_stages(wid)[-1]
+    body["stages"][-1]["code"] = original.code
+    body["stages"][-1]["objective"] = "updated future goal"
+    response = _http(wid, body)
+    assert response.status_code == 200
+    updated = response.json()[-1]
+    assert updated["id"] == original.id
+    assert pdb.list_workflow_stages(wid)[-1].created_at == original.created_at
