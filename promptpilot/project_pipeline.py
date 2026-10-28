@@ -2276,6 +2276,8 @@ def run(argv=None) -> int:
     parser.add_argument("--config", default="pipelinectl.json")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("capabilities")
+    inventory_parser = sub.add_parser("inventory")
+    inventory_parser.add_argument("--health-file", help="read an existing health JSON snapshot")
     next_parser = sub.add_parser("next")
     next_parser.add_argument("stage", choices=("review", "merge"))
     gate_parser = sub.add_parser("gate-fallback")
@@ -2307,7 +2309,16 @@ def run(argv=None) -> int:
             gh = GitHub()
             if hasattr(gh, "timeout_seconds"):
                 gh.timeout_seconds = int(config.get("github_timeout_seconds", 120))
-            if args.command == "next":
+            if args.command == "inventory":
+                from .pr_identity import inventory
+
+                if args.health_file:
+                    health = json.loads(Path(args.health_file).read_text(encoding="utf-8", errors="strict"))
+                else:
+                    # Slice A is read-only: no base checkout fast-forward or config rewrite.
+                    health = run_health(dict(config, sync_base_before_health=False))
+                value = inventory(gh, config, health)
+            elif args.command == "next":
                 value = (next_review(gh, config, config_path=args.config)
                          if args.stage == "review"
                          else next_merge(gh, config, config_path=args.config))
