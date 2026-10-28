@@ -46,6 +46,22 @@ const reportWaits = context.pipelineWaitReasons({
 assert.equal(reportWaits.length, 1);
 assert.equal(reportWaits[0].reason, 'waiting for integration REVIEW');
 
+const retryAt = '2026-10-27T18:00:00+00:00';
+const retryWaits = context.pipelineWaitReasons({
+  queues: [{id:'review', title:'Review', backlog:null,
+    series_replicas: [{task_id:99, title:'Review replica', task_status:'rate_limited',
+      task_error:'Provider overloaded', task_next_run_at:retryAt}]}],
+  current:{tasks:[{task_id:99, title:'Review replica', status:'rate_limited',
+    error:'Provider overloaded', scheduled_at:retryAt}]},
+});
+assert.equal(retryWaits.length, 1, 'the same task is not listed twice');
+assert.match(retryWaits[0].reason, /Provider overloaded/);
+assert.ok(retryWaits[0].reason.includes(retryAt), 'the next attempt is visible');
+assert.equal(context.pipelineWaitReasons({
+  current:{tasks:[{task_id:100, title:'Running', status:'running',
+    error:'old provider limit', scheduled_at:retryAt}]},
+}).length, 0, 'an old error does not make a running task look blocked');
+
 const breakdown = context.pipelineRunBreakdown({runs_5h:{
   runs:6, ready:2, empty:3, human:1,
 }});
