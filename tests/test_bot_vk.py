@@ -3,6 +3,7 @@
 (handle_text работает с локальной БД)."""
 import json
 import urllib.request
+import pytest
 
 from promptpilot import bot_vk, workflows
 from promptpilot.models import (
@@ -342,6 +343,65 @@ def test_backup_replaces_old_docs(isolated_db, tmp_path, monkeypatch):
     assert deleted == [(-42, 5)]          # старый удалён
     assert saved_titles == ["backup-journal.md"]
     assert "✅ backup-journal.md" in reply
+
+
+@pytest.mark.parametrize("failure", ["upload", "registry", "unconfirmed", None])
+def test_backup_keeps_previous_document_until_new_registry_is_durable(tmp_path, monkeypatch, failure):
+    path = tmp_path / "registry.json"
+    old = {"backup.md": {"owner_id": -42, "id": 5}}
+    path.write_text(json.dumps(old), encoding="utf8")
+    monkeypatch.setattr(bot_vk, "_backup_registry_path", lambda: path)
+    monkeypatch.setattr(bot_vk, "_backup_sources", lambda: [("backup.md", b"new")])
+    actions = []
+    class Transport:
+        def docs_upload(self, *args):
+            actions.append("upload")
+            if failure == "upload":
+                raise OSError("offline")
+            return {} if failure == "unconfirmed" else {"owner_id": -42, "id": 9}
+        def docs_delete(self, owner, ident):
+            assert json.loads(path.read_text())["backup.md"]["id"] == 9
+            assert (owner, ident) == (-42, 5)
+            actions.append("delete")
+    actual_replace = bot_vk.os.replace
+    def replace(src, dst):
+        actions.append("persist")
+        if failure == "registry":
+            raise OSError("disk full")
+        return actual_replace(src, dst)
+    monkeypatch.setattr(bot_vk.os, "replace", replace)
+    reply = bot_vk.cmd_backup(Transport())
+    if failure:
+        assert "❌" in reply and "delete" not in actions
+        assert json.loads(path.read_text()) == old
+    else:
+        assert "✅" in reply and actions == ["upload", "persist", "delete"]
+        assert json.loads(path.read_text())["backup.md"]["id"] == 9
+
+
+@pytest.mark.parametrize("kind", ["message_new", "message_event"])
+@pytest.mark.parametrize("authorized", [False, True])
+def test_shared_conversation_cannot_run_commands_or_receive_private_notifications(isolated_db, monkeypatch, kind, authorized):
+    monkeypatch.setattr(bot_vk, "is_authorized", lambda uid: authorized)
+    monkeypatch.setattr(bot_vk, "VK_PASSWORD", "secret")
+    monkeypatch.setattr(bot_vk, "handle_text", lambda *args: pytest.fail("no command in a shared conversation"))
+    monkeypatch.setattr(bot_vk, "_pw_grant", lambda *args: pytest.fail("no password grant in shared conversation"))
+    fake = _FakeTransport()
+    message = {"from_id": 7, "peer_id": 2_000_000_001, "text": "secret"}
+    obj = {"user_id": 7, "peer_id": 2_000_000_001, "event_id": "event", "payload": {"cmd": "продолжить"}} if kind == "message_event" else {"message": message}
+    peers = {}
+    bot_vk._process_update(fake, {"type": kind, "object": obj}, peers)
+    assert peers == {} and fake.sent == []
+
+
+def test_untrusted_private_sender_cannot_mutate_workflow(isolated_db, monkeypatch):
+    monkeypatch.setattr(bot_vk, "is_authorized", lambda uid: False)
+    monkeypatch.setattr(bot_vk, "VK_PASSWORD", "")
+    monkeypatch.setattr(bot_vk.workflows, "human_input", lambda *args: pytest.fail("unauthorized mutation"))
+    fake = _FakeTransport()
+    peers = {}
+    bot_vk._process_update(fake, {"type": "message_new", "object": {"message": {"from_id": 7, "peer_id": 7, "text": "продолжить"}}}, peers)
+    assert peers == {} and fake.sent[0][1] == "Нет доступа."
 
 
 def test_incoming_doc_saved_to_inbox(isolated_db, tmp_path, monkeypatch):

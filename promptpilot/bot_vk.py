@@ -21,6 +21,7 @@ import random
 import re
 import subprocess
 import threading
+import tempfile
 import time
 import urllib.parse
 import urllib.request
@@ -54,6 +55,7 @@ VK_PASSWORD = os.environ.get("PP_VK_PASSWORD", "").strip()
 _vk_config_path = DB_DIR / "vk_config.json"
 _pw_granted: dict[int, float] = {}
 _PW_TTL = 3600.0
+_BACKUP_LOCK = threading.Lock()
 
 
 # ── авторизация ──────────────────────────────────────────────────────────────
@@ -487,11 +489,39 @@ def _load_backup_registry() -> dict:
         return {}
 
 
+def _save_backup_registry(registry: dict) -> None:
+    """Replace the durable pointer before deleting any previously valid document."""
+    path = _backup_registry_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         prefix=path.name + ".", delete=False) as handle:
+            temporary = Path(handle.name)
+            json.dump(registry, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        if os.name != "nt":
+            descriptor = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
 def cmd_backup(transport: VKTransport | None = None) -> str:
     """Выгрузить память конвейера в документы сообщества. Старый бэкап
     удаляется по ЛОКАЛЬНОМУ реестру id: docs.get групповым токеном
     недоступен (живая ошибка 27), а save/delete — доступны."""
-    transport = transport or VKTransport(VK_TOKEN, VK_GROUP_ID)
+    with _BACKUP_LOCK:
+        return _cmd_backup(transport or VKTransport(VK_TOKEN, VK_GROUP_ID))
+
+
+def _cmd_backup(transport: VKTransport) -> str:
     sources = _backup_sources()
     if not sources:
         return "Бэкапить нечего: памяти и журнала не нашлось."
@@ -499,25 +529,23 @@ def cmd_backup(transport: VKTransport | None = None) -> str:
     saved = []
     for title, content in sources:
         old = registry.get(title) or {}
-        if old.get("owner_id") and old.get("id"):
-            try:
-                transport.docs_delete(int(old["owner_id"]), int(old["id"]))
-            except Exception as exc:  # noqa: BLE001 - старый не мешает
-                logger.warning("vk backup delete-old: %s", exc)
         try:
             doc = transport.docs_upload(title, content)
+            new = {"owner_id": int(doc["owner_id"]), "id": int(doc["id"])}
+            if not new["owner_id"] or new["id"] <= 0:
+                raise ValueError("upload did not confirm a saved document")
+            updated = {**registry, title: new}
+            _save_backup_registry(updated)
         except Exception as exc:  # noqa: BLE001 - владельцу видна причина
-            saved.append(f"❌ {title}: {exc}")
+            saved.append(f"❌ {title}: {type(exc).__name__}; прежний бэкап не удалён")
             continue
-        if doc.get("id") and doc.get("owner_id"):
-            registry[title] = {"owner_id": doc["owner_id"], "id": doc["id"]}
+        registry = updated
+        if old != new and old.get("owner_id") and old.get("id"):
+            try:
+                transport.docs_delete(int(old["owner_id"]), int(old["id"]))
+            except Exception as exc:  # noqa: BLE001 - new backup is already durable
+                logger.warning("vk backup delete-old: %s", type(exc).__name__)
         saved.append(f"✅ {title} ({len(content) // 1024} КБ)")
-    try:
-        _backup_registry_path().write_text(
-            json.dumps(registry, ensure_ascii=False, indent=1),
-            encoding="utf-8")
-    except OSError as exc:
-        logger.warning("vk backup registry: %s", exc)
     return "Бэкап в документах сообщества:\n" + "\n".join(saved)
 
 
@@ -594,13 +622,8 @@ def _photo_jpeg(data: bytes) -> bytes:
 
 
 def _owner_peers() -> list[int]:
-    """Авторизованные чаты владельца из vk-конфига."""
-    try:
-        with open(_vk_config_path, encoding="utf-8") as handle:
-            cfg = json.loads(handle.read())
-        return [int(p) for p in cfg.get("allowed_ids", [])]
-    except (OSError, ValueError):
-        return []
+    """Only private owner dialogs; never a conversation or community peer."""
+    return sorted(uid for uid in _allowed_ids() if 0 < uid < 2_000_000_000)
 
 
 def _save_incoming_attachment(attachment: dict, inbox: Path) -> str | None:
@@ -1111,7 +1134,7 @@ def _process_update(transport: VKTransport, update: dict,
         user_id = int(obj.get("user_id") or 0)
         peer_id = int(obj.get("peer_id") or user_id)
         event_id = str(obj.get("event_id") or "")
-        if not user_id:
+        if not (0 < user_id < 2_000_000_000 and peer_id == user_id):
             return
         if not is_authorized(user_id):
             transport.answer_event(event_id, user_id, peer_id)
@@ -1137,7 +1160,7 @@ def _process_update(transport: VKTransport, update: dict,
     user_id = int(message.get("from_id") or 0)
     peer_id = int(message.get("peer_id") or user_id)
     text = str(message.get("text") or "")
-    if not user_id:
+    if not (0 < user_id < 2_000_000_000 and peer_id == user_id):
         return
     if not is_authorized(user_id):
         if VK_PASSWORD and _pw_ok(user_id):
