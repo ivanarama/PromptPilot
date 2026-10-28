@@ -74,16 +74,33 @@ scan-lease and fairness deferrals do not themselves reset the baton.
 
 ## Item-level human handoffs
 
-The operator release enables `item_blockers` for TRIAGE, REVIEW and MERGE.
+The operator release enables `item_blockers` for TRIAGE, REVIEW, MERGE and FIX.
 Before launch a fresh complete cached snapshot records the target's Search
 metadata (including updated_at) and matching checker witnesses. An explicit,
 unambiguous HUMAN handoff parks only measured targets for at most 24 hours.
 Unchanged targets are excluded from future admission; changed state, expiry,
-Resume or Run now permits a new attempt. New targets remain eligible. A held
+actual Resume or an explicit retry permits a new attempt. New targets remain eligible. A held
 integration owner is never skipped to begin another integration: the owner
 barrier remains intact. A stale/partial snapshot does not authorize exclusion.
 Search timestamps are change hints, not mutation authority; every actual
 mutation still requires canonical fresh project checks.
+
+Ordinary Run now and priority/OWNER wake requests preserve item holds. A
+no-op Resume on an already active series preserves them too. To explicitly
+retry blocked work through the API, send `{"action":"run_now","retry_blocked":true}`
+to `/api/schedule/<id>/action`. An actual paused-to-active Resume also clears
+holds. A rejected action on an already running occurrence clears nothing.
+
+FIX also enables `item_error_holds`. A terminal UNABLE naming exactly one
+fresh checker-measured PR rework parks that unchanged item for at most 24 hours.
+The dispatch baseline must belong to the same task and include the candidate's
+valid HEAD and state fingerprint. Missing, stale or failed checker snapshots,
+unmeasured targets, ordinary issues and unscoped execution failures cannot create
+these holds. A changed target, expiry, actual Resume or explicit retry permits another attempt.
+WIP restrictions exclude held candidates while retaining the full active count,
+so a blocked rework cannot repeatedly occupy FIX or reopen ordinary intake.
+Other eligible reworks continue; no CI or mutation check is waived. The failed
+task and its diagnostics remain visible for operator repair.
 
 If another occurrence re-elects the same target, HEAD and stage while its hold
 is still live, the ordinary repeated-blocker guard decides whether to pause the

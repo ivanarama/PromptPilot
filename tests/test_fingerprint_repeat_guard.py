@@ -69,3 +69,32 @@ def test_unmeasured_target_cannot_renew_fingerprint_hold(isolated_db):
         state = isolated_db.pause_pipeline_series_on_repeated_blocker(task.series_id, task.id)
         assert state["suppress_recurrence"] is bool(attempt)
     assert isolated_db.get_setting(holds.PREFIX + str(first.series_id)) is None
+
+
+@pytest.mark.parametrize("verdict", ["\u041d\u0415 \u0421\u041c\u041e\u0413",
+                                      "\u041d\u0423\u0416\u0415\u041d \u0427\u0415\u041b\u041e\u0412\u0415\u041a"])
+def test_legacy_review_hold_without_stage_retains_repeat_guard(isolated_db, monkeypatch, verdict):
+    now = 100000.0
+    monkeypatch.setattr(holds.time, "time", lambda: now)
+    first = isolated_db.create_task(TaskCreate(prompt="review", recurrence="15m"))
+    holds.register_target(first, 7, "a" * 40, "review")
+    result = f"\u0418\u0422\u041e\u0413: {verdict} (#7 - route needs recovery)"
+    isolated_db.mark_completed(first.id, result, verdict=verdict)
+    assert not isolated_db.pause_pipeline_series_on_repeated_blocker(
+        first.series_id, first.id)["suppress_recurrence"]
+    key = holds.PREFIX + str(first.series_id)
+    legacy = json.loads(isolated_db.get_setting(key))
+    del legacy["7"]["stage"]
+    isolated_db.set_setting(key, json.dumps(legacy))
+    saved = isolated_db.get_setting(key)
+    now += 10
+    second = isolated_db.create_task(TaskCreate(
+        prompt=first.prompt, recurrence="15m", series_id=first.series_id))
+    data = {"cache": {"complete": True}, "queues": [], "diagnostics": {
+        "review_candidates": [{"number": 7, "stage": "review", "head": "a" * 40}]}}
+    assert holds.prepare(second, {"id": "review", "item_blockers": True}, data) == [7]
+    holds.register_target(second, 7, "a" * 40, "review")
+    isolated_db.mark_completed(second.id, result, verdict=verdict)
+    assert isolated_db.pause_pipeline_series_on_repeated_blocker(
+        second.series_id, second.id)["suppress_recurrence"]
+    assert isolated_db.get_setting(key) == saved
