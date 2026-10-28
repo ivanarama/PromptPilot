@@ -18,8 +18,9 @@ from typing import Optional
 from . import db, worktree
 from .config import (BASE_DELAY, CONCURRENCY, DEFAULT_CLI, MAX_DELAY, MIN_FREE_MB,
                      POLL_INTERVAL, TASK_TIMEOUT, VERDICT_REPAIR,
-                     VERDICT_REPAIR_TIMEOUT, VERDICT_REQUIRED, build_cmd,
-                     get_provider_env, load_providers)
+                     VERDICT_REPAIR_TIMEOUT, VERDICT_REQUIRED, RightsUnsupported,
+                     build_cmd, get_provider_env, load_providers, rights_args,
+                     rights_supported)
 from .process_tree import OwnedProcess, ProcessTreeError
 
 # Our quota is spent — the wait is measured in hours and nothing else will get
@@ -189,10 +190,13 @@ def _repair_verdict(task, provider: str, provider_cfg: dict,
     """
     prompt = VERDICT_REPAIR_PROMPT.format(tail=(report_tail or "")[-4000:])
     try:
+        # Restating a verdict needs no tools; confine the micro-request when
+        # the provider can be confined.
         cmd = build_cmd(provider, prompt,
                         model=getattr(task, "model", None),
                         effort=getattr(task, "effort", None),
-                        guard=True)
+                        guard=True,
+                        rights="none" if rights_supported(provider_cfg, "none") else None)
         prompt_stdin = prompt if provider_cfg.get("prompt_stdin") else None
         env = get_provider_env(provider)
         env.pop("PP_TASK_ID", None)
@@ -1181,6 +1185,8 @@ def _maybe_recur(task, failed: bool = False):
         machine=task.machine,
         keep_pane=task.keep_pane,
         worktree=task.worktree,
+        # What the run may do is part of the schedule too.
+        rights=task.rights,
     ))
     print(f"  -> Recurring: next run at {next_dt.strftime('%Y-%m-%d %H:%M UTC')}"
           f"{' (после падения)' if failed else ''}")
@@ -1776,6 +1782,24 @@ def _execute_task_body(task, admission_complete=None):
             return
         host = machine_remote(m)
 
+    rights = getattr(task, "rights", None)
+    if rights and provider_cfg.get("executor") == "herdr":
+        # Checked before any pane exists: a session that cannot be confined
+        # must not be opened at all. A task aimed at an already running
+        # session cannot be confined either — its agent keeps its own rights.
+        problem = None
+        if getattr(task, "herdr_target", None) and rights != "full":
+            problem = "задачу в открытую сессию herdr нельзя ограничить: агент уже запущен"
+        else:
+            try:
+                rights_args(provider_cfg, rights)
+            except RightsUnsupported as exc:
+                problem = str(exc)
+        if problem:
+            _mark_failed(task, f"Права «{rights}»: {problem}", exit_code=-1)
+            print(f"  -> Failed (rights): {problem}")
+            return
+
     if provider_cfg.get("executor") == "herdr":
         # herdr sessions work the same way on any machine: the CLI calls go
         # over ssh, the pane lives there (attach with `herdr --remote <host>`).
@@ -1832,9 +1856,15 @@ def _execute_task_body(task, admission_complete=None):
     except Exception as exc:  # noqa: BLE001 — телеметрия, не ломать запуск
         print(f"  !! run.snapshot #{task.id}: {exc}", flush=True)
 
-    cmd = build_cmd(provider, agent_prompt, skip_permissions=task.skip_permissions,
-                    session_id=task.session_id, model=task.model, guard=not machine,
-                    effort=task.effort)
+    try:
+        cmd = build_cmd(provider, agent_prompt, skip_permissions=task.skip_permissions,
+                        session_id=task.session_id, model=task.model, guard=not machine,
+                        effort=task.effort, rights=getattr(task, "rights", None))
+    except RightsUnsupported as exc:
+        # Fail closed: a run that asked for narrow rights must not start wide.
+        _mark_failed(task, f"Права «{task.rights}»: {exc}", exit_code=-1)
+        print(f"  -> Failed (rights): {exc}")
+        return
     prompt_stdin = agent_prompt if provider_cfg.get("prompt_stdin") else None
 
     env = get_provider_env(provider)

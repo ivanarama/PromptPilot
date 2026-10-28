@@ -77,6 +77,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     pipeline_priority_restore INTEGER,
     verdict TEXT
     ,series_id INTEGER REFERENCES task_series(id)
+    ,rights TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_series (
@@ -433,6 +434,8 @@ MIGRATIONS = [
         updated_at TEXT NOT NULL
     )""",
     "CREATE INDEX IF NOT EXISTS idx_epf_jobs_task ON epf_jobs(task_id)",
+    # what the agent run may do (models.TaskRights); NULL = skip_permissions decides
+    "ALTER TABLE tasks ADD COLUMN rights TEXT",
 ]
 
 WORKFLOW_SCHEMA_VERSION = "workflow_orchestrator_w0_v1"
@@ -1065,8 +1068,9 @@ def _insert_task(conn: sqlite3.Connection, task: TaskCreate) -> TaskInDB:
         """INSERT INTO tasks (prompt, working_dir, provider, status, priority,
            scheduled_at, created_at, max_retries, skip_permissions, model,
            session_id, parent_task_id, tg_chat_id, recurrence, task_timeout,
-           detached, keep_pane, herdr_target, machine, worktree, effort, series_id)
-           VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           detached, keep_pane, herdr_target, machine, worktree, effort, series_id,
+           rights)
+           VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             task.prompt,
             task.working_dir,
@@ -1089,6 +1093,7 @@ def _insert_task(conn: sqlite3.Connection, task: TaskCreate) -> TaskInDB:
             int(task.worktree),
             task.effort,
             series_id,
+            task.rights,
         ),
     )
     return get_task(cur.lastrowid, conn=conn)
@@ -2324,6 +2329,7 @@ def _recreate_series_occurrence(conn, series_id: int, series,
         herdr_target=latest.herdr_target,
         machine=latest.machine,
         worktree=latest.worktree,
+        rights=latest.rights,
         series_id=series_id,
     ))
     return True
