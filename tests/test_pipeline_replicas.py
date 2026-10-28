@@ -1056,6 +1056,78 @@ def test_execution_route_passes_replica_identity_to_preflight(
     }
 
 
+@pytest.mark.parametrize("fault", [None, "unsigned", "wrong-kind", "unavailable", "skill"])
+def test_two_fix_routes_have_distinct_signed_targets_and_no_unqualified_fallback(
+        isolated_db, monkeypatch, tmp_path, fault):
+    from promptpilot import fix_handoff
+
+    directories = [tmp_path / f"fix-{index}" for index in (1, 2)]
+    for directory in directories:
+        consumer = directory / ".claude/skills/fix-approved/SKILL.md"
+        consumer.parent.mkdir(parents=True)
+        consumer.write_text(fix_handoff.CONSUMER_MARKER + "\n", encoding="utf-8")
+        isolated_db.create_task(TaskCreate(
+            prompt=f"Project - FIX {directory.name}", working_dir=str(directory),
+            recurrence="15m"))
+    monkeypatch.setenv("PP_DATA_DIR", str(isolated_db.DB_PATH.parent))
+    queue = {
+        "id": "fix", "series_contains": "Project - FIX", "replicas": 2,
+        "execution": {"mode": "skill" if fault == "skill" else "auto",
+                      "command": ["pipelinectl", "next", "fix"]},
+    }
+    config = {"repository": "owner/repo", "parallel_fix_enabled": True}
+    monkeypatch.setattr(pipeline_insights, "_matching_queue", lambda _t: (
+        "p", {"repository": "owner/repo"}, queue))
+    monkeypatch.setattr(pipeline_insights, "_tool_available", lambda *_a: (
+        fault != "unavailable", "tool missing"))
+    monkeypatch.setattr(pipeline_insights, "load_providers", lambda: {})
+    monkeypatch.setattr(pipelinectl, "run_health", lambda *_a, **_k: {
+        "state": "green", "findings": [], "fix_candidates": [
+            {"stage": "review", "number": 10, "head": HEAD_A},
+            {"stage": "fix-issue", "number": 11, "eligibility_digest": HEAD_B},
+        ]})
+    calls = []
+
+    def preflight(_execution, command, working_dir, *, env_extra=None):
+        calls.append((command, working_dir))
+        with monkeypatch.context() as child:
+            for name, value in env_extra.items():
+                child.setenv(name, value)
+            child.chdir(working_dir)
+            value = pipelinectl.next_fix(None, config)
+            if fault == "unsigned":
+                del value["handoff"]
+            elif fault == "wrong-kind":
+                lease = pipelinectl.decode_signed_lease(value["handoff"]["lease"])
+                lease["target"]["stage"] = "review"
+                value["handoff"]["lease"] = pipelinectl.encode_signed_lease(lease)
+            return value
+
+    monkeypatch.setattr(pipeline_insights, "_tool_preflight", preflight)
+    routes = []
+    for directory in directories:
+        task = isolated_db.get_next_runnable()
+        assert task.working_dir == str(directory)
+        route = pipeline_insights.execution_route(task, "canonical FIX", str(directory))
+        routes.append(route)
+        if fault:
+            assert route["action"] == "block"
+            assert "prompt" not in route
+        else:
+            assert route["action"] == "prompt"
+            assert route["next_already_run"] is True
+            assert route["pipeline_replicas"] == 2
+            assert "gate-fix-owner" in route["prompt"]
+            assert "перед КАЖДОЙ".lower() in route["prompt"].lower()
+            assert route["pipeline_target_reservation"]["task_id"] == task.id
+    if not fault:
+        assert [route["target"]["number"] for route in routes] == [10, 11]
+        assert [route["target"]["stage"] for route in routes] == ["fix-pr", "fix-issue"]
+        assert len({route["gate_command"][-1] for route in routes}) == 2
+    if fault in {"unavailable", "skill"}:
+        assert calls == []
+
+
 def test_signed_integration_review_inherits_merge_budget_priority(
         isolated_db, monkeypatch, tmp_path):
     first_dir = tmp_path / "review-1"

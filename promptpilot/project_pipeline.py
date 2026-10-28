@@ -1228,7 +1228,9 @@ def ensure_identity(gh: GitHub, config: dict) -> None:
 def capabilities(config: dict) -> dict:
     return {"protocol": "promptpilot-pipelinectl-v1", "repository": config["repository"],
             "stages": {"review": "content-or-integration",
-                       "merge": "clean-ordinary-with-cleanup-recovery"},
+                       "merge": "clean-ordinary-with-cleanup-recovery",
+                       "fix": "signed-target-repository-gates" if config.get(
+                           "parallel_fix_enabled") else "off"},
             "review_completion_gate": config.get("review_completion_gate", "health"),
             "fallback_handoff": config.get("fallback_handoff", "legacy"),
             "target_reservations": "sqlite-task-lease-v1",
@@ -1395,7 +1397,7 @@ def _fix_candidate_key(candidate: dict) -> tuple[str, int, str]:
 
     The health report currently calls PR-rework candidates ``review``. An
     issue has no commit HEAD: its 40-hex eligibility digest must be supplied
-    by a future versioned health contract, never inferred from display text or
+    by the versioned health contract, never inferred from display text or
     ``updated_at`` alone. The live GitHub state still needs a separate gate.
     """
     if not isinstance(candidate, dict):
@@ -1430,8 +1432,8 @@ def _ordered_fix_candidates(candidates: list[dict]) -> list[dict]:
 def _elect_fix_candidate(config: dict, candidates: list[dict]) -> tuple[dict | None, dict | None]:
     """Atomically reserve one exact FIX target for a claimed task attempt.
 
-    This is a disabled-by-default building block. A signed handoff and a live
-    pre-mutation gate are required before exposing it as a runnable route.
+    The disabled-by-default route also requires its signed handoff, a paired
+    repository consumer and live ownership/project gates before each write.
     """
     if config.get("parallel_fix_enabled") is not True:
         raise PipelineError("parallel FIX election is disabled")
@@ -1476,7 +1478,9 @@ def next_fix(gh: GitHub, config: dict, *, config_path: str | None = None) -> dic
     from . import fix_handoff
 
     health = run_health(config, config_path=config_path)
-    ordered = fix_handoff.ordered_health_candidates(health)
+    fix_handoff.consumer_digest(config, str(Path.cwd().resolve()))
+    ordered = fix_handoff.ordered_health_candidates(
+        health, excluded=admission_exclusions())
     if not ordered:
         return {"action": "empty", "stage": "fix", "verdict": "ПУСТО",
                 "reason": "no executable FIX target"}
@@ -2385,6 +2389,10 @@ def run(argv=None) -> int:
     gate_lease = gate_parser.add_mutually_exclusive_group(required=True)
     gate_lease.add_argument("--lease")
     gate_lease.add_argument("--lease-file")
+    owner_parser = sub.add_parser("gate-fix-owner")
+    owner_lease = owner_parser.add_mutually_exclusive_group(required=True)
+    owner_lease.add_argument("--lease")
+    owner_lease.add_argument("--lease-file")
     complete_parser = sub.add_parser("complete")
     complete_parser.add_argument("stage", choices=("review", "merge", "merge-cleanup"))
     complete_lease = complete_parser.add_mutually_exclusive_group(required=True)
@@ -2416,6 +2424,10 @@ def run(argv=None) -> int:
                     value = next_merge(gh, config, config_path=args.config)
                 else:
                     value = next_fix(gh, config, config_path=args.config)
+            elif args.command == "gate-fix-owner":
+                from .fix_handoff import gate
+                value = gate(gh, config, args.lease, config_path=args.config,
+                             ownership_only=True)
             elif args.command == "gate-fallback":
                 if args.stage == "fix":
                     from .fix_handoff import gate

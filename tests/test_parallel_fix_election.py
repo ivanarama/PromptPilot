@@ -1,7 +1,8 @@
-"""Opt-in FIX target election primitives; no worker route is enabled yet."""
+"""Opt-in exact FIX election, delivery and task ownership fences."""
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timezone
+import json
 from threading import Barrier
 
 import pytest
@@ -112,6 +113,10 @@ def _health(*candidates):
 def _setup_handoff(isolated_db, monkeypatch, tmp_path, candidates):
     monkeypatch.setenv("PP_DATA_DIR", str(tmp_path))
     monkeypatch.setenv("PP_PIPELINE_REPLICAS", "2")
+    monkeypatch.chdir(tmp_path)
+    consumer = tmp_path / ".claude/skills/fix-approved/SKILL.md"
+    consumer.parent.mkdir(parents=True)
+    consumer.write_text(fix_handoff.CONSUMER_MARKER + "\n", encoding="utf-8")
     _attempt(isolated_db, monkeypatch, "parallel FIX")
     health = _health(*candidates)
     monkeypatch.setattr(pipelinectl, "run_health", lambda *_args, **_kwargs: health)
@@ -170,3 +175,123 @@ def test_fix_next_requires_multiple_replicas_before_reserving(
     with pytest.raises(pipelinectl.PipelineError, match="at least two replicas"):
         pipelinectl.next_fix(None, dict(CONFIG))
     assert isolated_db.list_pipeline_target_reservations(repository="owner/repo") == []
+
+
+def _cli(monkeypatch, capsys, tmp_path, *args):
+    config = tmp_path / "pipelinectl.json"
+    config.write_text(json.dumps({
+        **CONFIG, "trusted_account": "owner", "health_command": ["unused"],
+    }), encoding="utf-8")
+    code = pipelinectl.run(["--config", str(config), *args])
+    output = capsys.readouterr()
+    return code, json.loads(output.out)
+
+
+def test_public_issue_handoff_admission_and_own_delivery_finalization(
+        isolated_db, monkeypatch, tmp_path, capsys):
+    """Creating the PR removes the issue from FIX; cleanup must retain ownership."""
+    candidate = {"stage": "fix-issue", "number": 7, "eligibility_digest": DIGEST}
+    _setup_handoff(isolated_db, monkeypatch, tmp_path, [candidate])
+    code, preflight = _cli(monkeypatch, capsys, tmp_path, "next", "fix")
+    assert code == 0
+    assert preflight["target"] == {"stage": "fix-issue", "number": 7, "head": DIGEST}
+    lease_file = tmp_path / "election.lease"
+    lease_file.write_text(preflight["handoff"]["lease"], encoding="ascii")
+    code, admitted = _cli(monkeypatch, capsys, tmp_path, "gate-fallback", "fix",
+                           "--lease-file", str(lease_file))
+    assert code == 0 and admitted["phase"] == "admitted"
+    assert admitted["mutation_authorized"] is False
+
+    # The project procedure alone authorizes the PR and its subsequent labels.
+    # Here the fake checker only models its resulting queue membership.
+    monkeypatch.setattr(pipelinectl, "run_health", lambda *_a, **_k: _health())
+    progress_file = tmp_path / "progress.lease"
+    progress_file.write_text(admitted["ownership_lease"], encoding="ascii")
+    code, progress = _cli(monkeypatch, capsys, tmp_path, "gate-fix-owner",
+                           "--lease-file", str(progress_file))
+    assert code == 0 and progress["phase"] == "ownership"
+    assert progress["target"] == preflight["target"]
+    assert progress["mutation_authorized"] is False
+
+    # Neither direction can confuse scheduling admission with continuation.
+    for args in (("gate-fix-owner", "--lease-file", str(lease_file)),
+                 ("gate-fallback", "fix", "--lease-file", str(progress_file))):
+        code, refused = _cli(monkeypatch, capsys, tmp_path, *args)
+        assert code == 2 and refused["action"] == "error"
+
+    _attempt(isolated_db, monkeypatch, "different attempt")
+    code, refused = _cli(monkeypatch, capsys, tmp_path, "gate-fix-owner",
+                          "--lease-file", str(progress_file))
+    assert code == 2 and "another task" in refused["error"]
+
+
+def test_public_fix_requires_paired_consumer_before_reservation(
+        isolated_db, monkeypatch, tmp_path, capsys):
+    _setup_handoff(isolated_db, monkeypatch, tmp_path, [
+        {"stage": "review", "number": 10, "head": HEAD_A}])
+    (tmp_path / ".claude/skills/fix-approved/SKILL.md").write_text(
+        "Legacy unqualified FIX election\n", encoding="utf-8")
+    code, value = _cli(monkeypatch, capsys, tmp_path, "next", "fix")
+    assert code == 2 and "consumer protocol" in value["error"]
+    assert isolated_db.list_pipeline_target_reservations(repository="owner/repo") == []
+
+
+@pytest.mark.parametrize("change", ["consumer", "red", "lost", "attempt", "replicas", "single"])
+def test_public_progress_gate_fails_closed_after_live_change(
+        isolated_db, monkeypatch, tmp_path, capsys, change):
+    _setup_handoff(isolated_db, monkeypatch, tmp_path, [
+        {"stage": "review", "number": 10, "head": HEAD_A}])
+    _, preflight = _cli(monkeypatch, capsys, tmp_path, "next", "fix")
+    _, admitted = _cli(monkeypatch, capsys, tmp_path, "gate-fallback", "fix",
+                         "--lease", preflight["handoff"]["lease"])
+    if change == "consumer":
+        with (tmp_path / ".claude/skills/fix-approved/SKILL.md").open(
+                "a", encoding="utf-8") as handle:
+            handle.write("changed contract\n")
+    elif change == "red":
+        monkeypatch.setattr(pipelinectl, "run_health", lambda *_a, **_k: {
+            **_health(), "state": "red"})
+    elif change == "lost":
+        with isolated_db._connect() as connection:
+            connection.execute("DELETE FROM pipeline_target_reservations")
+    elif change == "attempt":
+        monkeypatch.setenv("PP_TASK_STARTED_AT", "2026-01-01T00:00:00+00:00")
+    else:
+        monkeypatch.setenv("PP_PIPELINE_REPLICAS", "1" if change == "single" else "3")
+    code, value = _cli(monkeypatch, capsys, tmp_path, "gate-fix-owner",
+                       "--lease", admitted["ownership_lease"])
+    assert code == 2 and value["action"] == "error"
+
+
+def test_health_checkout_is_pinned_across_worktree_changes(
+        isolated_db, monkeypatch, tmp_path):
+    _setup_handoff(isolated_db, monkeypatch, tmp_path, [
+        {"stage": "review", "number": 10, "head": HEAD_A}])
+    preflight = pipelinectl.next_fix(None, dict(CONFIG))
+    selected = fix_handoff.validate(preflight)
+    other = tmp_path / "target-worktree"
+    other.mkdir()
+    monkeypatch.chdir(other)
+    calls = []
+
+    def health(_config, **kwargs):
+        calls.append(kwargs["working_dir"])
+        return _health({"stage": "review", "number": 10, "head": HEAD_A})
+
+    monkeypatch.setattr(pipelinectl, "run_health", health)
+    assert fix_handoff.gate(None, dict(CONFIG), preflight["handoff"]["lease"])[
+        "action"] == "validated"
+    assert calls == [selected["health_checkout"]] == [str(tmp_path.resolve())]
+
+
+def test_fix_reuses_negative_admission_exclusions(
+        isolated_db, monkeypatch, tmp_path):
+    _setup_handoff(isolated_db, monkeypatch, tmp_path, [
+        {"stage": "review", "number": 9, "head": HEAD_B},
+        {"stage": "review", "number": 10, "head": HEAD_A}])
+    monkeypatch.setenv("PP_PIPELINE_EXCLUDED_NUMBERS", "[9]")
+    preflight = pipelinectl.next_fix(None, dict(CONFIG))
+    assert preflight["target"]["number"] == 10
+    monkeypatch.delenv("PP_PIPELINE_EXCLUDED_NUMBERS")
+    assert fix_handoff.gate(None, dict(CONFIG), preflight["handoff"]["lease"])[
+        "action"] == "validated"
