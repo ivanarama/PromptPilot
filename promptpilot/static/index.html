@@ -642,6 +642,7 @@
   </div>
 
   <div class="cost-bar" id="costBar"></div>
+  <div class="cost-bar" id="healthBar" title="живы ли фоновые процессы конвейера (воркер, каскад, вотчеры, боты)"></div>
 
   <div class="add-form">
     <textarea id="promptInput" placeholder="Enter your prompt here..."></textarea>
@@ -702,6 +703,15 @@
       <label id="skipPermsLabel" style="flex-direction:row;align-items:center;gap:8px;cursor:pointer;display:none">
         <input type="checkbox" id="skipPermissions" style="width:auto;margin:0" onchange="rememberSkipPermissions()">
         <span style="font-size:13px;color:var(--yellow)" title="Claude: --dangerously-skip-permissions; Codex: --dangerously-bypass-approvals-and-sandbox">⚠ не спрашивать разрешения</span>
+      </label>
+      <label id="rightsLabel" style="display:none" title="Что агенту можно. Без инструментов — только текст; чтение — смотреть файлы; правка — менять файлы в папке задачи, не запуская команд; полные — всё. «Как обычно» — решает галочка «не спрашивать разрешения». Недоступное для провайдера неактивно.">Права
+        <select id="rightsInput">
+          <option value="">как обычно</option>
+          <option value="none">без инструментов</option>
+          <option value="read">только чтение</option>
+          <option value="write">правка файлов</option>
+          <option value="full">полные</option>
+        </select>
       </label>
       <label id="keepPaneLabel" style="flex-direction:row;align-items:center;gap:8px;cursor:pointer;display:none">
         <input type="checkbox" id="keepPane" checked style="width:auto;margin:0">
@@ -908,6 +918,19 @@
   <div class="modal">
     <h2>Провайдеры <button class="btn btn-sm btn-ghost" style="margin-left:auto" onclick="closeProviders()">✕ Закрыть</button></h2>
     <div id="provList"></div>
+    <div class="prov-form" id="providerWizard">
+      <b>Подключить помощника</b>
+      <label>CLI <select id="pcCLI" onchange="catalogSelect()"></select></label>
+      <button class="btn" type="button" onclick="catalogInstall()">Установить CLI</button>
+      <label>Адрес API <input id="pcBase" type="url" placeholder="https://api.example.com/v1"></label>
+      <label>Ключ API <input id="pcKey" type="password" autocomplete="new-password"></label>
+      <button class="btn" type="button" onclick="catalogModels()">Получить модели</button>
+      <label>Модель <select id="pcModels" onchange="document.getElementById('pcModel').value=this.value"></select></label>
+      <input id="pcModel" placeholder="Или введите ID модели вручную">
+      <input id="pcTitle" placeholder="Название помощника (необязательно)">
+      <button class="btn btn-primary" type="button" onclick="catalogCreate()">Создать помощника</button>
+      <div id="pcStatus" role="status"></div>
+    </div>
     <div style="border-top:1px solid var(--border); margin-top:14px; padding-top:14px">
       <b style="font-size:14px">🖥 Машины (удалённое выполнение по SSH)</b>
       <div id="machineList" style="margin-top:8px"></div>
@@ -1333,6 +1356,7 @@ async function addTask() {
         priority,
         working_dir: workdir,
         skip_permissions: skipPermissions,
+        rights: document.getElementById('rightsInput').value || null,
         keep_pane: document.getElementById('keepPane').checked,
         worktree: document.getElementById('worktree').checked,
         herdr_target: herdrTarget,
@@ -2057,14 +2081,17 @@ function workflowSettingsHtml(wf) {
   </details>`;
 }
 
-function workflowStatusInfo(status, reviewerDone = false) {
+function workflowStatusInfo(status, reviewerDone = false, automation = {}) {
+  const automaticGate = automation.enabled === true && automation.auto_gate !== false;
   const info = {
     draft: ['Черновик', 'Следующее действие: сформировать план этапов либо запустить быструю задачу.'],
     planning: ['Планирование', 'Сильный планировщик исследует задачу и формирует этапы.'],
     awaiting_plan_approval: ['План ожидает утверждения', 'Проверьте порядок, scope и gate каждого этапа, затем утвердите план.'],
     queued: ['Готов к запуску', 'Следующее действие: выбрать исполнителя и отправить промпт.'],
     executing: ['Исполнитель работает', 'Следующее действие: наблюдать за агентом; после успешного ответа начнутся проверки.'],
-    gating: ['Автоматические проверки', 'Следующее действие: зафиксировать результат gate.'],
+    gating: automaticGate
+      ? ['Автоматические проверки', 'Проверки идут сами — ничего нажимать не нужно; результат применится автоматически.']
+      : ['Ручные проверки', 'Выполните проверки и выберите Gate PASS или FAIL.'],
     reviewing: ['Независимое ревью', 'Следующее действие: запустить проверяющего.'],
     revision_required: ['Нужны исправления', 'Следующее действие: открыть новый раунд доработок.'],
     awaiting_human: reviewerDone
@@ -2077,7 +2104,45 @@ function workflowStatusInfo(status, reviewerDone = false) {
   return info[status] || [status, ''];
 }
 
-function workflowOwnerInfo(wf, activeRun, reviewerDone) {
+function workflowNeedsHuman(wf) {
+  // U16b: gating в АВТО-режиме (auto_gate включён — наш дефолт) никого не
+  // ждёт: заголовок «НУЖНО ДЕЙСТВИЕ» врёт и рождал ложные тревоги владельца.
+  // Человека ждёт только ручной gate (auto_gate === false).
+  const s = wf?.status;
+  if (s === 'gating') return !(wf?.config?.automation?.enabled === true && wf.config.automation.auto_gate !== false);
+  return ['awaiting_human', 'revision_required', 'awaiting_plan_approval'].includes(s);
+}
+
+function workflowHumanAlertCopy(status, reviewerDone, decisionState = {}) {
+  if (status === 'awaiting_human' && reviewerDone && decisionState.budgetExhausted) {
+    return ['Каскад остановлен по лимиту попыток',
+      'Ревью уже завершено, но автоматическая ступень исчерпала свои попытки. Сначала нужно выбрать новую политику или явно принять риск вручную.'];
+  }
+  if (status === 'revision_required' && decisionState.budgetExhausted) {
+    return ['Лимит попыток исчерпан',
+      'Новый раунд сейчас заблокирован защитным лимитом. Измените политику попыток или создайте новый этап после проверки замечаний.'];
+  }
+  if (status === 'awaiting_human' && reviewerDone) {
+    return ['Требуется ваше решение по ревью',
+      'Проверяющий уже закончил. Выберите один из вариантов ниже — после этого PromptPilot продолжит или завершит workflow.'];
+  }
+  if (status === 'revision_required') {
+    return ['Нужны исправления',
+      'Ревью вернуло текущий этап на доработку. Проверьте отчёт и нажмите «Продолжить пайплайн».'];
+  }
+  if (status === 'awaiting_plan_approval') {
+    return ['Нужно утвердить план',
+      'Проверьте порядок этапов и gate-команды, затем нажмите «Сохранить и утвердить».'];
+  }
+  if (status === 'gating') {
+    return ['Gate в ручном режиме',
+      'Автоматический gate выключен для этого воркфлоу. По завершении проверок выберите PASS или FAIL.'];
+  }
+  return ['Пайплайн остановлен: требуется действие человека',
+    'Проверьте причину остановки и нажмите «Продолжить пайплайн», чтобы передать управление обратно оркестратору.'];
+}
+
+function workflowOwnerInfo(wf, activeRun, reviewerDone, decisionState = {}) {
   if (wf.status === 'planning') return {
     who: 'Планировщик', detail: activeRun?.task_id ? `task #${activeRun.task_id} · разбивает задачу на этапы` : 'запускается',
     next: 'Дальше: ваше однократное утверждение плана', color: 'var(--accent)',
@@ -2091,7 +2156,8 @@ function workflowOwnerInfo(wf, activeRun, reviewerDone) {
     next: 'Дальше: автоматические проверки (Gate)', color: 'var(--accent)',
   };
   if (wf.status === 'gating') return {
-    who: 'PromptPilot / Gate', detail: 'проверяется результат исполнителя',
+    who: workflowNeedsHuman(wf) ? 'Вы / Gate' : 'PromptPilot / Gate',
+    detail: workflowNeedsHuman(wf) ? 'нужно выполнить проверки и зафиксировать результат' : 'проверяется результат исполнителя',
     next: 'Дальше: независимый аудитор', color: 'var(--yellow)',
   };
   if (wf.status === 'reviewing') return {
@@ -2158,39 +2224,80 @@ function workflowStopReason(events) {
   return `${task}${reason}`;
 }
 
-function workflowStageEditorCard(stage = {}, index = 0) {
-  return `<div class="wf-stage-card wf-stage-edit-card" data-index="${index}" data-status="${escAttr(stage.status || 'draft')}">
+function workflowStageEditorCard(stage = {}, index = 0, frozen = false) {
+  const lockAttrs = frozen ? ' style="opacity:.65;border-left:3px solid var(--border)" title="Замороженный этап (завершён/выполняется): правке не подлежит"' : '';
+  const lockActions = frozen ? '<span class="cz-hint">🔖 заморожен</span>' : '';
+  return `<div class="wf-stage-card wf-stage-edit-card" data-index="${index}" data-frozen="${frozen ? 1 : 0}" data-status="${escAttr(stage.status || 'draft')}"${lockAttrs}>
+    <fieldset ${frozen ? 'disabled' : ''} style="border:0;padding:0;margin:0">
     <div class="wf-stage-editor">
       <input data-field="code" value="${escAttr(stage.code || '')}" placeholder="Код">
       <input data-field="title" value="${escAttr(stage.title || '')}" placeholder="Название">
       <select data-field="stage_type"><option value="implementation"${stage.stage_type !== 'integration' ? ' selected' : ''}>implementation</option><option value="integration"${stage.stage_type === 'integration' ? ' selected' : ''}>integration</option></select>
       <textarea class="wide" data-field="objective" placeholder="Проверяемая цель">${esc(stage.objective || '')}</textarea>
       <input class="wide" data-field="dependencies" value="${escAttr((stage.dependencies || []).join(', '))}" placeholder="Зависимости: S1, S2">
-      <textarea class="wide" data-field="allowed_paths" placeholder="Разрешённые пути — по одному на строке">${esc((stage.allowed_paths || []).join('\n'))}</textarea>
-      <textarea class="wide" data-field="deliverables" placeholder="Deliverables — по одному на строке">${esc((stage.deliverables || []).join('\n'))}</textarea>
-      <textarea class="wide" data-field="acceptance_gates" placeholder="Gate-команды — по одной на строке">${esc((stage.acceptance_gates || []).join('\n'))}</textarea>
+      <textarea class="wide" data-field="allowed_paths" placeholder="Разрешённые пути — по одному на строку">${esc((stage.allowed_paths || []).join('\n'))}</textarea>
+      <textarea class="wide" data-field="deliverables" placeholder="Deliverables — по одному на строку">${esc((stage.deliverables || []).join('\n'))}</textarea>
+      <textarea class="wide" data-field="acceptance_gates" placeholder="Gate-команды — по одной на строку">${esc((stage.acceptance_gates || []).join('\n'))}</textarea>
       <input data-field="max_revision_rounds" type="number" min="1" value="${stage.max_revision_rounds || ''}" placeholder="Лимит возвратов">
       <input data-field="executor_prompt" value="${escAttr(stage.executor_prompt || '')}" placeholder="Особый prompt executor">
       <input data-field="reviewer_prompt" value="${escAttr(stage.reviewer_prompt || '')}" placeholder="Особый prompt reviewer">
     </div>
-    <div class="wf-actions"><button class="btn btn-sm btn-ghost" data-stage-action="up" onclick="wfMoveStage(${index},-1)">↑</button><button class="btn btn-sm btn-ghost" data-stage-action="down" onclick="wfMoveStage(${index},1)">↓</button><button class="btn btn-sm btn-danger" data-stage-action="delete" onclick="wfDeleteStage(${index})">Удалить</button></div>
+    </fieldset>
+    <div class="wf-actions">${lockActions}${frozen ? '' : `<button class="btn btn-sm btn-ghost" data-stage-action="up" onclick="wfMoveStage(${index},-1)">↑</button><button class="btn btn-sm btn-ghost" data-stage-action="down" onclick="wfMoveStage(${index},1)">↓</button><button class="btn btn-sm btn-danger" data-stage-action="delete" onclick="wfDeleteStage(${index})">Удалить</button>`}</div>
   </div>`;
 }
 
 function workflowPlanHtml(wf, plan, stages) {
   if (!wf.config?.planning?.enabled && !stages.length) return '';
   const editable = wf.status === 'awaiting_plan_approval';
-  const cards = stages.map((stage, index) => editable ? workflowStageEditorCard(stage, index) : `
-    <div class="wf-stage-card" data-status="${escAttr(stage.status)}">
-      <div class="wf-stage-title">${index + 1}. ${esc(stage.code)} · ${esc(stage.title)} <span class="task-status" data-s="${escAttr(stage.status)}">${esc(stage.status)}</span></div>
-      <div class="wf-round-summary">${esc(stage.objective)}</div>
+  // F5: живой план с allow_editing_approved_plan — редактор хвоста
+  const amendable = !editable && wf.config?.planning?.allow_editing_approved_plan
+    && plan?.status === 'approved' && stages.some(st => st.id === wf.current_stage_id)
+    && ['queued','executing','gating','reviewing','revision_required','awaiting_human'].includes(wf.status);
+  const frozenN = amendable ? (() => {
+    let n = 0;
+    for (const st of stages) { n++; if (st.id === wf.current_stage_id) break; }
+    return n;
+  })() : 0;
+  window.__wfAmendFrozen = amendable ? frozenN : 0;
+  window.__wfAmendVersion = amendable ? wf.state_version : null;
+  window.__wfAmendWorkflowId = amendable ? wf.id : null;
+  window.__wfAmendSourceStages = amendable ? stages.map(st => ({
+    code: st.code, title: st.title, objective: st.objective,
+    stage_type: st.stage_type, dependencies: st.dependencies || [],
+    allowed_paths: st.allowed_paths || [], deliverables: st.deliverables || [],
+    acceptance_gates: st.acceptance_gates || [],
+    executor_prompt: st.executor_prompt || '', reviewer_prompt: st.reviewer_prompt || '',
+    max_revision_rounds: st.max_revision_rounds || null,
+  })) : null;
+  // U1: монотонный собственный % прогресса на каждой карточке (переходы видны)
+  const total = Math.max(stages.length, 1);
+  const completedCount = stages.filter(s => s.status === 'completed').length;
+  const cards = stages.map((stage, index) => {
+    if (editable) return workflowStageEditorCard(stage, index);
+    if (amendable) return workflowStageEditorCard(stage, index, index < frozenN);
+    const done = stages.slice(0, index + 1).filter(s => s.status === 'completed').length;
+    const pct = stage.status === 'completed'
+      ? Math.round(done / total * 100)
+      : Math.round((done + (stage.status === 'executing' || stage.status === 'reviewing' || stage.status === 'gating' ? 0.5 : 0)) / total * 100);
+    const shortGoal = String(stage.objective || '').split('.')[0].slice(0, 90);
+    return `
+    <div class="wf-stage-card" data-status="${escAttr(stage.status)}" style="min-height:96px">
+      <div class="wf-stage-title">${index + 1}/${total} · ${Math.max(0, pct)}% <span class="task-status" data-s="${escAttr(stage.status)}">${esc(stage.status)}</span></div>
+      <div style="font-weight:600;margin:2px 0">${esc(stage.code)} · ${esc(stage.title)}</div>
+      <div class="wf-round-summary" style="display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden">${esc(shortGoal)}</div>
       <div class="wf-meta">${esc(stage.stage_type)} · gate: ${(stage.acceptance_gates || []).length} · возвратов: ${stage.max_revision_rounds || wf.config?.planning?.max_revisions_per_stage || 3}</div>
-    </div>`).join('');
+    </div>`;
+  }).join('');
   const controls = editable ? `<div class="wf-actions">
     <button class="btn btn-sm btn-ghost" onclick="wfAddStage()">Добавить этап</button>
     <button class="btn btn-sm btn-ghost" onclick="wfSavePlan()">Сохранить план</button>
     <button class="btn btn-sm btn-primary" onclick="wfApprovePlan()">Сохранить и утвердить</button>
     <button class="btn btn-sm btn-ghost" onclick="wfPlannerDispatch(true)">Сформировать заново</button>
+  </div>` : amendable ? `<div class="wf-actions">
+    <button class="btn btn-sm btn-ghost" onclick="wfAddStage()">Добавить этап (в хвост)</button>
+    <button class="btn btn-sm btn-primary" onclick="wfAmendPlan()">Перепланировать хвост</button>
+    <span class="cz-hint">F5: замороженные 🔖 этапы — история; правится только хвост; причина обязательна и попадёт в журнал</span>
   </div>` : '';
   return `<div class="wf-section-title">План этапов · ${stages.length}</div>
     ${editable ? '<div class="wf-meta">Последний этап должен иметь тип integration. Gate-команды выполняются только после ручного утверждения плана.</div>' : ''}
@@ -2211,8 +2318,9 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, 
   const pastRounds = rounds.filter(r => r.round_no !== wf.current_round);
   const importedCount = rounds.filter(r => r.summary?.historical).length;
   const stage = stages.find(item => item.id === wf.current_stage_id) || wf.config?.stage || {};
-  const statusInfo = workflowStatusInfo(wf.status, !!reviewerDone);
+  const statusInfo = workflowStatusInfo(wf.status, !!reviewerDone, wf.config?.automation || {});
   const ownerInfo = workflowOwnerInfo(wf, activeRun, reviewerDone);
+  const humanAlert = workflowNeedsHuman(wf) ? workflowHumanAlertCopy(wf.status, !!reviewerDone) : null;
   const stopReason = workflowStopReason(events);
   const previousAudit = [...pastRounds].reverse().find(r => r.summary?.summary);
   const stageTitle = stage.title || `Раунд ${wf.current_round}: доработка после последнего аудита`;
@@ -2285,6 +2393,7 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, 
       ${wf.config?.automation?.enabled ? '<span class="task-status" data-s="running">АВТО</span>' : '<span class="wf-meta">ручной режим</span>'}</div>
     <div class="wf-stage" style="border-color:${ownerInfo.color}">
       <div class="wf-stage-title">🏓 Мяч сейчас: <span style="color:${ownerInfo.color}">${esc(ownerInfo.who)}</span></div>
+      ${humanAlert ? `<div class="wf-round-summary"><b>${esc(humanAlert[0])}</b> · ${esc(humanAlert[1])}</div>` : ''}
       <div class="wf-round-summary">${esc(ownerInfo.detail)}</div>
       ${ownerInfo.next ? `<div class="wf-next">${esc(ownerInfo.next)}</div>` : ''}
     </div>
@@ -2446,7 +2555,7 @@ function wfReindexStageCards() {
     const up = card.querySelector('[data-stage-action="up"]');
     const down = card.querySelector('[data-stage-action="down"]');
     const remove = card.querySelector('[data-stage-action="delete"]');
-    if (up) { up.setAttribute('onclick', `wfMoveStage(${index},-1)`); up.disabled = index === 0; }
+    if (up) { up.setAttribute('onclick', `wfMoveStage(${index},-1)`); up.disabled = index <= (window.__wfAmendFrozen || 0); }
     if (down) { down.setAttribute('onclick', `wfMoveStage(${index},1)`); down.disabled = index === document.querySelectorAll('#wfStageList .wf-stage-edit-card').length - 1; }
     if (remove) remove.setAttribute('onclick', `wfDeleteStage(${index})`);
   });
@@ -2456,6 +2565,7 @@ function wfMoveStage(index, delta) {
   const list = document.getElementById('wfStageList');
   const cards = [...list.querySelectorAll('.wf-stage-edit-card')];
   const target = index + delta;
+  if (index < (window.__wfAmendFrozen || 0) || target < (window.__wfAmendFrozen || 0)) return;
   if (!cards[index] || target < 0 || target >= cards.length) return;
   if (delta < 0) list.insertBefore(cards[index], cards[target]);
   else list.insertBefore(cards[target], cards[index]);
@@ -2463,6 +2573,7 @@ function wfMoveStage(index, delta) {
 }
 
 function wfDeleteStage(index) {
+  if (index < (window.__wfAmendFrozen || 0)) return;
   const cards = [...document.querySelectorAll('#wfStageList .wf-stage-edit-card')];
   if (cards.length <= 1) { toast('В плане должен остаться хотя бы один этап.'); return; }
   cards[index]?.remove();
@@ -2500,6 +2611,49 @@ function wfCollectPlanStages() {
       max_revision_rounds: revisionRaw ? parseInt(revisionRaw, 10) : null,
     };
   });
+}
+
+function wfCollectAmendStages() {
+  // как wfCollectPlanStages, но замороженные карточки читаются из кэша исходных данных
+  return [...document.querySelectorAll('#wfStageList .wf-stage-edit-card')].map(card => {
+    if (card.dataset.frozen === '1') {
+      const idx = parseInt(card.dataset.index, 10);
+      return JSON.parse(JSON.stringify((window.__wfAmendSourceStages || [])[idx] || {}));
+    }
+    const value = field => card.querySelector(`[data-field="${field}"]`)?.value?.trim() || '';
+    const lines = field => value(field).split('\n').map(x => x.trim()).filter(Boolean);
+    const comma = field => value(field).split(',').map(x => x.trim()).filter(Boolean);
+    const rev = parseInt(value('max_revision_rounds'), 10);
+    return {
+      code: value('code'), title: value('title'), objective: value('objective'),
+      stage_type: card.querySelector('[data-field="stage_type"]')?.value || 'implementation',
+      dependencies: comma('dependencies'),
+      allowed_paths: lines('allowed_paths'), deliverables: lines('deliverables'),
+      acceptance_gates: lines('acceptance_gates'),
+      executor_prompt: value('executor_prompt'), reviewer_prompt: value('reviewer_prompt'),
+      max_revision_rounds: Number.isFinite(rev) && rev >= 1 ? rev : null,
+    };
+  });
+}
+
+async function wfAmendPlan() {
+  const workflowId = window.__wfAmendWorkflowId;
+  const expectedVersion = window.__wfAmendVersion;
+  if (!workflowId || workflowId !== selectedWorkflowId || expectedVersion === null) return;
+  const stages = wfCollectAmendStages();
+  if (!stages.length) { toast('Пустой план'); return; }
+  const frozen = window.__wfAmendFrozen || 0;
+  const tailCodes = stages.slice(frozen).map(s => s.code).join(', ');
+  const reason = prompt('Причина перепланировки (обязательна, попадёт в журнал):\nХвост: ' + tailCodes, '');
+  if (!reason || reason.trim().length < 3) { toast('Причина обязательна (мин. 3 символа)'); return; }
+  try {
+    await fetchJSON(`${API}/workflows/${workflowId}/plan/amend`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({expected_version:expectedVersion, stages, reason:reason.trim()}),
+    });
+    toast('Хвост плана перепланирован (событие plan.amended)', false);
+    await loadWorkflows();
+  } catch (e) { toast('Перепланировка: ' + e.message); }
 }
 
 async function wfSavePlan(reload = true) {
@@ -3430,10 +3584,92 @@ async function seriesAction(id, action, confirmEnd=false) {
 
 function closeSchedule() { document.getElementById('schedModal').classList.remove('open'); }
 
+let providerCatalog = [];
+function catalogStatus(text) { document.getElementById('pcStatus').textContent = text; }
+async function loadCatalog() {
+  try {
+    providerCatalog = (await fetchJSON(`${API}/provider-catalog`)).items;
+    const select = document.getElementById('pcCLI');
+    select.replaceChildren();
+    for (const item of providerCatalog) {
+      const option = document.createElement('option');
+      option.value = item.id;
+      option.textContent = `${item.title}${item.installed ? ' ✓' : ''}`;
+      select.appendChild(option);
+    }
+    catalogSelect();
+  } catch (err) { catalogStatus(err.message); }
+}
+function catalogSelect() {
+  const item = providerCatalog.find(p => p.id === document.getElementById('pcCLI').value);
+  document.getElementById('pcBase').value = item?.default_base || '';
+  for (const id of ['pcKey', 'pcModel', 'pcTitle']) document.getElementById(id).value = '';
+  document.getElementById('pcModels').replaceChildren();
+  catalogStatus(item?.desc || '');
+}
+function catalogBody() {
+  return {base: document.getElementById('pcBase').value.trim(),
+          key: document.getElementById('pcKey').value,
+          model: document.getElementById('pcModel').value.trim(),
+          title: document.getElementById('pcTitle').value.trim()};
+}
+async function catalogPost(action) {
+  const id = document.getElementById('pcCLI').value;
+  return fetchJSON(`${API}/provider-catalog/${encodeURIComponent(id)}/${action}`, {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(catalogBody())});
+}
+async function catalogInstall() {
+  catalogStatus('Установка CLI…');
+  try {
+    const result = await catalogPost('install');
+    catalogStatus(result.ok ? 'CLI установлен. Укажите адрес и ключ.' : 'Установка завершилась с ошибкой. Проверьте зависимости CLI.');
+  } catch (err) { catalogStatus(err.message); }
+}
+async function catalogModels() {
+  catalogStatus('Получаю модели…');
+  try {
+    const result = await catalogPost('models');
+    const select = document.getElementById('pcModels');
+    select.replaceChildren();
+    for (const model of result.models) {
+      const option = document.createElement('option');
+      option.value = model;
+      option.textContent = model;
+      select.appendChild(option);
+    }
+    document.getElementById('pcModel').value = result.models[0] || '';
+    catalogStatus('Выберите модель и создайте помощника.');
+  } catch (err) { catalogStatus(err.message); }
+}
+async function catalogCreate() {
+  try {
+    const result = await catalogPost('create');
+    for (const id of ['pcKey', 'pcBase', 'pcModel', 'pcTitle']) document.getElementById(id).value = '';
+    document.getElementById('pcModels').replaceChildren();
+    await renderProvList();
+    await loadProviders();
+    const status = document.getElementById('pcStatus');
+    status.textContent = `Создан ${result.label}. `;
+    const probe = document.createElement('button');
+    probe.className = 'btn btn-sm';
+    probe.textContent = 'Проверить связь';
+    probe.addEventListener('click', async () => {
+      try {
+        const checked = await fetchJSON(`${API}/providers/${encodeURIComponent(result.name)}/probe`, {
+          method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
+        catalogStatus(checked.ok ? 'Связь и вердикт проверены.' : 'Проверка не пройдена: ' + checked.issues.join('; '));
+      } catch (err) { catalogStatus(err.message); }
+    });
+    status.appendChild(probe);
+  } catch (err) { catalogStatus(err.message); }
+}
+
 async function openProviders() {
   document.getElementById('provModal').classList.add('open');
   await renderProvList();
   await renderMachineList();
+  await loadCatalog();
 }
 function closeProviders() { document.getElementById('provModal').classList.remove('open'); }
 
@@ -3549,7 +3785,7 @@ async function renderProvList() {
       : esc(p.cmd))
       + (p.models && p.models.length ? `<br>модели: ${esc(p.models.join(', '))}` : '')
       + (p.effort ? `<br>эффорт: ${esc(p.effort)}` : '');
-    const canDelete = p.source !== 'builtin';
+    const canDelete = p.source === 'providers.json';
     return `<div class="prov-row${(!p.available || p.hidden) ? ' dim' : ''}">
       <span class="prov-name">${esc(name)}</span>${badges.join('')}
       <div class="prov-cmd">${esc(p.description || '')}</div>
@@ -3837,6 +4073,12 @@ function updateKeepPane() {
   // в target-режиме директория и permissions не применимы — прячем
   document.getElementById('workdirLabel').style.display = prov.session_target ? 'none' : 'flex';
   document.getElementById('skipPermsLabel').style.display = prov.session_target ? 'none' : 'flex';
+  // Only the rights this provider can actually be confined to are offered.
+  const rightsSel = document.getElementById('rightsInput');
+  const supportedRights = prov.rights || [];
+  [...rightsSel.options].forEach(o => { o.disabled = o.value !== '' && !supportedRights.includes(o.value); });
+  if (rightsSel.selectedOptions[0] && rightsSel.selectedOptions[0].disabled) rightsSel.value = '';
+  document.getElementById('rightsLabel').style.display = prov.session_target ? 'none' : 'flex';
   document.getElementById('providerModeHint').style.display = prov.session_target ? '' : 'none';
   updateWorktree();
   if (prov.session_target) loadHerdrAgents();
@@ -4140,11 +4382,53 @@ async function loadCosts() {
     }
   } catch (_) {}
 
+  // Only structured usage from completed conveyor tasks; unavailable stays unknown.
+  try {
+    const t = await fetchJSON(`${API}/stats/tokens`);
+    if (t && t.total && t.total.tasks > 0) {
+      const fmtTok = n => (n / 1e6).toFixed(1) + 'M';
+      const dollars = (t.total.cost !== null)
+        ? ` · $${t.total.cost.toFixed(2)}` : '';
+      const provBits = Object.entries(t.by_provider)
+        .filter(([, v]) => v.measured)
+        .map(([p, v]) =>
+          `<div class="cost-item" title="${escAttr(v.model || p)}: ${Number(v.input).toLocaleString('ru')} in / ${Number(v.output).toLocaleString('ru')} out, кэш ${fmtTok(v.cached)} · задач: ${v.tasks}">${esc(p)}: <span>${fmtTok(v.total)}</span></div>`)
+        .join('');
+      items.push(
+        `<div class="cost-item" title="Структурированный расход задач; старые задачи и неподдерживаемые CLI без измерения">Ток. сегодня: <span>${fmtTok(t.today.total)}</span> · неделя: <span>${fmtTok(t.week.total)}</span> · всего: <span>${fmtTok(t.total.total)}${dollars}</span> · измерено ${t.total.measured_tasks}/${t.total.tasks}</div>`,
+        provBits);
+    }
+  } catch (_) {}
+
   if (!items.length) return;
   const bar = document.getElementById('costBar');
   bar.innerHTML = items.join('');
   bar.classList.add('visible');
 }
+
+// --- Health: живы ли процессы конвейера ---
+async function loadHealth() {
+  let h;
+  try { h = await fetchJSON(`${API}/health/processes`); } catch (e) { return; }
+  const bar = document.getElementById('healthBar');
+  if (!bar) return;
+  if (!h || !h.processes || !h.processes.length) {
+    bar.classList.remove('visible');
+    return;
+  }
+  const dead = h.processes.filter(p => p.state === 'dead');
+  const unknown = h.processes.filter(p => p.state === 'unknown');
+  if (dead.length) {
+    bar.innerHTML = '<div class="cost-item" style="color:var(--red)">🚨 Мертвы: ' +
+      dead.map(p => `${esc(p.label)}${p.pid ? ` (pid ${p.pid})` : ''}`).join(', ') + '</div>';
+  } else if (unknown.length || !h.ok) {
+    bar.innerHTML = '<div class="cost-item" style="color:var(--yellow)" title="pid-файл недоступен или права не дают проверить процессы">⚠️ Конвейер: нет данных о процессах</div>';
+  } else {
+    bar.innerHTML = '<div class="cost-item" title="все фоновые процессы живы">❤️ Конвейер: все процессы живы</div>';
+  }
+  bar.classList.add('visible');
+}
+
 
 // --- Init ---
 restoreSkipPermissions();
@@ -4154,6 +4438,7 @@ loadProjects();
 loadWorkerStatus();
 loadVersion();
 loadCosts();
+loadHealth();
 refresh();
 if (location.hash === '#pipelines') openPipelines();
 setInterval(refresh, 5000);
@@ -4162,6 +4447,7 @@ setInterval(() => wfRefreshScreen(), 4000);  // экран активного ta
 setInterval(() => autoRefreshWorkflowState(), 5000);  // стадия, раунды и runs без ручного «Обновить»
 setInterval(loadWorkerStatus, 10000);
 setInterval(loadCosts, 30000);
+setInterval(loadHealth, 30000);
 </script>
 </body>
 </html>

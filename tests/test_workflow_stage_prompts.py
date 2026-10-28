@@ -124,7 +124,9 @@ def planned(db, stages, edited=None, **config):
         "automation": {"enabled": True},
         "roles": {"planner": {"provider": None}, "executor": {"provider": None},
                   "reviewer": {"provider": None}},
-        "gate": {"commands": []},
+        # These cases test prompt composition without deterministic commands;
+        # opt out explicitly. Cases supplying GATE still exercise a real gate.
+        "gate": {"enabled": False, "commands": []},
         "limits": {"max_rounds": 10},
     }
     cfg.update(config)
@@ -285,7 +287,7 @@ def test_stage_without_own_prompts_keeps_the_builtin_text(isolated_db):
     reviewer = pending(isolated_db)
     assert reviewer.prompt == render(
         LEGACY_REVIEWER, **common, executor_report="EXEC-REPORT",
-        gate_evidence="Настроенных deterministic-команд нет", open_findings="[]")
+        gate_evidence="Gate отключён настройками", open_findings="[]")
     assert isolated_db.get_workflow(workflow.id).status.value == "reviewing"
 
 

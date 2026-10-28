@@ -18,8 +18,9 @@ from typing import Optional
 from . import db, worktree
 from .config import (BASE_DELAY, CONCURRENCY, DEFAULT_CLI, MAX_DELAY, MIN_FREE_MB,
                      POLL_INTERVAL, TASK_TIMEOUT, VERDICT_REPAIR,
-                     VERDICT_REPAIR_TIMEOUT, VERDICT_REQUIRED, build_cmd,
-                     get_provider_env, load_providers)
+                     VERDICT_REPAIR_TIMEOUT, VERDICT_REQUIRED, RightsUnsupported,
+                     build_cmd, get_provider_env, load_providers, rights_args,
+                     rights_supported)
 from .process_tree import OwnedProcess, ProcessTreeError
 
 # Our quota is spent — the wait is measured in hours and nothing else will get
@@ -189,10 +190,14 @@ def _repair_verdict(task, provider: str, provider_cfg: dict,
     """
     prompt = VERDICT_REPAIR_PROMPT.format(tail=(report_tail or "")[-4000:])
     try:
+        # Restating a verdict needs no tools; confine the micro-request when
+        # the provider can be confined.
         cmd = build_cmd(provider, prompt,
                         model=getattr(task, "model", None),
                         effort=getattr(task, "effort", None),
-                        guard=True)
+                        guard=True,
+                        rights=("none" if rights_supported(provider_cfg, "none")
+                                else getattr(task, "rights", None)))
         prompt_stdin = prompt if provider_cfg.get("prompt_stdin") else None
         env = get_provider_env(provider)
         env.pop("PP_TASK_ID", None)
@@ -548,11 +553,21 @@ def parse_stream_json(stdout: str) -> dict:
             meta["is_error"] = event.get("is_error")
             meta["subtype"] = event.get("subtype")
             usage = event.get("usage", {})
-            meta["input_tokens"] = usage.get("input_tokens")
+            inputs = [usage.get("input_tokens"), usage.get("cache_read_input_tokens", 0),
+                      usage.get("cache_creation_input_tokens", 0)]
+            meta["input_tokens"] = (sum(inputs) if all(type(n) is int and n >= 0 for n in inputs)
+                                    else None)
+            meta["cached_input_tokens"] = inputs[1]
+            meta["cache_creation_input_tokens"] = inputs[2]
             meta["output_tokens"] = usage.get("output_tokens")
             model_usage = event.get("modelUsage", {})
-            if model_usage:
+            if len(model_usage) == 1:
                 meta["model"] = list(model_usage.keys())[0]
+            elif len(model_usage) > 1:
+                meta.pop("model", None)
+            # Aggregated multi-model usage and cache-write TTL mixtures cannot
+            # be honestly priced from these compact counters.
+            meta["cost_attributable"] = len(model_usage) <= 1 and not inputs[2]
             # Extract result text (always for errors, fallback for empty output)
             if event.get("result"):
                 if event.get("is_error") or not text_parts:
@@ -1019,6 +1034,43 @@ def _close_registered_provider_tree(task_id: int) -> bool:
     return True
 
 
+SPAWN_RETRY_DELAY_S = 20.0
+
+
+class _SpawnCancelled(Exception):
+    """Cancellation observed before a provider process was created."""
+
+
+def _start_owned_with_spawn_retry(build, cmd, attempts=2,
+                                  delay_s=None, sleep=None, exists=None, cancel_check=None):
+    """U16: FileNotFoundError у СУЩЕСТВУЮЩЕГО исполняемого файла — транзиентное
+    давление ресурсов (255MB Electron-бинарник goose.exe при параллельных
+    тяжёлых задачах; инцидент 2026-10-03: ревью-слоты падали «CLI not found»,
+    одиночный запуск того же провайдера проходил). Один повтор через паузу;
+    действительно отсутствующий CLI падает сразу, без ожидания."""
+    import os as _os
+    delay_s = SPAWN_RETRY_DELAY_S if delay_s is None else delay_s
+    sleep = time.sleep if sleep is None else sleep
+    exists = _os.path.isfile if exists is None else exists
+    def check_cancel():
+        if cancel_check is not None and cancel_check():
+            raise _SpawnCancelled()
+    try:
+        return build()
+    except FileNotFoundError:
+        exe = str(cmd[0]) if cmd else ""
+        if attempts <= 1 or not exe or not exists(exe):
+            raise
+        remaining = delay_s
+        while remaining > 0:
+            check_cancel()
+            interval = min(0.25, remaining) if cancel_check is not None else remaining
+            sleep(interval)
+            remaining -= interval
+        check_cancel()
+        return build()
+
+
 def _effective_timeout(task):
     """Per-task timeout in seconds; None = no limit (0 disables the global one)."""
     if task.task_timeout == 0:
@@ -1144,6 +1196,8 @@ def _maybe_recur(task, failed: bool = False):
         machine=task.machine,
         keep_pane=task.keep_pane,
         worktree=task.worktree,
+        # What the run may do is part of the schedule too.
+        rights=task.rights,
     ))
     print(f"  -> Recurring: next run at {next_dt.strftime('%Y-%m-%d %H:%M UTC')}"
           f"{' (после падения)' if failed else ''}")
@@ -1372,6 +1426,13 @@ def _execute_herdr_task(task, provider_cfg, host=None, machine=None, prompt_over
             lambda: db.set_worktree(task.id, path, branch),
             f"сохранение worktree задачи #{task.id}",
         )
+        # Снимок фактического дерева старта рана (см. _execute_task_body):
+        # база доказательств no-diff/чекпоинта — дерево, где работает агент.
+        try:
+            from . import workflows as _workflows
+            _workflows.record_run_snapshot(task.id, path)
+        except Exception as exc:  # noqa: BLE001 — телеметрия
+            print(f"  !! run.snapshot #{task.id}: {exc}", flush=True)
         print(f"  -> Worktree {path} ({branch})")
 
     def on_started(_pane_id):
@@ -1732,6 +1793,24 @@ def _execute_task_body(task, admission_complete=None):
             return
         host = machine_remote(m)
 
+    rights = getattr(task, "rights", None)
+    if rights and provider_cfg.get("executor") == "herdr":
+        # Checked before any pane exists: a session that cannot be confined
+        # must not be opened at all. A task aimed at an already running
+        # session cannot be confined either — its agent keeps its own rights.
+        problem = None
+        if getattr(task, "herdr_target", None) and rights != "full":
+            problem = "задачу в открытую сессию herdr нельзя ограничить: агент уже запущен"
+        else:
+            try:
+                rights_args(provider_cfg, rights)
+            except RightsUnsupported as exc:
+                problem = str(exc)
+        if problem:
+            _mark_failed(task, f"Права «{rights}»: {problem}", exit_code=-1)
+            print(f"  -> Failed (rights): {problem}")
+            return
+
     if provider_cfg.get("executor") == "herdr":
         # herdr sessions work the same way on any machine: the CLI calls go
         # over ssh, the pane lives there (attach with `herdr --remote <host>`).
@@ -1777,9 +1856,26 @@ def _execute_task_body(task, admission_complete=None):
         wt_note = "\n\n" + worktree.summary(wt["path"], wt["branch"], wt["copied"])
         print(f"  -> Worktree {wt['path']} ({wt['branch']})")
 
-    cmd = build_cmd(provider, agent_prompt, skip_permissions=task.skip_permissions,
-                    session_id=task.session_id, model=task.model, guard=not machine,
-                    effort=task.effort)
+    # Доказательная база рана (no-diff/чекпоинт): снимок ФАКТИЧЕСКОГО дерева
+    # старта — в worktree, если он создан. Диспатч-снимок берётся раньше, из
+    # working_dir: между диспатчем и стартом воркера ветка успела уйти, и
+    # сравнение «до/после» без снимка старта приписывало сдвиг ветки
+    # исполнителю.
+    try:
+        from . import workflows as _workflows
+        _workflows.record_run_snapshot(task.id, run_dir)
+    except Exception as exc:  # noqa: BLE001 — телеметрия, не ломать запуск
+        print(f"  !! run.snapshot #{task.id}: {exc}", flush=True)
+
+    try:
+        cmd = build_cmd(provider, agent_prompt, skip_permissions=task.skip_permissions,
+                        session_id=task.session_id, model=task.model, guard=not machine,
+                        effort=task.effort, rights=getattr(task, "rights", None))
+    except RightsUnsupported as exc:
+        # Fail closed: a run that asked for narrow rights must not start wide.
+        _mark_failed(task, f"Права «{task.rights}»: {exc}", exit_code=-1)
+        print(f"  -> Failed (rights): {exc}")
+        return
     prompt_stdin = agent_prompt if provider_cfg.get("prompt_stdin") else None
 
     env = get_provider_env(provider)
@@ -1855,17 +1951,24 @@ def _execute_task_body(task, admission_complete=None):
     if callable(target_heartbeat):
         target_heartbeat(force=True)
     try:
-        tree = OwnedProcess.start(
+        tree = _start_owned_with_spawn_retry(
+            lambda: OwnedProcess.start(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="surrogateescape",
+                cwd=run_dir,
+                stdin=subprocess.PIPE if prompt_stdin is not None else subprocess.DEVNULL,
+                env=env,
+            ),
             cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="surrogateescape",
-            cwd=run_dir,
-            stdin=subprocess.PIPE if prompt_stdin is not None else subprocess.DEVNULL,
-            env=env,
+            cancel_check=lambda: db.is_cancel_requested(task.id),
         )
+    except _SpawnCancelled:
+        _mark_cancelled(task, "Отменена пользователем до повторного запуска CLI")
+        return
     except FileNotFoundError:
         _mark_failed(task, f"CLI '{provider}' not found. Is it installed and in PATH?", exit_code=-1)
         return
@@ -2048,6 +2151,7 @@ def _execute_task_body(task, admission_complete=None):
         return
 
     # Parse output
+    reported_usage = None
     model_used = None
     session_id = None
     if is_stream_json(result.stdout):
@@ -2061,6 +2165,7 @@ def _execute_task_body(task, admission_complete=None):
             parsed["meta"]["unrecognized_model"] = unrecognized
         output = format_result(parsed)
         verdict_source = parsed["text"]
+        reported_usage = parsed["meta"]
         model_used = parsed["meta"].get("model")
         session_id = parsed["meta"].get("session_id")
         # Check for rate limit in stream events — only if no text was returned
@@ -2144,7 +2249,7 @@ def _execute_task_body(task, admission_complete=None):
         "headless successful outcome",
         lambda: _mark_completed(
             task, output, exit_code=0, model_used=model_used,
-            session_id=session_id, verdict=verdict or None,
+            session_id=session_id, verdict=verdict or None, usage=reported_usage,
         ),
     )
     if changed:
