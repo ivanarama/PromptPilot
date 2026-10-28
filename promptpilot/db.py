@@ -80,6 +80,14 @@ CREATE TABLE IF NOT EXISTS tasks (
     ,rights TEXT
 );
 
+CREATE TABLE IF NOT EXISTS task_token_usage (
+    task_id INTEGER PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+    input_tokens INTEGER NOT NULL CHECK(input_tokens >= 0),
+    output_tokens INTEGER NOT NULL CHECK(output_tokens >= 0),
+    cached_input_tokens INTEGER NOT NULL CHECK(cached_input_tokens >= 0),
+    model TEXT
+);
+
 CREATE TABLE IF NOT EXISTS task_series (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     title TEXT NOT NULL,
@@ -1363,7 +1371,7 @@ def _release_task_pipeline_targets(conn, task_id: int, started_at=None):
 
 def mark_completed(task_id: int, result: str, exit_code: int = 0,
                    model_used: str = None, session_id: str = None,
-                   verdict: str = None, *, expected_started_at=None) -> bool:
+                   verdict: str = None, *, expected_started_at=None, usage=None) -> bool:
     """Finalize a task, optionally committing its verdict atomically."""
     with _connect() as conn:
         attempt = _attempt_iso(expected_started_at)
@@ -1384,6 +1392,22 @@ def mark_completed(task_id: int, result: str, exit_code: int = 0,
         if cur.rowcount:
             _drop_cancel_flag(conn, task_id)
             _release_task_pipeline_targets(conn, task_id, attempt)
+            # Usage belongs to this successful attempt, never to assistant text.
+            conn.execute("DELETE FROM task_token_usage WHERE task_id = ?", (task_id,))
+            if isinstance(usage, dict):
+                counts = [usage.get("input_tokens"), usage.get("output_tokens"),
+                          usage.get("cached_input_tokens", 0)]
+                if counts[2] is None:
+                    counts[2] = 0
+                if (all(type(n) is int and 0 <= n <= 2**63 - 1 for n in counts)
+                        and counts[2] <= counts[0]):
+                    model = usage.get("model") or model_used
+                    if not isinstance(model, str):
+                        model = None
+                    conn.execute(
+                        "INSERT INTO task_token_usage VALUES (?, ?, ?, ?, ?)",
+                        (task_id, *counts, model),
+                    )
         return cur.rowcount > 0
 
 

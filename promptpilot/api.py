@@ -1,6 +1,7 @@
 """FastAPI web API + static file serving."""
 
 import asyncio
+import json
 import base64
 import json
 import os
@@ -11,7 +12,7 @@ import subprocess
 import sys
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
 from urllib.parse import urlsplit
@@ -817,6 +818,103 @@ def api_list_workflow_runs(workflow_id: str, round_id: str):
     if not round_data or round_data.workflow_id != workflow_id:
         raise HTTPException(404, "Workflow round not found")
     return db.list_workflow_runs(round_id)
+
+
+@app.get("/api/stats/tokens")
+def api_token_stats():
+    """Structured counters recorded atomically by the completing worker."""
+    from . import usage_conveyor
+
+    return usage_conveyor.summary()
+
+
+class NoteBody(BaseModel):
+    text: str = ""
+
+
+HEALTH_PROCESS_NAMES = (
+    "server", "worker", "cascade", "verdict_watcher",
+    "bot", "bot_vk", "quota_failover",
+)
+HEALTH_LABELS = {
+    "server": "сервер API", "worker": "воркер задач",
+    "cascade": "каскад ревью", "verdict_watcher": "вотчер вердиктов",
+    "bot": "Telegram-бот", "bot_vk": "VK-бот",
+    "quota_failover": "вотчер лестницы смен",
+}
+HEALTH_PIDS_PATH = Path(__file__).resolve().parent.parent / ".pp-pids.json"
+# квен-H3: якорь = корень репозитория (тот же, что у лаунчеров);
+# DB_DIR.parent в frozen/Docker расползается с этим путём
+
+
+def _pid_alive(pid: int):
+    """True/False/None(не знаем). Квен-L11: ACCESS_DENIED — не «смерть»;
+    прототипы ctypes заданы явно, HANDLE не урезается."""
+    if not pid or pid <= 0:
+        return False
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except (PermissionError, OSError, OverflowError):
+            return None
+        return True
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32  # noqa: N806 - win api
+        kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int,
+                                         ctypes.c_uint32]
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.GetLastError.restype = ctypes.c_uint32
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = ctypes.c_int
+        handle = kernel32.OpenProcess(0x1000, 0, int(pid))
+        if not handle:
+            # 5 = ERROR_ACCESS_DENIED: процесс чужой/элевированный — жив
+            return None if kernel32.GetLastError() == 5 else False
+        kernel32.CloseHandle(handle)
+        return True
+    except Exception:  # noqa: BLE001 - не-Windows или без прав: не знаем
+        return None
+
+
+@app.get("/api/health/processes")
+def api_health_processes():
+    try:
+        pids = json.loads(HEALTH_PIDS_PATH.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        pids = {}
+    if not isinstance(pids, dict):
+        pids = {}
+    runtime = db.worker_runtime_status()
+    worker_state = ("alive" if runtime["state"] == "online" else
+                    "dead" if runtime.get("heartbeat_at") else "unknown")
+    processes = [
+        {"name": "server", "label": HEALTH_LABELS["server"], "pid": os.getpid(),
+         "state": "alive", "alive": True},
+        {"name": "worker", "label": HEALTH_LABELS["worker"],
+         "pid": runtime.get("pid"), "state": worker_state,
+         "alive": None if worker_state == "unknown" else worker_state == "alive",
+         "heartbeat_at": runtime.get("heartbeat_at"), "paused": runtime["paused"]},
+    ]
+    for name in HEALTH_PROCESS_NAMES:
+        if name in {"server", "worker"}:
+            continue
+        raw = pids.get(name)
+        pid = raw if type(raw) is int and 0 < raw <= 2**32 - 1 else 0
+        if not pid:
+            continue  # Optional companions are not required by a core install.
+        alive = _pid_alive(pid)
+        state = "unknown" if alive is None else "alive" if alive else "dead"
+        processes.append({"name": name, "label": HEALTH_LABELS.get(name, name),
+                          "pid": pid, "state": state, "alive": alive})
+    return {
+        "ok": all(p["state"] == "alive" for p in processes),
+        "processes": processes,
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 @app.get(

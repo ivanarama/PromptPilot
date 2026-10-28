@@ -2140,6 +2140,7 @@ def _execute_task_body(task, admission_complete=None):
         return
 
     # Parse output
+    reported_usage = None
     model_used = None
     session_id = None
     if is_stream_json(result.stdout):
@@ -2153,6 +2154,7 @@ def _execute_task_body(task, admission_complete=None):
             parsed["meta"]["unrecognized_model"] = unrecognized
         output = format_result(parsed)
         verdict_source = parsed["text"]
+        reported_usage = parsed["meta"]
         model_used = parsed["meta"].get("model")
         session_id = parsed["meta"].get("session_id")
         # Check for rate limit in stream events — only if no text was returned
@@ -2236,7 +2238,7 @@ def _execute_task_body(task, admission_complete=None):
         "headless successful outcome",
         lambda: _mark_completed(
             task, output, exit_code=0, model_used=model_used,
-            session_id=session_id, verdict=verdict or None,
+            session_id=session_id, verdict=verdict or None, usage=reported_usage,
         ),
     )
     if changed:
