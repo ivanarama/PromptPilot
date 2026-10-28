@@ -402,6 +402,37 @@ def test_ambiguous_dispatch_keeps_durable_checkout_reservation(os_env, monkeypat
     assert list(state["work"]) == [str(issue["iid"])]
 
 
+@pytest.mark.parametrize("kind", ["review", "redo"])
+def test_ambiguous_review_or_redo_never_releases_live_task_checkout(os_env, monkeypatch, kind):
+    iid, state = claimed(os_env)
+    work = state["work"][str(iid)]
+    os_env.pp.finish(work["pp_task"], "ИТОГ: ГОТОВО")
+    if kind == "redo":
+        os_env.exec.watch(os_env.env, state, {})
+        os_env.pp.finish(work["review_task"], "РЕШЕНИЕ: FAIL\nЗАМЕЧАНИЯ: fix\nИТОГ: ГОТОВО")
+    pp = os_env.exec.pp_request
+    created = []
+    def response_lost(env, path, method="GET", payload=None):
+        task = pp(env, path, method, payload)
+        if method == "POST":
+            recorded = os_env.exec.load_state()["work"][str(iid)]
+            assert recorded["stage"] == "подготовка" and recorded["dispatch_kind"] == kind
+            created.append(task["id"])
+            raise TimeoutError("response lost after task creation")
+        return task
+    monkeypatch.setattr(os_env.exec, "pp_request", response_lost)
+    with pytest.raises(TimeoutError, match="response lost"):
+        os_env.exec.watch(os_env.env, state, {})
+    assert len(created) == 1 and os_env.pp.tasks[created[0]]["status"] == "pending"
+    other = os_env.gitlab.add(labels=["триаж-ТЗ"])
+    calls, tasks = len(os_env.git.calls), len(os_env.pp.tasks)
+    for _ in range(3):
+        os_env.exec.watch(os_env.env, state, {})
+        os_env.exec.claim(os_env.env, state, other["iid"])
+    assert (len(os_env.git.calls), len(os_env.pp.tasks)) == (calls, tasks)
+    assert work["stage"] == "подготовка"
+
+
 @pytest.mark.parametrize("bot_id", [None, "", "abc", "0", "-1"])
 def test_missing_keeper_identity_does_not_promote_forged_note(os_env, bot_id):
     issue = os_env.gitlab.add(description="original request", labels=["триаж-ТЗ"])

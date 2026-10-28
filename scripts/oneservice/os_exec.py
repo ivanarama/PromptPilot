@@ -363,13 +363,17 @@ def start_review(env: dict, state: dict, iid: int, w: dict) -> None:
     )
     payload = {"prompt": prompt, "provider": reviewer,
                "working_dir": str(repo()), "priority": 2}
+    w["stage"] = "подготовка"
+    w["dispatch_kind"] = "review"
+    save_state(state)
     task = pp_request(env, "/api/tasks", "POST", payload)
     w["stage"] = "ревью"
     w["review_task"] = task["id"]
     w["review_head"] = candidate
     w["review_base_head"] = base_sha
-    project_api(env, f"/issues/{iid}", "PUT", {"labels": "в работе,ревью"})
+    w.pop("dispatch_kind", None)
     save_state(state)
+    project_api(env, f"/issues/{iid}", "PUT", {"labels": "в работе,ревью"})
     print(f"🔍 issue #{iid}: ревью ({reviewer}), задача #{task['id']}")
 
 
@@ -397,7 +401,7 @@ def review_verdict(task: dict, env: dict, state: dict, iid: int, w: dict) -> Non
         w["stage"] = label
         print(f"issue #{iid}: ревью {'PASS' if passed else 'FAIL (предел раундов)'}")
     else:
-        redo(env, iid, w, remarks or "Ревью не прошло; замечания не сформулированы — "
+        redo(env, state, iid, w, remarks or "Ревью не прошло; замечания не сформулированы — "
                                      "перечитай ТЗ и проверь результат целиком.")
         project_api(env, f"/issues/{iid}/notes", "POST", {
             "body": f"↩ Замечания ревью вернули задачу исполнителю (раунд {w['rounds']})."})
@@ -405,7 +409,7 @@ def review_verdict(task: dict, env: dict, state: dict, iid: int, w: dict) -> Non
     save_state(state)
 
 
-def redo(env: dict, iid: int, w: dict, remarks: str) -> None:
+def redo(env: dict, state: dict, iid: int, w: dict, remarks: str) -> None:
     """Send the task back to the executor WITH the reviewer's remarks.
 
     The loop used to flip the stage to «в работе» and wait for the old,
@@ -418,10 +422,15 @@ def redo(env: dict, iid: int, w: dict, remarks: str) -> None:
         raise RuntimeError(f"не могу вернуться на ветку {w['branch']}: {out}")
     issue = project_api(env, f"/issues/{iid}")
     w["rounds"] = int(w.get("rounds", 1)) + 1
+    w["stage"] = "подготовка"
+    w["dispatch_kind"] = "redo"
+    save_state(state)
     w["pp_task"] = dispatch_executor(
         env, executor_prompt(env, issue, w["branch"], remarks=remarks, round_no=w["rounds"]))
     w["stage"] = "в работе"
     w["review_task"] = None
+    w.pop("dispatch_kind", None)
+    save_state(state)
     project_api(env, f"/issues/{iid}", "PUT", {"labels": "в работе,триаж-ТЗ"})
 
 
