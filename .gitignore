@@ -22,6 +22,8 @@ scripts/oneservice/.os_senders.json
 scripts/oneservice/.os_tg_allowed.json
 scripts/oneservice/.os_exec.json
 scripts/oneservice/.os_keeper.json
+scripts/oneservice/.os_authors.json
 scripts/oneservice/_template.html
+scripts/oneservice/os_iceberg.html
 NUL
 scripts/oneservice/.tg_lock
