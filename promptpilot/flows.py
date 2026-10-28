@@ -414,7 +414,7 @@ def reference_kind(reference: str, steps: dict, fixed_inputs: tuple = ()) -> str
     if head == "flow":
         return "fixed"
     if head == "item":
-        return "fixed" if rest in ("id", "created_at") else "outside"
+        return "fixed" if rest in ("id", "created_at", "attachments_dir") else "outside"
     if head == "input":
         return "fixed" if rest in fixed_inputs else "outside"
     if head == "material":
@@ -437,7 +437,7 @@ def reference_kind(reference: str, steps: dict, fixed_inputs: tuple = ()) -> str
 
 
 _FLOW_BUILTINS = ("name", "title", "dir", "attachments")
-_ITEM_FIELDS = ("id", "title", "author", "created_at")
+_ITEM_FIELDS = ("id", "title", "author", "created_at", "attachments_dir")
 _STEP_FIELDS = {
     "human": ("decision", "note", "by"),
     "command": ("exit_code", "ok", "output"),
@@ -447,7 +447,7 @@ _STEP_FIELDS = {
 }
 _INPUT_FIELDS = {
     "email": ("message_id", "from", "reply_to", "subject", "title", "author", "body", "date",
-              "sender_allowed", "attachments"),
+              "sender_allowed", "attachments", "attachments_dir"),
     "gitlab_issues": ("iid", "title", "body", "author", "labels", "web_url", "created_at"),
 }
 
@@ -722,6 +722,8 @@ def _lookup(context: dict, reference: str):
             value = value[part]
         else:
             return ""
+    if reference == "item.attachments_dir" and not value:
+        raise FlowError("Attachments directory is unavailable; receive this item through attachment-enabled intake")
     return value
 
 
@@ -1046,7 +1048,7 @@ def _flow_context(flow: FlowDef) -> dict:
 def _context(flow: FlowDef, item: dict) -> dict:
     return {
         "item": {"id": item["id"], "title": item["title"], "author": item["author"],
-                 "created_at": item["created_at"]},
+                 "created_at": item["created_at"], "attachments_dir": item["data"].get("attachments_dir")},
         "input": item["data"].get("input", {}),
         "steps": item["data"].get("steps", {}),
         "flow": _flow_context(flow),
@@ -1249,6 +1251,32 @@ def _flow_revision(flow: FlowDef, *, prompt_buffers=None) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _has_route_approval(conn, flow: FlowDef, item: dict, step, *, prompt_buffers=None) -> bool:
+    position = flow.index_of(step.id)
+    reply = isinstance(step, ReplyStep)
+    if reply:
+        humans = [candidate for candidate in flow.steps[:position] if isinstance(candidate, HumanStep)]
+        qualifying = {humans[-1].id} if humans else set()
+    else:
+        qualifying = {candidate.id for candidate in flow.steps[:position]
+                      if isinstance(candidate, HumanStep) and candidate.when is None
+                      and candidate.on_reject == "reject"}
+    revision = _flow_revision(flow, prompt_buffers=prompt_buffers)
+    for event in conn.execute(
+            "SELECT step_id, payload_json FROM flow_events "
+            "WHERE item_id=? AND event_type='approval.decided' ORDER BY seq DESC",
+            (item["id"],)).fetchall():
+        payload = db._json_load(event["payload_json"])
+        if reply and event["step_id"] in qualifying:
+            # Only the latest decision of the actual last reply gate counts.
+            # A rejected/newer-context decision cannot revive an older grant.
+            return payload.get("decision") == "approve" and payload.get("flow_revision") == revision
+        if (event["step_id"] in qualifying and payload.get("decision") == "approve"
+                and payload.get("flow_revision") == revision):
+            return True
+    return False
+
+
 def _check_agent_admission(conn, flow: FlowDef, item: dict, step: AgentStep, *, prompt_buffers) -> None:
     # The item's original trust cannot be raised by a later route edit.
     if item["trust"] not in TRUST_LIMITS:
@@ -1257,21 +1285,7 @@ def _check_agent_admission(conn, flow: FlowDef, item: dict, step: AgentStep, *, 
         if item["trust"] == flow.trust == "owner":
             return
         raise FlowError("Explicit agent rights are required for this request")
-    position = flow.index_of(step.id)
-    qualifying = {candidate.id for candidate in flow.steps[:position]
-                  if isinstance(candidate, HumanStep) and candidate.when is None
-                  and candidate.on_reject == "reject"}
-    revision = _flow_revision(flow, prompt_buffers=prompt_buffers)
-    approved = False
-    for event in conn.execute(
-            "SELECT step_id, payload_json FROM flow_events "
-            "WHERE item_id=? AND event_type='approval.decided' ORDER BY seq DESC",
-            (item["id"],)).fetchall():
-        payload = db._json_load(event["payload_json"])
-        if (event["step_id"] in qualifying and payload.get("decision") == "approve"
-                and payload.get("flow_revision") == revision):
-            approved = True
-            break
+    approved = _has_route_approval(conn, flow, item, step, prompt_buffers=prompt_buffers)
     phase = 1 if approved else 0
     ceiling = min(RIGHTS_ORDER[TRUST_LIMITS[item["trust"]][phase]],
                   RIGHTS_ORDER[TRUST_LIMITS[flow.trust][phase]])
@@ -1507,7 +1521,7 @@ def _enter_section(flow: FlowDef, item: dict, index: int, step) -> bool:
         if inside:
             rows = conn.execute(
                 "SELECT data_json FROM flow_items WHERE flow = ? AND id != ? AND status IN "
-                "('active', 'waiting_human', 'needs_human')", (flow.name, item["id"])).fetchall()
+                "('active', 'waiting_human', 'needs_human', 'cancelling')", (flow.name, item["id"])).fetchall()
             holders = sum(1 for row in rows if json.loads(row["data_json"] or "{}").get("section"))
             if holders >= section.max:
                 return False
@@ -1531,8 +1545,74 @@ def _connector_failed(flow: FlowDef, item: dict, index: int, step, error: str) -
     return False
 
 
+_CONNECTORS_INFLIGHT = set()
+_CONNECTORS_LOCK = threading.Lock()
+
+
+def _begin_connector(flow: FlowDef, item: dict, step, kind: str, seconds: int):
+    owner = uuid.uuid4().hex
+    with db._connect(immediate=True) as conn:
+        current = _locked_item(conn, item["id"], item["version"])
+        if current["status"] != "active" or (current["wait"] or {}).get("command"):
+            raise _Stale(item["id"])
+        if isinstance(step, ReplyStep) and not (current["trust"] == flow.trust == "owner"):
+            if not _has_route_approval(conn, flow, current, step):
+                raise FlowError("Current reply requires a new human approval of this route context")
+        until = datetime.now(timezone.utc) + timedelta(seconds=seconds)
+        current["wait"] = {"command": step.id, "side_effect": kind, "owner": owner,
+                           "until": until.isoformat(), "phase": "external_operation"}
+        _commit(current, [("connector.started", {"kind": kind}, step.id)], conn)
+    with _CONNECTORS_LOCK:
+        _CONNECTORS_INFLIGHT.add(owner)
+    return current, owner
+
+
+def _settle_connector(flow, item_id, owner, index, step, *, result=None, error=None, uncertain=False):
+    try:
+        with db._connect(immediate=True) as conn:
+            current = _command_claim(item_id, owner, conn=conn)
+            was_parked = current["status"] == "needs_human"
+            if uncertain:
+                current["wait"] = {**current["wait"], "ambiguous": True, "until": _now()}
+                current["status"], current["error"] = "needs_human", str(error)[:2000]
+                _commit(current, [("connector.effect_uncertain", {"reason": str(error)[:500]}, step.id)], conn)
+            elif current["status"] == "cancelling":
+                current["data"]["steps"][step.id] = result or {"error": str(error)[:500]}
+                current["status"], current["wait"] = "cancelled", None
+                _commit(current, [("item.cancelled", {"connector_settled": True}, step.id)], conn)
+            elif error is not None:
+                current["data"]["steps"][step.id] = {"error": str(error)[:500]}
+                current["wait"] = None
+                if step.on_error == "continue":
+                    _after_step(flow, current, index, step, {"error": str(error)[:500]}, conn=conn)
+                else:
+                    current["status"] = "failed" if step.on_error == "fail" else "needs_human"
+                    current["error"] = str(error)[:2000]
+                    _commit(current, [("connector.failed", {"reason": str(error)[:500]}, step.id)], conn)
+            elif current["status"] == "active":
+                current["data"]["steps"][step.id] = result
+                _after_step(flow, current, index, step, result, conn=conn)
+            else:
+                # A runner may have parked an expired lease while the owner settled.
+                # Record the actual result, retaining the need for an operator decision.
+                current["data"]["steps"][step.id] = result
+                # The effect is known successful: do not leave retry on that step.
+                # Keep the parked status; a human resume continues after it.
+                _after_step(flow, current, index, step, result, conn=conn)
+            if was_parked and current["status"] == "active":
+                current["status"] = "needs_human"
+                current["error"] = "Previous external operation settled; review before continuing after it"
+                _commit(current, [("connector.settled_after_stop", result or {"error": str(error)[:500]}, step.id)], conn)
+    finally:
+        with _CONNECTORS_LOCK:
+            _CONNECTORS_INFLIGHT.discard(owner)
+    if current["status"] == "needs_human":
+        _notify_stuck(flow, current)
+    return current["status"] == "active"
+
+
 def _run_gitlab(flow: FlowDef, item: dict, index: int, step: GitlabStep) -> bool:
-    from .flow_connectors import ConnectorError, gitlab_apply
+    from .flow_connectors import gitlab_apply
 
     context = _context(flow, item)
     issue = render(step.issue, context) if step.issue else item["data"]["input"].get("iid")
@@ -1541,6 +1621,7 @@ def _run_gitlab(flow: FlowDef, item: dict, index: int, step: GitlabStep) -> bool
         create = {"title": render(step.create.title, context),
                   "description": render(step.create.description, context),
                   "labels": render(step.create.labels, context)}
+    item, owner = _begin_connector(flow, item, step, "gitlab", 900)
     try:
         result = gitlab_apply(
             flow.gitlab, int(issue) if issue not in (None, "") else None, create=create,
@@ -1549,15 +1630,16 @@ def _run_gitlab(flow: FlowDef, item: dict, index: int, step: GitlabStep) -> bool
             add_labels=render(step.add_labels, context),
             remove_labels=render(step.remove_labels, context),
             assignee_id=render(step.assignee_id, context), state=step.state)
-    except (ConnectorError, ValueError, KeyError) as exc:
-        return _connector_failed(flow, item, index, step, f"{type(exc).__name__}: {exc}")
-    item["data"]["steps"][step.id] = result
-    _after_step(flow, item, index, step, {"iid": result.get("iid")})
-    return True
+    except BaseException as exc:
+        _settle_connector(flow, item["id"], owner, index, step, error=f"{type(exc).__name__}: {exc}", uncertain=True)
+        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            raise
+        return False
+    return _settle_connector(flow, item["id"], owner, index, step, result=result)
 
 
 def _send_reply(flow: FlowDef, item: dict, index: int, step: ReplyStep) -> bool:
-    from .flow_connectors import ConnectorError, send_reply
+    from .flow_connectors import ConnectorError, DeliveryUncertain, send_reply
 
     source = flow.input
     context = _context(flow, item)
@@ -1565,22 +1647,20 @@ def _send_reply(flow: FlowDef, item: dict, index: int, step: ReplyStep) -> bool:
     if not all(credentials):
         return _connector_failed(flow, item, index, step,
                                  f"не заданы {source.user_env} / {source.password_env}")
-    # Claim first, like a command: a letter must not go out twice.
-    until = datetime.now(timezone.utc) + timedelta(seconds=300)
-    item["wait"] = {"command": step.id, "until": until.isoformat()}
-    _commit(item, [("reply.started", {}, step.id)])
+    item, owner = _begin_connector(flow, item, step, "smtp", 300)
     try:
         text = render(step.text_override, context).strip() or render(step.text, context)
         sent_to = send_reply(source, item["data"]["input"], text=text,
                              subject=render(step.subject, context), smtp_host=step.smtp_host,
                              smtp_port=step.smtp_port, from_name=step.from_name,
                              credentials=credentials)
-    except ConnectorError as exc:
-        item["wait"] = None
-        return _connector_failed(flow, item, index, step, str(exc))
-    item["data"]["steps"][step.id] = {"sent": True, "to": sent_to}
-    _after_step(flow, item, index, step, {"sent": True})
-    return True
+    except BaseException as exc:
+        uncertain = isinstance(exc, DeliveryUncertain) or not isinstance(exc, ConnectorError)
+        _settle_connector(flow, item["id"], owner, index, step, error=str(exc), uncertain=uncertain)
+        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            raise
+        return False
+    return _settle_connector(flow, item["id"], owner, index, step, result={"sent": True, "to": sent_to})
 
 
 def _command_abandoned(flow: FlowDef, item: dict, step) -> bool:
@@ -1683,7 +1763,7 @@ def decide(item_id: int, decision: str, note: str = "", by: str = "",
     return item
 
 
-def _verify_recovery(conn, item, by, confirmed, note):
+def _verify_recovery(conn, item, by, confirmed, note, *, side_effect_reviewed=False):
     wait = item["wait"] or {}
     task_id = wait.get("task_id")
     if task_id:
@@ -1697,6 +1777,21 @@ def _verify_recovery(conn, item, by, confirmed, note):
             item["wait"] = None
         elif task.status.value not in ("completed", "failed", "cancelled"):
             raise FlowError("The previous task is still stopping; recovery is not admitted")
+    if wait.get("side_effect"):
+        with _CONNECTORS_LOCK:
+            in_flight = wait.get("owner") in _CONNECTORS_INFLIGHT
+        if in_flight:
+            raise FlowError("Previous external operation is still active in this process; recovery is refused")
+        until = datetime.fromisoformat(wait.get("until") or _now())
+        if datetime.now(timezone.utc) < until:
+            raise FlowError("Previous external operation is still active; wait for it to settle")
+        if not side_effect_reviewed or not note.strip():
+            raise FlowError("External delivery is uncertain; inspect remote effects and explicitly confirm side-effect review with a reason")
+        _event(conn, item["id"], "connector.effect_verified",
+               {"by": by[:80], "note": note.strip()[:2000], "observed_version": item["version"],
+                "previous_owner": wait.get("owner"), "kind": wait["side_effect"]}, item["step_id"])
+        item["wait"] = None
+        return
     if not wait.get("command"):
         return
     if not confirmed or not note.strip():
@@ -1708,13 +1803,15 @@ def _verify_recovery(conn, item, by, confirmed, note):
 
 
 def retry(item_id: int, by: str = "", flows: dict | None = None, *,
-          expected_version: int, confirm_command_stopped: bool = False, note: str = "") -> dict:
+          expected_version: int, confirm_command_stopped: bool = False, note: str = "",
+          confirm_side_effect_reviewed: bool = False) -> dict:
     """Run the step the item stopped at once more (after an exhausted repeat: one more round)."""
     with db._connect(immediate=True) as conn:
         item = _locked_item(conn, item_id, expected_version)
         if item["status"] != "needs_human":
             raise FlowError("повторить можно только заявку, которой нужен человек")
-        _verify_recovery(conn, item, by, confirm_command_stopped, note)
+        _verify_recovery(conn, item, by, confirm_command_stopped, note,
+                                 side_effect_reviewed=confirm_side_effect_reviewed)
         flow = _flow_of(item, flows)
         payload = {"by": by[:80]}
         exhausted = (item["wait"] or {}).get("exhausted")
@@ -1729,13 +1826,15 @@ def retry(item_id: int, by: str = "", flows: dict | None = None, *,
 
 
 def skip(item_id: int, by: str = "", flows: dict | None = None, *,
-          expected_version: int, confirm_command_stopped: bool = False, note: str = "") -> dict:
+          expected_version: int, confirm_command_stopped: bool = False, note: str = "",
+          confirm_side_effect_reviewed: bool = False) -> dict:
     """Go past the step the item stopped at, as if it succeeded without a result."""
     with db._connect(immediate=True) as conn:
         item = _locked_item(conn, item_id, expected_version)
         if item["status"] != "needs_human":
             raise FlowError("пропустить шаг можно только у заявки, которой нужен человек")
-        _verify_recovery(conn, item, by, confirm_command_stopped, note)
+        _verify_recovery(conn, item, by, confirm_command_stopped, note,
+                                 side_effect_reviewed=confirm_side_effect_reviewed)
         flow = _flow_of(item, flows)
         index = _position(flow, item)
         if index is None or index >= len(flow.steps):
@@ -1750,7 +1849,8 @@ def skip(item_id: int, by: str = "", flows: dict | None = None, *,
 
 
 def cancel(item_id: int, by: str = "", *, expected_version: int,
-           confirm_command_stopped: bool = False, note: str = "") -> dict:
+           confirm_command_stopped: bool = False, note: str = "",
+          confirm_side_effect_reviewed: bool = False) -> dict:
     with db._connect(immediate=True) as conn:
         item = _locked_item(conn, item_id, expected_version)
         if item["status"] in FINISHED:
@@ -1758,7 +1858,8 @@ def cancel(item_id: int, by: str = "", *, expected_version: int,
         wait = item["wait"] or {}
         if wait.get("command"):
             if wait.get("ambiguous") or item["status"] == "needs_human":
-                _verify_recovery(conn, item, by, confirm_command_stopped, note)
+                _verify_recovery(conn, item, by, confirm_command_stopped, note,
+                                 side_effect_reviewed=confirm_side_effect_reviewed)
             else:
                 if item["status"] != "cancelling":
                     item["status"] = "cancelling"
@@ -1768,7 +1869,8 @@ def cancel(item_id: int, by: str = "", *, expected_version: int,
         if task_id:
             task = db.get_task(task_id)
             if task is None:
-                _verify_recovery(conn, item, by, confirm_command_stopped, note)
+                _verify_recovery(conn, item, by, confirm_command_stopped, note,
+                                 side_effect_reviewed=confirm_side_effect_reviewed)
                 task_id = None
         if task_id:
             item["status"] = "cancelling"
@@ -1927,7 +2029,7 @@ def _poll_mail(flow: FlowDef, *, connect=None, today: date | None = None) -> lis
                 later[key] = day
                 continue
             if item:
-                if parts:
+                if source.save_attachments:
                     item = _keep_attachments(flow, item, parts, conn=conn)
                 created.append(item)
             seen.append(key)
@@ -1946,7 +2048,12 @@ def attachments_dir(flow: FlowDef) -> Path:
 def _keep_attachments(flow: FlowDef, item: dict, parts: list, *, conn=None) -> dict:
     from .flow_connectors import write_attachments
 
-    paths = write_attachments(attachments_dir(flow) / str(item["id"]), parts)
+    # A rolled-back SQLite id may be reused. A random, exclusively-created
+    # directory never becomes the next letter's working directory after a crash.
+    directory = attachments_dir(flow) / uuid.uuid4().hex
+    directory.mkdir(parents=True, exist_ok=False)
+    paths = write_attachments(directory, parts)
+    item["data"]["attachments_dir"] = str(directory)
     item["data"]["input"]["attachments"] = paths
     _commit(item, [("input.attachments", {"count": len(paths)}, None)], conn=conn)
     return item

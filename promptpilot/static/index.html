@@ -1658,7 +1658,9 @@ async function showFlowItem(id) {
         <button class="btn btn-sm btn-primary" onclick="decideFlowItem(${id}, 'approve', ${item.version})">Одобрить</button>
         <button class="btn btn-sm btn-danger" onclick="decideFlowItem(${id}, 'reject', ${item.version})">Отклонить</button></div>`;
     } else if (item.status === 'needs_human') {
-      const verifyStop = (wait.command || wait.ambiguous_task)
+      const verifyStop = wait.side_effect
+        ? '<label><input type="checkbox" id="flowEffectChecked"> Прежнее действие остановлено, последствия проверены; повтор может отправить ещё раз</label><textarea id="flowStopNote" placeholder="Что проверено и какое восстановление выбрано"></textarea>'
+        : (wait.command || wait.ambiguous_task)
         ? '<label><input type="checkbox" id="flowStopChecked"> Проверил, что прежнее выполнение остановлено</label><textarea id="flowStopNote" placeholder="Результат проверки"></textarea>' : '';
       actions = `<div class="flow-box"><b>Нужен человек.</b><div class="flow-error">${esc(item.error || '')}</div>${verifyStop}
         <button class="btn btn-sm btn-primary" onclick="flowItemAction(${id}, 'retry', ${item.version})">Повторить шаг</button>
@@ -1712,8 +1714,9 @@ async function flowItemAction(id, action, observedVersion) {
   if (action === 'cancel' && !confirm(`Снять заявку #${id}?`)) return;
   try {
     const confirm_command_stopped = !!(document.getElementById('flowStopChecked') || {}).checked;
+    const confirm_side_effect_reviewed = !!(document.getElementById('flowEffectChecked') || {}).checked;
     const note = (document.getElementById('flowStopNote') || {}).value || '';
-    const result = await fetchJSON(`${API}/flows/items/${id}/${action}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ expected_version, confirm_command_stopped, note }) });
+    const result = await fetchJSON(`${API}/flows/items/${id}/${action}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ expected_version, confirm_command_stopped, note, ...(confirm_side_effect_reviewed ? { confirm_side_effect_reviewed: true } : {}) }) });
     if (result.status === 'cancelling') {
       toast('Остановка запрошена', false);
       return showFlowItem(id);

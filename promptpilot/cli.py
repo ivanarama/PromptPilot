@@ -1028,14 +1028,16 @@ def flows_reject(item_id, note, expected_version):
 @click.option("--expected-version", type=click.IntRange(min=0), default=None,
               help="Observed version; default: fetch current state and submit with CAS")
 @click.option("--confirm-command-stopped", is_flag=True, help="Only after verifying previous execution stopped")
+@click.option("--confirm-side-effect-reviewed", is_flag=True, help="Only after inspecting uncertain external delivery; retry may resend")
 @click.option("--note", default="", help="Reason for verified recovery")
-def flows_retry(item_id, expected_version, confirm_command_stopped, note):
+def flows_retry(item_id, expected_version, confirm_command_stopped, note, confirm_side_effect_reviewed):
     """Повторить шаг, на котором заявка остановилась (после исчерпанных повторов — ещё круг)."""
     from . import flows
 
     click.echo(_flow_line(_flow_call_cli(flows.retry, item_id, "cli",
                                           expected_version=_flow_version(item_id, expected_version),
-                                          confirm_command_stopped=confirm_command_stopped, note=note)))
+                                          confirm_command_stopped=confirm_command_stopped,
+                                          confirm_side_effect_reviewed=confirm_side_effect_reviewed, note=note)))
 
 
 @flows_group.command("skip")
@@ -1043,14 +1045,16 @@ def flows_retry(item_id, expected_version, confirm_command_stopped, note):
 @click.option("--expected-version", type=click.IntRange(min=0), default=None,
               help="Observed version; default: fetch current state and submit with CAS")
 @click.option("--confirm-command-stopped", is_flag=True, help="Only after verifying previous execution stopped")
+@click.option("--confirm-side-effect-reviewed", is_flag=True, help="Only after inspecting uncertain external delivery; retry may resend")
 @click.option("--note", default="", help="Reason for verified recovery")
-def flows_skip(item_id, expected_version, confirm_command_stopped, note):
+def flows_skip(item_id, expected_version, confirm_command_stopped, note, confirm_side_effect_reviewed):
     """Пропустить шаг, на котором заявка остановилась."""
     from . import flows
 
     click.echo(_flow_line(_flow_call_cli(flows.skip, item_id, "cli",
                                           expected_version=_flow_version(item_id, expected_version),
-                                          confirm_command_stopped=confirm_command_stopped, note=note)))
+                                          confirm_command_stopped=confirm_command_stopped,
+                                          confirm_side_effect_reviewed=confirm_side_effect_reviewed, note=note)))
 
 
 @flows_group.command("cancel")
@@ -1058,14 +1062,16 @@ def flows_skip(item_id, expected_version, confirm_command_stopped, note):
 @click.option("--expected-version", type=click.IntRange(min=0), default=None,
               help="Observed version; default: fetch current state and submit with CAS")
 @click.option("--confirm-command-stopped", is_flag=True, help="Only after verifying previous execution stopped")
+@click.option("--confirm-side-effect-reviewed", is_flag=True, help="Only after inspecting uncertain external delivery; retry may resend")
 @click.option("--note", default="", help="Reason for verified recovery")
-def flows_cancel(item_id, expected_version, confirm_command_stopped, note):
+def flows_cancel(item_id, expected_version, confirm_command_stopped, note, confirm_side_effect_reviewed):
     """Снять заявку (и остановить задачу её шага)."""
     from . import flows
 
     click.echo(_flow_line(_flow_call_cli(flows.cancel, item_id, "cli",
                                           expected_version=_flow_version(item_id, expected_version),
-                                          confirm_command_stopped=confirm_command_stopped, note=note)))
+                                          confirm_command_stopped=confirm_command_stopped,
+                                          confirm_side_effect_reviewed=confirm_side_effect_reviewed, note=note)))
 
 
 @flows_group.command("run")

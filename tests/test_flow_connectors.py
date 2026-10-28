@@ -390,7 +390,7 @@ def test_unknown_input_flag_is_refused(env):
 def test_attachments_land_in_the_items_own_folder(env):
     flow = mail_flow(env.root, save_attachments=True)
     flow["steps"].insert(0, {"id": "look", "kind": "agent", "rights": "read", "provider": "claude",
-                             "working_dir": "{{flow.attachments}}/{{item.id}}",
+                             "working_dir": "{{item.attachments_dir}}",
                              "prompt": "Вложения: {{input.attachments}}"})
     flow = load(flow)
     mailbox = FakeIMAP([letter("a@known.ru", attachment=("../../evil.bat", b"payload"))])
@@ -399,7 +399,7 @@ def test_attachments_land_in_the_items_own_folder(env):
     advance(flow, item["id"])
 
     paths = flows.get_item(item["id"])["data"]["input"]["attachments"]
-    folder = flows.attachments_dir(flow) / str(item["id"])
+    folder = Path(flows.get_item(item["id"])["data"]["attachments_dir"])
     assert [Path(path).parent for path in paths] == [folder]
     assert Path(paths[0]).name == "01-evil.bat" and Path(paths[0]).read_bytes() == b"payload"
     task = env.db.get_task(flows.get_item(item["id"])["wait"]["task_id"])
