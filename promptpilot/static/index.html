@@ -2057,14 +2057,17 @@ function workflowSettingsHtml(wf) {
   </details>`;
 }
 
-function workflowStatusInfo(status, reviewerDone = false) {
+function workflowStatusInfo(status, reviewerDone = false, automation = {}) {
+  const automaticGate = automation.enabled === true && automation.auto_gate !== false;
   const info = {
     draft: ['Черновик', 'Следующее действие: сформировать план этапов либо запустить быструю задачу.'],
     planning: ['Планирование', 'Сильный планировщик исследует задачу и формирует этапы.'],
     awaiting_plan_approval: ['План ожидает утверждения', 'Проверьте порядок, scope и gate каждого этапа, затем утвердите план.'],
     queued: ['Готов к запуску', 'Следующее действие: выбрать исполнителя и отправить промпт.'],
     executing: ['Исполнитель работает', 'Следующее действие: наблюдать за агентом; после успешного ответа начнутся проверки.'],
-    gating: ['Автоматические проверки', 'Проверки идут сами — ничего нажимать не нужно; результат применится автоматически.'],
+    gating: automaticGate
+      ? ['Автоматические проверки', 'Проверки идут сами — ничего нажимать не нужно; результат применится автоматически.']
+      : ['Ручные проверки', 'Выполните проверки и выберите Gate PASS или FAIL.'],
     reviewing: ['Независимое ревью', 'Следующее действие: запустить проверяющего.'],
     revision_required: ['Нужны исправления', 'Следующее действие: открыть новый раунд доработок.'],
     awaiting_human: reviewerDone
@@ -2082,7 +2085,7 @@ function workflowNeedsHuman(wf) {
   // ждёт: заголовок «НУЖНО ДЕЙСТВИЕ» врёт и рождал ложные тревоги владельца.
   // Человека ждёт только ручной gate (auto_gate === false).
   const s = wf?.status;
-  if (s === 'gating') return wf?.config?.automation?.auto_gate === false;
+  if (s === 'gating') return !(wf?.config?.automation?.enabled === true && wf.config.automation.auto_gate !== false);
   return ['awaiting_human', 'revision_required', 'awaiting_plan_approval'].includes(s);
 }
 
@@ -2129,7 +2132,8 @@ function workflowOwnerInfo(wf, activeRun, reviewerDone, decisionState = {}) {
     next: 'Дальше: автоматические проверки (Gate)', color: 'var(--accent)',
   };
   if (wf.status === 'gating') return {
-    who: 'PromptPilot / Gate', detail: 'проверяется результат исполнителя',
+    who: workflowNeedsHuman(wf) ? 'Вы / Gate' : 'PromptPilot / Gate',
+    detail: workflowNeedsHuman(wf) ? 'нужно выполнить проверки и зафиксировать результат' : 'проверяется результат исполнителя',
     next: 'Дальше: независимый аудитор', color: 'var(--yellow)',
   };
   if (wf.status === 'reviewing') return {
@@ -2261,8 +2265,9 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, 
   const pastRounds = rounds.filter(r => r.round_no !== wf.current_round);
   const importedCount = rounds.filter(r => r.summary?.historical).length;
   const stage = stages.find(item => item.id === wf.current_stage_id) || wf.config?.stage || {};
-  const statusInfo = workflowStatusInfo(wf.status, !!reviewerDone);
+  const statusInfo = workflowStatusInfo(wf.status, !!reviewerDone, wf.config?.automation || {});
   const ownerInfo = workflowOwnerInfo(wf, activeRun, reviewerDone);
+  const humanAlert = workflowNeedsHuman(wf) ? workflowHumanAlertCopy(wf.status, !!reviewerDone) : null;
   const stopReason = workflowStopReason(events);
   const previousAudit = [...pastRounds].reverse().find(r => r.summary?.summary);
   const stageTitle = stage.title || `Раунд ${wf.current_round}: доработка после последнего аудита`;
@@ -2335,6 +2340,7 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, 
       ${wf.config?.automation?.enabled ? '<span class="task-status" data-s="running">АВТО</span>' : '<span class="wf-meta">ручной режим</span>'}</div>
     <div class="wf-stage" style="border-color:${ownerInfo.color}">
       <div class="wf-stage-title">🏓 Мяч сейчас: <span style="color:${ownerInfo.color}">${esc(ownerInfo.who)}</span></div>
+      ${humanAlert ? `<div class="wf-round-summary"><b>${esc(humanAlert[0])}</b> · ${esc(humanAlert[1])}</div>` : ''}
       <div class="wf-round-summary">${esc(ownerInfo.detail)}</div>
       ${ownerInfo.next ? `<div class="wf-next">${esc(ownerInfo.next)}</div>` : ''}
     </div>
