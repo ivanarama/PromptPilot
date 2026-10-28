@@ -815,6 +815,7 @@ def cmd_resume(text: str) -> str:
         workflows.human_input(workflow.id, WorkflowHumanInput(
             expected_version=workflow.state_version,
             text=f"{text} (через VK-бот, владелец)",
+            note=f"{text} (через VK-бот, владелец)",
             resume=True,
         ))
     except Exception as exc:  # noqa: BLE001 - владельцу важна любая причина
@@ -964,6 +965,18 @@ class _NotifyLoop(threading.Thread):
         self._stands_alerted: dict[str, float] = {}
         self._last_digest_date = ""
 
+    def _peers(self) -> list[int]:
+        # A remembered dialog is not an authorization grant. Re-read the
+        # allow-list for every outbound operation, including autonomous alerts.
+        return [peer for peer in sorted(set(self.peers) | set(_owner_peers()))
+                if 0 < peer < 2_000_000_000 and is_authorized(peer)]
+
+    def _send(self, peer_id, *args, **kwargs) -> bool:
+        if not is_authorized(peer_id):
+            return False
+        self.transport.send(peer_id, *args, **kwargs)
+        return True
+
     def _load_last_seq(self) -> int:
         seq = 0
         for workflow in db.list_workflows():
@@ -981,21 +994,29 @@ class _NotifyLoop(threading.Thread):
                 logger.warning("vk-notify: %s: %s", type(exc).__name__, exc)
 
     def _drain(self) -> None:
-        if not self.peers:
+        if not self._peers():
             return
         self._drain_count += 1
         if self._drain_count % HEALTH_CHECK_EVERY_DRAINS == 0:
             self._check_processes()
             self._check_stands()
         self._maybe_morning_digest()
-        messages: list[tuple[str, bool]] = []
+        pending = []
+        ceilings = []
+        floor = self._last_seq
         for workflow in db.list_workflows():
             events = db.list_workflow_events(
-                workflow.id, after_seq=self._last_seq, limit=100)
+                workflow.id, after_seq=floor, limit=100)
+            if len(events) == 100:
+                ceilings.append(events[-1].seq)
             for event in events:
-                self._last_seq = max(self._last_seq, int(event.seq or 0))
-                if event.event_type not in NOTIFY_EVENT_TYPES:
-                    continue
+                pending.append((int(event.seq), workflow.slug, event))
+        # Full pages may hide earlier events than another workflow's tail.
+        ceiling = min(ceilings) if ceilings else float("inf")
+        for seq, slug, event in sorted(pending, key=lambda item: item[0]):
+            if seq > ceiling:
+                break
+            if event.event_type in NOTIFY_EVENT_TYPES:
                 title, needs_actions = _RU_EVENTS.get(
                     event.event_type, (event.event_type, False))
                 detail = ""
@@ -1003,18 +1024,21 @@ class _NotifyLoop(threading.Thread):
                 reason = str(payload.get("reason") or payload.get("reasonText") or "")
                 if reason:
                     detail = f": {_clip(reason, 160)}"
-                messages.append(
-                    (f"🛠 {workflow.slug}\n{title}{detail}", needs_actions))
-        for peer_id in list(self.peers):
-            for text, needs_actions in messages:
-                self.transport.send(
-                    peer_id, text,
-                    _reply_keyboard(force_actions=needs_actions)
-                    if needs_actions else None)
+                peers = self._peers()
+                if not peers:
+                    return
+                for peer_id in peers:
+                    if not self._send(
+                            peer_id, f"🛠 {slug}\n{title}{detail}",
+                            _reply_keyboard(force_actions=needs_actions)
+                            if needs_actions else None):
+                        return
+            # At-least-once delivery: an exception leaves this event pending.
+            self._last_seq = seq
 
     def _maybe_morning_digest(self) -> None:
         """П5b: раз в сутки утром — сводка владельцу (без повторов)."""
-        if time.localtime().tm_hour != DIGEST_HOUR:
+        if not self._peers() or time.localtime().tm_hour != DIGEST_HOUR:
             return
         today = time.strftime("%Y-%m-%d")
         if self._last_digest_date == today:
@@ -1031,15 +1055,15 @@ class _NotifyLoop(threading.Thread):
             text = (text[:REPLY_LEN_LIMIT - 60]
                     + "\n…(полный дайджест — в прикреплённом документе)")
         sent_ok = True
-        for peer_id in list(self.peers):
+        for peer_id in self._peers():
             try:
                 attachment = ""
                 if full_text is not text:
                     attachment = self.transport.docs_upload_for_message(
                         peer_id, "promptpilot-дайджест.md",
                         full_text.encode("utf-8"))
-                self.transport.send(peer_id, text, main_keyboard(),
-                                    attachment=attachment)
+                if not self._send(peer_id, text, main_keyboard(), attachment=attachment):
+                    sent_ok = False
             except Exception as exc:  # noqa: BLE001 - квен-M8: сбой VK
                 sent_ok = False               # не гасит дайджест навсегда
                 logger.warning("vk digest send: %s", exc)
@@ -1053,8 +1077,8 @@ class _NotifyLoop(threading.Thread):
             # оф-сайт бэкап памяти раз в сутки, следом за дайджестом
             try:
                 note = cmd_backup(self.transport)
-                for peer_id in list(self.peers):
-                    self.transport.send(peer_id, note[:REPLY_LEN_LIMIT])
+                for peer_id in self._peers():
+                    self._send(peer_id, note[:REPLY_LEN_LIMIT])
             except Exception as exc:  # noqa: BLE001 - бэкап не роняет цикл
                 logger.warning("vk auto-backup: %s", exc)
 
@@ -1063,6 +1087,8 @@ class _NotifyLoop(threading.Thread):
         revision_required/awaiting_human, бот молчал — уведомления покрывали
         только события, а не «долго стоит». Теперь: стоит дольше 30 минут —
         тревога, дальше напоминание каждые 2 часа, живое = молчим."""
+        if not self._peers():
+            return
         for workflow in db.list_workflows():
             status = workflow.status.value
             if status not in {"awaiting_human", "revision_required"}:
@@ -1076,21 +1102,25 @@ class _NotifyLoop(threading.Thread):
             if (alerted_at is not None
                     and now - alerted_at < STAND_REPEAT_HOURS * 3600):
                 continue  # анти-спам: повтор не чаще раза в 2 часа
-            self._stands_alerted[workflow.id] = time.time()
+            delivered = True
             label = ("ждёт твоего решения" if status == "awaiting_human"
                      else "вернулся на доработку и стоит без диспетча")
-            for peer_id in list(self.peers):
+            for peer_id in self._peers():
                 try:
-                    self.transport.send(
+                    if not self._send(
                         peer_id,
                         f"⚠️ {workflow.slug}: {label} уже "
                         f"{int((time.time() - first) // 60)} мин (раунд "
                         f"{workflow.current_round}). «Статус» покажет детали; "
                         f"awaiting_human снимается кнопкой «Продолжить "
                         f"конвейер» или резюмом.",
-                        _reply_keyboard(force_actions=True))
+                        _reply_keyboard(force_actions=True)):
+                        delivered = False
                 except Exception as exc:  # noqa: BLE001 - стойка важнее
+                    delivered = False
                     logger.warning("vk stand send: %s", exc)
+            if delivered:
+                self._stands_alerted[workflow.id] = time.time()
 
     def _check_processes(self) -> None:
         """П1: тихая смерть процесса конвейера = сообщение владельцу;
@@ -1102,18 +1132,18 @@ class _NotifyLoop(threading.Thread):
             return
         fresh = deaths - self._reported_dead
         recovered = self._reported_dead - deaths
-        delivered = True
-        for peer_id in list(self.peers):
+        delivered = bool(self._peers())
+        for peer_id in self._peers():
             try:
                 if fresh:
                     names = ", ".join(
                         f"{HEALTH_LABELS.get(n, n)}" for n in sorted(fresh))
-                    self.transport.send(
+                    self._send(
                         peer_id,
                         f"🚨 Конвейер: мертвы — {names}. "
                         f"Дежурный цикл поднимет; проверь «Статус» позже.")
                 for name in sorted(recovered):
-                    self.transport.send(
+                    self._send(
                         peer_id,
                         f"✅ Конвейер: {HEALTH_LABELS.get(name, name)} снова жив.")
             except Exception as exc:  # noqa: BLE001 - квен-M8: алерт живёт

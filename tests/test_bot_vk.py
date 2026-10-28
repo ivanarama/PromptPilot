@@ -12,6 +12,12 @@ from promptpilot.models import (
 )
 
 
+@pytest.fixture(autouse=True)
+def private_test_authorization(tmp_path, monkeypatch):
+    monkeypatch.setattr(bot_vk, "VK_ALLOWED_ENV", "7")
+    monkeypatch.setattr(bot_vk, "_vk_config_path", tmp_path / "vk_config.json")
+
+
 def _wf(db, tmp_path, status=None):
     workflow = db.create_workflow(WorkflowCreate(
         slug="vk-test", objective="цель", repository_path=str(tmp_path),
@@ -64,6 +70,9 @@ def test_resume_awaits_single_workflow(isolated_db, tmp_path):
     refreshed = isolated_db.get_workflow(workflow.id)
     # human_input с resume из awaiting_human продолжает раунд/исполнение
     assert refreshed.status.value in {"executing", "queued", "reviewing"}
+    from promptpilot.models import WorkflowRole
+    assert any("применить вариант a по гейту" in note for note in
+               workflows._operator_notes(workflow.id, WorkflowRole.EXECUTOR))
 
 
 def test_resume_requires_awaiting(isolated_db, tmp_path):
@@ -133,6 +142,68 @@ def test_notify_sends_blocker_reason_to_peers(isolated_db, tmp_path):
     fake.sent.clear()
     loop._drain()
     assert not fake.sent
+
+
+def test_notify_global_order_pagination_and_delivery_retry(isolated_db, tmp_path, monkeypatch):
+    from promptpilot.models import WorkflowEventCreate
+    first = _wf(isolated_db, tmp_path)
+    second = isolated_db.create_workflow(WorkflowCreate(
+        slug="other", objective="goal", repository_path=str(tmp_path),
+        candidate_branch="b", config={}))
+    monkeypatch.setattr(isolated_db, "list_workflows", lambda: [first, second])
+    fake = _FakeTransport()
+    loop = bot_vk._NotifyLoop(fake, {7: None})
+    for i in range(205):
+        isolated_db.append_workflow_event(WorkflowEventCreate(
+            workflow_id=(second if i % 2 == 0 else first).id,
+            round_id=None, run_id=None, event_type="cascade.open_blocker",
+            idempotency_key=f"mixed-{i}", payload={"reason": f"event-{i:03}"}))
+    original = fake.send
+    failed = []
+
+    def send(peer, text, keyboard=None, attachment=""):
+        if "event-002" in text and not failed:
+            failed.append(True)
+            raise OSError("transient delivery error")
+        original(peer, text, keyboard, attachment)
+
+    monkeypatch.setattr(fake, "send", send)
+    with pytest.raises(OSError, match="delivery error"):
+        loop._drain()
+    assert len(fake.sent) == 2
+    loop._drain()
+    loop._drain()
+    assert len(fake.sent) == 205
+    assert [message[1].split(": ")[-1] for message in fake.sent] == [
+        f"event-{i:03}" for i in range(205)]
+    loop._drain()
+    assert len(fake.sent) == 205
+
+
+def test_revoked_peer_receives_no_autonomous_private_data(isolated_db, tmp_path, monkeypatch):
+    from promptpilot.models import WorkflowEventCreate
+    workflow = _wf(isolated_db, tmp_path, status="awaiting_human")
+    fake = _FakeTransport()
+    loop = bot_vk._NotifyLoop(fake, {7: None})
+    monkeypatch.setattr(bot_vk, "VK_ALLOWED_ENV", "")
+    isolated_db.append_workflow_event(WorkflowEventCreate(
+        workflow_id=workflow.id, round_id=None, run_id=None,
+        event_type="cascade.open_blocker", idempotency_key="private",
+        payload={"reason": "confidential"}))
+    monkeypatch.setattr(bot_vk, "process_deaths", lambda: ["worker"])
+    loop._stands[workflow.id] = 0
+    monkeypatch.setattr(bot_vk, "_digest_text", lambda: pytest.fail("revoked digest"))
+    loop._drain()
+    loop._check_stands()
+    loop._check_processes()
+    loop._maybe_morning_digest()
+    assert fake.sent == []
+    assert loop._reported_dead == set()
+    assert workflow.id not in loop._stands_alerted
+    # Newly authorized owners are discovered without restarting the loop.
+    bot_vk._persist_allowed(8)
+    loop._drain()
+    assert fake.sent and all(message[0] == 8 for message in fake.sent)
 
 
 def test_transport_keyboard_json(isolated_db, tmp_path):
