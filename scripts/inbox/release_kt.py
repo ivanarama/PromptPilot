@@ -270,7 +270,9 @@ def main() -> int:
     update_site_changelog(version)
     if args.closes and args.release:
         mark_released(version, [int(x) for x in args.closes.split(",") if x.strip()])
-    print(f"Готово: v{version}" + (" (опубликована)" if args.release else " (локально, без публикации)"))
+    print(f"Готово: v{version}" + (
+        " (main, тег и GitHub Release опубликованы)" if args.release
+        else " (main и тег опубликованы; GitHub Release не создавался)"))
     return 0
 
 
