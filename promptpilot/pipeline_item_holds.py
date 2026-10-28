@@ -121,7 +121,23 @@ def prepare(task, queue, data):
     if states is None:
         return []
     db.set_setting(MODE + str(task.series_id), "1")
-    db.set_setting(BASELINE + str(task.series_id), json.dumps({"task_id": task.id, "states": states, "at": time.time()}))
+    # FIX is a skill election, not the REVIEW/MERGE tool election. An explicit
+    # opt-in permits negative admission evidence for only the fresh checker's
+    # measured PR reworks. This never authorizes a write or a broader intake.
+    error_states = {}
+    diagnostics = data.get("diagnostics") or {}
+    if (queue.get("id") == "fix" and queue.get("item_error_holds") is True
+            and not diagnostics.get("checker_failed")):
+        for item in diagnostics.get("fix_candidates") or []:
+            if (isinstance(item, dict) and item.get("stage") == "review"
+                    and type(item.get("number")) is int
+                    and isinstance(item.get("head"), str)
+                    and re.fullmatch(r"[0-9a-fA-F]{40}", item["head"])
+                    and str(item["number"]) in states):
+                error_states[str(item["number"])] = states[str(item["number"])]
+    db.set_setting(BASELINE + str(task.series_id), json.dumps({
+        "task_id": task.id, "states": states, "error_states": error_states,
+        "at": time.time()}))
     try:
         holds = json.loads(db.get_setting(PREFIX + str(task.series_id)) or "{}")
     except (TypeError, ValueError):
@@ -186,11 +202,18 @@ def register_target(task, number, head, stage):
     db.set_setting(key, json.dumps(baseline))
 
 
+def _hold_matches_identity(hold, identity):
+    # Older exact REVIEW holds omitted stage; prepare() treats them as review.
+    return all(hold.get(key, "review" if key == "stage" else None) == value
+               for key, value in identity.items())
+
+
 def record(conn, series_id, task_id, verdict, result):
     """Called inside recurrence's existing transaction; return True if held.
 
-    Explicit HUMAN targets require measured state. UNABLE additionally requires
-    an exact validated tool election. Unscoped failures retain the series guard.
+    Explicit HUMAN targets require measured state. UNABLE requires an exact tool
+    election or an opted-in, fresh checker-measured FIX rework. Unscoped failures
+    retain the series guard; an executor cannot add a target to its baseline.
     """
     outcome = str(verdict or "").strip().upper()
     if outcome not in {"НУЖЕН ЧЕЛОВЕК", "НЕ СМОГ"}:
@@ -223,7 +246,11 @@ def record(conn, series_id, task_id, verdict, result):
                         and re.fullmatch(r"[0-9a-f]{40}", target["head"]))
         if target and not exact_target:
             return False
-        if outcome == "НЕ СМОГ" and not exact_target:
+        measured_error = (len(numbers) == 1
+                          and measured.get("error_states", {}).get(next(iter(numbers)))
+                          == states.get(next(iter(numbers)))
+                          and states.get(next(iter(numbers))) is not None)
+        if outcome == "НЕ СМОГ" and not (exact_target or measured_error):
             return False
         if not all(number in states for number in numbers) and not exact_target:
             return False
@@ -233,23 +260,28 @@ def record(conn, series_id, task_id, verdict, result):
             return False
     except (TypeError, ValueError, KeyError):
         return False
-    if exact_target:
-        old = holds.get(next(iter(numbers))) or {}
+    for number in numbers:
+        old = holds.get(number) or {}
+        identity = ({"head": target["head"], "stage": target.get("stage", "review")}
+                    if exact_target else {"fingerprint": states[number]})
         if (isinstance(old, dict)
-                and old.get("head") == target["head"]
-                and old.get("stage", "review") == target.get("stage", "review")
+                and _hold_matches_identity(old, identity)
                 and old.get("task_id") not in (None, task_id)
                 and type(old.get("at")) in {int, float}
                 and 0 <= time.time() - old["at"] < TTL):
-            # A different occurrence re-elected this still-held target.
-            # Its hold did not exclude it; retain the series repeat guard.
+            # A different occurrence re-elected a still-held measured target.
+            # Exact elections and fingerprint exclusions retain the same guard.
             return False
     # Preserve the initial timestamp: recurrence repair must not extend a hold.
     for number in numbers:
         old = holds.get(number) or {}
         identity = ({"head": target["head"], "stage": target.get("stage", "review")} if exact_target else
                     {"fingerprint": states[number]})
-        if any(old.get(key) != value for key, value in identity.items()):
+        live = (isinstance(old, dict) and type(old.get("at")) in {int, float}
+                and 0 <= time.time() - old["at"] < TTL)
+        old = old if isinstance(old, dict) else {}
+        if (not _hold_matches_identity(old, identity)
+                or (old.get("task_id") != task_id and not live)):
             holds[number] = {**identity, "at": time.time(),
                              "reason": reason, "task_id": task_id}
     holds = {number: hold for number, hold in holds.items()

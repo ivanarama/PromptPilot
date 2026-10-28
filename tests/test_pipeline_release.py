@@ -51,6 +51,8 @@ def test_configuration_preserves_other_profiles_gates_and_budget():
     for key in ["required_checks", "trusted_account", "review_completion_gate"]:
         assert cfg[key] == old_config[key]
     assert result["profiles"]["onebase"]["queues"][2]["execution"]["direct_complete"] is True
+    assert result["profiles"]["onebase"]["queues"][0]["item_blockers"] is True
+    assert result["profiles"]["onebase"]["queues"][0]["item_error_holds"] is True
     from promptpilot.pipeline_insights import _adaptive_cadence_policy
     policy = _adaptive_cadence_policy(result["profiles"]["onebase"]["queues"][2])
     assert policy is not None
