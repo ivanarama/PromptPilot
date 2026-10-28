@@ -23,7 +23,7 @@ def config(max_revisions=3, max_rounds=10, require_approval=True):
             "executor": {"provider": None},
             "reviewer": {"provider": None},
         },
-        "gate": {"commands": []},
+        "gate": {"enabled": False, "commands": []},
         "limits": {"max_rounds": max_rounds},
     }
 
