@@ -703,6 +703,15 @@
         <input type="checkbox" id="skipPermissions" style="width:auto;margin:0" onchange="rememberSkipPermissions()">
         <span style="font-size:13px;color:var(--yellow)" title="Claude: --dangerously-skip-permissions; Codex: --dangerously-bypass-approvals-and-sandbox">⚠ не спрашивать разрешения</span>
       </label>
+      <label id="rightsLabel" style="display:none" title="Что агенту можно. Без инструментов — только текст; чтение — смотреть файлы; правка — менять файлы в папке задачи, не запуская команд; полные — всё. «Как обычно» — решает галочка «не спрашивать разрешения». Недоступное для провайдера неактивно.">Права
+        <select id="rightsInput">
+          <option value="">как обычно</option>
+          <option value="none">без инструментов</option>
+          <option value="read">только чтение</option>
+          <option value="write">правка файлов</option>
+          <option value="full">полные</option>
+        </select>
+      </label>
       <label id="keepPaneLabel" style="flex-direction:row;align-items:center;gap:8px;cursor:pointer;display:none">
         <input type="checkbox" id="keepPane" checked style="width:auto;margin:0">
         <span style="font-size:13px" title="Панель herdr останется открытой — можно вернуться и продолжить диалог">🖥 оставить сессию открытой</span>
@@ -908,6 +917,19 @@
   <div class="modal">
     <h2>Провайдеры <button class="btn btn-sm btn-ghost" style="margin-left:auto" onclick="closeProviders()">✕ Закрыть</button></h2>
     <div id="provList"></div>
+    <div class="prov-form" id="providerWizard">
+      <b>Подключить помощника</b>
+      <label>CLI <select id="pcCLI" onchange="catalogSelect()"></select></label>
+      <button class="btn" type="button" onclick="catalogInstall()">Установить CLI</button>
+      <label>Адрес API <input id="pcBase" type="url" placeholder="https://api.example.com/v1"></label>
+      <label>Ключ API <input id="pcKey" type="password" autocomplete="new-password"></label>
+      <button class="btn" type="button" onclick="catalogModels()">Получить модели</button>
+      <label>Модель <select id="pcModels" onchange="document.getElementById('pcModel').value=this.value"></select></label>
+      <input id="pcModel" placeholder="Или введите ID модели вручную">
+      <input id="pcTitle" placeholder="Название помощника (необязательно)">
+      <button class="btn btn-primary" type="button" onclick="catalogCreate()">Создать помощника</button>
+      <div id="pcStatus" role="status"></div>
+    </div>
     <div style="border-top:1px solid var(--border); margin-top:14px; padding-top:14px">
       <b style="font-size:14px">🖥 Машины (удалённое выполнение по SSH)</b>
       <div id="machineList" style="margin-top:8px"></div>
@@ -1333,6 +1355,7 @@ async function addTask() {
         priority,
         working_dir: workdir,
         skip_permissions: skipPermissions,
+        rights: document.getElementById('rightsInput').value || null,
         keep_pane: document.getElementById('keepPane').checked,
         worktree: document.getElementById('worktree').checked,
         herdr_target: herdrTarget,
@@ -2057,14 +2080,17 @@ function workflowSettingsHtml(wf) {
   </details>`;
 }
 
-function workflowStatusInfo(status, reviewerDone = false) {
+function workflowStatusInfo(status, reviewerDone = false, automation = {}) {
+  const automaticGate = automation.enabled === true && automation.auto_gate !== false;
   const info = {
     draft: ['Черновик', 'Следующее действие: сформировать план этапов либо запустить быструю задачу.'],
     planning: ['Планирование', 'Сильный планировщик исследует задачу и формирует этапы.'],
     awaiting_plan_approval: ['План ожидает утверждения', 'Проверьте порядок, scope и gate каждого этапа, затем утвердите план.'],
     queued: ['Готов к запуску', 'Следующее действие: выбрать исполнителя и отправить промпт.'],
     executing: ['Исполнитель работает', 'Следующее действие: наблюдать за агентом; после успешного ответа начнутся проверки.'],
-    gating: ['Автоматические проверки', 'Проверки идут сами — ничего нажимать не нужно; результат применится автоматически.'],
+    gating: automaticGate
+      ? ['Автоматические проверки', 'Проверки идут сами — ничего нажимать не нужно; результат применится автоматически.']
+      : ['Ручные проверки', 'Выполните проверки и выберите Gate PASS или FAIL.'],
     reviewing: ['Независимое ревью', 'Следующее действие: запустить проверяющего.'],
     revision_required: ['Нужны исправления', 'Следующее действие: открыть новый раунд доработок.'],
     awaiting_human: reviewerDone
@@ -2082,7 +2108,7 @@ function workflowNeedsHuman(wf) {
   // ждёт: заголовок «НУЖНО ДЕЙСТВИЕ» врёт и рождал ложные тревоги владельца.
   // Человека ждёт только ручной gate (auto_gate === false).
   const s = wf?.status;
-  if (s === 'gating') return wf?.config?.automation?.auto_gate === false;
+  if (s === 'gating') return !(wf?.config?.automation?.enabled === true && wf.config.automation.auto_gate !== false);
   return ['awaiting_human', 'revision_required', 'awaiting_plan_approval'].includes(s);
 }
 
@@ -2129,7 +2155,8 @@ function workflowOwnerInfo(wf, activeRun, reviewerDone, decisionState = {}) {
     next: 'Дальше: автоматические проверки (Gate)', color: 'var(--accent)',
   };
   if (wf.status === 'gating') return {
-    who: 'PromptPilot / Gate', detail: 'проверяется результат исполнителя',
+    who: workflowNeedsHuman(wf) ? 'Вы / Gate' : 'PromptPilot / Gate',
+    detail: workflowNeedsHuman(wf) ? 'нужно выполнить проверки и зафиксировать результат' : 'проверяется результат исполнителя',
     next: 'Дальше: независимый аудитор', color: 'var(--yellow)',
   };
   if (wf.status === 'reviewing') return {
@@ -2290,8 +2317,9 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, 
   const pastRounds = rounds.filter(r => r.round_no !== wf.current_round);
   const importedCount = rounds.filter(r => r.summary?.historical).length;
   const stage = stages.find(item => item.id === wf.current_stage_id) || wf.config?.stage || {};
-  const statusInfo = workflowStatusInfo(wf.status, !!reviewerDone);
+  const statusInfo = workflowStatusInfo(wf.status, !!reviewerDone, wf.config?.automation || {});
   const ownerInfo = workflowOwnerInfo(wf, activeRun, reviewerDone);
+  const humanAlert = workflowNeedsHuman(wf) ? workflowHumanAlertCopy(wf.status, !!reviewerDone) : null;
   const stopReason = workflowStopReason(events);
   const previousAudit = [...pastRounds].reverse().find(r => r.summary?.summary);
   const stageTitle = stage.title || `Раунд ${wf.current_round}: доработка после последнего аудита`;
@@ -2364,6 +2392,7 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, 
       ${wf.config?.automation?.enabled ? '<span class="task-status" data-s="running">АВТО</span>' : '<span class="wf-meta">ручной режим</span>'}</div>
     <div class="wf-stage" style="border-color:${ownerInfo.color}">
       <div class="wf-stage-title">🏓 Мяч сейчас: <span style="color:${ownerInfo.color}">${esc(ownerInfo.who)}</span></div>
+      ${humanAlert ? `<div class="wf-round-summary"><b>${esc(humanAlert[0])}</b> · ${esc(humanAlert[1])}</div>` : ''}
       <div class="wf-round-summary">${esc(ownerInfo.detail)}</div>
       ${ownerInfo.next ? `<div class="wf-next">${esc(ownerInfo.next)}</div>` : ''}
     </div>
@@ -3554,10 +3583,92 @@ async function seriesAction(id, action, confirmEnd=false) {
 
 function closeSchedule() { document.getElementById('schedModal').classList.remove('open'); }
 
+let providerCatalog = [];
+function catalogStatus(text) { document.getElementById('pcStatus').textContent = text; }
+async function loadCatalog() {
+  try {
+    providerCatalog = (await fetchJSON(`${API}/provider-catalog`)).items;
+    const select = document.getElementById('pcCLI');
+    select.replaceChildren();
+    for (const item of providerCatalog) {
+      const option = document.createElement('option');
+      option.value = item.id;
+      option.textContent = `${item.title}${item.installed ? ' ✓' : ''}`;
+      select.appendChild(option);
+    }
+    catalogSelect();
+  } catch (err) { catalogStatus(err.message); }
+}
+function catalogSelect() {
+  const item = providerCatalog.find(p => p.id === document.getElementById('pcCLI').value);
+  document.getElementById('pcBase').value = item?.default_base || '';
+  for (const id of ['pcKey', 'pcModel', 'pcTitle']) document.getElementById(id).value = '';
+  document.getElementById('pcModels').replaceChildren();
+  catalogStatus(item?.desc || '');
+}
+function catalogBody() {
+  return {base: document.getElementById('pcBase').value.trim(),
+          key: document.getElementById('pcKey').value,
+          model: document.getElementById('pcModel').value.trim(),
+          title: document.getElementById('pcTitle').value.trim()};
+}
+async function catalogPost(action) {
+  const id = document.getElementById('pcCLI').value;
+  return fetchJSON(`${API}/provider-catalog/${encodeURIComponent(id)}/${action}`, {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(catalogBody())});
+}
+async function catalogInstall() {
+  catalogStatus('Установка CLI…');
+  try {
+    const result = await catalogPost('install');
+    catalogStatus(result.ok ? 'CLI установлен. Укажите адрес и ключ.' : 'Установка завершилась с ошибкой. Проверьте зависимости CLI.');
+  } catch (err) { catalogStatus(err.message); }
+}
+async function catalogModels() {
+  catalogStatus('Получаю модели…');
+  try {
+    const result = await catalogPost('models');
+    const select = document.getElementById('pcModels');
+    select.replaceChildren();
+    for (const model of result.models) {
+      const option = document.createElement('option');
+      option.value = model;
+      option.textContent = model;
+      select.appendChild(option);
+    }
+    document.getElementById('pcModel').value = result.models[0] || '';
+    catalogStatus('Выберите модель и создайте помощника.');
+  } catch (err) { catalogStatus(err.message); }
+}
+async function catalogCreate() {
+  try {
+    const result = await catalogPost('create');
+    for (const id of ['pcKey', 'pcBase', 'pcModel', 'pcTitle']) document.getElementById(id).value = '';
+    document.getElementById('pcModels').replaceChildren();
+    await renderProvList();
+    await loadProviders();
+    const status = document.getElementById('pcStatus');
+    status.textContent = `Создан ${result.label}. `;
+    const probe = document.createElement('button');
+    probe.className = 'btn btn-sm';
+    probe.textContent = 'Проверить связь';
+    probe.addEventListener('click', async () => {
+      try {
+        const checked = await fetchJSON(`${API}/providers/${encodeURIComponent(result.name)}/probe`, {
+          method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
+        catalogStatus(checked.ok ? 'Связь и вердикт проверены.' : 'Проверка не пройдена: ' + checked.issues.join('; '));
+      } catch (err) { catalogStatus(err.message); }
+    });
+    status.appendChild(probe);
+  } catch (err) { catalogStatus(err.message); }
+}
+
 async function openProviders() {
   document.getElementById('provModal').classList.add('open');
   await renderProvList();
   await renderMachineList();
+  await loadCatalog();
 }
 function closeProviders() { document.getElementById('provModal').classList.remove('open'); }
 
@@ -3673,7 +3784,7 @@ async function renderProvList() {
       : esc(p.cmd))
       + (p.models && p.models.length ? `<br>модели: ${esc(p.models.join(', '))}` : '')
       + (p.effort ? `<br>эффорт: ${esc(p.effort)}` : '');
-    const canDelete = p.source !== 'builtin';
+    const canDelete = p.source === 'providers.json';
     return `<div class="prov-row${(!p.available || p.hidden) ? ' dim' : ''}">
       <span class="prov-name">${esc(name)}</span>${badges.join('')}
       <div class="prov-cmd">${esc(p.description || '')}</div>
@@ -3961,6 +4072,12 @@ function updateKeepPane() {
   // в target-режиме директория и permissions не применимы — прячем
   document.getElementById('workdirLabel').style.display = prov.session_target ? 'none' : 'flex';
   document.getElementById('skipPermsLabel').style.display = prov.session_target ? 'none' : 'flex';
+  // Only the rights this provider can actually be confined to are offered.
+  const rightsSel = document.getElementById('rightsInput');
+  const supportedRights = prov.rights || [];
+  [...rightsSel.options].forEach(o => { o.disabled = o.value !== '' && !supportedRights.includes(o.value); });
+  if (rightsSel.selectedOptions[0] && rightsSel.selectedOptions[0].disabled) rightsSel.value = '';
+  document.getElementById('rightsLabel').style.display = prov.session_target ? 'none' : 'flex';
   document.getElementById('providerModeHint').style.display = prov.session_target ? '' : 'none';
   updateWorktree();
   if (prov.session_target) loadHerdrAgents();

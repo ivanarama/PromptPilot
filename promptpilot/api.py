@@ -2,6 +2,9 @@
 
 import asyncio
 import base64
+import json
+import os
+import time
 import ipaddress
 import secrets
 import subprocess
@@ -18,12 +21,12 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import Response
 from pydantic import BaseModel
 
-import os
 import re as _re
 
 from . import db, epf_tools, workflows
 from . import pipeline_insights
-from .config import ALLOWED_HOSTS, ALLOWED_ORIGINS, API_TOKEN, DB_DIR, EFFORT_LEVELS, PIPELINE_SNAPSHOT_INTERVAL, get_provider_models, get_skills, load_providers, mask_secret_value, provider_available, PROJECTS_ROOT
+from .config import ALLOWED_HOSTS, ALLOWED_ORIGINS, API_TOKEN, DB_DIR, DEFAULT_CLI, EFFORT_LEVELS, PIPELINE_SNAPSHOT_INTERVAL, get_provider_models, get_skills, load_providers, mask_secret_value, provider_available, RIGHTS_LEVELS, rights_supported, save_catalog_provider, PROJECTS_ROOT
+from .provider_catalog import CATALOG, catalog_entry, slugify, build_provider_entry
 from .models import (
     WorkflowPlanAmend,
     CostStats,
@@ -319,6 +322,15 @@ def api_create_task(task: TaskCreate):
     # UI only ever offers registered providers, so this rejects nothing real.
     if task.provider and task.provider not in load_providers():
         raise HTTPException(400, f"Неизвестный провайдер «{task.provider}»")
+    if task.rights:
+        # Refuse up front what the worker would refuse at run time.
+        cfg = load_providers().get(task.provider or DEFAULT_CLI, {})
+        if not rights_supported(cfg, task.rights):
+            raise HTTPException(
+                400, f"Провайдер «{task.provider or DEFAULT_CLI}» не умеет ограничивать "
+                     f"права до «{task.rights}» (задайте rights в providers.json)")
+        if task.herdr_target and task.rights != "full":
+            raise HTTPException(400, "Задачу в открытую сессию herdr нельзя ограничить")
     return db.create_task(task)
 
 
@@ -724,9 +736,25 @@ def api_validate_workflow_setup(request: WorkflowSetupValidationRequest):
 @app.post("/api/workflows", response_model=WorkflowInDB, status_code=201)
 def api_create_workflow(workflow: WorkflowCreate):
     try:
-        return db.create_workflow(workflow)
+        # One transaction: no other request can observe/start an intermediate
+        # draft before its supplied plan and approval barrier have been stored.
+        if workflow.plan:
+            WorkflowPlanReplace(
+                expected_version=0, stages=workflow.plan)
+        with db._connect(immediate=True) as conn:
+            created = db.create_workflow(workflow, conn=conn)
+            if workflow.plan:
+                workflows.provide_plan(created.id, WorkflowPlanReplace(
+                    expected_version=created.state_version,
+                    stages=workflow.plan,
+                ), conn=conn)
+            return db.get_workflow(created.id, conn=conn)
     except db.WorkflowConflictError as exc:
         raise HTTPException(409, str(exc)) from exc
+    except ValueError as exc:
+        # невалидный план (например, финал не integration) — миссии в БД нет,
+        # slug свободен, повторный запрос с исправленным планом пройдёт
+        raise HTTPException(422, str(exc)) from exc
 
 
 @app.get("/api/workflows", response_model=List[WorkflowInDB])
@@ -811,6 +839,33 @@ def api_list_workflow_findings(
     return db.list_workflow_findings(
         workflow_id, status=status.value if status else None
     )
+
+
+@app.get("/api/workflows/{workflow_id}/memory")
+def api_get_memory(workflow_id: str):
+    return db.list_memory(workflow_id)
+
+
+@app.put("/api/workflows/{workflow_id}/memory")
+def api_put_memory(workflow_id: str, body: dict):
+    """Заметки памяти миссии (например memory.md). Замена целиком;
+    лимит 16КБ на заметку — осознанный отказ, не обрезка."""
+    if not db.get_workflow(workflow_id):
+        raise HTTPException(404, "Workflow not found")
+    name = str(body.get("name") or "memory.md")
+    content = str(body.get("content") or "")
+    ok, msg = db.save_memory(workflow_id, name, content,
+                             scope_stage=body.get("scope_stage"))
+    if not ok:
+        raise HTTPException(400, msg)
+    return {"ok": True, "name": name}
+
+
+@app.delete("/api/workflows/{workflow_id}/memory/{name}")
+def api_delete_memory(workflow_id: str, name: str):
+    if not db.delete_memory(workflow_id, name):
+        raise HTTPException(404, "Note not found")
+    return {"ok": True}
 
 
 @app.get(
@@ -1291,6 +1346,8 @@ def api_providers():
             "hidden": bool(info.get("hidden")),
             "executor": info.get("executor", ""),
             "session_target": bool(info.get("session_target")),
+            # rights levels this provider can be confined to (models.TaskRights)
+            "rights": [level for level in RIGHTS_LEVELS if rights_supported(info, level)],
         }
         for name, info in providers.items()
     }
@@ -1445,6 +1502,8 @@ def api_providers_manage():
 @app.post("/api/providers", status_code=201)
 def api_provider_create(p: ProviderCreate):
     from .config import save_provider
+    source = load_providers().get(p.source_name or p.name, {})
+    stdin_transport = bool(source.get("prompt_stdin") and source.get("cmd") == p.cmd)
     if not _re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,31}", p.name):
         raise HTTPException(400, "Имя: латиница/цифры/-/_, до 32 символов")
     # "***" — оставленный без изменений секрет: берём сохранённое значение
@@ -1467,21 +1526,261 @@ def api_provider_create(p: ProviderCreate):
                       executor=p.executor, kind=p.kind, keep_pane=p.keep_pane,
                       models=p.models or None, args=p.args or None, effort=p.effort)
     else:
-        if not p.cmd or "{prompt}" not in p.cmd:
+        if not p.cmd or ("{prompt}" not in p.cmd and not stdin_transport):
             raise HTTPException(400, "cmd обязателен и должен содержать {prompt}")
         # Остальные флаги cmd-провайдера живут в шаблоне, а эффорт — поле:
         # он единственный, который приходится менять от этапа к этапу.
         save_provider(p.name, p.cmd, p.description, env=p.env or None,
-                      models=p.models or None, effort=p.effort)
+                      models=p.models or None, effort=p.effort, prompt_stdin=stdin_transport)
+    return {"ok": True}
+
+
+@app.get("/api/providers/{name}/models")
+def api_provider_models(name: str):
+    """U13: живой список моделей с эндпоинта провайдера (ключ не покидает сервер).
+
+    Работает для OpenAI-совместимых провайдеров: env провайдера ищет
+    OPENAI_BASE_URL/OPENAI_API_KEY или LLM_BASE_URL/LLM_API_KEY, дергает
+    GET {base}/models. Ответ содержит только id моделей и сам эндпоинт —
+    секреты не возвращаются никогда.
+    """
+    from .provider_catalog import fetch_models
+    cfg = load_providers().get(name)
+    if not cfg:
+        raise HTTPException(404, "Provider not found")
+    env = cfg.get("env") or {}
+    base = env.get("OPENAI_BASE_URL") or env.get("LLM_BASE_URL") or env.get("ANTHROPIC_BASE_URL") or ""
+    key = env.get("OPENAI_API_KEY") or env.get("LLM_API_KEY") or env.get("ANTHROPIC_AUTH_TOKEN") or ""
+    try:
+        ids = fetch_models(base, key, "anthropic" if env.get("ANTHROPIC_BASE_URL") else "openai")
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
+    except RuntimeError:
+        raise HTTPException(502, "Could not fetch models; check endpoint and credentials") from None
+    return {"endpoint": base, "models": ids, "count": len(ids)}
+
+
+
+# ── Каталог известных CLI: визард «Установить → Настроить → Подобрать модель» ──
+
+class CatalogConfig(_BaseModel):
+    base: str = ""
+    key: str = ""
+    model: str = ""
+    title: str = ""
+
+
+@app.get("/api/provider-catalog")
+def api_provider_catalog():
+    """Каталог известных CLI-агентов + статус установки + уже подключённые."""
+    from .provider_catalog import resolve_cli
+    providers = load_providers()
+    items = []
+    for e in CATALOG:
+        configured = [name for name, p in providers.items()
+                      if p.get("catalog_id") == e["id"]]
+        items.append({
+            "id": e["id"], "title": e["title"], "icon": e["icon"],
+            "desc": e["desc"], "default_base": e.get("default_base", ""),
+            "install_hint": e.get("install_hint", ""),
+            "installed": bool(resolve_cli(e)),
+            "configured": configured,
+        })
+    return {"items": items}
+
+
+@app.post("/api/provider-catalog/{cid}/install")
+def api_provider_catalog_install(cid: str):
+    """Поставить CLI в систему (npm-пакет или официальный zip)."""
+    import shutil
+    import subprocess
+    entry = catalog_entry(cid)
+    if not entry:
+        raise HTTPException(404, "Нет в каталоге")
+    from .provider_catalog import install_command
+    try:
+        argv = install_command(entry)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
+    resolved = shutil.which(argv[0])
+    if not resolved:
+        raise HTTPException(400, f"«{argv[0]}» не найден в системе — {entry.get('install_hint', 'установите вручную')}")
+    argv[0] = resolved
+    try:
+        from .process_tree import run_owned
+        proc = run_owned(argv, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=900,
+                              check=False)
+    except subprocess.TimeoutExpired:
+        raise HTTPException(504, "Установка не успела за 15 минут — проверьте сеть и повторите")
+    tail = "\n".join(((proc.stdout or "") + "\n" + (proc.stderr or "")).splitlines()[-15:])
+    return {"ok": proc.returncode == 0, "returncode": proc.returncode, "output": tail}
+
+
+@app.post("/api/provider-catalog/{cid}/models")
+def api_provider_catalog_models(cid: str, body: CatalogConfig):
+    """Подобрать известные модели: запрос идёт с сервера, ключ не возвращается."""
+    from .provider_catalog import fetch_models
+    entry = catalog_entry(cid)
+    if not entry:
+        raise HTTPException(404, "Not in catalog")
+    try:
+        ids = fetch_models(body.base or entry.get("default_base", ""), body.key, entry["api"])
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
+    except RuntimeError:
+        raise HTTPException(502, "Could not fetch models; check endpoint and credentials") from None
+    return {"models": ids, "count": len(ids)}
+
+
+
+@app.post("/api/provider-catalog/{cid}/create")
+def api_provider_catalog_create(cid: str, body: CatalogConfig):
+    """Создать помощника по выбору: короткое имя «CLI · Модель», cmd уже с моделью."""
+    entry = catalog_entry(cid)
+    if not entry:
+        raise HTTPException(404, "Нет в каталоге")
+    if not body.model:
+        raise HTTPException(400, "Сначала подберите модель")
+    from .config import _PROVIDER_WRITE_LOCK
+    try:
+        prov = build_provider_entry(entry, body.base, body.key, body.model, body.title)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
+    with _PROVIDER_WRITE_LOCK:
+        providers = load_providers()
+        slug = f"{cid}-{slugify(body.model) or 'model'}"[:32]
+        name, n = slug, 2
+        while name in providers:
+            suffix = f"-{n}"
+            name = slug[:32 - len(suffix)] + suffix
+            n += 1
+        save_catalog_provider(name, prov)
+    return {"ok": True, "name": name, "label": prov["human"]["label"]}
+
+
+
+@app.post("/api/providers/{name}/probe")
+def api_provider_probe(name: str, body: dict | None = None):
+    """Проверка провайдера ДО включения в конвейер.
+
+    Зонд идёт тем же путём, что и реальные задачи (build_cmd + env +
+    stdin/argv по конфигу), и проверяет три вещи:
+      1) процесс вообще запускается (и не упёрся в лимит длины командной строки);
+      2) промпт ДОСТАВЛЕН — модель повторила контрольную строку со случайным
+         токеном (ловит «-» вместо промпта, неработающий stdin и т.п.);
+      3) модель держит контракт вердикта — в ответе есть строка «ИТОГ:».
+    long=True прогоняет промпт ~40К символов: argv-провайдеры без stdin
+    на нём честно падают — так заранее видно, тянет ли провайдер роль исполнителя.
+    """
+    from .config import build_cmd, get_provider_env
+    providers = load_providers()
+    cfg = providers.get(name)
+    if not cfg:
+        raise HTTPException(404, "Провайдер не найден")
+    long_mode = bool((body or {}).get("long"))
+    token = "ПРОБА-" + secrets.token_hex(3)
+    prompt = ("Это тестовая проверка связи. Напиши ровно две строки и ничего больше:\n"
+              f"{token}\nИТОГ: ГОТОВО — тест")
+    if long_mode:
+        prompt += ("\n\n(Далее длинный служебный текст для проверки доставки больших промптов; "
+                   "читать и повторять его не нужно:)\n" + ("наполнитель-пробы-доставки. " * 2400))
+    try:
+        cmd = build_cmd(name, prompt, guard=True)
+    except Exception as exc:
+        raise HTTPException(400, "Не удалось собрать команду") from exc
+    env = get_provider_env(name)
+    use_stdin = bool(cfg.get("prompt_stdin"))
+    # .CMD-шимы (npm CLIs: qwen, opencode) не запускаются по «голому» имени —
+    # резолвим полный путь так же, как это делает воркер (worker.py:1786).
+    import shutil as _shutil
+    resolved = _shutil.which(cmd[0], path=env.get("PATH"))
+    if resolved:
+        cmd[0] = resolved
+    import tempfile
+    from .process_tree import run_owned
+    started = time.time()
+    try:
+        with tempfile.TemporaryDirectory(prefix="pp-provider-probe-") as cwd:
+            proc = run_owned(
+                cmd, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=300,
+                input=prompt if use_stdin else None, env=env, cwd=cwd)
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "delivered": False, "verdict": False,
+                "issues": ["Provider probe timed out after 300 seconds"]}
+    except OSError:
+        return {"ok": False, "delivered": False, "verdict": False,
+                "issues": ["Provider could not be started"]}
+
+    from .worker import is_stream_json, parse_stream_json, parse_verdict
+    text = (parse_stream_json(proc.stdout)["text"] if is_stream_json(proc.stdout or "")
+            else proc.stdout or "")
+    delivered = token in text
+    verdict = parse_verdict(text) == "ГОТОВО"
+    issues = []
+    if not delivered:
+        issues.append("ПРОМПТ НЕ ДОСТАВЛЕН: ответ не содержит контрольную строку. "
+                      "Типичные причины: провайдер не читает stdin (символ «-» уходит в модель "
+                      "как текст), сломанный шаблон {prompt}, чужая ошибка авторизации.")
+    if not verdict:
+        issues.append("Нет строки «ИТОГ:» — контракт вердикта не соблюдён; для ролей конвейера "
+                      "это критично (задачи будут падать в ожидание человека).")
+    if delivered and verdict and long_mode and not use_stdin:
+        issues.append("Примечание: длинный тест прошёл, но провайдер работает через argv — "
+                      "промпты заметно длиннее 30К символов могут не пройти.")
+    return {
+        "ok": delivered and verdict and proc.returncode == 0,
+        "delivered": delivered,
+        "verdict": verdict,
+        "stdin_mode": use_stdin,
+        "long_mode": long_mode,
+        "exit_code": proc.returncode,
+        "latency_s": round(time.time() - started, 1),
+        "issues": issues,
+    }
+
+
+@app.post("/api/providers/reorder")
+def api_providers_reorder(body: dict):
+    """Save the helper-card order (list of provider names, desired order)."""
+    from .config import set_providers_ui_order
+    names = body.get("names")
+    if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
+        raise HTTPException(400, "Ожидается {\"names\": [имена провайдеров по порядку]}")
+    set_providers_ui_order(names)
     return {"ok": True}
 
 
 @app.delete("/api/providers/{name}")
 def api_provider_delete(name: str):
-    from .config import remove_provider
-    if not remove_provider(name):
-        raise HTTPException(404, "Провайдер не найден среди кастомных (встроенные можно только скрыть)")
+    from .config import BUILTIN_PROVIDERS, remove_provider
+    if name in BUILTIN_PROVIDERS:
+        raise HTTPException(409, "Built-in providers can only be hidden")
+
+    def references(value):
+        if isinstance(value, dict):
+            return value.get("provider") == name or any(references(v) for v in value.values())
+        return isinstance(value, list) and any(references(v) for v in value)
+
+    with db._connect(immediate=True) as conn:
+        busy = conn.execute(
+            "SELECT 1 FROM tasks WHERE provider=? AND status NOT IN ('completed','failed','cancelled') LIMIT 1", (name,)).fetchone()
+        busy = busy or conn.execute(
+            "SELECT 1 FROM task_series WHERE provider=? AND ended_at IS NULL LIMIT 1", (name,)).fetchone()
+        configs = conn.execute(
+            "SELECT config_json FROM workflows WHERE status NOT IN ('completed','failed','cancelled')").fetchall()
+        for row in configs:
+            try:
+                busy = busy or references(json.loads(row["config_json"]))
+            except (ValueError, TypeError):
+                busy = True
+        if busy:
+            raise HTTPException(409, "Provider is referenced by active tasks, series or workflows")
+        if not remove_provider(name):
+            raise HTTPException(404, "Custom provider not found")
     return {"ok": True}
+
 
 
 @app.post("/api/providers/{name}/hide")

@@ -8,7 +8,7 @@ import sqlite3
 import time
 import unicodedata
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -77,6 +77,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     pipeline_priority_restore INTEGER,
     verdict TEXT
     ,series_id INTEGER REFERENCES task_series(id)
+    ,rights TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_series (
@@ -289,6 +290,15 @@ CREATE TABLE IF NOT EXISTS workflow_events (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS workflow_memory (
+    workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    content TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    updated_by_task INTEGER,
+    PRIMARY KEY (workflow_id, name)
+);
+
 CREATE TRIGGER IF NOT EXISTS workflow_events_no_update
 BEFORE UPDATE ON workflow_events
 BEGIN
@@ -344,6 +354,7 @@ MIGRATIONS = [
     "ALTER TABLE notifications ADD COLUMN pane_id TEXT",
     "ALTER TABLE notifications ADD COLUMN machine TEXT",
     "ALTER TABLE workflows ADD COLUMN current_stage_id TEXT",
+    "ALTER TABLE workflow_memory ADD COLUMN scope_stage TEXT",
     """CREATE TABLE IF NOT EXISTS workflow_plans (
         workflow_id TEXT PRIMARY KEY REFERENCES workflows(id) ON DELETE RESTRICT,
         status TEXT NOT NULL DEFAULT 'draft', planner_task_id INTEGER,
@@ -423,6 +434,8 @@ MIGRATIONS = [
         updated_at TEXT NOT NULL
     )""",
     "CREATE INDEX IF NOT EXISTS idx_epf_jobs_task ON epf_jobs(task_id)",
+    # what the agent run may do (models.TaskRights); NULL = skip_permissions decides
+    "ALTER TABLE tasks ADD COLUMN rights TEXT",
 ]
 
 WORKFLOW_SCHEMA_VERSION = "workflow_orchestrator_w0_v1"
@@ -1055,8 +1068,9 @@ def _insert_task(conn: sqlite3.Connection, task: TaskCreate) -> TaskInDB:
         """INSERT INTO tasks (prompt, working_dir, provider, status, priority,
            scheduled_at, created_at, max_retries, skip_permissions, model,
            session_id, parent_task_id, tg_chat_id, recurrence, task_timeout,
-           detached, keep_pane, herdr_target, machine, worktree, effort, series_id)
-           VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           detached, keep_pane, herdr_target, machine, worktree, effort, series_id,
+           rights)
+           VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             task.prompt,
             task.working_dir,
@@ -1079,6 +1093,7 @@ def _insert_task(conn: sqlite3.Connection, task: TaskCreate) -> TaskInDB:
             int(task.worktree),
             task.effort,
             series_id,
+            task.rights,
         ),
     )
     return get_task(cur.lastrowid, conn=conn)
@@ -2314,6 +2329,7 @@ def _recreate_series_occurrence(conn, series_id: int, series,
         herdr_target=latest.herdr_target,
         machine=latest.machine,
         worktree=latest.worktree,
+        rights=latest.rights,
         series_id=series_id,
     ))
     return True
@@ -4936,10 +4952,10 @@ def append_workflow_event(event: WorkflowEventCreate) -> WorkflowEventInDB:
         return _append_workflow_event(conn, event)
 
 
-def create_workflow(data: WorkflowCreate, workflow_id: str = None) -> WorkflowInDB:
+def create_workflow(data: WorkflowCreate, workflow_id: str = None, *, conn=None) -> WorkflowInDB:
     workflow_id = workflow_id or _new_id("wf")
     now = _now()
-    with _connect(immediate=True) as conn:
+    with (nullcontext(conn) if conn is not None else _connect(immediate=True)) as conn:
         try:
             conn.execute(
                 """INSERT INTO workflows
@@ -4970,6 +4986,37 @@ def create_workflow(data: WorkflowCreate, workflow_id: str = None) -> WorkflowIn
             "SELECT * FROM workflows WHERE id = ?", (workflow_id,)
         ).fetchone()
         return _row_to_workflow(row)
+
+
+def abort_draft_workflow(workflow_id: str) -> bool:
+    """Компенсация неатомарного создания миссии с готовым планом.
+
+    Отменяет ТОЛЬКО draft-миссию: терминальный cancelled + slug вида
+    «aborted-<slug>-<id>», освобождая исходный slug для повторного запроса.
+    Физическое удаление строки невозможно по схеме: workflow_events держит
+    FK ON DELETE RESTRICT (при foreign_keys=ON), а события append-only —
+    журнал целостности важнее. Планы/этапы/раунды draft-а удаляются.
+    """
+    with _connect(immediate=True) as conn:
+        row = conn.execute(
+            "SELECT status, slug FROM workflows WHERE id = ?", (workflow_id,)
+        ).fetchone()
+        if not row or row["status"] != "draft":
+            return False
+        conn.execute(
+            "DELETE FROM workflow_stages WHERE workflow_id = ?", (workflow_id,))
+        conn.execute(
+            "DELETE FROM workflow_plans WHERE workflow_id = ?", (workflow_id,))
+        conn.execute(
+            "DELETE FROM workflow_rounds WHERE workflow_id = ?", (workflow_id,))
+        cur = conn.execute(
+            """UPDATE workflows
+               SET status = 'cancelled',
+                   slug = 'aborted-' || substr(slug, 1, 40) || '-' || substr(id, 4, 8),
+                   updated_at = ?
+               WHERE id = ? AND status = 'draft'""",
+            (_now(), workflow_id))
+        return cur.rowcount > 0
 
 
 def get_workflow(workflow_id: str, *, conn=None) -> Optional[WorkflowInDB]:
@@ -5082,7 +5129,8 @@ def _replace_workflow_stages(conn: sqlite3.Connection, workflow_id: str,
 
 
 def update_workflow(workflow_id: str, update: WorkflowUpdate) -> WorkflowInDB:
-    changes = update.model_dump(exclude={"expected_version"}, exclude_none=True)
+    changes = update.model_dump(
+        exclude={"expected_version", "allow_terminal_config"}, exclude_none=True)
     if not changes:
         raise ValueError("workflow update contains no changed fields")
     if "config" in changes:
@@ -5104,9 +5152,14 @@ def update_workflow(workflow_id: str, update: WorkflowUpdate) -> WorkflowInDB:
                 "workflow metadata except config can only be edited while status is draft"
             )
         if current["status"] in {"completed", "failed", "cancelled"}:
-            raise WorkflowConflictError(
-                "terminal workflow configuration cannot be edited"
-            )
+            # allow_terminal_config: явная семантика правки конфига
+            # терминальной миссии (только config; на выполнение не влияет)
+            if not (getattr(update, "allow_terminal_config", False)
+                    and set(changes) <= {"config_json"}):
+                raise WorkflowConflictError(
+                    "terminal workflow configuration cannot be edited "
+                    "(allow_terminal_config=true разрешает правку только config)"
+                )
         if current["state_version"] != update.expected_version:
             raise WorkflowConflictError(
                 f"workflow version is {current['state_version']}, "
@@ -5360,6 +5413,66 @@ def list_workflow_findings(workflow_id: str,
         return [_row_to_workflow_finding(row) for row in rows]
 
 
+MEMORY_MAX_BYTES = 16 * 1024
+
+
+def list_memory(workflow_id: str) -> list[dict]:
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM workflow_memory WHERE workflow_id = ? ORDER BY name",
+            (workflow_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def save_memory(workflow_id: str, name: str, content: str,
+                updated_by_task: int = None,
+                scope_stage: str = None) -> tuple[bool, str]:
+    """Сохранить заметку миссии (замена целиком). Лимит 16КБ — ОТКАЗ, не
+    обрезка: агент должен знать, что не влезло, и разбить сам.
+    scope_stage привязывает заметку к этапу — конвейер удалит её при
+    закрытии этапа (уборка — работа пайплайна)."""
+    name = name or "memory.md"
+    if not name.strip():
+        return False, "пустое имя заметки"
+    if len(name) > 64:
+        return False, "имя заметки длиннее 64 символов"
+    if len(content.encode("utf-8")) > MEMORY_MAX_BYTES:
+        return False, (f"заметка {name} больше {MEMORY_MAX_BYTES} байт — "
+                       f"сократи или раздели на несколько заметок")
+    with _connect(immediate=True) as conn:
+        if scope_stage:
+            rows = conn.execute(
+                """SELECT id FROM workflow_stages WHERE workflow_id=?
+                   AND (id=? OR code=?) AND status NOT IN ('completed','skipped')""",
+                (workflow_id, scope_stage, scope_stage),
+            ).fetchall()
+            if len(rows) != 1:
+                return False, "scope_stage должен указывать на открытый этап этой миссии"
+            scope_stage = rows[0]["id"]
+        conn.execute(
+            """INSERT INTO workflow_memory (workflow_id, name, content, updated_at, updated_by_task, scope_stage)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(workflow_id, name) DO UPDATE SET
+                   content = excluded.content,
+                   updated_at = excluded.updated_at,
+                   updated_by_task = excluded.updated_by_task,
+                   scope_stage = excluded.scope_stage""",
+            (workflow_id, name, content, _now(), updated_by_task,
+             (scope_stage or None)),
+        )
+    return True, "сохранено"
+
+
+def delete_memory(workflow_id: str, name: str) -> bool:
+    with _connect() as conn:
+        cur = conn.execute(
+            "DELETE FROM workflow_memory WHERE workflow_id = ? AND name = ?",
+            (workflow_id, name),
+        )
+        return cur.rowcount > 0
+
+
 def create_workflow_artifact(data: WorkflowArtifactCreate,
                              artifact_id: str = None) -> WorkflowArtifactInDB:
     artifact_id = artifact_id or _new_id("artifact")
@@ -5447,15 +5560,35 @@ def list_workflow_artifacts(workflow_id: str,
         return [_row_to_workflow_artifact(row) for row in rows]
 
 
-def list_workflow_events(workflow_id: str, after_seq: int = 0,
-                         limit: int = 200) -> list[WorkflowEventInDB]:
+def list_workflow_notification_events(after_seq: int = 0, limit: int = 500,
+                                      *, tail: bool = False):
+    """One global event snapshot, including workflows beyond UI list limits."""
     with _connect() as conn:
         rows = conn.execute(
-            """SELECT * FROM workflow_events
+            "SELECT e.*, w.slug AS workflow_slug FROM workflow_events e "
+            "JOIN workflows w ON w.id=e.workflow_id WHERE e.seq>? ORDER BY e.seq "
+            + ("DESC" if tail else "ASC") + " LIMIT ?", (after_seq, limit),
+        ).fetchall()
+    if tail:
+        rows.reverse()
+    return [(row["workflow_slug"], _row_to_workflow_event(row)) for row in rows]
+
+
+def list_workflow_events(workflow_id: str, after_seq: int = 0,
+                         limit: int = 200,
+                         tail: bool = False) -> list[WorkflowEventInDB]:
+    """tail=True — последние `limit` событий в хронологическом порядке:
+    дешевле страницы «всё и отрезать» для длинных миссий."""
+    with _connect() as conn:
+        order = "DESC" if tail else "ASC"
+        rows = conn.execute(
+            f"""SELECT * FROM workflow_events
                WHERE workflow_id = ? AND seq > ?
-               ORDER BY seq LIMIT ?""",
+               ORDER BY seq {order} LIMIT ?""",
             (workflow_id, after_seq, limit),
         ).fetchall()
+        if tail:
+            rows = list(reversed(rows))
         return [_row_to_workflow_event(row) for row in rows]
 
 
