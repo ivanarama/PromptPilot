@@ -23,7 +23,7 @@ import re as _re
 
 from . import db, epf_tools, workflows
 from . import pipeline_insights
-from .config import ALLOWED_HOSTS, ALLOWED_ORIGINS, API_TOKEN, DB_DIR, EFFORT_LEVELS, PIPELINE_SNAPSHOT_INTERVAL, get_provider_models, get_skills, load_providers, mask_secret_value, provider_available, PROJECTS_ROOT
+from .config import ALLOWED_HOSTS, ALLOWED_ORIGINS, API_TOKEN, DB_DIR, DEFAULT_CLI, EFFORT_LEVELS, PIPELINE_SNAPSHOT_INTERVAL, get_provider_models, get_skills, load_providers, mask_secret_value, provider_available, RIGHTS_LEVELS, rights_supported, PROJECTS_ROOT
 from .models import (
     CostStats,
     FindingStatus,
@@ -318,6 +318,15 @@ def api_create_task(task: TaskCreate):
     # UI only ever offers registered providers, so this rejects nothing real.
     if task.provider and task.provider not in load_providers():
         raise HTTPException(400, f"Неизвестный провайдер «{task.provider}»")
+    if task.rights:
+        # Refuse up front what the worker would refuse at run time.
+        cfg = load_providers().get(task.provider or DEFAULT_CLI, {})
+        if not rights_supported(cfg, task.rights):
+            raise HTTPException(
+                400, f"Провайдер «{task.provider or DEFAULT_CLI}» не умеет ограничивать "
+                     f"права до «{task.rights}» (задайте rights в providers.json)")
+        if task.herdr_target and task.rights != "full":
+            raise HTTPException(400, "Задачу в открытую сессию herdr нельзя ограничить")
     return db.create_task(task)
 
 
@@ -723,9 +732,25 @@ def api_validate_workflow_setup(request: WorkflowSetupValidationRequest):
 @app.post("/api/workflows", response_model=WorkflowInDB, status_code=201)
 def api_create_workflow(workflow: WorkflowCreate):
     try:
-        return db.create_workflow(workflow)
+        # One transaction: no other request can observe/start an intermediate
+        # draft before its supplied plan and approval barrier have been stored.
+        if workflow.plan:
+            WorkflowPlanReplace(
+                expected_version=0, stages=workflow.plan)
+        with db._connect(immediate=True) as conn:
+            created = db.create_workflow(workflow, conn=conn)
+            if workflow.plan:
+                workflows.provide_plan(created.id, WorkflowPlanReplace(
+                    expected_version=created.state_version,
+                    stages=workflow.plan,
+                ), conn=conn)
+            return db.get_workflow(created.id, conn=conn)
     except db.WorkflowConflictError as exc:
         raise HTTPException(409, str(exc)) from exc
+    except ValueError as exc:
+        # невалидный план (например, финал не integration) — миссии в БД нет,
+        # slug свободен, повторный запрос с исправленным планом пройдёт
+        raise HTTPException(422, str(exc)) from exc
 
 
 @app.get("/api/workflows", response_model=List[WorkflowInDB])
@@ -1303,6 +1328,8 @@ def api_providers():
             "hidden": bool(info.get("hidden")),
             "executor": info.get("executor", ""),
             "session_target": bool(info.get("session_target")),
+            # rights levels this provider can be confined to (models.TaskRights)
+            "rights": [level for level in RIGHTS_LEVELS if rights_supported(info, level)],
         }
         for name, info in providers.items()
     }
