@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import ipaddress
 import secrets
 import subprocess
 import sys
@@ -10,6 +11,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.concurrency import run_in_threadpool
@@ -21,7 +23,7 @@ import re as _re
 
 from . import db, epf_tools, workflows
 from . import pipeline_insights
-from .config import API_TOKEN, DB_DIR, DEFAULT_CLI, EFFORT_LEVELS, PIPELINE_SNAPSHOT_INTERVAL, get_provider_models, get_skills, load_providers, mask_secret_value, provider_available, RIGHTS_LEVELS, rights_supported, PROJECTS_ROOT
+from .config import ALLOWED_HOSTS, ALLOWED_ORIGINS, API_TOKEN, DB_DIR, DEFAULT_CLI, EFFORT_LEVELS, PIPELINE_SNAPSHOT_INTERVAL, get_provider_models, get_skills, load_providers, mask_secret_value, provider_available, RIGHTS_LEVELS, rights_supported, PROJECTS_ROOT
 from .models import (
     CostStats,
     FindingStatus,
@@ -103,6 +105,83 @@ app = FastAPI(title="PromptPilot", version="0.1.0", lifespan=_lifespan)
 _SAFE_METHODS = ("GET", "HEAD", "OPTIONS")
 
 
+def _hostname(authority: str) -> str:
+    """Lowercased host part of a Host header or URL authority, without port."""
+    value = (authority or "").strip().lower()
+    if value.startswith("["):
+        end = value.find("]")
+        return value[1:end] if end > 0 else ""
+    if value.count(":") == 1:
+        value = value.split(":", 1)[0]
+    return value.rstrip(".")
+
+
+def _trusted_host(authority: str) -> bool:
+    """Whether a page served from elsewhere could have produced this Host.
+
+    DNS rebinding points an attacker's own hostname at 127.0.0.1, so the
+    browser treats the attacker's page as same-origin with this server and the
+    request carries the attacker's hostname. It cannot make the browser send a
+    localhost name (browsers resolve *.localhost themselves) or an IP literal,
+    so those stay allowed together with the names in PP_ALLOWED_HOSTS.
+    """
+    hostname = _hostname(authority)
+    if not hostname:
+        return False
+    if "*" in ALLOWED_HOSTS or hostname in ALLOWED_HOSTS:
+        return True
+    if hostname == "localhost" or hostname.endswith(".localhost"):
+        return True
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        return False
+    return True
+
+
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _origin_key(value: str) -> tuple[str, str, int] | None:
+    """(scheme, host, port) of a serialized origin, or None if it is not one.
+
+    Default ports are filled in: https://pp.example.com and
+    https://pp.example.com:443 are one origin, another scheme or port of the
+    same name is not.
+    """
+    try:
+        parts = urlsplit((value or "").strip())
+    except ValueError:
+        return None
+    if (parts.scheme not in _DEFAULT_PORTS or not parts.hostname
+            or parts.username is not None or parts.password is not None
+            or parts.path not in ("", "/") or parts.query or parts.fragment):
+        return None
+    try:
+        port = parts.port
+    except ValueError:
+        return None
+    return parts.scheme, parts.hostname.rstrip("."), port or _DEFAULT_PORTS[parts.scheme]
+
+
+def _same_origin(origin: str, authority: str, scheme: str) -> bool:
+    """Whether a browser Origin header is this server or an allowed origin.
+
+    Origins compare as (scheme, host, port). A page on another port of the
+    same machine is "same-site", not same-origin, and so is another scheme or
+    port of a proxied name. Behind a reverse proxy the request reaches the
+    upstream address while Origin keeps the public URL: that URL must be
+    listed in full in PP_ALLOWED_ORIGINS — PP_ALLOWED_HOSTS only admits a
+    Host name.
+    """
+    key = _origin_key(origin)
+    if key is None:
+        return False
+    if key == _origin_key(f"{scheme}://{(authority or '').strip()}"):
+        return True
+    return any(key == _origin_key(allowed) for allowed in ALLOWED_ORIGINS)
+
+
 @app.middleware("http")
 async def _auth(request, call_next):
     """Optional auth: enabled by PP_API_TOKEN. Accepts Bearer <token> or
@@ -112,11 +191,34 @@ async def _auth(request, call_next):
     cross-site is refused: without this, a malicious page open in the user's
     browser could POST to the loopback server (no token by default) and queue a
     task that runs with --dangerously-skip-permissions. curl/scripts don't send
-    Sec-Fetch-Site, so they're unaffected."""
+    Sec-Fetch-Site, so they're unaffected.
+
+    Without a token the loopback bind is the only boundary, and "cross-site"
+    does not cover every way around it: DNS rebinding makes a hostile page
+    same-origin with this server, and a page on another localhost port is
+    "same-site". So a foreign Host is refused on every request, and a
+    state-changing request whose Origin is neither this server nor an origin
+    listed in PP_ALLOWED_ORIGINS — compared as scheme, host and port — is
+    refused too. Scripts send neither a foreign Host nor an Origin and keep
+    working."""
     if request.method not in _SAFE_METHODS:
         if request.headers.get("sec-fetch-site") == "cross-site":
             return Response(status_code=403, content="cross-site request refused")
     if not API_TOKEN:
+        host = request.headers.get("host", "")
+        if not _trusted_host(host):
+            return Response(
+                status_code=403,
+                content="host not allowed: add it to PP_ALLOWED_HOSTS or set PP_API_TOKEN",
+            )
+        origin = request.headers.get("origin")
+        if (request.method not in _SAFE_METHODS and origin is not None
+                and not _same_origin(origin, host, request.url.scheme)):
+            return Response(
+                status_code=403,
+                content="cross-origin request refused: add the page origin to "
+                        "PP_ALLOWED_ORIGINS or set PP_API_TOKEN",
+            )
         return await call_next(request)
     header = request.headers.get("authorization", "")
     ok = False
@@ -162,9 +264,51 @@ def _task_with_epf(task: TaskInDB) -> dict:
     return d
 
 
+def _attach_workflow_attribution(tasks: list) -> list:
+    """Атрибуция и честная позиция для карточек задач.
+
+    Принадлежность задачи к миссии (workflow_id/role из workflow_runs) и
+    позиция в очереди. Базовый ранг учитывает paused-серии, отложенные
+    scheduled/next_run_at и, в параллельном режиме, занятые рабочие деревья.
+    Lanes, budget fairness, слоты и глобальная пауза не моделируются;
+    исключённые базовыми фильтрами задачи получают wait_reason.
+    Расчёт read-only (worker.admission_snapshot), claim не меняется.
+    """
+    if not tasks:
+        return tasks
+    task_ids = [t.id for t in tasks]
+    marks = ",".join("?" * len(task_ids))
+    runs = {}
+    with db._connect() as conn:
+        for row in conn.execute(
+            f"""SELECT task_id, workflow_id, role FROM workflow_runs
+                WHERE task_id IN ({marks})""", task_ids,
+        ):
+            runs[row["task_id"]] = (row["workflow_id"], row["role"])
+    try:
+        from .worker import admission_snapshot
+        admission = (admission_snapshot() if any(
+            task.status in {TaskStatus.PENDING, TaskStatus.RATE_LIMITED}
+            for task in tasks) else {})
+    except Exception as exc:  # noqa: BLE001 - проекция не должна ронять API
+        print(f"  !! admission_snapshot недоступен: {exc}", flush=True)
+        admission = {}
+    for task in tasks:
+        attribution = runs.get(task.id)
+        if attribution:
+            task.workflow_id, task.role = attribution
+        info = admission.get(task.id)
+        if info is not None:
+            task.queue_position = info["queue_position"]
+            task.wait_reason = info["wait_reason"]
+    return tasks
+
+
 @app.get("/api/tasks")
 def api_list_tasks(status: Optional[TaskStatus] = None, limit: int = 50, offset: int = 0):
-    return [_task_with_epf(t) for t in db.list_tasks(status=status, limit=limit, offset=offset)]
+    tasks = _attach_workflow_attribution(
+        db.list_tasks(status=status, limit=limit, offset=offset))
+    return [_task_with_epf(t) for t in tasks]
 
 
 @app.post("/api/tasks", response_model=TaskInDB, status_code=201)
@@ -447,8 +591,19 @@ def _setup_check(code: str, status: str, message: str) -> WorkflowSetupCheck:
     return WorkflowSetupCheck(code=code, status=status, message=message)
 
 
-def _validate_gate_syntax(command: str) -> tuple[bool, str]:
-    """Parse one gate command without executing it."""
+# Preflight probes start other programs, and starting one is not instant: a
+# cold powershell.exe on a loaded Windows machine takes seconds. This is a
+# "the process hung" limit, not a measure of how long a parse should take.
+_PROBE_TIMEOUT = 20
+
+
+def _validate_gate_syntax(command: str) -> tuple[str, str]:
+    """Parse one gate command without executing it.
+
+    Returns the check status: "ok" when the parser accepted the command,
+    "error" when it rejected it, and "warning" when the parser could not be
+    run at all — not managing to check is not proof the command is broken.
+    """
     try:
         if os.name == "nt":
             env = os.environ.copy()
@@ -461,17 +616,20 @@ def _validate_gate_syntax(command: str) -> tuple[bool, str]:
             )
             parsed = subprocess.run(
                 ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
-                capture_output=True, text=True, timeout=5, errors="replace", env=env,
+                capture_output=True, text=True, timeout=_PROBE_TIMEOUT,
+                errors="replace", env=env,
             )
         else:
             parsed = subprocess.run(
                 ["/bin/sh", "-n", "-c", command], capture_output=True,
-                text=True, timeout=5, errors="replace",
+                text=True, timeout=_PROBE_TIMEOUT, errors="replace",
             )
+    except subprocess.TimeoutExpired:
+        return "warning", f"синтаксис не проверен: парсер не ответил за {_PROBE_TIMEOUT} с"
     except (OSError, subprocess.SubprocessError) as exc:
-        return False, f"не удалось запустить parser: {exc}"
+        return "warning", f"синтаксис не проверен: не удалось запустить parser ({exc})"
     detail = ((parsed.stdout or "") + (parsed.stderr or "")).strip()
-    return parsed.returncode == 0, detail
+    return ("ok" if parsed.returncode == 0 else "error"), detail
 
 
 @app.post(
@@ -481,6 +639,9 @@ def _validate_gate_syntax(command: str) -> tuple[bool, str]:
 def api_validate_workflow_setup(request: WorkflowSetupValidationRequest):
     """Validate repository, branch, providers and gate syntax without mutation."""
     checks: list[WorkflowSetupCheck] = []
+    # Required checks that could not be performed at all (a probe timed out).
+    # They are not errors and not successes: nothing was proven either way.
+    unverified: list[str] = []
     repo = Path(request.repository_path).expanduser()
     if not repo.exists():
         checks.append(_setup_check("repository", "error", "Каталог репозитория не найден"))
@@ -490,7 +651,7 @@ def api_validate_workflow_setup(request: WorkflowSetupValidationRequest):
         try:
             git = subprocess.run(
                 ["git", "-C", str(repo), "rev-parse", "--show-toplevel"],
-                capture_output=True, text=True, timeout=5, errors="replace",
+                capture_output=True, text=True, timeout=_PROBE_TIMEOUT, errors="replace",
             )
             if git.returncode:
                 checks.append(_setup_check(
@@ -500,18 +661,32 @@ def api_validate_workflow_setup(request: WorkflowSetupValidationRequest):
                 checks.append(_setup_check(
                     "repository", "ok", f"Git-репозиторий: {git.stdout.strip()}",
                 ))
+        # A git that did not answer in time proves nothing about the directory;
+        # a git that cannot be started at all is a real problem. Keep them apart
+        # — TimeoutExpired is a SubprocessError, so it has to be caught first.
+        except subprocess.TimeoutExpired:
+            unverified.append("repository")
+            checks.append(_setup_check(
+                "repository", "warning",
+                f"не проверен: git не ответил за {_PROBE_TIMEOUT} с",
+            ))
         except (OSError, subprocess.SubprocessError) as exc:
             checks.append(_setup_check("repository", "error", f"Git недоступен: {exc}"))
 
     try:
         branch = subprocess.run(
             ["git", "check-ref-format", "--branch", request.candidate_branch],
-            capture_output=True, text=True, timeout=5, errors="replace",
+            capture_output=True, text=True, timeout=_PROBE_TIMEOUT, errors="replace",
         )
         checks.append(_setup_check(
             "branch", "ok" if branch.returncode == 0 else "error",
             (f"Допустимое имя ветки: {request.candidate_branch}"
              if branch.returncode == 0 else "Недопустимое имя Git-ветки"),
+        ))
+    except subprocess.TimeoutExpired:
+        unverified.append("branch")
+        checks.append(_setup_check(
+            "branch", "warning", f"не проверено: git не ответил за {_PROBE_TIMEOUT} с",
         ))
     except (OSError, subprocess.SubprocessError) as exc:
         checks.append(_setup_check("branch", "error", f"Git недоступен: {exc}"))
@@ -531,15 +706,26 @@ def api_validate_workflow_setup(request: WorkflowSetupValidationRequest):
             "gate", "warning", "Gate-команды не заданы: функциональная готовность не проверяется",
         ))
     for index, command in enumerate(request.gate_commands, start=1):
-        ok, detail = _validate_gate_syntax(command)
+        status, detail = _validate_gate_syntax(command)
+        if status == "warning":
+            # A gate the operator did specify, whose syntax we could not check.
+            unverified.append(f"gate#{index}")
         checks.append(_setup_check(
-            "gate", "ok" if ok else "error",
-            (f"Gate #{index}: синтаксис корректен"
-             if ok else f"Gate #{index}: {detail or 'ошибка синтаксиса'}"),
+            "gate", status,
+            (f"Gate #{index}: синтаксис корректен" if status == "ok"
+             else f"Gate #{index}: {detail or 'ошибка синтаксиса'}"),
         ))
 
+    # ready opens «Создать и запустить» in the wizard, so it must mean «checked
+    # and fine», not merely «nothing came back wrong». A probe that did not
+    # answer keeps its own warning status — the message says what was not
+    # checked — but readiness is withheld: an unchecked gate must not let an
+    # unattended run start. A gate nobody specified is a different thing: there
+    # is nothing to check, and that warning stays non-blocking.
     return WorkflowSetupValidationResponse(
-        ready=not any(check.status == "error" for check in checks), checks=checks,
+        ready=(not any(check.status == "error" for check in checks)
+               and not unverified),
+        checks=checks,
     )
 
 
@@ -575,7 +761,7 @@ def api_get_workflow(workflow_id: str):
 @app.patch("/api/workflows/{workflow_id}", response_model=WorkflowInDB)
 def api_update_workflow(workflow_id: str, update: WorkflowUpdate):
     try:
-        updated = db.update_workflow(workflow_id, update)
+        db.update_workflow(workflow_id, update)
         return workflows.advance_workflow(workflow_id)
     except db.WorkflowNotFoundError as exc:
         raise HTTPException(404, "Workflow not found") from exc
