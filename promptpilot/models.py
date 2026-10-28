@@ -29,7 +29,7 @@ class TaskStatus(str, Enum):
 class TaskCreate(BaseModel):
     prompt: str
     working_dir: Optional[str] = None
-    provider: Optional[str] = None  # e.g. "claude", "claude-z", or raw command
+    provider: Optional[str] = None
     priority: int = Field(default=5, ge=1, le=10)
     scheduled_at: Optional[datetime] = None
     max_retries: int = Field(default=5, ge=0, le=50)
@@ -223,6 +223,9 @@ class WorkflowRoleConfig(BaseModel):
     keep_pane: bool = True
     herdr_target: Optional[str] = None
     machine: Optional[str] = None
+    # Дешёвые часы: [{provider, window{from,to,tz_offset_hours,days}}];
+    # активное окно задаёт провайдера роли, вне окон — фолбэк на provider
+    provider_windows: Optional[list[dict]] = None
     rights: Optional[TaskRights] = None
     prompt_template: str = ""
     # Окно ДИСПАТЧА роли: [{"from":"22:00","to":"06:00","tz_offset_hours":0,
@@ -253,6 +256,33 @@ class WorkflowRoleConfig(BaseModel):
             if isinstance(days, list) and days and all(isinstance(day, str) and day.lower() in names for day in days):
                 continue
             raise ValueError("dispatch window days must name valid weekdays")
+        return windows
+
+    @field_validator("provider_windows")
+    @classmethod
+    def valid_provider_windows(cls, windows):
+        import re
+        day_names = {"mon", "tue", "wed", "thu", "fri", "sat", "sun"}
+        for item in windows or []:
+            if set(item) - {"provider", "window"} or not isinstance(item.get("provider"), str) or not item["provider"].strip():
+                raise ValueError("provider_windows requires a provider and window")
+            window = item.get("window")
+            if not isinstance(window, dict) or set(window) - {"from", "to", "tz_offset_hours", "days"}:
+                raise ValueError("invalid provider window fields")
+            for key in ("from", "to"):
+                if not isinstance(window.get(key), str) or not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", window[key]):
+                    raise ValueError("provider window time must be HH:MM (00:00..23:59)")
+            offset = window.get("tz_offset_hours", 3)
+            if type(offset) is not int or not -23 <= offset <= 23:
+                raise ValueError("tz_offset_hours must be an integer between -23 and 23")
+            days = window.get("days")
+            if days is None:
+                continue
+            if isinstance(days, str) and days.strip().lower() in {"all", "weekdays", "будни", "будни (пн–пт)", "weekend", "выходные", "выходные (сб–вс)"}:
+                continue
+            if isinstance(days, list) and days and all(isinstance(d, str) and d.lower() in day_names for d in days):
+                continue
+            raise ValueError("provider window days must name valid weekdays")
         return windows
 
 
