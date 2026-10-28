@@ -1,6 +1,8 @@
 """Usage from structured completion counters, never result text or global logs.
 
-pricing.json maps a reported model (or provider) to {"in": $/1M, "out": $/1M}.
+pricing.json maps a reported model (or provider) to {"in": $/1M, "out": $/1M,
+"cache_read": $/1M}. Cache-read pricing is required only when cache is used.
+Cache writes (unknown TTL mix) and mixed-model totals remain unpriced.
 Unknown coverage/prices yield cost=null; known_cost is the priced subtotal.
 """
 from __future__ import annotations
@@ -31,12 +33,18 @@ def load_pricing() -> dict:
             valid = False
         if valid:
             clean[model] = dict(zip(("in", "out"), values))
+            rate = rates.get("cache_read")
+            try:
+                if type(rate) in (int, float) and math.isfinite(rate) and rate >= 0:
+                    clean[model]["cache_read"] = rate
+            except OverflowError:
+                pass
     return clean
 
 
 def _bucket():
     return dict(tasks=0, measured_tasks=0, priced_tasks=0, input=0, output=0,
-                cached=0, total=0, known_cost=0.0, cost=None, measured=False)
+                cached=0, cache_created=0, total=0, known_cost=0.0, cost=None, measured=False)
 
 
 def summary(now=None) -> dict:
@@ -51,10 +59,12 @@ def summary(now=None) -> dict:
                    date(t.completed_at, 'localtime') AS day, u.model,
                    COUNT(*) AS tasks, COUNT(u.task_id) AS measured,
                    TOTAL(u.input_tokens) AS inp, TOTAL(u.output_tokens) AS out,
-                   TOTAL(u.cached_input_tokens) AS cached
+                   TOTAL(u.cached_input_tokens) AS cached,
+                   TOTAL(u.cache_creation_input_tokens) AS created,
+                   COALESCE(u.cost_attributable,0) AS attributable
             FROM tasks AS t LEFT JOIN task_token_usage AS u ON u.task_id=t.id
             WHERE t.status='completed' AND t.completed_at IS NOT NULL
-            GROUP BY provider, day, u.model
+            GROUP BY provider, day, u.model, attributable
         """).fetchall()
     totals, daily, weekly = _bucket(), _bucket(), _bucket()
     providers, days, models = {}, {}, {}
@@ -69,15 +79,20 @@ def summary(now=None) -> dict:
         if day and first_day <= day <= today:
             targets.append(weekly)
         rates = pricing.get(model) or pricing.get(provider)
-        cost = ((row["inp"] * rates["in"] + row["out"] * rates["out"]) / 1e6
-                if rates else None)
+        cost = None
+        if (rates and row["attributable"] and not row["created"]
+                and (not row["cached"] or "cache_read" in rates)):
+            cost = ((row["inp"] - row["cached"]) * rates["in"]
+                    + row["cached"] * rates.get("cache_read", 0)
+                    + row["out"] * rates["out"]) / 1e6
         if cost is not None and not math.isfinite(cost):
             cost = None
         for target in targets:
             target["tasks"] += row["tasks"]
             target["measured_tasks"] += row["measured"]
             target["priced_tasks"] += row["measured"] if cost is not None else 0
-            for key, column in (("input", "inp"), ("output", "out"), ("cached", "cached")):
+            for key, column in (("input", "inp"), ("output", "out"), ("cached", "cached"),
+                                ("cache_created", "created")):
                 target[key] += int(row[column])
             target["known_cost"] += cost or 0.0
         if model and row["measured"]:

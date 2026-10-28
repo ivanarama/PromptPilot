@@ -84,7 +84,9 @@ CREATE TABLE IF NOT EXISTS task_token_usage (
     input_tokens INTEGER NOT NULL CHECK(input_tokens >= 0),
     output_tokens INTEGER NOT NULL CHECK(output_tokens >= 0),
     cached_input_tokens INTEGER NOT NULL CHECK(cached_input_tokens >= 0),
-    model TEXT
+    model TEXT,
+    cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0 CHECK(cache_creation_input_tokens >= 0),
+    cost_attributable INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS task_series (
@@ -319,6 +321,8 @@ CREATE INDEX IF NOT EXISTS idx_workflow_events_workflow ON workflow_events(workf
 """
 
 MIGRATIONS = [
+    "ALTER TABLE task_token_usage ADD COLUMN cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE task_token_usage ADD COLUMN cost_attributable INTEGER NOT NULL DEFAULT 1",
     "ALTER TABLE tasks ADD COLUMN provider TEXT",
     "ALTER TABLE tasks ADD COLUMN model_used TEXT",
     "ALTER TABLE tasks ADD COLUMN skip_permissions INTEGER DEFAULT 0",
@@ -1381,17 +1385,21 @@ def mark_completed(task_id: int, result: str, exit_code: int = 0,
             conn.execute("DELETE FROM task_token_usage WHERE task_id = ?", (task_id,))
             if isinstance(usage, dict):
                 counts = [usage.get("input_tokens"), usage.get("output_tokens"),
-                          usage.get("cached_input_tokens", 0)]
+                          usage.get("cached_input_tokens", 0),
+                          usage.get("cache_creation_input_tokens", 0)]
                 if counts[2] is None:
                     counts[2] = 0
                 if (all(type(n) is int and 0 <= n <= 2**63 - 1 for n in counts)
-                        and counts[2] <= counts[0]):
+                        and counts[2] + counts[3] <= counts[0]):
                     model = usage.get("model") or model_used
                     if not isinstance(model, str):
                         model = None
                     conn.execute(
-                        "INSERT INTO task_token_usage VALUES (?, ?, ?, ?, ?)",
-                        (task_id, *counts, model),
+                        """INSERT INTO task_token_usage
+                           (task_id,input_tokens,output_tokens,cached_input_tokens,
+                            cache_creation_input_tokens,model,cost_attributable)
+                           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                        (task_id, *counts, model, int(usage.get("cost_attributable", True) is True)),
                     )
         return cur.rowcount > 0
 

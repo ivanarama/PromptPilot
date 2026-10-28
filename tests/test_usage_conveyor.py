@@ -121,7 +121,7 @@ def test_cost_and_seven_day_boundary(isolated_db, tmp_path, monkeypatch):
 def test_real_worker_stream_is_recorded_atomically(isolated_db, monkeypatch, tmp_path):
     events = [
         {"type": "thread.started", "thread_id": "local-test"},
-        {"type": "item.completed", "item": {"type": "agent_message", "text": "????: ??????"}},
+        {"type": "item.completed", "item": {"type": "agent_message", "text": "ИТОГ: ГОТОВО"}},
         {"type": "turn.completed", "usage": {"input_tokens": 100, "output_tokens": 20, "cached_input_tokens": 80}},
     ]
     script = "import json; events=" + repr(events) + "; [print(json.dumps(e)) for e in events]"
@@ -133,3 +133,50 @@ def test_real_worker_stream_is_recorded_atomically(isolated_db, monkeypatch, tmp
     worker.execute_task(running)
     assert isolated_db.get_task(running.id).status.value == "completed"
     assert request("/api/stats/tokens").json()["total"]["total"] == 120
+
+
+@pytest.mark.parametrize("created,mixed", [(20, False), (0, False), (0, True)])
+def test_real_claude_worker_preserves_cache_and_unknown_cost(
+        isolated_db, monkeypatch, tmp_path, created, mixed):
+    model_usage = {"actual": {}}
+    if mixed:
+        model_usage["another-model"] = {}
+    events = [{"type": "result", "subtype": "success", "result": "ИТОГ: ГОТОВО",
+               "modelUsage": model_usage, "usage": {"input_tokens": 10,
+               "cache_read_input_tokens": 90, "cache_creation_input_tokens": created,
+               "output_tokens": 5}}]
+    script = "import json; events=" + repr(events) + "; [print(json.dumps(e)) for e in events]"
+    isolated_db.create_task(TaskCreate(prompt="usage", provider="usage-test", working_dir=str(tmp_path)))
+    running = isolated_db.get_next_runnable()
+    monkeypatch.setattr(worker, "load_providers", lambda: {"usage-test": {}})
+    monkeypatch.setattr(worker, "build_cmd", lambda *a, **k: [sys.executable, "-X", "utf8", "-c", script])
+    monkeypatch.setattr(worker, "get_provider_env", lambda p: os.environ.copy())
+    monkeypatch.setattr(uc, "DB_DIR", tmp_path)
+    prices = {"actual": {"in": 1, "out": 2}, "usage-test": {"in": 100, "out": 100}}
+    (tmp_path / "pricing.json").write_text(json.dumps(prices))
+    worker.execute_task(running)
+    done = isolated_db.get_task(running.id)
+    assert done.status.value == "completed" and done.verdict == "ГОТОВО"
+    total = request("/api/stats/tokens").json()["total"]
+    assert (total["input"], total["output"], total["cached"], total["cache_created"]) == (100 + created, 5, 90, created)
+    assert total["total"] == 105 + created
+    assert total["cost"] is None
+    prices["actual"]["cache_read"] = .1
+    (tmp_path / "pricing.json").write_text(json.dumps(prices))
+    total = request("/api/stats/tokens").json()["total"]
+    if created or mixed:
+        assert total["cost"] is None and total["known_cost"] == 0
+    else:
+        assert total["cost"] == pytest.approx(.000029)
+
+
+def test_usage_schema_upgrades_legacy_compact_counters(isolated_db):
+    tid = task(isolated_db, {"input_tokens": 10, "output_tokens": 5})
+    with isolated_db._connect() as conn:
+        conn.execute("ALTER TABLE task_token_usage DROP COLUMN cache_creation_input_tokens")
+        conn.execute("ALTER TABLE task_token_usage DROP COLUMN cost_attributable")
+    isolated_db.init_db()
+    with isolated_db._connect() as conn:
+        row = conn.execute("SELECT * FROM task_token_usage WHERE task_id=?", (tid,)).fetchone()
+    assert row["input_tokens"] == 10 and row["cache_creation_input_tokens"] == 0
+    assert row["cost_attributable"] == 1
