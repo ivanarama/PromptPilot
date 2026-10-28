@@ -1156,7 +1156,7 @@ def record_review(workflow_id: str,
                             f"({len(run_changes['changed'])} путей), но "
                             "доказать, что их сделал именно этот запуск "
                             "исполнителя, нельзя (снимок до запуска "
-                            "обрезан). Неизвестное происхождение требует "
+                            "либо итоговый снимок обрезан или недоступен). Неизвестное происхождение требует "
                             "человека; перезапустите раунд (resume)"
                         ),
                         "round_no": round_row["round_no"],
@@ -1759,11 +1759,14 @@ _SNAPSHOT_MAX_PATHS = 2000
 
 
 def _file_sig(path: str) -> str:
-    """Сигнатура содержимого файла для снимка: md5 первых 1 МиБ + размер."""
+    """SHA256 всего файла + размер; для симлинка хешируется сама ссылка."""
     import hashlib
-    h = hashlib.md5()
+    h = hashlib.sha256()
     size = 0
     try:
+        if os.path.islink(path):
+            target = os.fsencode(os.readlink(path))
+            return "sha256:" + hashlib.sha256(target).hexdigest() + ":link"
         with open(path, "rb") as fh:
             while True:
                 chunk = fh.read(1 << 20)
@@ -1773,7 +1776,7 @@ def _file_sig(path: str) -> str:
                 h.update(chunk)
     except OSError:
         return "unreadable"
-    return f"{h.hexdigest()}:{size}"
+    return f"sha256:{h.hexdigest()}:{size}"
 
 
 def _porcelain_dirty(check_dir: str):
@@ -1783,21 +1786,27 @@ def _porcelain_dirty(check_dir: str):
             return subprocess.run(
                 ["git", "-C", check_dir, *args],
                 capture_output=True, text=True, timeout=30,
-                errors="replace",
+                encoding="utf-8", errors="surrogateescape",
             )
         except (OSError, subprocess.TimeoutExpired):
             return None
 
-    status = run_git(["status", "--porcelain"])
+    status = run_git(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
     if status is None or status.returncode != 0:
         return None, False
     dirty = {}
     truncated = False
-    for line in (status.stdout or "").splitlines():
+    entries = iter((status.stdout or "").split("\0"))
+    for line in entries:
         if len(line) < 4:
             continue
-        xy, rest = line[:2], line[3:]
-        path = rest.split(" -> ")[-1].strip().strip('"')
+        xy, path = line[:2], line[3:]
+        old_path = next(entries, None) if "R" in xy or "C" in xy else None
+        if old_path and "R" in xy:
+            dirty[old_path] = "D"
+        if any(0xD800 <= ord(c) <= 0xDFFF for c in path) or (old_path is None and ("R" in xy or "C" in xy)):
+            dirty["__unverifiable_path__"] = "unreadable"
+            continue
         if not path:
             continue
         if len(dirty) >= _SNAPSHOT_MAX_PATHS:
@@ -1858,9 +1867,17 @@ def _executor_run_changes(check_dir: str, snapshot, base_sha=None):
         except (OSError, subprocess.TimeoutExpired):
             return None
 
-    dirty_now, _truncated = _porcelain_dirty(check_dir)
+    dirty_now, truncated = _porcelain_dirty(check_dir)
     if dirty_now is None:
-        return {"available": False, "changed": [], "unknown": False}
+        directory = os.path.abspath(check_dir)
+        known_git = snapshot is not None
+        while not known_git:
+            known_git = os.path.lexists(os.path.join(directory, ".git"))
+            parent = os.path.dirname(directory)
+            if parent == directory:
+                break
+            directory = parent
+        return {"available": known_git, "changed": [], "unknown": known_git}
     head_now = _git_head(check_dir)
 
     if snapshot is None:
@@ -1872,18 +1889,24 @@ def _executor_run_changes(check_dir: str, snapshot, base_sha=None):
             changed.update(l.strip() for l in committed.stdout.splitlines()
                            if l.strip())
         return {"available": True, "changed": sorted(changed),
-                "unknown": bool(changed)}
+                "unknown": True}
 
     changed = {p for p, sig in dirty_now.items()
                if snapshot.get("dirty", {}).get(p) != sig}
+    changed.update(set(snapshot.get("dirty", {})) - set(dirty_now))
     snap_head = snapshot.get("head")
+    unknown = bool(truncated or snapshot.get("truncated") or not snap_head or not head_now)
+    signatures = [*dirty_now.values(), *snapshot.get("dirty", {}).values()]
+    unknown = unknown or any(not isinstance(sig, str) or (sig != "D" and not sig.startswith("sha256:")) for sig in signatures)
     if snap_head and head_now and snap_head != head_now:
+        ancestry = run_git(["merge-base", "--is-ancestor", snap_head, head_now])
+        unknown = unknown or ancestry is None or ancestry.returncode != 0
         committed = run_git(["diff", "--name-only",
-                             f"{snap_head}...{head_now}"])
+                             "-z", snap_head, head_now])
         if committed is not None and committed.returncode == 0:
-            changed.update(l.strip() for l in committed.stdout.splitlines()
-                           if l.strip())
-    unknown = bool(snapshot.get("truncated")) and bool(changed)
+            changed.update(path for path in committed.stdout.split("\0") if path)
+        else:
+            unknown = True
     return {"available": True, "changed": sorted(changed), "unknown": unknown}
 
 
@@ -2036,6 +2059,10 @@ def _stage_checkpoint_commit(workflow_id: str, stage_code: str,
                          "detail": detail[:400]},
             ))
         return False
+
+    current_dirty, truncated = _porcelain_dirty(check_dir)
+    if current_dirty is None or truncated or any(sig == "unreadable" for sig in current_dirty.values()):
+        return fail("полный итоговый снимок Git недоступен; commit запрещён")
 
     stage_files = sorted({
         path for path in changed_paths or []

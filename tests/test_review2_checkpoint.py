@@ -7,6 +7,7 @@
 """
 
 import subprocess
+import pytest
 
 from promptpilot import workflows
 from promptpilot.models import (
@@ -120,6 +121,47 @@ def test_checkpoint_commits_only_stage_files_not_foreign_dirt(
         capture_output=True, text=True).stdout
     assert "vendor/notes.txt" in status, "чужая грязь осталась незатронутой"
     assert "stage.checkpoint" in _events(isolated_db, wf)
+
+
+@pytest.mark.parametrize("checkpoint", [False, True])
+def test_truncated_final_snapshot_cannot_pass_review_or_create_checkpoint(isolated_db, tmp_path, checkpoint):
+    repo = _git_repo(tmp_path)
+    before = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+    wf = _wf(isolated_db, repo, "truncated-final", checkpoint)
+    _start(isolated_db, wf)
+    def create_many():
+        for index in range(workflows._SNAPSHOT_MAX_PATHS + 1):
+            (repo / f"file-{index:04d}.txt").write_text("new", encoding="utf8")
+    _finish(isolated_db, "executor", write=create_many)
+    _finish(isolated_db, REVIEWER_PASS)
+    assert isolated_db.get_workflow(wf.id).status.value == "awaiting_human"
+    assert "review.diff_origin_unknown" in _events(isolated_db, wf)
+    assert "stage.checkpoint" not in _events(isolated_db, wf)
+    assert "review.passed" not in _events(isolated_db, wf)
+    assert subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip() == before
+
+
+def test_current_git_read_failure_cannot_bypass_pass_guard(isolated_db, tmp_path, monkeypatch):
+    repo = _git_repo(tmp_path)
+    wf = _wf(isolated_db, repo, "failed-status", True)
+    _start(isolated_db, wf)
+    _finish(isolated_db, "executor", write=lambda: (repo / "app.py").write_text("new", encoding="utf8"))
+    monkeypatch.setattr(workflows, "_porcelain_dirty", lambda *args: (None, False))
+    _finish(isolated_db, REVIEWER_PASS)
+    assert isolated_db.get_workflow(wf.id).status.value == "awaiting_human"
+    assert "review.diff_origin_unknown" in _events(isolated_db, wf)
+    assert "stage.checkpoint" not in _events(isolated_db, wf)
+
+
+def test_unreadable_final_file_cannot_authorize_pass(isolated_db, tmp_path, monkeypatch):
+    repo = _git_repo(tmp_path)
+    wf = _wf(isolated_db, repo, "unreadable-file", True)
+    _start(isolated_db, wf)
+    _finish(isolated_db, "executor", write=lambda: (repo / "app.py").write_text("new", encoding="utf8"))
+    monkeypatch.setattr(workflows, "_file_sig", lambda *args: "unreadable")
+    _finish(isolated_db, REVIEWER_PASS)
+    assert isolated_db.get_workflow(wf.id).status.value == "awaiting_human"
+    assert "stage.checkpoint" not in _events(isolated_db, wf)
 
 
 def test_checkpoint_failure_stops_next_stage(isolated_db, tmp_path, monkeypatch):

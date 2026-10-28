@@ -642,8 +642,8 @@ class WorkflowReviewDecision(BaseModel):
     summary: str = ""
     findings: list[ReviewFindingInput] = Field(default_factory=list)
     # Явное человеческое подтверждение PASS без доказанных изменений
-    # исполнителя (no-diff или неизвестное происхождение). Автоприменение
-    # вердикта этот флаг не ставит.
+    # исполнителя (доказанно пустой diff). Неизвестное происхождение этот
+    # флаг не подтверждает; автоприменение вердикта его не ставит.
     allow_no_diff: bool = False
 
 
