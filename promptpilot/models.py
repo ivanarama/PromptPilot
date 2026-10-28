@@ -396,7 +396,13 @@ class WorkflowSetupValidationResponse(BaseModel):
 def normalize_workflow_config(value: Any = None) -> dict[str, Any]:
     """Validate raw/legacy JSON and return the canonical versioned shape."""
 
-    return WorkflowConfig.model_validate(value or {}).model_dump(mode="json")
+    validated = WorkflowConfig.model_validate(value or {})
+    result = validated.model_dump(mode="json")
+    # Keep absence durable: the model default must not become an owner override
+    # when a configuration is normalized, persisted, returned, or reloaded.
+    if "max_revisions_per_stage" not in validated.planning.model_fields_set:
+        result["planning"].pop("max_revisions_per_stage", None)
+    return result
 
 
 class WorkflowCreate(BaseModel):

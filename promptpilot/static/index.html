@@ -2068,7 +2068,7 @@ function workflowSettingsHtml(wf) {
         <label class="check"><input id="wfCfgPlanningEnabled" type="checkbox"${wfChecked(planning.enabled)}> использовать planner и последовательные этапы</label>
         <label class="check"><input id="wfCfgPlanApproval" type="checkbox"${wfChecked(planning.require_approval !== false)}> требовать утверждение плана человеком</label>
         <label>Максимум этапов<input id="wfCfgMaxStages" type="number" min="1" max="50" value="${planning.max_stages || 20}"></label>
-        <label>Возвратов на один этап<input id="wfCfgStageRevisions" type="number" min="1" max="20" value="${planning.max_revisions_per_stage || 3}"></label>
+        <label>Возвратов на один этап<input id="wfCfgStageRevisions" type="number" min="1" max="100" value="${planning.max_revisions_per_stage || 3}"></label>
         <label>Шаблон prompt планировщика<textarea id="wfCfgPlanningPrompt" placeholder="Пусто = встроенный шаблон">${esc(planning.prompt_template || '')}</textarea></label>
       </div>
       ${roleCard('Planner', 'Планировщик', planner, false)}
@@ -2286,7 +2286,7 @@ function workflowPlanHtml(wf, plan, stages) {
       <div class="wf-stage-title">${index + 1}/${total} · ${Math.max(0, pct)}% <span class="task-status" data-s="${escAttr(stage.status)}">${esc(stage.status)}</span></div>
       <div style="font-weight:600;margin:2px 0">${esc(stage.code)} · ${esc(stage.title)}</div>
       <div class="wf-round-summary" style="display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden">${esc(shortGoal)}</div>
-      <div class="wf-meta">${esc(stage.stage_type)} · gate: ${(stage.acceptance_gates || []).length} · возвратов: ${stage.max_revision_rounds || wf.config?.planning?.max_revisions_per_stage || 3}</div>
+      <div class="wf-meta">${esc(stage.stage_type)} · gate: ${(stage.acceptance_gates || []).length} · возвратов: ${wf.config?.planning?.max_revisions_per_stage ?? stage.max_revision_rounds ?? 3}</div>
     </div>`;
   }).join('');
   const controls = editable ? `<div class="wf-actions">
