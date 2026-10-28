@@ -2224,33 +2224,58 @@ function workflowStopReason(events) {
   return `${task}${reason}`;
 }
 
-function workflowStageEditorCard(stage = {}, index = 0) {
-  return `<div class="wf-stage-card wf-stage-edit-card" data-index="${index}" data-status="${escAttr(stage.status || 'draft')}">
+function workflowStageEditorCard(stage = {}, index = 0, frozen = false) {
+  const lockAttrs = frozen ? ' style="opacity:.65;border-left:3px solid var(--border)" title="Замороженный этап (завершён/выполняется): правке не подлежит"' : '';
+  const lockActions = frozen ? '<span class="cz-hint">🔖 заморожен</span>' : '';
+  return `<div class="wf-stage-card wf-stage-edit-card" data-index="${index}" data-frozen="${frozen ? 1 : 0}" data-status="${escAttr(stage.status || 'draft')}"${lockAttrs}>
+    <fieldset ${frozen ? 'disabled' : ''} style="border:0;padding:0;margin:0">
     <div class="wf-stage-editor">
       <input data-field="code" value="${escAttr(stage.code || '')}" placeholder="Код">
       <input data-field="title" value="${escAttr(stage.title || '')}" placeholder="Название">
       <select data-field="stage_type"><option value="implementation"${stage.stage_type !== 'integration' ? ' selected' : ''}>implementation</option><option value="integration"${stage.stage_type === 'integration' ? ' selected' : ''}>integration</option></select>
       <textarea class="wide" data-field="objective" placeholder="Проверяемая цель">${esc(stage.objective || '')}</textarea>
       <input class="wide" data-field="dependencies" value="${escAttr((stage.dependencies || []).join(', '))}" placeholder="Зависимости: S1, S2">
-      <textarea class="wide" data-field="allowed_paths" placeholder="Разрешённые пути — по одному на строке">${esc((stage.allowed_paths || []).join('\n'))}</textarea>
-      <textarea class="wide" data-field="deliverables" placeholder="Deliverables — по одному на строке">${esc((stage.deliverables || []).join('\n'))}</textarea>
-      <textarea class="wide" data-field="acceptance_gates" placeholder="Gate-команды — по одной на строке">${esc((stage.acceptance_gates || []).join('\n'))}</textarea>
+      <textarea class="wide" data-field="allowed_paths" placeholder="Разрешённые пути — по одному на строку">${esc((stage.allowed_paths || []).join('\n'))}</textarea>
+      <textarea class="wide" data-field="deliverables" placeholder="Deliverables — по одному на строку">${esc((stage.deliverables || []).join('\n'))}</textarea>
+      <textarea class="wide" data-field="acceptance_gates" placeholder="Gate-команды — по одной на строку">${esc((stage.acceptance_gates || []).join('\n'))}</textarea>
       <input data-field="max_revision_rounds" type="number" min="1" value="${stage.max_revision_rounds || ''}" placeholder="Лимит возвратов">
       <input data-field="executor_prompt" value="${escAttr(stage.executor_prompt || '')}" placeholder="Особый prompt executor">
       <input data-field="reviewer_prompt" value="${escAttr(stage.reviewer_prompt || '')}" placeholder="Особый prompt reviewer">
     </div>
-    <div class="wf-actions"><button class="btn btn-sm btn-ghost" data-stage-action="up" onclick="wfMoveStage(${index},-1)">↑</button><button class="btn btn-sm btn-ghost" data-stage-action="down" onclick="wfMoveStage(${index},1)">↓</button><button class="btn btn-sm btn-danger" data-stage-action="delete" onclick="wfDeleteStage(${index})">Удалить</button></div>
+    </fieldset>
+    <div class="wf-actions">${lockActions}${frozen ? '' : `<button class="btn btn-sm btn-ghost" data-stage-action="up" onclick="wfMoveStage(${index},-1)">↑</button><button class="btn btn-sm btn-ghost" data-stage-action="down" onclick="wfMoveStage(${index},1)">↓</button><button class="btn btn-sm btn-danger" data-stage-action="delete" onclick="wfDeleteStage(${index})">Удалить</button>`}</div>
   </div>`;
 }
 
 function workflowPlanHtml(wf, plan, stages) {
   if (!wf.config?.planning?.enabled && !stages.length) return '';
   const editable = wf.status === 'awaiting_plan_approval';
+  // F5: живой план с allow_editing_approved_plan — редактор хвоста
+  const amendable = !editable && wf.config?.planning?.allow_editing_approved_plan
+    && plan?.status === 'approved' && stages.some(st => st.id === wf.current_stage_id)
+    && ['queued','executing','gating','reviewing','revision_required','awaiting_human'].includes(wf.status);
+  const frozenN = amendable ? (() => {
+    let n = 0;
+    for (const st of stages) { n++; if (st.id === wf.current_stage_id) break; }
+    return n;
+  })() : 0;
+  window.__wfAmendFrozen = amendable ? frozenN : 0;
+  window.__wfAmendVersion = amendable ? wf.state_version : null;
+  window.__wfAmendWorkflowId = amendable ? wf.id : null;
+  window.__wfAmendSourceStages = amendable ? stages.map(st => ({
+    code: st.code, title: st.title, objective: st.objective,
+    stage_type: st.stage_type, dependencies: st.dependencies || [],
+    allowed_paths: st.allowed_paths || [], deliverables: st.deliverables || [],
+    acceptance_gates: st.acceptance_gates || [],
+    executor_prompt: st.executor_prompt || '', reviewer_prompt: st.reviewer_prompt || '',
+    max_revision_rounds: st.max_revision_rounds || null,
+  })) : null;
   // U1: монотонный собственный % прогресса на каждой карточке (переходы видны)
   const total = Math.max(stages.length, 1);
   const completedCount = stages.filter(s => s.status === 'completed').length;
   const cards = stages.map((stage, index) => {
     if (editable) return workflowStageEditorCard(stage, index);
+    if (amendable) return workflowStageEditorCard(stage, index, index < frozenN);
     const done = stages.slice(0, index + 1).filter(s => s.status === 'completed').length;
     const pct = stage.status === 'completed'
       ? Math.round(done / total * 100)
@@ -2269,6 +2294,10 @@ function workflowPlanHtml(wf, plan, stages) {
     <button class="btn btn-sm btn-ghost" onclick="wfSavePlan()">Сохранить план</button>
     <button class="btn btn-sm btn-primary" onclick="wfApprovePlan()">Сохранить и утвердить</button>
     <button class="btn btn-sm btn-ghost" onclick="wfPlannerDispatch(true)">Сформировать заново</button>
+  </div>` : amendable ? `<div class="wf-actions">
+    <button class="btn btn-sm btn-ghost" onclick="wfAddStage()">Добавить этап (в хвост)</button>
+    <button class="btn btn-sm btn-primary" onclick="wfAmendPlan()">Перепланировать хвост</button>
+    <span class="cz-hint">F5: замороженные 🔖 этапы — история; правится только хвост; причина обязательна и попадёт в журнал</span>
   </div>` : '';
   return `<div class="wf-section-title">План этапов · ${stages.length}</div>
     ${editable ? '<div class="wf-meta">Последний этап должен иметь тип integration. Gate-команды выполняются только после ручного утверждения плана.</div>' : ''}
@@ -2526,7 +2555,7 @@ function wfReindexStageCards() {
     const up = card.querySelector('[data-stage-action="up"]');
     const down = card.querySelector('[data-stage-action="down"]');
     const remove = card.querySelector('[data-stage-action="delete"]');
-    if (up) { up.setAttribute('onclick', `wfMoveStage(${index},-1)`); up.disabled = index === 0; }
+    if (up) { up.setAttribute('onclick', `wfMoveStage(${index},-1)`); up.disabled = index <= (window.__wfAmendFrozen || 0); }
     if (down) { down.setAttribute('onclick', `wfMoveStage(${index},1)`); down.disabled = index === document.querySelectorAll('#wfStageList .wf-stage-edit-card').length - 1; }
     if (remove) remove.setAttribute('onclick', `wfDeleteStage(${index})`);
   });
@@ -2536,6 +2565,7 @@ function wfMoveStage(index, delta) {
   const list = document.getElementById('wfStageList');
   const cards = [...list.querySelectorAll('.wf-stage-edit-card')];
   const target = index + delta;
+  if (index < (window.__wfAmendFrozen || 0) || target < (window.__wfAmendFrozen || 0)) return;
   if (!cards[index] || target < 0 || target >= cards.length) return;
   if (delta < 0) list.insertBefore(cards[index], cards[target]);
   else list.insertBefore(cards[target], cards[index]);
@@ -2543,6 +2573,7 @@ function wfMoveStage(index, delta) {
 }
 
 function wfDeleteStage(index) {
+  if (index < (window.__wfAmendFrozen || 0)) return;
   const cards = [...document.querySelectorAll('#wfStageList .wf-stage-edit-card')];
   if (cards.length <= 1) { toast('В плане должен остаться хотя бы один этап.'); return; }
   cards[index]?.remove();
@@ -2580,6 +2611,49 @@ function wfCollectPlanStages() {
       max_revision_rounds: revisionRaw ? parseInt(revisionRaw, 10) : null,
     };
   });
+}
+
+function wfCollectAmendStages() {
+  // как wfCollectPlanStages, но замороженные карточки читаются из кэша исходных данных
+  return [...document.querySelectorAll('#wfStageList .wf-stage-edit-card')].map(card => {
+    if (card.dataset.frozen === '1') {
+      const idx = parseInt(card.dataset.index, 10);
+      return JSON.parse(JSON.stringify((window.__wfAmendSourceStages || [])[idx] || {}));
+    }
+    const value = field => card.querySelector(`[data-field="${field}"]`)?.value?.trim() || '';
+    const lines = field => value(field).split('\n').map(x => x.trim()).filter(Boolean);
+    const comma = field => value(field).split(',').map(x => x.trim()).filter(Boolean);
+    const rev = parseInt(value('max_revision_rounds'), 10);
+    return {
+      code: value('code'), title: value('title'), objective: value('objective'),
+      stage_type: card.querySelector('[data-field="stage_type"]')?.value || 'implementation',
+      dependencies: comma('dependencies'),
+      allowed_paths: lines('allowed_paths'), deliverables: lines('deliverables'),
+      acceptance_gates: lines('acceptance_gates'),
+      executor_prompt: value('executor_prompt'), reviewer_prompt: value('reviewer_prompt'),
+      max_revision_rounds: Number.isFinite(rev) && rev >= 1 ? rev : null,
+    };
+  });
+}
+
+async function wfAmendPlan() {
+  const workflowId = window.__wfAmendWorkflowId;
+  const expectedVersion = window.__wfAmendVersion;
+  if (!workflowId || workflowId !== selectedWorkflowId || expectedVersion === null) return;
+  const stages = wfCollectAmendStages();
+  if (!stages.length) { toast('Пустой план'); return; }
+  const frozen = window.__wfAmendFrozen || 0;
+  const tailCodes = stages.slice(frozen).map(s => s.code).join(', ');
+  const reason = prompt('Причина перепланировки (обязательна, попадёт в журнал):\nХвост: ' + tailCodes, '');
+  if (!reason || reason.trim().length < 3) { toast('Причина обязательна (мин. 3 символа)'); return; }
+  try {
+    await fetchJSON(`${API}/workflows/${workflowId}/plan/amend`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({expected_version:expectedVersion, stages, reason:reason.trim()}),
+    });
+    toast('Хвост плана перепланирован (событие plan.amended)', false);
+    await loadWorkflows();
+  } catch (e) { toast('Перепланировка: ' + e.message); }
 }
 
 async function wfSavePlan(reload = true) {
