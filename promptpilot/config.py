@@ -663,8 +663,9 @@ RIGHTS_LEVELS = ("none", "read", "write", "full")
 # How each rights level (models.TaskRights) is spelled by the CLIs PromptPilot
 # knows. Claude Code: --tools names the built-in tools the run may use, and
 # --restricted also confines file tools to the working directories and
-# refuses bypassPermissions. Codex: its OS sandbox via the sandbox_mode config
-# override, which `exec` and `exec resume` both accept. Narrow rights require
+# refuses bypassPermissions. Codex's local sandbox does not also confine
+# external MCP/apps, so it cannot provide this universal narrow contract.
+# Narrow rights require
 # a direct supported CLI; a wrapper's own "rights" declaration is not proof.
 CLAUDE_RIGHTS = {
     "none": ["--restricted", "--tools", "", "--disallowedTools", "mcp__*"],
@@ -674,11 +675,8 @@ CLAUDE_RIGHTS = {
     "full": ["--dangerously-skip-permissions"],
 }
 CODEX_RIGHTS = {
-    # Codex has no "no tools" mode: a read-only sandbox can still run
-    # read-only commands, so "none" is not offered unless declared.
-    "read": ["-c", 'sandbox_mode="read-only"'],
-    # workspace-write permits shell commands: it cannot implement our
-    # file-editing-without-command-execution contract for "write".
+    # A separate proven adapter is required for none/read/write, including
+    # external MCP/app tools; local sandbox_mode alone is insufficient.
     "full": ["--dangerously-bypass-approvals-and-sandbox"],
 }
 

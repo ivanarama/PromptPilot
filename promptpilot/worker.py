@@ -196,7 +196,8 @@ def _repair_verdict(task, provider: str, provider_cfg: dict,
                         model=getattr(task, "model", None),
                         effort=getattr(task, "effort", None),
                         guard=True,
-                        rights="none" if rights_supported(provider_cfg, "none") else None)
+                        rights=("none" if rights_supported(provider_cfg, "none")
+                                else getattr(task, "rights", None)))
         prompt_stdin = prompt if provider_cfg.get("prompt_stdin") else None
         env = get_provider_env(provider)
         env.pop("PP_TASK_ID", None)

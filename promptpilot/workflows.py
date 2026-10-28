@@ -504,6 +504,7 @@ def dispatch_planner(workflow_id: str,
                 dispatch.max_retries if dispatch.max_retries != 5 else role.max_retries
             ),
             skip_permissions=False,
+            rights=role.rights,
             model=dispatch.model or role.model,
             effort=dispatch.effort or role.effort,
             task_timeout=(

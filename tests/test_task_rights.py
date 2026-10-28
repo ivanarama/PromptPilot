@@ -77,18 +77,13 @@ def test_guard_rides_along_only_for_acting_rights(providers):
     assert not has_guard("read") and not has_guard("none")
 
 
-def test_codex_rights_use_its_sandbox(providers):
-    read = config.build_cmd("codex", "do it", rights="read")
+def test_codex_narrow_rights_require_external_tool_confinement(providers):
     full = config.build_cmd("codex", "do it", rights="full")
-    resumed = config.build_cmd("codex", "do it", rights="read", session_id="s-1")
-
-    assert read[-3:] == ["-c", 'sandbox_mode="read-only"', "-"]
     assert "--dangerously-bypass-approvals-and-sandbox" in full
-    assert resumed[:3] == ["codex", "exec", "resume"]
-    assert resumed[-4:] == ["-c", 'sandbox_mode="read-only"', "s-1", "-"]
-    for unsupported in ("none", "write"):
-        with pytest.raises(config.RightsUnsupported):
-            config.build_cmd("codex", "do it", rights=unsupported)
+    for unsupported in ("none", "read", "write"):
+        for session in (None, "s-1"):
+            with pytest.raises(config.RightsUnsupported):
+                config.build_cmd("codex", "do it", rights=unsupported, session_id=session)
 
 
 def test_unknown_provider_only_runs_as_configured(providers):
@@ -142,6 +137,14 @@ def test_verdict_repair_runs_without_tools(isolated_db, providers, monkeypatch):
     assert seen and "--tools" in seen[0] and "" in seen[0]
 
 
+def test_verdict_repair_cannot_widen_an_existing_codex_read_task(isolated_db, providers, monkeypatch):
+    seen = []
+    monkeypatch.setattr(worker.subprocess, "run", lambda *a, **k: seen.append(a))
+    task = SimpleNamespace(model=None, effort=None, rights="read")
+    assert worker._repair_verdict(task, "codex", config.load_providers()["codex"], "report", ".") == ""
+    assert seen == []  # No permissive fallback when the narrow contract is unavailable.
+
+
 def test_recurring_task_keeps_its_rights(isolated_db, providers):
     first = isolated_db.create_task(TaskCreate(prompt="nightly", recurrence="6h", rights="read"))
     running = isolated_db.get_next_runnable()
@@ -174,7 +177,7 @@ def test_api_refuses_unsupported_rights_and_lists_supported(isolated_db, provide
     assert accepted.status_code == 201 and accepted.json()["rights"] == "read"
     assert listed["claude"]["rights"] == ["none", "read", "write", "full"]
     assert listed["agy"]["rights"] == ["full"]
-    assert listed["codex"]["rights"] == ["read", "full"]
+    assert listed["codex"]["rights"] == ["full"]
 
 
 def test_cli_add_with_rights(isolated_db, providers):
@@ -189,6 +192,17 @@ def test_cli_add_with_rights(isolated_db, providers):
 
 
 # --- workflow roles -----------------------------------------------------------------
+
+
+def test_planner_dispatch_preserves_configured_rights(isolated_db, providers):
+    workflow = isolated_db.create_workflow(WorkflowCreate(
+        slug="planner-rights", objective="plan", repository_path=str(providers),
+        candidate_branch="main", config={"planning": {"enabled": True},
+        "roles": {"planner": {"provider": "claude", "rights": "none"}}}))
+    response = call("POST", f"/api/workflows/{workflow.id}/plan/dispatch", json={"expected_version": 0})
+    assert response.status_code == 200, response.text
+    task = isolated_db.list_tasks(status=TaskStatus.PENDING)[0]
+    assert task.rights == "none" and not task.skip_permissions
 
 def test_workflow_roles_carry_rights_and_reviewer_cannot_act(isolated_db, providers):
     workflow = isolated_db.create_workflow(WorkflowCreate(
