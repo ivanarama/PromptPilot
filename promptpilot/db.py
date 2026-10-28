@@ -2492,7 +2492,7 @@ def clear_pipeline_series_wake(series_id: int) -> bool:
         return deleted.rowcount > 0
 
 
-def series_action(series_id: int, action: str) -> bool:
+def series_action(series_id: int, action: str, *, retry_blocked: bool = False) -> bool:
     with _connect() as conn:
         row = conn.execute("SELECT * FROM task_series WHERE id = ?", (series_id,)).fetchone()
         if not row:
@@ -2518,14 +2518,14 @@ def series_action(series_id: int, action: str) -> bool:
                 (_pipeline_series_wake_intent_key(series_id),),
             )
         elif action == "resume":
-            conn.execute("DELETE FROM settings WHERE key = ?",
-                         (f"pipeline_item_holds:v1:{series_id}",))
             resumed = conn.execute(
                 """UPDATE task_series SET paused = 0, updated_at = ?
                    WHERE id = ? AND paused = 1 AND ended_at IS NULL""",
                 (now, series_id),
             ).rowcount > 0
             if resumed:
+                conn.execute("DELETE FROM settings WHERE key = ?",
+                             (f"pipeline_item_holds:v1:{series_id}",))
                 conn.execute(
                     "DELETE FROM settings WHERE key = ?",
                     (_pipeline_repeat_blocker_pause_key(series_id),),
@@ -2545,8 +2545,6 @@ def series_action(series_id: int, action: str) -> bool:
             # the run started; Resume is the only way out of this state.
             if row["paused"] or row["ended_at"]:
                 return False
-            conn.execute("DELETE FROM settings WHERE key = ?",
-                         (f"pipeline_item_holds:v1:{series_id}",))
             cur = conn.execute(
                 """UPDATE tasks
                    SET scheduled_at = ?, next_run_at = NULL,
@@ -2556,6 +2554,9 @@ def series_action(series_id: int, action: str) -> bool:
                 (now, series_id),
             )
             if cur.rowcount > 0:
+                if retry_blocked:
+                    conn.execute("DELETE FROM settings WHERE key = ?",
+                                 (f"pipeline_item_holds:v1:{series_id}",))
                 conn.execute(
                     "DELETE FROM settings WHERE key = ?",
                     (_pipeline_series_wake_intent_key(series_id),),
@@ -2576,6 +2577,9 @@ def series_action(series_id: int, action: str) -> bool:
             recreated = _recreate_series_occurrence(
                 conn, series_id, row, datetime.now(timezone.utc))
             if recreated:
+                if retry_blocked:
+                    conn.execute("DELETE FROM settings WHERE key = ?",
+                                 (f"pipeline_item_holds:v1:{series_id}",))
                 conn.execute(
                     "DELETE FROM settings WHERE key = ?",
                     (_pipeline_series_wake_intent_key(series_id),),

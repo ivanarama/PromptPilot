@@ -80,8 +80,51 @@ def test_fix_error_hold_expires_and_run_now_can_retry(isolated_db, monkeypatch):
     assert holds.prepare(successor, queue, data) == []
     monkeypatch.setattr(holds.time, "time", lambda: now + 10)
     assert holds.prepare(successor, queue, data) == [2243]
-    assert isolated_db.series_action(task.series_id, "run_now")
+    assert isolated_db.series_action(task.series_id, "run_now", retry_blocked=True)
     assert holds.prepare(successor, queue, data) == []
+
+
+def test_public_run_now_keeps_holds_unless_retry_is_explicit(isolated_db, monkeypatch):
+    import asyncio
+    import httpx
+    from promptpilot.api import app
+
+    def action(ident, **body):
+        async def send():
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                         base_url="http://127.0.0.1:8420") as client:
+                return await client.post(f"/api/schedule/{ident}/action", json=body)
+        return asyncio.run(send())
+
+    task = isolated_db.create_task(TaskCreate(prompt="Example - FIX", recurrence="15m"))
+    queue = {"id": "fix", "series_contains": "Example - FIX", "item_blockers": True,
+             "item_error_holds": True, "dispatch_gate": {"backpressure": {
+                 "max_active": 1, "active_fields": ["fix_candidates"],
+                 "candidate_field": "fix_candidates",
+                 "allow_when_match": [{"key": "stage", "values": ["review"]}]}}}
+    data = fix_snapshot(2243, 2270)
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"example": {"queues": [queue]}})
+    monkeypatch.setattr(pipeline_insights, "read_cached", lambda *_: data)
+    pipeline_insights.dispatch_gate(task)
+    isolated_db.mark_completed(task.id, "ИТОГ: НЕ СМОГ (#2243 — lint timeout)", verdict="НЕ СМОГ")
+    isolated_db.pause_pipeline_series_on_repeated_blocker(task.series_id, task.id)
+    saved = isolated_db.get_setting(holds.PREFIX + str(task.series_id))
+    assert action(task.series_id, action="run_now").status_code == 200
+    assert action(task.series_id, action="resume").status_code == 200
+    assert isolated_db.get_setting(holds.PREFIX + str(task.series_id)) == saved
+    pending = isolated_db.get_task(isolated_db.get_series(task.series_id)["next_task_id"])
+    assert pipeline_insights.dispatch_gate(pending)["allowed_numbers"] == [2270]
+    assert action(task.series_id, action="run_now", retry_blocked=True).status_code == 200
+    assert pipeline_insights.dispatch_gate(pending)["allowed_numbers"] == [2243, 2270]
+
+
+def test_rejected_retry_of_running_series_cannot_clear_hold(isolated_db):
+    task = isolated_db.create_task(TaskCreate(prompt="fix", recurrence="15m"))
+    key = holds.PREFIX + str(task.series_id)
+    isolated_db.set_setting(key, '{"2243":{"fingerprint":"kept"}}')
+    assert isolated_db.get_next_runnable().id == task.id
+    assert not isolated_db.series_action(task.series_id, "run_now", retry_blocked=True)
+    assert isolated_db.get_setting(key) == '{"2243":{"fingerprint":"kept"}}'
 
 
 def test_public_dispatch_parks_item_and_keeps_series_and_new_work(isolated_db, monkeypatch):
@@ -117,7 +160,7 @@ def test_partial_snapshot_never_excludes_and_manual_run_clears_hold(isolated_db)
     partial = copy.deepcopy(data)
     partial["cache"]["complete"] = False
     assert holds.prepare(successor, queue, partial) == []
-    assert isolated_db.series_action(task.series_id, "run_now")
+    assert isolated_db.series_action(task.series_id, "run_now", retry_blocked=True)
     assert holds.prepare(successor, queue, data) == []
 
 

@@ -403,6 +403,7 @@ class SeriesUpdate(BaseModel):
 
 class SeriesAction(BaseModel):
     action: str
+    retry_blocked: bool = False
 
 
 class PipelinePriorityUpdate(BaseModel):
@@ -461,7 +462,9 @@ def api_update_series(series_id: int, update: SeriesUpdate):
 def api_series_action(series_id: int, body: SeriesAction):
     if body.action not in ("run_now", "pause", "resume", "end"):
         raise HTTPException(400, "Неизвестное действие")
-    if not db.series_action(series_id, body.action):
+    if body.retry_blocked and body.action != "run_now":
+        raise HTTPException(400, "Повтор блокированных задач доступен только для run_now")
+    if not db.series_action(series_id, body.action, retry_blocked=body.retry_blocked):
         raise HTTPException(400, "Действие неприменимо к этой серии")
     return {"ok": True, "series": db.get_series(series_id)}
 
