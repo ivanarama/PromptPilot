@@ -351,7 +351,10 @@ class WorkflowPlanningConfig(BaseModel):
     # P21: потолок поднят 20 → 100 по директиве владельца (раунды ревизий
     # съедают лимит на «уже сделано»-циклах; 422 при PATCH>20 ломал resume).
     max_revisions_per_stage: int = Field(default=3, ge=1, le=100)
+    # F5: динамическая перепланировка хвоста утверждённого плана.
+    # False (дефолт) — план неизменяем после утверждения (поведение автора).
     prompt_template: str = ""
+    allow_editing_approved_plan: bool = False
 
 
 class WorkflowConfig(BaseModel):
@@ -548,6 +551,18 @@ class WorkflowPlanReplace(BaseModel):
         if self.stages[-1].stage_type is not WorkflowStageType.INTEGRATION:
             raise ValueError("the final workflow stage must have stage_type=integration")
         return self
+
+
+class WorkflowPlanAmend(WorkflowPlanReplace):
+    """F5: правка хвоста утверждённого плана (замороженный префикс неприкосновенен)."""
+    reason: str = Field(min_length=3, max_length=2000)
+
+    @field_validator("reason")
+    @classmethod
+    def meaningful_reason(cls, value):
+        if len(value.strip()) < 3:
+            raise ValueError("amendment reason must contain at least three non-space characters")
+        return value.strip()
 
 
 class WorkflowStageInDB(WorkflowStageSpec):
