@@ -93,3 +93,43 @@ def test_owner_can_raise_budget_and_resume_a_stage_pinned_by_the_model(isolated_
     reloaded = isolated_db.get_workflow(workflow.id)
     resumed = workflows.human_input(workflow.id, WorkflowHumanInput(expected_version=reloaded.state_version, resume=True, text="Continue within raised owner budget"))
     assert resumed.status.value == "queued" and resumed.current_round == 2
+
+
+@pytest.mark.parametrize("initial,override", [(None, None), (5, "")])
+def test_real_web_settings_http_save_preserves_inherited_stage_budget(isolated_db, tmp_path, initial, override):
+    import asyncio
+    from pathlib import Path
+    import subprocess
+    import httpx
+    from promptpilot.api import app
+    config = {"planning": {"enabled": True}, "automation": {"enabled": True},
+              "gate": {"enabled": False}, "limits": {"max_rounds": 6}}
+    if initial is not None:
+        config["planning"]["max_revisions_per_stage"] = initial
+    workflow = isolated_db.create_workflow(WorkflowCreate(
+        slug="web-inherit", objective="Task", repository_path=str(isolated_db.DB_DIR),
+        candidate_branch="feature/budget", config=config))
+    snapshot = tmp_path / "workflow.json"
+    snapshot.write_text(workflow.model_dump_json(), encoding="utf-8")
+    command = ["node", str(Path(__file__).with_name("workflow_budget.cjs")), str(snapshot)]
+    if override is not None:
+        command.append(override)
+    rendered = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", check=True, timeout=30)
+    body = json.loads(rendered.stdout)
+    assert "max_revisions_per_stage" not in body["config"]["planning"]
+    async def patch():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:8420") as client:
+            return await client.patch(f"/api/workflows/{workflow.id}", json=body)
+    response = asyncio.run(patch())
+    assert response.status_code == 200, response.text
+    current = isolated_db.get_workflow(workflow.id)
+    assert "max_revisions_per_stage" not in current.config["planning"]
+    workflows.provide_plan(workflow.id, WorkflowPlanReplace(expected_version=current.state_version, stages=[
+        WorkflowStageSpec(code="FINAL", title="Final", objective="Complete", stage_type="integration", max_revision_rounds=1)]))
+    current = isolated_db.get_workflow(workflow.id)
+    workflows.approve_plan(workflow.id, WorkflowPlanApproval(expected_version=current.state_version))
+    workflows.advance_workflow(workflow.id)
+    finish(isolated_db, "Executor result")
+    finish(isolated_db, "AUDIT_FINDINGS_JSON: []\nAUDIT_VERDICT: REVISION_REQUIRED")
+    stopped = isolated_db.get_workflow(workflow.id)
+    assert stopped.status.value == "awaiting_human" and stopped.current_round == 1
