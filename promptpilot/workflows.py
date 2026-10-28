@@ -12,9 +12,10 @@ import re
 import sqlite3
 import subprocess
 from collections import Counter
+from contextlib import contextmanager
 from typing import Optional
 
-from . import db
+from . import db, stage_checkpoint
 from .models import (
     FindingStatus,
     FindingSeverity,
@@ -1228,6 +1229,18 @@ def record_review(workflow_id: str,
                         "allowed": list(spec.get("allowed_paths") or []),
                         "common": common,
                     }
+                    checkpoint_paths = sorted({
+                        path for path in run_changes["changed"]
+                        if not checkpoint_deferred["allowed"] or
+                        _paths_within(path, checkpoint_deferred["allowed"])
+                    })
+                    checkpoint_deferred["checkpoint_paths"] = checkpoint_paths
+                    checkpoint_deferred["run_id"] = reviewer["id"]
+                    try:
+                        checkpoint_deferred["reviewed"] = stage_checkpoint.reviewed(
+                            check_dir, checkpoint_paths, _file_sig)
+                    except (stage_checkpoint.CheckpointError, OSError, subprocess.SubprocessError):
+                        checkpoint_deferred["reviewed"] = None
                     db._append_workflow_event(conn, WorkflowEventCreate(
                         workflow_id=workflow_id,
                         round_id=round_row["id"],
@@ -1261,50 +1274,11 @@ def record_review(workflow_id: str,
             )
         result = db._row_to_workflow(workflow)
     if checkpoint_deferred is not None:
-        # Барьер: git-операции чекпоинта — вне транзакции. Дальнейший
-        # переход (следующая стадия/завершение) становится виден воркеру
-        # только здесь, после успешного чекпоинта. Возвращаемый статус —
-        # фактический, после исхода барьера.
-        checkpoint_ok = _stage_checkpoint_commit(
-            checkpoint_deferred["workflow_id"],
-            checkpoint_deferred["stage_code"],
-            checkpoint_deferred["check_dir"],
-            checkpoint_deferred["changed"],
-            checkpoint_deferred["allowed"],
-        )
-        with db._connect(immediate=True) as conn:
-            workflow = _workflow_row(
-                conn, checkpoint_deferred["workflow_id"])
-            state = WorkflowStatus(workflow["status"])
-            if state is not WorkflowStatus.AWAITING_HUMAN:
-                # параллельный resume уже завершил барьер и провёл миссию
-                result = db._row_to_workflow(workflow)
-            elif checkpoint_ok:
-                round_done = (
-                    _current_round_row(conn, workflow)
-                    if workflow["current_round"] else None)
-                workflow = _advance_after_stage(
-                    conn, workflow, round_done,
-                    checkpoint_deferred["common"],
-                    extra={"after_checkpoint": True},
-                )
-                result = db._row_to_workflow(workflow)
-            else:
-                # Неудача видима и восстанавливаема: миссия — у человека;
-                # выход — resume, который повторит чекпоинт.
-                round_done = (
-                    _current_round_row(conn, workflow)
-                    if workflow["current_round"] else None)
-                workflow = _touch(
-                    conn, workflow, "stage.checkpoint_failed",
-                    {"stage_code": checkpoint_deferred["stage_code"],
-                     "reason": "чекпоинт стадии не завершён — следующая "
-                               "стадия не стартует (или завершение "
-                               "отложено) до починки; resume повторит "
-                               "чекпоинт"},
-                    round_id=round_done["id"] if round_done else None,
-                )
-                result = db._row_to_workflow(workflow)
+        with db._connect() as conn:
+            pending = _pending_stage_checkpoint(conn, workflow_id)
+        if pending is not None:
+            result = _complete_pending_checkpoint(
+                workflow_id, result.state_version, pending, {}, resume=False)
     return result
 
 
@@ -1458,49 +1432,89 @@ def human_input(workflow_id: str,
 def _resume_pending_checkpoint(workflow_id: str,
                                action: WorkflowHumanInput,
                                said: dict, pending: dict) -> WorkflowInDB:
-    """Повтор висящего чекпоинта стадии по resume оператора.
+    return _complete_pending_checkpoint(
+        workflow_id, action.expected_version, pending, said, resume=True)
 
-    Чекпоинт выполняется вне транзакции; дальнейший переход (следующая
-    стадия/завершение) — только после успеха. Неудача оставляет миссию у
-    человека с новой причиной. Параллельный актор, уже проведший миссию
-    дальше, не дублируется.
-    """
-    ok = _stage_checkpoint_commit(
-        workflow_id, pending.get("stage_code") or "",
-        pending.get("check_dir") or "",
-        list(pending.get("changed") or []),
-        list(pending.get("allowed") or []),
-    )
-    with db._connect(immediate=True) as conn:
+
+def _complete_pending_checkpoint(workflow_id, expected_version, pending, said, *, resume):
+    owned = {"version": expected_version}
+
+    def validate(conn, version):
         workflow = _workflow_row(conn, workflow_id)
-        _require_version(workflow, action.expected_version)
+        _require_version(workflow, version)
         if WorkflowStatus(workflow["status"]) is not WorkflowStatus.AWAITING_HUMAN:
-            # параллельный актор уже завершил барьер и провёл миссию
+            raise db.WorkflowConflictError("workflow is not waiting for checkpoint")
+        if not pending or _pending_stage_checkpoint(conn, workflow_id) != pending:
+            raise db.WorkflowConflictError("pending checkpoint identity changed")
+        return workflow
+
+    # Reject stale/terminal requests before even creating private Git intent.
+    with db._connect() as conn:
+        validate(conn, expected_version)
+
+    def claim():
+        with db._connect(immediate=True) as conn:
+            workflow = validate(conn, expected_version)
+            workflow = _touch(conn, workflow, "stage.checkpoint_claimed", {
+                "pending_seq": pending["pending_seq"],
+                "stage_code": pending["stage_code"],
+            }, round_id=_current_round_row(conn, workflow)["id"])
+            if resume and said.get("note"):
+                db._append_workflow_event(conn, WorkflowEventCreate(
+                    workflow_id=workflow_id,
+                    round_id=_current_round_row(conn, workflow)["id"],
+                    event_type="human.input",
+                    idempotency_key=f"human.input:checkpoint:{pending['pending_seq']}:{expected_version}",
+                    payload={**said, "resume": True, "checkpoint_pending": True},
+                ))
+            owned["version"] = workflow["state_version"]
+
+    @contextmanager
+    def admit():
+        # Only publication and the lifecycle commit hold the SQLite writer.
+        # Cancellation during object preparation invalidates this admission.
+        with db._connect(immediate=True) as conn:
+            workflow = validate(conn, owned["version"])
+            owned.update(conn=conn, workflow=workflow,
+                         round=_current_round_row(conn, workflow))
+            yield
+
+    try:
+        context = _stage_checkpoint_commit(
+            workflow_id, pending["stage_code"], pending["check_dir"],
+            pending["changed"], pending["allowed"], pending=pending,
+            claim=claim, admit=admit)
+        if context is False:
+            raise stage_checkpoint.CheckpointError("checkpoint preparation failed")
+        with context as sha:
+            conn, workflow, round_row = owned["conn"], owned["workflow"], owned["round"]
+            db._append_workflow_event(conn, WorkflowEventCreate(
+                workflow_id=workflow_id, round_id=round_row["id"],
+                event_type="stage.checkpoint",
+                idempotency_key=f"stage.checkpoint:{pending['pending_seq']}",
+                payload={"stage_code": pending["stage_code"], "sha": sha,
+                         "pending_seq": pending["pending_seq"],
+                         "files": pending.get("checkpoint_paths", [])},
+            ))
+            if resume:
+                workflow = _touch(conn, workflow, "human.resumed", {
+                    **said, "checkpoint_resumed": True,
+                    "stage_code": pending["stage_code"],
+                }, round_id=round_row["id"])
+            workflow = _advance_after_stage(
+                conn, workflow, round_row, pending.get("common") or {},
+                extra={"after_checkpoint": True, "checkpoint_resumed": resume})
+            result = db._row_to_workflow(workflow)
+        return result
+    except stage_checkpoint.CheckpointBusyError as exc:
+        raise db.WorkflowConflictError(str(exc)) from exc
+    except (stage_checkpoint.CheckpointError, OSError, subprocess.SubprocessError) as exc:
+        with db._connect(immediate=True) as conn:
+            workflow = validate(conn, owned["version"])
+            workflow = _touch(conn, workflow, "stage.checkpoint_failed", {
+                **said, "stage_code": pending["stage_code"], "reason": str(exc)[:800],
+            }, round_id=_current_round_row(conn, workflow)["id"])
             return db._row_to_workflow(workflow)
-        round_row = (
-            _current_round_row(conn, workflow)
-            if workflow["current_round"] else None)
-        if not ok:
-            workflow = _touch(
-                conn, workflow, "stage.checkpoint_failed",
-                {**said,
-                 "stage_code": pending.get("stage_code"),
-                 "reason": "чекпоинт стадии по-прежнему не завершён — "
-                           "следующая стадия не стартует до починки"},
-                round_id=round_row["id"] if round_row else None,
-            )
-            return db._row_to_workflow(workflow)
-        workflow = _touch(
-            conn, workflow, "human.resumed",
-            {**said, "checkpoint_resumed": True,
-             "stage_code": pending.get("stage_code")},
-            round_id=round_row["id"] if round_row else None,
-        )
-        workflow = _advance_after_stage(
-            conn, workflow, round_row, pending.get("common") or {},
-            extra={"after_checkpoint": True, "checkpoint_resumed": True},
-        )
-        return db._row_to_workflow(workflow)
 
 
 def _keep_refused_note(conn: sqlite3.Connection, workflow: sqlite3.Row,
@@ -2003,6 +2017,7 @@ def _pending_stage_checkpoint(conn, workflow_id: str):
         if (db._json_load(row["payload_json"], {}).get("stage_code")
                 == payload.get("stage_code")):
             return None
+    payload["pending_seq"] = int(pending["seq"])
     return payload
 
 
@@ -2033,71 +2048,9 @@ def _paths_within(path: str, allowed: list) -> bool:
 
 def _stage_checkpoint_commit(workflow_id: str, stage_code: str,
                              check_dir: str, changed_paths: list,
-                             allowed_paths: list) -> bool:
-    """Безопасный чекпоинт стадии: коммит ТОЛЬКО файлов, доказанно
-    изменённых данным executor run'ом и входящих в allowed_paths, в
-    фактическом дереве исполнителя. Никакого add -A по всему репозиторию.
-
-    True — успех (или фиксировать нечего). Любая неудача — False: событие
-    stage.checkpoint_failed с причиной; вызывающий останавливает миссию —
-    следующая стадия не стартует, пока чекпоинт не завершён успешно.
-    """
-    def git(*args):
-        return subprocess.run(
-            ["git", "-C", check_dir, *args], capture_output=True, text=True,
-            timeout=60, errors="replace",
-        )
-
-    def fail(error: str, detail: str = "") -> bool:
-        with db._connect(immediate=True) as conn:
-            db._append_workflow_event(conn, WorkflowEventCreate(
-                workflow_id=workflow_id,
-                event_type="stage.checkpoint_failed",
-                idempotency_key=(
-                    f"stage.checkpoint_failed:{stage_code}:{db._now()}"),
-                payload={"stage_code": stage_code, "error": error[:400],
-                         "detail": detail[:400]},
-            ))
-        return False
-
-    current_dirty, truncated = _porcelain_dirty(check_dir)
-    if current_dirty is None or truncated or any(sig == "unreadable" for sig in current_dirty.values()):
-        return fail("полный итоговый снимок Git недоступен; commit запрещён")
-
-    stage_files = sorted({
-        path for path in changed_paths or []
-        if not allowed_paths or _paths_within(path, allowed_paths)
-    })
-    if not stage_files:
-        return True
-    # add нужен только ради untracked-файлов этапа; сам коммит — ЧАСТИЧНЫЙ
-    # с pathspec (git commit -- <пути>): в него попадают ровно эти пути, а
-    # остальное подготовленное в индексе (чужой staged-файл) остаётся
-    # staged и в коммит чекпоинта не попадает.
-    add = git("add", "--", *stage_files)
-    if add.returncode != 0:
-        return fail(f"git add не удался ({add.returncode})", add.stderr or "")
-    committed = git(
-        "commit", "-m",
-        f"stage {stage_code}: checkpoint by PromptPilot "
-        f"(ворота зелёные + PASS, {len(stage_files)} путей этапа)",
-        "--", *stage_files,
-    )
-    if committed.returncode != 0:
-        out = (committed.stdout or "") + (committed.stderr or "")
-        if "nothing to commit" in out:
-            return True  # уже зафиксировано — не неудача
-        return fail("git commit не удался", out)
-    sha = git("rev-parse", "HEAD").stdout.strip()
-    with db._connect() as conn:
-        db._append_workflow_event(conn, WorkflowEventCreate(
-            workflow_id=workflow_id,
-            event_type="stage.checkpoint",
-            idempotency_key=f"stage.checkpoint:{stage_code}:{db._now()}",
-            payload={"stage_code": stage_code, "sha": sha,
-                     "files": stage_files[:50]},
-        ))
-    return True
+                             allowed_paths: list, *, pending: dict, claim, admit):
+    """Create the publication context; admission and lifecycle are caller-owned."""
+    return stage_checkpoint.publish(pending, _file_sig, claim, admit)
 
 
 def _latest_event_seq(conn: sqlite3.Connection, workflow_id: str,

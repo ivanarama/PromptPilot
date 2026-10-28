@@ -189,7 +189,7 @@ def test_checkpoint_failure_stops_next_stage(isolated_db, tmp_path, monkeypatch)
     assert current.status.value != "completed"
 
 
-def test_checkpoint_failure_recorded_when_git_add_fails(
+def test_checkpoint_failure_recorded_when_freezing_git_objects_fails(
         isolated_db, tmp_path, monkeypatch):
     """Реальный сбой git (add падает) — событие с деталью, миссия стоит."""
     repo = _git_repo(tmp_path)
@@ -203,8 +203,8 @@ def test_checkpoint_failure_recorded_when_git_add_fails(
 
     def broken_run(args, *a, **k):
         # argv: [git, -C, <dir>, add, ...] — команда в args[3]
-        if len(args) > 3 and args[3] == "add":
-            class R: returncode = 128; stderr = "checkpoint add refused"; stdout = ""
+        if len(args) > 3 and args[3] == "hash-object":
+            class R: returncode = 128; stderr = b"checkpoint object refused"; stdout = b""
             return R()
         return real_run(args, *a, **k)
 
@@ -214,9 +214,9 @@ def test_checkpoint_failure_recorded_when_git_add_fails(
     assert isolated_db.get_workflow(wf.id).status.value == "awaiting_human"
     failed = [e for e in isolated_db.list_workflow_events(wf.id, limit=100)
               if e.event_type == "stage.checkpoint_failed"
-              and "error" in (e.payload or {})]
+              and "reason" in (e.payload or {})]
     assert failed, "нужен диагностический event с причиной"
-    assert "git add" in (failed[-1].payload or {}).get("error", "")
+    assert "checkpoint object refused" in (failed[-1].payload or {}).get("reason", "")
 
 
 def test_recovery_after_checkpoint_failure_via_resume(isolated_db, tmp_path):

@@ -216,19 +216,25 @@ def test_next_stage_not_claimable_during_slow_checkpoint(
 
     reviewer = threading.Thread(target=reviewer_side)
     reviewer.start()
+    claim_done = threading.Event()
+    claims = []
+    def claim_side():
+        claims.append(isolated_db.get_next_runnable())
+        claim_done.set()
+    claimant = threading.Thread(target=claim_side)
     try:
         assert started.wait(30), "чекпоинт должен стартовать при PASS"
         # параллельный тик: статус и очередь глазами другого процесса
         assert isolated_db.get_workflow(wf.id).status.value == (
             "awaiting_human"), "миссия не должна уходить в очередь мимо барьера"
         assert "stage.advanced" not in _types(isolated_db, wf)
-        assert isolated_db.get_next_runnable() is None, (
-            "исполнитель следующей стадии не должен быть доступен, "
-            "пока чекпоинт не завершён"
-        )
+        claimant.start()
+        assert claim_done.wait(3) and claims == [None], "preparation must not block the global queue"
     finally:
         release.set()
     reviewer.join(60)
+    claimant.join(30)
+    assert claim_done.is_set() and len(claims) == 1
     assert not errors, errors
 
     events = _events(isolated_db, wf)
