@@ -1063,6 +1063,10 @@ def reserve_merge_intent(gh: GitHub, config: dict, number: int,
 
 def exact_merge_intent_index(snapshot: dict, config: dict, intent: dict) -> int:
     """Locate the immutable GitHub marker in a stable PR timeline."""
+    if (not isinstance(intent, dict) or type(intent.get("id")) is not int
+            or type(intent.get("number")) is not int
+            or intent["id"] <= 0 or intent["number"] <= 0):
+        raise PipelineError("invalid merge cleanup intent identity")
     matches = []
     for index, edge in enumerate(snapshot.get("edges") or []):
         node = edge.get("node") or {}
@@ -1071,6 +1075,19 @@ def exact_merge_intent_index(snapshot: dict, config: dict, intent: dict) -> int:
                 and node.get("body") == intent.get("body")
                 and (node.get("author") or {}).get("login") == config["trusted_account"]
                 and node.get("lastEditedAt") is None):
+            # A caller-supplied lease is not authority for the marker's fields.
+            # Reconstruct them from the immutable server body, as for REST discovery.
+            created = node.get("createdAt")
+            if not isinstance(created, str) or not created:
+                continue
+            parsed = parse_merge_intent({
+                "id": comment_id(node), "body": node["body"],
+                "user": {"login": (node.get("author") or {}).get("login")},
+                "created_at": created, "updated_at": created,
+                "issue_url": f"https://api.github.com/repos/{config['repository']}/issues/{intent['number']}",
+            }, config)
+            if parsed is None or any(intent.get(key) != value for key, value in parsed.items()):
+                continue
             matches.append(index)
     if len(matches) != 1:
         raise PipelineError(
@@ -2142,12 +2159,20 @@ def _complete_carry_merge(gh: GitHub, config: dict, lease: dict,
             or intent.get("proof_sha256") != digest(lease["carry"])):
         raise PipelineError("merge intent does not bind this carry")
 
-    exact_merge_intent_index(stable_timeline(gh, config, number), config, intent)
+    def verify_reservation():
+        exact_merge_intent_index(stable_timeline(gh, config, number), config, intent)
+        pending = pending_merge_intents(gh, config)
+        if not pending or any(pending[0].get(key) != intent.get(key) for key in (
+                "id", "number", "head", "proof_sha256", "body_sha256", "issues", "body")):
+            raise PipelineError("carry intent no longer owns the pending merge lane")
+
+    verify_reservation()
     second = reprove()
     body = second["status"].get("body") or ""
     if (hashlib.sha256(body.encode("utf-8")).hexdigest() != intent["body_sha256"] or
             same_repo_closing_issues(body, config["repository"]) != intent["issues"]):
         raise PipelineError("cleanup payload changed after intent")
+    verify_reservation()
     result = gh.json("api", f"repos/{config['repository']}/pulls/{number}/merge",
                      "--method", "PUT", "--input", "-",
                      input_value={"merge_method": config["merge_method"], "sha": head})

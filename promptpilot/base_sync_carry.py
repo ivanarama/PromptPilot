@@ -274,8 +274,9 @@ def ensure_tree_proof_possible(config: dict) -> dict:
     route. A refusal, not a wait: no git gets newer on its own, and a carry
     pending forever would hold the lane with no way out.
 
-    Checked in the only place that produces the proof, so every route — the
-    live verification and the post-merge recomputation — is covered.
+    This is a pre-merge admission requirement. After a confirmed merge,
+    recovery validates the committed intent and immutable timeline evidence;
+    cleanup does not require enabling the opt-in or installing a newer Git.
     """
     binary = git_bin(config)
     version = git_version(config)

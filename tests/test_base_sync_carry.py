@@ -911,6 +911,106 @@ def test_crash_after_merge_finishes_cleanup_even_with_the_opt_in_off(pipelinectl
     assert "ship" not in github.labels
 
 
+def _supplied_carry_intent(pipelinectl, world, *, foreign=False, ordinary=False,
+                           marker_change=None, completed=False):
+    github = FakeGitHub(world).synced()
+    code, election, _ = pipelinectl(github, "next", "merge")
+    assert code == 0 and election["action"] == "merge"
+    lease = pp.decode_lease(election["lease"])
+    marker = pp.intent_body(world.to, lease["carry"], github.body, [])
+    if foreign:
+        other = github.comment(701, marker)
+        other["issue_url"] = f"https://api.github.com/repos/{REPO}/issues/8"
+        github.edges.pop()  # It belongs to PR8's timeline, not PR7's.
+    posted = github.comment(702, marker)
+    intent = pp.parse_merge_intent(posted, {"trusted_account": TRUSTED})
+    assert intent is not None
+    if ordinary:
+        posted["body"] = "An ordinary owner note, not a merge reservation."
+    elif marker_change:
+        before, after = marker_change(intent)
+        posted["body"] = marker.replace(before, after)
+        assert posted["body"] != marker
+    if ordinary or marker_change:
+        github.edges[-1]["node"]["body"] = posted["body"]
+        intent["body"] = posted["body"]  # Other lease fields still claim the valid reservation.
+    if completed:
+        github.comment(703, f"<!-- pp:merge-cleanup-done intent=702 head={world.to} merge={'f' * 40} -->")
+    lease["intent"] = intent
+    election["lease"] = pp.encode_lease(lease)
+    return github, election
+
+
+@pytest.mark.parametrize("foreign", [False, True])
+def test_carry_completion_rejects_ordinary_note_as_supplied_intent(
+        pipelinectl, world, tmp_path, foreign):
+    github, election = _supplied_carry_intent(
+        pipelinectl, world, foreign=foreign, ordinary=True)
+    code, result, _ = pipelinectl(github, "complete", "merge", "--lease-file",
+                                  lease_file(tmp_path, election))
+    assert code == 2 and result["action"] == "error"
+    assert not github.merged and github.mutations == []
+
+
+@pytest.mark.parametrize("field", ["head", "proof_sha256", "body_sha256", "issues"])
+def test_carry_completion_binds_supplied_fields_to_live_canonical_marker(
+        pipelinectl, world, tmp_path, field):
+    def change(intent):
+        if field == "issues":
+            return "issues=none", "issues=11"
+        name = {"head": "head", "proof_sha256": "proof-sha256", "body_sha256": "body-sha256"}[field]
+        return f"{name}={intent[field]}", f"{name}={'d' * (40 if field == 'head' else 64)}"
+    github, election = _supplied_carry_intent(pipelinectl, world, marker_change=change)
+    code, result, _ = pipelinectl(github, "complete", "merge", "--lease-file",
+                                  lease_file(tmp_path, election))
+    assert code == 2 and result["action"] == "error"
+    assert not github.merged and github.mutations == []
+
+
+@pytest.mark.parametrize("completed", [False, True])
+def test_carry_completion_requires_live_pending_lane_ownership(
+        pipelinectl, world, tmp_path, completed):
+    github, election = _supplied_carry_intent(
+        pipelinectl, world, foreign=not completed, completed=completed)
+    code, result, _ = pipelinectl(github, "complete", "merge", "--lease-file",
+                                  lease_file(tmp_path, election))
+    assert code == 2 and result["action"] == "error"
+    assert not github.merged and github.mutations == []
+
+
+def test_carry_rechecks_pending_owner_after_final_reproof(
+        pipelinectl, world, tmp_path, monkeypatch):
+    github, election = _supplied_carry_intent(pipelinectl, world)
+    lease = pp.decode_lease(election["lease"])
+    marker = pp.intent_body(world.to, lease["carry"], github.body, [])
+    original_run, original_json = github.run, github.json
+    seen = {"scans": 0, "revealed": False}
+
+    def run(*args, **kwargs):
+        if args[:2] == ("api", "--paginate") and args[2].startswith(f"repos/{REPO}/issues/comments"):
+            seen["scans"] += 1
+        return original_run(*args, **kwargs)
+
+    def request(*args, **kwargs):
+        if args[:2] == ("pr", "view") and seen["scans"] and not seen["revealed"]:
+            # The server's earlier PR8 reservation becomes visible after the first scan.
+            before = github.comments[-1]["created_at"]
+            other = github.comment(701, marker)
+            other.update(issue_url=f"https://api.github.com/repos/{REPO}/issues/8",
+                         created_at=before, updated_at=before)
+            github.edges.pop()
+            seen["revealed"] = True
+        return original_json(*args, **kwargs)
+
+    monkeypatch.setattr(github, "run", run)
+    monkeypatch.setattr(github, "json", request)
+    code, result, _ = pipelinectl(github, "complete", "merge", "--lease-file",
+                                  lease_file(tmp_path, election))
+    assert seen["revealed"] and code == 2 and result["action"] == "error"
+    assert "pending merge lane" in result["error"]
+    assert not github.merged and github.mutations == []
+
+
 # --- configuration ---------------------------------------------------------------------------------
 
 def test_carry_requires_an_explicit_required_check_list(tmp_path):
