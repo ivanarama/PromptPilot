@@ -37,6 +37,10 @@ from urllib.parse import quote
 class ConnectorError(RuntimeError):
     """The outside service refused or is unreachable; the step decides what next."""
 
+class DeliveryUncertain(ConnectorError):
+    """The server may have accepted the message; automatic resend is unsafe."""
+
+
 # Cyrillic look-alikes of Latin capitals: [КТ] typed on a Russian layout and
 # [KT] are the same marker.
 _HOMOGLYPHS = str.maketrans("АВСЕНКМОРТХ", "ABSEHKMOPTX")
@@ -348,7 +352,8 @@ def write_json_feed(path: str, entries: list[dict]) -> bool:
 # --- GitLab ------------------------------------------------------------------------
 
 def _curl(cmd: list[str], data: bytes | None) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, input=data, capture_output=True, timeout=180)
+    return subprocess.run(cmd, input=data, capture_output=True, timeout=180,
+                          creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
 
 
 def gitlab_request(connection, method: str, path: str, payload: dict | None = None):
@@ -399,7 +404,19 @@ def gitlab_issues(connection, source) -> list[dict]:
     query = "state=opened&per_page=100&order_by=created_at&sort=asc"
     if source.labels:
         query += "&labels=" + quote(",".join(source.labels), safe=",")
-    issues = gitlab_request(connection, "GET", f"/issues?{query}")
+    issues = []
+    deadline = time.monotonic() + 300
+    for page in range(1, 101):
+        if time.monotonic() > deadline:
+            raise ConnectorError("GitLab intake time budget exhausted; narrow the input labels before retrying")
+        batch = gitlab_request(connection, "GET", f"/issues?{query}&page={page}")
+        if not isinstance(batch, list):
+            raise ConnectorError("GitLab issue listing is not a list")
+        issues.extend(batch)
+        if len(batch) < 100:
+            break
+    else:
+        raise ConnectorError("GitLab intake exceeds 100 pages; narrow the input labels before retrying")
     requests = []
     for issue in issues if isinstance(issues, list) else []:
         labels = issue.get("labels") or []
@@ -500,15 +517,21 @@ def send_reply(source, request: dict, *, text: str, subject: str, smtp_host: str
         message["References"] = message_id
     message.set_content(text.strip() + "\n")
     factory = smtp_factory or smtplib.SMTP_SSL
-    last_error = None
-    for attempt in range(2):  # mail.ru turns automation away in waves
-        try:
-            with factory(smtp_host, smtp_port, timeout=30, context=ssl.create_default_context()) as smtp:
-                smtp.login(user, password)
-                smtp.send_message(message)
-            return recipient
-        except (OSError, smtplib.SMTPException) as exc:
-            last_error = exc
-            if attempt == 0:
-                time.sleep(5)
-    raise ConnectorError(f"SMTP: {type(last_error).__name__}: {last_error}")
+    sending = False
+    accepted = False
+    try:
+        with factory(smtp_host, smtp_port, timeout=30, context=ssl.create_default_context()) as smtp:
+            smtp.login(user, password)
+            sending = True
+            smtp.send_message(message)
+            accepted = True
+        return recipient
+    except (OSError, smtplib.SMTPException) as exc:
+        if accepted:
+            return recipient  # A failed QUIT cannot retract the accepted DATA.
+        definitive = isinstance(exc, (smtplib.SMTPRecipientsRefused,
+                                      smtplib.SMTPSenderRefused, smtplib.SMTPDataError))
+        error = f"SMTP: {type(exc).__name__}: {exc}"
+        if sending and not definitive:
+            raise DeliveryUncertain(error) from exc
+        raise ConnectorError(error) from exc

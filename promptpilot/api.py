@@ -1934,6 +1934,7 @@ def api_projects():
 class FlowActionRequest(BaseModel):
     expected_version: int = Field(ge=0, strict=True)
     confirm_command_stopped: bool = False
+    confirm_side_effect_reviewed: bool = False
     note: str = ""
 
 
@@ -2008,7 +2009,8 @@ def api_flow_action(item_id: int, action: str, body: FlowActionRequest):
         raise HTTPException(404, "Действие: retry | skip | cancel")
     return flows.summary(_flow_call(calls[action], item_id, "web",
                                     expected_version=body.expected_version,
-                                    confirm_command_stopped=body.confirm_command_stopped, note=body.note))
+                                    confirm_command_stopped=body.confirm_command_stopped,
+                                    confirm_side_effect_reviewed=body.confirm_side_effect_reviewed, note=body.note))
 
 
 @app.post("/api/flows/{name}/items", status_code=201)

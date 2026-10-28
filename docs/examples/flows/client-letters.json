@@ -24,7 +24,7 @@
       "title": "Триаж",
       "provider": "claude",
       "rights": "read",
-      "working_dir": "{{flow.attachments}}/{{item.id}}",
+      "working_dir": "{{item.attachments_dir}}",
       "prompt_file": "client-triage.md",
       "material": {"catalog": {"tree": "{{flow.projects}}", "depth": 2, "max": 8000}},
       "output": {
