@@ -701,7 +701,7 @@
         <input type="number" id="timeoutInput" placeholder="0 = no limit" min="0" style="width:80px" title="Per-task timeout in seconds (0 = no limit, empty = default)">
       </label>
       <label id="skipPermsLabel" style="flex-direction:row;align-items:center;gap:8px;cursor:pointer;display:none">
-        <input type="checkbox" id="skipPermissions" style="width:auto;margin:0">
+        <input type="checkbox" id="skipPermissions" style="width:auto;margin:0" onchange="rememberSkipPermissions()">
         <span style="font-size:13px;color:var(--yellow)" title="Claude: --dangerously-skip-permissions; Codex: --dangerously-bypass-approvals-and-sandbox">⚠ не спрашивать разрешения</span>
       </label>
       <label id="keepPaneLabel" style="flex-direction:row;align-items:center;gap:8px;cursor:pointer;display:none">
@@ -3097,13 +3097,27 @@ function pipelineStageFocus(queues) {
 }
 
 function pipelineWaitReasons(data) {
-  const waits = (data.queues || [])
-    .filter(q => Number(q.backlog) > 0 && q.task_status === 'pending' && q.task_error)
-    .map(q => ({id:q.id, title:q.title, reason:String(q.task_error)}));
-  for (const task of (data.current?.tasks || [])) {
-    if (task.status === 'pending' && task.error && !waits.some(wait => wait.reason === task.error)) {
-      waits.push({id:String(task.task_id || ''), title:task.title, reason:String(task.error)});
+  const waits = [];
+  const add = (id, title, status, error, retryAt, taskId) => {
+    if (!['pending', 'rate_limited'].includes(status) || !error) return;
+    const reason = String(error) + (status === 'rate_limited' && retryAt
+      ? ` · следующая попытка: ${retryAt}` : '');
+    if (waits.some(wait => taskId && wait.task_id === taskId
+        || wait.title === title && wait.reason === reason)) return;
+    waits.push({id, title, reason, task_id:taskId});
+  };
+  for (const queue of (data.queues || [])) {
+    const replicas = queue.series_replicas?.length ? queue.series_replicas : [queue];
+    for (const task of replicas) {
+      if (Number(queue.backlog) > 0 || task.task_status === 'rate_limited') {
+        add(queue.id, task.title || queue.title, task.task_status,
+          task.task_error, task.task_next_run_at, task.task_id);
+      }
     }
+  }
+  for (const task of (data.current?.tasks || [])) {
+    add(String(task.task_id || ''), task.title, task.status,
+      task.error, task.scheduled_at, task.task_id);
   }
   const owner = (data.diagnostics && data.diagnostics.integration_owner)
     || (data.current && data.current.integration_owner);
@@ -3966,6 +3980,22 @@ function selectSkill(name) {
 
 // --- Load projects into dir select ---
 const RECENT_WORKDIRS_KEY = 'promptpilot.recent-workdirs';
+const SKIP_PERMISSIONS_KEY = 'promptpilot.skip-permissions';
+
+function restoreSkipPermissions() {
+  const checkbox = document.getElementById('skipPermissions');
+  checkbox.checked = false;
+  try { checkbox.checked = localStorage.getItem(SKIP_PERMISSIONS_KEY) === 'true'; }
+  catch (_) { /* A new or storage-blocked browser keeps the default off. */ }
+}
+
+function rememberSkipPermissions() {
+  if (document.getElementById('skipPermsLabel').style.display === 'none') return;
+  try {
+    localStorage.setItem(SKIP_PERMISSIONS_KEY,
+      String(document.getElementById('skipPermissions').checked));
+  } catch (_) { /* The visible explicit choice still applies to this task. */ }
+}
 
 function recentWorkdirs() {
   try {
@@ -3976,9 +4006,10 @@ function recentWorkdirs() {
 
 async function rememberWorkdir(path) {
   try {
-    const recent = [path, ...recentWorkdirs().filter(p => p.toLowerCase() !== path.toLowerCase())].slice(0, 10);
+    // These are server paths: browser OS/case rules do not identify them.
+    const recent = [path, ...recentWorkdirs().filter(p => p !== path)].slice(0, 10);
     localStorage.setItem(RECENT_WORKDIRS_KEY, JSON.stringify(recent));
-    await loadProjects();
+    renderWorkdirOptions(Object.values(projectsByPath));
     document.getElementById('workdirSelect').value = path;
     onProjectSelect();
   } catch (_) { /* Task was created; browser history is optional. */ }
@@ -3986,24 +4017,29 @@ async function rememberWorkdir(path) {
 
 async function loadProjects() {
   const projects = await fetchJSON(`${API}/projects`);
-  const sel = document.getElementById('workdirSelect');
   let recent = recentWorkdirs();
   if (!localStorage.getItem(RECENT_WORKDIRS_KEY)) {
     try {
       const tasks = await fetchJSON(`${API}/tasks?limit=100`);
       const seen = new Set();
       recent = tasks.map(t => t.working_dir).filter(path => {
-        if (!path || seen.has(path.toLowerCase())) return false;
-        seen.add(path.toLowerCase());
+        if (!path || seen.has(path)) return false;
+        seen.add(path);
         return true;
       }).slice(0, 10);
       localStorage.setItem(RECENT_WORKDIRS_KEY, JSON.stringify(recent));
     } catch (_) { /* Project picker still works without task history. */ }
   }
+  renderWorkdirOptions(projects || []);
+}
+
+function renderWorkdirOptions(projects) {
+  const sel = document.getElementById('workdirSelect');
+  const recent = recentWorkdirs();
   if ((!projects || !projects.length) && !recent.length) return;
 
   projectsByPath = Object.fromEntries((projects || []).map(p => [p.path, p]));
-  const recentSet = new Set(recent.map(p => p.toLowerCase()));
+  const recentSet = new Set(recent);
   const previous = sel.value;
   sel.innerHTML = [
     '<option value="">— Select project —</option>',
@@ -4011,7 +4047,7 @@ async function loadProjects() {
       ...recent.map(path => `<option value="${escAttr(path)}">${esc(path)}</option>`),
       '</optgroup>'] : []),
     ...((projects || []).length ? ['<optgroup label="Другие проекты">',
-      ...projects.filter(p => !recentSet.has(p.path.toLowerCase()))
+      ...projects.filter(p => !recentSet.has(p.path))
         .map(p => `<option value="${escAttr(p.path)}">${esc(p.name)}${p.git ? '' : ' (не git)'}</option>`),
       '</optgroup>'] : []),
     '<option value="__custom__">✏️ Custom path...</option>',
@@ -4105,26 +4141,25 @@ async function loadCosts() {
     }
   } catch (_) {}
 
-  // Токены конвейера из реальных источников (Meta-блоки codex + журнал qwen);
-  // goose/mmx одноразовые и юзаж не оставляют — не выдумываем.
+  // Only structured usage from completed conveyor tasks; unavailable stays unknown.
   try {
     const t = await fetchJSON(`${API}/stats/tokens`);
-    if (t && t.total && t.total.total > 0) {
+    if (t && t.total && t.total.tasks > 0) {
       const fmtTok = n => (n / 1e6).toFixed(1) + 'M';
-      const dollars = (t.pricing_configured && t.total.cost > 0)
+      const dollars = (t.total.cost !== null)
         ? ` · $${t.total.cost.toFixed(2)}` : '';
       const provBits = Object.entries(t.by_provider)
         .filter(([, v]) => v.measured)
         .map(([p, v]) =>
-          `<div class="cost-item" title="${esc(v.model || p)}: ${Number(v.input).toLocaleString('ru')} in / ${Number(v.output).toLocaleString('ru')} out, кэш ${fmtTok(v.cached)} · задач: ${v.tasks}">${esc(p)}: <span>${fmtTok(v.total)}</span></div>`)
+          `<div class="cost-item" title="${escAttr(v.model || p)}: ${Number(v.input).toLocaleString('ru')} in / ${Number(v.output).toLocaleString('ru')} out, кэш ${fmtTok(v.cached)} · задач: ${v.tasks}">${esc(p)}: <span>${fmtTok(v.total)}</span></div>`)
         .join('');
       items.push(
-        `<div class="cost-item" title="токены конвейера по исполнителям, отдающим юзаж; доллары появятся после заполнения pricing.json">Ток. сегодня: <span>${fmtTok(t.today.total)}</span> · неделя: <span>${fmtTok(t.week.total)}</span> · всего: <span>${fmtTok(t.total.total)}${dollars}</span></div>`,
+        `<div class="cost-item" title="Структурированный расход задач; старые задачи и неподдерживаемые CLI без измерения">Ток. сегодня: <span>${fmtTok(t.today.total)}</span> · неделя: <span>${fmtTok(t.week.total)}</span> · всего: <span>${fmtTok(t.total.total)}${dollars}</span> · измерено ${t.total.measured_tasks}/${t.total.tasks}</div>`,
         provBits);
     }
   } catch (_) {}
 
-  if (!items.length) return;  if (!items.length) return;
+  if (!items.length) return;
   const bar = document.getElementById('costBar');
   bar.innerHTML = items.join('');
   bar.classList.add('visible');
@@ -4154,6 +4189,8 @@ async function loadHealth() {
 }
 
 
+// --- Init ---
+restoreSkipPermissions();
 setDefaultSchedule();
 loadProviders();
 loadProjects();
@@ -4169,6 +4206,7 @@ setInterval(() => wfRefreshScreen(), 4000);  // экран активного ta
 setInterval(() => autoRefreshWorkflowState(), 5000);  // стадия, раунды и runs без ручного «Обновить»
 setInterval(loadWorkerStatus, 10000);
 setInterval(loadCosts, 30000);
+setInterval(loadHealth, 30000);
 </script>
 </body>
 </html>

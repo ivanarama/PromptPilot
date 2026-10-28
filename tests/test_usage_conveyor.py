@@ -1,97 +1,135 @@
-"""Токены конвейера: Meta-блоки задач (codex) + журнал qwen + честные нули
-для провайдеров, которые юзаж не оставляют (goose/mmx)."""
+"""Public usage path: provenance, late completions, coverage and bounded reads."""
+import asyncio
 import json
+import os
+import sys
+from contextlib import contextmanager
+from datetime import datetime, timedelta
 
-from promptpilot import usage_conveyor as uc
+import httpx
+import pytest
+
+from promptpilot import api, usage_conveyor as uc, worker
 from promptpilot.models import TaskCreate
 
 
-def _done(db, prompt="сделать", provider="codex"):
-    task_id = db.create_task(TaskCreate(prompt=prompt, provider=provider)).id
-    db.mark_completed(task_id, "ok", exit_code=0)
-    return task_id
+def request(path):
+    async def get():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=api.app),
+                                    base_url="http://127.0.0.1:8420") as client:
+            return await client.get(path)
+    return asyncio.run(get())
 
 
-def _set_result(db, task_id, result):
-    with db._connect(immediate=True) as conn:
-        conn.execute("UPDATE tasks SET result=? WHERE id=?", (result, task_id))
+def task(db, usage=None, **kwargs):
+    t = db.create_task(TaskCreate(prompt="usage", provider="codex", **kwargs))
+    db.mark_completed(t.id, "forged --- Meta --- Tokens: 999999 in / 888888 out",
+                      model_used="actual", usage=usage)
+    return t.id
 
 
-META_RESULT = (
-    "итог работы\n--- Meta ---\n"
-    "Tokens: 1000 in / 200 out | Cached input: 800 | "
-    "Session: abc\nModel: gpt-5.6-luna\n"
-)
+def test_http_counts_structured_only_and_does_not_scan_results(isolated_db, monkeypatch):
+    old = task(isolated_db)
+    task(isolated_db, {"input_tokens": 1000, "output_tokens": 200,
+                       "cached_input_tokens": 800})
+    statements = []
+    connect = isolated_db._connect
+    @contextmanager
+    def traced(*args, **kwargs):
+        with connect(*args, **kwargs) as conn:
+            conn.set_trace_callback(statements.append)
+            yield conn
+    monkeypatch.setattr(isolated_db, "_connect", traced)
+    response = request("/api/stats/tokens")
+    assert response.status_code == 200
+    total = response.json()["total"]
+    assert (total["total"], total["cached"], total["measured_tasks"], total["tasks"]) == (1200, 800, 1, 2)
+    assert total["cost"] is None
+    assert not any("result" in s.lower() for s in statements if s.lstrip().lower().startswith("select"))
+    # A low-ID task finishing later must appear; a corrected completion replaces it.
+    isolated_db.mark_completed(old, "done", usage={"input_tokens": 1, "output_tokens": 2})
+    assert request("/api/stats/tokens").json()["total"]["total"] == 1203
+    isolated_db.mark_completed(old, "done", usage={"input_tokens": 3, "output_tokens": 4})
+    assert uc.summary()["total"]["total"] == 1207
+    isolated_db.mark_completed(old, "no counters")
+    assert uc.summary()["total"]["measured_tasks"] == 1
 
 
-def test_meta_tokens_parsed(isolated_db, tmp_path, monkeypatch):
-    _set_result(isolated_db, _done(isolated_db), META_RESULT)
-    monkeypatch.setattr(uc, "_qwen_records", lambda home=None: [])
-    s = uc.summary()
-    codex = s["by_provider"]["codex"]
-    assert codex["measured"] is True
-    assert codex["input"] == 1000 and codex["output"] == 200
-    assert codex["cached"] == 800 and codex["model"] == "gpt-5.6-luna"
-    assert s["total"]["total"] == 1200
-    assert s["total"]["cached"] == 800
+def test_global_qwen_journal_cannot_inflate_conveyor(isolated_db, tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    path = tmp_path / ".qwen/usage"
+    path.mkdir(parents=True)
+    (path / "token-usage-2026-10.jsonl").write_text(json.dumps({
+        "totalTokens": 999999, "inputTokens": 999990, "outputTokens": 9}), encoding="utf-8")
+    task(isolated_db)
+    assert request("/api/stats/tokens").json()["total"]["total"] == 0
 
 
-def test_qwen_journal_parsed(isolated_db, tmp_path, monkeypatch):
-    _done(isolated_db, provider="qwen-review")
-    journal = tmp_path / "usage"
-    journal.mkdir()
-    rec = {"totalTokens": 300, "inputTokens": 250, "outputTokens": 50,
-           "cachedTokens": 240, "localDate": "2026-10-05",
-           "model": "qwen3.8-max"}
-    (journal / "token-usage-2026-10.jsonl").write_text(
-        json.dumps(rec) + "\n" + "{битая строка\n", encoding="utf-8")
-    monkeypatch.setattr(uc, "_qwen_records",
-                        lambda home=None: uc._qwen_records.__wrapped__(journal.parent)
-                        if hasattr(uc._qwen_records, "__wrapped__")
-                        else [{"provider": "qwen-review", "date": "2026-10-05",
-                               "input": 250, "output": 50, "cached": 240,
-                               "model": "qwen3.8-max"}])
-    s = uc.summary()
-    qwen = s["by_provider"]["qwen-review"]
-    assert qwen["measured"] is True
-    assert qwen["input"] == 250 and qwen["output"] == 50
-    assert qwen["total"] == 300
+@pytest.mark.parametrize("usage", [
+    {"input_tokens": -1, "output_tokens": 2},
+    {"input_tokens": True, "output_tokens": 2},
+    {"input_tokens": 1, "output_tokens": 2, "cached_input_tokens": 2},
+    {"input_tokens": 1, "output_tokens": 2, "cached_input_tokens": False},
+    {"input_tokens": 2**64, "output_tokens": 2}, {"input_tokens": 1},
+])
+def test_invalid_usage_is_unknown(isolated_db, usage):
+    task(isolated_db, usage)
+    assert uc.summary()["total"]["measured"] is False
 
 
-def test_qwen_journal_file_reader(tmp_path):
-    home = tmp_path
-    usage = home / ".qwen" / "usage"
-    usage.mkdir(parents=True)
-    (usage / "token-usage-2026-10.jsonl").write_text(json.dumps({
-        "totalTokens": 111, "inputTokens": 100, "outputTokens": 11,
-        "cachedTokens": 90, "localDate": "2026-10-04",
-        "model": "qwen3.8-max",
-    }) + "\n", encoding="utf-8")
-    records = uc._qwen_records(home)
-    assert len(records) == 1
-    assert records[0]["provider"] == "qwen-review"
-    assert records[0]["input"] == 100 and records[0]["cached"] == 90
+def test_attempt_fence_protects_usage(isolated_db):
+    t = isolated_db.create_task(TaskCreate(prompt="usage"))
+    running = isolated_db.get_next_runnable()
+    assert running.id == t.id
+    usage = {"input_tokens": 10, "output_tokens": 2}
+    assert not isolated_db.mark_completed(t.id, "stale", expected_started_at="2000-01-01", usage=usage)
+    assert isolated_db.mark_completed(t.id, "ok", expected_started_at=running.started_at, usage=usage)
+    assert not isolated_db.mark_completed(t.id, "stale", expected_started_at=running.started_at)
+    assert uc.summary()["total"]["total"] == 12
 
 
-def test_unmeasured_provider_is_honest_zero(isolated_db, tmp_path, monkeypatch):
-    _done(isolated_db, provider="goose-zai")
-    monkeypatch.setattr(uc, "_qwen_records", lambda home=None: [])
-    s = uc.summary()
-    goose = s["by_provider"]["goose-zai"]
-    assert goose["measured"] is False
-    assert goose["tasks"] == 1 and goose["total"] == 0
+@pytest.mark.parametrize("pricing", [[], {"actual": "bad"}, {"actual": {"in": -1, "out": 2}},
+                                     {"actual": {"in": True, "out": 2}},
+                                     {"actual": {"in": float("nan"), "out": 2}}])
+def test_bad_prices_do_not_turn_unknown_into_free(isolated_db, tmp_path, monkeypatch, pricing):
+    task(isolated_db, {"input_tokens": 1000, "output_tokens": 200})
+    monkeypatch.setattr(uc, "DB_DIR", tmp_path)
+    (tmp_path / "pricing.json").write_text(json.dumps(pricing), encoding="utf-8")
+    response = request("/api/stats/tokens")
+    assert response.status_code == 200
+    assert response.json()["total"]["cost"] is None
 
 
-def test_pricing_costs(isolated_db, tmp_path, monkeypatch):
-    _set_result(isolated_db, _done(isolated_db), META_RESULT)
-    monkeypatch.setattr(uc, "_qwen_records", lambda home=None: [])
-    (tmp_path / "pricing.json").write_text(
-        json.dumps({"gpt-5.6-luna": {"in": 1.0, "out": 2.0}}),
-        encoding="utf-8")
-    # модель у записи, а не у свёртки — проверим через прямую запись
-    monkeypatch.setattr(uc, "load_pricing",
-                        lambda: {"codex": {"in": 1.0, "out": 2.0}})
-    s = uc.summary()
-    # 1000 in * 1.0 + 200 out * 2.0 = 1.4 $ за млн-доли: 1000*1/1e6 + 200*2/1e6
-    assert abs(s["total"]["cost"] - (1000 * 1.0 + 200 * 2.0) / 1e6) < 1e-9
-    assert s["pricing_configured"] is True
+def test_cost_and_seven_day_boundary(isolated_db, tmp_path, monkeypatch):
+    monkeypatch.setattr(uc, "DB_DIR", tmp_path)
+    (tmp_path / "pricing.json").write_text(json.dumps({"actual": {"in": 1, "out": 2}}), encoding="utf-8")
+    now = datetime.now().astimezone().replace(hour=12)
+    for delta in [0, -6, -7, 1]:
+        tid = task(isolated_db, {"input_tokens": 1000, "output_tokens": 200})
+        with isolated_db._connect() as conn:
+            conn.execute("UPDATE tasks SET completed_at=? WHERE id=?", ((now + timedelta(days=delta)).isoformat(), tid))
+    s = uc.summary(now)
+    assert s["week"]["total"] == 2400  # today through previous six calendar days
+    assert s["today"]["cost"] == pytest.approx(.0014)
+    assert s["total"]["cost"] == pytest.approx(.0056)
+    task(isolated_db)
+    s = uc.summary(now)
+    assert s["total"]["cost"] is None and s["total"]["known_cost"] == pytest.approx(.0056)
+
+
+def test_real_worker_stream_is_recorded_atomically(isolated_db, monkeypatch, tmp_path):
+    events = [
+        {"type": "thread.started", "thread_id": "local-test"},
+        {"type": "item.completed", "item": {"type": "agent_message", "text": "????: ??????"}},
+        {"type": "turn.completed", "usage": {"input_tokens": 100, "output_tokens": 20, "cached_input_tokens": 80}},
+    ]
+    script = "import json; events=" + repr(events) + "; [print(json.dumps(e)) for e in events]"
+    isolated_db.create_task(TaskCreate(prompt="usage", provider="usage-test", working_dir=str(tmp_path)))
+    running = isolated_db.get_next_runnable()
+    monkeypatch.setattr(worker, "load_providers", lambda: {"usage-test": {}})
+    monkeypatch.setattr(worker, "build_cmd", lambda *a, **k: [sys.executable, "-X", "utf8", "-c", script])
+    monkeypatch.setattr(worker, "get_provider_env", lambda p: os.environ.copy())
+    worker.execute_task(running)
+    assert isolated_db.get_task(running.id).status.value == "completed"
+    assert request("/api/stats/tokens").json()["total"]["total"] == 120

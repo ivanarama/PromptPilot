@@ -150,7 +150,10 @@ def _origin_key(value: str) -> tuple[str, str, int] | None:
     https://pp.example.com:443 are one origin, another scheme or port of the
     same name is not.
     """
-    parts = urlsplit((value or "").strip())
+    try:
+        parts = urlsplit((value or "").strip())
+    except ValueError:
+        return None
     if (parts.scheme not in _DEFAULT_PORTS or not parts.hostname
             or parts.username is not None or parts.password is not None
             or parts.path not in ("", "/") or parts.query or parts.fragment):
@@ -262,9 +265,51 @@ def _task_with_epf(task: TaskInDB) -> dict:
     return d
 
 
+def _attach_workflow_attribution(tasks: list) -> list:
+    """Атрибуция и честная позиция для карточек задач.
+
+    Принадлежность задачи к миссии (workflow_id/role из workflow_runs) и
+    позиция в очереди. Базовый ранг учитывает paused-серии, отложенные
+    scheduled/next_run_at и, в параллельном режиме, занятые рабочие деревья.
+    Lanes, budget fairness, слоты и глобальная пауза не моделируются;
+    исключённые базовыми фильтрами задачи получают wait_reason.
+    Расчёт read-only (worker.admission_snapshot), claim не меняется.
+    """
+    if not tasks:
+        return tasks
+    task_ids = [t.id for t in tasks]
+    marks = ",".join("?" * len(task_ids))
+    runs = {}
+    with db._connect() as conn:
+        for row in conn.execute(
+            f"""SELECT task_id, workflow_id, role FROM workflow_runs
+                WHERE task_id IN ({marks})""", task_ids,
+        ):
+            runs[row["task_id"]] = (row["workflow_id"], row["role"])
+    try:
+        from .worker import admission_snapshot
+        admission = (admission_snapshot() if any(
+            task.status in {TaskStatus.PENDING, TaskStatus.RATE_LIMITED}
+            for task in tasks) else {})
+    except Exception as exc:  # noqa: BLE001 - проекция не должна ронять API
+        print(f"  !! admission_snapshot недоступен: {exc}", flush=True)
+        admission = {}
+    for task in tasks:
+        attribution = runs.get(task.id)
+        if attribution:
+            task.workflow_id, task.role = attribution
+        info = admission.get(task.id)
+        if info is not None:
+            task.queue_position = info["queue_position"]
+            task.wait_reason = info["wait_reason"]
+    return tasks
+
+
 @app.get("/api/tasks")
 def api_list_tasks(status: Optional[TaskStatus] = None, limit: int = 50, offset: int = 0):
-    return [_task_with_epf(t) for t in db.list_tasks(status=status, limit=limit, offset=offset)]
+    tasks = _attach_workflow_attribution(
+        db.list_tasks(status=status, limit=limit, offset=offset))
+    return [_task_with_epf(t) for t in tasks]
 
 
 @app.post("/api/tasks", response_model=TaskInDB, status_code=201)
@@ -739,10 +784,9 @@ def api_list_workflow_runs(workflow_id: str, round_id: str):
     return db.list_workflow_runs(round_id)
 
 
+@app.get("/api/stats/tokens")
 def api_token_stats():
-    """Токены конвейера из реальных источников: Meta-блоки задач (codex и
-    прочие stream-json CLI) + журнал qwen. Панель показывает это, пока
-    ни один раннер не пишет Cost-строки."""
+    """Structured counters recorded atomically by the completing worker."""
     from . import usage_conveyor
 
     return usage_conveyor.summary()
@@ -808,31 +852,30 @@ def api_health_processes():
         pids = {}
     if not isinstance(pids, dict):
         pids = {}
-    processes = []
-    known = False
+    runtime = db.worker_runtime_status()
+    worker_state = ("alive" if runtime["state"] == "online" else
+                    "dead" if runtime.get("heartbeat_at") else "unknown")
+    processes = [
+        {"name": "server", "label": HEALTH_LABELS["server"], "pid": os.getpid(),
+         "state": "alive", "alive": True},
+        {"name": "worker", "label": HEALTH_LABELS["worker"],
+         "pid": runtime.get("pid"), "state": worker_state,
+         "alive": None if worker_state == "unknown" else worker_state == "alive",
+         "heartbeat_at": runtime.get("heartbeat_at"), "paused": runtime["paused"]},
+    ]
     for name in HEALTH_PROCESS_NAMES:
-        try:
-            pid = int(pids.get(name) or 0)
-        except (TypeError, ValueError):
-            pid = 0
-        known = known or pid > 0
-        # pid=0 — «не запущен» (давно выключенный Telegram-бот): не смерть
-        # и не тревога; тревога — только был жив и умер (квен-H4)
-        alive = _pid_alive(pid)
+        if name in {"server", "worker"}:
+            continue
+        raw = pids.get(name)
+        pid = raw if type(raw) is int and 0 < raw <= 2**32 - 1 else 0
         if not pid:
-            state = "off"
-        elif alive is None:
-            state = "unknown"
-        else:
-            state = "alive" if alive else "dead"
-        processes.append({
-            "name": name, "label": HEALTH_LABELS.get(name, name),
-            "pid": pid, "state": state, "alive": state != "dead",
-        })
-    # квен-H4: нет данных вообще — честное «не знаем», не зелёная панель
-    ok = known and all(p["state"] != "dead" for p in processes)
+            continue  # Optional companions are not required by a core install.
+        alive = _pid_alive(pid)
+        state = "unknown" if alive is None else "alive" if alive else "dead"
+        processes.append({"name": name, "label": HEALTH_LABELS.get(name, name),
+                          "pid": pid, "state": state, "alive": alive})
     return {
-        "ok": ok,
+        "ok": all(p["state"] == "alive" for p in processes),
         "processes": processes,
         "checked_at": datetime.now(timezone.utc).isoformat(),
     }

@@ -79,6 +79,14 @@ CREATE TABLE IF NOT EXISTS tasks (
     ,series_id INTEGER REFERENCES task_series(id)
 );
 
+CREATE TABLE IF NOT EXISTS task_token_usage (
+    task_id INTEGER PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+    input_tokens INTEGER NOT NULL CHECK(input_tokens >= 0),
+    output_tokens INTEGER NOT NULL CHECK(output_tokens >= 0),
+    cached_input_tokens INTEGER NOT NULL CHECK(cached_input_tokens >= 0),
+    model TEXT
+);
+
 CREATE TABLE IF NOT EXISTS task_series (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     title TEXT NOT NULL,
@@ -1348,7 +1356,7 @@ def _release_task_pipeline_targets(conn, task_id: int, started_at=None):
 
 def mark_completed(task_id: int, result: str, exit_code: int = 0,
                    model_used: str = None, session_id: str = None,
-                   verdict: str = None, *, expected_started_at=None) -> bool:
+                   verdict: str = None, *, expected_started_at=None, usage=None) -> bool:
     """Finalize a task, optionally committing its verdict atomically."""
     with _connect() as conn:
         attempt = _attempt_iso(expected_started_at)
@@ -1369,6 +1377,22 @@ def mark_completed(task_id: int, result: str, exit_code: int = 0,
         if cur.rowcount:
             _drop_cancel_flag(conn, task_id)
             _release_task_pipeline_targets(conn, task_id, attempt)
+            # Usage belongs to this successful attempt, never to assistant text.
+            conn.execute("DELETE FROM task_token_usage WHERE task_id = ?", (task_id,))
+            if isinstance(usage, dict):
+                counts = [usage.get("input_tokens"), usage.get("output_tokens"),
+                          usage.get("cached_input_tokens", 0)]
+                if counts[2] is None:
+                    counts[2] = 0
+                if (all(type(n) is int and 0 <= n <= 2**63 - 1 for n in counts)
+                        and counts[2] <= counts[0]):
+                    model = usage.get("model") or model_used
+                    if not isinstance(model, str):
+                        model = None
+                    conn.execute(
+                        "INSERT INTO task_token_usage VALUES (?, ?, ?, ?, ?)",
+                        (task_id, *counts, model),
+                    )
         return cur.rowcount > 0
 
 
@@ -1722,14 +1746,14 @@ def list_series() -> list:
                        GROUP BY series_id
                    )
                    SELECT 'active' AS kind, t.series_id, t.id, t.machine,
-                          t.scheduled_at, t.error, t.worktree, t.detached,
+                          t.scheduled_at, t.next_run_at, t.error, t.worktree, t.detached,
                           t.herdr_target
                    FROM tasks AS t
                    INNER JOIN picked ON picked.active_id = t.id
                    INNER JOIN task_series AS s ON s.id = t.series_id
                    UNION ALL
                    SELECT 'last' AS kind, t.series_id, t.id, t.machine,
-                          NULL AS scheduled_at, NULL AS error,
+                          NULL AS scheduled_at, NULL AS next_run_at, NULL AS error,
                           NULL AS worktree, NULL AS detached,
                           NULL AS herdr_target
                    FROM tasks AS t
@@ -1783,7 +1807,12 @@ def list_series() -> list:
                 "auto_pause_reason": auto_pause_reason if s["paused"] else None,
                 "next_task_id": active["id"] if active else None,
                 "next_status": active["status"] if active else None,
-                "next_run_at": active_detail["scheduled_at"] if active_detail else None,
+                # The worker requires both the schedule and retry deadline.
+                # Showing only scheduled_at hides a rate-limited retry entirely.
+                "next_run_at": max(
+                    (value for value in (active_detail["scheduled_at"],
+                                         active_detail["next_run_at"]) if value),
+                    key=_parse_dt, default=None) if active_detail else None,
                 "next_error": active_detail["error"] if active_detail else None,
                 "next_started_at": active["started_at"] if active else None,
                 "last_task_id": last["id"] if last else None,
@@ -3189,11 +3218,17 @@ def pipeline_series_activity(series_ids: list[int]) -> dict[int, dict]:
     marks = ",".join("?" for _ in ids)
     with _connect() as conn:
         rows = conn.execute(
-            f"""SELECT id, series_id, status, verdict, started_at, completed_at,
-                       result
-                FROM tasks WHERE series_id IN ({marks})
-                  AND status IN ('completed', 'failed', 'cancelled')
-                ORDER BY id DESC""",
+            f"""WITH latest AS (
+                    SELECT series_id, MAX(id) AS id
+                    FROM tasks WHERE series_id IN ({marks})
+                      AND status IN ('completed', 'failed', 'cancelled')
+                    GROUP BY series_id
+                )
+                SELECT t.id, t.series_id, t.status, t.verdict,
+                       t.started_at, t.completed_at, t.result
+                FROM tasks AS t
+                INNER JOIN latest ON latest.id = t.id
+                ORDER BY t.id DESC""",
             ids,
         ).fetchall()
     activity = {}

@@ -3575,6 +3575,10 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                         "preflight": preflight,
                     }
             if mode == "auto":
+                if stage == "merge" and queue.get("item_blockers") is True:
+                    from .pipeline_item_holds import register_target
+                    target = fallback_lease["target"]
+                    register_target(task, target["number"], target["head"], "merge")
                 gate_command = [*command[:-2], "gate-fallback", stage,
                                 *_lease_argument(task, preflight["handoff"]["lease"], "gate")]
                 envelope = {"protocol": "promptpilot-fallback-target-v1",
@@ -3998,7 +4002,10 @@ def _queue_replica_status(queue: dict, series: list[dict]) -> dict:
             "task_id": item.get("next_task_id"),
             "task_status": item.get("next_status"),
             "task_error": (item.get("next_error")
-                           if item.get("next_status") == "pending" else None),
+                           if item.get("next_status") in {"pending", "rate_limited"} else None),
+            "task_next_run_at": (item.get("next_run_at")
+                                 if item.get("next_status") in {"pending", "rate_limited"}
+                                 else None),
             "interval": item.get("effective_recurrence"),
             "paused": bool(item.get("paused")),
             "broken": bool(item.get("broken")),
@@ -4174,8 +4181,11 @@ def _refresh_local_state(result: dict, profile: dict, series: list[dict], *,
             "task_id": matching.get("next_task_id") if matching else None,
             "task_status": matching.get("next_status") if matching else None,
             "task_error": (matching.get("next_error")
-                           if matching and matching.get("next_status") == "pending"
+                           if matching and matching.get("next_status") in {"pending", "rate_limited"}
                            else None),
+            "task_next_run_at": (matching.get("next_run_at")
+                                 if matching and matching.get("next_status") in {"pending", "rate_limited"}
+                                 else None),
             **projection,
         })
         backlog = queue.get("backlog")
@@ -5461,7 +5471,7 @@ def build_period_report(profile_id: str, series: list[dict], *, hours: int = 24,
         "task_id": item.get("next_task_id"), "title": item.get("title"),
         "status": item.get("next_status"),
         "error": (item.get("next_error")
-                  if item.get("next_status") == "pending" else None),
+                  if item.get("next_status") in {"pending", "rate_limited"} else None),
         "started_at": item.get("next_started_at"),
         "scheduled_at": item.get("next_run_at"),
         "paused": bool(item.get("paused")),
