@@ -5,6 +5,25 @@
 срез A принятого плана и не включает техническую передачу REVIEW → FIX.
 Установленный выпуск, scheduler и данные пользователя не меняются.
 
+## Инвентаризация существующего маршрута
+
+Основание — main `d7be4eb24e862d7028bcd863ddea7e24ff546076`, включающий
+независимо принятую в PR #144 парковку одной цели.
+
+| Точка входа | Текущий контракт и ограничение для следующего среза |
+|---|---|
+| `project_pipeline.run` | `next` принимает только review/merge, `complete` — review/merge/merge-cleanup. Публичного `next fix` пока нет: его нужно согласовать с проектным исполнителем, а не объявить готовым в процедуре. |
+| `project_pipeline.next_review` | При depth >= 2 возвращает fallback с причиной third review round requires human-escalation rules; технический outcome не выдаёт. |
+| `project_pipeline.format_review` / `complete_review` | Legacy blockers — строки. Completion проверяет lease, identity, target/global gate и публикует review/claim/label/completion; новый report должен получить отдельный совместимый путь и привязку hash. |
+| `project_pipeline.content_review_target_gate` / `review_gate` | Текущие HEAD/epoch/routing и allowlist остаются mutation gates, их не заменяет offline validator. |
+| `fallback_handoff.gate` | HMAC/expiry и свежий допуск точной цели должны сохраняться для fallback; новый outcome сам по себе полномочий не добавляет. |
+| `pipeline_insights.execution_route` | Выбирает инструмент/полный проектный prompt. Будущий FIX нельзя добавить лишь новым label в health, без совместимого публичного dispatch. |
+| `pipeline_item_holds.register_review_target`, `prepare`, `record` | Уже сохраняют точную цель REVIEW и локальную парковку одной работы. Использовать существующий механизм, не создавать вторую парковку для #144. |
+
+Эта инвентаризация не доказывает готовность durable technical intent/recovery:
+они ещё не реализованы. Merge integration owner не становится владельцем
+технической доработки, а локальная парковка не заменяет общую GitHub chain.
+
 ## Публичная команда
 
 ```console
