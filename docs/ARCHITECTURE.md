@@ -186,6 +186,11 @@ planner → этапы → для каждого раунды «исполнит
 ## Тесты и сборка
 
 - `pytest` — весь набор (`tests/`), с изолированной базой (`isolated_db`).
+  Before importing application configuration, `tests/conftest.py` assigns a temporary
+  HOME/USERPROFILE and PP_DATA_DIR to the pytest process. The permanent user
+  `~/.promptpilot/.env` is excluded; application dotenv precedence is unchanged.
+  Tests that need configuration set dummy values explicitly. The temporary home
+  is removed at session teardown; subprocess pytest runs receive their own home.
 - `tests/test_pipeline_report_web.py` проверяет синтаксис встроенного JavaScript
   и запускает каждый стенд `tests/*.cjs` настоящим Node. При отсутствии Node эти
   проверки помечаются `skip`; в CI Node доступен на обеих ОС, поэтому стенды
