@@ -255,6 +255,7 @@ CREATE TABLE IF NOT EXISTS workflow_runs (
     task_id INTEGER,
     status TEXT NOT NULL DEFAULT 'pending',
     input_sha256 TEXT NOT NULL,
+    input_json TEXT,
     output_sha256 TEXT,
     output_json TEXT,
     started_at TEXT,
@@ -492,6 +493,8 @@ MIGRATIONS = [
         updated_at TEXT NOT NULL
     )""",
     "CREATE INDEX IF NOT EXISTS idx_epf_jobs_task ON epf_jobs(task_id)",
+    # the assignment of a stage done outside PromptPilot (issue #122)
+    "ALTER TABLE workflow_runs ADD COLUMN input_json TEXT",
     # what the agent run may do (models.TaskRights); NULL = skip_permissions decides
     "ALTER TABLE tasks ADD COLUMN rights TEXT",
     # flow notifications carry "<item>:<step>" (approval) or "<item>:" (stuck item)
@@ -4939,6 +4942,7 @@ def _row_to_workflow_round(row: sqlite3.Row) -> WorkflowRoundInDB:
 
 def _row_to_workflow_run(row: sqlite3.Row) -> WorkflowRunInDB:
     data = dict(row)
+    data["input"] = _json_load(data.pop("input_json", None), None)
     data["output"] = _json_load(data.pop("output_json"), None)
     for field in ("started_at", "completed_at"):
         data[field] = _parse_dt(data[field])

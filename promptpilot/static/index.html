@@ -2259,7 +2259,7 @@ function workflowSettingsHtml(wf) {
     </div>
     <div class="wf-actions"><button class="btn btn-sm btn-primary" onclick="wfSaveSettings()">Сохранить настройки</button>
       <button class="btn btn-sm btn-ghost" onclick="wfAdvance()">Запустить следующий автоматический переход</button></div>
-    <div class="wf-meta">Переменные шаблонов: {{objective}}, {{stage_code}}, {{stage_title}}, {{stage_goal}}, {{repository_path}}, {{candidate_branch}}, {{round_no}}, {{previous_review}}, {{executor_report}}, {{gate_evidence}}, {{open_findings}}.</div>
+    <div class="wf-meta">Переменные шаблонов: {{objective}}, {{stage_code}}, {{stage_title}}, {{stage_goal}}, {{repository_path}}, {{candidate_branch}}, {{round_no}}, {{previous_review}}, {{executor_report}}, {{gate_evidence}}, {{open_findings}}, {{previous_stages}}, {{stage_review}}, {{acceptance_gates}}.</div>
   </details>`;
 }
 
@@ -2276,6 +2276,7 @@ function workflowStatusInfo(status, reviewerDone = false, automation = {}) {
       : ['Ручные проверки', 'Выполните проверки и выберите Gate PASS или FAIL.'],
     reviewing: ['Независимое ревью', 'Следующее действие: запустить проверяющего.'],
     revision_required: ['Нужны исправления', 'Следующее действие: открыть новый раунд доработок.'],
+    awaiting_external: ['Ожидает внешнего результата', 'Этап выполняют вне PromptPilot. Следующее действие: сдать результат — дальше проверки и независимое ревью.'],
     awaiting_human: reviewerDone
       ? ['Ожидается вердикт ревью', 'Следующее действие: принять, вернуть на доработку или запросить решение человека.']
       : ['Ожидается ваше решение', 'Предыдущая попытка не завершила этап. Следующее действие: продолжить текущий раунд.'],
@@ -2350,6 +2351,10 @@ function workflowOwnerInfo(wf, activeRun, reviewerDone, decisionState = {}) {
     who: 'Вы', detail: reviewerDone ? 'нужно зафиксировать решение по аудиту' : 'автоматический этап остановлен',
     next: reviewerDone ? 'Выбрать: принять / вернуть на доработку / нужен человек' : 'Проверить причину остановки', color: 'var(--red)',
   };
+  if (wf.status === 'awaiting_external') return {
+    who: 'Внешний исполнитель', detail: 'задание выдано, ждём результат — процесс не занят',
+    next: 'Дальше: сдать результат → gate → независимый аудитор', color: 'var(--yellow)',
+  };
   if (wf.status === 'revision_required') return {
     who: 'Вы', detail: 'аудитор вернул результат на доработку',
     next: 'Открыть следующий раунд исполнителя', color: 'var(--red)',
@@ -2415,6 +2420,7 @@ function workflowStageEditorCard(stage = {}, index = 0, frozen = false) {
       <input data-field="code" value="${escAttr(stage.code || '')}" placeholder="Код">
       <input data-field="title" value="${escAttr(stage.title || '')}" placeholder="Название">
       <select data-field="stage_type"><option value="implementation"${stage.stage_type !== 'integration' ? ' selected' : ''}>implementation</option><option value="integration"${stage.stage_type === 'integration' ? ' selected' : ''}>integration</option></select>
+      <select data-field="execution_mode" title="Кто выполняет этап"><option value="automatic"${stage.execution_mode !== 'external' ? ' selected' : ''}>исполняет агент</option><option value="external"${stage.execution_mode === 'external' ? ' selected' : ''}>вне PromptPilot</option></select>
       <textarea class="wide" data-field="objective" placeholder="Проверяемая цель">${esc(stage.objective || '')}</textarea>
       <input class="wide" data-field="dependencies" value="${escAttr((stage.dependencies || []).join(', '))}" placeholder="Зависимости: S1, S2">
       <textarea class="wide" data-field="allowed_paths" placeholder="Разрешённые пути — по одному на строку">${esc((stage.allowed_paths || []).join('\n'))}</textarea>
@@ -2435,7 +2441,7 @@ function workflowPlanHtml(wf, plan, stages) {
   // F5: живой план с allow_editing_approved_plan — редактор хвоста
   const amendable = !editable && wf.config?.planning?.allow_editing_approved_plan
     && plan?.status === 'approved' && stages.some(st => st.id === wf.current_stage_id)
-    && ['queued','executing','gating','reviewing','revision_required','awaiting_human'].includes(wf.status);
+    && ['queued','executing','gating','reviewing','revision_required','awaiting_human','awaiting_external'].includes(wf.status);
   const frozenN = amendable ? (() => {
     let n = 0;
     for (const st of stages) { n++; if (st.id === wf.current_stage_id) break; }
@@ -2451,6 +2457,7 @@ function workflowPlanHtml(wf, plan, stages) {
     acceptance_gates: st.acceptance_gates || [],
     executor_prompt: st.executor_prompt || '', reviewer_prompt: st.reviewer_prompt || '',
     max_revision_rounds: st.max_revision_rounds || null,
+    execution_mode: st.execution_mode || 'automatic',
   })) : null;
   // U1: монотонный собственный % прогресса на каждой карточке (переходы видны)
   const total = Math.max(stages.length, 1);
@@ -2468,7 +2475,7 @@ function workflowPlanHtml(wf, plan, stages) {
       <div class="wf-stage-title">${index + 1}/${total} · ${Math.max(0, pct)}% <span class="task-status" data-s="${escAttr(stage.status)}">${esc(stage.status)}</span></div>
       <div style="font-weight:600;margin:2px 0">${esc(stage.code)} · ${esc(stage.title)}</div>
       <div class="wf-round-summary" style="display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden">${esc(shortGoal)}</div>
-      <div class="wf-meta">${esc(stage.stage_type)} · gate: ${(stage.acceptance_gates || []).length} · возвратов: ${stage.max_revision_rounds || wf.config?.planning?.max_revisions_per_stage || 3}</div>
+      <div class="wf-meta">${esc(stage.stage_type)}${stage.execution_mode === 'external' ? ' · вне PromptPilot' : ''} · gate: ${(stage.acceptance_gates || []).length} · возвратов: ${stage.max_revision_rounds || wf.config?.planning?.max_revisions_per_stage || 3}</div>
     </div>`;
   }).join('');
   const controls = editable ? `<div class="wf-actions">
@@ -2484,6 +2491,27 @@ function workflowPlanHtml(wf, plan, stages) {
   return `<div class="wf-section-title">План этапов · ${stages.length}</div>
     ${editable ? '<div class="wf-meta">Последний этап должен иметь тип integration. Gate-команды выполняются только после ручного утверждения плана.</div>' : ''}
     <div class="wf-stage-list" id="wfStageList">${cards || '<div class="wf-meta">Планировщик ещё не сформировал этапы.</div>'}</div>${controls}`;
+}
+
+function workflowExternalFormHtml(wf, runs) {
+  const run = [...runs].reverse().find(r => r.input?.execution_mode === 'external'
+    && r.status === 'awaiting_external' && r.round_id === wf.current_round_id)
+    || [...runs].reverse().find(r => r.input?.execution_mode === 'external' && r.status === 'awaiting_external');
+  if (!run) return '<div class="wf-meta">Нет активного внешнего задания. Обновите workflow.</div>';
+  const id = escAttr(run.id);
+  const token = [wf.id, run.id, wf.state_version, run.input_sha256].map(x => escAttr(JSON.stringify(x))).join(', ');
+  return `<div class="wf-stage" style="border-color:var(--yellow)">
+    <b>Задание для внешнего исполнителя</b> ? попытка ${run.attempt_no}
+    <div class="result-block"><pre id="wfExternalAssignment">${esc(run.input?.assignment || '')}</pre></div>
+    <button class="btn btn-sm btn-ghost" onclick="wfCopyAssignment()">Скопировать задание</button>
+  </div><div class="wf-form wide" id="wfExternalForm-${id}"
+      data-workflow="${escAttr(wf.id)}" data-run="${id}" data-version="${wf.state_version}"
+      data-input-sha="${escAttr(run.input_sha256)}">
+    <textarea class="wide" id="wfExternalResult-${id}" placeholder="Результат, факты и ссылки"></textarea>
+    <input id="wfExternalPerformer-${id}" placeholder="Кто выполнил">
+    <input class="wide" id="wfExternalComment-${id}" placeholder="Комментарий (необязательно)">
+    <button class="btn btn-sm btn-primary" onclick="wfSubmitExternal(${token})">Сдать результат</button>
+  </div>`;
 }
 
 function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, plannerTask, orphanPane = null) {
@@ -2519,6 +2547,10 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, 
       : `<button class="btn btn-sm btn-primary" onclick="wfStart()">Начать первый раунд</button>`;
   } else if (wf.status === 'awaiting_human' && plan?.status === 'failed' && !wf.current_round) {
     action = plannerForm;
+  } else if (wf.status === 'awaiting_external') {
+    action = workflowExternalFormHtml(wf, runs);
+  } else if (wf.status === 'queued' && stage.execution_mode === 'external') {
+    action = `<div class="wf-form"><button class="btn btn-sm btn-primary" onclick="wfRequestExternal()">Выдать задание внешнему исполнителю</button></div>`;
   } else if (['queued','reviewing'].includes(wf.status)) {
     const role = wf.status === 'queued' ? 'executor' : 'reviewer';
     action = `<div class="wf-form wide">
@@ -2555,7 +2587,7 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, 
       <button class="btn btn-sm btn-ghost wide" onclick="wfReview('HUMAN_REQUIRED')">Нужен человек</button></div>`;
   }
   const runRows = (plannerTask ? [`<div class="wf-round${plannerRun ? ' current' : ''}"><b>planner</b> · ${esc(plannerTask.status)} · task #${plannerTask.id}</div>`] : [])
-    .concat(runs.map(r => `<div class="wf-round${r === activeRun ? ' current' : ''}"><b>${esc(r.role)} · попытка ${r.attempt_no}</b> · ${esc(r.status)}${r.task_id ? ` · task #${r.task_id}` : ''}</div>`)).join('');
+    .concat(runs.map(r => `<div class="wf-round${r === activeRun ? ' current' : ''}"><b>${esc(r.role)} · попытка ${r.attempt_no}</b> · ${esc(r.status)}${r.task_id ? ` · task #${r.task_id}` : ''}${r.input?.execution_mode === 'external' ? ` · вне PromptPilot${r.output?.external?.performer ? ': ' + esc(r.output.external.performer) : ''}` : ''}</div>`)).join('');
   const eventRows = [...events].reverse().slice(0, 30).map(e => `<div class="wf-event"><code>${esc(e.event_type)}</code> · ${formatTime(e.created_at)}</div>`).join('');
   const historyRows = pastRounds.map(r => workflowRoundRow(r)).join('');
   // Scroll-jump fix: the 5s auto-refresh rebuilds this pane from scratch.
@@ -2785,6 +2817,7 @@ function wfCollectPlanStages() {
     return {
       code: value('code'), title: value('title'), objective: value('objective'),
       stage_type: value('stage_type') || 'implementation',
+      execution_mode: value('execution_mode') || 'automatic',
       dependencies: wfStageListValue(card, 'dependencies', true),
       allowed_paths: wfStageListValue(card, 'allowed_paths'),
       deliverables: wfStageListValue(card, 'deliverables'),
@@ -2809,6 +2842,7 @@ function wfCollectAmendStages() {
     return {
       code: value('code'), title: value('title'), objective: value('objective'),
       stage_type: card.querySelector('[data-field="stage_type"]')?.value || 'implementation',
+      execution_mode: value('execution_mode') || 'automatic',
       dependencies: comma('dependencies'),
       allowed_paths: lines('allowed_paths'), deliverables: lines('deliverables'),
       acceptance_gates: lines('acceptance_gates'),
@@ -2904,6 +2938,25 @@ function wfResume() {
 function wfGate(verdict) { return wfPost('gate', {expected_version: selectedWorkflowData.state_version, verdict, gate_id: 'ui-manual-gate', summary: document.getElementById('wfDecisionSummary').value}); }
 function wfReview(verdict) { return wfPost('review', {expected_version: selectedWorkflowData.state_version, verdict, summary: document.getElementById('wfDecisionSummary').value, findings: []}); }
 function wfCancel() { if (confirm('Отменить workflow и все его активные задачи?')) return wfPost('cancel', {expected_version: selectedWorkflowData.state_version}); }
+function wfRequestExternal() { return wfPost('external-request', {expected_version: selectedWorkflowData.state_version}); }
+function wfSubmitExternal(workflowId, runId, expectedVersion, inputSha) {
+  if (workflowId !== selectedWorkflowId || !Number.isInteger(expectedVersion)) return;
+  const form = document.getElementById(`wfExternalForm-${runId}`);
+  if (!form || form.dataset.workflow !== workflowId || form.dataset.run !== runId
+      || form.dataset.version !== String(expectedVersion) || form.dataset.inputSha !== inputSha) return;
+  const result = document.getElementById(`wfExternalResult-${runId}`).value;
+  if (!result.trim()) { toast('Пустой результат'); return; }
+  return wfPost('external-result', {
+    expected_version: expectedVersion, run_id: runId, input_sha256: inputSha, result,
+    performer: document.getElementById(`wfExternalPerformer-${runId}`).value,
+    comment: document.getElementById(`wfExternalComment-${runId}`).value,
+  });
+}
+async function wfCopyAssignment() {
+  const text = document.getElementById('wfExternalAssignment')?.textContent || '';
+  try { await navigator.clipboard.writeText(text); toast('Задание скопировано', false); }
+  catch (e) { toast('Не удалось скопировать: выделите текст вручную.'); }
+}
 
 async function wfDispatch(role) {
   const provider = document.getElementById('wfProvider').value;

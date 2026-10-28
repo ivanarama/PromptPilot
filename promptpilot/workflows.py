@@ -27,6 +27,9 @@ from .models import (
     TaskCreate,
     WorkflowDispatchResult,
     WorkflowEventCreate,
+    WorkflowExecutionMode,
+    WorkflowExternalAssignment,
+    WorkflowExternalResult,
     WorkflowFindingInDB,
     WorkflowHistoryImport,
     WorkflowHumanInput,
@@ -75,6 +78,14 @@ ALLOWED_TRANSITIONS = {
     },
     WorkflowStatus.QUEUED: {
         WorkflowStatus.EXECUTING,
+        WorkflowStatus.AWAITING_EXTERNAL,
+        WorkflowStatus.AWAITING_HUMAN,
+        WorkflowStatus.CANCELLED,
+    },
+    # A stage done outside PromptPilot: its handed-in result goes through the
+    # same gate and independent review as an agent's.
+    WorkflowStatus.AWAITING_EXTERNAL: {
+        WorkflowStatus.GATING,
         WorkflowStatus.AWAITING_HUMAN,
         WorkflowStatus.CANCELLED,
     },
@@ -169,7 +180,9 @@ DEFAULT_PLANNER_PROMPT = """Ты — ведущий инженер-планир�
 Верни план между маркерами строго как JSON-объект {"stages": [...]}.
 Для каждого этапа обязательны code, title, objective; доступны stage_type
 (implementation/integration), dependencies, allowed_paths, deliverables,
-acceptance_gates, executor_prompt, reviewer_prompt, max_revision_rounds.
+acceptance_gates, executor_prompt, reviewer_prompt, max_revision_rounds,
+execution_mode (automatic — делает агент PromptPilot; external — этап выполнит
+человек или внешний инструмент, PromptPilot выдаст задание и примет результат).
 """ + STAGE_PROMPTS_NOTE + "\n"
 
 PLAN_OUTPUT_CONTRACT = """
@@ -202,6 +215,40 @@ DEFAULT_EXECUTOR_PROMPT = """Ты — исполнитель в автономн
 проверяемых фактов. В итоговом ответе перечисли изменения, команды проверок,
 commit SHA, незакрытые ограничения и пути к evidence.
 """
+
+DEFAULT_EXTERNAL_PROMPT = """Задание для внешнего исполнителя (workflow PromptPilot).
+
+Общая цель: {{objective}}
+Этап: {{stage_code}} {{stage_title}}
+Цель этапа: {{stage_goal}}
+Ожидаемые результаты: {{deliverables}}
+Ограничения — разрешённые пути: {{allowed_paths}}
+Критерии приёмки — проверки: {{acceptance_gates}}
+Раунд: {{round_no}}
+
+Результаты предыдущих этапов:
+{{previous_stages}}
+
+Замечания независимого аудита к прошлой попытке этого этапа:
+{{stage_review}}
+
+Результаты предыдущих автоматических проверок:
+{{gate_evidence}}
+
+Верните результат текстом: что сделано, выводы и факты, на которых они
+основаны, ссылки на материалы. Результат пройдёт автоматические проверки и
+независимое ревью; при замечаниях этап вернётся к вам на доработку.
+"""
+
+EXTERNAL_REVIEW_NOTICE = """
+
+<внешний-исполнитель>
+Этот этап выполнен вне PromptPilot, результат сдан вручную.
+Исполнитель: {performer}
+Комментарий: {comment}
+Проверяй сам результат по цели и критериям этапа: изменений в репозитории
+может не быть.
+</внешний-исполнитель>"""
 
 # The auditor's answer format. Every reviewer prompt carries it exactly once,
 # whatever the role template or stage text says (``{{audit_contract}}``).
@@ -784,6 +831,7 @@ def amend_plan(workflow_id: str,
             WorkflowStatus.QUEUED, WorkflowStatus.EXECUTING,
             WorkflowStatus.GATING, WorkflowStatus.REVIEWING,
             WorkflowStatus.REVISION_REQUIRED, WorkflowStatus.AWAITING_HUMAN,
+            WorkflowStatus.AWAITING_EXTERNAL,
         }
         if not live:
             raise db.WorkflowConflictError(
@@ -1030,6 +1078,11 @@ def dispatch_task(workflow_id: str,
                   dispatch: WorkflowTaskDispatch) -> WorkflowDispatchResult:
     if dispatch.role not in {WorkflowRole.EXECUTOR, WorkflowRole.REVIEWER}:
         raise db.WorkflowConflictError("W1 can dispatch only executor or reviewer")
+    external = dispatch.execution_mode is WorkflowExecutionMode.EXTERNAL
+    if external and dispatch.role is not WorkflowRole.EXECUTOR:
+        raise db.WorkflowConflictError(
+            "only the executor can work outside PromptPilot; review stays independent"
+        )
     if dispatch.role is WorkflowRole.REVIEWER and dispatch.skip_permissions:
         raise db.WorkflowConflictError(
             "reviewer cannot use skip_permissions in the W1 manual pilot"
@@ -1053,6 +1106,8 @@ def dispatch_task(workflow_id: str,
             )
         round_row = _current_round_row(conn, workflow)
         working_dir = dispatch.working_dir or workflow["repository_path"]
+        if external:
+            return _open_external_run(conn, workflow, round_row, dispatch, working_dir)
         task = db._insert_task(conn, TaskCreate(
             prompt=dispatch.prompt.rstrip() + WORKFLOW_VERDICT_INSTRUCTION,
             working_dir=working_dir,
@@ -1136,6 +1191,162 @@ def dispatch_task(workflow_id: str,
             run=db._row_to_workflow_run(run_row),
             task=task,
         )
+
+
+def _open_external_run(conn: sqlite3.Connection, workflow: sqlite3.Row,
+                       round_row: sqlite3.Row, dispatch: WorkflowTaskDispatch,
+                       working_dir: str) -> WorkflowDispatchResult:
+    """Hand the stage out: a run with the assignment and no queue task.
+
+    The wait survives restarts (it is only rows) and holds no CLI process.
+    """
+    attempt_no = conn.execute(
+        """SELECT COALESCE(MAX(attempt_no), 0) + 1
+           FROM workflow_runs WHERE round_id = ? AND role = 'executor'""",
+        (round_row["id"],),
+    ).fetchone()[0]
+    run_id = db._new_id("run")
+    input_sha = _input_sha(dispatch, working_dir)
+    assignment = dispatch.prompt.strip()
+    conn.execute(
+        """INSERT INTO workflow_runs
+           (id, workflow_id, round_id, role, attempt_no, task_id, status,
+            input_sha256, input_json, started_at)
+           VALUES (?, ?, ?, 'executor', ?, NULL, 'awaiting_external', ?, ?, ?)""",
+        (run_id, workflow["id"], round_row["id"], attempt_no, input_sha,
+         db._json_dump({"execution_mode": "external", "assignment": assignment}),
+         db._now()),
+    )
+    db._append_workflow_event(conn, WorkflowEventCreate(
+        workflow_id=workflow["id"],
+        round_id=round_row["id"],
+        run_id=run_id,
+        event_type="run.created",
+        idempotency_key=f"run.created:{run_id}",
+        payload={"role": "executor", "attempt_no": attempt_no,
+                 "execution_mode": "external", "input_sha256": input_sha},
+    ))
+    conn.execute(
+        "UPDATE workflow_rounds SET status = 'executing' WHERE id = ?",
+        (round_row["id"],),
+    )
+    workflow = _transition(
+        conn, workflow, WorkflowStatus.AWAITING_EXTERNAL, "external.requested",
+        {"run_id": run_id, "attempt_no": attempt_no},
+        round_id=round_row["id"],
+    )
+    run_row = conn.execute(
+        "SELECT * FROM workflow_runs WHERE id = ?", (run_id,)
+    ).fetchone()
+    round_row = conn.execute(
+        "SELECT * FROM workflow_rounds WHERE id = ?", (round_row["id"],)
+    ).fetchone()
+    return WorkflowDispatchResult(
+        workflow=db._row_to_workflow(workflow),
+        round=db._row_to_workflow_round(round_row),
+        run=db._row_to_workflow_run(run_row),
+        task=None,
+    )
+
+
+def request_external(workflow_id: str, expected_version: int) -> WorkflowInDB:
+    """Hand the current stage out of PromptPilot (manual mode or a manual retry)."""
+    workflow = db.get_workflow(workflow_id)
+    if not workflow:
+        raise db.WorkflowNotFoundError(workflow_id)
+    if workflow.state_version != expected_version:
+        raise db.WorkflowConflictError(
+            f"workflow version is {workflow.state_version}, expected {expected_version}"
+        )
+    return _dispatch_configured_role(
+        workflow, WorkflowRole.EXECUTOR, external=True
+    ).workflow
+
+
+def external_assignment(workflow_id: str) -> Optional[WorkflowExternalAssignment]:
+    """The assignment of the current round's latest external run, if there is one."""
+    with db._connect() as conn:
+        workflow = _workflow_row(conn, workflow_id)
+        if not workflow["current_round"]:
+            return None
+        round_row = _current_round_row(conn, workflow)
+        run = conn.execute(
+            """SELECT * FROM workflow_runs WHERE round_id = ? AND role = 'executor'
+               AND input_json IS NOT NULL ORDER BY attempt_no DESC LIMIT 1""",
+            (round_row["id"],),
+        ).fetchone()
+        stage = (conn.execute("SELECT * FROM workflow_stages WHERE id = ?",
+                              (workflow["current_stage_id"],)).fetchone()
+                 if workflow["current_stage_id"] else None)
+    if not run:
+        return None
+    data = db._json_load(run["input_json"])
+    if data.get("execution_mode") != "external":
+        return None
+    return WorkflowExternalAssignment(
+        workflow_id=workflow_id, run_id=run["id"], round_no=round_row["round_no"],
+        expected_version=workflow["state_version"], input_sha256=run["input_sha256"],
+        attempt_no=run["attempt_no"], status=run["status"],
+        stage_code=stage["code"] if stage else "", stage_title=stage["title"] if stage else "",
+        assignment=data.get("assignment", ""),
+    )
+
+
+def submit_external_result(workflow_id: str,
+                           submission: WorkflowExternalResult) -> WorkflowInDB:
+    """Accept the result of an external stage; it goes on to gate and review.
+
+    Handing a result in does not complete the stage: an independent review
+    decides that, and may send the stage back out for revision.
+    """
+    with db._connect(immediate=True) as conn:
+        workflow = _workflow_row(conn, workflow_id)
+        _require_version(workflow, submission.expected_version)
+        if WorkflowStatus(workflow["status"]) is not WorkflowStatus.AWAITING_EXTERNAL:
+            raise db.WorkflowConflictError(
+                "workflow is not waiting for an external result"
+            )
+        round_row = _current_round_row(conn, workflow)
+        run = conn.execute(
+            """SELECT * FROM workflow_runs WHERE round_id = ? AND role = 'executor'
+               AND status = 'awaiting_external' ORDER BY attempt_no DESC LIMIT 1""",
+            (round_row["id"],),
+        ).fetchone()
+        if not run:
+            raise db.WorkflowConflictError("current round has no external assignment")
+        if run["id"] != submission.run_id or run["input_sha256"] != submission.input_sha256:
+            raise db.WorkflowConflictError("external assignment identity changed; load its actual assignment")
+        if not submission.result.strip():
+            raise db.WorkflowConflictError("external result cannot be blank")
+        external = {"performer": submission.performer.strip(),
+                    "comment": submission.comment.strip()}
+        output = {"task_status": "completed", "result": submission.result,
+                  "error": None, "verdict": "ГОТОВО", "external": external}
+        output_json = db._json_dump(output)
+        output_sha = hashlib.sha256(output_json.encode("utf-8")).hexdigest()
+        conn.execute(
+            """UPDATE workflow_runs SET status = 'completed', output_json = ?,
+               output_sha256 = ?, completed_at = ? WHERE id = ?""",
+            (output_json, output_sha, db._now(), run["id"]),
+        )
+        db._append_workflow_event(conn, WorkflowEventCreate(
+            workflow_id=workflow_id,
+            round_id=round_row["id"],
+            run_id=run["id"],
+            event_type="run.completed",
+            idempotency_key=f"run.completed:{run['id']}:external",
+            payload={"execution_mode": "external", "output_sha256": output_sha},
+        ))
+        conn.execute(
+            "UPDATE workflow_rounds SET status = 'gating' WHERE id = ?",
+            (round_row["id"],),
+        )
+        workflow = _transition(
+            conn, workflow, WorkflowStatus.GATING, "external.submitted",
+            {"run_id": run["id"], "output_sha256": output_sha, **external},
+            round_id=round_row["id"],
+        )
+        return db._row_to_workflow(workflow)
 
 
 def record_gate(workflow_id: str,
@@ -1364,82 +1575,102 @@ def record_review(workflow_id: str,
                 raise db.WorkflowConflictError(
                     f"review cannot pass with {blockers} open blocker/high findings"
                 )
-            # No-diff привязан к конкретному executor run: PASS без
-            # доказанных изменений данного запуска — холостой исход; чужая
-            # заранее существовавшая грязь автопассом не считается.
-            # Проверки происхождения выполняются и при allow_no_diff:
-            # явное подтверждение «принимаю без изменений» не может
-            # подтверждать НЕИЗВЕСТНУЮ базу рана.
-            executor_task = _latest_completed_executor_with_run(
-                conn, round_row["id"])
-            check_dir = (
-                (executor_task["worktree_path"]
-                 or executor_task["working_dir"])
-                if executor_task else workflow["repository_path"])
-            snapshot = (
-                _executor_before_snapshot(
-                    conn, round_row["id"], executor_task["run_id"])
-                if executor_task else None)
-            run_changes = _executor_run_changes(
-                check_dir, snapshot, round_row["base_sha"])
-            if run_changes["available"] and snapshot is None:
-                workflow = _touch(
-                    conn, workflow, "review.diff_origin_unknown",
-                    {
-                        "reason": (
-                            "База рана неизвестна: снимок дерева до запуска "
-                            "исполнителя отсутствует (легаси-раунд), "
-                            "доказать ни отсутствие изменений, ни их "
-                            "происхождение нельзя. Авто-PASS запрещён; "
-                            "явное allow_no_diff неизвестное не "
-                            "подтверждает. Перезапустите раунд (resume) — "
-                            "новый запуск получит снимок старта"
-                        ),
-                        "round_no": round_row["round_no"],
-                        "changed_sample": run_changes["changed"][:20],
-                    },
-                    round_id=round_row["id"],
-                    run_id=reviewer["id"],
-                )
-                return db._row_to_workflow(workflow)
-            if run_changes["available"] and run_changes["unknown"]:
-                workflow = _touch(
-                    conn, workflow, "review.diff_origin_unknown",
-                    {
-                        "reason": (
-                            "Ревьюер дал PASS, в дереве есть изменения "
-                            f"({len(run_changes['changed'])} путей), но "
-                            "доказать, что их сделал именно этот запуск "
-                            "исполнителя, нельзя (снимок до запуска "
-                            "либо итоговый снимок обрезан или недоступен). Неизвестное происхождение требует "
-                            "человека; перезапустите раунд (resume)"
-                        ),
-                        "round_no": round_row["round_no"],
-                        "changed_sample": run_changes["changed"][:20],
-                    },
-                    round_id=round_row["id"],
-                    run_id=reviewer["id"],
-                )
-                return db._row_to_workflow(workflow)
-            if (run_changes["available"] and not run_changes["changed"]
-                    and not decision.allow_no_diff):
-                workflow = _touch(
-                    conn, workflow, "review.no_diff",
-                    {
-                        "reason": (
-                            "Ревьюер дал PASS, но данный запуск "
-                            "исполнителя не изменил ни одного файла "
-                            "(сравнение с снимком до запуска: diff пуст). "
-                            "Холостой PASS запрещён: проверьте работу "
-                            "исполнителя или подтвердите приём без "
-                            "изменений явно (allow_no_diff)"
-                        ),
-                        "round_no": round_row["round_no"],
-                    },
-                    round_id=round_row["id"],
-                    run_id=reviewer["id"],
-                )
-                return db._row_to_workflow(workflow)
+            external_run = conn.execute(
+                """SELECT * FROM workflow_runs WHERE round_id=? AND role='executor'
+                   ORDER BY attempt_no DESC LIMIT 1""", (round_row["id"],),
+            ).fetchone()
+            external_result = bool(
+                external_run and external_run["status"] == "completed"
+                and external_run["task_id"] is None
+                and (db._json_load(external_run["input_json"]) or {}).get("execution_mode") == "external"
+                and (db._json_load(external_run["output_json"]) or {}).get("external") is not None
+                and hashlib.sha256(external_run["output_json"].encode("utf-8")).hexdigest()
+                    == external_run["output_sha256"]
+            )
+            if external_result:
+                # Accept the submitted text, not any files currently in the repo.
+                # A taskless external run has no attributable repository diff.
+                check_dir = workflow["repository_path"]
+                run_changes = {"available": False, "changed": [], "unknown": False}
+                common["external_result_run_id"] = external_run["id"]
+                common["external_result_sha256"] = external_run["output_sha256"]
+            else:
+                # No-diff привязан к конкретному executor run: PASS без
+                # доказанных изменений данного запуска — холостой исход; чужая
+                # заранее существовавшая грязь автопассом не считается.
+                # Проверки происхождения выполняются и при allow_no_diff:
+                # явное подтверждение «принимаю без изменений» не может
+                # подтверждать НЕИЗВЕСТНУЮ базу рана.
+                executor_task = _latest_completed_executor_with_run(
+                    conn, round_row["id"])
+                check_dir = (
+                    (executor_task["worktree_path"]
+                     or executor_task["working_dir"])
+                    if executor_task else workflow["repository_path"])
+                snapshot = (
+                    _executor_before_snapshot(
+                        conn, round_row["id"], executor_task["run_id"])
+                    if executor_task else None)
+                run_changes = _executor_run_changes(
+                    check_dir, snapshot, round_row["base_sha"])
+                if run_changes["available"] and snapshot is None:
+                    workflow = _touch(
+                        conn, workflow, "review.diff_origin_unknown",
+                        {
+                            "reason": (
+                                "База рана неизвестна: снимок дерева до запуска "
+                                "исполнителя отсутствует (легаси-раунд), "
+                                "доказать ни отсутствие изменений, ни их "
+                                "происхождение нельзя. Авто-PASS запрещён; "
+                                "явное allow_no_diff неизвестное не "
+                                "подтверждает. Перезапустите раунд (resume) — "
+                                "новый запуск получит снимок старта"
+                            ),
+                            "round_no": round_row["round_no"],
+                            "changed_sample": run_changes["changed"][:20],
+                        },
+                        round_id=round_row["id"],
+                        run_id=reviewer["id"],
+                    )
+                    return db._row_to_workflow(workflow)
+                if run_changes["available"] and run_changes["unknown"]:
+                    workflow = _touch(
+                        conn, workflow, "review.diff_origin_unknown",
+                        {
+                            "reason": (
+                                "Ревьюер дал PASS, в дереве есть изменения "
+                                f"({len(run_changes['changed'])} путей), но "
+                                "доказать, что их сделал именно этот запуск "
+                                "исполнителя, нельзя (снимок до запуска "
+                                "либо итоговый снимок обрезан или недоступен). Неизвестное происхождение требует "
+                                "человека; перезапустите раунд (resume)"
+                            ),
+                            "round_no": round_row["round_no"],
+                            "changed_sample": run_changes["changed"][:20],
+                        },
+                        round_id=round_row["id"],
+                        run_id=reviewer["id"],
+                    )
+                    return db._row_to_workflow(workflow)
+                if (run_changes["available"] and not run_changes["changed"]
+                        and not decision.allow_no_diff):
+                    workflow = _touch(
+                        conn, workflow, "review.no_diff",
+                        {
+                            "reason": (
+                                "Ревьюер дал PASS, но данный запуск "
+                                "исполнителя не изменил ни одного файла "
+                                "(сравнение с снимком до запуска: diff пуст). "
+                                "Холостой PASS запрещён: проверьте работу "
+                                "исполнителя или подтвердите приём без "
+                                "изменений явно (allow_no_diff)"
+                            ),
+                            "round_no": round_row["round_no"],
+                        },
+                        round_id=round_row["id"],
+                        run_id=reviewer["id"],
+                    )
+                    return db._row_to_workflow(workflow)
             conn.execute(
                 """UPDATE workflow_rounds SET status = 'completed',
                    completed_at = ?, summary_json = ? WHERE id = ?""",
@@ -1471,7 +1702,7 @@ def record_review(workflow_id: str,
                 # миссия НЕ уходит в очередь: следующая стадия недоступна
                 # воркеру, вердикт повторно не применяется. Флаг
                 # automation.stage_checkpoint, по умолчанию ВЫКЛ.
-                if (_config_for(db._row_to_workflow(workflow))
+                if (not external_result and _config_for(db._row_to_workflow(workflow))
                         .automation.stage_checkpoint):
                     spec = db._json_load(current_stage["spec_json"]) or {}
                     checkpoint_deferred = {
@@ -1905,6 +2136,11 @@ def cancel_workflow(workflow_id: str,
                 "UPDATE workflow_plans SET status='cancelled', updated_at=? WHERE workflow_id=?",
                 (db._now(), workflow_id),
             )
+        conn.execute(
+            """UPDATE workflow_runs SET status = 'cancelled', completed_at = ?
+               WHERE workflow_id = ? AND status = 'awaiting_external'""",
+            (db._now(), workflow_id),
+        )
         round_row = None
         if workflow["current_round"]:
             round_row = _current_round_row(conn, workflow)
@@ -2071,6 +2307,54 @@ def _latest_gate_evidence(workflow_id: str, *, before_round: int = None) -> str:
     evidence = payload.get("evidence") or []
     return summary + ("\n" + "\n".join(evidence) if evidence else "")
 
+
+def _previous_stage_results(workflow: WorkflowInDB, limit: int = 3000) -> str:
+    """What the stages already completed produced (their accepted executor reports)."""
+    stages = [stage for stage in db.list_workflow_stages(workflow.id)
+              if stage.status.value == "completed"]
+    if not stages:
+        return "(нет: это первый этап)"
+    with db._connect() as conn:
+        blocks = []
+        for stage in stages:
+            row = conn.execute(
+                """SELECT r.output_json FROM workflow_runs r
+                   JOIN workflow_rounds rd ON rd.id = r.round_id
+                   WHERE rd.stage_id = ? AND r.role = 'executor' AND r.status = 'completed'
+                   ORDER BY rd.round_no DESC, r.attempt_no DESC LIMIT 1""",
+                (stage.id,),
+            ).fetchone()
+            report = (db._json_load(row["output_json"]).get("result") if row else "") or "(нет отчёта)"
+            blocks.append(f"{stage.code} {stage.title}:\n{report[:limit]}")
+    return "\n\n".join(blocks)
+
+
+def _stage_review_output(workflow: WorkflowInDB) -> str:
+    """The last review of an earlier round of the SAME stage — its remarks.
+
+    previous_review reaches across stages (the PASS report of the stage
+    before); a person doing this stage must not read that as remarks.
+    """
+    with db._connect() as conn:
+        current = conn.execute(
+            "SELECT stage_id FROM workflow_rounds WHERE workflow_id = ? AND round_no = ?",
+            (workflow.id, workflow.current_round),
+        ).fetchone()
+        if not current or not current["stage_id"]:
+            return _latest_run_output(workflow.id, WorkflowRole.REVIEWER,
+                                      before_round=workflow.current_round)
+        row = conn.execute(
+            """SELECT r.output_json FROM workflow_runs r
+               JOIN workflow_rounds rd ON rd.id = r.round_id
+               WHERE r.workflow_id = ? AND rd.stage_id = ? AND rd.round_no < ?
+                 AND r.role = 'reviewer' AND r.status = 'completed'
+               ORDER BY rd.round_no DESC, r.attempt_no DESC LIMIT 1""",
+            (workflow.id, current["stage_id"], workflow.current_round),
+        ).fetchone()
+    if not row:
+        return "(нет: это первая попытка этапа)"
+    output = db._json_load(row["output_json"])
+    return output.get("result") or output.get("error") or "(пустой отчёт)"
 
 _ROLE_DISPATCH_EVENT = {
     WorkflowRole.EXECUTOR: "executor.dispatched",
@@ -2613,7 +2897,7 @@ def _place_audit_contract(text: str, role: WorkflowRole) -> str:
 
 
 def _render_role_prompt(workflow: WorkflowInDB, role: WorkflowRole,
-                        template: str) -> str:
+                        template: str, *, external: bool = False) -> str:
     round_no = workflow.current_round
     stage_row = (
         db.get_workflow_stage(workflow.current_stage_id)
@@ -2644,6 +2928,9 @@ def _render_role_prompt(workflow: WorkflowInDB, role: WorkflowRole,
         "gate_evidence": _latest_gate_evidence(
             workflow.id, before_round=round_no
         ),
+        "acceptance_gates": "\n".join(stage.get("acceptance_gates") or []) or "(нет автоматических)",
+        "previous_stages": _previous_stage_results(workflow),
+        "stage_review": _stage_review_output(workflow),
         "open_findings": json.dumps([
             {
                 "fingerprint": finding.fingerprint,
@@ -2665,7 +2952,7 @@ def _render_role_prompt(workflow: WorkflowInDB, role: WorkflowRole,
             stage_row.executor_prompt
             if role is WorkflowRole.EXECUTOR else stage_row.reviewer_prompt
         ) or ""
-    base = stage_text or template or (
+    base = stage_text or (DEFAULT_EXTERNAL_PROMPT if external else template) or (
         DEFAULT_EXECUTOR_PROMPT
         if role is WorkflowRole.EXECUTOR else DEFAULT_REVIEWER_PROMPT
     )
@@ -2712,26 +2999,60 @@ def _render_role_prompt(workflow: WorkflowInDB, role: WorkflowRole,
             + _operator_notes_block(notes)
             + "\n</указания-оператора>"
         )
+    if role is WorkflowRole.REVIEWER:
+        handed_in = _latest_external_output(workflow)
+        if handed_in is not None:
+            rendered += EXTERNAL_REVIEW_NOTICE.format(
+                performer=handed_in.get("performer") or "not specified",
+                comment=handed_in.get("comment") or "none",
+            )
     return rendered.strip()
 
 
+def _latest_external_output(workflow: WorkflowInDB) -> Optional[dict]:
+    """performer/comment of the current round's result, if it was handed in."""
+    with db._connect() as conn:
+        row = conn.execute(
+            """SELECT r.output_json FROM workflow_runs r
+               JOIN workflow_rounds rd ON rd.id = r.round_id
+               WHERE r.workflow_id = ? AND rd.round_no = ? AND r.role = 'executor'
+                 AND r.status = 'completed'
+               ORDER BY r.attempt_no DESC LIMIT 1""",
+            (workflow.id, workflow.current_round),
+        ).fetchone()
+    if not row:
+        return None
+    return db._json_load(row["output_json"]).get("external")
+
+
+def _current_stage_external(workflow: WorkflowInDB) -> bool:
+    stage = (db.get_workflow_stage(workflow.current_stage_id)
+             if workflow.current_stage_id else None)
+    if stage is not None:
+        return stage.execution_mode is WorkflowExecutionMode.EXTERNAL
+    return (workflow.config.get("stage") or {}).get("execution_mode") == "external"
+
+
 def _dispatch_configured_role(workflow: WorkflowInDB,
-                              role: WorkflowRole) -> WorkflowDispatchResult:
+                              role: WorkflowRole, *,
+                              external: bool = False) -> WorkflowDispatchResult:
     config = _config_for(workflow)
     role_config = (
         config.roles.executor
         if role is WorkflowRole.EXECUTOR else config.roles.reviewer
     )
     provider = resolve_role_provider(workflow, role.value)
-    if provider == "herdr-session" and not role_config.herdr_target:
+    if not external and provider == "herdr-session" and not role_config.herdr_target:
         raise ValueError(
             f"autonomous {role.value} using herdr-session needs herdr_target"
         )
     return dispatch_task(workflow.id, WorkflowTaskDispatch(
         expected_version=workflow.state_version,
         role=role,
+        execution_mode=(WorkflowExecutionMode.EXTERNAL if external
+                        else WorkflowExecutionMode.AUTOMATIC),
         prompt=_render_role_prompt(
-            workflow, role, role_config.prompt_template
+            workflow, role, role_config.prompt_template, external=external
         ),
         provider=provider,
         priority=role_config.priority,
@@ -2976,7 +3297,8 @@ def advance_workflow(workflow_id: str, max_actions: int = 12) -> WorkflowInDB:
                 continue
 
             if workflow.status is WorkflowStatus.QUEUED:
-                if not config.automation.auto_dispatch_executor:
+                external = _current_stage_external(workflow)
+                if not external and not config.automation.auto_dispatch_executor:
                     return workflow
                 if config.planning.enabled and config.planning.require_approval:
                     with db._connect() as conn:
@@ -3004,7 +3326,11 @@ def advance_workflow(workflow_id: str, max_actions: int = 12) -> WorkflowInDB:
                                 round_id=round_row["id"] if round_row else None,
                             )
                         return db.get_workflow(workflow.id)
-                return _dispatch_configured_role(workflow, WorkflowRole.EXECUTOR).workflow
+                return _dispatch_configured_role(
+                    workflow, WorkflowRole.EXECUTOR, external=external).workflow
+
+            if workflow.status is WorkflowStatus.AWAITING_EXTERNAL:
+                return workflow  # the result comes in through submit_external_result
 
             if workflow.status is WorkflowStatus.GATING:
                 if not config.automation.auto_gate:
@@ -3408,6 +3734,8 @@ def workflow_report(workflow_id: str) -> dict:
         "rounds_imported": sum(bool(item.summary and item.summary.get("historical")) for item in rounds),
         "rounds_promptpilot": sum(not bool(item.summary and item.summary.get("historical")) for item in rounds),
         "executor_attempts": sum(run.role is WorkflowRole.EXECUTOR for run in runs),
+        "external_attempts": sum(
+            (run.input or {}).get("execution_mode") == "external" for run in runs),
         "reviewer_attempts": sum(run.role is WorkflowRole.REVIEWER for run in runs),
         "planner_attempts": event_counts["planner.dispatched"],
         "stages_total": len(stages),
@@ -3466,9 +3794,10 @@ def workflow_report_markdown(workflow_id: str) -> str:
     lines.extend(["", "## Stage plan", ""])
     if report["stages"]:
         for stage in report["stages"]:
+            mode = " · external" if stage.get("execution_mode") == "external" else ""
             lines.append(
                 f"- {stage['position']}. `{stage['code']}` — {stage['title']} "
-                f"[{stage['stage_type']}/{stage['status']}]: {stage['objective']}"
+                f"[{stage['stage_type']}/{stage['status']}{mode}]: {stage['objective']}"
             )
     else:
         lines.append("- No stage plan recorded.")
