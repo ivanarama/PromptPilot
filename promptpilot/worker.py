@@ -553,11 +553,21 @@ def parse_stream_json(stdout: str) -> dict:
             meta["is_error"] = event.get("is_error")
             meta["subtype"] = event.get("subtype")
             usage = event.get("usage", {})
-            meta["input_tokens"] = usage.get("input_tokens")
+            inputs = [usage.get("input_tokens"), usage.get("cache_read_input_tokens", 0),
+                      usage.get("cache_creation_input_tokens", 0)]
+            meta["input_tokens"] = (sum(inputs) if all(type(n) is int and n >= 0 for n in inputs)
+                                    else None)
+            meta["cached_input_tokens"] = inputs[1]
+            meta["cache_creation_input_tokens"] = inputs[2]
             meta["output_tokens"] = usage.get("output_tokens")
             model_usage = event.get("modelUsage", {})
-            if model_usage:
+            if len(model_usage) == 1:
                 meta["model"] = list(model_usage.keys())[0]
+            elif len(model_usage) > 1:
+                meta.pop("model", None)
+            # Aggregated multi-model usage and cache-write TTL mixtures cannot
+            # be honestly priced from these compact counters.
+            meta["cost_attributable"] = len(model_usage) <= 1 and not inputs[2]
             # Extract result text (always for errors, fallback for empty output)
             if event.get("result"):
                 if event.get("is_error") or not text_parts:
@@ -1416,6 +1426,13 @@ def _execute_herdr_task(task, provider_cfg, host=None, machine=None, prompt_over
             lambda: db.set_worktree(task.id, path, branch),
             f"сохранение worktree задачи #{task.id}",
         )
+        # Снимок фактического дерева старта рана (см. _execute_task_body):
+        # база доказательств no-diff/чекпоинта — дерево, где работает агент.
+        try:
+            from . import workflows as _workflows
+            _workflows.record_run_snapshot(task.id, path)
+        except Exception as exc:  # noqa: BLE001 — телеметрия
+            print(f"  !! run.snapshot #{task.id}: {exc}", flush=True)
         print(f"  -> Worktree {path} ({branch})")
 
     def on_started(_pane_id):
@@ -1839,6 +1856,17 @@ def _execute_task_body(task, admission_complete=None):
         wt_note = "\n\n" + worktree.summary(wt["path"], wt["branch"], wt["copied"])
         print(f"  -> Worktree {wt['path']} ({wt['branch']})")
 
+    # Доказательная база рана (no-diff/чекпоинт): снимок ФАКТИЧЕСКОГО дерева
+    # старта — в worktree, если он создан. Диспатч-снимок берётся раньше, из
+    # working_dir: между диспатчем и стартом воркера ветка успела уйти, и
+    # сравнение «до/после» без снимка старта приписывало сдвиг ветки
+    # исполнителю.
+    try:
+        from . import workflows as _workflows
+        _workflows.record_run_snapshot(task.id, run_dir)
+    except Exception as exc:  # noqa: BLE001 — телеметрия, не ломать запуск
+        print(f"  !! run.snapshot #{task.id}: {exc}", flush=True)
+
     try:
         cmd = build_cmd(provider, agent_prompt, skip_permissions=task.skip_permissions,
                         session_id=task.session_id, model=task.model, guard=not machine,
@@ -2123,6 +2151,7 @@ def _execute_task_body(task, admission_complete=None):
         return
 
     # Parse output
+    reported_usage = None
     model_used = None
     session_id = None
     if is_stream_json(result.stdout):
@@ -2136,6 +2165,7 @@ def _execute_task_body(task, admission_complete=None):
             parsed["meta"]["unrecognized_model"] = unrecognized
         output = format_result(parsed)
         verdict_source = parsed["text"]
+        reported_usage = parsed["meta"]
         model_used = parsed["meta"].get("model")
         session_id = parsed["meta"].get("session_id")
         # Check for rate limit in stream events — only if no text was returned
@@ -2219,7 +2249,7 @@ def _execute_task_body(task, admission_complete=None):
         "headless successful outcome",
         lambda: _mark_completed(
             task, output, exit_code=0, model_used=model_used,
-            session_id=session_id, verdict=verdict or None,
+            session_id=session_id, verdict=verdict or None, usage=reported_usage,
         ),
     )
     if changed:
