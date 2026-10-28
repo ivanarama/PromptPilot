@@ -703,6 +703,15 @@
         <input type="checkbox" id="skipPermissions" style="width:auto;margin:0" onchange="rememberSkipPermissions()">
         <span style="font-size:13px;color:var(--yellow)" title="Claude: --dangerously-skip-permissions; Codex: --dangerously-bypass-approvals-and-sandbox">⚠ не спрашивать разрешения</span>
       </label>
+      <label id="rightsLabel" style="display:none" title="Что агенту можно. Без инструментов — только текст; чтение — смотреть файлы; правка — менять файлы в папке задачи, не запуская команд; полные — всё. «Как обычно» — решает галочка «не спрашивать разрешения». Недоступное для провайдера неактивно.">Права
+        <select id="rightsInput">
+          <option value="">как обычно</option>
+          <option value="none">без инструментов</option>
+          <option value="read">только чтение</option>
+          <option value="write">правка файлов</option>
+          <option value="full">полные</option>
+        </select>
+      </label>
       <label id="keepPaneLabel" style="flex-direction:row;align-items:center;gap:8px;cursor:pointer;display:none">
         <input type="checkbox" id="keepPane" checked style="width:auto;margin:0">
         <span style="font-size:13px" title="Панель herdr останется открытой — можно вернуться и продолжить диалог">🖥 оставить сессию открытой</span>
@@ -1333,6 +1342,7 @@ async function addTask() {
         priority,
         working_dir: workdir,
         skip_permissions: skipPermissions,
+        rights: document.getElementById('rightsInput').value || null,
         keep_pane: document.getElementById('keepPane').checked,
         worktree: document.getElementById('worktree').checked,
         herdr_target: herdrTarget,
@@ -2057,14 +2067,17 @@ function workflowSettingsHtml(wf) {
   </details>`;
 }
 
-function workflowStatusInfo(status, reviewerDone = false) {
+function workflowStatusInfo(status, reviewerDone = false, automation = {}) {
+  const automaticGate = automation.enabled === true && automation.auto_gate !== false;
   const info = {
     draft: ['Черновик', 'Следующее действие: сформировать план этапов либо запустить быструю задачу.'],
     planning: ['Планирование', 'Сильный планировщик исследует задачу и формирует этапы.'],
     awaiting_plan_approval: ['План ожидает утверждения', 'Проверьте порядок, scope и gate каждого этапа, затем утвердите план.'],
     queued: ['Готов к запуску', 'Следующее действие: выбрать исполнителя и отправить промпт.'],
     executing: ['Исполнитель работает', 'Следующее действие: наблюдать за агентом; после успешного ответа начнутся проверки.'],
-    gating: ['Автоматические проверки', 'Следующее действие: зафиксировать результат gate.'],
+    gating: automaticGate
+      ? ['Автоматические проверки', 'Проверки идут сами — ничего нажимать не нужно; результат применится автоматически.']
+      : ['Ручные проверки', 'Выполните проверки и выберите Gate PASS или FAIL.'],
     reviewing: ['Независимое ревью', 'Следующее действие: запустить проверяющего.'],
     revision_required: ['Нужны исправления', 'Следующее действие: открыть новый раунд доработок.'],
     awaiting_human: reviewerDone
@@ -2077,7 +2090,45 @@ function workflowStatusInfo(status, reviewerDone = false) {
   return info[status] || [status, ''];
 }
 
-function workflowOwnerInfo(wf, activeRun, reviewerDone) {
+function workflowNeedsHuman(wf) {
+  // U16b: gating в АВТО-режиме (auto_gate включён — наш дефолт) никого не
+  // ждёт: заголовок «НУЖНО ДЕЙСТВИЕ» врёт и рождал ложные тревоги владельца.
+  // Человека ждёт только ручной gate (auto_gate === false).
+  const s = wf?.status;
+  if (s === 'gating') return !(wf?.config?.automation?.enabled === true && wf.config.automation.auto_gate !== false);
+  return ['awaiting_human', 'revision_required', 'awaiting_plan_approval'].includes(s);
+}
+
+function workflowHumanAlertCopy(status, reviewerDone, decisionState = {}) {
+  if (status === 'awaiting_human' && reviewerDone && decisionState.budgetExhausted) {
+    return ['Каскад остановлен по лимиту попыток',
+      'Ревью уже завершено, но автоматическая ступень исчерпала свои попытки. Сначала нужно выбрать новую политику или явно принять риск вручную.'];
+  }
+  if (status === 'revision_required' && decisionState.budgetExhausted) {
+    return ['Лимит попыток исчерпан',
+      'Новый раунд сейчас заблокирован защитным лимитом. Измените политику попыток или создайте новый этап после проверки замечаний.'];
+  }
+  if (status === 'awaiting_human' && reviewerDone) {
+    return ['Требуется ваше решение по ревью',
+      'Проверяющий уже закончил. Выберите один из вариантов ниже — после этого PromptPilot продолжит или завершит workflow.'];
+  }
+  if (status === 'revision_required') {
+    return ['Нужны исправления',
+      'Ревью вернуло текущий этап на доработку. Проверьте отчёт и нажмите «Продолжить пайплайн».'];
+  }
+  if (status === 'awaiting_plan_approval') {
+    return ['Нужно утвердить план',
+      'Проверьте порядок этапов и gate-команды, затем нажмите «Сохранить и утвердить».'];
+  }
+  if (status === 'gating') {
+    return ['Gate в ручном режиме',
+      'Автоматический gate выключен для этого воркфлоу. По завершении проверок выберите PASS или FAIL.'];
+  }
+  return ['Пайплайн остановлен: требуется действие человека',
+    'Проверьте причину остановки и нажмите «Продолжить пайплайн», чтобы передать управление обратно оркестратору.'];
+}
+
+function workflowOwnerInfo(wf, activeRun, reviewerDone, decisionState = {}) {
   if (wf.status === 'planning') return {
     who: 'Планировщик', detail: activeRun?.task_id ? `task #${activeRun.task_id} · разбивает задачу на этапы` : 'запускается',
     next: 'Дальше: ваше однократное утверждение плана', color: 'var(--accent)',
@@ -2091,7 +2142,8 @@ function workflowOwnerInfo(wf, activeRun, reviewerDone) {
     next: 'Дальше: автоматические проверки (Gate)', color: 'var(--accent)',
   };
   if (wf.status === 'gating') return {
-    who: 'PromptPilot / Gate', detail: 'проверяется результат исполнителя',
+    who: workflowNeedsHuman(wf) ? 'Вы / Gate' : 'PromptPilot / Gate',
+    detail: workflowNeedsHuman(wf) ? 'нужно выполнить проверки и зафиксировать результат' : 'проверяется результат исполнителя',
     next: 'Дальше: независимый аудитор', color: 'var(--yellow)',
   };
   if (wf.status === 'reviewing') return {
@@ -2180,12 +2232,24 @@ function workflowStageEditorCard(stage = {}, index = 0) {
 function workflowPlanHtml(wf, plan, stages) {
   if (!wf.config?.planning?.enabled && !stages.length) return '';
   const editable = wf.status === 'awaiting_plan_approval';
-  const cards = stages.map((stage, index) => editable ? workflowStageEditorCard(stage, index) : `
-    <div class="wf-stage-card" data-status="${escAttr(stage.status)}">
-      <div class="wf-stage-title">${index + 1}. ${esc(stage.code)} · ${esc(stage.title)} <span class="task-status" data-s="${escAttr(stage.status)}">${esc(stage.status)}</span></div>
-      <div class="wf-round-summary">${esc(stage.objective)}</div>
+  // U1: монотонный собственный % прогресса на каждой карточке (переходы видны)
+  const total = Math.max(stages.length, 1);
+  const completedCount = stages.filter(s => s.status === 'completed').length;
+  const cards = stages.map((stage, index) => {
+    if (editable) return workflowStageEditorCard(stage, index);
+    const done = stages.slice(0, index + 1).filter(s => s.status === 'completed').length;
+    const pct = stage.status === 'completed'
+      ? Math.round(done / total * 100)
+      : Math.round((done + (stage.status === 'executing' || stage.status === 'reviewing' || stage.status === 'gating' ? 0.5 : 0)) / total * 100);
+    const shortGoal = String(stage.objective || '').split('.')[0].slice(0, 90);
+    return `
+    <div class="wf-stage-card" data-status="${escAttr(stage.status)}" style="min-height:96px">
+      <div class="wf-stage-title">${index + 1}/${total} · ${Math.max(0, pct)}% <span class="task-status" data-s="${escAttr(stage.status)}">${esc(stage.status)}</span></div>
+      <div style="font-weight:600;margin:2px 0">${esc(stage.code)} · ${esc(stage.title)}</div>
+      <div class="wf-round-summary" style="display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden">${esc(shortGoal)}</div>
       <div class="wf-meta">${esc(stage.stage_type)} · gate: ${(stage.acceptance_gates || []).length} · возвратов: ${stage.max_revision_rounds || wf.config?.planning?.max_revisions_per_stage || 3}</div>
-    </div>`).join('');
+    </div>`;
+  }).join('');
   const controls = editable ? `<div class="wf-actions">
     <button class="btn btn-sm btn-ghost" onclick="wfAddStage()">Добавить этап</button>
     <button class="btn btn-sm btn-ghost" onclick="wfSavePlan()">Сохранить план</button>
@@ -2211,8 +2275,9 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, 
   const pastRounds = rounds.filter(r => r.round_no !== wf.current_round);
   const importedCount = rounds.filter(r => r.summary?.historical).length;
   const stage = stages.find(item => item.id === wf.current_stage_id) || wf.config?.stage || {};
-  const statusInfo = workflowStatusInfo(wf.status, !!reviewerDone);
+  const statusInfo = workflowStatusInfo(wf.status, !!reviewerDone, wf.config?.automation || {});
   const ownerInfo = workflowOwnerInfo(wf, activeRun, reviewerDone);
+  const humanAlert = workflowNeedsHuman(wf) ? workflowHumanAlertCopy(wf.status, !!reviewerDone) : null;
   const stopReason = workflowStopReason(events);
   const previousAudit = [...pastRounds].reverse().find(r => r.summary?.summary);
   const stageTitle = stage.title || `Раунд ${wf.current_round}: доработка после последнего аудита`;
@@ -2285,6 +2350,7 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, 
       ${wf.config?.automation?.enabled ? '<span class="task-status" data-s="running">АВТО</span>' : '<span class="wf-meta">ручной режим</span>'}</div>
     <div class="wf-stage" style="border-color:${ownerInfo.color}">
       <div class="wf-stage-title">🏓 Мяч сейчас: <span style="color:${ownerInfo.color}">${esc(ownerInfo.who)}</span></div>
+      ${humanAlert ? `<div class="wf-round-summary"><b>${esc(humanAlert[0])}</b> · ${esc(humanAlert[1])}</div>` : ''}
       <div class="wf-round-summary">${esc(ownerInfo.detail)}</div>
       ${ownerInfo.next ? `<div class="wf-next">${esc(ownerInfo.next)}</div>` : ''}
     </div>
@@ -3837,6 +3903,12 @@ function updateKeepPane() {
   // в target-режиме директория и permissions не применимы — прячем
   document.getElementById('workdirLabel').style.display = prov.session_target ? 'none' : 'flex';
   document.getElementById('skipPermsLabel').style.display = prov.session_target ? 'none' : 'flex';
+  // Only the rights this provider can actually be confined to are offered.
+  const rightsSel = document.getElementById('rightsInput');
+  const supportedRights = prov.rights || [];
+  [...rightsSel.options].forEach(o => { o.disabled = o.value !== '' && !supportedRights.includes(o.value); });
+  if (rightsSel.selectedOptions[0] && rightsSel.selectedOptions[0].disabled) rightsSel.value = '';
+  document.getElementById('rightsLabel').style.display = prov.session_target ? 'none' : 'flex';
   document.getElementById('providerModeHint').style.display = prov.session_target ? '' : 'none';
   updateWorktree();
   if (prov.session_target) loadHerdrAgents();
