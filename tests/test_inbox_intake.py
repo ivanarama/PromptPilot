@@ -459,3 +459,38 @@ def test_reply_draft_is_shown_whole(bot):
     messages = bot.draft_messages({"subject": "Вопрос"}, 9, reply, has_address=True)
 
     assert "P.S. хвост" in "".join(messages)
+
+
+
+@pytest.mark.parametrize("domain,accepted", [("formsubmit.co.extra.example", False),
+                                                ("formsubmit.co-extra.example", False),
+                                                ("formsubmit.co", True), ("sub.formsubmit.co", True)])
+def test_public_intake_checks_complete_sender_identity(poller, monkeypatch, tmp_path, domain, accepted):
+    message = letter("[KT] Request", KT_BODY, sender=FORM,
+                     Authentication_Results=f"mxs.mail.ru; dkim=pass header.d={domain}")
+    created, _ = run(poller, monkeypatch, tmp_path, [message], KT_DKIM_AUTHSERV="mxs.mail.ru")
+    assert bool(created) is accepted
+
+
+def test_public_poller_connection_uses_verified_finite_tls(poller, monkeypatch, tmp_path):
+    import ssl
+    connect = poller.connect
+    _, env = run(poller, monkeypatch, tmp_path, [])
+    monkeypatch.setattr(poller, "connect", connect)
+    observed = {}
+    class EmptyMailbox(FakeIMAP):
+        def login(self, user, password):
+            assert (user, password) == ("dummy-user", "dummy-password")
+        def _simple_command(self, *args):
+            return "OK", []
+        def response(self, *args):
+            return "OK", []
+    def constructor(host, port, **kwargs):
+        observed.update(kwargs)
+        return EmptyMailbox([])
+    monkeypatch.setattr(poller.imaplib, "IMAP4_SSL", constructor)
+    env.update(IMAP_HOST="imap.example", IMAP_PORT="993", IMAP_USER="dummy-user", IMAP_PASSWORD="dummy-password")
+    poller.run_once(env, dry=False)
+    assert observed["ssl_context"].verify_mode == ssl.CERT_REQUIRED
+    assert observed["ssl_context"].check_hostname
+    assert 0 < observed["timeout"] <= 60
