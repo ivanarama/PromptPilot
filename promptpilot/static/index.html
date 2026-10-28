@@ -6,6 +6,7 @@
 <title>PromptPilot</title>
 <style>
   :root {
+    color-scheme: dark;
     --bg: #0f1117;
     --surface: #1a1d27;
     --surface2: #232733;
@@ -22,6 +23,29 @@
     --font: 'Inter', -apple-system, system-ui, sans-serif;
     --mono: 'JetBrains Mono', 'Fira Code', monospace;
   }
+
+  /* Appearance palette adapted from Evgeny Kerzhaev's operator package #106. */
+  :root[data-ui-theme="light"] {
+    color-scheme: light;
+    --bg: #f5f6f8;
+    --surface: #ffffff;
+    --surface2: #eef0f3;
+    --border: #d9dde3;
+    --text: #1a1d21;
+    --text2: #57606a;
+    --accent: #4c5fd5;
+    --accent2: #3b4fc0;
+    --green: #1a7f37;
+    --red: #cf222e;
+    --yellow: #9a6700;
+    --cyan: #0969da;
+  }
+
+  #settingsDialog { margin: auto; color: var(--text); max-width: 520px; }
+  #settingsDialog::backdrop { background: rgba(0,0,0,.55); }
+  #settingsDialog label { display: flex; align-items: center; gap: 12px; margin: 16px 0; }
+  #settingsDialog select { background: var(--surface2); color: var(--text); border: 1px solid var(--border); padding: 6px; border-radius: 6px; }
+  .settings-links { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 16px; }
 
   * { margin: 0; padding: 0; box-sizing: border-box; }
 
@@ -527,7 +551,7 @@
   .wf-wizard-role label.check { flex-direction:row; align-items:center; }
   .wf-wizard-role input, .wf-wizard-role select { width:100%; background:var(--surface2); border:1px solid var(--border); border-radius:6px; color:var(--text); padding:7px; }
   .wf-wizard-role label.check input, .wf-wizard-fields label.check input { width:auto; }
-  .wf-wizard-danger { margin-top:8px; padding:8px 10px; border:1px solid #ed6e8666; border-radius:7px; color:#f59aad; font-size:11px; }
+  .wf-wizard-danger { margin-top:8px; padding:8px 10px; border:1px solid #ed6e8666; border-radius:7px; color:var(--red); font-size:11px; }
   .wf-wizard-summary { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin:10px 0; }
   .wf-wizard-summary > div { background:var(--bg); border:1px solid var(--border); border-radius:7px; padding:9px; font-size:11px; }
   .wf-wizard-summary b { display:block; margin-bottom:3px; color:var(--text); }
@@ -535,7 +559,7 @@
   .wf-preflight-row { padding:7px 9px; border-radius:6px; background:var(--bg); font-size:11px; border-left:3px solid var(--border); }
   .wf-preflight-row[data-status="ok"] { border-left-color:var(--green); }
   .wf-preflight-row[data-status="warning"] { border-left-color:var(--yellow); }
-  .wf-preflight-row[data-status="error"] { border-left-color:var(--red); color:#f59aad; }
+  .wf-preflight-row[data-status="error"] { border-left-color:var(--red); color:var(--red); }
   .wf-wizard-nav { display:flex; justify-content:space-between; align-items:center; gap:8px; margin-top:14px; padding-top:12px; border-top:1px solid var(--border); }
   .wf-wizard-nav-right { display:flex; gap:7px; }
   .wf-settings-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:10px; }
@@ -649,6 +673,7 @@
 <div class="container">
   <header>
     <div class="logo">Prompt<span>Pilot</span></div>
+    <button class="btn btn-ghost" onclick="openSettings()">⚙ Настройки</button>
     <div class="badges" id="badges"></div>
   </header>
 
@@ -1012,7 +1037,57 @@
   </div>
 </div>
 
+<dialog class="modal" id="settingsDialog" aria-labelledby="settingsTitle">
+  <h2 id="settingsTitle">⚙ Настройки
+    <button class="btn btn-sm btn-ghost" style="margin-left:auto" onclick="closeSettings()">Закрыть</button>
+  </h2>
+  <label>Оформление
+    <select id="appearanceTheme" onchange="applyUiTheme(this.value)">
+      <option value="dark">Тёмная тема</option>
+      <option value="light">Светлая тема</option>
+      <option value="system">Как в системе</option>
+    </select>
+  </label>
+  <p style="color:var(--text2);font-size:12px">Тема применяется сразу и сохраняется в этом браузере, если доступно локальное хранилище.</p>
+  <div class="settings-links">
+    <button class="btn btn-ghost" onclick="closeSettings();openProviders()">Помощники</button>
+    <button class="btn btn-ghost" onclick="closeSettings();openWorkflows()">Воркфлоу</button>
+    <button class="btn btn-ghost" onclick="closeSettings();openSchedule()">Расписание</button>
+  </div>
+</dialog>
+
 <script>
+let uiThemeChoice = 'dark';
+let uiThemeMedia = null;
+
+function applyUiTheme(choice, persist = true) {
+  uiThemeChoice = ['dark', 'light', 'system'].includes(choice) ? choice : 'dark';
+  const light = uiThemeChoice === 'light' || (uiThemeChoice === 'system' && uiThemeMedia?.matches);
+  document.documentElement.dataset.uiTheme = light ? 'light' : 'dark';
+  const select = document.getElementById('appearanceTheme');
+  if (select) select.value = uiThemeChoice;
+  if (persist) {
+    try { localStorage.setItem('pp-theme', uiThemeChoice); } catch (_) { /* Restricted browser storage. */ }
+  }
+}
+
+function initUiAppearance() {
+  let choice = 'dark';
+  try { choice = localStorage.getItem('pp-theme') || 'dark'; } catch (_) { /* Keep the default. */ }
+  try { uiThemeMedia = window.matchMedia('(prefers-color-scheme: light)'); } catch (_) { /* Dark fallback. */ }
+  applyUiTheme(choice, false);
+  if (uiThemeMedia?.addEventListener) {
+    uiThemeMedia.addEventListener('change', () => {
+      if (uiThemeChoice === 'system') applyUiTheme('system', false);
+    });
+  }
+}
+
+function openSettings() { document.getElementById('settingsDialog').showModal(); }
+function closeSettings() { document.getElementById('settingsDialog').close(); }
+
+initUiAppearance();
+
 const API = '/api';
 let currentFilter = '';
 let expandedId = null;
