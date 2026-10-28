@@ -64,8 +64,8 @@ class _FakeResp:
     def __init__(self, payload):
         self._p = json.dumps(payload).encode()
 
-    def read(self):
-        return self._p
+    def read(self, size=-1):
+        return self._p if size < 0 else self._p[:size]
 
     def __enter__(self):
         return self
@@ -154,7 +154,7 @@ def test_create_provider_short_name_and_uniqueness(isolated_providers):
 
     saved = json.loads((isolated_providers / "providers.json").read_text(encoding="utf-8"))
     prov = saved["goose-glm-5-3"]
-    assert prov["cmd"] == "goose run -i -"
+    assert prov["cmd"] == "goose run --model glm-5.3 -i -"
     assert prov["prompt_stdin"] is True
     assert prov["env"]["GOOSE_PROVIDER"] == "openai"
     assert prov["env"]["OPENAI_API_KEY"] == "sk-1"
@@ -169,3 +169,153 @@ def test_create_provider_short_name_and_uniqueness(isolated_providers):
 def test_create_requires_model(isolated_providers):
     r = _request("POST", "/api/provider-catalog/codex/create", json={"base": "b", "key": "k"})
     assert r.status_code == 400
+
+
+@pytest.mark.parametrize("model", ["--help", "good --dangerously-skip-permissions", "a\\nb", "x');alert(1)//", "<svg/onload=alert(1)>"])
+def test_model_argument_injection_rejected(isolated_providers, model):
+    r = _request("POST", "/api/provider-catalog/codex/create", json={"base": "https://a.example/v1", "model": model})
+    assert r.status_code == 400
+    assert not (isolated_providers / "providers.json").exists()
+
+
+@pytest.mark.parametrize("base", ["file:///etc/passwd", "https://user:secret@example.com/v1", "https://example.com/v1?key=secret", "https://example.com/#x", "http://a.example:999999", "https://a.example/{file:/secret}"])
+def test_unsafe_endpoint_rejected_without_echoing_credentials(isolated_providers, base):
+    r = _request("POST", "/api/provider-catalog/codex/models", json={"base": base, "key": "sk-secret"})
+    assert r.status_code == 400
+    assert "sk-secret" not in r.text and "user:secret" not in r.text
+
+
+@pytest.mark.parametrize("cid", [e["id"] for e in CATALOG])
+def test_each_adapter_delivers_selected_model_once(isolated_providers, cid):
+    from promptpilot import config
+    response = _request("POST", f"/api/provider-catalog/{cid}/create", json={"base": "https://a.example/v1", "key": "k", "model": "selected-model"})
+    assert response.status_code == 200
+    name = response.json()["name"]
+    prov = config.load_providers()[name]
+    cmd = config.build_cmd(name, "prompt", guard=False)
+    assert cmd.count("--model") == 1
+    expected = "promptpilot/selected-model" if cid == "opencode" else "selected-model"
+    assert cmd[cmd.index("--model") + 1] == expected
+    override = config.build_cmd(name, "prompt", model="other-model", guard=False)
+    assert override.count("--model") == 1 and override[override.index("--model") + 1] == "other-model"
+    if cid == "claude":
+        assert prov["prompt_stdin"] and prov["supports_skills"] and prov["supports_effort"]
+        assert "--resume" in config.build_cmd(name, "prompt", session_id="s", guard=False)
+    if cid == "goose":
+        assert prov["env"]["OPENAI_HOST"] == "https://a.example"
+        assert prov["env"]["OPENAI_BASE_PATH"] == "v1/chat/completions"
+    if cid == "opencode":
+        options = json.loads(prov["env"]["OPENCODE_CONFIG_CONTENT"])["provider"]["promptpilot"]["options"]
+        assert options["baseURL"] == "https://a.example/v1" and options["apiKey"] == "{env:OPENAI_API_KEY}"
+    if cid == "pi":
+        from pathlib import Path
+        path = Path(prov["env"]["PI_CODING_AGENT_DIR"]) / "models.json"
+        assert path.is_relative_to(isolated_providers)
+        assert json.loads(path.read_text())["providers"]["promptpilot"]["apiKey"] == "$OPENAI_API_KEY"
+
+
+def test_reorder_and_hidden_builtin_keep_command_and_secret(isolated_providers):
+    from promptpilot import config
+    config.save_catalog_provider("claude", {"cmd": "claude -p {prompt}", "models": ["m"], "description": "c", "env": {"ANTHROPIC_AUTH_TOKEN": "real-secret"}})
+    before = config.load_providers()["claude"]
+    assert _request("POST", "/api/providers/reorder", json={"names": ["claude", "codex"]}).status_code == 200
+    assert config.load_providers_detailed()["codex"]["cmd"] == config.BUILTIN_PROVIDERS["codex"]["cmd"]
+    assert _request("DELETE", "/api/providers/claude").status_code == 409
+    after = config.load_providers()["claude"]
+    assert before["cmd"] == after["cmd"] and after["env"]["ANTHROPIC_AUTH_TOKEN"] == "real-secret"
+
+
+def test_busy_provider_cannot_be_deleted(isolated_db, isolated_providers):
+    from promptpilot import config
+    from promptpilot.models import TaskCreate, WorkflowCreate
+    config.save_provider("busy", "echo {prompt}")
+    t = isolated_db.create_task(TaskCreate(prompt="x", provider="busy"))
+    assert _request("DELETE", "/api/providers/busy").status_code == 409
+    isolated_db.mark_completed(t.id, "done")
+    isolated_db.create_workflow(WorkflowCreate(slug="uses-busy", objective="x", repository_path=str(isolated_providers), candidate_branch="main", config={"roles": {"reviewer": {"provider": "busy"}}}))
+    assert _request("DELETE", "/api/providers/busy").status_code == 409
+    assert "busy" in config.load_providers()
+
+
+def test_model_response_bounded_and_untrusted_ids_filtered(isolated_providers, monkeypatch):
+    captured = {}
+    monkeypatch.setattr("urllib.request.build_opener", lambda *a, **k: _FakeOpener({"data": [{"id": "ok-model"}, {"id": "x');alert(1)//"}, {"id": "--help"}]}, captured))
+    response = _request("POST", "/api/provider-catalog/codex/models", json={"base": "https://example.com/v1"})
+    assert response.json()["models"] == ["ok-model"]
+    monkeypatch.setattr("urllib.request.build_opener", lambda *a, **k: _FakeOpener({"padding": "x" * (1024 * 1024 + 100)}, {}))
+    assert _request("POST", "/api/provider-catalog/codex/models", json={"base": "https://example.com/v1"}).status_code == 502
+
+
+def test_redirect_does_not_forward_key(isolated_providers):
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    received = []
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            received.append((self.path, self.headers.get("Authorization")))
+            self.send_response(302)
+            self.send_header("Location", f"http://127.0.0.1:{self.server.server_port}/stolen")
+            self.end_headers()
+        def log_message(self, *args):
+            pass
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever)
+    thread.start()
+    try:
+        r = _request("POST", "/api/provider-catalog/codex/models", json={"base": f"http://127.0.0.1:{server.server_port}", "key": "sk-secret"})
+        assert r.status_code == 502 and "sk-secret" not in r.text
+        assert received == [("/models", "Bearer sk-secret")]
+    finally:
+        server.shutdown()
+        thread.join()
+        server.server_close()
+
+
+def test_goose_installer_selects_host_platform():
+    from promptpilot.provider_catalog import install_command
+    entry = catalog_entry("goose")
+    assert install_command(entry, "darwin") == ["brew", "install", "block-goose-cli"]
+    assert install_command(entry, "linux")[0] == "bash"
+    assert install_command(entry, "win32")[0] == "powershell"
+
+
+def test_edit_and_clone_keep_stdin_and_original_env_names(isolated_providers):
+    from promptpilot import config
+    r = _request("POST", "/api/provider-catalog/goose/create", json={
+        "base": "https://example.com/v1", "key": "sk-secret", "model": "chosen"})
+    name = r.json()["name"]
+    managed = _request("GET", "/api/providers/manage").json()[name]
+    managed["env"]["LLM_BASE_URL"] = managed["env"].pop("OPENAI_BASE_URL")
+    for target in [name, "copy-of-goose"]:
+        r = _request("POST", "/api/providers", json={
+            "name": target, "source_name": name, "cmd": managed["cmd"],
+            "description": "edited", "env": managed["env"], "models": managed["models"]})
+        assert r.status_code == 201
+        saved = config.load_providers()[target]
+        assert saved["prompt_stdin"] is True
+        assert saved["env"]["LLM_BASE_URL"] == "https://example.com/v1"
+        assert saved["env"]["OPENAI_API_KEY"] == "sk-secret"
+        assert "OPENAI_BASE_URL" not in saved["env"]
+
+
+@pytest.mark.parametrize("exit_code", [0, 1])
+def test_probe_uses_guard_isolated_cwd_and_success_exit(isolated_providers, monkeypatch, exit_code):
+    import subprocess
+    from pathlib import Path
+
+    from promptpilot import config
+    config.save_provider("probe", "echo {prompt}")
+    guarded = []
+    monkeypatch.setattr(config, "build_cmd", lambda name, prompt, **kw: guarded.append(kw) or ["echo", prompt])
+
+    def run(args, **kwargs):
+        assert Path(kwargs["cwd"]).is_dir() and not list(Path(kwargs["cwd"]).iterdir())
+        assert kwargs["timeout"] == 300
+        return subprocess.CompletedProcess(args, exit_code, args[1], "sk-secret")
+
+    monkeypatch.setattr("promptpilot.process_tree.run_owned", run)
+    response = _request("POST", "/api/providers/probe/probe", json={})
+    assert response.status_code == 200
+    assert response.json()["ok"] is (exit_code == 0)
+    assert guarded == [{"guard": True}]
+    assert "sk-secret" not in response.text

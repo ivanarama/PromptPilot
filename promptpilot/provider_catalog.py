@@ -1,19 +1,13 @@
-"""Каталог известных CLI-агентов для визарда подключения помощников.
+"""Known CLI adapters for the reachable provider wizard.
 
-Директива владельца 2026-10-04: настройка провайдеров «через одну жопу» —
-рядовой пользователь не должен видеть cmd/env-простыни. Визард:
-Установить CLI → вставить ключ и адрес → Подобрать модели → клик по модели →
-готовый помощник с коротким именем «Кодекс · Астра».
-
-install-команды проверены по факту (npm-пакеты существуют, goose-asset
-Windows зовётся goose-x86_64-pc-windows-msvc.zip); cmd-шаблоны сняты с
-боевых провайдеров этой машины (goose-zai / codex / qwen-review / pi).
+Commands are static templates. Model IDs and endpoints are validated before
+interpolation; secrets stay in provider environment, never command arguments.
 """
-
+import json
 import re
+import sys
+from urllib.parse import urlsplit
 
-# Каждая запись: как узнать установлен, как поставить, как запускать,
-# как спросить список моделей и какие env нужны.
 CATALOG = [
     {
         "id": "codex",
@@ -38,8 +32,8 @@ CATALOG = [
         "exe": "claude",
         "install": ["npm", "install", "-g", "@anthropic-ai/claude-code"],
         "install_hint": "нужен Node.js (npm)",
-        "cmd": "claude -p {prompt} --model {model} --output-format text",
-        "prompt_stdin": False,
+        "cmd": "claude -p --verbose --output-format stream-json --model {model} {prompt}",
+        "prompt_stdin": True,
         "api": "anthropic",
         "env_key": "ANTHROPIC_AUTH_TOKEN",
         "env_base": "ANTHROPIC_BASE_URL",
@@ -58,16 +52,16 @@ CATALOG = [
             ("$d = Join-Path $env:USERPROFILE 'goose'; "
              "New-Item -ItemType Directory -Force $d | Out-Null; "
              "$z = Join-Path $env:TEMP 'goose-install.zip'; "
-             "Invoke-WebRequest 'https://github.com/block/goose/releases/latest/download/"
+             "Invoke-WebRequest 'https://github.com/aaif-goose/goose/releases/latest/download/"
              "goose-x86_64-pc-windows-msvc.zip' -OutFile $z; "
              "Expand-Archive $z -DestinationPath $d -Force; "
              "$p = [Environment]::GetEnvironmentVariable('Path','User'); "
              "if ($p -notlike \"*$d*\") { "
              "[Environment]::SetEnvironmentVariable('Path', $p + ';' + $d, 'User') "
-             "}; goose --version"),
+             "}; & (Join-Path $d 'goose.exe') --version"),
         ],
         "install_hint": "скачивает официальный zip с GitHub Releases",
-        "cmd": "goose run -i -",
+        "cmd": "goose run --model {model} -i -",
         "prompt_stdin": True,
         "api": "openai",
         "env_key": "OPENAI_API_KEY",
@@ -83,7 +77,7 @@ CATALOG = [
         "exe": "qwen",
         "install": ["npm", "install", "-g", "@qwen-code/qwen-code"],
         "install_hint": "нужен Node.js (npm)",
-        "cmd": "qwen --approval-mode auto --max-subagent-depth 1 -p -",
+        "cmd": "qwen --auth-type openai --model {model} --output-format stream-json",
         "prompt_stdin": True,
         "api": "openai",
         "env_key": "OPENAI_API_KEY",
@@ -98,7 +92,7 @@ CATALOG = [
         "exe": "opencode",
         "install": ["npm", "install", "-g", "opencode-ai"],
         "install_hint": "нужен Node.js (npm)",
-        "cmd": "opencode run --model {model} {prompt}",
+        "cmd": "opencode run --model promptpilot/{model} {prompt}",
         "prompt_stdin": False,
         "api": "openai",
         "env_key": "OPENAI_API_KEY",
@@ -111,9 +105,9 @@ CATALOG = [
         "icon": "🥧",
         "desc": "Pi — лёгкий быстрый агент (Mario Zechner).",
         "exe": "pi",
-        "install": ["npm", "install", "-g", "@mariozechner/pi"],
+        "install": ["npm", "install", "-g", "@mariozechner/pi-coding-agent"],
         "install_hint": "нужен Node.js (npm)",
-        "cmd": "pi --print --no-session {prompt}",
+        "cmd": "pi --provider promptpilot --model {model} --print --no-session {prompt}",
         "prompt_stdin": False,
         "api": "openai",
         "env_key": "OPENAI_API_KEY",
@@ -123,6 +117,7 @@ CATALOG = [
 ]
 
 _BY_ID = {e["id"]: e for e in CATALOG}
+MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}\Z")
 
 
 def catalog_entry(cid: str):
@@ -130,50 +125,126 @@ def catalog_entry(cid: str):
 
 
 def slugify(text: str) -> str:
-    """Латинский/цифровой слаг для технического имени провайдера."""
-    s = re.sub(r"[^A-Za-z0-9]+", "-", (text or "").strip()).strip("-").lower()
-    return s[:24]
+    return re.sub(r"[^A-Za-z0-9]+", "-", (text or "").strip()).strip("-").lower()[:24]
 
 
 def pretty_model(model_id: str) -> str:
-    """«astra-3.1-pro» -> «Astra 3.1 Pro»: короткое имя для карточки."""
     words = [w for w in re.split(r"[-_ ]+", (model_id or "").strip()) if w]
     return " ".join(w[:1].upper() + w[1:] for w in words)
 
 
+def validate_base(base):
+    try:
+        u = urlsplit(base)
+        if (u.scheme not in {"http", "https"} or not u.hostname or u.username is not None
+                or u.password is not None or u.query or u.fragment or u.port == 0
+                or any(ord(c) <= 32 or c in "\\{}" for c in base)):
+            raise ValueError
+        _ = u.port
+    except (ValueError, TypeError):
+        raise ValueError("Endpoint must be an HTTP(S) URL without credentials, query or fragment") from None
+    return base.rstrip("/")
+
+
+def validate_key(key):
+    if any(ord(c) < 32 or ord(c) == 127 for c in key):
+        raise ValueError("API key contains control characters")
+    return key
+
+
+def fetch_models(base, key, api="openai"):
+    import urllib.error
+    import urllib.request
+
+    base, key = validate_base(base), validate_key(key)
+
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+
+    suffix = "/v1/models" if api == "anthropic" and not base.endswith("/v1") else "/models"
+    req = urllib.request.Request(base + suffix)
+    if api == "anthropic":
+        req.add_header("x-api-key", key)
+        req.add_header("anthropic-version", "2023-06-01")
+    elif key:
+        req.add_header("Authorization", "Bearer " + key)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+    try:
+        with opener.open(req, timeout=25) as response:
+            raw = response.read(1024 * 1024 + 1)
+        if len(raw) > 1024 * 1024:
+            raise ValueError("Response too large")
+        data = json.loads(raw.decode("utf-8"))
+        values = data.get("data") or data.get("models") or []
+        if not isinstance(values, list):
+            raise ValueError("Invalid response shape")
+        ids = sorted({m["id"] for m in values if isinstance(m, dict)
+                      and isinstance(m.get("id"), str) and MODEL_ID.fullmatch(m["id"])})
+        if not ids or len(ids) > 2048:
+            raise ValueError("No usable models")
+        return ids
+    except urllib.error.HTTPError as exc:
+        exc.close()
+        raise RuntimeError("Could not fetch models; check endpoint and credentials") from None
+    except (OSError, ValueError, TypeError, AttributeError) as exc:
+        # Never reflect network diagnostics: they can contain credentials/URLs.
+        raise RuntimeError("Could not fetch models; check endpoint and credentials") from exc
+
+
+def install_command(entry, platform=None):
+    platform = platform or sys.platform
+    if entry["id"] != "goose" or platform == "win32":
+        return list(entry["install"])
+    if platform == "darwin":
+        return ["brew", "install", "block-goose-cli"]
+    if platform.startswith("linux"):
+        return ["bash", "-c", "set -o pipefail; curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | CONFIGURE=false bash"]
+    raise ValueError("Install this CLI manually on this platform")
+
+
 def build_provider_entry(entry: dict, base: str, key: str, model: str,
                          title_override: str = "") -> dict:
-    """Собрать запись providers.json по выбору пользователя.
-
-    cmd получает модель сразу (как у боевого codex-провайдера: диспетчер
-    подставляет только {prompt}); ключ и адрес живут в env и не светятся
-    в UI дальше маски.
-    """
-    cmd = entry["cmd"]
-    if "{model}" in cmd:
-        cmd = cmd.replace("{model}", model)
-    env = {}
-    if entry.get("extra_env"):
-        env.update(entry["extra_env"])
-    if base:
-        env[entry["env_base"]] = base.rstrip("/")
+    if not MODEL_ID.fullmatch(model):
+        raise ValueError("Invalid model ID")
+    base = validate_base(base or entry.get("default_base") or "https://api.openai.com/v1")
+    key = validate_key(key)
+    env = dict(entry.get("extra_env") or {})
+    env[entry["env_base"]] = base
     if key:
         env[entry["env_key"]] = key
-    label = (title_override or f"{entry['title']} · {pretty_model(model)}").strip()
+    cid = entry["id"]
+    if cid == "goose":
+        u = urlsplit(base)
+        env.update(OPENAI_HOST=f"{u.scheme}://{u.netloc}",
+                   OPENAI_BASE_PATH=u.path.rstrip("/").lstrip("/") + "/chat/completions",
+                   GOOSE_MODEL=model)
+    if cid == "qwen":
+        env["OPENAI_MODEL"] = model
+    if cid == "opencode":
+        env["OPENCODE_CONFIG_CONTENT"] = json.dumps({"provider": {"promptpilot": {
+            "npm": "@ai-sdk/openai-compatible", "name": "PromptPilot",
+            "options": {"baseURL": base, "apiKey": "{env:OPENAI_API_KEY}"},
+            "models": {model: {"name": model}},
+        }}})
+    configured_model = f"promptpilot/{model}" if cid == "opencode" else model
     prov = {
-        "cmd": cmd,
-        "description": f"{entry['title']} ({entry['desc'].split('.')[0]}), модель {model}",
-        "models": [model],
-        "human": {
-            "label": label,
-            "role": "writer",
-            "desc": f"Модель {pretty_model(model)} через {entry['title']}",
-        },
-        "ui_order": 20,
-        "catalog_id": entry["id"],
+        "cmd": entry["cmd"].replace("{model}", model),
+        "description": f"{entry['title']}, model {model}",
+        "models": [configured_model], "env": env,
+        "human": {"label": (title_override or f"{entry['title']} · {pretty_model(model)}").strip(),
+                  "role": "writer", "desc": f"{model} via {entry['title']}"},
+        "ui_order": 20, "catalog_id": cid,
+        "prompt_stdin": bool(entry.get("prompt_stdin")),
     }
-    if env:
-        prov["env"] = env
-    if entry.get("prompt_stdin"):
-        prov["prompt_stdin"] = True
+    if cid in {"claude", "codex"}:
+        prov["kind"] = cid
+        prov["supports_effort"] = True
+    if cid == "claude":
+        prov["supports_skills"] = True
+    if cid == "pi":
+        prov["catalog_models_config"] = {"providers": {"promptpilot": {
+            "baseUrl": base, "api": "openai-completions", "apiKey": "$OPENAI_API_KEY",
+            "models": [{"id": model}],
+        }}}
     return prov
