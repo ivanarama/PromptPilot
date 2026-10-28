@@ -1504,7 +1504,7 @@ class CatalogConfig(_BaseModel):
 @app.get("/api/provider-catalog")
 def api_provider_catalog():
     """Каталог известных CLI-агентов + статус установки + уже подключённые."""
-    import shutil
+    from .provider_catalog import resolve_cli
     providers = load_providers()
     items = []
     for e in CATALOG:
@@ -1514,7 +1514,7 @@ def api_provider_catalog():
             "id": e["id"], "title": e["title"], "icon": e["icon"],
             "desc": e["desc"], "default_base": e.get("default_base", ""),
             "install_hint": e.get("install_hint", ""),
-            "installed": bool(shutil.which(e["exe"])),
+            "installed": bool(resolve_cli(e)),
             "configured": configured,
         })
     return {"items": items}
@@ -1580,10 +1580,11 @@ def api_provider_catalog_create(cid: str, body: CatalogConfig):
         raise HTTPException(400, str(exc)) from None
     with _PROVIDER_WRITE_LOCK:
         providers = load_providers()
-        slug = f"{cid}-{slugify(body.model) or 'model'}"
+        slug = f"{cid}-{slugify(body.model) or 'model'}"[:32]
         name, n = slug, 2
         while name in providers:
-            name = f"{slug}-{n}"
+            suffix = f"-{n}"
+            name = slug[:32 - len(suffix)] + suffix
             n += 1
         save_catalog_provider(name, prov)
     return {"ok": True, "name": name, "label": prov["human"]["label"]}

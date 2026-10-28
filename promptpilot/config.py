@@ -427,19 +427,19 @@ def save_catalog_provider(name: str, prov: dict) -> None:
             folder.chmod(0o700)
         _atomic_write_json(folder / "models.json", model_config)
         prov["env"] = {**prov.get("env", {}), "PI_CODING_AGENT_DIR": str(folder)}
-    save_provider(name, prov["cmd"], prov["description"], env=prov.get("env"), models=prov["models"])
     custom = _load_custom_providers()
-    custom[name].update(prov)
+    entry = _provider_entry(name, custom, prov["cmd"], prov["description"],
+                            env=prov.get("env"), models=prov["models"])
+    entry.update(prov)
+    custom[name] = entry
     _write_custom_providers(custom)
 
 
-@_provider_write
-def save_provider(name: str, cmd: str = None, description: str = "", env: dict = None,
+def _provider_entry(name: str, custom: dict, cmd: str = None, description: str = "", env: dict = None,
                   executor: str = None, kind: str = None, keep_pane: bool = False,
                   models: list = None, args: list = None, effort: str = None,
                   prompt_stdin: bool = False):
-    """Save a custom provider (cmd-template or executor-based) to providers.json."""
-    custom = _load_custom_providers()
+    """Pure normalization shared by advanced form and atomic catalog creation."""
     entry = {"description": description}
     previous = custom.get(name) or {}
     if previous.get("cmd") == cmd:
@@ -479,7 +479,17 @@ def save_provider(name: str, cmd: str = None, description: str = "", env: dict =
             entry["supports_effort"] = True
     if env:
         entry["env"] = env
-    custom[name] = entry
+    return entry
+
+
+@_provider_write
+def save_provider(name: str, cmd: str = None, description: str = "", env: dict = None,
+                  executor: str = None, kind: str = None, keep_pane: bool = False,
+                  models: list = None, args: list = None, effort: str = None,
+                  prompt_stdin: bool = False):
+    custom = _load_custom_providers()
+    custom[name] = _provider_entry(name, custom, cmd, description, env, executor,
+                                  kind, keep_pane, models, args, effort, prompt_stdin)
     _write_custom_providers(custom)
 
 

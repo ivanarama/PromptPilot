@@ -5,7 +5,9 @@ interpolation; secrets stay in provider environment, never command arguments.
 """
 import json
 import re
+import shutil
 import sys
+from pathlib import Path
 from urllib.parse import urlsplit
 
 CATALOG = [
@@ -124,6 +126,18 @@ def catalog_entry(cid: str):
     return _BY_ID.get(cid)
 
 
+def resolve_cli(entry):
+    """Find a newly installed Goose without restarting API/worker PATH."""
+    found = shutil.which(entry["exe"])
+    if found:
+        return found
+    if entry["id"] == "goose":
+        candidates = ([Path.home() / "goose" / "goose.exe"] if sys.platform == "win32"
+                      else [Path.home() / ".local/bin/goose", Path("/opt/homebrew/bin/goose"), Path("/usr/local/bin/goose")])
+        return next((str(path) for path in candidates if path.is_file()), None)
+    return None
+
+
 def slugify(text: str) -> str:
     return re.sub(r"[^A-Za-z0-9]+", "-", (text or "").strip()).strip("-").lower()[:24]
 
@@ -237,6 +251,13 @@ def build_provider_entry(entry: dict, base: str, key: str, model: str,
         "ui_order": 20, "catalog_id": cid,
         "prompt_stdin": bool(entry.get("prompt_stdin")),
     }
+    if cid == "goose":
+        executable = resolve_cli(entry)
+        if executable:
+            # Persist the actual executable; another worker process can have a
+            # different/stale PATH even after the install endpoint succeeds.
+            from .config import _q
+            prov["cmd"] = _q(executable) + prov["cmd"][len(entry["exe"]):]
     if cid in {"claude", "codex"}:
         prov["kind"] = cid
         prov["supports_effort"] = True

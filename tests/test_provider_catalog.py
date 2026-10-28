@@ -319,3 +319,63 @@ def test_probe_uses_guard_isolated_cwd_and_success_exit(isolated_providers, monk
     assert response.json()["ok"] is (exit_code == 0)
     assert guarded == [{"guard": True}]
     assert "sk-secret" not in response.text
+
+
+def test_catalog_publishes_one_complete_entry_or_nothing(isolated_providers, monkeypatch):
+    from promptpilot import config
+    original = config._write_custom_providers
+    writes = []
+
+    def fail(entries):
+        writes.append(entries)
+        assert entries["goose-chosen"]["prompt_stdin"] is True
+        assert entries["goose-chosen"]["catalog_id"] == "goose"
+        raise OSError("simulated publication failure")
+
+    monkeypatch.setattr(config, "_write_custom_providers", fail)
+    with pytest.raises(OSError, match="publication failure"):
+        _request("POST", "/api/provider-catalog/goose/create", json={
+            "base": "https://example.com/v1", "model": "chosen"})
+    assert len(writes) == 1
+    assert "goose-chosen" not in config.load_providers()
+    monkeypatch.setattr(config, "_write_custom_providers", original)
+    assert _request("POST", "/api/provider-catalog/goose/create", json={
+        "base": "https://example.com/v1", "model": "chosen"}).status_code == 200
+    assert config.load_providers()["goose-chosen"]["prompt_stdin"] is True
+
+
+@pytest.mark.parametrize("cid", [e["id"] for e in CATALOG])
+def test_long_generated_names_and_collisions_remain_editable(isolated_providers, cid):
+    names = []
+    for _ in range(2):
+        response = _request("POST", f"/api/provider-catalog/{cid}/create", json={
+            "base": "https://example.com/v1", "model": "a" * 100})
+        assert response.status_code == 200
+        name = response.json()["name"]
+        assert len(name) <= 32
+        names.append(name)
+        managed = _request("GET", "/api/providers/manage").json()[name]
+        response = _request("POST", "/api/providers", json={
+            "name": name, "source_name": name, "cmd": managed["cmd"],
+            "description": "edited", "env": managed["env"], "models": managed["models"]})
+        assert response.status_code == 201, response.text
+    assert names[0] != names[1]
+
+
+def test_new_goose_is_discovered_without_process_path_refresh(isolated_providers, monkeypatch):
+    from pathlib import Path
+    from promptpilot import config, provider_catalog
+    exe = isolated_providers / "goose" / "goose.exe"
+    exe.parent.mkdir()
+    exe.write_bytes(b"fake executable; must never run")
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: isolated_providers))
+    monkeypatch.setattr(provider_catalog.sys, "platform", "win32")
+    monkeypatch.setattr("shutil.which", lambda executable: None)
+    items = _request("GET", "/api/provider-catalog").json()["items"]
+    assert next(item for item in items if item["id"] == "goose")["installed"] is True
+    response = _request("POST", "/api/provider-catalog/goose/create", json={
+        "base": "https://example.com/v1", "model": "chosen"})
+    assert response.status_code == 200
+    command = config.build_cmd(response.json()["name"], "prompt", guard=False)
+    assert Path(command[0]) == exe
+    assert command[-2:] == ["-i", "-"]
