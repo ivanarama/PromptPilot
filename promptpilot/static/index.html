@@ -918,6 +918,19 @@
   <div class="modal">
     <h2>Провайдеры <button class="btn btn-sm btn-ghost" style="margin-left:auto" onclick="closeProviders()">✕ Закрыть</button></h2>
     <div id="provList"></div>
+    <div class="prov-form" id="providerWizard">
+      <b>Подключить помощника</b>
+      <label>CLI <select id="pcCLI" onchange="catalogSelect()"></select></label>
+      <button class="btn" type="button" onclick="catalogInstall()">Установить CLI</button>
+      <label>Адрес API <input id="pcBase" type="url" placeholder="https://api.example.com/v1"></label>
+      <label>Ключ API <input id="pcKey" type="password" autocomplete="new-password"></label>
+      <button class="btn" type="button" onclick="catalogModels()">Получить модели</button>
+      <label>Модель <select id="pcModels" onchange="document.getElementById('pcModel').value=this.value"></select></label>
+      <input id="pcModel" placeholder="Или введите ID модели вручную">
+      <input id="pcTitle" placeholder="Название помощника (необязательно)">
+      <button class="btn btn-primary" type="button" onclick="catalogCreate()">Создать помощника</button>
+      <div id="pcStatus" role="status"></div>
+    </div>
     <div style="border-top:1px solid var(--border); margin-top:14px; padding-top:14px">
       <b style="font-size:14px">🖥 Машины (удалённое выполнение по SSH)</b>
       <div id="machineList" style="margin-top:8px"></div>
@@ -3497,10 +3510,92 @@ async function seriesAction(id, action, confirmEnd=false) {
 
 function closeSchedule() { document.getElementById('schedModal').classList.remove('open'); }
 
+let providerCatalog = [];
+function catalogStatus(text) { document.getElementById('pcStatus').textContent = text; }
+async function loadCatalog() {
+  try {
+    providerCatalog = (await fetchJSON(`${API}/provider-catalog`)).items;
+    const select = document.getElementById('pcCLI');
+    select.replaceChildren();
+    for (const item of providerCatalog) {
+      const option = document.createElement('option');
+      option.value = item.id;
+      option.textContent = `${item.title}${item.installed ? ' ✓' : ''}`;
+      select.appendChild(option);
+    }
+    catalogSelect();
+  } catch (err) { catalogStatus(err.message); }
+}
+function catalogSelect() {
+  const item = providerCatalog.find(p => p.id === document.getElementById('pcCLI').value);
+  document.getElementById('pcBase').value = item?.default_base || '';
+  for (const id of ['pcKey', 'pcModel', 'pcTitle']) document.getElementById(id).value = '';
+  document.getElementById('pcModels').replaceChildren();
+  catalogStatus(item?.desc || '');
+}
+function catalogBody() {
+  return {base: document.getElementById('pcBase').value.trim(),
+          key: document.getElementById('pcKey').value,
+          model: document.getElementById('pcModel').value.trim(),
+          title: document.getElementById('pcTitle').value.trim()};
+}
+async function catalogPost(action) {
+  const id = document.getElementById('pcCLI').value;
+  return fetchJSON(`${API}/provider-catalog/${encodeURIComponent(id)}/${action}`, {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(catalogBody())});
+}
+async function catalogInstall() {
+  catalogStatus('Установка CLI…');
+  try {
+    const result = await catalogPost('install');
+    catalogStatus(result.ok ? 'CLI установлен. Укажите адрес и ключ.' : 'Установка завершилась с ошибкой. Проверьте зависимости CLI.');
+  } catch (err) { catalogStatus(err.message); }
+}
+async function catalogModels() {
+  catalogStatus('Получаю модели…');
+  try {
+    const result = await catalogPost('models');
+    const select = document.getElementById('pcModels');
+    select.replaceChildren();
+    for (const model of result.models) {
+      const option = document.createElement('option');
+      option.value = model;
+      option.textContent = model;
+      select.appendChild(option);
+    }
+    document.getElementById('pcModel').value = result.models[0] || '';
+    catalogStatus('Выберите модель и создайте помощника.');
+  } catch (err) { catalogStatus(err.message); }
+}
+async function catalogCreate() {
+  try {
+    const result = await catalogPost('create');
+    for (const id of ['pcKey', 'pcBase', 'pcModel', 'pcTitle']) document.getElementById(id).value = '';
+    document.getElementById('pcModels').replaceChildren();
+    await renderProvList();
+    await loadProviders();
+    const status = document.getElementById('pcStatus');
+    status.textContent = `Создан ${result.label}. `;
+    const probe = document.createElement('button');
+    probe.className = 'btn btn-sm';
+    probe.textContent = 'Проверить связь';
+    probe.addEventListener('click', async () => {
+      try {
+        const checked = await fetchJSON(`${API}/providers/${encodeURIComponent(result.name)}/probe`, {
+          method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
+        catalogStatus(checked.ok ? 'Связь и вердикт проверены.' : 'Проверка не пройдена: ' + checked.issues.join('; '));
+      } catch (err) { catalogStatus(err.message); }
+    });
+    status.appendChild(probe);
+  } catch (err) { catalogStatus(err.message); }
+}
+
 async function openProviders() {
   document.getElementById('provModal').classList.add('open');
   await renderProvList();
   await renderMachineList();
+  await loadCatalog();
 }
 function closeProviders() { document.getElementById('provModal').classList.remove('open'); }
 
@@ -3616,7 +3711,7 @@ async function renderProvList() {
       : esc(p.cmd))
       + (p.models && p.models.length ? `<br>модели: ${esc(p.models.join(', '))}` : '')
       + (p.effort ? `<br>эффорт: ${esc(p.effort)}` : '');
-    const canDelete = p.source !== 'builtin';
+    const canDelete = p.source === 'providers.json';
     return `<div class="prov-row${(!p.available || p.hidden) ? ' dim' : ''}">
       <span class="prov-name">${esc(name)}</span>${badges.join('')}
       <div class="prov-cmd">${esc(p.description || '')}</div>

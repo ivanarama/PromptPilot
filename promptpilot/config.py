@@ -1,6 +1,8 @@
 """Configuration settings."""
 
 import json
+import functools
+import threading
 import os
 import time
 import sys
@@ -371,45 +373,24 @@ def load_providers() -> dict:
 
 
 def load_providers_detailed() -> dict:
-    """Load providers with source tracking.
+    """Use exactly the same partial-override semantics as worker dispatch."""
+    custom = _load_custom_providers()
+    return {name: {**info,
+                   "_source": ("builtin + providers.json" if name in BUILTIN_PROVIDERS else "providers.json")
+                              if name in custom else "builtin",
+                   "_source_path": str(_providers_file()) if name in custom else None}
+            for name, info in load_providers().items()}
 
-    Each provider entry gets extra fields:
-      _source: "builtin", "providers.json", or "builtin + providers.json"
-      _source_path: path to providers.json (if applicable)
-    """
-    providers = {}
 
-    for name, info in BUILTIN_PROVIDERS.items():
-        entry = dict(info)
-        entry["_source"] = "builtin"
-        entry["_source_path"] = None
-        providers[name] = entry
+_PROVIDER_WRITE_LOCK = threading.RLock()
 
-    user_file = _providers_file()
-    custom_names = set()
-    if user_file.exists():
-        try:
-            custom = _read_json_file(user_file)
-            for name, info in custom.items():
-                custom_names.add(name)
-                entry = dict(info)
-                if name in providers:
-                    if "supports_skills" not in entry:
-                        entry["supports_skills"] = providers[name].get("supports_skills", False)
-                    if "supports_effort" not in entry:
-                        entry["supports_effort"] = providers[name].get("supports_effort", False)
-                    entry["_source"] = "builtin + providers.json"
-                else:
-                    entry["_source"] = "providers.json"
-                entry["_source_path"] = str(user_file)
-                providers[name] = entry
-        except ValueError as e:
-            _warn_once("providers.json",
-                       f"⚠ {user_file} не читается ({e}) — кастомные провайдеры игнорируются")
-        except OSError:
-            pass
 
-    return providers
+def _provider_write(function):
+    @functools.wraps(function)
+    def locked(*args, **kwargs):
+        with _PROVIDER_WRITE_LOCK:
+            return function(*args, **kwargs)
+    return locked
 
 
 def _load_custom_providers() -> dict:
@@ -429,12 +410,58 @@ def _write_custom_providers(custom: dict):
     _atomic_write_json(_providers_file(), custom)
 
 
-def save_provider(name: str, cmd: str = None, description: str = "", env: dict = None,
-                  executor: str = None, kind: str = None, keep_pane: bool = False,
-                  models: list = None, args: list = None, effort: str = None):
-    """Save a custom provider (cmd-template or executor-based) to providers.json."""
+@_provider_write
+def set_providers_ui_order(names: list) -> bool:
+    """Persist the helper-card order chosen by drag&drop in the UI.
+
+    Stored as a per-provider `ui_order` field (partial-override friendly:
+    missing entries keep their default alphabetical tail).
+    """
+    known = set(load_providers())
     custom = _load_custom_providers()
+    for idx, name in enumerate(names):
+        if name not in known:
+            continue
+        entry = custom.get(name, {})
+        entry["ui_order"] = idx
+        custom[name] = entry
+    _write_custom_providers(custom)
+    return True
+
+
+@_provider_write
+def save_catalog_provider(name: str, prov: dict) -> None:
+    """Normalize through the common save path, then add catalog-only metadata."""
+    prov = dict(prov)
+    model_config = prov.pop("catalog_models_config", None)
+    if model_config is not None:
+        folder = DB_DIR / "catalog-configs" / name
+        folder.mkdir(parents=True, exist_ok=True)
+        if os.name != "nt":
+            folder.chmod(0o700)
+        _atomic_write_json(folder / "models.json", model_config)
+        prov["env"] = {**prov.get("env", {}), "PI_CODING_AGENT_DIR": str(folder)}
+    custom = _load_custom_providers()
+    entry = _provider_entry(name, custom, prov["cmd"], prov["description"],
+                            env=prov.get("env"), models=prov["models"])
+    entry.update(prov)
+    custom[name] = entry
+    _write_custom_providers(custom)
+
+
+def _provider_entry(name: str, custom: dict, cmd: str = None, description: str = "", env: dict = None,
+                  executor: str = None, kind: str = None, keep_pane: bool = False,
+                  models: list = None, args: list = None, effort: str = None,
+                  prompt_stdin: bool = False):
+    """Pure normalization shared by advanced form and atomic catalog creation."""
     entry = {"description": description}
+    previous = custom.get(name) or {}
+    if previous.get("cmd") == cmd:
+        for key in ("human", "catalog_id", "ui_order", "hidden", "prompt_stdin"):
+            if key in previous:
+                entry[key] = previous[key]
+    if prompt_stdin:
+        entry["prompt_stdin"] = True
     if models:
         entry["models"] = models
     if args:
@@ -466,10 +493,21 @@ def save_provider(name: str, cmd: str = None, description: str = "", env: dict =
             entry["supports_effort"] = True
     if env:
         entry["env"] = env
-    custom[name] = entry
+    return entry
+
+
+@_provider_write
+def save_provider(name: str, cmd: str = None, description: str = "", env: dict = None,
+                  executor: str = None, kind: str = None, keep_pane: bool = False,
+                  models: list = None, args: list = None, effort: str = None,
+                  prompt_stdin: bool = False):
+    custom = _load_custom_providers()
+    custom[name] = _provider_entry(name, custom, cmd, description, env, executor,
+                                  kind, keep_pane, models, args, effort, prompt_stdin)
     _write_custom_providers(custom)
 
 
+@_provider_write
 def set_provider_hidden(name: str, hidden: bool) -> bool:
     """Hide/unhide a provider in pickers (partial override, keeps built-in cmd)."""
     if name not in load_providers():
@@ -609,8 +647,11 @@ def pickable_providers() -> dict:
     }
 
 
+@_provider_write
 def remove_provider(name: str) -> bool:
     """Remove a custom provider from providers.json."""
+    if name in BUILTIN_PROVIDERS:
+        return False
     user_file = _providers_file()
     if not user_file.exists():
         return False
@@ -796,7 +837,16 @@ def build_cmd(provider: str, prompt: str, skip_permissions: bool = False, sessio
     is_codex = provider_is_codex(cfg)
     extras = []
     if model:
-        extras += ["--model", model]
+        # A task override replaces the template choice, never duplicates flags.
+        for i, value in enumerate(cmd):
+            if value == "--model" and i + 1 < len(cmd):
+                cmd[i + 1] = model
+                break
+            if value.startswith("--model="):
+                cmd[i] = "--model=" + model
+                break
+        else:
+            extras += ["--model", model]
     # --effort понимает только Claude Code (у opencode это --variant), а если
     # флаг уже вписан в шаблон руками — второй не добавляем, чтобы не спорить
     # с тем, что человек написал явно.
