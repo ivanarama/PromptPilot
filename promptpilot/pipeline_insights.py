@@ -2236,7 +2236,7 @@ def _window_metrics(snapshots: list[dict], current: dict, series_ids: list[int],
     }
 
 
-def _backpressure_gate(config: dict, data: dict) -> dict | None:
+def _backpressure_gate(config: dict, data: dict, *, excluded_numbers=()) -> dict | None:
     """Profile-owned intake throttle, never an authorization to mutate GitHub.
 
     A complete cached snapshot is an admission hint, not a hard transactional
@@ -2264,6 +2264,8 @@ def _backpressure_gate(config: dict, data: dict) -> dict | None:
     allowed = []
     for item in diagnostics[candidate_field]:
         if not isinstance(item, dict) or type(item.get("number")) is not int:
+            continue
+        if item["number"] in excluded_numbers:
             continue
         if any(isinstance(rule, dict) and rule.get("key") in item
                and item[rule["key"]] in rule.get("values", [])
@@ -2335,13 +2337,13 @@ def dispatch_gate(task) -> dict | None:
                         "profile_id": profile_id, "queue_id": queue_config["id"],
                     }
                 return None
-            pressure = _backpressure_gate(config, data)
+            from .pipeline_item_holds import complete_members, prepare
+            exclusions = prepare(task, queue_config, data)
+            pressure = _backpressure_gate(config, data, excluded_numbers=exclusions)
             if pressure:
                 return {**pressure, "profile_id": profile_id, "queue_id": queue_config["id"]}
             queue = next((item for item in data["queues"]
                           if item["id"] == queue_config["id"]), None)
-            from .pipeline_item_holds import complete_members, prepare
-            exclusions = prepare(task, queue_config, data)
             admission_members = complete_members(queue)
             if exclusions and admission_members is not None:
                 members = {item.get("number") for item in admission_members
@@ -3144,7 +3146,7 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
     exclusions = prepare(task, queue, read_cached(profile_id, db.list_series())) if queue.get("item_blockers") is True else []
     if exclusions:
         fallback_prompt += ("\n\nЛокальное ограничение приёма: не брать неизменные "
-                            "задачи, ранее переданные человеку: "
+                            "задачи с зарегистрированным блокером: "
                             + ", ".join(f"#{number}" for number in exclusions)
                             + ". Новые задачи обслуживать по прежней процедуре. "
                             "Нельзя обходить интеграционного владельца или расширять полномочия.")
