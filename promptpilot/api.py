@@ -723,9 +723,25 @@ def api_validate_workflow_setup(request: WorkflowSetupValidationRequest):
 @app.post("/api/workflows", response_model=WorkflowInDB, status_code=201)
 def api_create_workflow(workflow: WorkflowCreate):
     try:
-        return db.create_workflow(workflow)
+        # One transaction: no other request can observe/start an intermediate
+        # draft before its supplied plan and approval barrier have been stored.
+        if workflow.plan:
+            WorkflowPlanReplace(
+                expected_version=0, stages=workflow.plan)
+        with db._connect(immediate=True) as conn:
+            created = db.create_workflow(workflow, conn=conn)
+            if workflow.plan:
+                workflows.provide_plan(created.id, WorkflowPlanReplace(
+                    expected_version=created.state_version,
+                    stages=workflow.plan,
+                ), conn=conn)
+            return db.get_workflow(created.id, conn=conn)
     except db.WorkflowConflictError as exc:
         raise HTTPException(409, str(exc)) from exc
+    except ValueError as exc:
+        # невалидный план (например, финал не integration) — миссии в БД нет,
+        # slug свободен, повторный запрос с исправленным планом пройдёт
+        raise HTTPException(422, str(exc)) from exc
 
 
 @app.get("/api/workflows", response_model=List[WorkflowInDB])
