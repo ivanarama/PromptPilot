@@ -171,24 +171,68 @@ def test_invalid_plan_leaves_no_draft_and_slug_free(isolated_db):
     assert second.json()["status"] == "awaiting_plan_approval"
 
 
-def test_late_provide_failure_compensates(isolated_db, monkeypatch):
+def test_late_provide_failure_rolls_back_entire_creation(isolated_db, monkeypatch):
     from promptpilot import workflows as wf
 
+    original = wf.provide_plan
+
     def boom(*a, **k):
+        original(*a, **k)
         raise RuntimeError("поздний сбой укладки")
 
-    original = wf.provide_plan
     monkeypatch.setattr(wf, "provide_plan", boom)
     response = request("POST", "/api/workflows", json=payload(GOOD_PLAN))
     assert response.status_code == 500
     slugs = [w.slug for w in db.list_workflows(limit=10)]
     assert "atomic-plan" not in slugs
-    states = {w.slug: w.status.value for w in db.list_workflows(limit=10)}
-    assert any(s.startswith("aborted-atomic-plan-") and v == "cancelled"
-               for s, v in states.items()), states
+    assert isolated_db.list_workflows() == []
+    with isolated_db._connect() as conn:
+        for table in ("workflow_events", "workflow_plans", "workflow_stages"):
+            assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
     monkeypatch.setattr(wf, "provide_plan", original)
     retry = request("POST", "/api/workflows", json=payload(GOOD_PLAN))
     assert retry.status_code == 201, retry.text
+
+
+def test_create_plan_does_not_expose_intermediate_draft_to_concurrent_start(isolated_db, monkeypatch):
+    import threading
+
+    original = workflows.provide_plan
+    observations, outcomes, threads = [], [], []
+    starting = threading.Event()
+
+    def provide(wid, replacement, *, conn=None):
+        # A separate reader cannot see the uncommitted workflow at all.
+        observations.append(db.get_workflow(wid))
+
+        def start():
+            starting.set()
+            try:
+                workflows.start_workflow(wid, WorkflowStartRequest(expected_version=0))
+            except db.WorkflowConflictError:
+                outcomes.append("approval barrier retained")
+            except Exception as exc:
+                outcomes.append(type(exc).__name__)
+            else:
+                outcomes.append("started incorrectly")
+
+        thread = threading.Thread(target=start)
+        threads.append(thread)
+        thread.start()
+        assert starting.wait(2)
+        return original(wid, replacement, conn=conn)
+
+    monkeypatch.setattr(workflows, "provide_plan", provide)
+    response = request("POST", "/api/workflows", json=payload(GOOD_PLAN))
+    for thread in threads:
+        thread.join(10)
+        assert not thread.is_alive()
+    assert response.status_code == 201, response.text
+    assert observations == [None]
+    assert outcomes == ["approval barrier retained"]
+    workflow = db.get_workflow(response.json()["id"])
+    assert workflow.status.value == "awaiting_plan_approval"
+    assert len(db.list_workflow_stages(workflow.id)) == 1
 
 
 def test_provide_plan_still_requires_explicit_approve(isolated_db):

@@ -6,6 +6,7 @@ update is committed in the same SQLite transaction as its append-only event.
 """
 
 import hashlib
+from contextlib import nullcontext
 import json
 import os
 import re
@@ -624,14 +625,14 @@ def _require_plan_limit(workflow, stages) -> None:
 
 
 def provide_plan(workflow_id: str,
-                  replacement: WorkflowPlanReplace) -> list[WorkflowStageInDB]:
+                  replacement: WorkflowPlanReplace, *, conn=None) -> list[WorkflowStageInDB]:
     """Готовый план дежурного при создании миссии.
 
     Миссия сразу попадает в awaiting_plan_approval — планировщик не
     запускается вообще. Утверждение (approve_plan) остаётся обязательным
     переходом, даже если план написал человек.
     """
-    with db._connect(immediate=True) as conn:
+    with (nullcontext(conn) if conn is not None else db._connect(immediate=True)) as conn:
         workflow = _workflow_row(conn, workflow_id)
         _require_version(workflow, replacement.expected_version)
         if WorkflowStatus(workflow["status"]) is not WorkflowStatus.DRAFT:

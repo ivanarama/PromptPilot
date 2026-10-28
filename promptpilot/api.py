@@ -723,27 +723,19 @@ def api_validate_workflow_setup(request: WorkflowSetupValidationRequest):
 @app.post("/api/workflows", response_model=WorkflowInDB, status_code=201)
 def api_create_workflow(workflow: WorkflowCreate):
     try:
-        # Создание атомарно: план валидируется ДО создания миссии (класс
-        # невалидных планов вообще не трогает БД и не занимает slug); редкий
-        # поздний сбой укладки компенсируется отменой только что созданного
-        # draft (db.abort_draft_workflow) — повторный запрос с тем же slug
-        # проходит.
+        # One transaction: no other request can observe/start an intermediate
+        # draft before its supplied plan and approval barrier have been stored.
         if workflow.plan:
             WorkflowPlanReplace(
                 expected_version=0, stages=workflow.plan)
-        created = db.create_workflow(workflow)
-        if workflow.plan:
-            # Готовый план дежурного — сразу awaiting_plan_approval.
-            try:
+        with db._connect(immediate=True) as conn:
+            created = db.create_workflow(workflow, conn=conn)
+            if workflow.plan:
                 workflows.provide_plan(created.id, WorkflowPlanReplace(
                     expected_version=created.state_version,
                     stages=workflow.plan,
-                ))
-            except Exception:
-                db.abort_draft_workflow(created.id)
-                raise
-            return db.get_workflow(created.id)
-        return created
+                ), conn=conn)
+            return db.get_workflow(created.id, conn=conn)
     except db.WorkflowConflictError as exc:
         raise HTTPException(409, str(exc)) from exc
     except ValueError as exc:

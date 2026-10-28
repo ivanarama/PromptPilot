@@ -8,7 +8,7 @@ import sqlite3
 import time
 import unicodedata
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -4936,10 +4936,10 @@ def append_workflow_event(event: WorkflowEventCreate) -> WorkflowEventInDB:
         return _append_workflow_event(conn, event)
 
 
-def create_workflow(data: WorkflowCreate, workflow_id: str = None) -> WorkflowInDB:
+def create_workflow(data: WorkflowCreate, workflow_id: str = None, *, conn=None) -> WorkflowInDB:
     workflow_id = workflow_id or _new_id("wf")
     now = _now()
-    with _connect(immediate=True) as conn:
+    with (nullcontext(conn) if conn is not None else _connect(immediate=True)) as conn:
         try:
             conn.execute(
                 """INSERT INTO workflows
