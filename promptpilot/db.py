@@ -129,7 +129,8 @@ CREATE TABLE IF NOT EXISTS notifications (
     created_at TEXT NOT NULL,
     sent_at TEXT,
     pane_id TEXT,
-    machine TEXT
+    machine TEXT,
+    flow_ref TEXT
 );
 
 CREATE TABLE IF NOT EXISTS prompt_log (
@@ -321,6 +322,51 @@ BEGIN
     SELECT RAISE(ABORT, 'workflow_events is append-only');
 END;
 
+-- Flows (promptpilot/flows.py): one row per request going through a flow.
+CREATE TABLE IF NOT EXISTS flow_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    flow TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    step_index INTEGER NOT NULL DEFAULT 0,
+    step_id TEXT,
+    version INTEGER NOT NULL DEFAULT 0,
+    trust TEXT NOT NULL DEFAULT 'owner',
+    dedup_key TEXT,
+    author TEXT NOT NULL DEFAULT '',
+    title TEXT NOT NULL DEFAULT '',
+    data_json TEXT NOT NULL DEFAULT '{}',
+    wait_json TEXT,
+    error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(flow, dedup_key)
+);
+
+CREATE TABLE IF NOT EXISTS flow_events (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_id INTEGER NOT NULL REFERENCES flow_items(id) ON DELETE RESTRICT,
+    step_id TEXT,
+    event_type TEXT NOT NULL,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS flow_events_no_update
+BEFORE UPDATE ON flow_events
+BEGIN
+    SELECT RAISE(ABORT, 'flow_events is append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS flow_events_no_delete
+BEFORE DELETE ON flow_events
+BEGIN
+    SELECT RAISE(ABORT, 'flow_events is append-only');
+END;
+
+CREATE INDEX IF NOT EXISTS idx_flow_items_status ON flow_items(status, flow);
+CREATE INDEX IF NOT EXISTS idx_flow_items_flow ON flow_items(flow, created_at);
+CREATE INDEX IF NOT EXISTS idx_flow_events_item ON flow_events(item_id, seq);
+
 CREATE INDEX IF NOT EXISTS idx_workflows_status ON workflows(status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_workflow_stages_workflow ON workflow_stages(workflow_id, position);
 CREATE INDEX IF NOT EXISTS idx_workflow_rounds_workflow ON workflow_rounds(workflow_id, round_no);
@@ -448,6 +494,9 @@ MIGRATIONS = [
     "CREATE INDEX IF NOT EXISTS idx_epf_jobs_task ON epf_jobs(task_id)",
     # what the agent run may do (models.TaskRights); NULL = skip_permissions decides
     "ALTER TABLE tasks ADD COLUMN rights TEXT",
+    # flow notifications carry "<item>:<step>" (approval) or "<item>:" (stuck item)
+    # so the bot adds the matching buttons
+    "ALTER TABLE notifications ADD COLUMN flow_ref TEXT",
 ]
 
 WORKFLOW_SCHEMA_VERSION = "workflow_orchestrator_w0_v1"
@@ -4676,16 +4725,19 @@ def update_epf_job(job_id: int, fields: dict):
 
 
 def add_notification(tg_chat_id: int, message: str, task_id: int = None,
-                     pane_id: str = None, machine: str = None):
+                     pane_id: str = None, machine: str = None,
+                     flow_ref: str = None):
     """Queue a free-form message for the bot's notify loop (e.g. blocked agent).
 
     pane_id/machine let the bot attach herdr action buttons (confirm/screen/
-    reply) to the delivered message instead of sending bare text."""
+    reply) to the delivered message instead of sending bare text; flow_ref
+    attaches flow buttons: "<item>:<step>" approve/reject an approval,
+    "<item>:" retry/skip/cancel an item that needs a person."""
     with _connect() as conn:
         conn.execute(
-            "INSERT INTO notifications (task_id, tg_chat_id, message, created_at, pane_id, machine)"
-            " VALUES (?, ?, ?, ?, ?, ?)",
-            (task_id, tg_chat_id, message, _now(), pane_id, machine),
+            "INSERT INTO notifications (task_id, tg_chat_id, message, created_at, pane_id,"
+            " machine, flow_ref) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (task_id, tg_chat_id, message, _now(), pane_id, machine, flow_ref),
         )
 
 

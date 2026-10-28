@@ -790,6 +790,240 @@ def workflow_import_history(reference, file_path):
     )
 
 
+@cli.group("flows")
+def flows_group():
+    """Маршруты заявок (flows): входы, шаги, согласования."""
+
+
+def _flow_call_cli(call, *args, **kwargs):
+    from . import flows
+
+    try:
+        return call(*args, **kwargs)
+    except flows.FlowError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+def _flow_line(item: dict) -> str:
+    from . import flows
+
+    status = flows.STATUS_WORDS.get(item["status"], item["status"])
+    where = f" · шаг {item['step_id']}" if item["step_id"] else ""
+    return f"#{item['id']:<5} {item['flow']:<18} {status:<14}{where}  {item['title']}"
+
+
+@flows_group.command("list")
+def flows_list():
+    """Маршруты из каталога, их заявки и файлы, которые не прошли проверку."""
+    from . import flows
+
+    loaded, errors = flows.load_flows()
+    counts = flows.status_counts()
+    click.echo(f"Каталог маршрутов: {flows.flows_dir()}")
+    if not loaded and not errors:
+        click.echo("  маршрутов нет — положите сюда *.json (см. docs/FLOWS.md)")
+    for flow in loaded.values():
+        tally = ", ".join(f"{flows.STATUS_WORDS.get(status, status)}: {count}"
+                          for status, count in sorted(counts.get(flow.name, {}).items()))
+        click.echo(f"  {flow.name}  [{flow.trust}]  {flow.title}  — {tally or 'заявок нет'}")
+    for name, error in errors.items():
+        click.echo(click.style(f"  ✗ {name}: {error}", fg="red"), err=True)
+    if errors:
+        sys.exit(1)
+
+
+@flows_group.command("check")
+@click.argument("file_path", type=click.Path(exists=True, dir_okay=False))
+def flows_check(file_path):
+    """Проверить файл маршрута, ничего не запуская."""
+    from pathlib import Path
+
+    from . import flows
+
+    try:
+        flow = flows.load_flow_file(Path(file_path))
+    except (OSError, ValueError) as exc:
+        raise click.ClickException(f"маршрут не принят:\n{exc}") from exc
+    click.echo(click.style(f"OK: {flow.name} [{flow.trust}], шагов: {len(flow.steps)}",
+                           fg="green"))
+    for step in flow.steps:
+        rights = getattr(step, "rights", None)
+        extra = f" права={rights}" if rights else ""
+        click.echo(f"  {step.id:<16} {step.kind:<8}{extra} {step.title}")
+
+
+@flows_group.command("items")
+@click.option("--flow", "flow_name", default=None, help="Только этот маршрут")
+@click.option("-s", "--status", default=None,
+              type=click.Choice(["active", "waiting_human", "needs_human", "done",
+                                 "rejected", "failed", "cancelled"]))
+@click.option("-n", "--limit", default=30, show_default=True)
+def flows_items(flow_name, status, limit):
+    """Заявки, новые сверху."""
+    from . import flows
+
+    items = flows.list_items(flow_name, status, limit)
+    if not items:
+        click.echo("Заявок нет.")
+    for item in items:
+        click.echo(_flow_line(item))
+        if item["error"]:
+            click.echo(click.style(f"        {item['error'][:200]}", fg="yellow"))
+
+
+@flows_group.command("show")
+@click.argument("item_id", type=int)
+@click.option("--json", "as_json", is_flag=True)
+def flows_show(item_id, as_json):
+    """Заявка целиком: вход, результаты шагов, журнал."""
+    import json as _json
+
+    from . import flows
+
+    item = flows.get_item(item_id)
+    if item is None:
+        raise click.ClickException("заявка не найдена")
+    events = flows.item_events(item_id)
+    if as_json:
+        click.echo(_json.dumps({**item, "events": events}, ensure_ascii=False, indent=2))
+        return
+    click.echo(_flow_line(item))
+    if item["error"]:
+        click.echo(click.style(f"Нужен человек: {item['error']}", fg="yellow"))
+    wait = item["wait"] or {}
+    if wait.get("approval"):
+        click.echo(f"Ждёт решения по шагу «{wait['approval']}»: {wait.get('text', '')}")
+        click.echo(f"  pp flows approve {item_id}   |   pp flows reject {item_id}")
+    click.echo("Результаты шагов:")
+    click.echo(_json.dumps(item["data"].get("steps", {}), ensure_ascii=False, indent=2))
+    click.echo("Журнал:")
+    for event in events:
+        detail = _json.dumps(event["payload"], ensure_ascii=False) if event["payload"] else ""
+        click.echo(f"  {event['created_at'][:19]}  {event['step_id'] or '-':<14} "
+                   f"{event['event_type']:<22} {detail[:160]}")
+
+
+@flows_group.command("add")
+@click.argument("flow_name")
+@click.argument("title")
+@click.option("-t", "--text", default="", help="Текст заявки")
+@click.option("-f", "--file", "file_path", type=click.Path(exists=True, dir_okay=False),
+              help="Текст заявки из файла")
+def flows_add(flow_name, title, text, file_path):
+    """Завести заявку вручную (как будто она пришла на вход маршрута)."""
+    from . import flows
+
+    loaded, errors = flows.load_flows()
+    flow = loaded.get(flow_name)
+    if flow is None:
+        raise click.ClickException(
+            f"маршрута «{flow_name}» нет или он не прошёл проверку (pp flows list)")
+    if file_path:
+        with open(file_path, encoding="utf-8-sig") as handle:
+            text = handle.read()
+    item = flows.create_item(flow, {"title": title, "body": text}, title=title, by="cli")
+    click.echo(f"Заявка #{item['id']} заведена; её поведёт `pp flows run`.")
+
+
+def _flow_version(item_id, observed):
+    from . import flows
+    if observed is not None:
+        return observed
+    item = _flow_call_cli(flows.get_item, item_id)
+    if item is None:
+        raise click.ClickException("Flow item not found")
+    return item["version"]
+
+
+def _flow_decision(item_id, decision, note, observed):
+    from . import flows
+
+    item = _flow_call_cli(flows.decide, item_id, decision, note, "cli",
+                          expected_version=_flow_version(item_id, observed))
+    click.echo(_flow_line(item))
+
+
+@flows_group.command("approve")
+@click.argument("item_id", type=int)
+@click.option("--note", default="", help="Указание к решению — попадёт в следующие шаги")
+@click.option("--expected-version", type=click.IntRange(min=0), default=None,
+              help="Observed version; default: fetch current state and submit with CAS")
+def flows_approve(item_id, note, expected_version):
+    """Одобрить согласование, которого ждёт заявка."""
+    _flow_decision(item_id, "approve", note, expected_version)
+
+
+@flows_group.command("reject")
+@click.argument("item_id", type=int)
+@click.option("--note", default="", help="Причина")
+@click.option("--expected-version", type=click.IntRange(min=0), default=None,
+              help="Observed version; default: fetch current state and submit with CAS")
+def flows_reject(item_id, note, expected_version):
+    """Отклонить согласование, которого ждёт заявка."""
+    _flow_decision(item_id, "reject", note, expected_version)
+
+
+@flows_group.command("retry")
+@click.argument("item_id", type=int)
+@click.option("--expected-version", type=click.IntRange(min=0), default=None,
+              help="Observed version; default: fetch current state and submit with CAS")
+@click.option("--confirm-command-stopped", is_flag=True, help="Only after verifying previous execution stopped")
+@click.option("--note", default="", help="Reason for verified recovery")
+def flows_retry(item_id, expected_version, confirm_command_stopped, note):
+    """Повторить шаг, на котором заявка остановилась (после исчерпанных повторов — ещё круг)."""
+    from . import flows
+
+    click.echo(_flow_line(_flow_call_cli(flows.retry, item_id, "cli",
+                                          expected_version=_flow_version(item_id, expected_version),
+                                          confirm_command_stopped=confirm_command_stopped, note=note)))
+
+
+@flows_group.command("skip")
+@click.argument("item_id", type=int)
+@click.option("--expected-version", type=click.IntRange(min=0), default=None,
+              help="Observed version; default: fetch current state and submit with CAS")
+@click.option("--confirm-command-stopped", is_flag=True, help="Only after verifying previous execution stopped")
+@click.option("--note", default="", help="Reason for verified recovery")
+def flows_skip(item_id, expected_version, confirm_command_stopped, note):
+    """Пропустить шаг, на котором заявка остановилась."""
+    from . import flows
+
+    click.echo(_flow_line(_flow_call_cli(flows.skip, item_id, "cli",
+                                          expected_version=_flow_version(item_id, expected_version),
+                                          confirm_command_stopped=confirm_command_stopped, note=note)))
+
+
+@flows_group.command("cancel")
+@click.argument("item_id", type=int)
+@click.option("--expected-version", type=click.IntRange(min=0), default=None,
+              help="Observed version; default: fetch current state and submit with CAS")
+@click.option("--confirm-command-stopped", is_flag=True, help="Only after verifying previous execution stopped")
+@click.option("--note", default="", help="Reason for verified recovery")
+def flows_cancel(item_id, expected_version, confirm_command_stopped, note):
+    """Снять заявку (и остановить задачу её шага)."""
+    from . import flows
+
+    click.echo(_flow_line(_flow_call_cli(flows.cancel, item_id, "cli",
+                                          expected_version=_flow_version(item_id, expected_version),
+                                          confirm_command_stopped=confirm_command_stopped, note=note)))
+
+
+@flows_group.command("run")
+@click.option("--once", is_flag=True, help="Один проход и выход")
+@click.option("--interval", type=int, default=None,
+              help="Секунд между проходами (по умолчанию PP_FLOWS_INTERVAL или 15)")
+def flows_run(once, interval):
+    """Вести заявки: читать входы, двигать шаги, обновлять публикации."""
+    from . import flows
+
+    if once:
+        result = flows.run_once(click.echo)
+        click.echo(f"маршрутов: {result['flows']}, новых заявок: {result['created']}, "
+                   f"продвинуто: {result['moved']}")
+        return
+    flows.run_forever(interval, click.echo)
+
+
 @cli.command()
 @click.argument("action", required=False, default="list")
 @click.argument("name", required=False)

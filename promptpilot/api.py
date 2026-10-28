@@ -19,11 +19,11 @@ from urllib.parse import urlsplit
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 import re as _re
 
-from . import db, epf_tools, workflows
+from . import db, epf_tools, flows, workflows
 from . import pipeline_insights
 from .config import ALLOWED_HOSTS, ALLOWED_ORIGINS, API_TOKEN, DB_DIR, DEFAULT_CLI, EFFORT_LEVELS, PIPELINE_SNAPSHOT_INTERVAL, get_provider_models, get_skills, load_providers, mask_secret_value, provider_available, RIGHTS_LEVELS, rights_supported, save_catalog_provider, PROJECTS_ROOT
 from .provider_catalog import CATALOG, catalog_entry, slugify, build_provider_entry
@@ -1927,6 +1927,98 @@ def api_projects():
         return entries
     except OSError:
         return []
+
+
+# --- Flows (маршруты заявок) ---
+
+class FlowActionRequest(BaseModel):
+    expected_version: int = Field(ge=0, strict=True)
+    confirm_command_stopped: bool = False
+    note: str = ""
+
+
+class FlowDecisionRequest(FlowActionRequest):
+    decision: str
+    note: str = ""
+    step: Optional[str] = None  # the approval the caller saw; stale buttons are refused
+
+
+class FlowItemRequest(BaseModel):
+    title: str
+    text: str = ""
+    fields: dict = {}
+
+
+def _flow_call(call, *args, **kwargs):
+    try:
+        return call(*args, **kwargs)
+    except flows.FlowError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.get("/api/flows")
+def api_flows():
+    loaded, errors = flows.load_flows()
+    counts = flows.status_counts()
+    return {
+        "dir": str(flows.flows_dir()),
+        "flows": [
+            {"name": flow.name, "title": flow.title, "trust": flow.trust,
+             "input": flow.input.type if flow.input else None,
+             "steps": [{"id": step.id, "kind": step.kind, "title": step.title}
+                       for step in flow.steps],
+             "counts": counts.get(flow.name, {})}
+            for flow in loaded.values()
+        ],
+        "errors": errors,
+    }
+
+
+@app.get("/api/flows/items")
+def api_flow_items(
+    flow: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+):
+    return [flows.summary(item) for item in flows.list_items(flow, status, limit, offset)]
+
+
+@app.get("/api/flows/items/{item_id}")
+def api_flow_item(item_id: int):
+    item = flows.get_item(item_id)
+    if item is None:
+        raise HTTPException(404, "Заявка не найдена")
+    return {**item, "events": flows.item_events(item_id)}
+
+
+@app.post("/api/flows/items/{item_id}/decision")
+def api_flow_decision(item_id: int, body: FlowDecisionRequest):
+    if body.decision not in ("approve", "reject"):
+        raise HTTPException(400, "decision: approve | reject")
+    item = _flow_call(flows.decide, item_id, body.decision, body.note, "web", step_id=body.step,
+                      expected_version=body.expected_version)
+    return flows.summary(item)
+
+
+@app.post("/api/flows/items/{item_id}/{action}")
+def api_flow_action(item_id: int, action: str, body: FlowActionRequest):
+    calls = {"retry": flows.retry, "skip": flows.skip, "cancel": flows.cancel}
+    if action not in calls:
+        raise HTTPException(404, "Действие: retry | skip | cancel")
+    return flows.summary(_flow_call(calls[action], item_id, "web",
+                                    expected_version=body.expected_version,
+                                    confirm_command_stopped=body.confirm_command_stopped, note=body.note))
+
+
+@app.post("/api/flows/{name}/items", status_code=201)
+def api_flow_create_item(name: str, body: FlowItemRequest):
+    loaded, _errors = flows.load_flows()
+    flow = loaded.get(name)
+    if flow is None:
+        raise HTTPException(404, "Маршрута нет или он не прошёл проверку")
+    request = {**body.fields, "title": body.title, "body": body.text}
+    return flows.summary(flows.create_item(flow, request, title=body.title, by="web"))
 
 
 # --- Frontend ---
