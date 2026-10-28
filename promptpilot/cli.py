@@ -696,7 +696,9 @@ def workflow_review(reference, verdict, summary, findings_file):
 @click.argument("reference")
 @click.argument("text")
 @click.option("--resume", is_flag=True)
-def workflow_input(reference, text, resume):
+@click.option("--note", default="",
+              help="Указание агенту: уйдёт в следующий запуск исполнителя и аудитора")
+def workflow_input(reference, text, resume, note):
     """Append a human decision and optionally resume the workflow."""
     from . import workflows
     from .models import WorkflowHumanInput
@@ -709,6 +711,7 @@ def workflow_input(reference, text, resume):
             expected_version=item.state_version,
             text=text,
             resume=resume,
+            note=note,
         ),
     )
     click.echo(f"Workflow {updated.slug}: {updated.status.value}")

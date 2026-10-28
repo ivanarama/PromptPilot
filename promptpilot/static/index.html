@@ -439,10 +439,24 @@
   .pipeline-report-queues { width:100%; border-collapse:collapse; font-size:12px; }
   .pipeline-report-queues th, .pipeline-report-queues td { text-align:left; padding:5px 7px; border-top:1px solid var(--border); }
   .pipeline-report-queues th.num, .pipeline-report-queues td.num { text-align:right; font-variant-numeric:tabular-nums; }
+  .pipeline-flow-row { display:grid; grid-template-columns:115px minmax(0,1fr) 75px; gap:9px; align-items:center; margin:7px 0; font-size:12px; }
+  .pipeline-flow-bar { display:flex; height:12px; overflow:hidden; border-radius:5px; background:var(--surface2); border:1px solid var(--border); }
+  .pipeline-flow-bar span { display:block; height:100%; }
+  .pipeline-flow-bar .ready { background:var(--green); }
+  .pipeline-flow-bar .empty { background:var(--muted); }
+  .pipeline-flow-bar .no_change { background:var(--text2); }
+  .pipeline-flow-bar .stale { background:var(--accent); }
+  .pipeline-flow-bar .safe_refusal { background:var(--yellow); }
+  .pipeline-flow-bar .human { background:var(--yellow); }
+  .pipeline-flow-bar .error { background:var(--red); }
+  .pipeline-flow-bar .other { background:var(--text2); }
+  .pipeline-flow-legend { display:flex; flex-wrap:wrap; gap:5px 13px; color:var(--text2); font-size:11px; }
+  .pipeline-flow-legend span::before { content:''; display:inline-block; width:8px; height:8px; border-radius:2px; margin-right:4px; background:var(--legend-color); }
   #pipelineModal .modal { max-width:1120px; }
   @media (max-width: 720px) {
     .pipeline-summary { grid-template-columns:repeat(2,minmax(120px,1fr)); }
     .pipeline-report-grid { grid-template-columns:repeat(2,minmax(120px,1fr)); }
+    .pipeline-flow-row { grid-template-columns:75px minmax(0,1fr) 65px; gap:5px; font-size:11px; }
     .insights-table { table-layout:auto; display:block; overflow-x:auto; white-space:nowrap; }
     .insights-table th, .insights-table td { min-width:75px; }
     .insights-table th:first-child, .insights-table td:first-child { min-width:130px; }
@@ -686,7 +700,7 @@
         <input type="number" id="timeoutInput" placeholder="0 = no limit" min="0" style="width:80px" title="Per-task timeout in seconds (0 = no limit, empty = default)">
       </label>
       <label id="skipPermsLabel" style="flex-direction:row;align-items:center;gap:8px;cursor:pointer;display:none">
-        <input type="checkbox" id="skipPermissions" style="width:auto;margin:0">
+        <input type="checkbox" id="skipPermissions" style="width:auto;margin:0" onchange="rememberSkipPermissions()">
         <span style="font-size:13px;color:var(--yellow)" title="Claude: --dangerously-skip-permissions; Codex: --dangerously-bypass-approvals-and-sandbox">⚠ не спрашивать разрешения</span>
       </label>
       <label id="keepPaneLabel" style="flex-direction:row;align-items:center;gap:8px;cursor:pointer;display:none">
@@ -1283,7 +1297,9 @@ async function addTask() {
   const sel = document.getElementById('workdirSelect');
   const selVal = sel.style.display !== 'none' && sel.value && sel.value !== '__custom__' ? sel.value : null;
   const workdir = selVal || document.getElementById('workdirInput').value.trim() || null;
-  const skipPermissions = document.getElementById('skipPermissions').checked;
+  // A hidden option is not a choice the user made: session targets hide it.
+  const skipPermissions = document.getElementById('skipPermsLabel').style.display !== 'none'
+    && document.getElementById('skipPermissions').checked;
   const provInfo = providersData[provider] || {};
   const herdrTarget = provInfo.session_target ? document.getElementById('herdrTargetInput').value : null;
   if (provInfo.session_target && !herdrTarget) { alert('Нет открытой herdr-сессии для отправки.'); return; }
@@ -1331,6 +1347,8 @@ async function addTask() {
     toast('Не удалось создать задачу: ' + e.message);
     return;
   }
+
+  if (workdir) await rememberWorkdir(workdir);
 
   document.getElementById('promptInput').value = '';
   document.getElementById('recurrenceInput').value = '';
@@ -2230,7 +2248,8 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, 
       <div class="wf-round-summary">Не запускайте новый раунд. Дождитесь завершения фоновых build/pytest; экран агента показан ниже.</div>
     </div>`;
   } else if (wf.status === 'revision_required' || (wf.status === 'awaiting_human' && !reviewerDone)) {
-    action = `<div class="wf-form"><input class="wide" id="wfHumanText" value="Продолжить работу с учётом сохранённого состояния" required>
+    action = `<div class="wf-form"><textarea class="wide" id="wfHumanNote" rows="3"
+        placeholder="Что передать агенту (необязательно). Уйдёт в следующий запуск исполнителя и аудитора как указание, главнее инструкций раунда."></textarea>
       <button class="btn btn-sm btn-primary" onclick="wfResume()">Продолжить ${wf.status === 'revision_required' ? 'новым раундом' : 'текущий раунд'}</button></div>`;
   } else if (wf.status === 'awaiting_human' && reviewerDone) {
     const auditColor = auditVerdict === 'PASS' ? 'var(--green)' : 'var(--red)';
@@ -2537,7 +2556,15 @@ function wfDownloadReport(format) {
 
 function wfStart() { return wfPost('start', {expected_version: selectedWorkflowData.state_version}); }
 function wfSync() { return wfPost('sync', {}); }
-function wfResume() { return wfPost('human-input', {expected_version: selectedWorkflowData.state_version, text: document.getElementById('wfHumanText').value, resume: true}); }
+function wfResume() {
+  const note = (document.getElementById('wfHumanNote')?.value || '').trim();
+  return wfPost('human-input', {
+    expected_version: selectedWorkflowData.state_version,
+    text: note || 'Продолжить работу с учётом сохранённого состояния',
+    note,
+    resume: true,
+  });
+}
 function wfGate(verdict) { return wfPost('gate', {expected_version: selectedWorkflowData.state_version, verdict, gate_id: 'ui-manual-gate', summary: document.getElementById('wfDecisionSummary').value}); }
 function wfReview(verdict) { return wfPost('review', {expected_version: selectedWorkflowData.state_version, verdict, summary: document.getElementById('wfDecisionSummary').value, findings: []}); }
 function wfCancel() { if (confirm('Отменить workflow и все его активные задачи?')) return wfPost('cancel', {expected_version: selectedWorkflowData.state_version}); }
@@ -2758,7 +2785,7 @@ function aggregateDiagnosticFindings(findings) {
 
 function diagnosticFindingMessage(finding) {
   const messages = {
-    single_flight_barrier: 'Интеграционная полоса занята этим PR; обычное содержательное ревью других PR продолжает работать.',
+    single_flight_barrier: 'Слияние других PR ждёт завершения интеграции; обычное ревью идёт параллельно только при разрешённом маршруте.',
     legacy_ship_waiting_review_validation: 'Переход со старого формата: очередь безопасно перепроверит эти PR перед слиянием.',
     base_sync_base_advanced: 'Ветка main обновилась после подготовки PR; перед слиянием нужна повторная синхронизация.',
     ship_waiting_initial_review: 'Разрешение ship сохранено; этот HEAD сначала пройдёт обычное содержательное ревью.',
@@ -2906,6 +2933,10 @@ async function loadPipelineReport(profile, hours=24, refresh=false) {
     const attention = data.attention || [];
     const runs = data.runs || {verdicts: {}, tokens: {}, errors: {}};
     const verdicts = runs.verdicts || {};
+    const reportFlow = pipelineRunBreakdown({runs_5h: {...verdicts, runs:runs.total}});
+    const reportFlowSegments = reportFlow.parts.filter(part => part.count).map(part =>
+      `<span class="${part.key}" style="width:${(100 * part.count / reportFlow.total).toFixed(2)}%" title="${escAttr(part.label)}: ${part.count}"></span>`).join('');
+    const reportFlowSummary = reportFlow.parts.filter(part => part.count).map(part => `${part.label} ${part.count}`).join(', ');
     const tokens = runs.tokens || {};
     const cost = runs.cost || {};
     const errors = runs.errors || {};
@@ -2979,6 +3010,8 @@ async function loadPipelineReport(profile, hours=24, refresh=false) {
       `<div class="pipeline-metric"><div class="pipeline-metric-label">${esc(group.title)}</div><div class="pipeline-metric-value">${pipelineReportNumber(group.count)}</div></div>`).join('');
     const blockedRows = (board.blocked || []).map(item =>
       `<li>${item.number == null ? '' : `#${pipelineReportNumber(item.number)} · `}${esc(item.message || item.code || 'Причина не указана')}</li>`).join('');
+    const currentWaitRows = pipelineWaitReasons(data).map(wait =>
+      `<li><b>${esc(wait.title || wait.id)}</b>: ${esc(wait.reason)}</li>`).join('');
     const ciRows = (board.waiting_ci || []).map(item =>
       `<li>${pipelineReportItem(item)} · ${esc(item.message || 'Проверки ещё выполняются')}</li>`).join('');
 
@@ -3001,6 +3034,9 @@ async function loadPipelineReport(profile, hours=24, refresh=false) {
       <div class="pipeline-metric"><div class="pipeline-metric-label">Влито PR / закрыто issues</div><div class="pipeline-metric-value">${deliveryExact ? `${pipelineReportNumber(merged.length)} / ${pipelineReportNumber(closed.length)}` : 'Ещё не проверено'}</div><div class="pipeline-metric-note">${deliveryExact ? `всего событий: ${pipelineReportNumber(delivered)}` : 'Нажмите «Уточнить результат в GitHub». Это не ноль выполненных работ.'}</div></div>
       ${categories}
     </div>
+    <div class="pipeline-flow-row"><b>Итоги запусков</b><div class="pipeline-flow-bar" role="img" aria-label="${escAttr(reportFlow.total ? reportFlowSummary : 'Завершённых запусков нет')}">${reportFlowSegments}</div><span class="num">${runsLabel(reportFlow.total)}</span></div>
+    <div class="pipeline-flow-legend"><span style="--legend-color:var(--green)">готово</span><span style="--legend-color:var(--muted)">пусто</span><span style="--legend-color:var(--text2)">без изменений</span><span style="--legend-color:var(--accent)">перевыбор</span><span style="--legend-color:var(--yellow)">нужен человек / безопасный отказ</span><span style="--legend-color:var(--red)">ошибка</span></div>
+    <div class="pipeline-report-meta">Зелёный сегмент означает результат этапа «готово», а не влитый PR. «Пусто» и ошибки сохраняются в локальной истории; ожидание WIP или API показано ниже как причина, а не как завершённый запуск.</div>
     <div class="pipeline-report-meta">Закрытые issues и влитые PR — отдельные события, не сумма выполненных задач. Категории относятся только к влитым PR; без подтверждённой классификации результат не записывается в продукт.</div>
     ${pipelineReportDeliveryNotice(delivery, periodLabel)}
     <div class="pipeline-report-section"><h3>Результат в GitHub</h3>${deliveryRows ? `<ul class="pipeline-report-list">${deliveryBody}</ul>` : deliveryBody}</div>
@@ -3013,6 +3049,7 @@ async function loadPipelineReport(profile, hours=24, refresh=false) {
       ${ciRows ? `<ul class="pipeline-report-list">${ciRows}</ul>` : '<div>Нет подтверждённого списка ожиданий CI. Это не означает, что все проверки зелёные.</div>'}
     </div>
     <div class="pipeline-report-section"><h3>Почему задачи ждут</h3>
+      ${currentWaitRows ? `<ul class="pipeline-report-list">${currentWaitRows}</ul>` : '<div>У текущих запусков нет записанной причины ожидания.</div>'}
       ${board.available ? (blockedRows ? `<ul class="pipeline-report-list">${blockedRows}</ul>` : '<div>В свежей диагностике нет дополнительных предупреждений.</div>') : '<div>Свежая полная диагностика недоступна; причины ожидания пока неизвестны.</div>'}
       <div class="pipeline-report-meta">Предупреждение не означает остановку всего конвейера. Решения человека перечислены отдельно выше.</div>
     </div>
@@ -3028,7 +3065,7 @@ async function loadPipelineReport(profile, hours=24, refresh=false) {
       <div class="pipeline-metric"><div class="pipeline-metric-label">Стоимость</div><div class="pipeline-metric-value">${esc(costValue)}</div><div class="pipeline-metric-note">измерено запусков: ${pipelineReportNumber(cost.known_runs)} из ${pipelineReportNumber(runs.total)}</div></div>
     </div>
     <div class="pipeline-report-section"><h3>Движение по этапам</h3>
-      <div class="pipeline-report-meta">Узкое место: ${bottleneck}</div>
+      <div class="pipeline-report-meta">Этап, требующий внимания: ${bottleneck}</div>
       ${queueRows ? `<table class="pipeline-report-queues"><thead><tr><th>Этап</th><th class="num">Сейчас</th><th class="num">Δ</th><th class="num">Вышло</th></tr></thead><tbody>${queueRows}</tbody></table>` : '<div class="pipeline-report-meta">Нет данных об очередях.</div>'}
     </div>
     <div class="pipeline-report-section"><h3>Запуски</h3>
@@ -3042,6 +3079,80 @@ async function loadPipelineReport(profile, hours=24, refresh=false) {
     if (requestId !== pipelineReportRequestId) return;
     box.innerHTML = `<div style="color:var(--red);margin-bottom:10px">Отчёт недоступен: ${esc(e.message)}</div>`;
   }
+}
+
+function pipelineStageFocus(queues) {
+  const pending = (queues || []).filter(q => Number(q.backlog) > 0);
+  const stopped = pending.filter(q => q.parallel_capacity != null && Number(q.parallel_capacity) === 0);
+  const working = pending.filter(q => Number(q.parallel_capacity) > 0);
+  const pressure = q => {
+    const eta = Number(q.eta_hours);
+    if (q.eta_hours != null && Number.isFinite(eta)) return eta;
+    const work = Number(q.runs_needed ?? q.backlog);
+    return Number.isFinite(work) ? work / Number(q.parallel_capacity) : 0;
+  };
+  working.sort((a, b) => pressure(b) - pressure(a));
+  return {stopped, workingBottleneck: working[0] || null};
+}
+
+function pipelineWaitReasons(data) {
+  const waits = [];
+  const add = (id, title, status, error, retryAt, taskId) => {
+    if (!['pending', 'rate_limited'].includes(status) || !error) return;
+    const reason = String(error) + (status === 'rate_limited' && retryAt
+      ? ` · следующая попытка: ${retryAt}` : '');
+    if (waits.some(wait => taskId && wait.task_id === taskId
+        || wait.title === title && wait.reason === reason)) return;
+    waits.push({id, title, reason, task_id:taskId});
+  };
+  for (const queue of (data.queues || [])) {
+    const replicas = queue.series_replicas?.length ? queue.series_replicas : [queue];
+    for (const task of replicas) {
+      if (Number(queue.backlog) > 0 || task.task_status === 'rate_limited') {
+        add(queue.id, task.title || queue.title, task.task_status,
+          task.task_error, task.task_next_run_at, task.task_id);
+      }
+    }
+  }
+  for (const task of (data.current?.tasks || [])) {
+    add(String(task.task_id || ''), task.title, task.status,
+      task.error, task.scheduled_at, task.task_id);
+  }
+  const owner = (data.diagnostics && data.diagnostics.integration_owner)
+    || (data.current && data.current.integration_owner);
+  const reviewStages = ['integration-review', 'legacy-integration-review'];
+  if (owner && reviewStages.includes(owner.stage) && !data.cache?.stale && data.coverage?.fresh !== false && !waits.some(wait => wait.id === 'merge')) {
+    waits.push({id:'merge', title:'Слияние', reason:`PR #${owner.number} ожидает независимого ревью нового HEAD`});
+  }
+  return waits;
+}
+
+function pipelineRunBreakdown(queue) {
+  const runs = queue.runs_5h || {};
+  const count = key => Math.max(0, Number(runs[key] || 0));
+  const parts = [
+    {key:'ready', label:'Готово', count:count('ready')},
+    {key:'empty', label:'Пусто', count:count('empty')},
+    {key:'no_change', label:'Без изменений', count:count('no_change')},
+    {key:'stale', label:'Перевыбор', count:count('stale')},
+    {key:'safe_refusal', label:'Безопасный отказ', count:count('safe_refusal')},
+    {key:'human', label:'Нужен человек', count:count('human')},
+    {key:'error', label:'Не смог / упал', count:count('unable') + count('failed')},
+  ];
+  const known = parts.reduce((sum, part) => sum + part.count, 0);
+  const total = Math.max(known, count('runs'));
+  if (total > known) parts.push({key:'other', label:'Другой итог', count:total - known});
+  return {total, parts};
+}
+
+function runsLabel(count) {
+  const n = Math.abs(Number(count) || 0);
+  const tens = n % 100;
+  const last = n % 10;
+  const word = tens >= 11 && tens <= 14 ? 'запусков'
+    : last === 1 ? 'запуск'
+    : last >= 2 && last <= 4 ? 'запуска' : 'запусков';
+  return `${n} ${word}`;
 }
 
 async function loadPipelineInsights(profile, refresh=false) {
@@ -3144,7 +3255,17 @@ async function loadPipelineInsights(profile, refresh=false) {
     const coreColor = coreShare == null ? 'var(--muted)' : coreShare <= 0.05 ? 'var(--red)' : coreShare <= 0.2 ? 'var(--yellow)' : '';
     const deltaRateByQueue = h5.queue_deltas_per_hour || {};
     const throughputRateByQueue = h5.queue_throughput_per_hour || {};
-    const bottleneckQueue = (data.queues || []).find(q => q.id === data.bottleneck);
+    const stageFocus = pipelineStageFocus(data.queues);
+    const workingBottleneck = stageFocus.workingBottleneck;
+    const waits = pipelineWaitReasons(data);
+    const waitRows = waits.map(wait => `<li><b>${esc(wait.title)}</b> — ${esc(wait.reason)}</li>`).join('');
+    const flowRows = (data.queues || []).map(queue => {
+      const {total, parts} = pipelineRunBreakdown(queue);
+      const segments = parts.filter(part => part.count).map(part =>
+        `<span class="${part.key}" style="width:${(100 * part.count / total).toFixed(2)}%" title="${escAttr(part.label)}: ${part.count}"></span>`).join('');
+      const summary = parts.filter(part => part.count).map(part => `${part.label} ${part.count}`).join(', ');
+      return `<div class="pipeline-flow-row"><b>${esc(queue.title)}</b><div class="pipeline-flow-bar" role="img" aria-label="${escAttr(total ? summary : 'Завершённых запусков нет')}">${segments}</div><span class="num">${total ? runsLabel(total) : 'нет запусков'}</span></div>`;
+    }).join('');
     const diagnostics = data.diagnostics;
     const runtime = data.runtime || {};
     const healthLabel = data.health.label === 'нужна проверка' ? 'есть ожидания' : data.health.label;
@@ -3163,7 +3284,7 @@ async function loadPipelineInsights(profile, refresh=false) {
       const lastLine = last && last.at
         ? `последний #${last.task_id}: ${timeAgo(last.at)} · ${last.verdict || last.status}${lastTokens}`
         : 'завершённых запусков нет';
-      const stageLine = `5 ч: ${stageRuns.runs || 0} запусков · действий ${stageRuns.ready || 0} · холостых ${stageRuns.no_change || 0} · фактический выход ${perHour(throughputRateByQueue[q.id])}`;
+      const stageLine = `5 ч: ${runsLabel(stageRuns.runs || 0)} · действий ${stageRuns.ready || 0} · холостых ${stageRuns.no_change || 0} · фактический выход ${perHour(throughputRateByQueue[q.id])}`;
       const route = q.execution || {configured:'skill',effective:'skill'};
       const routeLine = `маршрут: ${route.configured}${route.configured!==route.effective ? ` → ${route.effective}` : ''}${route.reason && route.effective!=='tool' ? ` · ${route.reason}` : ''}`;
       const wake = q.wake;
@@ -3181,9 +3302,10 @@ async function loadPipelineInsights(profile, refresh=false) {
         `#${replica.series_id} ${replica.task_status || (replica.paused ? 'paused' : replica.broken ? 'broken' : 'idle')} · ${replica.interval || 'без интервала'} · ${replica.working_dir || 'working_dir не задан'}`
       );
       const replicaLine = `${replicaSummary}${replicaIssues}${replicaLines.length ? ` · ${replicaLines.join(' | ')}` : ''}`;
-      const bottleneck = data.bottleneck===q.id ? 'bottleneck' : '';
+      const stopped = stageFocus.stopped.some(item => item.id === q.id);
+      const bottleneck = stopped || workingBottleneck?.id === q.id ? 'bottleneck' : '';
       const capacity = `${q.capacity} × ${q.replicas_active || 0} = ${q.parallel_capacity}`;
-      return `<tr class="${bottleneck}"><td class="insights-stage-title">${data.bottleneck===q.id?'⚠ ':''}${esc(q.title)}${q.replica_count>1?` ×${q.replica_count}`:''}</td><td class="num">${q.backlog == null ? '—' : q.backlog}</td><td class="num">${h5.complete?perHour(deltaRateByQueue[q.id] ?? 0):'—'}</td><td class="num">${capacity}</td><td class="num">${q.runs_needed == null ? '—' : q.runs_needed}</td><td>${duration(q.avg_duration_seconds)}</td><td>${q.eta_hours == null ? '—' : q.eta_hours+' ч'}</td><td>${age(q.age.oldest_hours)}</td><td>${esc(q.interval || 'нет серии')}</td><td class="insights-recommendation">${esc(q.recommendation || '—')}</td></tr>
+      return `<tr class="${bottleneck}"><td class="insights-stage-title">${stopped?'⏸ ':workingBottleneck?.id===q.id?'⚠ ':''}${esc(q.title)}${q.replica_count>1?` ×${q.replica_count}`:''}</td><td class="num">${q.backlog == null ? '—' : q.backlog}</td><td class="num">${h5.complete?perHour(deltaRateByQueue[q.id] ?? 0):'—'}</td><td class="num">${capacity}</td><td class="num">${q.runs_needed == null ? '—' : q.runs_needed}</td><td>${duration(q.avg_duration_seconds)}</td><td>${q.eta_hours == null ? '—' : q.eta_hours+' ч'}</td><td>${age(q.age.oldest_hours)}</td><td>${esc(q.interval || 'нет серии')}</td><td class="insights-recommendation">${esc(q.recommendation || '—')}</td></tr>
         <tr class="insights-stage-detail ${bottleneck}"><td colspan="10"><div class="insights-stage-meta"><span class="prov-cmd" title="${escAttr(last?.summary || '')}">${esc(lastLine)}</span><span class="prov-cmd">${esc(stageLine)}</span><span class="prov-cmd">${esc(routeLine)}</span><span class="prov-cmd" style="${replicaStatus.valid?'':'color:var(--red)'}">${esc(replicaLine)}</span>${wakeLine?`<span class="prov-cmd">${esc(wakeLine)}</span>`:''}${cadenceLine?`<span class="prov-cmd">${esc(cadenceLine)}</span>`:''}</div></td></tr>`;
     }).join('');
     const priorityHtml = data.priority_control ? `<details style="margin-top:12px" open>
@@ -3219,7 +3341,8 @@ async function loadPipelineInsights(profile, refresh=false) {
         <div class="pipeline-metric"><div class="pipeline-metric-label">Снимок GitHub</div><div class="pipeline-metric-value" style="${cacheColor ? `color:${cacheColor}` : ''}">${esc(cacheValue)}</div><div class="pipeline-metric-note">${esc(cacheNote)}</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Backlog сейчас</div><div class="pipeline-metric-value">${data.backlog_total == null ? '—' : data.backlog_total}</div><div class="pipeline-metric-note">Δ/ч: ${h5.complete?perHour(h5.backlog_delta_per_hour):'копится история'}</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Вход / выход</div><div class="pipeline-metric-value">${h5.complete?`${perHour(h5.entered_per_hour)} / ${perHour(h5.exited_per_hour)}`:'—'}</div><div class="pipeline-metric-note">фактическая скорость · ${historyNote}</div></div>
-        <div class="pipeline-metric"><div class="pipeline-metric-label">Узкое место</div><div class="pipeline-metric-value">${bottleneckQueue?esc(bottleneckQueue.title):'нет'}</div><div class="pipeline-metric-note">${bottleneckQueue&&bottleneckQueue.eta_hours!=null?`ETA ${bottleneckQueue.eta_hours} ч · очередь ${bottleneckQueue.backlog}`:'активной очереди нет'}</div></div>
+        <div class="pipeline-metric"><div class="pipeline-metric-label">Остановленные этапы</div><div class="pipeline-metric-value">${stageFocus.stopped.length ? stageFocus.stopped.map(q => esc(q.title)).join(', ') : 'нет'}</div><div class="pipeline-metric-note">${stageFocus.stopped.length ? `есть работа, но нет активных реплик: ${stageFocus.stopped.map(q => `${esc(q.title)} — ${q.backlog}`).join('; ')}` : 'все очереди с работой имеют рабочую ёмкость'}</div></div>
+        <div class="pipeline-metric"><div class="pipeline-metric-label">Самая длинная очередь по ETA</div><div class="pipeline-metric-value">${workingBottleneck?esc(workingBottleneck.title):'нет'}</div><div class="pipeline-metric-note">${workingBottleneck ? `очередь ${workingBottleneck.backlog}${workingBottleneck.eta_hours != null ? ` · ETA ${workingBottleneck.eta_hours} ч` : ' · ETA пока неизвестно'}; причина ожидания показана ниже` : 'очередей с работой и активными репликами нет'}</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Переходы / churn</div><div class="pipeline-metric-value">${h5.complete?`${h5.transitions} / ${h5.churn_items}`:'—'}</div><div class="pipeline-metric-note">между очередями / 3+ состояний</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Возраст p90 / max</div><div class="pipeline-metric-value">${age(data.age.p90_hours)} / ${age(data.age.oldest_hours)}</div><div class="pipeline-metric-note">текущие элементы</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Прогоны 5 ч</div><div class="pipeline-metric-value">${runs.runs}</div><div class="pipeline-metric-note">с действием ${runs.ready} · без действий ${runs.no_change || 0} · пусто ${runs.empty} · перевыбор ${runs.stale || 0}</div></div>
@@ -3234,6 +3357,15 @@ async function loadPipelineInsights(profile, refresh=false) {
         <div class="pipeline-metric"><div class="pipeline-metric-label">Worker</div><div class="pipeline-metric-value">${runtime.state==='online'?'online':'offline'}</div><div class="pipeline-metric-note">${runtime.age_seconds == null ? 'heartbeat отсутствует' : 'heartbeat '+runtime.age_seconds+' сек назад'}</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">GitHub REST API</div><div class="pipeline-metric-value" style="${coreColor ? `color:${coreColor}` : ''}">${esc(githubLimitText('core'))}</div><div class="pipeline-metric-note">${esc(rateObserved)} · Search ${esc(githubLimitText('search'))} · GraphQL ${esc(githubLimitText('graphql'))}</div></div>
         ${budgetMetric}
+      </div>
+      <div class="pipeline-report-section"><h3>Почему этапы ждут прямо сейчас</h3>
+        ${waitRows ? `<ul class="pipeline-report-list">${waitRows}</ul>` : '<div class="pipeline-report-meta">Нет записанной причины ожидания. Это не означает, что очередь пуста.</div>'}
+        <div class="pipeline-report-meta">Здесь показана причина последней отложенной попытки, а не оценка размера очереди.</div>
+      </div>
+      <div class="pipeline-report-section"><h3>Итоги запусков по этапам · 5 часов</h3>
+        ${flowRows}
+        <div class="pipeline-flow-legend"><span style="--legend-color:var(--green)">готово</span><span style="--legend-color:var(--muted)">пусто</span><span style="--legend-color:var(--text2)">без изменений</span><span style="--legend-color:var(--accent)">перевыбор</span><span style="--legend-color:var(--yellow)">нужен человек / безопасный отказ</span><span style="--legend-color:var(--red)">ошибка</span></div>
+        <div class="pipeline-report-meta">«Готово» здесь — итог запуска, не обязательно влитый PR. Отложенные попытки (WIP, бюджет API) не становятся «ПУСТО» и показаны отдельно выше. Данные — из локальной базы PromptPilot.</div>
       </div>
       ${diagnosticHtml}
       <table class="insights-table"><colgroup><col class="insights-col-stage"><col class="insights-col-small"><col class="insights-col-small"><col class="insights-col-capacity"><col class="insights-col-capacity"><col class="insights-col-duration"><col class="insights-col-small"><col class="insights-col-oldest"><col class="insights-col-interval"><col class="insights-col-recommendation"></colgroup><thead><tr><th>Этап</th><th class="num">Очередь</th><th class="num">Δ/ч</th><th class="num">За реплику × активные</th><th class="num">Прогонов</th><th>Средний запуск</th><th>ETA</th><th>Самый старый</th><th>Интервал</th><th>Рекомендация</th></tr></thead><tbody>${rows}</tbody></table>
@@ -3846,22 +3978,86 @@ function selectSkill(name) {
 }
 
 // --- Load projects into dir select ---
+const RECENT_WORKDIRS_KEY = 'promptpilot.recent-workdirs';
+const SKIP_PERMISSIONS_KEY = 'promptpilot.skip-permissions';
+
+function restoreSkipPermissions() {
+  const checkbox = document.getElementById('skipPermissions');
+  checkbox.checked = false;
+  try { checkbox.checked = localStorage.getItem(SKIP_PERMISSIONS_KEY) === 'true'; }
+  catch (_) { /* A new or storage-blocked browser keeps the default off. */ }
+}
+
+function rememberSkipPermissions() {
+  if (document.getElementById('skipPermsLabel').style.display === 'none') return;
+  try {
+    localStorage.setItem(SKIP_PERMISSIONS_KEY,
+      String(document.getElementById('skipPermissions').checked));
+  } catch (_) { /* The visible explicit choice still applies to this task. */ }
+}
+
+function recentWorkdirs() {
+  try {
+    const paths = JSON.parse(localStorage.getItem(RECENT_WORKDIRS_KEY) || '[]');
+    return Array.isArray(paths) ? paths.filter(p => typeof p === 'string' && p.trim()).slice(0, 10) : [];
+  } catch (_) { return []; }
+}
+
+async function rememberWorkdir(path) {
+  try {
+    // These are server paths: browser OS/case rules do not identify them.
+    const recent = [path, ...recentWorkdirs().filter(p => p !== path)].slice(0, 10);
+    localStorage.setItem(RECENT_WORKDIRS_KEY, JSON.stringify(recent));
+    renderWorkdirOptions(Object.values(projectsByPath));
+    document.getElementById('workdirSelect').value = path;
+    onProjectSelect();
+  } catch (_) { /* Task was created; browser history is optional. */ }
+}
+
 async function loadProjects() {
   const projects = await fetchJSON(`${API}/projects`);
-  const sel = document.getElementById('workdirSelect');
-  const inp = document.getElementById('workdirInput');
-  if (!projects || !projects.length) return;
+  let recent = recentWorkdirs();
+  if (!localStorage.getItem(RECENT_WORKDIRS_KEY)) {
+    try {
+      const tasks = await fetchJSON(`${API}/tasks?limit=100`);
+      const seen = new Set();
+      recent = tasks.map(t => t.working_dir).filter(path => {
+        if (!path || seen.has(path)) return false;
+        seen.add(path);
+        return true;
+      }).slice(0, 10);
+      localStorage.setItem(RECENT_WORKDIRS_KEY, JSON.stringify(recent));
+    } catch (_) { /* Project picker still works without task history. */ }
+  }
+  renderWorkdirOptions(projects || []);
+}
 
-  projectsByPath = Object.fromEntries(projects.map(p => [p.path, p]));
+function renderWorkdirOptions(projects) {
+  const sel = document.getElementById('workdirSelect');
+  const recent = recentWorkdirs();
+  if ((!projects || !projects.length) && !recent.length) return;
+
+  projectsByPath = Object.fromEntries((projects || []).map(p => [p.path, p]));
+  const recentSet = new Set(recent);
+  const previous = sel.value;
   sel.innerHTML = [
     '<option value="">— Select project —</option>',
-    ...projects.map(p => `<option value="${escAttr(p.path)}">${esc(p.name)}${p.git ? '' : ' (не git)'}</option>`),
+    ...(recent.length ? ['<optgroup label="Недавние">',
+      ...recent.map(path => `<option value="${escAttr(path)}">${esc(path)}</option>`),
+      '</optgroup>'] : []),
+    ...((projects || []).length ? ['<optgroup label="Другие проекты">',
+      ...projects.filter(p => !recentSet.has(p.path))
+        .map(p => `<option value="${escAttr(p.path)}">${esc(p.name)}${p.git ? '' : ' (не git)'}</option>`),
+      '</optgroup>'] : []),
     '<option value="__custom__">✏️ Custom path...</option>',
   ].join('');
 
+  if (previous && [...sel.options].some(option => option.value === previous)) sel.value = previous;
   sel.style.display = '';
-  inp.style.display = 'none';
-  inp.placeholder = '';
+  if (sel.value !== '__custom__') {
+    document.getElementById('workdirInput').style.display = 'none';
+    document.getElementById('workdirInput').value = '';
+  }
   updateWorktree();
 }
 
@@ -3951,6 +4147,7 @@ async function loadCosts() {
 }
 
 // --- Init ---
+restoreSkipPermissions();
 setDefaultSchedule();
 loadProviders();
 loadProjects();

@@ -125,6 +125,26 @@ def _atomic_write_json(path: "Path", data):
     os.replace(tmp, path)
 
 
+def _read_json_file(path: "Path"):
+    """Read a JSON config that _atomic_write_json wrote — or a human edited.
+
+    These files are written as UTF-8, but open() without an encoding decodes
+    with the Windows code page (cp1251): Cyrillic came back as mojibake, and a
+    byte such as 0x98 (the second byte of «И») raised a UnicodeDecodeError no
+    caller expected, so one custom provider took the API, worker and bot down.
+    utf-8-sig also accepts the BOM Notepad writes, and a file saved by hand in
+    the code page still reads. Anything unreadable raises ValueError —
+    JSONDecodeError and UnicodeDecodeError are both ValueErrors.
+    """
+    raw = path.read_bytes()
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        import locale
+        text = raw.decode(locale.getpreferredencoding(False))
+    return json.loads(text)
+
+
 # Database
 DB_DIR = Path(os.environ.get("PP_DATA_DIR", Path.home() / ".promptpilot"))
 DB_PATH = DB_DIR / "promptpilot.db"
@@ -235,13 +255,17 @@ BUILTIN_PROVIDERS = {
         "description": "Промпт в открытую сессию herdr",
     },
     "claude": {
+        # stdin preserves multiline prompts and avoids cmd.exe's command-line
+        # limit when Windows resolves Claude to an npm .cmd wrapper.
         "cmd": f"{_q(CLAUDE_EXE)} -p --verbose --output-format stream-json {{prompt}}",
+        "prompt_stdin": True,
         "description": "Claude Code (Anthropic)",
         "supports_skills": True,
         "supports_effort": True,
     },
     "claude-z": {
         "cmd": f"{_q(CLAUDE_EXE)} -p --verbose --output-format stream-json {{prompt}}",
+        "prompt_stdin": True,
         "description": "Claude Code (GLM)",
         "supports_skills": True,
         "supports_effort": True,
@@ -314,14 +338,17 @@ def load_providers() -> dict:
     user_file = _providers_file()
     if user_file.exists():
         try:
-            with open(user_file) as f:
-                custom = json.load(f)
+            custom = _read_json_file(user_file)
             for name, info in custom.items():
                 if name in providers:
                     providers[name] = {**providers[name], **info}
+                    # An existing argv template must not also receive the
+                    # prompt on stdin just because the built-in changed.
+                    if "{prompt}" in info.get("cmd", "") and "prompt_stdin" not in info:
+                        providers[name]["prompt_stdin"] = False
                 else:
                     providers[name] = info
-        except json.JSONDecodeError as e:
+        except ValueError as e:
             _warn_once("providers.json",
                        f"⚠ {user_file} не читается ({e}) — кастомные провайдеры игнорируются")
         except OSError:
@@ -337,7 +364,6 @@ def load_providers_detailed() -> dict:
       _source_path: path to providers.json (if applicable)
     """
     providers = {}
-    builtin_names = set(BUILTIN_PROVIDERS)
 
     for name, info in BUILTIN_PROVIDERS.items():
         entry = dict(info)
@@ -349,8 +375,7 @@ def load_providers_detailed() -> dict:
     custom_names = set()
     if user_file.exists():
         try:
-            with open(user_file) as f:
-                custom = json.load(f)
+            custom = _read_json_file(user_file)
             for name, info in custom.items():
                 custom_names.add(name)
                 entry = dict(info)
@@ -364,7 +389,7 @@ def load_providers_detailed() -> dict:
                     entry["_source"] = "providers.json"
                 entry["_source_path"] = str(user_file)
                 providers[name] = entry
-        except json.JSONDecodeError as e:
+        except ValueError as e:
             _warn_once("providers.json",
                        f"⚠ {user_file} не читается ({e}) — кастомные провайдеры игнорируются")
         except OSError:
@@ -377,9 +402,8 @@ def _load_custom_providers() -> dict:
     user_file = _providers_file()
     if user_file.exists():
         try:
-            with open(user_file) as f:
-                return json.load(f)
-        except json.JSONDecodeError as e:
+            return _read_json_file(user_file)
+        except ValueError as e:
             _warn_once("providers.json",
                        f"⚠ {user_file} не читается ({e}) — кастомные провайдеры игнорируются")
         except OSError:
@@ -459,9 +483,8 @@ def load_machines() -> dict:
     f = _machines_file()
     if f.exists():
         try:
-            with open(f) as fp:
-                return json.load(fp)
-        except (json.JSONDecodeError, OSError):
+            return _read_json_file(f)
+        except (ValueError, OSError):
             pass
     return {}
 
@@ -578,9 +601,8 @@ def remove_provider(name: str) -> bool:
     if not user_file.exists():
         return False
     try:
-        with open(user_file) as f:
-            custom = json.load(f)
-    except (json.JSONDecodeError, OSError):
+        custom = _read_json_file(user_file)
+    except (ValueError, OSError):
         return False
     if name not in custom:
         return False
@@ -651,7 +673,10 @@ def build_cmd(provider: str, prompt: str, skip_permissions: bool = False, sessio
         template = f"{provider} {{prompt}}"
     marker = "\x00PROMPT\x00"
     parts = _split_cmd(template.replace("{prompt}", marker))
-    cmd = [prompt if p == marker else p for p in parts]
+    # Retain the placeholder in editable templates for custom argv providers,
+    # but never put the prompt on the command line when stdin carries it.
+    cmd = [prompt if p == marker else p for p in parts
+           if not (p == marker and cfg.get("prompt_stdin"))]
     # Claude and Codex spell autonomous mode differently; qwen/opencode do not
     # receive either flag. --model is shared by several CLIs and stays general.
     is_claude = provider_is_claude(cfg)
@@ -1101,6 +1126,26 @@ def is_loopback_host(host: str) -> bool:
 # browser — native Basic-auth prompt (any username, token as password);
 # scripts — "Authorization: Bearer <token>" or curl -u x:<token>.
 API_TOKEN = os.environ.get("PP_API_TOKEN", "")
+
+# Without a token the server answers only to Host names a hostile web page
+# cannot make the browser send: localhost names and IP literals. Names used by
+# a reverse proxy or a tunnel go here (comma-separated); "*" turns the Host
+# check off entirely.
+ALLOWED_HOSTS = [
+    host.strip().lower().rstrip(".")
+    for host in os.environ.get("PP_ALLOWED_HOSTS", "").split(",")
+    if host.strip()
+]
+
+# Full browser origins (scheme://host[:port]) that may send state-changing
+# requests without a token besides the server's own origin: the public URL of
+# a reverse proxy or tunnel, e.g. https://pp.example.com. Matched exactly — a
+# name in PP_ALLOWED_HOSTS admits no other scheme or port of that name.
+ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get("PP_ALLOWED_ORIGINS", "").split(",")
+    if origin.strip()
+]
 
 # Escape hatch for the loopback guard on `pp server`: inside a container binding
 # 0.0.0.0 is normal (the security boundary is the host port publish, not the

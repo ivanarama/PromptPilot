@@ -398,8 +398,9 @@ def _trim_transcript(raw: str, prompt: str) -> str:
         # or >.  Requiring only ❯ made an attached agy session start trimming
         # at the previous turn; the first separator then cut the real answer
         # down to its heading even though the closing verdict was visible.
-        prompt_line = line.lstrip().lstrip("❯>").lstrip()
-        if probe and probe in prompt_line:
+        prompt_line = line.lstrip().lstrip("❯>›").lstrip()
+        if (probe and line.lstrip().startswith(("❯", ">", "›"))
+                and probe in prompt_line):
             start = i
 
     # Workflow prompts contain verdict examples.  Do not return those examples
@@ -419,14 +420,20 @@ def _trim_transcript(raw: str, prompt: str) -> str:
     end = len(lines)
     for i in range(start + 1, len(lines)):
         s = lines[i].strip()
-        if len(s) >= 30 and set(s) <= {"─"}:
+        if ((len(s) >= 30 and set(s) <= {"─"})
+                or s.startswith("› Ask Codex to do anything")
+                or (s == "Approaching rate limits" and i + 1 < len(lines)
+                    and lines[i + 1].strip().startswith("Switch to "))):
             end = i
             break
 
     def chrome(s: str) -> bool:
         s = s.strip()
         return (not s or s == "❯" or s.startswith("⏸")
-                or "? for shortcuts" in s or "· /effort" in s)
+                or "? for shortcuts" in s or "· /effort" in s
+                or s.startswith("Tip:") or re.fullmatch(r"\d{1,2}:\d{2}", s)
+                or re.fullmatch(r"Worked for (?:\d+h )?(?:\d+m )?\d+s • \d{1,2}:\d{2}", s)
+                or (s.startswith("⚠ 5h limit:") and s.endswith("/status")))
 
     while end > start and chrome(lines[end - 1]):
         end -= 1
@@ -848,9 +855,12 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
             agent_args += ["--effort", eff]
         if task.session_id:
             agent_args += ["--resume", task.session_id]
-        if (task.skip_permissions
-                and "--dangerously-skip-permissions" not in agent_args):
-            agent_args.append("--dangerously-skip-permissions")
+        permission_flag = (
+            "--dangerously-bypass-approvals-and-sandbox" if kind == "codex"
+            else "--dangerously-skip-permissions"
+        )
+        if task.skip_permissions and permission_flag not in agent_args:
+            agent_args.append(permission_flag)
         if not host and guard_enabled(provider_cfg, task.skip_permissions):
             # Local only: the settings file with the hook lives on this machine.
             settings = guard_settings_file()

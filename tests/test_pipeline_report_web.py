@@ -21,6 +21,19 @@ def test_embedded_dashboard_javascript_parses():
                            input=script, text=True, encoding="utf-8", capture_output=True, check=True)
 
 
+@pytest.mark.parametrize("harness", sorted(Path(__file__).parent.glob("*.cjs")),
+                         ids=lambda path: path.name)
+def test_dashboard_javascript_harness(harness):
+    # Syntax alone let a broken report renderer through (#147): run the
+    # harnesses, which execute real page functions in node.
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node is unavailable; web behaviour checked on the Windows host")
+    result = subprocess.run([node, str(harness)], cwd=Path(__file__).parents[1],
+                            text=True, encoding="utf-8", capture_output=True, timeout=120)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_web_index_is_kept_in_memory_after_startup(monkeypatch, tmp_path):
     # PyInstaller one-file extracts package data under a temporary directory.
     # A long-running macOS launchd process must keep serving the UI even if the
@@ -70,6 +83,9 @@ def test_web_pipeline_report_labels_exact_and_incomplete_data_honestly():
     assert "ship, needs-decision или hold" in html
     assert "function pipelineReportUrl(value)" in html
     assert "Почему задачи ждут" in html
+    assert "У текущих запусков нет записанной причины ожидания." in html
+    assert "Итоги запусков" in html
+    assert "reportFlowSegments" in html
     assert "Ждём CI" in html
     assert "board.delivery_groups" in html
     assert "Запуски с итогом «готово»" in html

@@ -13,7 +13,7 @@ def _request(method, path, **kwargs):
     async def run():
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(
-                transport=transport, base_url="http://testserver") as client:
+                transport=transport, base_url="http://127.0.0.1:8420") as client:
             return await client.request(method, path, **kwargs)
 
     return asyncio.run(run())
@@ -62,6 +62,26 @@ def test_report_snapshot_query_uses_selected_window_plus_one_day(
         ("example", timedelta(hours=192), 10000),
         ("example", timedelta(hours=744), 10000),
     ]
+
+
+def test_period_report_shows_current_pending_deferral(isolated_db, monkeypatch):
+    profile = _profile()
+    monkeypatch.setattr(
+        pipeline_insights, "_profiles", lambda: {"example": profile})
+    task = isolated_db.create_task(TaskCreate(
+        prompt="Example - MERGE", recurrence="1h"))
+    claimed = isolated_db.get_next_runnable()
+    assert claimed.id == task.id
+    assert isolated_db.defer_task(
+        task.id, datetime.now(timezone.utc) + timedelta(minutes=10),
+        "waiting for integration REVIEW")
+
+    report = pipeline_insights.build_period_report(
+        "example", isolated_db.list_series(), hours=24)
+
+    assert report["current"]["tasks"][0]["error"] == (
+        "waiting for integration REVIEW")
+    assert report["current"]["tasks"][0]["status"] == "pending"
 
 
 def test_period_report_uses_only_local_history_and_deduplicates_attention(
