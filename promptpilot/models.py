@@ -218,6 +218,30 @@ class WorkflowRoleConfig(BaseModel):
     # auto_dispatch_reviewer в часы пиковой нагрузки.
     dispatch_window: Optional[list[dict]] = None
 
+    @field_validator("dispatch_window")
+    @classmethod
+    def validate_dispatch_windows(cls, windows):
+        import re
+        names = {"mon", "tue", "wed", "thu", "fri", "sat", "sun"}
+        for window in windows or []:
+            if set(window) - {"from", "to", "tz_offset_hours", "days"}:
+                raise ValueError("unknown dispatch window field")
+            for key in ("from", "to"):
+                if not isinstance(window.get(key), str) or not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", window[key]):
+                    raise ValueError("dispatch window time must be HH:MM (00:00..23:59)")
+            offset = window.get("tz_offset_hours", 0)
+            if type(offset) is not int or not -23 <= offset <= 23:
+                raise ValueError("dispatch window timezone offset must be an integer between -23 and 23")
+            days = window.get("days")
+            if days is None:
+                continue
+            if isinstance(days, str) and days.strip().lower() in {"all", "weekdays", "будни", "будни (пн–пт)", "weekend", "выходные", "выходные (сб–вс)"}:
+                continue
+            if isinstance(days, list) and days and all(isinstance(day, str) and day.lower() in names for day in days):
+                continue
+            raise ValueError("dispatch window days must name valid weekdays")
+        return windows
+
 
 class WorkflowRolesConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -334,12 +358,18 @@ class WorkflowCreate(BaseModel):
     config: dict[str, Any] = Field(default_factory=normalize_workflow_config)
     # Готовый план дежурного: миссия создаётся сразу в awaiting_plan_approval,
     # минуя запуск планировщика; невалидный план не занимает slug (атомарно).
-    plan: Optional[list["WorkflowStageSpec"]] = None
+    plan: Optional[list["WorkflowStageSpec"]] = Field(default=None, min_length=1)
 
     @field_validator("config", mode="before")
     @classmethod
     def validate_config(cls, value):
         return normalize_workflow_config(value)
+
+    @model_validator(mode="after")
+    def plan_within_configured_limit(self):
+        if self.plan is not None and len(self.plan) > self.config["planning"]["max_stages"]:
+            raise ValueError("plan exceeds planning.max_stages")
+        return self
 
 
 class WorkflowUpdate(BaseModel):

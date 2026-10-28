@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import httpx
+import pytest
 
 from promptpilot import db, workflows
 from promptpilot.api import app
@@ -66,9 +67,9 @@ def test_tz_offset_shifts_window():
         datetime(2026, 10, 23, 10, 0, tzinfo=timezone.utc))[0] is False
 
 
-def test_unparsable_window_does_not_block():
+def test_unparsable_legacy_window_fails_closed():
     assert workflows._dispatch_window_allows(
-        reviewer([{"from": "не-время"}])) == (True, None)
+        reviewer([{"from": "не-время"}]))[0] is False
 
 
 # ── Окна: интеграция с advance_workflow ────────────────────────────────────
@@ -143,7 +144,7 @@ def request(method, path, **kwargs):
     async def run():
         transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
         async with httpx.AsyncClient(
-            transport=transport, base_url="http://testserver",
+            transport=transport, base_url="http://127.0.0.1:8420",
         ) as client:
             return await client.request(method, path, **kwargs)
     return asyncio.run(run())
@@ -230,6 +231,56 @@ def test_replace_plan_in_planning_cancels_hanging_planner(isolated_db):
     assert "plan.replaced_hanging_planner" in types
     assert isolated_db.get_task(hanging[0].id).status.value == "cancelled"
     assert isolated_db.list_tasks(status=TaskStatus.PENDING) == []
+
+
+TWO_STAGES = [{"code": "S1", "title": "first", "objective": "first"},
+              {"code": "FINAL", "title": "last", "objective": "last", "stage_type": "integration"}]
+
+
+@pytest.mark.parametrize("state", ["draft", "planning", "planning-running", "awaiting_plan_approval"])
+def test_oversized_plan_never_mutates_plan_or_cancels_planner(isolated_db, state):
+    from promptpilot.models import WorkflowPlanDispatch
+    workflow = isolated_db.create_workflow(WorkflowCreate(
+        slug="limit-" + state, objective="x", repository_path=str(isolated_db.DB_DIR),
+        candidate_branch="main", config={"planning": {"max_stages": 1}}))
+    if state.startswith("planning"):
+        workflows.dispatch_planner(workflow.id, WorkflowPlanDispatch(expected_version=0))
+        if state == "planning-running":
+            running = isolated_db.get_next_runnable()
+            assert running is not None
+    elif state == "awaiting_plan_approval":
+        workflows.provide_plan(workflow.id, WorkflowPlanReplace(expected_version=0, stages=GOOD_PLAN))
+    before = isolated_db.get_workflow(workflow.id)
+    old_stages = [s.model_dump() for s in isolated_db.list_workflow_stages(workflow.id)]
+    old_tasks = [t.model_dump() for t in isolated_db.list_tasks()]
+    old_plan = isolated_db.get_workflow_plan(workflow.id)
+    replacement = WorkflowPlanReplace(expected_version=before.state_version, stages=TWO_STAGES)
+    with pytest.raises(db.WorkflowConflictError, match="max_stages"):
+        (workflows.provide_plan if state == "draft" else workflows.replace_plan)(workflow.id, replacement)
+    assert isolated_db.get_workflow(workflow.id).model_dump() == before.model_dump()
+    assert [s.model_dump() for s in isolated_db.list_workflow_stages(workflow.id)] == old_stages
+    assert [t.model_dump() for t in isolated_db.list_tasks()] == old_tasks
+    assert isolated_db.get_workflow_plan(workflow.id) == old_plan
+    if state == "planning-running":
+        assert isolated_db.get_setting(f"cancel_task:{running.id}") is None
+
+
+def test_http_oversized_plan_leaves_slug_available(isolated_db):
+    data = payload(TWO_STAGES, slug="too-many")
+    data["config"] = {"planning": {"max_stages": 1}}
+    response = request("POST", "/api/workflows", json=data)
+    assert response.status_code == 422
+    assert isolated_db.list_workflows() == []
+    data["plan"] = GOOD_PLAN
+    assert request("POST", "/api/workflows", json=data).status_code == 201
+
+
+@pytest.mark.parametrize("bad", [{"from": "aa:bb"}, {"from": "25:00", "to": "26:00"}, {"to": "12:60"}, {"days": ["bad"]}, {"tz_offset_hours": 30}])
+def test_bad_dispatch_windows_are_rejected_by_http_without_breaking_advance(isolated_db, bad):
+    data = payload(None, slug="bad-window")
+    data["config"] = _config([{"from": "22:00", "to": "06:00", **bad}])
+    assert request("POST", "/api/workflows", json=data).status_code == 422
+    assert isolated_db.list_workflows() == []
 
 
 def test_terminal_config_patch_needs_explicit_flag(isolated_db):

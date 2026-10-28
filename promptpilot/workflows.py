@@ -43,6 +43,7 @@ from .models import (
     WorkflowTaskDispatch,
     WorkflowGateDecision,
     WorkflowConfig,
+    WorkflowRoleConfig,
 )
 
 
@@ -616,6 +617,12 @@ def sync_planner_task(task_id: int) -> Optional[WorkflowPlanInDB]:
     return result
 
 
+def _require_plan_limit(workflow, stages) -> None:
+    limit = _config_for(workflow).planning.max_stages
+    if len(stages) > limit:
+        raise db.WorkflowConflictError(f"plan exceeds max_stages={limit}")
+
+
 def provide_plan(workflow_id: str,
                   replacement: WorkflowPlanReplace) -> list[WorkflowStageInDB]:
     """Готовый план дежурного при создании миссии.
@@ -631,6 +638,7 @@ def provide_plan(workflow_id: str,
             raise db.WorkflowConflictError(
                 "plan can only be provided for a draft workflow"
             )
+        _require_plan_limit(workflow, replacement.stages)
         now = db._now()
         conn.execute(
             """INSERT INTO workflow_plans
@@ -665,6 +673,7 @@ def replace_plan(workflow_id: str,
             WorkflowStatus.PLANNING,
         }:
             raise db.WorkflowConflictError("plan can only be edited before approval")
+        _require_plan_limit(workflow, replacement.stages)
         if state is WorkflowStatus.PLANNING:
             # Замена зависшего планировщика готовым планом: его задачи
             # отменяются, поздние sync упавшего трака игнорируются
@@ -709,9 +718,6 @@ def replace_plan(workflow_id: str,
                      "cancelled_planner_task": plan_row["planner_task_id"]},
                 )
                 return stages
-        limit = _config_for(db._row_to_workflow(workflow)).planning.max_stages
-        if len(replacement.stages) > limit:
-            raise db.WorkflowConflictError(f"plan exceeds max_stages={limit}")
         stages = db._replace_workflow_stages(conn, workflow_id, replacement.stages)
         conn.execute(
             "UPDATE workflow_plans SET updated_at=? WHERE workflow_id=?",
@@ -1564,6 +1570,7 @@ def _parse_window_item(item: dict):
     if not isinstance(item, dict):
         return None
     try:
+        item = WorkflowRoleConfig(dispatch_window=[item]).dispatch_window[0]
         fh, fm = str(item.get("from", "0:0")).split(":")[:2]
         th, tm = str(item.get("to", "0:0")).split(":")[:2]
         offset = int(item.get("tz_offset_hours", 0)) * 60
@@ -1591,11 +1598,13 @@ def _dispatch_window_allows(role_config, now=None) -> "tuple[bool, str | None]":
         return True, None
     from datetime import timedelta
     now = now or _utcnow()
+    from datetime import timezone
+    now = now.replace(tzinfo=timezone.utc) if now.tzinfo is None else now.astimezone(timezone.utc)
     best_open = None
     day_names = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
     parsed = [w for w in (_parse_window_item(item) for item in windows) if w]
-    if not parsed:
-        return True, None
+    if len(parsed) != len(windows):
+        return False, "исправления конфигурации окна"
     for start, end, allowed, offset in parsed:
         local = now + timedelta(minutes=offset)
         local_min = local.hour * 60 + local.minute
@@ -1619,7 +1628,7 @@ def _dispatch_window_allows(role_config, now=None) -> "tuple[bool, str | None]":
                 best_open = candidate_utc
             break
     if best_open is None:
-        return True, None  # за 7 дней нет разрешённого дня — кривой конфиг
+        return False, "исправления конфигурации окна"
     return False, best_open.strftime("%H:%M UTC")
 
 
