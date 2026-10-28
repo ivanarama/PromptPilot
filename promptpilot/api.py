@@ -1480,6 +1480,16 @@ def api_version():
     return check_for_update()
 
 
+def _provider_display(info: dict) -> dict:
+    human = info.get("human")
+    order = info.get("ui_order")
+    return {
+        "human": {key: human[key] for key in ("label", "role", "desc")
+                  if isinstance(human, dict) and isinstance(human.get(key), str)},
+        "ui_order": order if type(order) is int and 0 <= order <= 2**53 - 1 else None,
+    }
+
+
 @app.get("/api/providers")
 def api_providers():
     providers = load_providers()
@@ -1498,6 +1508,7 @@ def api_providers():
             "hidden": bool(info.get("hidden")),
             "executor": info.get("executor", ""),
             "session_target": bool(info.get("session_target")),
+            **_provider_display(info),
             # rights levels this provider can be confined to (models.TaskRights)
             "rights": [level for level in RIGHTS_LEVELS if rights_supported(info, level)],
         }
@@ -1646,6 +1657,7 @@ def api_providers_manage():
             "available": provider_available(info),
             "hidden": bool(info.get("hidden")),
             "source": info.get("_source", "builtin"),
+            **_provider_display(info),
         }
         for name, info in providers.items()
     }
