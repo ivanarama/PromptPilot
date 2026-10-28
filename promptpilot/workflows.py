@@ -1767,6 +1767,14 @@ def record_review(workflow_id: str,
     return result
 
 
+def _revision_budget(raw_config: dict, stage: dict) -> int:
+    planning = raw_config.get("planning") or {}
+    explicit = planning.get("max_revisions_per_stage")
+    if explicit is not None:
+        return int(explicit)
+    return int(stage.get("max_revision_rounds") or WorkflowConfig().planning.max_revisions_per_stage)
+
+
 def human_input(workflow_id: str,
                 action: WorkflowHumanInput) -> WorkflowInDB:
     # The note is recorded next to the decision text and later rendered into
@@ -1832,10 +1840,7 @@ def human_input(workflow_id: str,
             revision_limit_reason = None
             if current_stage:
                 spec = db._json_load(current_stage["spec_json"])
-                configured_limit = (
-                    spec.get("max_revision_rounds")
-                    or _config_for(db._row_to_workflow(workflow)).planning.max_revisions_per_stage
-                )
+                configured_limit = _revision_budget(db._json_load(workflow["config_json"]), spec)
                 revision_count = conn.execute(
                     """SELECT COUNT(*) FROM workflow_rounds
                        WHERE stage_id=? AND status='revision_required'""",
@@ -1852,10 +1857,7 @@ def human_input(workflow_id: str,
                 # so the executor/auditor loop ran unbounded (issue #88:
                 # 14+ rounds with max_revision_rounds=6).
                 stage_cfg = (db._json_load(workflow["config_json"]).get("stage") or {})
-                configured_limit = (
-                    stage_cfg.get("max_revision_rounds")
-                    or _config_for(db._row_to_workflow(workflow)).planning.max_revisions_per_stage
-                )
+                configured_limit = _revision_budget(db._json_load(workflow["config_json"]), stage_cfg)
                 revision_count = conn.execute(
                     """SELECT COUNT(*) FROM workflow_rounds
                        WHERE workflow_id=? AND status='revision_required'""",
