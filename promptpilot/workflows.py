@@ -1028,6 +1028,18 @@ def _input_sha(dispatch: WorkflowTaskDispatch, working_dir: str) -> str:
 
 def dispatch_task(workflow_id: str,
                   dispatch: WorkflowTaskDispatch) -> WorkflowDispatchResult:
+    guarded = db.get_workflow(workflow_id)
+    if guarded and guarded.config.get("workorder_guard"):
+        from .config import DEFAULT_CLI, load_providers
+        selected = load_providers().get(dispatch.provider or DEFAULT_CLI, {})
+        if selected.get("executor") or dispatch.worktree:
+            raise db.WorkflowConflictError("Workorders require an owned local headless process")
+        if dispatch.working_dir and os.path.realpath(dispatch.working_dir) != os.path.realpath(guarded.repository_path):
+            raise db.WorkflowConflictError("Workorder working directory is pinned")
+        if (dispatch.skip_permissions or dispatch.machine or dispatch.herdr_target
+                or dispatch.max_retries != 0 or not dispatch.task_timeout
+                or dispatch.task_timeout > 3600):
+            raise db.WorkflowConflictError("Workorder tasks require bounded local execution without retries")
     if dispatch.role not in {WorkflowRole.EXECUTOR, WorkflowRole.REVIEWER}:
         raise db.WorkflowConflictError("W1 can dispatch only executor or reviewer")
     if dispatch.role is WorkflowRole.REVIEWER and dispatch.skip_permissions:

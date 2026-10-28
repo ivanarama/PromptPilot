@@ -63,6 +63,7 @@ from .models import (
     WorkflowVersionRequest,
 )
 from .version import check_for_update
+from .workorder_api import router as workorder_router
 
 
 def _sample_pipeline_profiles():
@@ -104,6 +105,8 @@ async def _lifespan(application: FastAPI):
 
 
 app = FastAPI(title="PromptPilot", version="0.1.0", lifespan=_lifespan)
+
+app.include_router(workorder_router)
 
 
 _SAFE_METHODS = ("GET", "HEAD", "OPTIONS")

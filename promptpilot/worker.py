@@ -1951,8 +1951,16 @@ def _execute_task_body(task, admission_complete=None):
     if callable(target_heartbeat):
         target_heartbeat(force=True)
     try:
-        tree = _start_owned_with_spawn_retry(
-            lambda: OwnedProcess.start(
+        from .workorder_guard import check_task, configuration
+
+        check_task(task.id)
+        if configuration(task.id):
+            for key in list(env):
+                if key.startswith("WORKORDERS_") or key in {"PP_API_TOKEN", "PP_TG_TOKEN"}:
+                    env.pop(key)
+        def launch_owned():
+            check_task(task.id)
+            return OwnedProcess.start(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -1962,7 +1970,10 @@ def _execute_task_body(task, admission_complete=None):
                 cwd=run_dir,
                 stdin=subprocess.PIPE if prompt_stdin is not None else subprocess.DEVNULL,
                 env=env,
-            ),
+            )
+
+        tree = _start_owned_with_spawn_retry(
+            launch_owned,
             cmd,
             cancel_check=lambda: db.is_cancel_requested(task.id),
         )
@@ -2294,9 +2305,15 @@ def execute_task(task, admission_complete=None):
     except Exception as exc:
         print(f"  !! workflow start sync #{task.id}: {exc}", flush=True)
     try:
-        if admission_complete is None:
-            return _execute_task_inner(task)
-        return _execute_task_inner(task, admission_complete)
+        from .workorder_guard import WorkorderAuthorizationError, watch_task
+
+        with watch_task(task.id, _close_registered_provider_tree):
+            if admission_complete is None:
+                return _execute_task_inner(task)
+            return _execute_task_inner(task, admission_complete)
+    except WorkorderAuthorizationError as exc:
+        _mark_failed(task, f"Workorder guard refused execution: {exc}", exit_code=-1)
+        return
     finally:
         # Project-pipeline election reserves an exact target before any
         # provider can start. Every attempt exit (success, failure, defer,
