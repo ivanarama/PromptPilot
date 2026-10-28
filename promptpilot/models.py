@@ -329,6 +329,11 @@ class WorkflowAutomationConfig(BaseModel):
     auto_apply_review: bool = True
     auto_resume_revision: bool = True
     stop_on_human_required: bool = True
+    # Stage checkpoint: после stage.completed (ворота зелёные + PASS)
+    # автоматический коммит ИМЕННО файлов этапа, доказанно изменённых данным
+    # executor run'ом; неудача останавливает миссию до человека. Выключен
+    # по умолчанию.
+    stage_checkpoint: bool = False
 
 
 class WorkflowLimitsConfig(BaseModel):
@@ -724,12 +729,19 @@ class WorkflowReviewDecision(BaseModel):
     expected_version: int = Field(ge=0)
     summary: str = ""
     findings: list[ReviewFindingInput] = Field(default_factory=list)
+    # Явное человеческое подтверждение PASS без доказанных изменений
+    # исполнителя (доказанно пустой diff). Неизвестное происхождение этот
+    # флаг не подтверждает; автоприменение вердикта его не ставит.
+    allow_no_diff: bool = False
 
 
 class WorkflowHumanInput(BaseModel):
     text: str = Field(min_length=1)
     expected_version: int = Field(ge=0)
     resume: bool = False
+    restart_checkpoint: bool = False
+    checkpoint_head: Optional[str] = Field(
+        default=None, pattern=r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
     # What the next agent run must be told. `text` is the journal record of
     # the decision (automation writes its own boilerplate there); only `note`
     # is delivered into the next executor/reviewer prompt.

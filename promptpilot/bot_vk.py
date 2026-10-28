@@ -753,16 +753,16 @@ def cmd_mission(prefix: str) -> str:
 
 
 def _awaiting_workflows() -> list:
-    return [w for w in db.list_workflows()
-            if w.status.value == "awaiting_human"]
+    return db.list_workflows(status="awaiting_human", limit=-1)
 
 
 def _standstill_reason(workflow) -> str:
     """Последний вопрос/блокер стоящего воркфлоу из событий."""
-    for event in _events_tail(workflow.id, 50):
+    for event in reversed(_events_tail(workflow.id, 50)):
         if event.event_type not in {"workflow.awaiting_human",
                                     "cascade.open_blocker",
-                                    "review.awaiting_decision"}:
+                                    "review.awaiting_decision",
+                                    "stage.checkpoint_failed"}:
             continue
         payload = event.payload or {}
         for key in ("reason", "question", "text", "notes"):
@@ -822,13 +822,19 @@ def cmd_resume(text: str) -> str:
         return f"Не получилось: {type(exc).__name__}: {exc}"
     fresh = db.get_workflow(workflow.id)
     stages = db.list_workflow_stages(workflow.id)
-    stage = next(
-        (s for s in stages if s.status.value == "executing"),
-        next((s for s in stages
-              if s.status.value not in {"completed", "skipped"}), None))
+    stage = next((s for s in stages if s.id == fresh.current_stage_id), None)
+    if stage is None:
+        stage = next((s for s in stages if s.status.value == "executing"), None)
     stage_bit = (f"стадия {stage.code}"
-                 + (f" «{stage.title}»" if stage.title else "")) if stage else "план завершён"
+                 + (f" «{stage.title}»" if stage.title else "")) if stage else "без плана этапов"
     state = _WF_STATE_RU.get(fresh.status.value, fresh.status.value)
+    if fresh.status.value == "completed":
+        return (f"✅ Миссия завершена: {workflow.slug}\n"
+                f"{stage_bit}, раунд {fresh.current_round} — {state}.")
+    if fresh.status.value not in {"queued", "executing", "gating", "reviewing"}:
+        return (f"⏸ Продолжение не выполнено: {workflow.slug}\n"
+                f"{stage_bit}, раунд {fresh.current_round} — {state}.\n"
+                f"{_standstill_reason(fresh)}")
     return (f"✅ Конвейер продолжен: {workflow.slug}\n"
             f"{stage_bit}, раунд {fresh.current_round} — {state}.\n"
             f"Задание исполнителю: {_clip(text, 300)}")

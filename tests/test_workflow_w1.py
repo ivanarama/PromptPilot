@@ -25,7 +25,8 @@ def create_workflow(db, slug="w1-pilot", max_rounds=2):
     return db.create_workflow(WorkflowCreate(
         slug=slug,
         objective="Автономно закрыть замечания аудита",
-        repository_path=r"D:\Projects\exchange",
+        # State-machine tests must not inspect a maintainer's real checkout.
+        repository_path=str(db.DB_DIR),
         candidate_branch="workflow/pilot",
         config={"limits": {"max_rounds": max_rounds}},
     ))

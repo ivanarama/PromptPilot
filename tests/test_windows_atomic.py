@@ -211,6 +211,10 @@ def test_create_plan_does_not_expose_intermediate_draft_to_concurrent_start(isol
                 workflows.start_workflow(wid, WorkflowStartRequest(expected_version=0))
             except db.WorkflowConflictError:
                 outcomes.append("approval barrier retained")
+            except db.WorkflowNotFoundError:
+                # Read-only preflight can run before the create transaction
+                # commits. An invisible workflow is also a safe rejection.
+                outcomes.append("workflow still unpublished")
             except Exception as exc:
                 outcomes.append(type(exc).__name__)
             else:
@@ -229,7 +233,8 @@ def test_create_plan_does_not_expose_intermediate_draft_to_concurrent_start(isol
         assert not thread.is_alive()
     assert response.status_code == 201, response.text
     assert observations == [None]
-    assert outcomes == ["approval barrier retained"]
+    assert len(outcomes) == 1 and outcomes[0] in {
+        "approval barrier retained", "workflow still unpublished"}
     workflow = db.get_workflow(response.json()["id"])
     assert workflow.status.value == "awaiting_plan_approval"
     assert len(db.list_workflow_stages(workflow.id)) == 1
