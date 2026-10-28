@@ -6,8 +6,9 @@ import math
 import re
 import sqlite3
 import time
+import unicodedata
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -76,6 +77,17 @@ CREATE TABLE IF NOT EXISTS tasks (
     pipeline_priority_restore INTEGER,
     verdict TEXT
     ,series_id INTEGER REFERENCES task_series(id)
+    ,rights TEXT
+);
+
+CREATE TABLE IF NOT EXISTS task_token_usage (
+    task_id INTEGER PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+    input_tokens INTEGER NOT NULL CHECK(input_tokens >= 0),
+    output_tokens INTEGER NOT NULL CHECK(output_tokens >= 0),
+    cached_input_tokens INTEGER NOT NULL CHECK(cached_input_tokens >= 0),
+    model TEXT,
+    cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0 CHECK(cache_creation_input_tokens >= 0),
+    cost_attributable INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS task_series (
@@ -117,7 +129,9 @@ CREATE TABLE IF NOT EXISTS notifications (
     created_at TEXT NOT NULL,
     sent_at TEXT,
     pane_id TEXT,
-    machine TEXT
+    machine TEXT,
+    flow_ref TEXT,
+    kind TEXT
 );
 
 CREATE TABLE IF NOT EXISTS prompt_log (
@@ -242,6 +256,7 @@ CREATE TABLE IF NOT EXISTS workflow_runs (
     task_id INTEGER,
     status TEXT NOT NULL DEFAULT 'pending',
     input_sha256 TEXT NOT NULL,
+    input_json TEXT,
     output_sha256 TEXT,
     output_json TEXT,
     started_at TEXT,
@@ -288,6 +303,15 @@ CREATE TABLE IF NOT EXISTS workflow_events (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS workflow_memory (
+    workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    content TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    updated_by_task INTEGER,
+    PRIMARY KEY (workflow_id, name)
+);
+
 CREATE TRIGGER IF NOT EXISTS workflow_events_no_update
 BEFORE UPDATE ON workflow_events
 BEGIN
@@ -300,6 +324,51 @@ BEGIN
     SELECT RAISE(ABORT, 'workflow_events is append-only');
 END;
 
+-- Flows (promptpilot/flows.py): one row per request going through a flow.
+CREATE TABLE IF NOT EXISTS flow_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    flow TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    step_index INTEGER NOT NULL DEFAULT 0,
+    step_id TEXT,
+    version INTEGER NOT NULL DEFAULT 0,
+    trust TEXT NOT NULL DEFAULT 'owner',
+    dedup_key TEXT,
+    author TEXT NOT NULL DEFAULT '',
+    title TEXT NOT NULL DEFAULT '',
+    data_json TEXT NOT NULL DEFAULT '{}',
+    wait_json TEXT,
+    error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(flow, dedup_key)
+);
+
+CREATE TABLE IF NOT EXISTS flow_events (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_id INTEGER NOT NULL REFERENCES flow_items(id) ON DELETE RESTRICT,
+    step_id TEXT,
+    event_type TEXT NOT NULL,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS flow_events_no_update
+BEFORE UPDATE ON flow_events
+BEGIN
+    SELECT RAISE(ABORT, 'flow_events is append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS flow_events_no_delete
+BEFORE DELETE ON flow_events
+BEGIN
+    SELECT RAISE(ABORT, 'flow_events is append-only');
+END;
+
+CREATE INDEX IF NOT EXISTS idx_flow_items_status ON flow_items(status, flow);
+CREATE INDEX IF NOT EXISTS idx_flow_items_flow ON flow_items(flow, created_at);
+CREATE INDEX IF NOT EXISTS idx_flow_events_item ON flow_events(item_id, seq);
+
 CREATE INDEX IF NOT EXISTS idx_workflows_status ON workflows(status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_workflow_stages_workflow ON workflow_stages(workflow_id, position);
 CREATE INDEX IF NOT EXISTS idx_workflow_rounds_workflow ON workflow_rounds(workflow_id, round_no);
@@ -310,6 +379,8 @@ CREATE INDEX IF NOT EXISTS idx_workflow_events_workflow ON workflow_events(workf
 """
 
 MIGRATIONS = [
+    "ALTER TABLE task_token_usage ADD COLUMN cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE task_token_usage ADD COLUMN cost_attributable INTEGER NOT NULL DEFAULT 1",
     "ALTER TABLE tasks ADD COLUMN provider TEXT",
     "ALTER TABLE tasks ADD COLUMN model_used TEXT",
     "ALTER TABLE tasks ADD COLUMN skip_permissions INTEGER DEFAULT 0",
@@ -342,7 +413,9 @@ MIGRATIONS = [
     "ALTER TABLE tasks ADD COLUMN effort TEXT",
     "ALTER TABLE notifications ADD COLUMN pane_id TEXT",
     "ALTER TABLE notifications ADD COLUMN machine TEXT",
+    "ALTER TABLE notifications ADD COLUMN kind TEXT",
     "ALTER TABLE workflows ADD COLUMN current_stage_id TEXT",
+    "ALTER TABLE workflow_memory ADD COLUMN scope_stage TEXT",
     """CREATE TABLE IF NOT EXISTS workflow_plans (
         workflow_id TEXT PRIMARY KEY REFERENCES workflows(id) ON DELETE RESTRICT,
         status TEXT NOT NULL DEFAULT 'draft', planner_task_id INTEGER,
@@ -370,7 +443,15 @@ MIGRATIONS = [
         task_timeout INTEGER, paused INTEGER NOT NULL DEFAULT 0, ended_at TEXT,
         created_at TEXT NOT NULL, updated_at TEXT NOT NULL
     )""",
-    "CREATE INDEX IF NOT EXISTS idx_tasks_series ON tasks(series_id, id)",
+    # Schedule refreshes scan narrow health columns for every occurrence. A
+    # covering index avoids visiting task rows containing large result payloads.
+    "CREATE INDEX IF NOT EXISTS idx_tasks_series_summary ON tasks(series_id, id, status, started_at, completed_at, verdict)",
+    # The covering index also supports every lookup using the older
+    # idx_tasks_series(series_id, id) prefix. Keeping both can make SQLite
+    # prefer the narrow, table-reading scan, so the old one is only dropped:
+    # migrations replay on every start, and creating it here first would
+    # rebuild it over the whole task table each time just to drop it again.
+    "DROP INDEX IF EXISTS idx_tasks_series",
     """CREATE TABLE IF NOT EXISTS pipeline_snapshots (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         profile_id TEXT NOT NULL, repository TEXT NOT NULL,
@@ -398,6 +479,29 @@ MIGRATIONS = [
     "ALTER TABLE tasks ADD COLUMN pipeline_priority_restore INTEGER",
     "ALTER TABLE tasks ADD COLUMN budget_wait_started_at TEXT",
     "CREATE INDEX IF NOT EXISTS idx_tasks_budget_wait_fairness ON tasks(budget_wait_scope, status, budget_wait_started_at, priority, id)",
+    # 1С-доработка (epf_tools): связь PP-задачи с проектом обработки
+    """CREATE TABLE IF NOT EXISTS epf_jobs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        project_dir TEXT NOT NULL,
+        original_name TEXT NOT NULL,
+        base_key TEXT,
+        base_label TEXT,
+        chat_id INTEGER,
+        status TEXT NOT NULL DEFAULT 'queued',
+        epf_path TEXT,
+        error TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_epf_jobs_task ON epf_jobs(task_id)",
+    # the assignment of a stage done outside PromptPilot (issue #122)
+    "ALTER TABLE workflow_runs ADD COLUMN input_json TEXT",
+    # what the agent run may do (models.TaskRights); NULL = skip_permissions decides
+    "ALTER TABLE tasks ADD COLUMN rights TEXT",
+    # flow notifications carry "<item>:<step>" (approval) or "<item>:" (stuck item)
+    # so the bot adds the matching buttons
+    "ALTER TABLE notifications ADD COLUMN flow_ref TEXT",
 ]
 
 WORKFLOW_SCHEMA_VERSION = "workflow_orchestrator_w0_v1"
@@ -1030,8 +1134,9 @@ def _insert_task(conn: sqlite3.Connection, task: TaskCreate) -> TaskInDB:
         """INSERT INTO tasks (prompt, working_dir, provider, status, priority,
            scheduled_at, created_at, max_retries, skip_permissions, model,
            session_id, parent_task_id, tg_chat_id, recurrence, task_timeout,
-           detached, keep_pane, herdr_target, machine, worktree, effort, series_id)
-           VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           detached, keep_pane, herdr_target, machine, worktree, effort, series_id,
+           rights)
+           VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             task.prompt,
             task.working_dir,
@@ -1054,6 +1159,7 @@ def _insert_task(conn: sqlite3.Connection, task: TaskCreate) -> TaskInDB:
             int(task.worktree),
             task.effort,
             series_id,
+            task.rights,
         ),
     )
     return get_task(cur.lastrowid, conn=conn)
@@ -1323,7 +1429,7 @@ def _release_task_pipeline_targets(conn, task_id: int, started_at=None):
 
 def mark_completed(task_id: int, result: str, exit_code: int = 0,
                    model_used: str = None, session_id: str = None,
-                   verdict: str = None, *, expected_started_at=None) -> bool:
+                   verdict: str = None, *, expected_started_at=None, usage=None) -> bool:
     """Finalize a task, optionally committing its verdict atomically."""
     with _connect() as conn:
         attempt = _attempt_iso(expected_started_at)
@@ -1344,6 +1450,26 @@ def mark_completed(task_id: int, result: str, exit_code: int = 0,
         if cur.rowcount:
             _drop_cancel_flag(conn, task_id)
             _release_task_pipeline_targets(conn, task_id, attempt)
+            # Usage belongs to this successful attempt, never to assistant text.
+            conn.execute("DELETE FROM task_token_usage WHERE task_id = ?", (task_id,))
+            if isinstance(usage, dict):
+                counts = [usage.get("input_tokens"), usage.get("output_tokens"),
+                          usage.get("cached_input_tokens", 0),
+                          usage.get("cache_creation_input_tokens", 0)]
+                if counts[2] is None:
+                    counts[2] = 0
+                if (all(type(n) is int and 0 <= n <= 2**63 - 1 for n in counts)
+                        and counts[2] + counts[3] <= counts[0]):
+                    model = usage.get("model") or model_used
+                    if not isinstance(model, str):
+                        model = None
+                    conn.execute(
+                        """INSERT INTO task_token_usage
+                           (task_id,input_tokens,output_tokens,cached_input_tokens,
+                            cache_creation_input_tokens,model,cost_attributable)
+                           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                        (task_id, *counts, model, int(usage.get("cost_attributable", True) is True)),
+                    )
         return cur.rowcount > 0
 
 
@@ -1654,13 +1780,17 @@ def list_series() -> list:
         # queue snapshot even if a worker completes a run between SELECTs.
         conn.execute("BEGIN")
         series_rows = [dict(r) for r in conn.execute(
-            """SELECT id, title, prompt, working_dir, base_recurrence,
-                      temporary_recurrence, temporary_until,
-                      temporary_empty_limit, temporary_empty_count,
-                      provider, model, effort, priority, task_timeout,
-                      paused, ended_at
-               FROM task_series
-               ORDER BY id DESC""")]
+            """SELECT s.id, s.title, s.prompt, s.working_dir,
+                      s.base_recurrence, s.temporary_recurrence,
+                      s.temporary_until, s.temporary_empty_limit,
+                      s.temporary_empty_count, s.provider, s.model, s.effort,
+                      s.priority, s.task_timeout, s.paused, s.ended_at,
+                      auto_pause.value AS auto_pause_data
+               FROM task_series AS s
+               LEFT JOIN settings AS auto_pause
+                 ON auto_pause.key = ? || CAST(s.id AS TEXT)
+               ORDER BY s.id DESC""",
+            (_PIPELINE_REPEAT_BLOCKER_PAUSE_PREFIX,))]
         # Keep this read deliberately narrow.  Task result/prompt/note payloads
         # can be very large and none of them contributes to series health.
         # Fetching all series histories in one pass also avoids the old N+1
@@ -1693,14 +1823,14 @@ def list_series() -> list:
                        GROUP BY series_id
                    )
                    SELECT 'active' AS kind, t.series_id, t.id, t.machine,
-                          t.scheduled_at, t.error, t.worktree, t.detached,
+                          t.scheduled_at, t.next_run_at, t.error, t.worktree, t.detached,
                           t.herdr_target
                    FROM tasks AS t
                    INNER JOIN picked ON picked.active_id = t.id
                    INNER JOIN task_series AS s ON s.id = t.series_id
                    UNION ALL
                    SELECT 'last' AS kind, t.series_id, t.id, t.machine,
-                          NULL AS scheduled_at, NULL AS error,
+                          NULL AS scheduled_at, NULL AS next_run_at, NULL AS error,
                           NULL AS worktree, NULL AS detached,
                           NULL AS herdr_target
                    FROM tasks AS t
@@ -1725,6 +1855,15 @@ def list_series() -> list:
                 if r["started_at"] and r["completed_at"]:
                     durations.append((_parse_dt(r["completed_at"]) -
                                       _parse_dt(r["started_at"])).total_seconds())
+            auto_pause_reason = None
+            try:
+                auto_pause = json.loads(s["auto_pause_data"])
+                reason = auto_pause.get("reason")
+                if (auto_pause.get("kind") == "repeated_blocker"
+                        and isinstance(reason, str) and reason.strip()):
+                    auto_pause_reason = reason.strip()
+            except (TypeError, ValueError, json.JSONDecodeError, AttributeError):
+                pass
             out.append({
                 "id": s["id"], "title": s["title"], "prompt": s["prompt"],
                 "working_dir": s["working_dir"], "runs": len(tasks),
@@ -1742,9 +1881,15 @@ def list_series() -> list:
                 "detached": bool(active_detail["detached"]) if active_detail else False,
                 "herdr_target": active_detail["herdr_target"] if active_detail else None,
                 "paused": bool(s["paused"]), "ended": bool(s["ended_at"]),
+                "auto_pause_reason": auto_pause_reason if s["paused"] else None,
                 "next_task_id": active["id"] if active else None,
                 "next_status": active["status"] if active else None,
-                "next_run_at": active_detail["scheduled_at"] if active_detail else None,
+                # The worker requires both the schedule and retry deadline.
+                # Showing only scheduled_at hides a rate-limited retry entirely.
+                "next_run_at": max(
+                    (value for value in (active_detail["scheduled_at"],
+                                         active_detail["next_run_at"]) if value),
+                    key=_parse_dt, default=None) if active_detail else None,
                 "next_error": active_detail["error"] if active_detail else None,
                 "next_started_at": active["started_at"] if active else None,
                 "last_task_id": last["id"] if last else None,
@@ -1754,7 +1899,7 @@ def list_series() -> list:
                 "failure_rate": round(failures / len(completed), 3) if completed else 0,
                 "empty_rate": round(empties / len(completed), 3) if completed else 0,
                 "avg_duration_seconds": round(sum(durations) / len(durations)) if durations else None,
-                "broken": not active and not s["ended_at"],
+                "broken": not active and not s["ended_at"] and not s["paused"],
             })
     out.sort(key=lambda x: (x["ended"], x["broken"], x["paused"], x["next_run_at"] or ""))
     return out
@@ -1990,6 +2135,259 @@ def _pipeline_series_wake_intent_key(series_id: int) -> str:
     return f"pipeline_series_wake_intent:v1:{series_id}"
 
 
+_PIPELINE_BLOCKER_VERDICTS = {
+    "НУЖЕН ЧЕЛОВЕК": "human",
+    "HUMAN": "human",
+    "HUMAN_REQUIRED": "human",
+    "NEEDS_HUMAN": "human",
+    "НЕ СМОГ": "unable",
+    "UNABLE": "unable",
+}
+_PIPELINE_BLOCKER_LINE_RE = re.compile(
+    r"^[ \t>*#-]*ИТОГ:\s*(?P<verdict>"
+    + "|".join(re.escape(value) for value in _PIPELINE_BLOCKER_VERDICTS)
+    + r")\b(?P<reason>.*)$",
+    re.IGNORECASE,
+)
+_PIPELINE_VOLATILE_UUID_RE = re.compile(
+    r"\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-"
+    r"[89ab][0-9a-f]{3}-[0-9a-f]{12}\b",
+    re.IGNORECASE,
+)
+_PIPELINE_VOLATILE_HEX_RE = re.compile(
+    r"\b(?=[0-9a-f]{7,64}\b)(?=[0-9a-f]*[a-f])[0-9a-f]+\b",
+    re.IGNORECASE,
+)
+_PIPELINE_VOLATILE_TIME_RE = re.compile(
+    r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}"
+    r"(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\b",
+    re.IGNORECASE,
+)
+_PIPELINE_VOLATILE_TASK_RE = re.compile(
+    r"\b(?:(?:scheduler\s+)?task\s*#?\s*\d+"
+    r"|задач[аи]\s+(?:promptpilot|планировщика)\s*#?\s*\d+)\b",
+    re.IGNORECASE,
+)
+_PIPELINE_GENERIC_BLOCKER_REASONS = {
+    "blocked",
+    "failed",
+    "unable",
+    "не получилось",
+    "не смог",
+    "нужен человек",
+    "нужно решение",
+    "подробности выше",
+    "см. выше",
+    "см. отчет выше",
+    "см. отчёт выше",
+    "требуется решение",
+}
+
+# Issue #37: pipelinectl refuses before the first mutation when a
+# single-flight/allowlist race takes the item away (owner appeared, item left
+# the allowlist, base-sync lineage changed). That fence doing its job is a
+# safe retry — a run ending НЕ СМОГ with one of these reasons must not count
+# as an execution incident.
+_PIPELINE_SAFE_RACE_MARKERS = (
+    "single-flight owner appeared",
+    "single-flight/base-sync owner requires the full skill",
+    "base-sync lineage requires the full skill",
+    "integration/base-sync state requires the full skill",
+    "target left the allowlist",
+)
+
+
+def _is_safe_race_refusal(output: str) -> bool:
+    text = (output or "").lower()
+    return any(marker in text for marker in _PIPELINE_SAFE_RACE_MARKERS)
+_PIPELINE_REPEAT_BLOCKER_PAUSE_PREFIX = "pipeline_repeat_blocker_pause:v1:"
+
+
+def _pipeline_blocker_details(
+        verdict: Optional[str], result: Optional[str]) -> Optional[dict]:
+    """Stable identity and readable reason of one explicit blocker.
+
+    Provider metadata, commit OIDs and the scheduler's own task id change on
+    every run and therefore cannot participate in repeat detection. Issue and
+    PR numbers deliberately remain: two blocked targets are two different
+    reasons. A bare HUMAN/UNABLE without a reason is not safe to correlate.
+    """
+    kind = _PIPELINE_BLOCKER_VERDICTS.get(str(verdict or "").strip().upper())
+    if kind is None:
+        return None
+
+    response = re.split(
+        r"(?m)^\s*--- Meta ---\s*$", str(result or ""), maxsplit=1,
+    )[0]
+    lines = response.splitlines()
+    selected = None
+    for index, line in enumerate(lines):
+        match = _PIPELINE_BLOCKER_LINE_RE.match(line)
+        if not match:
+            continue
+        line_kind = _PIPELINE_BLOCKER_VERDICTS.get(
+            match.group("verdict").strip().upper())
+        if line_kind != kind:
+            continue
+        parts = [match.group("reason")]
+        # Narrow terminals may wrap the final reason. Only indented lines are
+        # presentation continuations; stop before worktree summaries or prose.
+        for continuation in lines[index + 1:index + 9]:
+            if not continuation.strip():
+                break
+            if not continuation[:1].isspace():
+                break
+            parts.append(continuation.strip())
+        selected = " ".join(parts)
+    if selected is None:
+        return None
+
+    display_reason = unicodedata.normalize("NFKC", selected)
+    display_reason = re.sub(
+        r"^\s*(?:[—–:-]\s*|\(\s*)+", "", display_reason)
+    display_reason = re.sub(r"\s+", " ", display_reason).strip(
+        " \t\r\n()[]{}.,;:—–-")
+    normalized = display_reason.casefold()
+    normalized = _PIPELINE_VOLATILE_UUID_RE.sub("<uuid>", normalized)
+    normalized = _PIPELINE_VOLATILE_HEX_RE.sub("<oid>", normalized)
+    normalized = _PIPELINE_VOLATILE_TIME_RE.sub("<time>", normalized)
+    normalized = _PIPELINE_VOLATILE_TASK_RE.sub("task <id>", normalized)
+    normalized = re.sub(r"\bpp[/\\]t\d+\b", "pp/t<id>", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip(" \t\r\n()[]{}.,;:—–-")
+    if (not normalized
+            or normalized in _PIPELINE_GENERIC_BLOCKER_REASONS
+            or not any(character.isalnum() for character in normalized)):
+        return None
+    # Human-required is a terminal handoff, not a retryable execution error.
+    # Two consecutive handoffs for the same unambiguous target must stop even
+    # when the agent paraphrases the diagnosis (incident: OneBase PR #1505).
+    # Keep UNABLE text-sensitive and ambiguous/multi-target reports separate.
+    targets = set(re.findall(r"(?<![\w#])#([1-9][0-9]*)\b", display_reason))
+    identity = normalized
+    if kind == "human" and len(targets) == 1:
+        identity = "human-target:#" + next(iter(targets))
+    elif kind == "human" and len(targets) > 1:
+        # An explicit semicolon-separated list has a diagnosis for each exact
+        # target. Correlate its unordered target set, not paraphrased prose.
+        # Joint/ambiguous reports ("#1 and #2: ...") remain text-sensitive.
+        entries = display_reason.split(";")
+        named = [re.match(r"^\s*#([1-9][0-9]*)\s+[—–-]\s+\S", entry)
+                 for entry in entries]
+        if (len(entries) == len(targets) and all(named)
+                and {match.group(1) for match in named} == targets):
+            identity = "human-target-set:" + ",".join(sorted(targets, key=int))
+    return {
+        "fingerprint": hashlib.sha256(
+            f"{kind}\0{identity}".encode("utf-8")).hexdigest(),
+        "reason": display_reason[:1000],
+    }
+
+
+def _pipeline_blocker_fingerprint(
+        verdict: Optional[str], result: Optional[str]) -> Optional[str]:
+    details = _pipeline_blocker_details(verdict, result)
+    return details["fingerprint"] if details else None
+
+
+def _pipeline_repeat_blocker_pause_key(series_id: int) -> str:
+    if isinstance(series_id, bool) or not isinstance(series_id, int) or series_id <= 0:
+        raise ValueError("pipeline series id must be a positive integer")
+    return f"{_PIPELINE_REPEAT_BLOCKER_PAUSE_PREFIX}{series_id}"
+
+
+def _continue_pipeline_recurrence() -> dict:
+    return {
+        "suppress_recurrence": False,
+        "newly_paused": False,
+        "repeated": False,
+    }
+
+
+def _pause_pipeline_series_on_repeated_blocker(
+        conn, series_id: int, current_task_id: int) -> dict:
+    """Transactional implementation shared by recurrence and repair paths."""
+    series = conn.execute(
+        "SELECT paused, ended_at FROM task_series WHERE id = ?",
+        (series_id,),
+    ).fetchone()
+    if not series or series["ended_at"]:
+        return _continue_pipeline_recurrence()
+
+    current = conn.execute(
+        """SELECT id, status, verdict, result FROM tasks
+           WHERE id = ? AND series_id = ?
+             AND id = (SELECT MAX(id) FROM tasks WHERE series_id = ?)""",
+        (current_task_id, series_id, series_id),
+    ).fetchone()
+    if not current or current["status"] != "completed":
+        return _continue_pipeline_recurrence()
+    from .pipeline_item_holds import record
+    if record(conn, series_id, current_task_id, current["verdict"], current["result"]):
+        # Measured item handoffs park the target, not unrelated future work.
+        return _continue_pipeline_recurrence()
+    current_details = _pipeline_blocker_details(
+        current["verdict"], current["result"])
+    if current_details is None:
+        return _continue_pipeline_recurrence()
+
+    previous = conn.execute(
+        """SELECT id, status, verdict, result FROM tasks
+           WHERE series_id = ? AND id < ?
+           ORDER BY id DESC LIMIT 1""",
+        (series_id, current_task_id),
+    ).fetchone()
+    if (not previous or previous["status"] != "completed"
+            or _pipeline_blocker_fingerprint(
+                previous["verdict"], previous["result"]
+            ) != current_details["fingerprint"]):
+        return _continue_pipeline_recurrence()
+
+    now = _now()
+    changed = conn.execute(
+        """UPDATE task_series SET paused = 1, updated_at = ?
+           WHERE id = ? AND paused = 0 AND ended_at IS NULL""",
+        (now, series_id),
+    ).rowcount > 0
+    conn.execute(
+        "DELETE FROM settings WHERE key = ?",
+        (_pipeline_series_wake_intent_key(series_id),),
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+        (
+            _pipeline_repeat_blocker_pause_key(series_id),
+            json.dumps({
+                "kind": "repeated_blocker",
+                "reason": current_details["reason"],
+                "fingerprint": current_details["fingerprint"],
+                "previous_task_id": int(previous["id"]),
+                "current_task_id": current_task_id,
+            }, ensure_ascii=False, separators=(",", ":")),
+        ),
+    )
+    return {
+        "suppress_recurrence": True,
+        "newly_paused": changed,
+        "repeated": True,
+        "reason": current_details["reason"],
+        "current_task_id": current_task_id,
+        "previous_task_id": int(previous["id"]),
+    }
+
+
+def pause_pipeline_series_on_repeated_blocker(
+        series_id: int, current_task_id: int) -> dict:
+    """Pause after two consecutive occurrences report the same blocker.
+
+    The caller applies this only to a configured project-pipeline series. The
+    comparison and pause share one write transaction, so no successor can be
+    inserted between the decision and the pause made by this worker.
+    """
+    with _connect(immediate=True) as conn:
+        return _pause_pipeline_series_on_repeated_blocker(
+            conn, series_id, current_task_id)
+
+
 def _recreate_series_occurrence(conn, series_id: int, series,
                                 scheduled_at: datetime) -> bool:
     latest_row = conn.execute(
@@ -2017,6 +2415,7 @@ def _recreate_series_occurrence(conn, series_id: int, series,
         herdr_target=latest.herdr_target,
         machine=latest.machine,
         worktree=latest.worktree,
+        rights=latest.rights,
         series_id=series_id,
     ))
     return True
@@ -2078,6 +2477,16 @@ def request_pipeline_series_wake(series_id: int) -> dict:
                 (key,),
             )
             return {"accepted": True, "state": "latched"}
+        latest = conn.execute(
+            """SELECT id, status FROM tasks WHERE series_id = ?
+               ORDER BY id DESC LIMIT 1""",
+            (series_id,),
+        ).fetchone()
+        if latest and latest["status"] == "completed":
+            repeat_guard = _pause_pipeline_series_on_repeated_blocker(
+                conn, series_id, int(latest["id"]))
+            if repeat_guard["suppress_recurrence"]:
+                return {"accepted": False, "state": "repeat_blocker_paused"}
         if _recreate_series_occurrence(
                 conn, series_id, series, datetime.now(timezone.utc)):
             conn.execute("DELETE FROM settings WHERE key = ?", (key,))
@@ -2085,13 +2494,20 @@ def request_pipeline_series_wake(series_id: int) -> dict:
         return {"accepted": False, "state": "missing"}
 
 
-def repair_active_series_occurrences() -> list[int]:
+def repair_active_series_occurrences(
+        *, repeat_guard_series_ids=()) -> list[int]:
     """Recreate active series lost after a terminal commit and hard crash.
 
     A worker can die after marking an occurrence completed/failed but before
     its ``finally`` schedules the successor.  Repair only that narrow terminal
     state: a cancelled latest occurrence remains an explicit human stop.
+    ``repeat_guard_series_ids`` is an explicit project-profile allowlist;
+    generic recurring schedules retain their historical repair behaviour.
     """
+    guarded = {
+        value for value in repeat_guard_series_ids
+        if type(value) is int and value > 0
+    }
     repaired = []
     with _connect(immediate=True) as conn:
         series_rows = conn.execute(
@@ -2108,12 +2524,17 @@ def repair_active_series_occurrences() -> list[int]:
             ).fetchone() is not None:
                 continue
             latest = conn.execute(
-                """SELECT status, completed_at FROM tasks WHERE series_id = ?
+                """SELECT id, status, completed_at FROM tasks WHERE series_id = ?
                    ORDER BY id DESC LIMIT 1""",
                 (series_id,),
             ).fetchone()
             if (latest is None
                     or latest["status"] not in ("completed", "failed")):
+                continue
+            if (series_id in guarded and latest["status"] == "completed"
+                    and _pause_pipeline_series_on_repeated_blocker(
+                        conn, series_id, int(latest["id"]))[
+                            "suppress_recurrence"]):
                 continue
             wake_key = _pipeline_series_wake_intent_key(series_id)
             has_wake = conn.execute(
@@ -2173,7 +2594,7 @@ def clear_pipeline_series_wake(series_id: int) -> bool:
         return deleted.rowcount > 0
 
 
-def series_action(series_id: int, action: str) -> bool:
+def series_action(series_id: int, action: str, *, retry_blocked: bool = False) -> bool:
     with _connect() as conn:
         row = conn.execute("SELECT * FROM task_series WHERE id = ?", (series_id,)).fetchone()
         if not row:
@@ -2182,6 +2603,10 @@ def series_action(series_id: int, action: str) -> bool:
         if action == "pause":
             conn.execute("UPDATE task_series SET paused = 1, updated_at = ? WHERE id = ?",
                          (now, series_id))
+            # An explicit operator pause overrides an earlier automatic pause.
+            # A background repair must never resume it on the operator's behalf.
+            conn.execute("DELETE FROM settings WHERE key = ?",
+                         (_pipeline_repeat_blocker_pause_key(series_id),))
             conn.execute(
                 """UPDATE tasks
                    SET budget_wait_scope = NULL,
@@ -2195,9 +2620,33 @@ def series_action(series_id: int, action: str) -> bool:
                 (_pipeline_series_wake_intent_key(series_id),),
             )
         elif action == "resume":
-            conn.execute("UPDATE task_series SET paused = 0, updated_at = ? WHERE id = ? AND ended_at IS NULL",
-                         (now, series_id))
+            resumed = conn.execute(
+                """UPDATE task_series SET paused = 0, updated_at = ?
+                   WHERE id = ? AND paused = 1 AND ended_at IS NULL""",
+                (now, series_id),
+            ).rowcount > 0
+            if resumed:
+                conn.execute("DELETE FROM settings WHERE key = ?",
+                             (f"pipeline_item_holds:v1:{series_id}",))
+                conn.execute(
+                    "DELETE FROM settings WHERE key = ?",
+                    (_pipeline_repeat_blocker_pause_key(series_id),),
+                )
+            if resumed and conn.execute(
+                    """SELECT 1 FROM tasks WHERE series_id = ?
+                       AND status IN ('pending', 'running', 'rate_limited')""",
+                    (series_id,),
+            ).fetchone() is None:
+                # An automatic repeat-blocker pause intentionally has no
+                # successor. Resume restores exactly one runnable occurrence.
+                _recreate_series_occurrence(
+                    conn, series_id, row, datetime.now(timezone.utc))
         elif action == "run_now":
+            # A paused series is an explicit stop. Creating or moving a task
+            # here would still leave it unclaimable and falsely report that
+            # the run started; Resume is the only way out of this state.
+            if row["paused"] or row["ended_at"]:
+                return False
             cur = conn.execute(
                 """UPDATE tasks
                    SET scheduled_at = ?, next_run_at = NULL,
@@ -2207,12 +2656,15 @@ def series_action(series_id: int, action: str) -> bool:
                 (now, series_id),
             )
             if cur.rowcount > 0:
+                if retry_blocked:
+                    conn.execute("DELETE FROM settings WHERE key = ?",
+                                 (f"pipeline_item_holds:v1:{series_id}",))
                 conn.execute(
                     "DELETE FROM settings WHERE key = ?",
                     (_pipeline_series_wake_intent_key(series_id),),
                 )
                 return True
-            if row["ended_at"] or conn.execute(
+            if conn.execute(
                 "SELECT 1 FROM tasks WHERE series_id = ? AND status = 'running'",
                 (series_id,),
             ).fetchone():
@@ -2227,6 +2679,9 @@ def series_action(series_id: int, action: str) -> bool:
             recreated = _recreate_series_occurrence(
                 conn, series_id, row, datetime.now(timezone.utc))
             if recreated:
+                if retry_blocked:
+                    conn.execute("DELETE FROM settings WHERE key = ?",
+                                 (f"pipeline_item_holds:v1:{series_id}",))
                 conn.execute(
                     "DELETE FROM settings WHERE key = ?",
                     (_pipeline_series_wake_intent_key(series_id),),
@@ -2244,8 +2699,57 @@ def series_action(series_id: int, action: str) -> bool:
                 "DELETE FROM settings WHERE key = ?",
                 (_pipeline_series_wake_intent_key(series_id),),
             )
+            conn.execute(
+                "DELETE FROM settings WHERE key = ?",
+                (_pipeline_repeat_blocker_pause_key(series_id),),
+            )
         else:
             return False
+        return True
+
+
+def resume_resolved_pipeline_blocker(series_id: int, task_id: int) -> bool:
+    """Resume only the still-current automatic pause, never an operator pause.
+
+    The caller supplies external proof that the blocker changed. The pause
+    record and series state are checked together under SQLite's write lock so
+    a manual pause or a newer blocker cannot be overwritten by a stale scan.
+    """
+    with _connect(immediate=True) as conn:
+        series = conn.execute(
+            "SELECT * FROM task_series WHERE id = ?", (series_id,),
+        ).fetchone()
+        if not series or not series["paused"] or series["ended_at"]:
+            return False
+        key = _pipeline_repeat_blocker_pause_key(series_id)
+        row = conn.execute(
+            "SELECT value FROM settings WHERE key = ?", (key,),
+        ).fetchone()
+        if not row:
+            return False
+        try:
+            pause = json.loads(row["value"])
+        except (TypeError, ValueError):
+            return False
+        if (not isinstance(pause, dict)
+                or pause.get("kind") != "repeated_blocker"
+                or pause.get("current_task_id") != task_id):
+            return False
+        now = _now()
+        conn.execute(
+            "UPDATE task_series SET paused = 0, updated_at = ? WHERE id = ?",
+            (now, series_id),
+        )
+        conn.execute("DELETE FROM settings WHERE key = ?", (key,))
+        if conn.execute(
+                """SELECT 1 FROM tasks WHERE series_id = ?
+                   AND status IN ('pending', 'running', 'rate_limited')""",
+                (series_id,),
+        ).fetchone() is None:
+            if not _recreate_series_occurrence(
+                    conn, series_id, series, datetime.now(timezone.utc)):
+                raise RuntimeError(
+                    "automatic pipeline resume could not recreate its occurrence")
         return True
 
 
@@ -2422,12 +2926,17 @@ def wake_series_group_once(series_ids: list[int], latch_key: str,
                     # so only repair the same terminal states as
                     # ``repair_active_series_occurrences``.
                     latest = conn.execute(
-                        """SELECT status FROM tasks WHERE series_id = ?
+                        """SELECT id, status FROM tasks WHERE series_id = ?
                            ORDER BY id DESC LIMIT 1""",
                         (series_id,),
                     ).fetchone()
                     if (latest is None
                             or latest["status"] not in ("completed", "failed")):
+                        continue
+                    if (latest["status"] == "completed"
+                            and _pause_pipeline_series_on_repeated_blocker(
+                                conn, series_id, int(latest["id"]))[
+                                    "suppress_recurrence"]):
                         continue
                     if not _recreate_series_occurrence(
                             conn, series_id, series, datetime.now(timezone.utc)):
@@ -2703,11 +3212,12 @@ def pipeline_run_metrics(series_ids: list[int], since: datetime) -> dict:
     ids = sorted({int(value) for value in series_ids if value is not None})
     empty = {"runs": 0, "ready": 0, "empty": 0, "human": 0,
              "no_change": 0, "stale": 0, "unable": 0, "failed": 0,
-             "other": 0,
+             "other": 0, "safe_refusal": 0,
              "unresolved_unable": 0, "unresolved_failed": 0,
              "recovered_unable": 0, "recovered_failed": 0,
              "tokens_known_runs": 0, "input_tokens": 0,
-             "output_tokens": 0, "total_tokens": 0}
+             "output_tokens": 0, "total_tokens": 0,
+             "cost_known_runs": 0, "total_cost_usd": 0.0}
     if not ids:
         return empty
     marks = ",".join("?" for _ in ids)
@@ -2731,6 +3241,11 @@ def pipeline_run_metrics(series_ids: list[int], since: datetime) -> dict:
             result["input_tokens"] += input_tokens
             result["output_tokens"] += output_tokens
             result["total_tokens"] += input_tokens + output_tokens
+        cost = re.search(
+            r"(?mi)^Cost:\s*\$(\d+(?:\.\d+)?)\s*$", output)
+        if cost:
+            result["cost_known_runs"] += 1
+            result["total_cost_usd"] += float(cost.group(1))
         reported_no_change = any(pattern in output.lower() for pattern in (
             "github не изменялся", "очередь оставлена без изменений",
             "ничего не влито", "изменений не выполнялось",
@@ -2759,14 +3274,21 @@ def pipeline_run_metrics(series_ids: list[int], since: datetime) -> dict:
             result["stale"] += 1
             unresolved[int(row["series_id"])] = {"unable": 0, "failed": 0}
         elif verdict == "НЕ СМОГ":
-            result["unable"] += 1
-            unresolved[int(row["series_id"])]["unable"] += 1
+            if _is_safe_race_refusal(output):
+                # A pre-mutation owner/allowlist race: the fence worked and
+                # re-election follows — neutral, not an incident (issue #37).
+                result["safe_refusal"] += 1
+                unresolved[int(row["series_id"])] = {"unable": 0, "failed": 0}
+            else:
+                result["unable"] += 1
+                unresolved[int(row["series_id"])]["unable"] += 1
         else:
             result["other"] += 1
     result["unresolved_unable"] = sum(item["unable"] for item in unresolved.values())
     result["unresolved_failed"] = sum(item["failed"] for item in unresolved.values())
     result["recovered_unable"] = result["unable"] - result["unresolved_unable"]
     result["recovered_failed"] = result["failed"] - result["unresolved_failed"]
+    result["total_cost_usd"] = round(result["total_cost_usd"], 6)
     return result
 
 
@@ -2778,11 +3300,17 @@ def pipeline_series_activity(series_ids: list[int]) -> dict[int, dict]:
     marks = ",".join("?" for _ in ids)
     with _connect() as conn:
         rows = conn.execute(
-            f"""SELECT id, series_id, status, verdict, started_at, completed_at,
-                       result
-                FROM tasks WHERE series_id IN ({marks})
-                  AND status IN ('completed', 'failed', 'cancelled')
-                ORDER BY id DESC""",
+            f"""WITH latest AS (
+                    SELECT series_id, MAX(id) AS id
+                    FROM tasks WHERE series_id IN ({marks})
+                      AND status IN ('completed', 'failed', 'cancelled')
+                    GROUP BY series_id
+                )
+                SELECT t.id, t.series_id, t.status, t.verdict,
+                       t.started_at, t.completed_at, t.result
+                FROM tasks AS t
+                INNER JOIN latest ON latest.id = t.id
+                ORDER BY t.id DESC""",
             ids,
         ).fetchall()
     activity = {}
@@ -3206,6 +3734,7 @@ def _wake_pipeline_github_budget_waiters(conn, scope: str) -> dict:
 def arm_pipeline_github_budget_waiter(
         scope: str, *, task_id: int, task_started_at,
         expected_revision: int | None = None,
+        yield_aged_baton_seconds: int = 0,
         now: Optional[float] = None) -> dict:
     """Persist a priority handoff before releasing the admission scan lease.
 
@@ -3231,22 +3760,36 @@ def arm_pipeline_github_budget_waiter(
     if not math.isfinite(current):
         raise ValueError("pipeline budget waiter time must be finite")
     wait_started_at = datetime.fromtimestamp(current, timezone.utc).isoformat()
+    yield_aged_baton_seconds = _pipeline_budget_starvation_timeout(yield_aged_baton_seconds)
     with _connect(immediate=True) as conn:
         revision = _pipeline_github_budget_revision(conn, scope)
+        previous = conn.execute(
+            "SELECT budget_wait_scope, budget_wait_started_at FROM tasks "
+            "WHERE id=? AND status='running' AND started_at=?", (task_id, attempt)).fetchone()
+        yielded = False
+        if (yield_aged_baton_seconds and previous is not None
+                and previous["budget_wait_scope"] == scope
+                and previous["budget_wait_started_at"]):
+            started = datetime.fromisoformat(previous["budget_wait_started_at"])
+            if started.tzinfo is None:
+                raise ValueError("pipeline budget waiter timestamp is invalid")
+            yielded = current - started.timestamp() >= yield_aged_baton_seconds
         cur = conn.execute(
             """UPDATE tasks
                SET budget_wait_started_at = CASE
                      WHEN budget_wait_scope = ?
                        AND budget_wait_started_at IS NOT NULL
+                       AND ? = 0
                      THEN budget_wait_started_at
                      ELSE ?
                    END,
                    budget_wait_scope = ?
                WHERE id = ? AND status = 'running' AND started_at = ?""",
-            (scope, wait_started_at, scope, task_id, attempt),
+            (scope, int(yielded), wait_started_at, scope, task_id, attempt),
         )
         return {
             "armed": cur.rowcount > 0,
+            **({"fairness_yielded": True} if yielded and cur.rowcount > 0 else {}),
             "revision": revision,
             "revision_changed": (
                 expected_revision is not None
@@ -4137,17 +4680,118 @@ def mark_notified(task_id: int):
         )
 
 
+# ── 1С-доработка (epf_tools): связь задачи с проектом обработки ─────────
+
+def create_epf_job(task_id: int, project_dir: str, original_name: str,
+                   base_key: str | None, base_label: str,
+                   chat_id: int | None) -> int:
+    now = _now()
+    with _connect() as conn:
+        cur = conn.execute(
+            """INSERT INTO epf_jobs (task_id, project_dir, original_name,
+               base_key, base_label, chat_id, status, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?)""",
+            (task_id, project_dir, original_name, base_key, base_label,
+             chat_id, now, now),
+        )
+        return int(cur.lastrowid)
+
+
+def get_epf_job(job_id: int) -> Optional[dict]:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM epf_jobs WHERE id = ?", (job_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def get_epf_job_by_task(task_id: int) -> Optional[dict]:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM epf_jobs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def update_epf_job(job_id: int, fields: dict):
+    """Обновить поля epf_jobs (status, epf_path, error, base_key, base_label)."""
+    allowed = {"status", "epf_path", "error", "base_key", "base_label"}
+    sets = {k: v for k, v in fields.items() if k in allowed}
+    if not sets:
+        return
+    sets["updated_at"] = _now()
+    cols = ", ".join(f"{k} = ?" for k in sets)
+    with _connect() as conn:
+        conn.execute(
+            f"UPDATE epf_jobs SET {cols} WHERE id = ?",
+            (*sets.values(), job_id),
+        )
+
+
+def queue_herdr_completions(source_key: str, completions: list[dict], chat_ids: list[int], *, machine: str = "",
+                            present_panes: Optional[list[str]] = None) -> int:
+    """Atomically observe completion identities and enqueue durable delivery.
+
+    First successful observation baselines old sessions. Later observations,
+    including the first after a restart, enqueue every visible new identity.
+    Delivery uses the existing persistent notification outbox.
+    """
+    key = "herdr_watch_completion_v2:" + source_key
+    queued = 0
+    with _connect(immediate=True) as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        state = _json_load(row["value"], {}) if row else {}
+        initialized = state.get("initialized", False)
+        observed = state.setdefault("observed", {})
+        if present_panes is not None:
+            present = set(present_panes)
+            # Without an instance identity, observed absence is the only proof
+            # that reusing a pane starts a new lifetime. Stable terminal/session
+            # cursors survive layout moves and temporary absence.
+            observed = {slot: value for slot, value in observed.items()
+                        if not slot.startswith("legacy:") or slot[7:] in present}
+            state["observed"] = observed
+        for completion in completions:
+            pane = completion["pane"]
+            terminal = completion.get("terminal_id")
+            session = completion.get("agent_session")
+            if isinstance(terminal, str) and terminal:
+                slot = "terminal:" + terminal
+            elif isinstance(session, dict) and session.get("value"):
+                slot = "session:" + _json_dump({field: session.get(field) for field in ("agent", "kind", "value")})
+            else:
+                slot = "legacy:" + pane
+            identity = {"sequence": completion["sequence"]}
+            if observed.get(slot) == identity:
+                continue
+            if initialized:
+                for chat_id in chat_ids:
+                    conn.execute(
+                        "INSERT INTO notifications(tg_chat_id,message,created_at,pane_id,machine,kind) VALUES(?,?,?,?,?,?)",
+                        (int(chat_id), completion["message"], _now(), pane, machine, "herdr.done"),
+                    )
+                    queued += 1
+            observed[slot] = identity
+        state["initialized"] = True
+        conn.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (key, _json_dump(state)))
+    return queued
+
+
 def add_notification(tg_chat_id: int, message: str, task_id: int = None,
-                     pane_id: str = None, machine: str = None):
+                     pane_id: str = None, machine: str = None,
+                     flow_ref: str = None):
     """Queue a free-form message for the bot's notify loop (e.g. blocked agent).
 
     pane_id/machine let the bot attach herdr action buttons (confirm/screen/
-    reply) to the delivered message instead of sending bare text."""
+    reply) to the delivered message instead of sending bare text; flow_ref
+    attaches flow buttons: "<item>:<step>" approve/reject an approval,
+    "<item>:" retry/skip/cancel an item that needs a person."""
     with _connect() as conn:
         conn.execute(
-            "INSERT INTO notifications (task_id, tg_chat_id, message, created_at, pane_id, machine)"
-            " VALUES (?, ?, ?, ?, ?, ?)",
-            (task_id, tg_chat_id, message, _now(), pane_id, machine),
+            "INSERT INTO notifications (task_id, tg_chat_id, message, created_at, pane_id,"
+            " machine, flow_ref) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (task_id, tg_chat_id, message, _now(), pane_id, machine, flow_ref),
         )
 
 
@@ -4349,6 +4993,7 @@ def _row_to_workflow_round(row: sqlite3.Row) -> WorkflowRoundInDB:
 
 def _row_to_workflow_run(row: sqlite3.Row) -> WorkflowRunInDB:
     data = dict(row)
+    data["input"] = _json_load(data.pop("input_json", None), None)
     data["output"] = _json_load(data.pop("output_json"), None)
     for field in ("started_at", "completed_at"):
         data[field] = _parse_dt(data[field])
@@ -4450,10 +5095,10 @@ def append_workflow_event(event: WorkflowEventCreate) -> WorkflowEventInDB:
         return _append_workflow_event(conn, event)
 
 
-def create_workflow(data: WorkflowCreate, workflow_id: str = None) -> WorkflowInDB:
+def create_workflow(data: WorkflowCreate, workflow_id: str = None, *, conn=None) -> WorkflowInDB:
     workflow_id = workflow_id or _new_id("wf")
     now = _now()
-    with _connect(immediate=True) as conn:
+    with (nullcontext(conn) if conn is not None else _connect(immediate=True)) as conn:
         try:
             conn.execute(
                 """INSERT INTO workflows
@@ -4484,6 +5129,37 @@ def create_workflow(data: WorkflowCreate, workflow_id: str = None) -> WorkflowIn
             "SELECT * FROM workflows WHERE id = ?", (workflow_id,)
         ).fetchone()
         return _row_to_workflow(row)
+
+
+def abort_draft_workflow(workflow_id: str) -> bool:
+    """Компенсация неатомарного создания миссии с готовым планом.
+
+    Отменяет ТОЛЬКО draft-миссию: терминальный cancelled + slug вида
+    «aborted-<slug>-<id>», освобождая исходный slug для повторного запроса.
+    Физическое удаление строки невозможно по схеме: workflow_events держит
+    FK ON DELETE RESTRICT (при foreign_keys=ON), а события append-only —
+    журнал целостности важнее. Планы/этапы/раунды draft-а удаляются.
+    """
+    with _connect(immediate=True) as conn:
+        row = conn.execute(
+            "SELECT status, slug FROM workflows WHERE id = ?", (workflow_id,)
+        ).fetchone()
+        if not row or row["status"] != "draft":
+            return False
+        conn.execute(
+            "DELETE FROM workflow_stages WHERE workflow_id = ?", (workflow_id,))
+        conn.execute(
+            "DELETE FROM workflow_plans WHERE workflow_id = ?", (workflow_id,))
+        conn.execute(
+            "DELETE FROM workflow_rounds WHERE workflow_id = ?", (workflow_id,))
+        cur = conn.execute(
+            """UPDATE workflows
+               SET status = 'cancelled',
+                   slug = 'aborted-' || substr(slug, 1, 40) || '-' || substr(id, 4, 8),
+                   updated_at = ?
+               WHERE id = ? AND status = 'draft'""",
+            (_now(), workflow_id))
+        return cur.rowcount > 0
 
 
 def get_workflow(workflow_id: str, *, conn=None) -> Optional[WorkflowInDB]:
@@ -4596,7 +5272,8 @@ def _replace_workflow_stages(conn: sqlite3.Connection, workflow_id: str,
 
 
 def update_workflow(workflow_id: str, update: WorkflowUpdate) -> WorkflowInDB:
-    changes = update.model_dump(exclude={"expected_version"}, exclude_none=True)
+    changes = update.model_dump(
+        exclude={"expected_version", "allow_terminal_config"}, exclude_none=True)
     if not changes:
         raise ValueError("workflow update contains no changed fields")
     if "config" in changes:
@@ -4618,9 +5295,14 @@ def update_workflow(workflow_id: str, update: WorkflowUpdate) -> WorkflowInDB:
                 "workflow metadata except config can only be edited while status is draft"
             )
         if current["status"] in {"completed", "failed", "cancelled"}:
-            raise WorkflowConflictError(
-                "terminal workflow configuration cannot be edited"
-            )
+            # allow_terminal_config: явная семантика правки конфига
+            # терминальной миссии (только config; на выполнение не влияет)
+            if not (getattr(update, "allow_terminal_config", False)
+                    and set(changes) <= {"config_json"}):
+                raise WorkflowConflictError(
+                    "terminal workflow configuration cannot be edited "
+                    "(allow_terminal_config=true разрешает правку только config)"
+                )
         if current["state_version"] != update.expected_version:
             raise WorkflowConflictError(
                 f"workflow version is {current['state_version']}, "
@@ -4874,6 +5556,66 @@ def list_workflow_findings(workflow_id: str,
         return [_row_to_workflow_finding(row) for row in rows]
 
 
+MEMORY_MAX_BYTES = 16 * 1024
+
+
+def list_memory(workflow_id: str) -> list[dict]:
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM workflow_memory WHERE workflow_id = ? ORDER BY name",
+            (workflow_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def save_memory(workflow_id: str, name: str, content: str,
+                updated_by_task: int = None,
+                scope_stage: str = None) -> tuple[bool, str]:
+    """Сохранить заметку миссии (замена целиком). Лимит 16КБ — ОТКАЗ, не
+    обрезка: агент должен знать, что не влезло, и разбить сам.
+    scope_stage привязывает заметку к этапу — конвейер удалит её при
+    закрытии этапа (уборка — работа пайплайна)."""
+    name = name or "memory.md"
+    if not name.strip():
+        return False, "пустое имя заметки"
+    if len(name) > 64:
+        return False, "имя заметки длиннее 64 символов"
+    if len(content.encode("utf-8")) > MEMORY_MAX_BYTES:
+        return False, (f"заметка {name} больше {MEMORY_MAX_BYTES} байт — "
+                       f"сократи или раздели на несколько заметок")
+    with _connect(immediate=True) as conn:
+        if scope_stage:
+            rows = conn.execute(
+                """SELECT id FROM workflow_stages WHERE workflow_id=?
+                   AND (id=? OR code=?) AND status NOT IN ('completed','skipped')""",
+                (workflow_id, scope_stage, scope_stage),
+            ).fetchall()
+            if len(rows) != 1:
+                return False, "scope_stage должен указывать на открытый этап этой миссии"
+            scope_stage = rows[0]["id"]
+        conn.execute(
+            """INSERT INTO workflow_memory (workflow_id, name, content, updated_at, updated_by_task, scope_stage)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(workflow_id, name) DO UPDATE SET
+                   content = excluded.content,
+                   updated_at = excluded.updated_at,
+                   updated_by_task = excluded.updated_by_task,
+                   scope_stage = excluded.scope_stage""",
+            (workflow_id, name, content, _now(), updated_by_task,
+             (scope_stage or None)),
+        )
+    return True, "сохранено"
+
+
+def delete_memory(workflow_id: str, name: str) -> bool:
+    with _connect() as conn:
+        cur = conn.execute(
+            "DELETE FROM workflow_memory WHERE workflow_id = ? AND name = ?",
+            (workflow_id, name),
+        )
+        return cur.rowcount > 0
+
+
 def create_workflow_artifact(data: WorkflowArtifactCreate,
                              artifact_id: str = None) -> WorkflowArtifactInDB:
     artifact_id = artifact_id or _new_id("artifact")
@@ -4961,15 +5703,35 @@ def list_workflow_artifacts(workflow_id: str,
         return [_row_to_workflow_artifact(row) for row in rows]
 
 
-def list_workflow_events(workflow_id: str, after_seq: int = 0,
-                         limit: int = 200) -> list[WorkflowEventInDB]:
+def list_workflow_notification_events(after_seq: int = 0, limit: int = 500,
+                                      *, tail: bool = False):
+    """One global event snapshot, including workflows beyond UI list limits."""
     with _connect() as conn:
         rows = conn.execute(
-            """SELECT * FROM workflow_events
+            "SELECT e.*, w.slug AS workflow_slug FROM workflow_events e "
+            "JOIN workflows w ON w.id=e.workflow_id WHERE e.seq>? ORDER BY e.seq "
+            + ("DESC" if tail else "ASC") + " LIMIT ?", (after_seq, limit),
+        ).fetchall()
+    if tail:
+        rows.reverse()
+    return [(row["workflow_slug"], _row_to_workflow_event(row)) for row in rows]
+
+
+def list_workflow_events(workflow_id: str, after_seq: int = 0,
+                         limit: int = 200,
+                         tail: bool = False) -> list[WorkflowEventInDB]:
+    """tail=True — последние `limit` событий в хронологическом порядке:
+    дешевле страницы «всё и отрезать» для длинных миссий."""
+    with _connect() as conn:
+        order = "DESC" if tail else "ASC"
+        rows = conn.execute(
+            f"""SELECT * FROM workflow_events
                WHERE workflow_id = ? AND seq > ?
-               ORDER BY seq LIMIT ?""",
+               ORDER BY seq {order} LIMIT ?""",
             (workflow_id, after_seq, limit),
         ).fetchall()
+        if tail:
+            rows = list(reversed(rows))
         return [_row_to_workflow_event(row) for row in rows]
 
 

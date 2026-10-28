@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 import time
 from datetime import datetime
+from pathlib import Path
 
 
 PROTOCOL = "promptpilot-fallback-target-v1"
@@ -118,6 +119,28 @@ def validate_health(health: dict) -> None:
     reviewing = queues["review_candidates"]
     content = queues["content_review_candidates"]
     merging = queues["merge_executable"]
+    parallel = health.get("parallel_review_candidates", [])
+    if not isinstance(parallel, list):
+        raise PipelineError("fallback parallel REVIEW allowlist is invalid")
+    content_keys = set()
+    for item in health["content_review_candidates"]:
+        depth = item.get("review_depth")
+        if type(depth) is int and depth >= 0:
+            content_keys.add((item["number"], item["head"], item["stage"], depth))
+    parallel_numbers = set()
+    for item in parallel:
+        exact = identity(item)
+        depth = item.get("review_depth")
+        if (exact["stage"] != "review" or type(depth) is not int
+                or not 0 <= depth < 2
+                or (exact["number"], exact["head"], exact["stage"], depth)
+                not in content_keys or exact["number"] in parallel_numbers):
+            raise PipelineError("fallback parallel REVIEW contradicts content backlog")
+        parallel_numbers.add(exact["number"])
+    if parallel and (owner is None or owner["stage"] not in INTEGRATION_REVIEW_STAGES):
+        raise PipelineError("fallback parallel REVIEW has no integration-review owner")
+    if owner is not None and owner["number"] in parallel_numbers:
+        raise PipelineError("fallback parallel REVIEW includes its integration owner")
     if owner is not None and owner["stage"] in INTEGRATION_REVIEW_STAGES:
         if reviewing != [owner] or merging:
             raise PipelineError("fallback integration REVIEW contradicts executable queues")
@@ -175,7 +198,12 @@ def health_gate(health: dict, stage: str, target: dict, *, election: bool) -> No
     actual = [identity(item) for item in candidates]
     if len({item["number"] for item in actual}) != len(actual):
         raise PipelineError("fallback allowlist contains duplicate PRs")
-    if expected not in actual or ((election or stage == "merge") and actual[0] != expected):
+    # Priority selects a new ordinary target once. An unrelated PR taking the
+    # first slot while the elected task is running does not invalidate its
+    # exact HEAD/ship/proof gates. Integration targets still own a single-flight
+    # lane and must remain the sole first candidate.
+    if expected not in actual or ((election or expected["stage"] in INTEGRATION_STAGES)
+                              and actual[0] != expected):
         raise PipelineError("fallback target no longer matches the exact executable candidate")
     if expected["stage"] in INTEGRATION_STAGES:
         if owner != expected or actual != [expected]:
@@ -213,6 +241,10 @@ def create(config: dict, health: dict, stage: str, target: dict, reason: str,
              "repository": config["repository"], "target": target,
              "config_sha256": config_digest(config), "issued_at": issued,
              "expires_at": issued + TTL}
+    if config.get("sync_base_before_health", False):
+        # Sign the election checkout, not the agent's later audit worktree.
+        # This is execution context only: fresh health and every gate still run.
+        lease["health_checkout"] = str(Path.cwd().resolve())
     if target_reservation is not None:
         repository, target_stage, number, head, task_id, _token = \
             pp._reservation_identity(target_reservation)
@@ -260,6 +292,10 @@ def validate_lease(lease: dict, stage: str) -> None:
             or not re.fullmatch(r"[0-9a-f]{64}", lease["config_sha256"])):
         raise PipelineError("invalid fallback lease")
     target = identity(lease.get("target"))
+    checkout = lease.get("health_checkout")
+    if checkout is not None and (not isinstance(checkout, str)
+                                 or not Path(checkout).is_absolute()):
+        raise PipelineError("fallback health checkout must be an absolute path")
     if target["stage"] not in (REVIEW_STAGES if stage == "review" else MERGE_STAGES):
         raise PipelineError("fallback lease target belongs to another stage")
     issued, expires = lease.get("issued_at"), lease.get("expires_at")
@@ -298,7 +334,9 @@ def gate(gh, config: dict, stage: str, lease_value: str, *, config_path=None) ->
             raise pp.PipelineError("fallback configuration changed; start a new task")
 
     check_config()
-    health = pp.run_health(config, config_path=config_path)
+    checkout = lease.get("health_checkout")
+    health = pp.run_health(config, config_path=config_path,
+                          **({"working_dir": checkout} if checkout is not None else {}))
     check_config()  # run_health may fast-forward and reload the project config
     validate_lease(lease, stage)  # scan time counts toward expiry
     pp.ensure_identity(gh, config)

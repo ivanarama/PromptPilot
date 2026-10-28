@@ -1,0 +1,167 @@
+import copy
+from pathlib import PurePosixPath
+import hashlib
+import json
+import os
+import plistlib
+import sqlite3
+import sys
+
+import pytest
+
+from tools.install_onebase_release import configure, rewrite_prompt, validate_manifest
+from tools import install_onebase_release as release
+
+
+def test_prompt_upgrade_replaces_old_hotfix_and_preserves_adapter():
+    original = ("Read CLAUDE.md canonical /old/review-queue/SKILL.md "
+                "adapter .agents/skills/review-queue/SKILL.md."
+                "\n\nОператорский runtime hotfix: old clause")
+    result = rewrite_prompt(original, "review-queue", PurePosixPath("/release"), "v1")
+    assert "Read /release/CLAUDE.md" in result
+    assert "/release/.claude/skills/review-queue/SKILL.md" in result
+    assert ".agents/skills/review-queue/SKILL.md" in result
+    assert "old clause" not in result
+    again = rewrite_prompt(result, "review-queue", PurePosixPath("/next"), "v2")
+    assert "/release" not in again
+    assert "Read /next/CLAUDE.md" in again
+
+
+def test_unknown_prompt_is_not_rewritten_broadly():
+    with pytest.raises(ValueError):
+        rewrite_prompt("Do arbitrary work", "fix-approved", PurePosixPath("/release"), "v1")
+
+
+def test_configuration_preserves_other_profiles_gates_and_budget():
+    config = {"health_command": ["old", "-json"], "required_checks": ["build", "test-windows"],
+              "trusted_account": "owner", "review_completion_gate": "target-v1"}
+    profiles = {"profiles": {"onebase": {"health_check": {"command": ["old", "-json"]},
+                 "github_budget": {"minimum_remaining": {"core": 250}},
+                 "queues": [{"id": "fix"}, {"id": "plan"},
+                     {"id": "merge", "execution": {"direct_complete": True,
+                      "command": ["{python}", "-m", "promptpilot.project_pipeline", "next", "merge"],
+                      "probe_command": ["{python}", "-m", "promptpilot.project_pipeline", "capabilities"]}}]},
+                "other": {"untouched": True}}}
+    old = copy.deepcopy(profiles)
+    old_config = copy.deepcopy(config)
+    result, cfg = configure(profiles, config, PurePosixPath("/r/pp"), PurePosixPath("/r/health"),
+                            PurePosixPath("/r/procedures"), "r")
+    assert result["profiles"]["other"] == old["profiles"]["other"]
+    assert result["profiles"]["onebase"]["github_budget"] == old["profiles"]["onebase"]["github_budget"]
+    for key in ["required_checks", "trusted_account", "review_completion_gate"]:
+        assert cfg[key] == old_config[key]
+    assert result["profiles"]["onebase"]["queues"][2]["execution"]["direct_complete"] is True
+    assert result["profiles"]["onebase"]["queues"][0]["item_blockers"] is True
+    assert result["profiles"]["onebase"]["queues"][0]["item_error_holds"] is True
+    from promptpilot.pipeline_insights import _adaptive_cadence_policy
+    policy = _adaptive_cadence_policy(result["profiles"]["onebase"]["queues"][2])
+    assert policy is not None
+    assert result["profiles"]["onebase"]["queues"][2]["execution"]["command"] == ["/r/pp", "pipelinectl", "next", "merge"]
+    updated, _ = configure(result, cfg, PurePosixPath("/next/pp"), PurePosixPath("/next/health"),
+                           PurePosixPath("/next/procedures"), "next")
+    assert updated["profiles"]["onebase"]["queues"][2]["execution"]["command"][0] == "/next/pp"
+
+
+def test_manifest_detects_changed_artifact_before_install(tmp_path):
+    path = tmp_path / "skill"
+    path.write_text("tampered", encoding="utf-8")
+    with pytest.raises(ValueError, match="artifact changed"):
+        validate_manifest({"artifacts": {str(path): "0" * 64}})
+
+
+def test_release_enables_snapshot_recovery_without_changing_reserves():
+    budget = {"costs": {"insights": {"search": 10}},
+              "minimum_remaining": {"core": 250, "search": 2, "graphql": 100},
+              "priority_one_headroom": {"core": 1200, "search": 12, "graphql": 1000}}
+    original = copy.deepcopy(budget)
+    profiles = {"profiles": {"onebase": {"github_budget": budget,
+                "health_check": {"command": ["old"]}, "queues": []}}}
+    configure(profiles, {"health_command": ["old"]}, PurePosixPath("/pp"),
+              PurePosixPath("/health"), PurePosixPath("/procedures"), "test")
+    assert budget == {**original, "essential_snapshot_headroom": True}
+
+
+def test_operator_classifications_are_repository_bound_and_preserve_overrides():
+    profile = {"repository": "ivanarama/onebase", "queues": [],
+               "health_check": {"command": ["old"]},
+               "delivery_classifications": {"1700": {"category": "unclassified", "evidence": "operator override"}}}
+    profiles = {"profiles": {"onebase": profile}}
+    configure(profiles, {"health_command": ["old"]}, PurePosixPath("/pp"),
+              PurePosixPath("/health"), PurePosixPath("/procedures"), "test")
+    assert profile["delivery_classifications"]["1700"]["category"] == "unclassified"
+    assert profile["delivery_classifications"]["1475"]["category"] == "docs_plans"
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_public_installer_preserves_pauses_and_rolls_back_launch_failure(tmp_path, monkeypatch, failure):
+    data = tmp_path / "data"
+    launch = tmp_path / "launch"
+    procedures = tmp_path / "procedures"
+    for directory in [data, launch, procedures]:
+        directory.mkdir()
+    binary = tmp_path / "pp"
+    health = tmp_path / "health"
+    for path in [binary, health]:
+        path.write_bytes(b"fake executable")
+    manifest = {"release_id": "test", "binary": str(binary), "health": str(health),
+                "procedures": str(procedures),
+                "artifacts": {str(binary): hashlib.sha256(binary.read_bytes()).hexdigest()}}
+    manifest_path = tmp_path / "release.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    profiles = {"profiles": {"onebase": {"health_check": {"command": ["old", "-json"]},
+                 "queues": [{"id": "fix"}, {"id": "plan"}]}, "other": {"unchanged": True}}}
+    (data / "pipeline_profiles.json").write_text(json.dumps(profiles), encoding="utf-8")
+    (data / "pipelinectl-onebase.json").write_text(json.dumps({"health_command": ["old", "-json"],
+                                                          "required_checks": ["build"]}), encoding="utf-8")
+    for service in ["server", "bot", "worker"]:
+        (launch / f"com.promptpilot.{service}.plist").write_bytes(plistlib.dumps({
+            "ProgramArguments": ["/old/pp", service], "KeepAlive": True}))
+    originals = {path: path.read_bytes() for directory in [data, launch] for path in directory.iterdir()}
+    rows = [{"id": number, "title": "OneBase - " + stage, "paused": number == 3,
+             "prompt": f"Read CLAUDE.md canonical .claude/skills/{stage}/SKILL.md"}
+            for number, stage in release.STAGES.items()]
+    with sqlite3.connect(data / "promptpilot.db") as connection:
+        connection.executescript("CREATE TABLE task_series(id INTEGER, prompt TEXT, ended_at TEXT, paused INTEGER);"
+                                 "CREATE TABLE tasks(series_id INTEGER, status TEXT, prompt TEXT);")
+        for row in rows:
+            connection.execute("INSERT INTO task_series VALUES(?,?,NULL,?)", (row["id"], row["prompt"], row["paused"]))
+            connection.execute("INSERT INTO tasks VALUES(?,'pending',?)", (row["id"], row["prompt"]))
+    restarted = []
+    failed_once = False
+    def run(command, **kwargs):
+        nonlocal failed_once
+        if "bootstrap" in command:
+            restarted.append(command[-1])
+            if failure and not failed_once:
+                failed_once = True
+                raise RuntimeError("simulated launch failure")
+    def api(path, payload=None):
+        if path == "/api/worker/status":
+            return {"state": "online", "paused": True, "pid": 2 if restarted else 1}
+        if path == "/api/schedule":
+            return rows
+        assert path == "/api/tasks?status=running"
+        return []
+    monkeypatch.setattr(release.subprocess, "run", run)
+    monkeypatch.setattr(release, "api", api)
+    monkeypatch.setattr(os, "getuid", lambda: 501, raising=False)
+    monkeypatch.setattr(sys, "argv", ["installer", "install", "--manifest", str(manifest_path),
+                                    "--data", str(data), "--launch", str(launch)])
+    if failure:
+        with pytest.raises(RuntimeError, match="simulated launch failure"):
+            release.main()
+        assert all(path.read_bytes() == value for path, value in originals.items())
+    else:
+        release.main()
+        assert json.loads((tmp_path / "installed.json").read_text())["worker"]["paused"] is True
+        assert len(restarted) == 3
+    with sqlite3.connect(data / "promptpilot.db") as connection:
+        assert connection.execute("SELECT paused FROM task_series WHERE id=3").fetchone()[0] == 1
+        for row in rows:
+            prompt = connection.execute("SELECT prompt FROM task_series WHERE id=?", (row["id"],)).fetchone()[0]
+            pending = connection.execute("SELECT prompt FROM tasks WHERE series_id=?", (row["id"],)).fetchone()[0]
+            assert pending == prompt
+            assert (prompt == row["prompt"]) is failure
+            if not failure:
+                assert str(data / "pipelinectl-onebase.json") in prompt
+                assert "Все глобальные owner/allowlist" in prompt

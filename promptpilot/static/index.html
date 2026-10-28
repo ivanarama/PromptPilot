@@ -421,9 +421,42 @@
   .pipeline-health.yellow { color:var(--yellow); border-color:var(--yellow); }
   .pipeline-health.red { color:var(--red); border-color:var(--red); }
   .pipeline-health.warming { color:var(--accent); border-color:var(--accent); }
+  .pipeline-view-tabs { display:inline-flex; padding:2px; gap:2px; border:1px solid var(--border); border-radius:8px; background:var(--surface2); }
+  .pipeline-view-tab { border:0; border-radius:6px; padding:5px 10px; color:var(--text2); background:transparent; cursor:pointer; font:inherit; font-size:12px; }
+  .pipeline-view-tab.active { color:var(--text); background:var(--surface); box-shadow:0 1px 3px rgba(0,0,0,.18); }
+  .pipeline-report-head { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; flex-wrap:wrap; }
+  .pipeline-periods { display:flex; gap:5px; flex-wrap:wrap; }
+  .pipeline-period.active { color:var(--accent); border-color:var(--accent); background:var(--surface2); }
+  .pipeline-report-grid { display:grid; grid-template-columns:repeat(3,minmax(180px,1fr)); gap:9px; margin:12px 0; }
+  .pipeline-report-section { border:1px solid var(--border); border-radius:8px; padding:11px 12px; margin-top:9px; }
+  .pipeline-report-section h3 { margin:0 0 8px; font-size:13px; }
+  .pipeline-report-list { margin:0; padding-left:19px; font-size:12px; }
+  .pipeline-report-list li { margin:5px 0; }
+  .pipeline-report-meta { color:var(--muted); font-size:11px; margin-top:4px; }
+  .pipeline-report-notice { border-left:3px solid var(--accent); padding:7px 9px; margin:9px 0; color:var(--text2); font-size:12px; background:var(--surface2); }
+  .pipeline-report-notice.warn { border-left-color:var(--yellow); }
+  .pipeline-report-notice.error { border-left-color:var(--red); }
+  .pipeline-report-queues { width:100%; border-collapse:collapse; font-size:12px; }
+  .pipeline-report-queues th, .pipeline-report-queues td { text-align:left; padding:5px 7px; border-top:1px solid var(--border); }
+  .pipeline-report-queues th.num, .pipeline-report-queues td.num { text-align:right; font-variant-numeric:tabular-nums; }
+  .pipeline-flow-row { display:grid; grid-template-columns:115px minmax(0,1fr) 75px; gap:9px; align-items:center; margin:7px 0; font-size:12px; }
+  .pipeline-flow-bar { display:flex; height:12px; overflow:hidden; border-radius:5px; background:var(--surface2); border:1px solid var(--border); }
+  .pipeline-flow-bar span { display:block; height:100%; }
+  .pipeline-flow-bar .ready { background:var(--green); }
+  .pipeline-flow-bar .empty { background:var(--muted); }
+  .pipeline-flow-bar .no_change { background:var(--text2); }
+  .pipeline-flow-bar .stale { background:var(--accent); }
+  .pipeline-flow-bar .safe_refusal { background:var(--yellow); }
+  .pipeline-flow-bar .human { background:var(--yellow); }
+  .pipeline-flow-bar .error { background:var(--red); }
+  .pipeline-flow-bar .other { background:var(--text2); }
+  .pipeline-flow-legend { display:flex; flex-wrap:wrap; gap:5px 13px; color:var(--text2); font-size:11px; }
+  .pipeline-flow-legend span::before { content:''; display:inline-block; width:8px; height:8px; border-radius:2px; margin-right:4px; background:var(--legend-color); }
   #pipelineModal .modal { max-width:1120px; }
   @media (max-width: 720px) {
     .pipeline-summary { grid-template-columns:repeat(2,minmax(120px,1fr)); }
+    .pipeline-report-grid { grid-template-columns:repeat(2,minmax(120px,1fr)); }
+    .pipeline-flow-row { grid-template-columns:75px minmax(0,1fr) 65px; gap:5px; font-size:11px; }
     .insights-table { table-layout:auto; display:block; overflow-x:auto; white-space:nowrap; }
     .insights-table th, .insights-table td { min-width:75px; }
     .insights-table th:first-child, .insights-table td:first-child { min-width:130px; }
@@ -440,6 +473,22 @@
   .wf-meta { color: var(--text2); font-size: 11px; margin-top: 3px; }
   .wf-panel { border: 1px solid var(--border); border-radius: 8px; padding: 12px; min-height: 220px; }
   .wf-actions { display: flex; flex-wrap: wrap; gap: 7px; margin: 10px 0; }
+  .flows-bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 10px 0; }
+  .flows-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr); gap: 14px; }
+  @media (max-width: 860px) { .flows-layout { grid-template-columns: 1fr; } }
+  .flow-row { padding: 4px 0; font-size: 13px; }
+  .flow-item { padding: 7px 9px; border-bottom: 1px solid var(--border); cursor: pointer; font-size: 13px; }
+  .flow-item:hover, .flow-item.selected { background: var(--surface2); }
+  .flow-status { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 11px; background: var(--surface2); margin: 0 4px; }
+  .flow-waiting_human, .flow-needs_human { background: rgba(251,191,36,.18); color: var(--yellow); }
+  .flow-done { color: var(--green); }
+  .flow-rejected, .flow-failed { color: var(--red); }
+  .flow-muted { color: var(--text2); font-size: 12px; }
+  .flow-error { color: var(--yellow); font-size: 12px; margin-top: 3px; white-space: pre-wrap; }
+  .flow-box { border: 1px solid var(--border); border-radius: var(--radius); padding: 10px; margin: 8px 0; }
+  .flow-box pre, .flow-detail pre { white-space: pre-wrap; word-break: break-word; font-family: var(--mono); font-size: 12px; background: var(--bg); padding: 8px; border-radius: 6px; max-height: 320px; overflow: auto; }
+  .flow-box textarea { width: 100%; min-height: 60px; margin: 6px 0; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 6px; }
+  .flow-event { font-size: 12px; padding: 2px 0; border-bottom: 1px dashed var(--border); word-break: break-word; }
   .wf-form { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 10px; }
   .wf-form .wide { grid-column: 1 / -1; }
   .wf-form input, .wf-form select, .wf-form textarea {
@@ -609,6 +658,7 @@
   </div>
 
   <div class="cost-bar" id="costBar"></div>
+  <div class="cost-bar" id="healthBar" title="живы ли фоновые процессы конвейера (воркер, каскад, вотчеры, боты)"></div>
 
   <div class="add-form">
     <textarea id="promptInput" placeholder="Enter your prompt here..."></textarea>
@@ -667,8 +717,17 @@
         <input type="number" id="timeoutInput" placeholder="0 = no limit" min="0" style="width:80px" title="Per-task timeout in seconds (0 = no limit, empty = default)">
       </label>
       <label id="skipPermsLabel" style="flex-direction:row;align-items:center;gap:8px;cursor:pointer;display:none">
-        <input type="checkbox" id="skipPermissions" style="width:auto;margin:0">
+        <input type="checkbox" id="skipPermissions" style="width:auto;margin:0" onchange="rememberSkipPermissions()">
         <span style="font-size:13px;color:var(--yellow)" title="Claude: --dangerously-skip-permissions; Codex: --dangerously-bypass-approvals-and-sandbox">⚠ не спрашивать разрешения</span>
+      </label>
+      <label id="rightsLabel" style="display:none" title="Что агенту можно. Без инструментов — только текст; чтение — смотреть файлы; правка — менять файлы в папке задачи, не запуская команд; полные — всё. «Как обычно» — решает галочка «не спрашивать разрешения». Недоступное для провайдера неактивно.">Права
+        <select id="rightsInput">
+          <option value="">как обычно</option>
+          <option value="none">без инструментов</option>
+          <option value="read">только чтение</option>
+          <option value="write">правка файлов</option>
+          <option value="full">полные</option>
+        </select>
       </label>
       <label id="keepPaneLabel" style="flex-direction:row;align-items:center;gap:8px;cursor:pointer;display:none">
         <input type="checkbox" id="keepPane" checked style="width:auto;margin:0">
@@ -694,10 +753,76 @@
     <button class="btn-pause" onclick="openPipelines()" style="margin-left:8px">📈 Конвейеры</button>
     <button class="btn-pause" onclick="openSchedule()" style="margin-left:8px">🗓 Расписание</button>
     <button class="btn-pause" onclick="openWorkflows()" style="margin-left:8px">Workflows</button>
+    <button class="btn-pause" onclick="openFlows()" style="margin-left:8px" title="Маршруты заявок: входы, согласования, журнал">📨 Заявки</button>
     <button class="btn-pause" onclick="openProviders()" style="margin-left:8px">⚙ Providers</button>
+    <button class="btn-pause" onclick="openEpf()" style="margin-left:8px" title="Доработка внешних обработок 1С">🔧 1С</button>
   </div>
 
   <div class="task-list" id="taskList"></div>
+</div>
+
+<div class="modal-overlay" id="epfModal" onclick="if(event.target===this)closeEpf()">
+  <div class="modal" style="max-width:720px">
+    <h2>🔧 1С: доработка обработок <button class="btn btn-sm btn-ghost" style="margin-left:auto" onclick="closeEpf()">✕ Закрыть</button></h2>
+    <div id="epfStatus" style="font-size:13px;color:var(--text2);margin-bottom:10px"></div>
+
+    <div style="border-top:1px solid var(--border); padding-top:12px">
+      <b style="font-size:14px">Новая доработка</b>
+      <form onsubmit="return epfRework(event)" style="display:flex;flex-direction:column;gap:8px;margin-top:8px">
+        <input type="file" id="epfFile" accept=".epf,.erf" required style="font-size:13px;color:inherit">
+        <textarea id="epfPrompt" placeholder="Что сделать с обработкой?" required style="min-height:80px;resize:vertical;background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:inherit;padding:8px;font-size:13px;font-family:inherit"></textarea>
+        <label style="font-size:13px;color:var(--text2)">База 1С
+          <select id="epfBase" style="width:100%;background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:inherit;padding:7px 10px;font-size:13px"></select>
+        </label>
+        <button class="btn btn-primary" type="submit" id="epfReworkBtn">Декомпилировать и поставить в очередь</button>
+        <div id="epfReworkMsg" style="font-size:13px"></div>
+      </form>
+    </div>
+
+    <details style="margin-top:14px">
+      <summary style="cursor:pointer;font-size:14px">⚙ Настройки 1С</summary>
+      <div id="epfEnvHint" style="font-size:12px;color:var(--yellow);margin:6px 0"></div>
+      <form onsubmit="return epfSaveSettings(event)" style="display:flex;flex-direction:column;gap:8px;margin-top:6px">
+        <input id="epfExe" placeholder="Путь к 1cv8.exe (пусто — авто: реестр/Program Files)" style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:inherit;padding:7px 10px;font-size:13px">
+        <input id="epfBasesRoot" placeholder="Каталог баз для сканирования" style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:inherit;padding:7px 10px;font-size:13px">
+        <input id="epfBasePath" placeholder="База декомпиляции по умолчанию" style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:inherit;padding:7px 10px;font-size:13px">
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+          <input id="epfUt11" placeholder="База УТ 11" style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:inherit;padding:7px 10px;font-size:13px">
+          <input id="epfBp3" placeholder="База БП 3.0" style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:inherit;padding:7px 10px;font-size:13px">
+          <input id="epfErp" placeholder="База ERP" style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:inherit;padding:7px 10px;font-size:13px">
+          <input id="epfUnf" placeholder="База УНФ" style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:inherit;padding:7px 10px;font-size:13px">
+          <input id="epfAa" placeholder="База Альфа-Авто" style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:inherit;padding:7px 10px;font-size:13px">
+          <input id="epfSkills" placeholder="Каталог cc-1c-skills (опционально)" style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:inherit;padding:7px 10px;font-size:13px">
+        </div>
+        <button class="btn btn-primary" type="submit">Сохранить настройки</button>
+        <div id="epfSetMsg" style="font-size:13px"></div>
+      </form>
+    </details>
+  </div>
+</div>
+
+<div class="modal-overlay" id="flowsModal" onclick="if(event.target===this)closeFlows()">
+  <div class="modal" style="max-width:1160px">
+    <h2>Заявки по маршрутам <button class="btn btn-sm btn-ghost" style="margin-left:auto" onclick="closeFlows()">Закрыть</button></h2>
+    <div id="flowsHead"></div>
+    <div class="flows-bar">
+      <select id="flowsStatus" onchange="loadFlowItems()">
+        <option value="">все заявки</option>
+        <option value="waiting_human">ждут решения</option>
+        <option value="needs_human">нужен человек</option>
+        <option value="active">в работе</option>
+        <option value="done">готово</option>
+        <option value="rejected">отклонено</option>
+        <option value="failed">не вышло</option>
+        <option value="cancelled">снято</option>
+      </select>
+      <button class="btn btn-sm btn-ghost" onclick="loadFlows()">Обновить</button>
+    </div>
+    <div class="flows-layout">
+      <div id="flowsItems"></div>
+      <div id="flowsDetail" class="flow-detail"><div class="flow-muted">Выберите заявку слева.</div></div>
+    </div>
+  </div>
 </div>
 
 <div class="modal-overlay" id="workflowModal" onclick="if(event.target===this)closeWorkflows()">
@@ -811,10 +936,11 @@
   <div class="modal">
     <h2>📈 Конвейеры <button class="btn btn-sm btn-ghost" style="margin-left:auto" onclick="closePipelines()">✕ Закрыть</button></h2>
     <div style="font-size:12px;color:var(--muted);margin-bottom:10px">
-      Профиль объединяет внешние очереди и связанные повторяющиеся серии. Метрики считаются обычным кодом; токены не расходуются.
+      Профиль объединяет внешние очереди и связанные повторяющиеся серии. Состояние показывает, где конвейер сейчас; «Итоги» — что произошло за период. Метрики считаются обычным кодом, токены не расходуются.
     </div>
     <div class="insights-tools" id="pipelineProfileTools"><span style="color:var(--muted);font-size:12px">Загрузка профилей…</span></div>
     <div id="pipelineInsights"></div>
+    <div id="pipelineReport" style="display:none"></div>
   </div>
 </div>
 
@@ -833,6 +959,19 @@
   <div class="modal">
     <h2>Провайдеры <button class="btn btn-sm btn-ghost" style="margin-left:auto" onclick="closeProviders()">✕ Закрыть</button></h2>
     <div id="provList"></div>
+    <div class="prov-form" id="providerWizard">
+      <b>Подключить помощника</b>
+      <label>CLI <select id="pcCLI" onchange="catalogSelect()"></select></label>
+      <button class="btn" type="button" onclick="catalogInstall()">Установить CLI</button>
+      <label>Адрес API <input id="pcBase" type="url" placeholder="https://api.example.com/v1"></label>
+      <label>Ключ API <input id="pcKey" type="password" autocomplete="new-password"></label>
+      <button class="btn" type="button" onclick="catalogModels()">Получить модели</button>
+      <label>Модель <select id="pcModels" onchange="document.getElementById('pcModel').value=this.value"></select></label>
+      <input id="pcModel" placeholder="Или введите ID модели вручную">
+      <input id="pcTitle" placeholder="Название помощника (необязательно)">
+      <button class="btn btn-primary" type="button" onclick="catalogCreate()">Создать помощника</button>
+      <div id="pcStatus" role="status"></div>
+    </div>
     <div style="border-top:1px solid var(--border); margin-top:14px; padding-top:14px">
       <b style="font-size:14px">🖥 Машины (удалённое выполнение по SSH)</b>
       <div id="machineList" style="margin-top:8px"></div>
@@ -1039,6 +1178,10 @@ async function loadTasks() {
     return;
   }
 
+  // Scroll-jump fix: the 5s background refresh rebuilds the whole task list.
+  // Snapshot scroll positions (prompt/result blocks of the expanded card) so
+  // a reader is not yanked back to the top after the rebuild.
+  const taskScrolls = uiSnapScrolls(list);
   list.innerHTML = tasks.map(t => {
     const expanded = t.id === expandedId;
     const time = timeAgo(t.created_at);
@@ -1075,6 +1218,7 @@ async function loadTasks() {
         <span class="task-prompt" title="${escAttr(taskDisplayTitle(t))}">${esc(taskDisplayTitle(t))}</span>
         ${t.working_dir ? `<span class="task-meta">📁 ${esc(t.working_dir.split(/[/\\]/).filter(Boolean).pop() || t.working_dir)}</span>` : ''}
         ${t.worktree ? `<span class="task-meta" title="отдельный git worktree">🌿 ${esc(t.worktree_branch || 'worktree')}</span>` : ''}
+        ${t.epf ? `<span class="task-meta" title="доработка обработки 1С: ${escAttr(t.epf.base_label || '')}">🔧 ${esc(EPF_STATUS_RU[t.epf.status] || '1С')}</span>` : ''}
         ${t.verdict ? `<span class="task-meta" title="итог, которым задача сама себя закрыла">${verdictIcon(t.verdict)} ${esc(t.verdict)}</span>` : ''}
         ${t.note ? `<span class="task-meta" title="${escAttr(t.note)}">✎ приписка</span>` : ''}
         ${t.provider ? `<span class="task-meta">${esc(t.provider)}</span>` : ''}
@@ -1090,6 +1234,7 @@ async function loadTasks() {
         </div>
 
         ${t.working_dir ? `<div class="detail-info"><span class="label">Dir: </span><span>${esc(t.working_dir)}</span></div>` : ''}
+        ${t.epf ? `<div class="detail-info"><span class="label">1С (${esc(t.epf.base_label || '')}): </span><span>${t.epf.epf_path ? esc(t.epf.epf_path) : esc(EPF_STATUS_RU[t.epf.status] || t.epf.status)}</span></div>` : ''}
         ${t.worktree ? `<div class="detail-info"><span class="label">Worktree: </span><span>${esc(t.worktree_path || 'ещё не создан')}</span>${t.worktree_branch ? ` <span class="label">ветка</span> <span>${esc(t.worktree_branch)}</span>` : ''}</div>` : ''}
 
         <div class="detail-info" style="align-items:center;gap:6px">
@@ -1158,6 +1303,9 @@ async function loadTasks() {
   // экран агента дорисован из кэша — держим прокрутку у свежих строк
   const sc = document.getElementById('screen-' + expandedId);
   if (sc && screenCache[expandedId]) sc.scrollTop = sc.scrollHeight;
+  // Scroll-jump fix: put the reader back where they were. The live agent
+  // screen keeps its own bottom autoscroll and is skipped here.
+  uiRestoreScrolls(list, taskScrolls);
 }
 
 function providerOptions(current) {
@@ -1213,7 +1361,9 @@ async function addTask() {
   const sel = document.getElementById('workdirSelect');
   const selVal = sel.style.display !== 'none' && sel.value && sel.value !== '__custom__' ? sel.value : null;
   const workdir = selVal || document.getElementById('workdirInput').value.trim() || null;
-  const skipPermissions = document.getElementById('skipPermissions').checked;
+  // A hidden option is not a choice the user made: session targets hide it.
+  const skipPermissions = document.getElementById('skipPermsLabel').style.display !== 'none'
+    && document.getElementById('skipPermissions').checked;
   const provInfo = providersData[provider] || {};
   const herdrTarget = provInfo.session_target ? document.getElementById('herdrTargetInput').value : null;
   if (provInfo.session_target && !herdrTarget) { alert('Нет открытой herdr-сессии для отправки.'); return; }
@@ -1247,6 +1397,7 @@ async function addTask() {
         priority,
         working_dir: workdir,
         skip_permissions: skipPermissions,
+        rights: document.getElementById('rightsInput').value || null,
         keep_pane: document.getElementById('keepPane').checked,
         worktree: document.getElementById('worktree').checked,
         herdr_target: herdrTarget,
@@ -1261,6 +1412,8 @@ async function addTask() {
     toast('Не удалось создать задачу: ' + e.message);
     return;
   }
+
+  if (workdir) await rememberWorkdir(workdir);
 
   document.getElementById('promptInput').value = '';
   document.getElementById('recurrenceInput').value = '';
@@ -1434,6 +1587,147 @@ document.getElementById('filterBar').addEventListener('click', e => {
 const STATUS_RU = { completed: 'успех', failed: 'падение', cancelled: 'отменена',
                     pending: 'в очереди', running: 'идёт', rate_limited: 'ждёт лимита' };
 
+// --- Flows (маршруты заявок) ---
+const FLOW_STATUS_RU = { cancelling: 'останавливается', active: 'в работе', waiting_human: 'ждёт решения', needs_human: 'нужен человек',
+                         done: 'готово', rejected: 'отклонено', failed: 'не вышло', cancelled: 'снято' };
+let flowSelected = null;
+
+function openFlows() {
+  document.getElementById('flowsModal').classList.add('open');
+  loadFlows();
+}
+
+function closeFlows() { document.getElementById('flowsModal').classList.remove('open'); }
+
+function flowText(value) {
+  return typeof value === 'string' ? value : JSON.stringify(value, null, 1);
+}
+
+async function loadFlows() {
+  const head = document.getElementById('flowsHead');
+  try {
+    const data = await fetchJSON(`${API}/flows`);
+    const rows = data.flows.map(flow => {
+      const counts = Object.entries(flow.counts)
+        .map(([status, n]) => `${esc(FLOW_STATUS_RU[status] || status)}: ${n}`).join(', ');
+      return `<div class="flow-row"><b>${esc(flow.name)}</b> <span class="flow-muted">[${esc(flow.trust)}]</span> `
+        + `${esc(flow.title || '')} — ${counts || 'заявок нет'}</div>`;
+    });
+    const errors = Object.entries(data.errors)
+      .map(([file, error]) => `<div class="flow-error">✗ ${esc(file)} не принят: ${esc(error)}</div>`);
+    head.innerHTML = (rows.join('')
+      || `<div class="flow-muted">Маршрутов нет. Положите *.json в ${esc(data.dir)} (docs/FLOWS.md).</div>`)
+      + errors.join('');
+  } catch (err) {
+    head.textContent = err.message;
+  }
+  await loadFlowItems();
+}
+
+async function loadFlowItems() {
+  const status = document.getElementById('flowsStatus').value;
+  const box = document.getElementById('flowsItems');
+  try {
+    const query = status ? `&status=${encodeURIComponent(status)}` : '';
+    const items = await fetchJSON(`${API}/flows/items?limit=100${query}`);
+    box.innerHTML = items.length ? items.map(item => `
+      <div class="flow-item${item.id === flowSelected ? ' selected' : ''}" onclick="showFlowItem(${item.id})">
+        <b>#${item.id}</b> <span class="flow-muted">${esc(item.flow)}</span>
+        <span class="flow-status flow-${esc(item.status)}">${esc(FLOW_STATUS_RU[item.status] || item.status)}</span>
+        ${item.step_id ? `<span class="flow-muted">· ${esc(item.step_id)}</span>` : ''}
+        <div>${esc(item.title || '(без названия)')}</div>
+        ${item.error ? `<div class="flow-error">${esc(item.error.slice(0, 240))}</div>` : ''}
+      </div>`).join('') : '<div class="flow-muted">Заявок нет.</div>';
+  } catch (err) {
+    box.textContent = err.message;
+  }
+}
+
+async function showFlowItem(id) {
+  flowSelected = id;
+  const box = document.getElementById('flowsDetail');
+  try {
+    const item = await fetchJSON(`${API}/flows/items/${id}`);
+    const wait = item.wait || {};
+    let actions = '';
+    if (item.status === 'waiting_human' && wait.approval) {
+      const shown = Object.entries(wait.show || {})
+        .map(([ref, value]) => `<div class="flow-muted">${esc(ref)}</div><pre>${esc(flowText(value))}</pre>`).join('');
+      actions = `<div class="flow-box"><b>${esc(wait.text || 'Решение')}</b>${shown}
+        <textarea id="flowNote" placeholder="Указание к решению или причина — необязательно"></textarea>
+        <button class="btn btn-sm btn-primary" onclick="decideFlowItem(${id}, 'approve', ${item.version})">Одобрить</button>
+        <button class="btn btn-sm btn-danger" onclick="decideFlowItem(${id}, 'reject', ${item.version})">Отклонить</button></div>`;
+    } else if (item.status === 'needs_human') {
+      const verifyStop = wait.side_effect
+        ? '<label><input type="checkbox" id="flowEffectChecked"> Прежнее действие остановлено, последствия проверены; повтор может отправить ещё раз</label><textarea id="flowStopNote" placeholder="Что проверено и какое восстановление выбрано"></textarea>'
+        : (wait.command || wait.ambiguous_task)
+        ? '<label><input type="checkbox" id="flowStopChecked"> Проверил, что прежнее выполнение остановлено</label><textarea id="flowStopNote" placeholder="Результат проверки"></textarea>' : '';
+      actions = `<div class="flow-box"><b>Нужен человек.</b><div class="flow-error">${esc(item.error || '')}</div>${verifyStop}
+        <button class="btn btn-sm btn-primary" onclick="flowItemAction(${id}, 'retry', ${item.version})">Повторить шаг</button>
+        <button class="btn btn-sm btn-ghost" onclick="flowItemAction(${id}, 'skip', ${item.version})">Пропустить шаг</button>
+        <button class="btn btn-sm btn-danger" onclick="flowItemAction(${id}, 'cancel', ${item.version})">Снять</button></div>`;
+    } else if (item.status === 'active') {
+      actions = `<div class="flow-box"><button class="btn btn-sm btn-danger" onclick="flowItemAction(${id}, 'cancel', ${item.version})">Снять</button></div>`;
+    }
+    const events = item.events.map(event => {
+      const payload = Object.keys(event.payload || {}).length ? esc(JSON.stringify(event.payload).slice(0, 300)) : '';
+      return `<div class="flow-event"><span class="flow-muted">${esc(event.created_at.slice(0, 19).replace('T', ' '))}</span> `
+        + `${esc(event.step_id || '—')} · ${esc(event.event_type)} ${payload}</div>`;
+    }).join('');
+    box.innerHTML = `<h3>#${item.id} ${esc(item.title || '')}</h3>
+      <div class="flow-muted">${esc(item.flow)} · ${esc(FLOW_STATUS_RU[item.status] || item.status)}${item.author ? ' · ' + esc(item.author) : ''}</div>
+      ${actions}
+      <details><summary>Заявка</summary><pre>${esc(flowText(item.data.input || {}))}</pre></details>
+      <details><summary>Результаты шагов</summary><pre>${esc(flowText(item.data.steps || {}))}</pre></details>
+      <details open><summary>Журнал</summary>${events}</details>`;
+    const approval = wait.approval || null;
+    box.dataset.approval = approval || '';
+    box.dataset.item = String(item.id);
+    box.dataset.version = String(item.version);
+  } catch (err) {
+    box.textContent = err.message;
+  }
+  loadFlowItems();
+}
+
+async function decideFlowItem(id, decision, observedVersion) {
+  const box = document.getElementById('flowsDetail');
+  if (box.dataset.item !== String(id) || !Number.isSafeInteger(observedVersion)) return;
+  const expected_version = observedVersion;
+  const note = (document.getElementById('flowNote') || {}).value || '';
+  try {
+    await fetchJSON(`${API}/flows/items/${id}/decision`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ decision, note, step: box.dataset.approval || null, expected_version }),
+    });
+    toast(decision === 'approve' ? 'Одобрено — заявка пойдёт дальше' : 'Отклонено', false);
+  } catch (err) {
+    toast(err.message);
+  }
+  showFlowItem(id);
+}
+
+async function flowItemAction(id, action, observedVersion) {
+  const box = document.getElementById('flowsDetail');
+  if (box.dataset.item !== String(id) || !Number.isSafeInteger(observedVersion)) return;
+  const expected_version = observedVersion;
+  if (action === 'cancel' && !confirm(`Снять заявку #${id}?`)) return;
+  try {
+    const confirm_command_stopped = !!(document.getElementById('flowStopChecked') || {}).checked;
+    const confirm_side_effect_reviewed = !!(document.getElementById('flowEffectChecked') || {}).checked;
+    const note = (document.getElementById('flowStopNote') || {}).value || '';
+    const result = await fetchJSON(`${API}/flows/items/${id}/${action}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ expected_version, confirm_command_stopped, note, ...(confirm_side_effect_reviewed ? { confirm_side_effect_reviewed: true } : {}) }) });
+    if (result.status === 'cancelling') {
+      toast('Остановка запрошена', false);
+      return showFlowItem(id);
+    }
+    toast({ retry: 'Шаг повторится', skip: 'Шаг пропущен', cancel: 'Заявка снята' }[action], false);
+  } catch (err) {
+    toast(err.message);
+  }
+  showFlowItem(id);
+}
+
 // --- Workflow orchestrator ---
 function openWorkflows() {
   document.getElementById('workflowModal').classList.add('open');
@@ -1459,9 +1753,55 @@ function restoreWorkflowOpenDetails(openKeys) {
   });
 }
 
+// Reading-pause (scroll-jump fix): a background auto-refresh that rebuilds
+// DOM from scratch destroys scroll positions and mouse text selections while
+// the user is reading a long prompt or report. Any real interaction with the
+// task list or the workflow card pauses the auto-refresh for a minute:
+// scrolling (wheel, inner blocks, OR dragging a scrollbar — 'scroll' does not
+// bubble, so capture on document catches every case), starting a mouse
+// selection, touch, or paging keys. Explicit user actions are unaffected.
+const UI_READING_PAUSE_MS = 60000;
+const uiReadingPause = { tasks: 0, workflow: 0 };
+// Scroll-jump fix helpers: a rebuild resets the scrollTop of every block it
+// recreates, so snapshot/restore the few real scrollers (report/result
+// <pre>, round history, prompt textareas). Keyed by element id when present,
+// else by position within this narrow NodeList — a document-wide index map
+// would break as soon as the render shape changes. The live agent screen
+// keeps its own bottom autoscroll and is excluded.
+const UI_SCROLL_SELECTOR = '.result-block pre:not(.agent-screen), .wf-history, textarea';
+function uiSnapScrolls(root) {
+  const snaps = new Map();
+  root.querySelectorAll(UI_SCROLL_SELECTOR).forEach((el, i) => {
+    if (el.scrollTop > 0) snaps.set(el.id || i, el.scrollTop);
+  });
+  return snaps;
+}
+function uiRestoreScrolls(root, snaps) {
+  if (!snaps || !snaps.size) return;
+  root.querySelectorAll(UI_SCROLL_SELECTOR).forEach((el, i) => {
+    const top = snaps.get(el.id || i);
+    if (top) el.scrollTop = top;
+  });
+}
+function uiNoteReading(node) {
+  if (!node || node.nodeType !== 1) return;
+  if (node.id === 'taskList' || node.closest('#taskList')) uiReadingPause.tasks = Date.now() + UI_READING_PAUSE_MS;
+  const modal = document.getElementById('workflowModal');
+  if (modal?.classList.contains('open') && (node === modal || modal.contains(node))) {
+    uiReadingPause.workflow = Date.now() + UI_READING_PAUSE_MS;
+  }
+}
+['scroll', 'mousedown', 'touchmove'].forEach(evt => document.addEventListener(evt,
+  e => uiNoteReading(e.target), { passive: true, capture: true }));
+document.addEventListener('keydown', e => {
+  if (!['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '].includes(e.key)) return;
+  uiNoteReading(document.activeElement);
+});
+
 async function autoRefreshWorkflowState() {
   const modal = document.getElementById('workflowModal');
   if (!modal?.classList.contains('open') || !selectedWorkflowId || workflowAutoRefreshBusy) return;
+  if (Date.now() < uiReadingPause.workflow) return;
   const active = document.activeElement;
   // Never erase a prompt/decision while the user is typing or selecting it.
   if (active && document.getElementById('wfDetail')?.contains(active)
@@ -1910,7 +2250,7 @@ function workflowSettingsHtml(wf) {
         <label class="check"><input id="wfCfgPlanningEnabled" type="checkbox"${wfChecked(planning.enabled)}> использовать planner и последовательные этапы</label>
         <label class="check"><input id="wfCfgPlanApproval" type="checkbox"${wfChecked(planning.require_approval !== false)}> требовать утверждение плана человеком</label>
         <label>Максимум этапов<input id="wfCfgMaxStages" type="number" min="1" max="50" value="${planning.max_stages || 20}"></label>
-        <label>Возвратов на один этап<input id="wfCfgStageRevisions" type="number" min="1" max="20" value="${planning.max_revisions_per_stage || 3}"></label>
+        <label>Возвратов на один этап<input id="wfCfgStageRevisions" type="number" min="1" max="100" value="${planning.max_revisions_per_stage ?? ''}" placeholder="Из плана (или 3)"></label>
         <label>Шаблон prompt планировщика<textarea id="wfCfgPlanningPrompt" placeholder="Пусто = встроенный шаблон">${esc(planning.prompt_template || '')}</textarea></label>
       </div>
       ${roleCard('Planner', 'Планировщик', planner, false)}
@@ -1919,20 +2259,24 @@ function workflowSettingsHtml(wf) {
     </div>
     <div class="wf-actions"><button class="btn btn-sm btn-primary" onclick="wfSaveSettings()">Сохранить настройки</button>
       <button class="btn btn-sm btn-ghost" onclick="wfAdvance()">Запустить следующий автоматический переход</button></div>
-    <div class="wf-meta">Переменные шаблонов: {{objective}}, {{stage_code}}, {{stage_title}}, {{stage_goal}}, {{repository_path}}, {{candidate_branch}}, {{round_no}}, {{previous_review}}, {{executor_report}}, {{gate_evidence}}, {{open_findings}}.</div>
+    <div class="wf-meta">Переменные шаблонов: {{objective}}, {{stage_code}}, {{stage_title}}, {{stage_goal}}, {{repository_path}}, {{candidate_branch}}, {{round_no}}, {{previous_review}}, {{executor_report}}, {{gate_evidence}}, {{open_findings}}, {{previous_stages}}, {{stage_review}}, {{acceptance_gates}}.</div>
   </details>`;
 }
 
-function workflowStatusInfo(status, reviewerDone = false) {
+function workflowStatusInfo(status, reviewerDone = false, automation = {}) {
+  const automaticGate = automation.enabled === true && automation.auto_gate !== false;
   const info = {
     draft: ['Черновик', 'Следующее действие: сформировать план этапов либо запустить быструю задачу.'],
     planning: ['Планирование', 'Сильный планировщик исследует задачу и формирует этапы.'],
     awaiting_plan_approval: ['План ожидает утверждения', 'Проверьте порядок, scope и gate каждого этапа, затем утвердите план.'],
     queued: ['Готов к запуску', 'Следующее действие: выбрать исполнителя и отправить промпт.'],
     executing: ['Исполнитель работает', 'Следующее действие: наблюдать за агентом; после успешного ответа начнутся проверки.'],
-    gating: ['Автоматические проверки', 'Следующее действие: зафиксировать результат gate.'],
+    gating: automaticGate
+      ? ['Автоматические проверки', 'Проверки идут сами — ничего нажимать не нужно; результат применится автоматически.']
+      : ['Ручные проверки', 'Выполните проверки и выберите Gate PASS или FAIL.'],
     reviewing: ['Независимое ревью', 'Следующее действие: запустить проверяющего.'],
     revision_required: ['Нужны исправления', 'Следующее действие: открыть новый раунд доработок.'],
+    awaiting_external: ['Ожидает внешнего результата', 'Этап выполняют вне PromptPilot. Следующее действие: сдать результат — дальше проверки и независимое ревью.'],
     awaiting_human: reviewerDone
       ? ['Ожидается вердикт ревью', 'Следующее действие: принять, вернуть на доработку или запросить решение человека.']
       : ['Ожидается ваше решение', 'Предыдущая попытка не завершила этап. Следующее действие: продолжить текущий раунд.'],
@@ -1943,7 +2287,45 @@ function workflowStatusInfo(status, reviewerDone = false) {
   return info[status] || [status, ''];
 }
 
-function workflowOwnerInfo(wf, activeRun, reviewerDone) {
+function workflowNeedsHuman(wf) {
+  // U16b: gating в АВТО-режиме (auto_gate включён — наш дефолт) никого не
+  // ждёт: заголовок «НУЖНО ДЕЙСТВИЕ» врёт и рождал ложные тревоги владельца.
+  // Человека ждёт только ручной gate (auto_gate === false).
+  const s = wf?.status;
+  if (s === 'gating') return !(wf?.config?.automation?.enabled === true && wf.config.automation.auto_gate !== false);
+  return ['awaiting_human', 'revision_required', 'awaiting_plan_approval'].includes(s);
+}
+
+function workflowHumanAlertCopy(status, reviewerDone, decisionState = {}) {
+  if (status === 'awaiting_human' && reviewerDone && decisionState.budgetExhausted) {
+    return ['Каскад остановлен по лимиту попыток',
+      'Ревью уже завершено, но автоматическая ступень исчерпала свои попытки. Сначала нужно выбрать новую политику или явно принять риск вручную.'];
+  }
+  if (status === 'revision_required' && decisionState.budgetExhausted) {
+    return ['Лимит попыток исчерпан',
+      'Новый раунд сейчас заблокирован защитным лимитом. Измените политику попыток или создайте новый этап после проверки замечаний.'];
+  }
+  if (status === 'awaiting_human' && reviewerDone) {
+    return ['Требуется ваше решение по ревью',
+      'Проверяющий уже закончил. Выберите один из вариантов ниже — после этого PromptPilot продолжит или завершит workflow.'];
+  }
+  if (status === 'revision_required') {
+    return ['Нужны исправления',
+      'Ревью вернуло текущий этап на доработку. Проверьте отчёт и нажмите «Продолжить пайплайн».'];
+  }
+  if (status === 'awaiting_plan_approval') {
+    return ['Нужно утвердить план',
+      'Проверьте порядок этапов и gate-команды, затем нажмите «Сохранить и утвердить».'];
+  }
+  if (status === 'gating') {
+    return ['Gate в ручном режиме',
+      'Автоматический gate выключен для этого воркфлоу. По завершении проверок выберите PASS или FAIL.'];
+  }
+  return ['Пайплайн остановлен: требуется действие человека',
+    'Проверьте причину остановки и нажмите «Продолжить пайплайн», чтобы передать управление обратно оркестратору.'];
+}
+
+function workflowOwnerInfo(wf, activeRun, reviewerDone, decisionState = {}) {
   if (wf.status === 'planning') return {
     who: 'Планировщик', detail: activeRun?.task_id ? `task #${activeRun.task_id} · разбивает задачу на этапы` : 'запускается',
     next: 'Дальше: ваше однократное утверждение плана', color: 'var(--accent)',
@@ -1957,7 +2339,8 @@ function workflowOwnerInfo(wf, activeRun, reviewerDone) {
     next: 'Дальше: автоматические проверки (Gate)', color: 'var(--accent)',
   };
   if (wf.status === 'gating') return {
-    who: 'PromptPilot / Gate', detail: 'проверяется результат исполнителя',
+    who: workflowNeedsHuman(wf) ? 'Вы / Gate' : 'PromptPilot / Gate',
+    detail: workflowNeedsHuman(wf) ? 'нужно выполнить проверки и зафиксировать результат' : 'проверяется результат исполнителя',
     next: 'Дальше: независимый аудитор', color: 'var(--yellow)',
   };
   if (wf.status === 'reviewing') return {
@@ -1967,6 +2350,10 @@ function workflowOwnerInfo(wf, activeRun, reviewerDone) {
   if (wf.status === 'awaiting_human') return {
     who: 'Вы', detail: reviewerDone ? 'нужно зафиксировать решение по аудиту' : 'автоматический этап остановлен',
     next: reviewerDone ? 'Выбрать: принять / вернуть на доработку / нужен человек' : 'Проверить причину остановки', color: 'var(--red)',
+  };
+  if (wf.status === 'awaiting_external') return {
+    who: 'Внешний исполнитель', detail: 'задание выдано, ждём результат — процесс не занят',
+    next: 'Дальше: сдать результат → gate → независимый аудитор', color: 'var(--yellow)',
   };
   if (wf.status === 'revision_required') return {
     who: 'Вы', detail: 'аудитор вернул результат на доработку',
@@ -2024,43 +2411,107 @@ function workflowStopReason(events) {
   return `${task}${reason}`;
 }
 
-function workflowStageEditorCard(stage = {}, index = 0) {
-  return `<div class="wf-stage-card wf-stage-edit-card" data-index="${index}" data-status="${escAttr(stage.status || 'draft')}">
+function workflowStageEditorCard(stage = {}, index = 0, frozen = false) {
+  const lockAttrs = frozen ? ' style="opacity:.65;border-left:3px solid var(--border)" title="Замороженный этап (завершён/выполняется): правке не подлежит"' : '';
+  const lockActions = frozen ? '<span class="cz-hint">🔖 заморожен</span>' : '';
+  return `<div class="wf-stage-card wf-stage-edit-card" data-index="${index}" data-frozen="${frozen ? 1 : 0}" data-status="${escAttr(stage.status || 'draft')}"${lockAttrs}>
+    <fieldset ${frozen ? 'disabled' : ''} style="border:0;padding:0;margin:0">
     <div class="wf-stage-editor">
       <input data-field="code" value="${escAttr(stage.code || '')}" placeholder="Код">
       <input data-field="title" value="${escAttr(stage.title || '')}" placeholder="Название">
       <select data-field="stage_type"><option value="implementation"${stage.stage_type !== 'integration' ? ' selected' : ''}>implementation</option><option value="integration"${stage.stage_type === 'integration' ? ' selected' : ''}>integration</option></select>
+      <select data-field="execution_mode" title="Кто выполняет этап"><option value="automatic"${stage.execution_mode !== 'external' ? ' selected' : ''}>исполняет агент</option><option value="external"${stage.execution_mode === 'external' ? ' selected' : ''}>вне PromptPilot</option></select>
       <textarea class="wide" data-field="objective" placeholder="Проверяемая цель">${esc(stage.objective || '')}</textarea>
       <input class="wide" data-field="dependencies" value="${escAttr((stage.dependencies || []).join(', '))}" placeholder="Зависимости: S1, S2">
-      <textarea class="wide" data-field="allowed_paths" placeholder="Разрешённые пути — по одному на строке">${esc((stage.allowed_paths || []).join('\n'))}</textarea>
-      <textarea class="wide" data-field="deliverables" placeholder="Deliverables — по одному на строке">${esc((stage.deliverables || []).join('\n'))}</textarea>
-      <textarea class="wide" data-field="acceptance_gates" placeholder="Gate-команды — по одной на строке">${esc((stage.acceptance_gates || []).join('\n'))}</textarea>
+      <textarea class="wide" data-field="allowed_paths" placeholder="Разрешённые пути — по одному на строку">${esc((stage.allowed_paths || []).join('\n'))}</textarea>
+      <textarea class="wide" data-field="deliverables" placeholder="Deliverables — по одному на строку">${esc((stage.deliverables || []).join('\n'))}</textarea>
+      <textarea class="wide" data-field="acceptance_gates" placeholder="Gate-команды — по одной на строку">${esc((stage.acceptance_gates || []).join('\n'))}</textarea>
       <input data-field="max_revision_rounds" type="number" min="1" value="${stage.max_revision_rounds || ''}" placeholder="Лимит возвратов">
       <input data-field="executor_prompt" value="${escAttr(stage.executor_prompt || '')}" placeholder="Особый prompt executor">
       <input data-field="reviewer_prompt" value="${escAttr(stage.reviewer_prompt || '')}" placeholder="Особый prompt reviewer">
     </div>
-    <div class="wf-actions"><button class="btn btn-sm btn-ghost" data-stage-action="up" onclick="wfMoveStage(${index},-1)">↑</button><button class="btn btn-sm btn-ghost" data-stage-action="down" onclick="wfMoveStage(${index},1)">↓</button><button class="btn btn-sm btn-danger" data-stage-action="delete" onclick="wfDeleteStage(${index})">Удалить</button></div>
+    </fieldset>
+    <div class="wf-actions">${lockActions}${frozen ? '' : `<button class="btn btn-sm btn-ghost" data-stage-action="up" onclick="wfMoveStage(${index},-1)">↑</button><button class="btn btn-sm btn-ghost" data-stage-action="down" onclick="wfMoveStage(${index},1)">↓</button><button class="btn btn-sm btn-danger" data-stage-action="delete" onclick="wfDeleteStage(${index})">Удалить</button>`}</div>
   </div>`;
 }
 
 function workflowPlanHtml(wf, plan, stages) {
   if (!wf.config?.planning?.enabled && !stages.length) return '';
   const editable = wf.status === 'awaiting_plan_approval';
-  const cards = stages.map((stage, index) => editable ? workflowStageEditorCard(stage, index) : `
-    <div class="wf-stage-card" data-status="${escAttr(stage.status)}">
-      <div class="wf-stage-title">${index + 1}. ${esc(stage.code)} · ${esc(stage.title)} <span class="task-status" data-s="${escAttr(stage.status)}">${esc(stage.status)}</span></div>
-      <div class="wf-round-summary">${esc(stage.objective)}</div>
-      <div class="wf-meta">${esc(stage.stage_type)} · gate: ${(stage.acceptance_gates || []).length} · возвратов: ${stage.max_revision_rounds || wf.config?.planning?.max_revisions_per_stage || 3}</div>
-    </div>`).join('');
+  // F5: живой план с allow_editing_approved_plan — редактор хвоста
+  const amendable = !editable && wf.config?.planning?.allow_editing_approved_plan
+    && plan?.status === 'approved' && stages.some(st => st.id === wf.current_stage_id)
+    && ['queued','executing','gating','reviewing','revision_required','awaiting_human','awaiting_external'].includes(wf.status);
+  const frozenN = amendable ? (() => {
+    let n = 0;
+    for (const st of stages) { n++; if (st.id === wf.current_stage_id) break; }
+    return n;
+  })() : 0;
+  window.__wfAmendFrozen = amendable ? frozenN : 0;
+  window.__wfAmendVersion = amendable ? wf.state_version : null;
+  window.__wfAmendWorkflowId = amendable ? wf.id : null;
+  window.__wfAmendSourceStages = amendable ? stages.map(st => ({
+    code: st.code, title: st.title, objective: st.objective,
+    stage_type: st.stage_type, dependencies: st.dependencies || [],
+    allowed_paths: st.allowed_paths || [], deliverables: st.deliverables || [],
+    acceptance_gates: st.acceptance_gates || [],
+    executor_prompt: st.executor_prompt || '', reviewer_prompt: st.reviewer_prompt || '',
+    max_revision_rounds: st.max_revision_rounds || null,
+    execution_mode: st.execution_mode || 'automatic',
+  })) : null;
+  // U1: монотонный собственный % прогресса на каждой карточке (переходы видны)
+  const total = Math.max(stages.length, 1);
+  const completedCount = stages.filter(s => s.status === 'completed').length;
+  const cards = stages.map((stage, index) => {
+    if (editable) return workflowStageEditorCard(stage, index);
+    if (amendable) return workflowStageEditorCard(stage, index, index < frozenN);
+    const done = stages.slice(0, index + 1).filter(s => s.status === 'completed').length;
+    const pct = stage.status === 'completed'
+      ? Math.round(done / total * 100)
+      : Math.round((done + (stage.status === 'executing' || stage.status === 'reviewing' || stage.status === 'gating' ? 0.5 : 0)) / total * 100);
+    const shortGoal = String(stage.objective || '').split('.')[0].slice(0, 90);
+    return `
+    <div class="wf-stage-card" data-status="${escAttr(stage.status)}" style="min-height:96px">
+      <div class="wf-stage-title">${index + 1}/${total} · ${Math.max(0, pct)}% <span class="task-status" data-s="${escAttr(stage.status)}">${esc(stage.status)}</span></div>
+      <div style="font-weight:600;margin:2px 0">${esc(stage.code)} · ${esc(stage.title)}</div>
+      <div class="wf-round-summary" style="display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden">${esc(shortGoal)}</div>
+      <div class="wf-meta">${esc(stage.stage_type)}${stage.execution_mode === 'external' ? ' · вне PromptPilot' : ''} · gate: ${(stage.acceptance_gates || []).length} · возвратов: ${wf.config?.planning?.max_revisions_per_stage ?? stage.max_revision_rounds ?? 3}</div>
+    </div>`;
+  }).join('');
   const controls = editable ? `<div class="wf-actions">
     <button class="btn btn-sm btn-ghost" onclick="wfAddStage()">Добавить этап</button>
     <button class="btn btn-sm btn-ghost" onclick="wfSavePlan()">Сохранить план</button>
     <button class="btn btn-sm btn-primary" onclick="wfApprovePlan()">Сохранить и утвердить</button>
     <button class="btn btn-sm btn-ghost" onclick="wfPlannerDispatch(true)">Сформировать заново</button>
+  </div>` : amendable ? `<div class="wf-actions">
+    <button class="btn btn-sm btn-ghost" onclick="wfAddStage()">Добавить этап (в хвост)</button>
+    <button class="btn btn-sm btn-primary" onclick="wfAmendPlan()">Перепланировать хвост</button>
+    <span class="cz-hint">F5: замороженные 🔖 этапы — история; правится только хвост; причина обязательна и попадёт в журнал</span>
   </div>` : '';
   return `<div class="wf-section-title">План этапов · ${stages.length}</div>
     ${editable ? '<div class="wf-meta">Последний этап должен иметь тип integration. Gate-команды выполняются только после ручного утверждения плана.</div>' : ''}
     <div class="wf-stage-list" id="wfStageList">${cards || '<div class="wf-meta">Планировщик ещё не сформировал этапы.</div>'}</div>${controls}`;
+}
+
+function workflowExternalFormHtml(wf, runs) {
+  const run = [...runs].reverse().find(r => r.input?.execution_mode === 'external'
+    && r.status === 'awaiting_external' && r.round_id === wf.current_round_id)
+    || [...runs].reverse().find(r => r.input?.execution_mode === 'external' && r.status === 'awaiting_external');
+  if (!run) return '<div class="wf-meta">Нет активного внешнего задания. Обновите workflow.</div>';
+  const id = escAttr(run.id);
+  const token = [wf.id, run.id, wf.state_version, run.input_sha256].map(x => escAttr(JSON.stringify(x))).join(', ');
+  return `<div class="wf-stage" style="border-color:var(--yellow)">
+    <b>Задание для внешнего исполнителя</b> ? попытка ${run.attempt_no}
+    <div class="result-block"><pre id="wfExternalAssignment">${esc(run.input?.assignment || '')}</pre></div>
+    <button class="btn btn-sm btn-ghost" onclick="wfCopyAssignment()">Скопировать задание</button>
+  </div><div class="wf-form wide" id="wfExternalForm-${id}"
+      data-workflow="${escAttr(wf.id)}" data-run="${id}" data-version="${wf.state_version}"
+      data-input-sha="${escAttr(run.input_sha256)}">
+    <textarea class="wide" id="wfExternalResult-${id}" placeholder="Результат, факты и ссылки"></textarea>
+    <input id="wfExternalPerformer-${id}" placeholder="Кто выполнил">
+    <input class="wide" id="wfExternalComment-${id}" placeholder="Комментарий (необязательно)">
+    <button class="btn btn-sm btn-primary" onclick="wfSubmitExternal(${token})">Сдать результат</button>
+  </div>`;
 }
 
 function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, plannerTask, orphanPane = null) {
@@ -2077,8 +2528,9 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, 
   const pastRounds = rounds.filter(r => r.round_no !== wf.current_round);
   const importedCount = rounds.filter(r => r.summary?.historical).length;
   const stage = stages.find(item => item.id === wf.current_stage_id) || wf.config?.stage || {};
-  const statusInfo = workflowStatusInfo(wf.status, !!reviewerDone);
+  const statusInfo = workflowStatusInfo(wf.status, !!reviewerDone, wf.config?.automation || {});
   const ownerInfo = workflowOwnerInfo(wf, activeRun, reviewerDone);
+  const humanAlert = workflowNeedsHuman(wf) ? workflowHumanAlertCopy(wf.status, !!reviewerDone) : null;
   const stopReason = workflowStopReason(events);
   const previousAudit = [...pastRounds].reverse().find(r => r.summary?.summary);
   const stageTitle = stage.title || `Раунд ${wf.current_round}: доработка после последнего аудита`;
@@ -2095,6 +2547,10 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, 
       : `<button class="btn btn-sm btn-primary" onclick="wfStart()">Начать первый раунд</button>`;
   } else if (wf.status === 'awaiting_human' && plan?.status === 'failed' && !wf.current_round) {
     action = plannerForm;
+  } else if (wf.status === 'awaiting_external') {
+    action = workflowExternalFormHtml(wf, runs);
+  } else if (wf.status === 'queued' && stage.execution_mode === 'external') {
+    action = `<div class="wf-form"><button class="btn btn-sm btn-primary" onclick="wfRequestExternal()">Выдать задание внешнему исполнителю</button></div>`;
   } else if (['queued','reviewing'].includes(wf.status)) {
     const role = wf.status === 'queued' ? 'executor' : 'reviewer';
     action = `<div class="wf-form wide">
@@ -2114,7 +2570,8 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, 
       <div class="wf-round-summary">Не запускайте новый раунд. Дождитесь завершения фоновых build/pytest; экран агента показан ниже.</div>
     </div>`;
   } else if (wf.status === 'revision_required' || (wf.status === 'awaiting_human' && !reviewerDone)) {
-    action = `<div class="wf-form"><input class="wide" id="wfHumanText" value="Продолжить работу с учётом сохранённого состояния" required>
+    action = `<div class="wf-form"><textarea class="wide" id="wfHumanNote" rows="3"
+        placeholder="Что передать агенту (необязательно). Уйдёт в следующий запуск исполнителя и аудитора как указание, главнее инструкций раунда."></textarea>
       <button class="btn btn-sm btn-primary" onclick="wfResume()">Продолжить ${wf.status === 'revision_required' ? 'новым раундом' : 'текущий раунд'}</button></div>`;
   } else if (wf.status === 'awaiting_human' && reviewerDone) {
     const auditColor = auditVerdict === 'PASS' ? 'var(--green)' : 'var(--red)';
@@ -2130,14 +2587,27 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, 
       <button class="btn btn-sm btn-ghost wide" onclick="wfReview('HUMAN_REQUIRED')">Нужен человек</button></div>`;
   }
   const runRows = (plannerTask ? [`<div class="wf-round${plannerRun ? ' current' : ''}"><b>planner</b> · ${esc(plannerTask.status)} · task #${plannerTask.id}</div>`] : [])
-    .concat(runs.map(r => `<div class="wf-round${r === activeRun ? ' current' : ''}"><b>${esc(r.role)} · попытка ${r.attempt_no}</b> · ${esc(r.status)}${r.task_id ? ` · task #${r.task_id}` : ''}</div>`)).join('');
+    .concat(runs.map(r => `<div class="wf-round${r === activeRun ? ' current' : ''}"><b>${esc(r.role)} · попытка ${r.attempt_no}</b> · ${esc(r.status)}${r.task_id ? ` · task #${r.task_id}` : ''}${r.input?.execution_mode === 'external' ? ` · вне PromptPilot${r.output?.external?.performer ? ': ' + esc(r.output.external.performer) : ''}` : ''}</div>`)).join('');
   const eventRows = [...events].reverse().slice(0, 30).map(e => `<div class="wf-event"><code>${esc(e.event_type)}</code> · ${formatTime(e.created_at)}</div>`).join('');
   const historyRows = pastRounds.map(r => workflowRoundRow(r)).join('');
-  document.getElementById('wfDetail').innerHTML = `
+  // Scroll-jump fix: the 5s auto-refresh rebuilds this pane from scratch.
+  // While innerHTML is being replaced the pane momentarily collapses, so the
+  // modal scroller clamps to the top, and every rebuilt scrollable block
+  // (report <pre>, prompt textarea, history) restarts at scrollTop=0 — yanking
+  // a reading user back to the start of the text. Snapshot positions and
+  // typed values first, put them back after the rebuild.
+  const wfPane = document.getElementById('wfDetail');
+  const wfSnapScrolls = uiSnapScrolls(wfPane);
+  const wfSnapValues = {};
+  wfPane.querySelectorAll('textarea,input').forEach(el => { if (el.id) wfSnapValues[el.id] = el.value; });
+  const wfModalScroller = wfPane.closest('.modal');
+  const wfSnapModalTop = wfModalScroller ? wfModalScroller.scrollTop : 0;
+  wfPane.innerHTML = `
     <div class="wf-title">${esc(wf.slug)} <span class="task-status" data-s="${escAttr(wf.status)}">${esc(statusInfo[0])}</span>
       ${wf.config?.automation?.enabled ? '<span class="task-status" data-s="running">АВТО</span>' : '<span class="wf-meta">ручной режим</span>'}</div>
     <div class="wf-stage" style="border-color:${ownerInfo.color}">
       <div class="wf-stage-title">🏓 Мяч сейчас: <span style="color:${ownerInfo.color}">${esc(ownerInfo.who)}</span></div>
+      ${humanAlert ? `<div class="wf-round-summary"><b>${esc(humanAlert[0])}</b> · ${esc(humanAlert[1])}</div>` : ''}
       <div class="wf-round-summary">${esc(ownerInfo.detail)}</div>
       ${ownerInfo.next ? `<div class="wf-next">${esc(ownerInfo.next)}</div>` : ''}
     </div>
@@ -2182,6 +2652,16 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, 
     <details class="wf-technical" data-wf-detail="technical-log"><summary>Технический журнал · ${events.length} событий · state version ${wf.state_version}</summary>
       <div class="wf-history">${eventRows || '<div class="wf-meta">Событий пока нет.</div>'}</div>
     </details>`;
+  // Scroll-jump fix: restore what the user was reading/typing. Keys are ids
+  // (or positions within the narrow scroller list), so a changed render shape
+  // cannot shift the mapping. The agent screen keeps its own bottom autoscroll.
+  uiRestoreScrolls(wfPane, wfSnapScrolls);
+  wfPane.querySelectorAll('textarea,input').forEach(el => {
+    if (el.id && wfSnapValues[el.id] !== undefined && el.value !== wfSnapValues[el.id]) {
+      el.value = wfSnapValues[el.id];
+    }
+  });
+  if (wfModalScroller) wfModalScroller.scrollTop = wfSnapModalTop;
   if (['queued','reviewing'].includes(wf.status)) setTimeout(wfProviderChanged, 0);
   if (wf.status === 'awaiting_plan_approval') setTimeout(wfReindexStageCards, 0);
   if (activeWorkflowTaskId) setTimeout(() => wfRefreshScreen(activeWorkflowTaskId), 0);
@@ -2237,6 +2717,13 @@ async function wfSaveSettings() {
   if (!wasEnabled && enabled && !confirm('Включить автономный ping-pong? После сохранения PromptPilot сразу выполнит допустимый следующий переход.')) return;
   const commands = document.getElementById('wfCfgGateCommands').value
     .split(/\r?\n/).map(x => x.trim()).filter(Boolean);
+  const revisionText = document.getElementById('wfCfgStageRevisions').value.trim();
+  const revisionOverride = Number(revisionText);
+  if (revisionText && (!/^\d+$/.test(revisionText) || !Number.isSafeInteger(revisionOverride)
+      || revisionOverride < 1 || revisionOverride > 100)) {
+    toast('Бюджет: целое число от 1 до 100; пусто — лимит из плана');
+    return;
+  }
   const config = {
     ...old,
     schema_version: 1,
@@ -2252,7 +2739,6 @@ async function wfSaveSettings() {
       enabled: document.getElementById('wfCfgPlanningEnabled').checked,
       require_approval: document.getElementById('wfCfgPlanApproval').checked,
       max_stages: Math.max(1, parseInt(document.getElementById('wfCfgMaxStages').value, 10) || 20),
-      max_revisions_per_stage: Math.max(1, parseInt(document.getElementById('wfCfgStageRevisions').value, 10) || 3),
       prompt_template: document.getElementById('wfCfgPlanningPrompt').value,
     },
     automation: {
@@ -2273,6 +2759,8 @@ async function wfSaveSettings() {
       reviewer: wfRoleSettings('Reviewer', old.roles?.reviewer, false),
     },
   };
+  if (revisionText) config.planning.max_revisions_per_stage = revisionOverride;
+  else delete config.planning.max_revisions_per_stage;
   try {
     await fetchJSON(`${API}/workflows/${selectedWorkflowId}`, {
       method:'PATCH', headers:{'Content-Type':'application/json'},
@@ -2289,7 +2777,7 @@ function wfReindexStageCards() {
     const up = card.querySelector('[data-stage-action="up"]');
     const down = card.querySelector('[data-stage-action="down"]');
     const remove = card.querySelector('[data-stage-action="delete"]');
-    if (up) { up.setAttribute('onclick', `wfMoveStage(${index},-1)`); up.disabled = index === 0; }
+    if (up) { up.setAttribute('onclick', `wfMoveStage(${index},-1)`); up.disabled = index <= (window.__wfAmendFrozen || 0); }
     if (down) { down.setAttribute('onclick', `wfMoveStage(${index},1)`); down.disabled = index === document.querySelectorAll('#wfStageList .wf-stage-edit-card').length - 1; }
     if (remove) remove.setAttribute('onclick', `wfDeleteStage(${index})`);
   });
@@ -2299,6 +2787,7 @@ function wfMoveStage(index, delta) {
   const list = document.getElementById('wfStageList');
   const cards = [...list.querySelectorAll('.wf-stage-edit-card')];
   const target = index + delta;
+  if (index < (window.__wfAmendFrozen || 0) || target < (window.__wfAmendFrozen || 0)) return;
   if (!cards[index] || target < 0 || target >= cards.length) return;
   if (delta < 0) list.insertBefore(cards[index], cards[target]);
   else list.insertBefore(cards[target], cards[index]);
@@ -2306,6 +2795,7 @@ function wfMoveStage(index, delta) {
 }
 
 function wfDeleteStage(index) {
+  if (index < (window.__wfAmendFrozen || 0)) return;
   const cards = [...document.querySelectorAll('#wfStageList .wf-stage-edit-card')];
   if (cards.length <= 1) { toast('В плане должен остаться хотя бы один этап.'); return; }
   cards[index]?.remove();
@@ -2335,6 +2825,7 @@ function wfCollectPlanStages() {
     return {
       code: value('code'), title: value('title'), objective: value('objective'),
       stage_type: value('stage_type') || 'implementation',
+      execution_mode: value('execution_mode') || 'automatic',
       dependencies: wfStageListValue(card, 'dependencies', true),
       allowed_paths: wfStageListValue(card, 'allowed_paths'),
       deliverables: wfStageListValue(card, 'deliverables'),
@@ -2343,6 +2834,50 @@ function wfCollectPlanStages() {
       max_revision_rounds: revisionRaw ? parseInt(revisionRaw, 10) : null,
     };
   });
+}
+
+function wfCollectAmendStages() {
+  // как wfCollectPlanStages, но замороженные карточки читаются из кэша исходных данных
+  return [...document.querySelectorAll('#wfStageList .wf-stage-edit-card')].map(card => {
+    if (card.dataset.frozen === '1') {
+      const idx = parseInt(card.dataset.index, 10);
+      return JSON.parse(JSON.stringify((window.__wfAmendSourceStages || [])[idx] || {}));
+    }
+    const value = field => card.querySelector(`[data-field="${field}"]`)?.value?.trim() || '';
+    const lines = field => value(field).split('\n').map(x => x.trim()).filter(Boolean);
+    const comma = field => value(field).split(',').map(x => x.trim()).filter(Boolean);
+    const rev = parseInt(value('max_revision_rounds'), 10);
+    return {
+      code: value('code'), title: value('title'), objective: value('objective'),
+      stage_type: card.querySelector('[data-field="stage_type"]')?.value || 'implementation',
+      execution_mode: value('execution_mode') || 'automatic',
+      dependencies: comma('dependencies'),
+      allowed_paths: lines('allowed_paths'), deliverables: lines('deliverables'),
+      acceptance_gates: lines('acceptance_gates'),
+      executor_prompt: value('executor_prompt'), reviewer_prompt: value('reviewer_prompt'),
+      max_revision_rounds: Number.isFinite(rev) && rev >= 1 ? rev : null,
+    };
+  });
+}
+
+async function wfAmendPlan() {
+  const workflowId = window.__wfAmendWorkflowId;
+  const expectedVersion = window.__wfAmendVersion;
+  if (!workflowId || workflowId !== selectedWorkflowId || expectedVersion === null) return;
+  const stages = wfCollectAmendStages();
+  if (!stages.length) { toast('Пустой план'); return; }
+  const frozen = window.__wfAmendFrozen || 0;
+  const tailCodes = stages.slice(frozen).map(s => s.code).join(', ');
+  const reason = prompt('Причина перепланировки (обязательна, попадёт в журнал):\nХвост: ' + tailCodes, '');
+  if (!reason || reason.trim().length < 3) { toast('Причина обязательна (мин. 3 символа)'); return; }
+  try {
+    await fetchJSON(`${API}/workflows/${workflowId}/plan/amend`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({expected_version:expectedVersion, stages, reason:reason.trim()}),
+    });
+    toast('Хвост плана перепланирован (событие plan.amended)', false);
+    await loadWorkflows();
+  } catch (e) { toast('Перепланировка: ' + e.message); }
 }
 
 async function wfSavePlan(reload = true) {
@@ -2399,10 +2934,37 @@ function wfDownloadReport(format) {
 
 function wfStart() { return wfPost('start', {expected_version: selectedWorkflowData.state_version}); }
 function wfSync() { return wfPost('sync', {}); }
-function wfResume() { return wfPost('human-input', {expected_version: selectedWorkflowData.state_version, text: document.getElementById('wfHumanText').value, resume: true}); }
+function wfResume() {
+  const note = (document.getElementById('wfHumanNote')?.value || '').trim();
+  return wfPost('human-input', {
+    expected_version: selectedWorkflowData.state_version,
+    text: note || 'Продолжить работу с учётом сохранённого состояния',
+    note,
+    resume: true,
+  });
+}
 function wfGate(verdict) { return wfPost('gate', {expected_version: selectedWorkflowData.state_version, verdict, gate_id: 'ui-manual-gate', summary: document.getElementById('wfDecisionSummary').value}); }
 function wfReview(verdict) { return wfPost('review', {expected_version: selectedWorkflowData.state_version, verdict, summary: document.getElementById('wfDecisionSummary').value, findings: []}); }
 function wfCancel() { if (confirm('Отменить workflow и все его активные задачи?')) return wfPost('cancel', {expected_version: selectedWorkflowData.state_version}); }
+function wfRequestExternal() { return wfPost('external-request', {expected_version: selectedWorkflowData.state_version}); }
+function wfSubmitExternal(workflowId, runId, expectedVersion, inputSha) {
+  if (workflowId !== selectedWorkflowId || !Number.isInteger(expectedVersion)) return;
+  const form = document.getElementById(`wfExternalForm-${runId}`);
+  if (!form || form.dataset.workflow !== workflowId || form.dataset.run !== runId
+      || form.dataset.version !== String(expectedVersion) || form.dataset.inputSha !== inputSha) return;
+  const result = document.getElementById(`wfExternalResult-${runId}`).value;
+  if (!result.trim()) { toast('Пустой результат'); return; }
+  return wfPost('external-result', {
+    expected_version: expectedVersion, run_id: runId, input_sha256: inputSha, result,
+    performer: document.getElementById(`wfExternalPerformer-${runId}`).value,
+    comment: document.getElementById(`wfExternalComment-${runId}`).value,
+  });
+}
+async function wfCopyAssignment() {
+  const text = document.getElementById('wfExternalAssignment')?.textContent || '';
+  try { await navigator.clipboard.writeText(text); toast('Задание скопировано', false); }
+  catch (e) { toast('Не удалось скопировать: выделите текст вручную.'); }
+}
 
 async function wfDispatch(role) {
   const provider = document.getElementById('wfProvider').value;
@@ -2466,7 +3028,11 @@ async function openSchedule() {
             + (s.last_verdict ? ` (${s.last_verdict})` : '') + `, ${when(s.last_at)}`)
       : 'ещё не запускалась';
     const githubWait = githubApiWait({status: s.next_status, scheduled_at: s.next_run_at, error: s.next_error});
-    const next = s.broken
+    const autoPauseReason = typeof s.auto_pause_reason === 'string'
+      ? s.auto_pause_reason.trim() : '';
+    const next = s.paused && !s.next_task_id
+      ? `<span style="color:var(--yellow)"${autoPauseReason ? ` title="${escAttr(autoPauseReason)}"` : ''}>${autoPauseReason ? 'автопауза — повторился тот же блокер' : 'серия на паузе'} — Возобновить создаст следующий запуск</span>${autoPauseReason ? `<br><span title="${escAttr(autoPauseReason)}">Причина: ${esc(autoPauseReason)}</span>` : ''}`
+      : s.broken
       ? '<span style="color:var(--red)">серия оборвана — следующего запуска нет</span>'
       : githubWait
       ? `<span style="color:var(--yellow)" title="${escAttr(githubWait.reason)}">#${s.next_task_id} — ждёт GitHub API до ${when(githubWait.until)}</span><br><span title="${escAttr(githubWait.reason)}">Причина: ${esc(githubWait.reason)}</span>`
@@ -2489,7 +3055,7 @@ async function openSchedule() {
       <div class="prov-cmd">Прошлый: ${last}</div>
       ${!s.ended ? `<div class="prov-actions" style="margin-top:9px">
         <button class="btn btn-sm btn-ghost" onclick="toggleSeriesEditor(${s.id})">⚙ Изменить</button>
-        <button class="btn btn-sm btn-ghost" onclick="seriesAction(${s.id},'run_now')" ${!s.next_task_id ? 'disabled' : ''}>▶ Сейчас</button>
+        <button class="btn btn-sm btn-ghost" onclick="seriesAction(${s.id},'run_now')" ${s.paused || !s.next_task_id ? 'disabled' : ''}>▶ Сейчас</button>
         <button class="btn btn-sm btn-ghost" onclick="seriesAction(${s.id},'${s.paused ? 'resume' : 'pause'}')">${s.paused ? '▶ Возобновить' : '⏸ Пауза'}</button>
         <button class="btn btn-sm btn-danger" onclick="seriesAction(${s.id},'end',true)">Завершить серию</button>
       </div>
@@ -2523,23 +3089,74 @@ async function openSchedule() {
   box.innerHTML = activeHtml + brokenHtml;
 }
 
+let pipelineView = 'status';
+let pipelineReportHours = 24;
+let pipelineReportRequestId = 0;
+
 async function loadPipelineProfiles() {
   const box = document.getElementById('pipelineProfileTools');
   try {
     const profiles = await fetchJSON(`${API}/pipeline-insights/profiles`);
     if (!profiles.length) { box.innerHTML = '<span style="color:var(--muted);font-size:12px">Профили не настроены.</span>'; return; }
-    box.innerHTML = `<select id="pipelineProfileSelect" onchange="loadSelectedPipelineInsights(false)">${profiles.map(p=>`<option value="${escAttr(p.id)}">${esc(p.title)}</option>`).join('')}</select><button class="btn btn-sm btn-ghost" onclick="loadSelectedPipelineInsights(true)">↻ Обновить</button>`;
-    loadSelectedPipelineInsights(false);
+    box.innerHTML = `<select id="pipelineProfileSelect" aria-label="Профиль конвейера" onchange="loadSelectedPipelineView(false)">${profiles.map(p=>`<option value="${escAttr(p.id)}">${esc(p.title)}</option>`).join('')}</select>
+      <div class="pipeline-view-tabs" role="tablist" aria-label="Представление конвейера">
+        <button type="button" class="pipeline-view-tab" id="pipelineStatusTab" role="tab" onclick="setPipelineView('status')">Состояние</button>
+        <button type="button" class="pipeline-view-tab" id="pipelineReportTab" role="tab" onclick="setPipelineView('report')">Итоги</button>
+      </div>
+      <button class="btn btn-sm btn-ghost" id="pipelineRefreshButton" onclick="loadSelectedPipelineView(true)">↻ Обновить GitHub</button>`;
+    syncPipelineViewControls();
+    loadSelectedPipelineView(false);
   } catch(e) { box.innerHTML = `<span style="color:var(--red);font-size:12px">Профили анализа недоступны: ${esc(e.message)}</span>`; }
 }
 
 function openPipelines() {
   document.getElementById('pipelineModal').classList.add('open');
   document.getElementById('pipelineInsights').innerHTML = '';
+  document.getElementById('pipelineReport').innerHTML = '';
+  pipelineView = 'status';
   loadPipelineProfiles();
 }
 
 function closePipelines() { document.getElementById('pipelineModal').classList.remove('open'); }
+
+function syncPipelineViewControls() {
+  const status = pipelineView === 'status';
+  const statusBox = document.getElementById('pipelineInsights');
+  const reportBox = document.getElementById('pipelineReport');
+  if (statusBox) statusBox.style.display = status ? '' : 'none';
+  if (reportBox) reportBox.style.display = status ? 'none' : '';
+  const statusTab = document.getElementById('pipelineStatusTab');
+  const reportTab = document.getElementById('pipelineReportTab');
+  if (statusTab) {
+    statusTab.classList.toggle('active', status);
+    statusTab.setAttribute('aria-selected', String(status));
+  }
+  if (reportTab) {
+    reportTab.classList.toggle('active', !status);
+    reportTab.setAttribute('aria-selected', String(!status));
+  }
+  const refresh = document.getElementById('pipelineRefreshButton');
+  if (refresh) {
+    refresh.textContent = status ? '↻ Обновить GitHub' : '↻ Уточнить результат в GitHub';
+    refresh.title = status
+      ? 'Получить свежий снимок очередей. Использует лимит GitHub API.'
+      : 'Точно посчитать влитые PR и закрытые issues за период. Использует лимит GitHub API.';
+  }
+}
+
+function setPipelineView(view) {
+  if (view !== 'status' && view !== 'report') return;
+  pipelineView = view;
+  syncPipelineViewControls();
+  loadSelectedPipelineView(false);
+}
+
+function loadSelectedPipelineView(refresh=false) {
+  const select = document.getElementById('pipelineProfileSelect');
+  if (!select) return;
+  if (pipelineView === 'report') loadPipelineReport(select.value, pipelineReportHours, refresh);
+  else loadPipelineInsights(select.value, refresh);
+}
 
 function loadSelectedPipelineInsights(refresh=false) {
   const select = document.getElementById('pipelineProfileSelect');
@@ -2565,7 +3182,7 @@ function aggregateDiagnosticFindings(findings) {
 
 function diagnosticFindingMessage(finding) {
   const messages = {
-    single_flight_barrier: 'Интеграционная полоса занята этим PR; обычное содержательное ревью других PR продолжает работать.',
+    single_flight_barrier: 'Слияние других PR ждёт завершения интеграции; обычное ревью идёт параллельно только при разрешённом маршруте.',
     legacy_ship_waiting_review_validation: 'Переход со старого формата: очередь безопасно перепроверит эти PR перед слиянием.',
     base_sync_base_advanced: 'Ветка main обновилась после подготовки PR; перед слиянием нужна повторная синхронизация.',
     ship_waiting_initial_review: 'Разрешение ship сохранено; этот HEAD сначала пройдёт обычное содержательное ревью.',
@@ -2639,6 +3256,302 @@ function diagnosticBadgeLabel(diagnostics) {
   return diagnostics && diagnostics.checker_failed ? 'проверка недоступна' : diagnosticStateLabel(diagnostics.state);
 }
 
+function pipelineReportPeriodLabel(hours) {
+  return ({24: '24 часа', 168: '7 дней', 720: '30 дней'})[hours] || `${hours} ч`;
+}
+
+function pipelineReportNumber(value) {
+  return value == null || Number.isNaN(Number(value)) ? '—' : Number(value).toLocaleString('ru-RU');
+}
+
+function pipelineReportSigned(value) {
+  if (value == null || Number.isNaN(Number(value))) return '—';
+  const number = Number(value);
+  return `${number > 0 ? '+' : ''}${number.toLocaleString('ru-RU')}`;
+}
+
+function pipelineReportUrl(value) {
+  try {
+    const url = new URL(String(value || ''), window.location.href);
+    return url.protocol === 'https:' || url.protocol === 'http:' ? url.href : '';
+  } catch (_) { return ''; }
+}
+
+function setPipelineReportHours(hours) {
+  if (![24, 168, 720].includes(Number(hours))) return;
+  pipelineReportHours = Number(hours);
+  if (pipelineView === 'report') loadSelectedPipelineView(false);
+}
+
+function pipelineReportDeliveryNotice(delivery, periodLabel) {
+  const reason = delivery.reason ? ` ${esc(delivery.reason)}` : '';
+  if (delivery.status === 'refreshed') {
+    return `<div class="pipeline-report-notice">GitHub проверен: список влитых PR и закрытых issues за ${esc(periodLabel)} точный.</div>`;
+  }
+  if (delivery.status === 'partial') {
+    return `<div class="pipeline-report-notice warn">GitHub вернул частичный результат.${reason}</div>`;
+  }
+  if (delivery.status === 'blocked') {
+    return `<div class="pipeline-report-notice warn">Точный результат в GitHub пока не получен: лимит API сохранён.${reason}</div>`;
+  }
+  if (delivery.status === 'failed') {
+    return `<div class="pipeline-report-notice error">Не удалось уточнить результат в GitHub.${reason} Остальная часть отчёта собрана из локальной истории.</div>`;
+  }
+  return '<div class="pipeline-report-notice">Локальный отчёт не обращался к GitHub. Нажмите «Уточнить результат в GitHub», чтобы точно посчитать влитые PR и закрытые issues.</div>';
+}
+
+function pipelineReportItem(item, prefix='') {
+  const title = item.title ? ` — ${esc(item.title)}` : '';
+  const label = `${prefix}${item.number == null ? esc(item.key || '') : `#${pipelineReportNumber(item.number)}`}${title}`;
+  const url = pipelineReportUrl(item.url);
+  return url ? `<a href="${escAttr(url)}" target="_blank" rel="noopener noreferrer">${label}</a>` : label;
+}
+
+async function loadPipelineReport(profile, hours=24, refresh=false) {
+  const box = document.getElementById('pipelineReport');
+  if (!box) return;
+  const requestId = ++pipelineReportRequestId;
+  box.innerHTML = refresh
+    ? '<div class="prov-cmd">Уточняю доставку по GitHub и собираю отчёт…</div>'
+    : '<div class="prov-cmd">Собираю отчёт из локальной истории…</div>';
+  try {
+    const query = `hours=${encodeURIComponent(hours)}${refresh ? '&refresh=true' : ''}`;
+    const data = await fetchJSON(`${API}/pipeline-insights/${encodeURIComponent(profile)}/report?${query}`);
+    if (requestId !== pipelineReportRequestId) return;
+    const summary = data.summary || {};
+    const coverage = data.coverage || {};
+    const health = data.health || {state: 'warming', label: 'нет данных', reason: ''};
+    const delivery = data.delivery || {status: 'not_requested', merged_prs: [], closed_issues: []};
+    const merged = delivery.merged_prs || [];
+    const closed = delivery.closed_issues || [];
+    const delivered = merged.length + closed.length;
+    const deliveryExact = delivery.exact === true;
+    const queues = data.queues || [];
+    const attention = data.attention || [];
+    const runs = data.runs || {verdicts: {}, tokens: {}, errors: {}};
+    const verdicts = runs.verdicts || {};
+    const reportFlow = pipelineRunBreakdown({runs_5h: {...verdicts, runs:runs.total}});
+    const reportFlowSegments = reportFlow.parts.filter(part => part.count).map(part =>
+      `<span class="${part.key}" style="width:${(100 * part.count / reportFlow.total).toFixed(2)}%" title="${escAttr(part.label)}: ${part.count}"></span>`).join('');
+    const reportFlowSummary = reportFlow.parts.filter(part => part.count).map(part => `${part.label} ${part.count}`).join(', ');
+    const tokens = runs.tokens || {};
+    const cost = runs.cost || {};
+    const errors = runs.errors || {};
+    const periodLabel = pipelineReportPeriodLabel(Number(data.hours || hours));
+    const state = ['green', 'yellow', 'red', 'warming'].includes(health.state) ? health.state : 'warming';
+    const from = data.period && data.period.from ? new Date(data.period.from).toLocaleString('ru-RU') : '—';
+    const to = data.period && data.period.to ? new Date(data.period.to).toLocaleString('ru-RU') : '—';
+    const coverageText = coverage.complete
+      ? `покрытие ${pipelineReportNumber(coverage.coverage_hours)} ч, ${pipelineReportNumber(coverage.snapshot_count)} снимков`
+      : `наблюдаемая часть: ${pipelineReportNumber(coverage.coverage_hours)} ч из ${pipelineReportNumber(data.hours || hours)}, ${pipelineReportNumber(coverage.snapshot_count)} снимков`;
+    const tailText = coverage.fresh === false && coverage.tail_gap_hours != null
+      ? ` Последний снимок отстаёт на ${pipelineReportNumber(coverage.tail_gap_hours)} ч.`
+      : '';
+    const membershipText = coverage.membership_complete === false
+      ? ' Состав отдельных задач известен не для всех снимков, поэтому переходы могут быть занижены.'
+      : '';
+    const attentionText = coverage.attention_complete === false
+      ? ' Список элементов, требующих внимания, тоже может быть неполным.'
+      : '';
+    const movementPeriod = coverage.movement_period || {};
+    const movementPeriodText = movementPeriod.from && movementPeriod.to
+      ? `${new Date(movementPeriod.from).toLocaleString('ru-RU')} — ${new Date(movementPeriod.to).toLocaleString('ru-RU')}`
+      : '';
+    const deliveryRows = [
+      ...merged.map(item => `<li>${pipelineReportItem(item, 'PR ')}</li>`),
+      ...closed.map(item => `<li>${pipelineReportItem(item, 'Issue ')}</li>`),
+    ].join('');
+    const deliveryBody = deliveryExact
+      ? deliveryRows || `<div class="pipeline-report-meta">За ${esc(periodLabel)} влитых PR и закрытых issues не найдено.</div>`
+      : '<div class="pipeline-report-meta">Точный список появится после явного обновления GitHub.</div>';
+    const attentionRows = attention.map(item => {
+      const queuesText = item.queues && item.queues.length ? ` · ${item.queues.map(esc).join(', ')}` : '';
+      const labelsText = item.labels && item.labels.length ? ` · метки: ${item.labels.map(esc).join(', ')}` : '';
+      return `<li>${pipelineReportItem(item)}<span class="pipeline-report-meta">${queuesText}${labelsText}</span></li>`;
+    }).join('');
+    const queueRows = queues.map(queue => `<tr>
+      <td>${esc(queue.title || queue.id)}</td>
+      <td class="num">${pipelineReportNumber(queue.backlog)}</td>
+      <td class="num">${pipelineReportSigned(queue.delta)}</td>
+      <td class="num">${pipelineReportNumber(queue.throughput)}</td>
+    </tr>`).join('');
+    const bottleneck = data.bottleneck
+      ? `${esc(data.bottleneck.title || data.bottleneck.id)} · ${pipelineReportNumber(data.bottleneck.backlog)} в очереди`
+      : 'не обнаружено';
+    const tokenValue = tokens.known_runs ? pipelineReportNumber(tokens.total) : 'нет данных';
+    const costValue = cost.known_runs ? `$${Number(cost.total_usd || 0).toFixed(4)}` : 'Стоимость не измеряется';
+    const decisions = data.decisions || {};
+    const decisionItems = [
+      ...(decisions.waiting_ship || []).map(item => ({...item, action: 'Посмотреть ревью и разрешить слияние меткой ship'})),
+      ...(decisions.human_waiting || []).map(item => ({...item, action: 'Открыть обсуждение и выбрать решение'})),
+    ];
+    const decisionRow = item => `<li>${pipelineReportItem(item)}<div class="pipeline-report-meta">${esc(item.action)}</div></li>`;
+    const decisionRows = decisionItems.slice(0, 5).map(decisionRow).join('');
+    const remainingDecisions = decisionItems.slice(5).map(decisionRow).join('');
+    const currentTasks = (data.current || {}).tasks || [];
+    const running = currentTasks.filter(item => item.status === 'running');
+    const currentRows = running.map(item => {
+      const minutes = item.started_at ? Math.max(0, Math.floor((Date.now() - new Date(item.started_at).getTime()) / 60000)) : null;
+      return `<li>${esc(item.title || 'Задача')} · #${pipelineReportNumber(item.task_id)}${minutes == null ? '' : ` · выполняется ${minutes} мин`}</li>`;
+    }).join('');
+    const nextTask = currentTasks.filter(item => !item.paused && item.status === 'pending' && item.scheduled_at)
+      .sort((a,b) => new Date(a.scheduled_at) - new Date(b.scheduled_at))[0];
+    const freshness = coverage.data_through
+      ? `Очереди GitHub проверены ${new Date(coverage.data_through).toLocaleString('ru-RU')}${coverage.fresh === false ? ' — данные устарели' : ''}`
+      : 'Очереди GitHub ещё не проверены';
+    const emptyRuns = summary.empty_or_no_change_runs == null
+      ? Number(verdicts.empty || 0) + Number(verdicts.no_change || 0)
+      : summary.empty_or_no_change_runs;
+    const board = data.board || {};
+    const categories = (board.delivery_groups || []).map(group =>
+      `<div class="pipeline-metric"><div class="pipeline-metric-label">${esc(group.title)}</div><div class="pipeline-metric-value">${pipelineReportNumber(group.count)}</div></div>`).join('');
+    const blockedRows = (board.blocked || []).map(item =>
+      `<li>${item.number == null ? '' : `#${pipelineReportNumber(item.number)} · `}${esc(item.message || item.code || 'Причина не указана')}</li>`).join('');
+    const currentWaitRows = pipelineWaitReasons(data).map(wait =>
+      `<li><b>${esc(wait.title || wait.id)}</b>: ${esc(wait.reason)}</li>`).join('');
+    const ciRows = (board.waiting_ci || []).map(item =>
+      `<li>${pipelineReportItem(item)} · ${esc(item.message || 'Проверки ещё выполняются')}</li>`).join('');
+
+    box.innerHTML = `<div class="pipeline-report-head">
+      <div>
+        <div><b>${esc(data.title || profile)}</b><span class="pipeline-health ${escAttr(state)}">${esc(health.label || state)}</span></div>
+        <div class="prov-cmd">${esc(data.repository || '')} · ${esc(from)} — ${esc(to)}</div>
+      </div>
+      <div class="pipeline-periods" aria-label="Период отчёта">
+        ${[24,168,720].map(value => `<button type="button" class="btn btn-sm btn-ghost pipeline-period ${Number(data.hours || hours) === value ? 'active' : ''}" onclick="setPipelineReportHours(${value})">${pipelineReportPeriodLabel(value)}</button>`).join('')}
+      </div>
+    </div>
+    <div class="pipeline-report-notice ${coverage.fresh === false ? 'warn' : ''}">${esc(freshness)}. Текущие запуски ниже получены из расписания отдельно.${data.cache && data.cache.refresh_blocked ? `<div>${esc(data.cache.refresh_blocked_reason || 'Обновление GitHub временно отложено.')}</div>` : ''}</div>
+    <div class="pipeline-report-section"><h3>Что происходит сейчас</h3>
+      ${currentRows ? `<ul class="pipeline-report-list">${currentRows}</ul>` : `<div>Сейчас ни один этап не выполняется.${nextTask ? ` Следующая проверка: ${esc(nextTask.title || 'задача')} — ${new Date(nextTask.scheduled_at).toLocaleString('ru-RU')}.` : ' Ближайший запуск не найден.'}</div>`}
+      <div class="pipeline-report-meta">Незавершённых ошибок за выбранный период: ${pipelineReportNumber(summary.errors)}.</div>
+    </div>
+    <div class="pipeline-report-section"><h3>Что сделано за ${esc(periodLabel)}</h3>
+    <div class="pipeline-report-grid">
+      <div class="pipeline-metric"><div class="pipeline-metric-label">Влито PR / закрыто issues</div><div class="pipeline-metric-value">${deliveryExact ? `${pipelineReportNumber(merged.length)} / ${pipelineReportNumber(closed.length)}` : 'Ещё не проверено'}</div><div class="pipeline-metric-note">${deliveryExact ? `всего событий: ${pipelineReportNumber(delivered)}` : 'Нажмите «Уточнить результат в GitHub». Это не ноль выполненных работ.'}</div></div>
+      ${categories}
+    </div>
+    <div class="pipeline-flow-row"><b>Итоги запусков</b><div class="pipeline-flow-bar" role="img" aria-label="${escAttr(reportFlow.total ? reportFlowSummary : 'Завершённых запусков нет')}">${reportFlowSegments}</div><span class="num">${runsLabel(reportFlow.total)}</span></div>
+    <div class="pipeline-flow-legend"><span style="--legend-color:var(--green)">готово</span><span style="--legend-color:var(--muted)">пусто</span><span style="--legend-color:var(--text2)">без изменений</span><span style="--legend-color:var(--accent)">перевыбор</span><span style="--legend-color:var(--yellow)">нужен человек / безопасный отказ</span><span style="--legend-color:var(--red)">ошибка</span></div>
+    <div class="pipeline-report-meta">Зелёный сегмент означает результат этапа «готово», а не влитый PR. «Пусто» и ошибки сохраняются в локальной истории; ожидание WIP или API показано ниже как причина, а не как завершённый запуск.</div>
+    <div class="pipeline-report-meta">Закрытые issues и влитые PR — отдельные события, не сумма выполненных задач. Категории относятся только к влитым PR; без подтверждённой классификации результат не записывается в продукт.</div>
+    ${pipelineReportDeliveryNotice(delivery, periodLabel)}
+    <div class="pipeline-report-section"><h3>Результат в GitHub</h3>${deliveryRows ? `<ul class="pipeline-report-list">${deliveryBody}</ul>` : deliveryBody}</div>
+    </div>
+    <div class="pipeline-report-section"><h3>Что нужно от вас</h3>
+      <div class="pipeline-report-meta">По последней проверке GitHub${coverage.fresh === false ? ' (устаревшие данные)' : ''}. Перечислены решения, а не количество запусков.</div>
+      ${decisions.available ? (decisionRows ? `<div>Ждут разрешения на слияние: ${(decisions.waiting_ship || []).length}. Другие решения: ${(decisions.human_waiting || []).length}.</div><ul class="pipeline-report-list">${decisionRows}</ul>${remainingDecisions ? `<details><summary>Ещё ${decisionItems.length - 5} решений</summary><ul class="pipeline-report-list">${remainingDecisions}</ul></details>` : ''}` : '<div>В последней диагностике нет ожидающих решений.</div>') : '<div>Список решений ещё не получен. Посмотрите вкладку «Состояние» и обновите диагностику.</div>'}
+    </div>
+    <div class="pipeline-report-section"><h3>Ждём CI</h3>
+      ${ciRows ? `<ul class="pipeline-report-list">${ciRows}</ul>` : '<div>Нет подтверждённого списка ожиданий CI. Это не означает, что все проверки зелёные.</div>'}
+    </div>
+    <div class="pipeline-report-section"><h3>Почему задачи ждут</h3>
+      ${currentWaitRows ? `<ul class="pipeline-report-list">${currentWaitRows}</ul>` : '<div>У текущих запусков нет записанной причины ожидания.</div>'}
+      ${board.available ? (blockedRows ? `<ul class="pipeline-report-list">${blockedRows}</ul>` : '<div>В свежей диагностике нет дополнительных предупреждений.</div>') : '<div>Свежая полная диагностика недоступна; причины ожидания пока неизвестны.</div>'}
+      <div class="pipeline-report-meta">Предупреждение не означает остановку всего конвейера. Решения человека перечислены отдельно выше.</div>
+    </div>
+    <details class="pipeline-report-section"><summary>Технические подробности: очереди, запуски и расход</summary>
+    <div class="pipeline-report-meta">${esc(coverageText)}.${esc(tailText)}${esc(membershipText)}${esc(attentionText)}</div>
+    ${coverage.complete ? '' : `<div class="pipeline-report-notice warn">Выводы предварительные: локальная история ещё не покрывает весь выбранный период.${movementPeriodText ? ` Движение посчитано только за ${esc(movementPeriodText)}.` : ''} Прочерк означает отсутствие данных, а не ноль.</div>`}
+    <div class="pipeline-report-grid">
+      <div class="pipeline-metric"><div class="pipeline-metric-label">Очередь сейчас / Δ</div><div class="pipeline-metric-value">${pipelineReportNumber(summary.backlog_current)} / ${pipelineReportSigned(summary.backlog_delta)}</div><div class="pipeline-metric-note">остаток и изменение за период</div></div>
+      <div class="pipeline-metric"><div class="pipeline-metric-label">Вошло / вышло / перешло</div><div class="pipeline-metric-value">${pipelineReportNumber(summary.entered)} / ${pipelineReportNumber(summary.exited)} / ${pipelineReportNumber(summary.moved)}</div><div class="pipeline-metric-note">движение между снимками очередей</div></div>
+      <div class="pipeline-metric"><div class="pipeline-metric-label">Запуски с итогом «готово»</div><div class="pipeline-metric-value">${pipelineReportNumber(summary.useful_runs)} из ${pipelineReportNumber(summary.runs)}</div><div class="pipeline-metric-note">Это не число доставленных изменений. Пусто или без изменений: ${pipelineReportNumber(emptyRuns)}</div></div>
+      <div class="pipeline-metric"><div class="pipeline-metric-label">Требуют внимания</div><div class="pipeline-metric-value">${pipelineReportNumber(summary.attention == null ? attention.length : summary.attention)}</div><div class="pipeline-metric-note">не восстановлено после прогонов: ${pipelineReportNumber(summary.errors)}</div></div>
+      <div class="pipeline-metric"><div class="pipeline-metric-label">Токены</div><div class="pipeline-metric-value">${esc(tokenValue)}</div><div class="pipeline-metric-note">измерено запусков: ${pipelineReportNumber(tokens.known_runs)} из ${pipelineReportNumber(runs.total)}</div></div>
+      <div class="pipeline-metric"><div class="pipeline-metric-label">Стоимость</div><div class="pipeline-metric-value">${esc(costValue)}</div><div class="pipeline-metric-note">измерено запусков: ${pipelineReportNumber(cost.known_runs)} из ${pipelineReportNumber(runs.total)}</div></div>
+    </div>
+    <div class="pipeline-report-section"><h3>Движение по этапам</h3>
+      <div class="pipeline-report-meta">Этап, требующий внимания: ${bottleneck}</div>
+      ${queueRows ? `<table class="pipeline-report-queues"><thead><tr><th>Этап</th><th class="num">Сейчас</th><th class="num">Δ</th><th class="num">Вышло</th></tr></thead><tbody>${queueRows}</tbody></table>` : '<div class="pipeline-report-meta">Нет данных об очередях.</div>'}
+    </div>
+    <div class="pipeline-report-section"><h3>Запуски</h3>
+      <div class="pipeline-report-meta">готово к действию ${pipelineReportNumber(verdicts.ready)} · пусто ${pipelineReportNumber(verdicts.empty)} · без изменений ${pipelineReportNumber(verdicts.no_change)} · перевыбор ${pipelineReportNumber(verdicts.stale)} · безопасный отказ ${pipelineReportNumber(verdicts.safe_refusal)} · решение человека ${pipelineReportNumber(verdicts.human)}</div>
+      <div class="pipeline-report-meta">не смог ${pipelineReportNumber(verdicts.unable)} · упало ${pipelineReportNumber(verdicts.failed)} · активных ошибок ${pipelineReportNumber(Number(errors.unresolved_unable || 0) + Number(errors.unresolved_failed || 0))} · восстановлено ${pipelineReportNumber(Number(errors.recovered_unable || 0) + Number(errors.recovered_failed || 0))}</div>
+    </div>
+    <div class="pipeline-report-meta">«Готово к действию» — результат этапа, не обязательно влитый PR. Токены включают повторно переданный контекст; это не процент лимита подписки.</div>
+    <div class="pipeline-report-section"><h3>Технические метки и хвосты</h3><div class="pipeline-report-meta">Здесь могут быть уже влитые PR с меткой ship. Это не список ваших обязательных действий.</div>${attentionRows ? `<ul class="pipeline-report-list">${attentionRows}</ul>` : '<div class="pipeline-report-meta">В текущем снимке нет элементов с метками ship, needs-decision или hold.</div>'}</div>
+    </details>`;
+  } catch(e) {
+    if (requestId !== pipelineReportRequestId) return;
+    box.innerHTML = `<div style="color:var(--red);margin-bottom:10px">Отчёт недоступен: ${esc(e.message)}</div>`;
+  }
+}
+
+function pipelineStageFocus(queues) {
+  const pending = (queues || []).filter(q => Number(q.backlog) > 0);
+  const stopped = pending.filter(q => q.parallel_capacity != null && Number(q.parallel_capacity) === 0);
+  const working = pending.filter(q => Number(q.parallel_capacity) > 0);
+  const pressure = q => {
+    const eta = Number(q.eta_hours);
+    if (q.eta_hours != null && Number.isFinite(eta)) return eta;
+    const work = Number(q.runs_needed ?? q.backlog);
+    return Number.isFinite(work) ? work / Number(q.parallel_capacity) : 0;
+  };
+  working.sort((a, b) => pressure(b) - pressure(a));
+  return {stopped, workingBottleneck: working[0] || null};
+}
+
+function pipelineWaitReasons(data) {
+  const waits = [];
+  const add = (id, title, status, error, retryAt, taskId) => {
+    if (!['pending', 'rate_limited'].includes(status) || !error) return;
+    const reason = String(error) + (status === 'rate_limited' && retryAt
+      ? ` · следующая попытка: ${retryAt}` : '');
+    if (waits.some(wait => taskId && wait.task_id === taskId
+        || wait.title === title && wait.reason === reason)) return;
+    waits.push({id, title, reason, task_id:taskId});
+  };
+  for (const queue of (data.queues || [])) {
+    const replicas = queue.series_replicas?.length ? queue.series_replicas : [queue];
+    for (const task of replicas) {
+      if (Number(queue.backlog) > 0 || task.task_status === 'rate_limited') {
+        add(queue.id, task.title || queue.title, task.task_status,
+          task.task_error, task.task_next_run_at, task.task_id);
+      }
+    }
+  }
+  for (const task of (data.current?.tasks || [])) {
+    add(String(task.task_id || ''), task.title, task.status,
+      task.error, task.scheduled_at, task.task_id);
+  }
+  const owner = (data.diagnostics && data.diagnostics.integration_owner)
+    || (data.current && data.current.integration_owner);
+  const reviewStages = ['integration-review', 'legacy-integration-review'];
+  if (owner && reviewStages.includes(owner.stage) && !data.cache?.stale && data.coverage?.fresh !== false && !waits.some(wait => wait.id === 'merge')) {
+    waits.push({id:'merge', title:'Слияние', reason:`PR #${owner.number} ожидает независимого ревью нового HEAD`});
+  }
+  return waits;
+}
+
+function pipelineRunBreakdown(queue) {
+  const runs = queue.runs_5h || {};
+  const count = key => Math.max(0, Number(runs[key] || 0));
+  const parts = [
+    {key:'ready', label:'Готово', count:count('ready')},
+    {key:'empty', label:'Пусто', count:count('empty')},
+    {key:'no_change', label:'Без изменений', count:count('no_change')},
+    {key:'stale', label:'Перевыбор', count:count('stale')},
+    {key:'safe_refusal', label:'Безопасный отказ', count:count('safe_refusal')},
+    {key:'human', label:'Нужен человек', count:count('human')},
+    {key:'error', label:'Не смог / упал', count:count('unable') + count('failed')},
+  ];
+  const known = parts.reduce((sum, part) => sum + part.count, 0);
+  const total = Math.max(known, count('runs'));
+  if (total > known) parts.push({key:'other', label:'Другой итог', count:total - known});
+  return {total, parts};
+}
+
+function runsLabel(count) {
+  const n = Math.abs(Number(count) || 0);
+  const tens = n % 100;
+  const last = n % 10;
+  const word = tens >= 11 && tens <= 14 ? 'запусков'
+    : last === 1 ? 'запуск'
+    : last >= 2 && last <= 4 ? 'запуска' : 'запусков';
+  return `${n} ${word}`;
+}
+
 async function loadPipelineInsights(profile, refresh=false) {
   const box = document.getElementById('pipelineInsights');
   box.innerHTML = refresh
@@ -2656,7 +3569,7 @@ async function loadPipelineInsights(profile, refresh=false) {
     const duration = seconds => seconds == null ? '—' : seconds < 3600 ? `${Math.round(seconds/60)} мин` : `${(seconds/3600).toFixed(1)} ч`;
     const historyNote = h5.complete ? 'за последние 5 часов' : `история ${h5.coverage_hours} из 5 ч`;
     const runs = h5.runs;
-    const outcomes = data.outcomes || {safe_deferrals_now:0, stale_reselections_5h:0, real_errors_5h:0};
+    const outcomes = data.outcomes || {safe_deferrals_now:0, stale_reselections_5h:0, safe_refusals_5h:0, real_errors_5h:0};
     const activeUnable = runs.unresolved_unable ?? runs.unable;
     const activeFailed = runs.unresolved_failed ?? runs.failed;
     const recoveredRuns = (runs.recovered_unable || 0) + (runs.recovered_failed || 0);
@@ -2739,7 +3652,17 @@ async function loadPipelineInsights(profile, refresh=false) {
     const coreColor = coreShare == null ? 'var(--muted)' : coreShare <= 0.05 ? 'var(--red)' : coreShare <= 0.2 ? 'var(--yellow)' : '';
     const deltaRateByQueue = h5.queue_deltas_per_hour || {};
     const throughputRateByQueue = h5.queue_throughput_per_hour || {};
-    const bottleneckQueue = (data.queues || []).find(q => q.id === data.bottleneck);
+    const stageFocus = pipelineStageFocus(data.queues);
+    const workingBottleneck = stageFocus.workingBottleneck;
+    const waits = pipelineWaitReasons(data);
+    const waitRows = waits.map(wait => `<li><b>${esc(wait.title)}</b> — ${esc(wait.reason)}</li>`).join('');
+    const flowRows = (data.queues || []).map(queue => {
+      const {total, parts} = pipelineRunBreakdown(queue);
+      const segments = parts.filter(part => part.count).map(part =>
+        `<span class="${part.key}" style="width:${(100 * part.count / total).toFixed(2)}%" title="${escAttr(part.label)}: ${part.count}"></span>`).join('');
+      const summary = parts.filter(part => part.count).map(part => `${part.label} ${part.count}`).join(', ');
+      return `<div class="pipeline-flow-row"><b>${esc(queue.title)}</b><div class="pipeline-flow-bar" role="img" aria-label="${escAttr(total ? summary : 'Завершённых запусков нет')}">${segments}</div><span class="num">${total ? runsLabel(total) : 'нет запусков'}</span></div>`;
+    }).join('');
     const diagnostics = data.diagnostics;
     const runtime = data.runtime || {};
     const healthLabel = data.health.label === 'нужна проверка' ? 'есть ожидания' : data.health.label;
@@ -2758,7 +3681,7 @@ async function loadPipelineInsights(profile, refresh=false) {
       const lastLine = last && last.at
         ? `последний #${last.task_id}: ${timeAgo(last.at)} · ${last.verdict || last.status}${lastTokens}`
         : 'завершённых запусков нет';
-      const stageLine = `5 ч: ${stageRuns.runs || 0} запусков · действий ${stageRuns.ready || 0} · холостых ${stageRuns.no_change || 0} · фактический выход ${perHour(throughputRateByQueue[q.id])}`;
+      const stageLine = `5 ч: ${runsLabel(stageRuns.runs || 0)} · действий ${stageRuns.ready || 0} · холостых ${stageRuns.no_change || 0} · фактический выход ${perHour(throughputRateByQueue[q.id])}`;
       const route = q.execution || {configured:'skill',effective:'skill'};
       const routeLine = `маршрут: ${route.configured}${route.configured!==route.effective ? ` → ${route.effective}` : ''}${route.reason && route.effective!=='tool' ? ` · ${route.reason}` : ''}`;
       const wake = q.wake;
@@ -2776,9 +3699,10 @@ async function loadPipelineInsights(profile, refresh=false) {
         `#${replica.series_id} ${replica.task_status || (replica.paused ? 'paused' : replica.broken ? 'broken' : 'idle')} · ${replica.interval || 'без интервала'} · ${replica.working_dir || 'working_dir не задан'}`
       );
       const replicaLine = `${replicaSummary}${replicaIssues}${replicaLines.length ? ` · ${replicaLines.join(' | ')}` : ''}`;
-      const bottleneck = data.bottleneck===q.id ? 'bottleneck' : '';
+      const stopped = stageFocus.stopped.some(item => item.id === q.id);
+      const bottleneck = stopped || workingBottleneck?.id === q.id ? 'bottleneck' : '';
       const capacity = `${q.capacity} × ${q.replicas_active || 0} = ${q.parallel_capacity}`;
-      return `<tr class="${bottleneck}"><td class="insights-stage-title">${data.bottleneck===q.id?'⚠ ':''}${esc(q.title)}${q.replica_count>1?` ×${q.replica_count}`:''}</td><td class="num">${q.backlog == null ? '—' : q.backlog}</td><td class="num">${h5.complete?perHour(deltaRateByQueue[q.id] ?? 0):'—'}</td><td class="num">${capacity}</td><td class="num">${q.runs_needed == null ? '—' : q.runs_needed}</td><td>${duration(q.avg_duration_seconds)}</td><td>${q.eta_hours == null ? '—' : q.eta_hours+' ч'}</td><td>${age(q.age.oldest_hours)}</td><td>${esc(q.interval || 'нет серии')}</td><td class="insights-recommendation">${esc(q.recommendation || '—')}</td></tr>
+      return `<tr class="${bottleneck}"><td class="insights-stage-title">${stopped?'⏸ ':workingBottleneck?.id===q.id?'⚠ ':''}${esc(q.title)}${q.replica_count>1?` ×${q.replica_count}`:''}</td><td class="num">${q.backlog == null ? '—' : q.backlog}</td><td class="num">${h5.complete?perHour(deltaRateByQueue[q.id] ?? 0):'—'}</td><td class="num">${capacity}</td><td class="num">${q.runs_needed == null ? '—' : q.runs_needed}</td><td>${duration(q.avg_duration_seconds)}</td><td>${q.eta_hours == null ? '—' : q.eta_hours+' ч'}</td><td>${age(q.age.oldest_hours)}</td><td>${esc(q.interval || 'нет серии')}</td><td class="insights-recommendation">${esc(q.recommendation || '—')}</td></tr>
         <tr class="insights-stage-detail ${bottleneck}"><td colspan="10"><div class="insights-stage-meta"><span class="prov-cmd" title="${escAttr(last?.summary || '')}">${esc(lastLine)}</span><span class="prov-cmd">${esc(stageLine)}</span><span class="prov-cmd">${esc(routeLine)}</span><span class="prov-cmd" style="${replicaStatus.valid?'':'color:var(--red)'}">${esc(replicaLine)}</span>${wakeLine?`<span class="prov-cmd">${esc(wakeLine)}</span>`:''}${cadenceLine?`<span class="prov-cmd">${esc(cadenceLine)}</span>`:''}</div></td></tr>`;
     }).join('');
     const priorityHtml = data.priority_control ? `<details style="margin-top:12px" open>
@@ -2814,11 +3738,12 @@ async function loadPipelineInsights(profile, refresh=false) {
         <div class="pipeline-metric"><div class="pipeline-metric-label">Снимок GitHub</div><div class="pipeline-metric-value" style="${cacheColor ? `color:${cacheColor}` : ''}">${esc(cacheValue)}</div><div class="pipeline-metric-note">${esc(cacheNote)}</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Backlog сейчас</div><div class="pipeline-metric-value">${data.backlog_total == null ? '—' : data.backlog_total}</div><div class="pipeline-metric-note">Δ/ч: ${h5.complete?perHour(h5.backlog_delta_per_hour):'копится история'}</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Вход / выход</div><div class="pipeline-metric-value">${h5.complete?`${perHour(h5.entered_per_hour)} / ${perHour(h5.exited_per_hour)}`:'—'}</div><div class="pipeline-metric-note">фактическая скорость · ${historyNote}</div></div>
-        <div class="pipeline-metric"><div class="pipeline-metric-label">Узкое место</div><div class="pipeline-metric-value">${bottleneckQueue?esc(bottleneckQueue.title):'нет'}</div><div class="pipeline-metric-note">${bottleneckQueue&&bottleneckQueue.eta_hours!=null?`ETA ${bottleneckQueue.eta_hours} ч · очередь ${bottleneckQueue.backlog}`:'активной очереди нет'}</div></div>
+        <div class="pipeline-metric"><div class="pipeline-metric-label">Остановленные этапы</div><div class="pipeline-metric-value">${stageFocus.stopped.length ? stageFocus.stopped.map(q => esc(q.title)).join(', ') : 'нет'}</div><div class="pipeline-metric-note">${stageFocus.stopped.length ? `есть работа, но нет активных реплик: ${stageFocus.stopped.map(q => `${esc(q.title)} — ${q.backlog}`).join('; ')}` : 'все очереди с работой имеют рабочую ёмкость'}</div></div>
+        <div class="pipeline-metric"><div class="pipeline-metric-label">Самая длинная очередь по ETA</div><div class="pipeline-metric-value">${workingBottleneck?esc(workingBottleneck.title):'нет'}</div><div class="pipeline-metric-note">${workingBottleneck ? `очередь ${workingBottleneck.backlog}${workingBottleneck.eta_hours != null ? ` · ETA ${workingBottleneck.eta_hours} ч` : ' · ETA пока неизвестно'}; причина ожидания показана ниже` : 'очередей с работой и активными репликами нет'}</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Переходы / churn</div><div class="pipeline-metric-value">${h5.complete?`${h5.transitions} / ${h5.churn_items}`:'—'}</div><div class="pipeline-metric-note">между очередями / 3+ состояний</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Возраст p90 / max</div><div class="pipeline-metric-value">${age(data.age.p90_hours)} / ${age(data.age.oldest_hours)}</div><div class="pipeline-metric-note">текущие элементы</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Прогоны 5 ч</div><div class="pipeline-metric-value">${runs.runs}</div><div class="pipeline-metric-note">с действием ${runs.ready} · без действий ${runs.no_change || 0} · пусто ${runs.empty} · перевыбор ${runs.stale || 0}</div></div>
-        <div class="pipeline-metric"><div class="pipeline-metric-label">Безопасные ожидания / ошибки</div><div class="pipeline-metric-value">${outcomes.safe_deferrals_now + outcomes.stale_reselections_5h} / ${outcomes.real_errors_5h}</div><div class="pipeline-metric-note">ожидают сейчас ${outcomes.safe_deferrals_now} · stale-перевыборов 5 ч ${outcomes.stale_reselections_5h} · активных ошибок ${outcomes.real_errors_5h}</div></div>
+        <div class="pipeline-metric"><div class="pipeline-metric-label">Безопасные ожидания / ошибки</div><div class="pipeline-metric-value">${outcomes.safe_deferrals_now + outcomes.stale_reselections_5h + outcomes.safe_refusals_5h} / ${outcomes.real_errors_5h}</div><div class="pipeline-metric-note">ожидают сейчас ${outcomes.safe_deferrals_now} · stale-перевыборов 5 ч ${outcomes.stale_reselections_5h} · безопасных отказов 5 ч ${outcomes.safe_refusals_5h} · активных ошибок ${outcomes.real_errors_5h}</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Требуют внимания</div><div class="pipeline-metric-value">${runs.human + activeUnable + activeFailed}</div><div class="pipeline-metric-note">человек ${runs.human} · не смог ${activeUnable} · упало ${activeFailed}${recoveredRuns ? ` · восстановлено ${recoveredRuns}` : ''}</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Последнее REVIEW</div><div class="pipeline-metric-value">${esc(lastReviewValue)}</div><div class="pipeline-metric-note">${esc(lastReviewNote)}</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Токены 5 ч</div><div class="pipeline-metric-value">${esc(tokenValue)}</div><div class="pipeline-metric-note">измерено запусков: ${runs.tokens_known_runs || 0} из ${runs.runs}</div></div>
@@ -2829,6 +3754,15 @@ async function loadPipelineInsights(profile, refresh=false) {
         <div class="pipeline-metric"><div class="pipeline-metric-label">Worker</div><div class="pipeline-metric-value">${runtime.state==='online'?'online':'offline'}</div><div class="pipeline-metric-note">${runtime.age_seconds == null ? 'heartbeat отсутствует' : 'heartbeat '+runtime.age_seconds+' сек назад'}</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">GitHub REST API</div><div class="pipeline-metric-value" style="${coreColor ? `color:${coreColor}` : ''}">${esc(githubLimitText('core'))}</div><div class="pipeline-metric-note">${esc(rateObserved)} · Search ${esc(githubLimitText('search'))} · GraphQL ${esc(githubLimitText('graphql'))}</div></div>
         ${budgetMetric}
+      </div>
+      <div class="pipeline-report-section"><h3>Почему этапы ждут прямо сейчас</h3>
+        ${waitRows ? `<ul class="pipeline-report-list">${waitRows}</ul>` : '<div class="pipeline-report-meta">Нет записанной причины ожидания. Это не означает, что очередь пуста.</div>'}
+        <div class="pipeline-report-meta">Здесь показана причина последней отложенной попытки, а не оценка размера очереди.</div>
+      </div>
+      <div class="pipeline-report-section"><h3>Итоги запусков по этапам · 5 часов</h3>
+        ${flowRows}
+        <div class="pipeline-flow-legend"><span style="--legend-color:var(--green)">готово</span><span style="--legend-color:var(--muted)">пусто</span><span style="--legend-color:var(--text2)">без изменений</span><span style="--legend-color:var(--accent)">перевыбор</span><span style="--legend-color:var(--yellow)">нужен человек / безопасный отказ</span><span style="--legend-color:var(--red)">ошибка</span></div>
+        <div class="pipeline-report-meta">«Готово» здесь — итог запуска, не обязательно влитый PR. Отложенные попытки (WIP, бюджет API) не становятся «ПУСТО» и показаны отдельно выше. Данные — из локальной базы PromptPilot.</div>
       </div>
       ${diagnosticHtml}
       <table class="insights-table"><colgroup><col class="insights-col-stage"><col class="insights-col-small"><col class="insights-col-small"><col class="insights-col-capacity"><col class="insights-col-capacity"><col class="insights-col-duration"><col class="insights-col-small"><col class="insights-col-oldest"><col class="insights-col-interval"><col class="insights-col-recommendation"></colgroup><thead><tr><th>Этап</th><th class="num">Очередь</th><th class="num">Δ/ч</th><th class="num">За реплику × активные</th><th class="num">Прогонов</th><th>Средний запуск</th><th>ETA</th><th>Самый старый</th><th>Интервал</th><th>Рекомендация</th></tr></thead><tbody>${rows}</tbody></table>
@@ -2893,12 +3827,191 @@ async function seriesAction(id, action, confirmEnd=false) {
 
 function closeSchedule() { document.getElementById('schedModal').classList.remove('open'); }
 
+let providerCatalog = [];
+function catalogStatus(text) { document.getElementById('pcStatus').textContent = text; }
+async function loadCatalog() {
+  try {
+    providerCatalog = (await fetchJSON(`${API}/provider-catalog`)).items;
+    const select = document.getElementById('pcCLI');
+    select.replaceChildren();
+    for (const item of providerCatalog) {
+      const option = document.createElement('option');
+      option.value = item.id;
+      option.textContent = `${item.title}${item.installed ? ' ✓' : ''}`;
+      select.appendChild(option);
+    }
+    catalogSelect();
+  } catch (err) { catalogStatus(err.message); }
+}
+function catalogSelect() {
+  const item = providerCatalog.find(p => p.id === document.getElementById('pcCLI').value);
+  document.getElementById('pcBase').value = item?.default_base || '';
+  for (const id of ['pcKey', 'pcModel', 'pcTitle']) document.getElementById(id).value = '';
+  document.getElementById('pcModels').replaceChildren();
+  catalogStatus(item?.desc || '');
+}
+function catalogBody() {
+  return {base: document.getElementById('pcBase').value.trim(),
+          key: document.getElementById('pcKey').value,
+          model: document.getElementById('pcModel').value.trim(),
+          title: document.getElementById('pcTitle').value.trim()};
+}
+async function catalogPost(action) {
+  const id = document.getElementById('pcCLI').value;
+  return fetchJSON(`${API}/provider-catalog/${encodeURIComponent(id)}/${action}`, {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(catalogBody())});
+}
+async function catalogInstall() {
+  catalogStatus('Установка CLI…');
+  try {
+    const result = await catalogPost('install');
+    catalogStatus(result.ok ? 'CLI установлен. Укажите адрес и ключ.' : 'Установка завершилась с ошибкой. Проверьте зависимости CLI.');
+  } catch (err) { catalogStatus(err.message); }
+}
+async function catalogModels() {
+  catalogStatus('Получаю модели…');
+  try {
+    const result = await catalogPost('models');
+    const select = document.getElementById('pcModels');
+    select.replaceChildren();
+    for (const model of result.models) {
+      const option = document.createElement('option');
+      option.value = model;
+      option.textContent = model;
+      select.appendChild(option);
+    }
+    document.getElementById('pcModel').value = result.models[0] || '';
+    catalogStatus('Выберите модель и создайте помощника.');
+  } catch (err) { catalogStatus(err.message); }
+}
+async function catalogCreate() {
+  try {
+    const result = await catalogPost('create');
+    for (const id of ['pcKey', 'pcBase', 'pcModel', 'pcTitle']) document.getElementById(id).value = '';
+    document.getElementById('pcModels').replaceChildren();
+    await renderProvList();
+    await loadProviders();
+    const status = document.getElementById('pcStatus');
+    status.textContent = `Создан ${result.label}. `;
+    const probe = document.createElement('button');
+    probe.className = 'btn btn-sm';
+    probe.textContent = 'Проверить связь';
+    probe.addEventListener('click', async () => {
+      try {
+        const checked = await fetchJSON(`${API}/providers/${encodeURIComponent(result.name)}/probe`, {
+          method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
+        catalogStatus(checked.ok ? 'Связь и вердикт проверены.' : 'Проверка не пройдена: ' + checked.issues.join('; '));
+      } catch (err) { catalogStatus(err.message); }
+    });
+    status.appendChild(probe);
+  } catch (err) { catalogStatus(err.message); }
+}
+
 async function openProviders() {
   document.getElementById('provModal').classList.add('open');
   await renderProvList();
   await renderMachineList();
+  await loadCatalog();
 }
 function closeProviders() { document.getElementById('provModal').classList.remove('open'); }
+
+// --- 1С: доработка обработок ---
+const EPF_STATUS_RU = { queued: 'в работе', building: 'сборка…', built: 'собрана', build_failed: 'сбой сборки' };
+
+function openEpf() {
+  document.getElementById('epfModal').classList.add('open');
+  loadEpfStatus();
+  loadEpfBases();
+}
+function closeEpf() { document.getElementById('epfModal').classList.remove('open'); }
+
+async function loadEpfStatus() {
+  const s = await fetchJSON(`${API}/epf/status`);
+  const el = document.getElementById('epfStatus');
+  if (s.available) {
+    el.innerHTML = `✅ Платформа: <code>${esc(s.v8_path)}</code> · баз просканировано: <b>${s.bases_count}</b>`;
+    document.getElementById('epfReworkBtn').disabled = false;
+  } else {
+    el.innerHTML = `❌ 1cv8.exe не найден — укажите путь в настройках ниже (или переменной PP_1C_EXE_PATH).`;
+    document.getElementById('epfReworkBtn').disabled = true;
+  }
+  const hint = document.getElementById('epfEnvHint');
+  hint.textContent = s.env_keys.length
+    ? `Задано переменными окружения (форма их не перекрывает): ${s.env_keys.join(', ')}`
+    : '';
+  const c = s.config || {}, p = c.presets || {};
+  document.getElementById('epfExe').value = c.exe_path || '';
+  document.getElementById('epfBasesRoot').value = c.bases_root || '';
+  document.getElementById('epfBasePath').value = c.base_path || '';
+  document.getElementById('epfUt11').value = p.ut11 || '';
+  document.getElementById('epfBp3').value = p.bp3 || '';
+  document.getElementById('epfErp').value = p.erp || '';
+  document.getElementById('epfUnf').value = p.unf || '';
+  document.getElementById('epfAa').value = p.aa || '';
+  document.getElementById('epfSkills').value = c.skills_dir || '';
+}
+
+async function loadEpfBases() {
+  const bases = await fetchJSON(`${API}/epf/bases`);
+  document.getElementById('epfBase').innerHTML = bases.map(b =>
+    `<option value="${escAttr(b.key)}"${b.missing ? ' disabled' : ''}>${esc(b.label)}${b.missing ? ' (не найдена)' : ''}</option>`
+  ).join('');
+}
+
+async function epfRework(event) {
+  event.preventDefault();
+  const msg = document.getElementById('epfReworkMsg');
+  const btn = document.getElementById('epfReworkBtn');
+  const file = document.getElementById('epfFile').files[0];
+  if (!file) { msg.textContent = 'Выберите файл .epf/.erf'; return false; }
+  msg.textContent = '⏳ Декомпиляция (может занять несколько минут)...';
+  btn.disabled = true;
+  try {
+    const fd = new FormData();
+    fd.append('file', file);
+    fd.append('prompt', document.getElementById('epfPrompt').value);
+    fd.append('base_key', document.getElementById('epfBase').value);
+    const res = await fetchJSON(`${API}/epf/rework`, { method: 'POST', body: fd });
+    msg.innerHTML = `✅ Задача <a href="#" onclick="toggleTask(${res.task.id});closeEpf();return false">#${res.task.id}</a> поставлена в очередь${res.warnings && res.warnings.length ? ' (⚠ ' + esc(res.warnings.join('; ')) + ')' : ''}.`;
+    document.getElementById('epfFile').value = '';
+    document.getElementById('epfPrompt').value = '';
+    await loadTasks();
+  } catch (e) {
+    msg.textContent = '❌ ' + (e.message || e);
+  } finally {
+    btn.disabled = false;
+  }
+  return false;
+}
+
+async function epfSaveSettings(event) {
+  event.preventDefault();
+  const msg = document.getElementById('epfSetMsg');
+  try {
+    const s = await fetchJSON(`${API}/epf/settings`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        exe_path: document.getElementById('epfExe').value,
+        bases_root: document.getElementById('epfBasesRoot').value,
+        base_path: document.getElementById('epfBasePath').value,
+        ut11: document.getElementById('epfUt11').value,
+        bp3: document.getElementById('epfBp3').value,
+        erp: document.getElementById('epfErp').value,
+        unf: document.getElementById('epfUnf').value,
+        aa: document.getElementById('epfAa').value,
+        skills_dir: document.getElementById('epfSkills').value,
+      }),
+    });
+    msg.textContent = s.available ? '✅ Сохранено, платформа найдена' : 'Сохранено, но 1cv8.exe пока не найден';
+    await loadEpfStatus();
+    await loadEpfBases();
+  } catch (e) {
+    msg.textContent = '❌ ' + (e.message || e);
+  }
+  return false;
+}
 
 let provManageData = {};
 
@@ -2915,7 +4028,7 @@ async function renderProvList() {
       : esc(p.cmd))
       + (p.models && p.models.length ? `<br>модели: ${esc(p.models.join(', '))}` : '')
       + (p.effort ? `<br>эффорт: ${esc(p.effort)}` : '');
-    const canDelete = p.source !== 'builtin';
+    const canDelete = p.source === 'providers.json';
     return `<div class="prov-row${(!p.available || p.hidden) ? ' dim' : ''}">
       <span class="prov-name">${esc(name)}</span>${badges.join('')}
       <div class="prov-cmd">${esc(p.description || '')}</div>
@@ -3086,14 +4199,18 @@ async function refresh() {
   if (refreshInFlight) return;
   refreshInFlight = true;
   try {
-    const requests = [loadStats()];
-    // Keep the list live even with a card expanded (a running task used to
-    // freeze once opened), but don't re-render under an unsaved inline edit.
-    const ae = document.activeElement;
-    if (!(ae && ae.id && (ae.id.startsWith('note-') || ae.id.startsWith('ed-')))) {
-      requests.push(loadTasks());
+    // Don't re-render out from under a user who is reading a long
+    // prompt/report (scroll-jump fix).
+    if (Date.now() >= uiReadingPause.tasks) {
+      const requests = [loadStats()];
+      // Keep the list live even with a card expanded (a running task used to
+      // freeze once opened), but don't re-render under an unsaved inline edit.
+      const ae = document.activeElement;
+      if (!(ae && ae.id && (ae.id.startsWith('note-') || ae.id.startsWith('ed-')))) {
+        requests.push(loadTasks());
+      }
+      await Promise.allSettled(requests);
     }
-    await Promise.allSettled(requests);
   } finally {
     refreshInFlight = false;
   }
@@ -3199,6 +4316,12 @@ function updateKeepPane() {
   // в target-режиме директория и permissions не применимы — прячем
   document.getElementById('workdirLabel').style.display = prov.session_target ? 'none' : 'flex';
   document.getElementById('skipPermsLabel').style.display = prov.session_target ? 'none' : 'flex';
+  // Only the rights this provider can actually be confined to are offered.
+  const rightsSel = document.getElementById('rightsInput');
+  const supportedRights = prov.rights || [];
+  [...rightsSel.options].forEach(o => { o.disabled = o.value !== '' && !supportedRights.includes(o.value); });
+  if (rightsSel.selectedOptions[0] && rightsSel.selectedOptions[0].disabled) rightsSel.value = '';
+  document.getElementById('rightsLabel').style.display = prov.session_target ? 'none' : 'flex';
   document.getElementById('providerModeHint').style.display = prov.session_target ? '' : 'none';
   updateWorktree();
   if (prov.session_target) loadHerdrAgents();
@@ -3340,22 +4463,86 @@ function selectSkill(name) {
 }
 
 // --- Load projects into dir select ---
+const RECENT_WORKDIRS_KEY = 'promptpilot.recent-workdirs';
+const SKIP_PERMISSIONS_KEY = 'promptpilot.skip-permissions';
+
+function restoreSkipPermissions() {
+  const checkbox = document.getElementById('skipPermissions');
+  checkbox.checked = false;
+  try { checkbox.checked = localStorage.getItem(SKIP_PERMISSIONS_KEY) === 'true'; }
+  catch (_) { /* A new or storage-blocked browser keeps the default off. */ }
+}
+
+function rememberSkipPermissions() {
+  if (document.getElementById('skipPermsLabel').style.display === 'none') return;
+  try {
+    localStorage.setItem(SKIP_PERMISSIONS_KEY,
+      String(document.getElementById('skipPermissions').checked));
+  } catch (_) { /* The visible explicit choice still applies to this task. */ }
+}
+
+function recentWorkdirs() {
+  try {
+    const paths = JSON.parse(localStorage.getItem(RECENT_WORKDIRS_KEY) || '[]');
+    return Array.isArray(paths) ? paths.filter(p => typeof p === 'string' && p.trim()).slice(0, 10) : [];
+  } catch (_) { return []; }
+}
+
+async function rememberWorkdir(path) {
+  try {
+    // These are server paths: browser OS/case rules do not identify them.
+    const recent = [path, ...recentWorkdirs().filter(p => p !== path)].slice(0, 10);
+    localStorage.setItem(RECENT_WORKDIRS_KEY, JSON.stringify(recent));
+    renderWorkdirOptions(Object.values(projectsByPath));
+    document.getElementById('workdirSelect').value = path;
+    onProjectSelect();
+  } catch (_) { /* Task was created; browser history is optional. */ }
+}
+
 async function loadProjects() {
   const projects = await fetchJSON(`${API}/projects`);
-  const sel = document.getElementById('workdirSelect');
-  const inp = document.getElementById('workdirInput');
-  if (!projects || !projects.length) return;
+  let recent = recentWorkdirs();
+  if (!localStorage.getItem(RECENT_WORKDIRS_KEY)) {
+    try {
+      const tasks = await fetchJSON(`${API}/tasks?limit=100`);
+      const seen = new Set();
+      recent = tasks.map(t => t.working_dir).filter(path => {
+        if (!path || seen.has(path)) return false;
+        seen.add(path);
+        return true;
+      }).slice(0, 10);
+      localStorage.setItem(RECENT_WORKDIRS_KEY, JSON.stringify(recent));
+    } catch (_) { /* Project picker still works without task history. */ }
+  }
+  renderWorkdirOptions(projects || []);
+}
 
-  projectsByPath = Object.fromEntries(projects.map(p => [p.path, p]));
+function renderWorkdirOptions(projects) {
+  const sel = document.getElementById('workdirSelect');
+  const recent = recentWorkdirs();
+  if ((!projects || !projects.length) && !recent.length) return;
+
+  projectsByPath = Object.fromEntries((projects || []).map(p => [p.path, p]));
+  const recentSet = new Set(recent);
+  const previous = sel.value;
   sel.innerHTML = [
     '<option value="">— Select project —</option>',
-    ...projects.map(p => `<option value="${escAttr(p.path)}">${esc(p.name)}${p.git ? '' : ' (не git)'}</option>`),
+    ...(recent.length ? ['<optgroup label="Недавние">',
+      ...recent.map(path => `<option value="${escAttr(path)}">${esc(path)}</option>`),
+      '</optgroup>'] : []),
+    ...((projects || []).length ? ['<optgroup label="Другие проекты">',
+      ...projects.filter(p => !recentSet.has(p.path))
+        .map(p => `<option value="${escAttr(p.path)}">${esc(p.name)}${p.git ? '' : ' (не git)'}</option>`),
+      '</optgroup>'] : []),
     '<option value="__custom__">✏️ Custom path...</option>',
   ].join('');
 
+  if (previous && [...sel.options].some(option => option.value === previous)) sel.value = previous;
   sel.style.display = '';
-  inp.style.display = 'none';
-  inp.placeholder = '';
+  if (sel.value !== '__custom__') {
+    document.getElementById('workdirInput').style.display = 'none';
+    document.getElementById('workdirInput').value = '';
+  }
   updateWorktree();
 }
 
@@ -3438,19 +4625,63 @@ async function loadCosts() {
     }
   } catch (_) {}
 
+  // Only structured usage from completed conveyor tasks; unavailable stays unknown.
+  try {
+    const t = await fetchJSON(`${API}/stats/tokens`);
+    if (t && t.total && t.total.tasks > 0) {
+      const fmtTok = n => (n / 1e6).toFixed(1) + 'M';
+      const dollars = (t.total.cost !== null)
+        ? ` · $${t.total.cost.toFixed(2)}` : '';
+      const provBits = Object.entries(t.by_provider)
+        .filter(([, v]) => v.measured)
+        .map(([p, v]) =>
+          `<div class="cost-item" title="${escAttr(v.model || p)}: ${Number(v.input).toLocaleString('ru')} in / ${Number(v.output).toLocaleString('ru')} out, кэш ${fmtTok(v.cached)} · задач: ${v.tasks}">${esc(p)}: <span>${fmtTok(v.total)}</span></div>`)
+        .join('');
+      items.push(
+        `<div class="cost-item" title="Структурированный расход задач; старые задачи и неподдерживаемые CLI без измерения">Ток. сегодня: <span>${fmtTok(t.today.total)}</span> · неделя: <span>${fmtTok(t.week.total)}</span> · всего: <span>${fmtTok(t.total.total)}${dollars}</span> · измерено ${t.total.measured_tasks}/${t.total.tasks}</div>`,
+        provBits);
+    }
+  } catch (_) {}
+
   if (!items.length) return;
   const bar = document.getElementById('costBar');
   bar.innerHTML = items.join('');
   bar.classList.add('visible');
 }
 
+// --- Health: живы ли процессы конвейера ---
+async function loadHealth() {
+  let h;
+  try { h = await fetchJSON(`${API}/health/processes`); } catch (e) { return; }
+  const bar = document.getElementById('healthBar');
+  if (!bar) return;
+  if (!h || !h.processes || !h.processes.length) {
+    bar.classList.remove('visible');
+    return;
+  }
+  const dead = h.processes.filter(p => p.state === 'dead');
+  const unknown = h.processes.filter(p => p.state === 'unknown');
+  if (dead.length) {
+    bar.innerHTML = '<div class="cost-item" style="color:var(--red)">🚨 Мертвы: ' +
+      dead.map(p => `${esc(p.label)}${p.pid ? ` (pid ${p.pid})` : ''}`).join(', ') + '</div>';
+  } else if (unknown.length || !h.ok) {
+    bar.innerHTML = '<div class="cost-item" style="color:var(--yellow)" title="pid-файл недоступен или права не дают проверить процессы">⚠️ Конвейер: нет данных о процессах</div>';
+  } else {
+    bar.innerHTML = '<div class="cost-item" title="все фоновые процессы живы">❤️ Конвейер: все процессы живы</div>';
+  }
+  bar.classList.add('visible');
+}
+
+
 // --- Init ---
+restoreSkipPermissions();
 setDefaultSchedule();
 loadProviders();
 loadProjects();
 loadWorkerStatus();
 loadVersion();
 loadCosts();
+loadHealth();
 refresh();
 if (location.hash === '#pipelines') openPipelines();
 setInterval(refresh, 5000);
@@ -3459,6 +4690,7 @@ setInterval(() => wfRefreshScreen(), 4000);  // экран активного ta
 setInterval(() => autoRefreshWorkflowState(), 5000);  // стадия, раунды и runs без ручного «Обновить»
 setInterval(loadWorkerStatus, 10000);
 setInterval(loadCosts, 30000);
+setInterval(loadHealth, 30000);
 </script>
 </body>
 </html>

@@ -47,6 +47,27 @@ def test_lease_round_trip_is_stable():
     assert pp.decode_lease(pp.encode_lease(value)) == value
 
 
+@pytest.mark.parametrize("states,expected", [
+    (["SUCCESS", "IN_PROGRESS"], True),
+    (["PENDING", "QUEUED"], True),
+    (["SUCCESS", "FAILURE"], False),
+    (["IN_PROGRESS", "FAILURE"], False),
+    (["SUCCESS", ""], False),
+    (["SUCCESS"], False),
+    ([], False),
+])
+def test_ci_wait_requires_complete_explicit_pending_set(states, expected):
+    checks = [{"name": name, "status": state}
+              for name, state in zip(["build", "lint"], states)]
+    assert pp.checks_in_progress({"required_checks": ["build", "lint"]}, checks) is expected
+
+
+def test_optional_pending_check_does_not_block_required_green_checks():
+    checks = [{"name": "build", "conclusion": "SUCCESS"},
+              {"name": "bench", "status": "IN_PROGRESS"}]
+    assert not pp.checks_in_progress({"required_checks": ["build"]}, checks)
+
+
 def test_epoch_uses_later_trusted_override_as_anchor():
     value = snapshot(
         trusted_comment("c2", 10, "pp:review-again"),
@@ -585,6 +606,157 @@ def test_content_review_stays_executable_while_integration_owner_waits_merge(mon
     })
     assert result["action"] == "audit"
     assert result["target"]["number"] == 42
+
+
+def test_opt_in_parallel_content_review_uses_native_target_gate(tmp_path, monkeypatch):
+    owner = {"number": 10, "head": "b" * 40, "stage": "integration-review"}
+    content = {"number": 42, "head": HEAD, "stage": "review", "review_depth": 0}
+    health = {
+        "state": "yellow", "integration_owner": owner,
+        "findings": [{"code": "single_flight_barrier", "severity": "yellow", "pr": 10}],
+        "review_candidates": [owner], "content_review_candidates": [content],
+        "parallel_review_candidates": [content], "merge_executable": [],
+    }
+    config = {
+        "repository": "owner/repo", "trusted_account": "owner", "base_branch": "main",
+        "review_completion_gate": "target-v1", "fallback_handoff": "target-v1",
+        "parallel_content_review": True,
+    }
+    monkeypatch.setenv("PP_PIPELINE_REPLICAS", "2")
+    monkeypatch.setenv("PP_PIPELINE_LEASE_KEY_FILE", str(tmp_path / "lease.key"))
+    monkeypatch.setattr(pp, "run_health", lambda *_args, **_kwargs: health)
+    monkeypatch.setattr(pp, "stable_timeline", lambda *_args: snapshot())
+
+    def elect(_config, _health, candidates):
+        assert [item["number"] for item in candidates] == [10, 42]
+        return content, {"token": "reserved"}, health
+
+    monkeypatch.setattr(pp, "_elect_review_candidate", elect)
+    result = pp.next_review(object(), config)
+    assert result["action"] == "audit"
+    assert result["target"] == content
+    lease = pp.decode_signed_lease(result["lease"])
+    assert (lease["number"], lease["head"], lease["pipeline_replicas"]) == (42, HEAD, 2)
+
+
+def test_parallel_content_review_disables_opt_in_without_checker_allowlist(monkeypatch):
+    monkeypatch.setenv("PP_PIPELINE_REPLICAS", "2")
+    config = {
+        "review_completion_gate": "target-v1", "fallback_handoff": "target-v1",
+        "parallel_content_review": True,
+    }
+    health = {"integration_owner": {"stage": "integration-review"}}
+    assert pp.parallel_content_candidates(config, health) == []
+
+
+def _parallel_optin_config(tmp_path, monkeypatch, replicas):
+    monkeypatch.setenv("PP_PIPELINE_REPLICAS", str(replicas))
+    monkeypatch.setenv("PP_PIPELINE_LEASE_KEY_FILE", str(tmp_path / "optin.key"))
+    return {
+        "repository": "owner/repo", "trusted_account": "owner", "base_branch": "main",
+        "review_completion_gate": "target-v1", "fallback_handoff": "target-v1",
+        "parallel_content_review": True,
+    }
+
+
+def test_one_replica_optin_keeps_ordinary_review_executable(tmp_path, monkeypatch):
+    config = _parallel_optin_config(tmp_path, monkeypatch, 1)
+    content = {"number": 42, "head": HEAD, "stage": "review", "review_depth": 0}
+    health = {
+        "state": "green", "findings": [], "integration_owner": None,
+        "review_candidates": [content], "content_review_candidates": [content],
+        "merge_executable": [],
+    }
+    monkeypatch.setattr(pp, "run_health", lambda *_args, **_kwargs: health)
+    monkeypatch.setattr(pp, "stable_timeline", lambda *_args: snapshot())
+
+    result = pp.next_review(object(), config)
+
+    assert result["action"] == "audit"
+    assert result["target"] == content
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_disabled_or_unsupported_parallel_optin_keeps_integration_owner(
+        tmp_path, monkeypatch, enabled):
+    config = _parallel_optin_config(tmp_path, monkeypatch, 2)
+    config["parallel_content_review"] = enabled
+    owner = {"number": 10, "head": "b" * 40, "stage": "integration-review"}
+    content = {"number": 42, "head": HEAD, "stage": "review", "review_depth": 0}
+    health = {
+        "state": "yellow", "integration_owner": owner,
+        "findings": [{"code": "single_flight_barrier", "severity": "yellow", "pr": 10}],
+        "review_candidates": [owner], "content_review_candidates": [content],
+        "merge_executable": [],
+    }
+    if not enabled:
+        # The checker may advertise a valid parallel target while the consumer opts out.
+        health["parallel_review_candidates"] = [content]
+    monkeypatch.setattr(pp, "run_health", lambda *_args, **_kwargs: health)
+
+    def elect(_config, _health, candidates):
+        assert candidates == [owner]
+        return owner, {"token": "reserved"}, health
+
+    def fallback(_gh, _config, stage, target, reason, **kwargs):
+        assert stage == "review" and target == owner
+        return {"action": "fallback_target", "target": target}
+
+    monkeypatch.setattr(pp, "_elect_review_candidate", elect)
+    monkeypatch.setattr(pp, "fallback_target", fallback)
+
+    result = pp.next_review(object(), config)
+
+    assert result["action"] == "fallback_target"
+    assert result["target"] == owner
+
+
+def test_disabled_parallel_optin_still_rejects_corrupt_present_allowlist(
+        tmp_path, monkeypatch):
+    config = _parallel_optin_config(tmp_path, monkeypatch, 1)
+    config["parallel_content_review"] = False
+    content = {"number": 42, "head": HEAD, "stage": "review", "review_depth": 0}
+    health = {
+        "state": "green", "findings": [], "integration_owner": None,
+        "review_candidates": [content], "content_review_candidates": [content],
+        "parallel_review_candidates": "corrupt", "merge_executable": [],
+    }
+    monkeypatch.setattr(pp, "run_health", lambda *_args, **_kwargs: health)
+
+    with pytest.raises(pp.PipelineError, match="allowlist is invalid"):
+        pp.next_review(object(), config)
+
+
+def test_parallel_target_gate_failure_waits_without_full_skill_fallback(
+        tmp_path, monkeypatch):
+    config = _parallel_optin_config(tmp_path, monkeypatch, 2)
+    owner = {"number": 10, "head": "b" * 40, "stage": "integration-review"}
+    content = {"number": 42, "head": HEAD, "stage": "review", "review_depth": 0}
+    health = {
+        "state": "yellow", "integration_owner": owner,
+        "findings": [{"code": "single_flight_barrier", "severity": "yellow", "pr": 10}],
+        "review_candidates": [owner], "content_review_candidates": [content],
+        "parallel_review_candidates": [content], "merge_executable": [],
+    }
+    monkeypatch.setattr(pp, "run_health", lambda *_args, **_kwargs: health)
+    monkeypatch.setattr(pp, "stable_timeline", lambda *_args: snapshot())
+    monkeypatch.setattr(pp, "_elect_review_candidate",
+                        lambda *_args: (content, {"token": "reserved"}, health))
+
+    def reject(*_args):
+        raise pp.PipelineError("exact target changed")
+
+    def forbidden_fallback(*_args, **_kwargs):
+        pytest.fail("a parallel content target cannot expand into full-skill fallback")
+
+    monkeypatch.setattr(pp, "content_review_target_gate", reject)
+    monkeypatch.setattr(pp, "fallback_target", forbidden_fallback)
+
+    result = pp.next_review(object(), config)
+
+    assert result["action"] == "wait"
+    assert result["target"] == content
+    assert result["reason"] == "exact target changed"
 
 
 def test_content_review_completion_ignores_unrelated_integration_owner():

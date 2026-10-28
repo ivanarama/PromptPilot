@@ -1,0 +1,92 @@
+from pathlib import Path
+import re
+import shutil
+import subprocess
+
+import pytest
+
+from promptpilot import api
+
+
+def test_embedded_dashboard_javascript_parses():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node is unavailable; web syntax checked on the Windows host")
+    html = (Path(__file__).parents[1] / "promptpilot/static/index.html").read_text(encoding="utf-8")
+    scripts = re.findall(r"<script(?:\s[^>]*)?>(.*?)</script>", html, re.S)
+    assert scripts
+    for script in scripts:
+        if script.strip():
+            subprocess.run([node, "-e", "new Function(require('fs').readFileSync(0, 'utf8'));"],
+                           input=script, text=True, encoding="utf-8", capture_output=True, check=True)
+
+
+@pytest.mark.parametrize("harness", sorted(Path(__file__).parent.glob("*.cjs")),
+                         ids=lambda path: path.name)
+def test_dashboard_javascript_harness(harness):
+    # Syntax alone let a broken report renderer through (#147): run the
+    # harnesses, which execute real page functions in node.
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node is unavailable; web behaviour checked on the Windows host")
+    result = subprocess.run([node, str(harness)], cwd=Path(__file__).parents[1],
+                            text=True, encoding="utf-8", capture_output=True, timeout=120)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_web_index_is_kept_in_memory_after_startup(monkeypatch, tmp_path):
+    # PyInstaller one-file extracts package data under a temporary directory.
+    # A long-running macOS launchd process must keep serving the UI even if the
+    # OS later cleans that directory.
+    monkeypatch.setattr(api, "STATIC_DIR", tmp_path / "already-cleaned")
+
+    response = api.index()
+
+    assert response.status_code == 200
+    assert response.media_type == "text/html"
+    assert b"<title>PromptPilot</title>" in response.body
+
+
+def test_web_pipeline_report_has_local_first_period_controls():
+    html = (
+        Path(__file__).parents[1] / "promptpilot" / "static" / "index.html"
+    ).read_text(encoding="utf-8")
+
+    assert 'id="pipelineReport"' in html
+    assert "setPipelineView('report')" in html
+    assert "[24,168,720]" in html
+    assert "function loadPipelineReport(profile, hours=24, refresh=false)" in html
+    assert (
+        "pipeline-insights/${encodeURIComponent(profile)}/report?${query}"
+        in html
+    )
+    assert "${refresh ? '&refresh=true' : ''}" in html
+    assert "Собираю отчёт из локальной истории" in html
+    assert "Уточнить результат в GitHub" in html
+
+
+def test_web_pipeline_report_labels_exact_and_incomplete_data_honestly():
+    html = (
+        Path(__file__).parents[1] / "promptpilot" / "static" / "index.html"
+    ).read_text(encoding="utf-8")
+
+    assert "const deliveryExact = delivery.exact === true" in html
+    assert "Локальный отчёт не обращался к GitHub" in html
+    assert "Выводы предварительные" in html
+    assert "coverage.tail_gap_hours" in html
+    assert "coverage.movement_period" in html
+    assert "coverage.attention_complete" in html
+    assert "Влито PR / закрыто issues" in html
+    assert '<div class="pipeline-metric-label">Стоимость</div>' in html
+    assert "cost.total_usd" in html
+    assert "Результат в GitHub" in html
+    assert "ship, needs-decision или hold" in html
+    assert "function pipelineReportUrl(value)" in html
+    assert "Почему задачи ждут" in html
+    assert "У текущих запусков нет записанной причины ожидания." in html
+    assert "Итоги запусков" in html
+    assert "reportFlowSegments" in html
+    assert "Ждём CI" in html
+    assert "board.delivery_groups" in html
+    assert "Запуски с итогом «готово»" in html
+    assert "url.protocol === 'https:' || url.protocol === 'http:'" in html

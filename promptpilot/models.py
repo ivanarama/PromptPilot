@@ -2,9 +2,19 @@
 
 from datetime import datetime
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+
+# What an agent run may do, independent of the CLI (config.rights_args maps
+# each level to the provider's own flags):
+#   none  — no tools: text in, text out
+#   read  — may read files, changes nothing
+#   write — may read and edit files in its working directory, runs no commands
+#   full  — anything (what skip_permissions means)
+# None keeps the legacy behaviour: skip_permissions decides.
+TaskRights = Literal["none", "read", "write", "full"]
 
 
 class TaskStatus(str, Enum):
@@ -19,7 +29,7 @@ class TaskStatus(str, Enum):
 class TaskCreate(BaseModel):
     prompt: str
     working_dir: Optional[str] = None
-    provider: Optional[str] = None  # e.g. "claude", "claude-z", or raw command
+    provider: Optional[str] = None
     priority: int = Field(default=5, ge=1, le=10)
     scheduled_at: Optional[datetime] = None
     max_retries: int = Field(default=5, ge=0, le=50)
@@ -37,6 +47,7 @@ class TaskCreate(BaseModel):
     machine: Optional[str] = None  # run on a registered remote machine (machines.json) over ssh
     worktree: bool = False  # run in a fresh git worktree of working_dir (branch pp/t<id>)
     series_id: Optional[int] = None  # durable recurring-series identity (internal/API)
+    rights: Optional[TaskRights] = None  # see TaskRights; wins over skip_permissions
 
 
 class TaskUpdate(BaseModel):
@@ -84,6 +95,7 @@ class TaskInDB(BaseModel):
     herdr_target: Optional[str] = None
     machine: Optional[str] = None
     worktree: bool = False
+    rights: Optional[str] = None
     worktree_path: Optional[str] = None  # filled in once the checkout exists
     worktree_branch: Optional[str] = None
     herdr_pane: Optional[str] = None  # pane of a herdr-executor run (📺 in the bot)
@@ -92,6 +104,14 @@ class TaskInDB(BaseModel):
     series_id: Optional[int] = None
     series_title: Optional[str] = None
     series_paused: bool = False
+    # Атрибуция задач (очередь/миссия): None = задача вне воркфлоу / не в ожидании.
+    workflow_id: Optional[str] = None
+    role: Optional[str] = None
+    # Базовый ранг по времени, состоянию серии и параллельным lock_key.
+    # Lanes, fairness, слоты и глобальная пауза не моделируются. Исключённые
+    # задачи несут wait_reason; у кандидатов базового допуска он None.
+    queue_position: Optional[int] = None
+    wait_reason: Optional[str] = None
 
 
 class Stats(BaseModel):
@@ -126,6 +146,9 @@ class WorkflowStatus(str, Enum):
     REVIEWING = "reviewing"
     REVISION_REQUIRED = "revision_required"
     AWAITING_HUMAN = "awaiting_human"
+    # A planned wait: the stage is being done outside PromptPilot (issue #122).
+    # Unlike AWAITING_HUMAN nothing went wrong, and no process is held.
+    AWAITING_EXTERNAL = "awaiting_external"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
@@ -145,6 +168,7 @@ class WorkflowRoundStatus(str, Enum):
 class WorkflowRunStatus(str, Enum):
     PENDING = "pending"
     RUNNING = "running"
+    AWAITING_EXTERNAL = "awaiting_external"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
@@ -187,6 +211,12 @@ class WorkflowStageType(str, Enum):
     INTEGRATION = "integration"
 
 
+class WorkflowExecutionMode(str, Enum):
+    """Who does a stage: a PromptPilot agent, or someone outside (issue #122)."""
+    AUTOMATIC = "automatic"
+    EXTERNAL = "external"
+
+
 class WorkflowRoleConfig(BaseModel):
     """Durable defaults for one AI role in an autonomous workflow."""
 
@@ -203,7 +233,67 @@ class WorkflowRoleConfig(BaseModel):
     keep_pane: bool = True
     herdr_target: Optional[str] = None
     machine: Optional[str] = None
+    # Дешёвые часы: [{provider, window{from,to,tz_offset_hours,days}}];
+    # активное окно задаёт провайдера роли, вне окон — фолбэк на provider
+    provider_windows: Optional[list[dict]] = None
+    rights: Optional[TaskRights] = None
     prompt_template: str = ""
+    # Окно ДИСПАТЧА роли: [{"from":"22:00","to":"06:00","tz_offset_hours":0,
+    # "days":"weekdays"}] (по умолчанию 0 = UTC). Вне окна авто-диспетчер
+    # ждёт и пишет событие review.deferred — вместо ручного тоггла
+    # auto_dispatch_reviewer в часы пиковой нагрузки.
+    dispatch_window: Optional[list[dict]] = None
+
+    @field_validator("dispatch_window")
+    @classmethod
+    def validate_dispatch_windows(cls, windows):
+        import re
+        names = {"mon", "tue", "wed", "thu", "fri", "sat", "sun"}
+        for window in windows or []:
+            if set(window) - {"from", "to", "tz_offset_hours", "days"}:
+                raise ValueError("unknown dispatch window field")
+            for key in ("from", "to"):
+                if not isinstance(window.get(key), str) or not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", window[key]):
+                    raise ValueError("dispatch window time must be HH:MM (00:00..23:59)")
+            offset = window.get("tz_offset_hours", 0)
+            if type(offset) is not int or not -23 <= offset <= 23:
+                raise ValueError("dispatch window timezone offset must be an integer between -23 and 23")
+            days = window.get("days")
+            if days is None:
+                continue
+            if isinstance(days, str) and days.strip().lower() in {"all", "weekdays", "будни", "будни (пн–пт)", "weekend", "выходные", "выходные (сб–вс)"}:
+                continue
+            if isinstance(days, list) and days and all(isinstance(day, str) and day.lower() in names for day in days):
+                continue
+            raise ValueError("dispatch window days must name valid weekdays")
+        return windows
+
+    @field_validator("provider_windows")
+    @classmethod
+    def valid_provider_windows(cls, windows):
+        import re
+        day_names = {"mon", "tue", "wed", "thu", "fri", "sat", "sun"}
+        for item in windows or []:
+            if set(item) - {"provider", "window"} or not isinstance(item.get("provider"), str) or not item["provider"].strip():
+                raise ValueError("provider_windows requires a provider and window")
+            window = item.get("window")
+            if not isinstance(window, dict) or set(window) - {"from", "to", "tz_offset_hours", "days"}:
+                raise ValueError("invalid provider window fields")
+            for key in ("from", "to"):
+                if not isinstance(window.get(key), str) or not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", window[key]):
+                    raise ValueError("provider window time must be HH:MM (00:00..23:59)")
+            offset = window.get("tz_offset_hours", 3)
+            if type(offset) is not int or not -23 <= offset <= 23:
+                raise ValueError("tz_offset_hours must be an integer between -23 and 23")
+            days = window.get("days")
+            if days is None:
+                continue
+            if isinstance(days, str) and days.strip().lower() in {"all", "weekdays", "будни", "будни (пн–пт)", "weekend", "выходные", "выходные (сб–вс)"}:
+                continue
+            if isinstance(days, list) and days and all(isinstance(d, str) and d.lower() in day_names for d in days):
+                continue
+            raise ValueError("provider window days must name valid weekdays")
+        return windows
 
 
 class WorkflowRolesConfig(BaseModel):
@@ -249,6 +339,11 @@ class WorkflowAutomationConfig(BaseModel):
     auto_apply_review: bool = True
     auto_resume_revision: bool = True
     stop_on_human_required: bool = True
+    # Stage checkpoint: после stage.completed (ворота зелёные + PASS)
+    # автоматический коммит ИМЕННО файлов этапа, доказанно изменённых данным
+    # executor run'ом; неудача останавливает миссию до человека. Выключен
+    # по умолчанию.
+    stage_checkpoint: bool = False
 
 
 class WorkflowLimitsConfig(BaseModel):
@@ -263,8 +358,13 @@ class WorkflowPlanningConfig(BaseModel):
     enabled: bool = False
     require_approval: bool = True
     max_stages: int = Field(default=20, ge=1, le=50)
-    max_revisions_per_stage: int = Field(default=3, ge=1, le=20)
+    # P21: потолок поднят 20 → 100 по директиве владельца (раунды ревизий
+    # съедают лимит на «уже сделано»-циклах; 422 при PATCH>20 ломал resume).
+    max_revisions_per_stage: int = Field(default=3, ge=1, le=100)
+    # F5: динамическая перепланировка хвоста утверждённого плана.
+    # False (дефолт) — план неизменяем после утверждения (поведение автора).
     prompt_template: str = ""
+    allow_editing_approved_plan: bool = False
 
 
 class WorkflowConfig(BaseModel):
@@ -306,7 +406,13 @@ class WorkflowSetupValidationResponse(BaseModel):
 def normalize_workflow_config(value: Any = None) -> dict[str, Any]:
     """Validate raw/legacy JSON and return the canonical versioned shape."""
 
-    return WorkflowConfig.model_validate(value or {}).model_dump(mode="json")
+    validated = WorkflowConfig.model_validate(value or {})
+    result = validated.model_dump(mode="json")
+    # Keep absence durable: the model default must not become an owner override
+    # when a configuration is normalized, persisted, returned, or reloaded.
+    if "max_revisions_per_stage" not in validated.planning.model_fields_set:
+        result["planning"].pop("max_revisions_per_stage", None)
+    return result
 
 
 class WorkflowCreate(BaseModel):
@@ -319,11 +425,20 @@ class WorkflowCreate(BaseModel):
     repository_path: str = Field(min_length=1)
     candidate_branch: str = Field(min_length=1)
     config: dict[str, Any] = Field(default_factory=normalize_workflow_config)
+    # Готовый план дежурного: миссия создаётся сразу в awaiting_plan_approval,
+    # минуя запуск планировщика; невалидный план не занимает slug (атомарно).
+    plan: Optional[list["WorkflowStageSpec"]] = Field(default=None, min_length=1)
 
     @field_validator("config", mode="before")
     @classmethod
     def validate_config(cls, value):
         return normalize_workflow_config(value)
+
+    @model_validator(mode="after")
+    def plan_within_configured_limit(self):
+        if self.plan is not None and len(self.plan) > self.config["planning"]["max_stages"]:
+            raise ValueError("plan exceeds planning.max_stages")
+        return self
 
 
 class WorkflowUpdate(BaseModel):
@@ -338,6 +453,10 @@ class WorkflowUpdate(BaseModel):
     repository_path: Optional[str] = Field(default=None, min_length=1)
     candidate_branch: Optional[str] = Field(default=None, min_length=1)
     config: Optional[dict[str, Any]] = None
+    # Явная семантика правки КОНФИГА терминальной миссии: разрешает менять
+    # ТОЛЬКО config (на выполнение терминальной миссии не влияет —
+    # история/шаблоны/гигиена), иначе frozen.
+    allow_terminal_config: bool = False
     expected_version: int = Field(ge=0)
 
     @field_validator("config", mode="before")
@@ -405,6 +524,7 @@ class WorkflowRunInDB(BaseModel):
     task_id: Optional[int] = None
     status: WorkflowRunStatus
     input_sha256: str
+    input: Optional[dict[str, Any]] = None
     output_sha256: Optional[str] = None
     output: Optional[dict[str, Any]] = None
     started_at: Optional[datetime] = None
@@ -425,6 +545,7 @@ class WorkflowStageSpec(BaseModel):
     executor_prompt: str = ""
     reviewer_prompt: str = ""
     max_revision_rounds: Optional[int] = Field(default=None, ge=1, le=20)
+    execution_mode: WorkflowExecutionMode = WorkflowExecutionMode.AUTOMATIC
 
 
 class WorkflowPlanReplace(BaseModel):
@@ -448,6 +569,18 @@ class WorkflowPlanReplace(BaseModel):
         if self.stages[-1].stage_type is not WorkflowStageType.INTEGRATION:
             raise ValueError("the final workflow stage must have stage_type=integration")
         return self
+
+
+class WorkflowPlanAmend(WorkflowPlanReplace):
+    """F5: правка хвоста утверждённого плана (замороженный префикс неприкосновенен)."""
+    reason: str = Field(min_length=3, max_length=2000)
+
+    @field_validator("reason")
+    @classmethod
+    def meaningful_reason(cls, value):
+        if len(value.strip()) < 3:
+            raise ValueError("amendment reason must contain at least three non-space characters")
+        return value.strip()
 
 
 class WorkflowStageInDB(WorkflowStageSpec):
@@ -585,13 +718,44 @@ class WorkflowTaskDispatch(BaseModel):
     herdr_target: Optional[str] = None
     machine: Optional[str] = None
     task_timeout: Optional[int] = Field(default=None, ge=0)
+    # external: no queue task — the prompt becomes an assignment handed out
+    # of PromptPilot, and the workflow waits for its result (executor only)
+    execution_mode: WorkflowExecutionMode = WorkflowExecutionMode.AUTOMATIC
+    rights: Optional[TaskRights] = None
 
 
 class WorkflowDispatchResult(BaseModel):
     workflow: WorkflowInDB
     round: WorkflowRoundInDB
     run: WorkflowRunInDB
-    task: TaskInDB
+    task: Optional[TaskInDB] = None
+
+
+class WorkflowExternalRequest(BaseModel):
+    expected_version: int = Field(ge=0, strict=True)
+
+
+class WorkflowExternalResult(BaseModel):
+    """The result of a stage done outside PromptPilot, handed in by a person."""
+    expected_version: int = Field(ge=0, strict=True)
+    run_id: str = Field(min_length=1)
+    input_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    result: str = Field(min_length=1, max_length=200000)
+    comment: str = Field(default="", max_length=5000)
+    performer: str = Field(default="", max_length=200)
+
+
+class WorkflowExternalAssignment(BaseModel):
+    workflow_id: str
+    run_id: str
+    expected_version: int = Field(ge=0, strict=True)
+    input_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    round_no: int
+    attempt_no: int
+    status: WorkflowRunStatus
+    stage_code: str = ""
+    stage_title: str = ""
+    assignment: str
 
 
 class GateVerdict(str, Enum):
@@ -628,12 +792,23 @@ class WorkflowReviewDecision(BaseModel):
     expected_version: int = Field(ge=0)
     summary: str = ""
     findings: list[ReviewFindingInput] = Field(default_factory=list)
+    # Явное человеческое подтверждение PASS без доказанных изменений
+    # исполнителя (доказанно пустой diff). Неизвестное происхождение этот
+    # флаг не подтверждает; автоприменение вердикта его не ставит.
+    allow_no_diff: bool = False
 
 
 class WorkflowHumanInput(BaseModel):
     text: str = Field(min_length=1)
     expected_version: int = Field(ge=0)
     resume: bool = False
+    restart_checkpoint: bool = False
+    checkpoint_head: Optional[str] = Field(
+        default=None, pattern=r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+    # What the next agent run must be told. `text` is the journal record of
+    # the decision (automation writes its own boilerplate there); only `note`
+    # is delivered into the next executor/reviewer prompt.
+    note: str = Field(default="", max_length=20000)
 
 
 class HistoricalFactStatus(str, Enum):

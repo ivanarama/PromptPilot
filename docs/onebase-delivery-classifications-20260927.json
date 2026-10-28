@@ -1,0 +1,13 @@
+{
+  "repository": "ivanarama/onebase",
+  "observed_on": "2026-09-27",
+  "items": {
+    "1700": {"category": "product", "evidence": "Checked paginated PR files: internal/auth/roles.go, internal/configcheck/lint.go, internal/launcher/ai_generate.go. https://github.com/ivanarama/onebase/pull/1700/files"},
+    "1220": {"category": "product", "evidence": "Checked paginated PR files: internal/entityservice/defaults.go and internal/ui public entry paths. https://github.com/ivanarama/onebase/pull/1220/files"},
+    "1409": {"category": "product", "evidence": "Checked paginated PR files: internal/query/query.go and internal/storage timezone handling. https://github.com/ivanarama/onebase/pull/1409/files"},
+    "1469": {"category": "product", "evidence": "Checked paginated PR files: internal/api/v2_inforeg.go and internal/storage/inforeg.go. https://github.com/ivanarama/onebase/pull/1469/files"},
+    "1475": {"category": "docs_plans", "evidence": "Complete file list contains only Plans/176-write-context-and-load-mode.md and Plans/README.md. https://github.com/ivanarama/onebase/pull/1475/files"},
+    "1483": {"category": "pipeline", "evidence": "Complete file list contains only tools/pipelinehealth/main.go and main_test.go. https://github.com/ivanarama/onebase/pull/1483/files"},
+    "1499": {"category": "docs_plans", "evidence": "Complete file list contains only Plans/179-onec-code-compat.md and Plans/README.md. https://github.com/ivanarama/onebase/pull/1499/files"}
+  }
+}

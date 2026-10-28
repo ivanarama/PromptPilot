@@ -41,6 +41,8 @@ _CACHE_PUBLISHED_PROFILE_REVISION_PREFIX = \
 _INTERVAL_PRESETS = ((0.25, "15m"), (0.5, "30m"), (1, "1h"), (2, "2h"),
                      (4, "4h"), (8, "8h"), (12, "12h"), (24, "24h"))
 _HISTORY_WINDOWS = (5, 24, 24 * 7, 24 * 30)
+_REPORT_HOURS = (24, 24 * 7, 24 * 30)
+_ATTENTION_LABELS = ("ship", "needs-decision", "hold")
 _PRIORITY_LEVELS = ("p0", "p1", "p2", "p3")
 _DEFAULT_PRIORITY_RULES = (
     ({"security", "severity:critical", "blocker", "data-loss"}, 0, "critical label"),
@@ -350,11 +352,17 @@ def _github_budget_policy(profile: dict) -> dict | None:
     if any(priority_one_headroom.values()) and costs is None:
         raise ValueError(
             "github_budget.priority_one_headroom требует github_budget.costs")
+    essential_snapshot_headroom = raw.get("essential_snapshot_headroom", False)
+    if not isinstance(essential_snapshot_headroom, bool):
+        raise ValueError("github_budget.essential_snapshot_headroom must be a boolean")
+    if essential_snapshot_headroom and costs is None:
+        raise ValueError("github_budget.essential_snapshot_headroom requires costs")
 
     return {
         "minimum_remaining": minimum_remaining,
         "priority_one_headroom": priority_one_headroom,
         "costs": costs,
+        "essential_snapshot_headroom": essential_snapshot_headroom,
         "reset_grace_seconds": _bounded_int(
             raw, "reset_grace_seconds", 60, 0, 3600),
         "lease_seconds": _bounded_int(raw, "lease_seconds", 900, 30, 3600),
@@ -823,7 +831,7 @@ def _priority_waiter_decision(
     return decision
 
 
-def _arm_budget_waiter(task, decision: dict) -> dict:
+def _arm_budget_waiter(task, decision: dict, *, starvation_timeout_seconds: int = 0) -> dict:
     """Persist a budget handoff before the serial admission lease is released."""
     state = decision.get("state")
     if state not in {
@@ -844,6 +852,8 @@ def _arm_budget_waiter(task, decision: dict) -> dict:
             "for GitHub budget wait")
     armed = db.arm_pipeline_github_budget_waiter(
         scope, task_id=task_id, task_started_at=started_at,
+        yield_aged_baton_seconds=(starvation_timeout_seconds
+                                 if state == "budget_in_flight" else 0),
         expected_revision=(revision if revision_valid else None))
     if not armed.get("armed"):
         raise ValueError(
@@ -852,6 +862,8 @@ def _arm_budget_waiter(task, decision: dict) -> dict:
     if type(current_revision) is not int or current_revision < 0:
         raise ValueError("GitHub budget waiter returned an invalid revision")
     decision["_budget_reservation_revision"] = current_revision
+    if armed.get("fairness_yielded"):
+        decision["reason"] += "; ожидающая задача не помещается в бюджет и уступила старшинство"
     if armed.get("revision_changed"):
         # A release may race the budget observation, but cannot race a lower
         # admission while this scan lease is held. Keep the priority marker and
@@ -866,17 +878,21 @@ def _github_scan_admission(profile: dict, purpose: str,
                            budget_route: str | None = None, task=None):
     """Admit one expensive scan and hold its cross-process reservation."""
     now = time.time()
+    admission_priority = getattr(
+        task, "priority", 10 if budget_route == "insights" else None)
+    route_policy = None
     try:
         policy = _github_budget_policy(profile)
         if policy is not None:
             policy = _with_shared_budget_floor(policy)
             policy = _budget_policy_for_route(policy, budget_route)
+            route_policy = policy
             if task is not None:
                 policy = _budget_policy_for_admission_priority(
                     policy, getattr(task, "priority", None))
             elif budget_route == "insights":
-                # Full queue refreshes are useful but never more urgent than
-                # an already queued P1 integration task.
+                # Optional/fresh scans preserve urgent-task headroom. Essential
+                # snapshot recovery is checked again under the shared lease.
                 policy = _budget_policy_for_admission_priority(policy, 10)
     except (TypeError, ValueError) as exc:
         fallback = {
@@ -927,7 +943,7 @@ def _github_scan_admission(profile: dict, purpose: str,
                              if isinstance(status_revision, int) else None))
         if task is not None:
             try:
-                decision = _arm_budget_waiter(task, decision)
+                decision = _arm_budget_waiter(task, decision, starvation_timeout_seconds=policy.get("starvation_timeout_seconds", 0))
             except (TypeError, ValueError, sqlite3.Error) as exc:
                 decision = _budget_denied(
                     policy, state="lease_unavailable",
@@ -954,6 +970,17 @@ def _github_scan_admission(profile: dict, purpose: str,
     try:
         try:
             lease.start()
+            if (task is None and profile_id is not None
+                    and budget_route == "insights"
+                    and policy.get("essential_snapshot_headroom")):
+                # Only full queue recovery may borrow soft P1 headroom. Check
+                # *after* acquiring the account-wide scan lease so concurrent
+                # refreshes cannot all observe a cold cache and borrow it.
+                cached, _source, epoch = _cached_entry(profile_id, profile)
+                if (cached is None or int(cached[2]) != epoch
+                        or time.time() - float(cached[0]) >= _CACHE_TTL_SECONDS):
+                    admission_priority = 1
+                    policy = _budget_policy_for_admission_priority(route_policy, 1)
             try:
                 limits = _github_rate_limits()
             except _GitHubScanLeaseFailure:
@@ -981,9 +1008,6 @@ def _github_scan_admission(profile: dict, purpose: str,
                         now=time.time(), limits=limits,
                         status_revision=lease.status_revision)
                 else:
-                    admission_priority = getattr(
-                        task, "priority",
-                        10 if budget_route == "insights" else None)
                     decision = _priority_waiter_decision(
                         policy, limits, reservations,
                         priority=admission_priority,
@@ -998,7 +1022,7 @@ def _github_scan_admission(profile: dict, purpose: str,
                         decision["_budget_reservation_revision"] = \
                             reservations["revision"]
                     if task is not None:
-                        decision = _arm_budget_waiter(task, decision)
+                        decision = _arm_budget_waiter(task, decision, starvation_timeout_seconds=policy.get("starvation_timeout_seconds", 0))
         except _GitHubScanLeaseFailure as exc:
             decision = _lease_exception_decision(
                 profile, exc, status_revision=lease.status_revision)
@@ -1250,7 +1274,7 @@ def _reserve_execution_admission(
                     _execution_budget_context.reservation = \
                         _GitHubBudgetReservation(
                             policy["lease_scope"], token, task_id, started_at)
-        decision = _arm_budget_waiter(task, decision)
+        decision = _arm_budget_waiter(task, decision, starvation_timeout_seconds=policy.get("starvation_timeout_seconds", 0))
         if decision.get("allowed") and not retain_budget:
             _clear_budget_waiter_after_admission(task)
     except _GitHubScanLeaseFailure as exc:
@@ -1598,6 +1622,8 @@ def _github_search(repository: str, query: str) -> dict:
             "labels": sorted(label.get("name", "") for label in item.get("labels", [])
                              if label.get("name")),
             "created_at": item.get("created_at"), "updated_at": item.get("updated_at"),
+            "closed_at": item.get("closed_at"),
+            "merged_at": (item.get("pull_request") or {}).get("merged_at"),
             "url": item.get("html_url"),
         })
     return {"count": total, "items": items, "membership_complete": total <= len(items)}
@@ -2210,6 +2236,59 @@ def _window_metrics(snapshots: list[dict], current: dict, series_ids: list[int],
     }
 
 
+def _backpressure_gate(config: dict, data: dict, *, excluded_numbers=()) -> dict | None:
+    """Profile-owned intake throttle, never an authorization to mutate GitHub.
+
+    A complete cached snapshot is an admission hint, not a hard transactional
+    WIP bound. Rework/critical exceptions constrain the executor's selection;
+    they must not accidentally reopen admission for ordinary new work.
+    """
+    policy = config.get("backpressure")
+    if not isinstance(policy, dict):
+        return None
+    limit = policy.get("max_active")
+    if type(limit) is not int or limit < 1:
+        raise ValueError("backpressure.max_active must be a positive integer")
+    diagnostics = data.get("diagnostics") or {}
+    fields = policy.get("active_fields", [])
+    candidate_field = policy.get("candidate_field")
+    if (not fields or any(not isinstance(diagnostics.get(field), list) for field in fields)
+            or not isinstance(diagnostics.get(candidate_field), list)):
+        return {"action": "defer", "defer_for": config.get("defer_for", "10m"),
+                "reason": "WIP: нет полного снимка активной очереди"}
+    active = {item["number"] for field in fields for item in diagnostics[field]
+              if isinstance(item, dict) and type(item.get("number")) is int
+              and item.get("head")}
+    if len(active) < limit:
+        return None
+    allowed = []
+    for item in diagnostics[candidate_field]:
+        if not isinstance(item, dict) or type(item.get("number")) is not int:
+            continue
+        if item["number"] in excluded_numbers:
+            continue
+        if any(isinstance(rule, dict) and rule.get("key") in item
+               and item[rule["key"]] in rule.get("values", [])
+               for rule in policy.get("allow_when_match", [])):
+            allowed.append(item)
+    reason = f"WIP: активных PR {len(active)}, порог новых задач {limit}"
+    if not allowed:
+        return {"action": "defer", "defer_for": config.get("defer_for", "10m"),
+                "reason": reason + "; сначала завершить уже начатое"}
+    targets = ", ".join(str(item["number"]) for item in allowed)
+    return {
+        "action": "restrict_prompt", "reason": reason,
+        "prompt_constraint": (
+            "Операторское ограничение приёма новых задач (не разрешение на изменения): "
+            + reason + ". В этом запуске выбирай только номера " + targets
+            + ". Остальные новые задачи не начинай. Снимок — только подсказка выбора: "
+            "заново проверь актуальное состояние и все канонические гейты выбранной "
+            "задачи. Если эти кандидаты больше не допустимы, закончи без изменений; "
+            "не переключайся на другую обычную задачу."),
+        "allowed_numbers": sorted({item["number"] for item in allowed}),
+    }
+
+
 def dispatch_gate(task) -> dict | None:
     """Evaluate an optional user-owned, token-free gate for a series task.
 
@@ -2231,14 +2310,48 @@ def dispatch_gate(task) -> dict | None:
             # spend hundreds of GitHub requests on the same queue state.
             data = read_cached(profile_id, db.list_series())
             cache = data.get("cache") or {}
+            if (isinstance(config.get("backpressure"), dict)
+                    and (cache.get("stale") or not cache.get("complete"))):
+                # Intake cannot rely on stale state indefinitely. Refresh via
+                # the existing shared scan lease/budget and cache, never via an
+                # agent or an unbudgeted direct GitHub request.
+                try:
+                    data = analyze(profile_id, db.list_series(), use_cache=False,
+                                   refresh_diagnostics=True)
+                except Exception:
+                    return {
+                        "action": "defer", "defer_for": config.get("defer_for", "10m"),
+                        "reason": "WIP: обновление снимка не удалось; новые задачи отложены",
+                        "profile_id": profile_id, "queue_id": queue_config["id"],
+                    }
+                cache = data.get("cache") or {}
             # A stale/partial empty snapshot must never complete a live stage as
             # empty, and stale diagnostics must not defer it. The project-owned
             # preflight remains the authoritative fallback.
             if (cache.get("refresh_blocked") or cache.get("stale")
                     or not cache.get("complete")):
+                if isinstance(config.get("backpressure"), dict):
+                    return {
+                        "action": "defer", "defer_for": config.get("defer_for", "10m"),
+                        "reason": "WIP: свежий полный снимок недоступен; приём новых задач отложен",
+                        "profile_id": profile_id, "queue_id": queue_config["id"],
+                    }
                 return None
+            from .pipeline_item_holds import complete_members, prepare
+            exclusions = prepare(task, queue_config, data)
+            pressure = _backpressure_gate(config, data, excluded_numbers=exclusions)
+            if pressure:
+                return {**pressure, "profile_id": profile_id, "queue_id": queue_config["id"]}
             queue = next((item for item in data["queues"]
                           if item["id"] == queue_config["id"]), None)
+            admission_members = complete_members(queue)
+            if exclusions and admission_members is not None:
+                members = {item.get("number") for item in admission_members
+                           if isinstance(item, dict)}
+                if members and members.issubset(set(exclusions)):
+                    return {"action": "defer", "defer_for": "30m",
+                            "reason": "неизменные задачи ожидают решения: " + ", ".join(f"#{n}" for n in exclusions),
+                            "profile_id": profile_id, "queue_id": queue_config["id"]}
             if config.get("skip_when_empty") and queue and queue["backlog"] == 0:
                 return {
                     "action": "complete_empty",
@@ -2281,17 +2394,49 @@ def dispatch_gate(task) -> dict | None:
     return None
 
 
+def _repeat_guard_series_identity(prompt, fallback_title=None) -> str:
+    lines = str(prompt or "").splitlines()
+    return (lines[0] if lines else str(fallback_title or "")).lower()
+
+
 def _matching_queue(task) -> tuple[str, dict, dict] | None:
     """Return the profile and queue owning a recurring task, if configured."""
     if not getattr(task, "series_id", None):
         return None
-    title = (getattr(task, "series_title", None) or task.prompt.splitlines()[0]).lower()
+    title = _repeat_guard_series_identity(
+        getattr(task, "prompt", ""), getattr(task, "series_title", None))
     for profile_id, profile in _profiles().items():
         for queue in profile.get("queues", []):
             marker = str(queue.get("series_contains", "")).lower()
             if marker and marker in title:
                 return profile_id, profile, queue
     return None
+
+
+def repeat_guard_series_ids(series: list[dict]) -> list[int]:
+    """Return every active series owned by a configured pipeline queue.
+
+    Startup repair is otherwise generic, so the caller passes this explicit
+    allowlist before applying project-pipeline-only recurrence policy.
+    """
+    markers = {
+        str(queue.get("series_contains") or "").lower()
+        for profile in _profiles().values()
+        for queue in profile.get("queues", [])
+        if isinstance(queue, dict) and queue.get("series_contains")
+    }
+    matching = []
+    for item in series:
+        if item.get("ended") or item.get("ended_at"):
+            continue
+        value = item.get("id")
+        if type(value) is not int or value <= 0:
+            continue
+        identity = _repeat_guard_series_identity(
+            item.get("prompt"), item.get("title"))
+        if any(marker in identity for marker in markers):
+            matching.append(value)
+    return matching
 
 
 def worker_lane_policy() -> dict | None:
@@ -2576,6 +2721,105 @@ def _wake_ready_queues(profile_id: str, profile: dict, data: dict,
     return woken
 
 
+_AUTO_RESUME_CHECK_PREFIX = "pipeline_auto_resume_check:v1:"
+_AUTO_RESUME_CHECK_SECONDS = 600
+
+
+def _resume_resolved_blockers(profile: dict, data: dict,
+                              series: list[dict]) -> list[int]:
+    """Recover an automatic pause only after fresh, narrow external proof.
+
+    A closed GitHub target cannot still need work from its old series. A new
+    eligible TRIAGE/REVIEW item may proceed independently of an old blocker.
+    REVIEW may also resume when a stale-ship target has re-entered the
+    content-review queue; this launches a review, never a merge or ship.
+    Unknown or still-open blockers without new work remain paused.
+    """
+    cache = data.get("cache") or {}
+    if (db.is_paused() or cache.get("complete") is not True
+            or cache.get("stale") or cache.get("refresh_blocked")):
+        return []
+    repository = profile.get("repository")
+    if not isinstance(repository, str) or not re.fullmatch(
+            r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
+        return []
+    diagnostics = data.get("diagnostics") or {}
+    from .pipeline_item_holds import complete_members
+    reviewable = {
+        item.get("number") for item in
+        (diagnostics.get("content_review_candidates") or [])
+        if isinstance(item, dict) and type(item.get("number")) is int
+    }
+    resumed = []
+    for queue in profile.get("queues", []):
+        for item in _series_replicas_for_queue(queue, series):
+            reason = item.get("auto_pause_reason")
+            task_id = item.get("last_task_id")
+            series_id = item.get("id")
+            if (not item.get("paused") or not isinstance(reason, str)
+                    or type(task_id) is not int or type(series_id) is not int):
+                continue
+            numbers = {int(value) for value in re.findall(
+                r"(?<![\w#])#([1-9][0-9]*)\b", reason)}
+            if not 1 <= len(numbers) <= 3:
+                continue
+            review_ready = (
+                queue.get("id") == "review" and len(numbers) == 1
+                and "ship" in reason.casefold()
+                and next(iter(numbers)) in reviewable
+            )
+            new_work = False
+            if queue.get("id") in {"triage", "review"}:
+                try:
+                    baseline = json.loads(db.get_setting(
+                        f"pipeline_item_baseline:v1:{series_id}") or "{}")
+                except (TypeError, ValueError):
+                    baseline = {}
+                current_queue = next(
+                    (entry for entry in (data.get("queues") or [])
+                     if isinstance(entry, dict)
+                     and entry.get("id") == queue.get("id")), None)
+                members = complete_members(current_queue) if isinstance(
+                    current_queue, dict) else None
+                if (isinstance(baseline, dict)
+                        and baseline.get("task_id") == task_id
+                        and isinstance(baseline.get("states"), dict)
+                        and members is not None):
+                    new_work = any(
+                        isinstance(member, dict)
+                        and type(member.get("number")) is int
+                        and str(member["number"]) not in baseline["states"]
+                        for member in members)
+            if not review_ready and not new_work:
+                key = f"{_AUTO_RESUME_CHECK_PREFIX}{series_id}"
+                now = time.time()
+                try:
+                    previous = json.loads(db.get_setting(key) or "{}")
+                except (TypeError, ValueError):
+                    previous = {}
+                if (isinstance(previous, dict)
+                        and previous.get("task_id") == task_id
+                        and type(previous.get("at")) in (int, float)
+                        and 0 <= now - previous["at"] < _AUTO_RESUME_CHECK_SECONDS):
+                    continue
+                db.set_setting(key, json.dumps({"task_id": task_id, "at": now}))
+                try:
+                    closed = all(
+                        (target := _gh_api_json([
+                            f"repos/{repository}/issues/{number}"]))
+                        .get("number") == number
+                        and target.get("state") == "closed"
+                        for number in sorted(numbers)
+                    )
+                except Exception:
+                    continue
+                if not closed:
+                    continue
+            if db.resume_resolved_pipeline_blocker(series_id, task_id):
+                resumed.append(series_id)
+    return resumed
+
+
 def _wake_configured_successors(profile: dict, queue: dict,
                                 series: list[dict]) -> list[str] | None:
     """Wake explicit successors locally; None preserves legacy scan-based wake."""
@@ -2716,6 +2960,25 @@ def _tool_available(execution: dict, command: list[str], working_dir: str | None
     return True, "инструмент доступен"
 
 
+def _lease_argument(task, token: str, purpose: str) -> list[str]:
+    """Use scheduler-owned opaque files; all HMAC and fresh gates still apply."""
+    task_id = getattr(task, "id", None)
+    if type(task_id) is not int or task_id <= 0:
+        return ["--lease", token]
+    directory = Path(db.DB_PATH).resolve().parent / "pipelinectl-state" / "leases"
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    identity = hashlib.sha256(token.encode("ascii")).hexdigest()[:20]
+    path = directory / f"task-{task_id}-{purpose}-{identity}.lease"
+    try:
+        with path.open("x", encoding="ascii") as handle:
+            os.chmod(path, 0o600)
+            handle.write(token)
+    except FileExistsError:
+        if path.read_text(encoding="ascii") != token:
+            raise RuntimeError("stored pipeline lease changed")
+    return ["--lease-file", str(path)]
+
+
 def _tool_preflight(execution: dict, command: list[str], working_dir: str | None,
                     *, env_extra: dict[str, str] | None = None) -> dict:
     root = Path(working_dir or os.getcwd())
@@ -2728,6 +2991,7 @@ def _tool_preflight(execution: dict, command: list[str], working_dir: str | None
     environment.pop("PP_PIPELINE_REPLICAS", None)
     environment.pop("PP_PROVIDER_OWNERSHIP_KIND", None)
     environment.pop("PP_PIPELINE_TARGET_TOKEN", None)
+    environment.pop("PP_PIPELINE_EXCLUDED_NUMBERS", None)
     if env_extra:
         environment.update(env_extra)
     try:
@@ -2878,6 +3142,14 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
         _clear_budget_waiter_after_admission(task)
         return {"action": "prompt", "mode": "skill", "prompt": fallback_prompt}
     profile_id, profile, queue = matched
+    from .pipeline_item_holds import prepare
+    exclusions = prepare(task, queue, read_cached(profile_id, db.list_series())) if queue.get("item_blockers") is True else []
+    if exclusions:
+        fallback_prompt += ("\n\nЛокальное ограничение приёма: не брать неизменные "
+                            "задачи с зарегистрированным блокером: "
+                            + ", ".join(f"#{number}" for number in exclusions)
+                            + ". Новые задачи обслуживать по прежней процедуре. "
+                            "Нельзя обходить интеграционного владельца или расширять полномочия.")
     try:
         replica_count = _queue_replica_count(queue)
     except ValueError as exc:
@@ -3056,10 +3328,13 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                         "PP_PROVIDER_OWNERSHIP_KIND": provider_ownership_kind,
                         "PP_DATA_DIR": scheduler_data_dir,
                         "PP_PIPELINE_LEASE_KEY_FILE": scheduler_lease_key,
+                        **({"PP_PIPELINE_EXCLUDED_NUMBERS": json.dumps(exclusions)} if exclusions else {}),
                     },
                 )
             else:
-                preflight = _tool_preflight(execution, command, working_dir)
+                preflight = (_tool_preflight(execution, command, working_dir,
+                    env_extra={"PP_PIPELINE_EXCLUDED_NUMBERS": json.dumps(exclusions)})
+                    if exclusions else _tool_preflight(execution, command, working_dir))
         except _GitHubScanLeaseFailure as exc:
             return _budget_defer_route(
                 _replace_admission_with_lease_failure(
@@ -3126,6 +3401,9 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                         "pipeline target reservation contradicts task, repository, or target")
                 target_reservation = reservation
                 validated_target_stage = target_stage
+                if target_stage == "review" and queue.get("item_blockers") is True:
+                    from .pipeline_item_holds import register_review_target
+                    register_review_target(task, number, head)
             except (project_pipeline.PipelineError, TypeError, ValueError) as exc:
                 return {
                     "action": "block", "mode": "tool",
@@ -3226,6 +3504,36 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                     mode=("tool" if provider_route == "tool" else "skill"),
                     phase="post_preflight", preflight=preflight)
 
+        # Explicit operator opt-in: an already-reviewed MERGE/cleanup has no
+        # content audit left for a model. The same adapter owns every fresh
+        # authorization/CI/CAS/recovery gate; never use this for REVIEW or a
+        # fallback. Keep completion inside the admitted GitHub scan scope.
+        if (stage == "merge" and execution.get("direct_complete") is True
+                and preflight_action in {"merge", "cleanup"}
+                and command[-2:] == ["next", stage]):
+            token = preflight.get("lease")
+            if not isinstance(token, str) or not token:
+                return {"action": "block", "mode": "tool",
+                        "reason": "direct MERGE has no opaque completion lease"}
+            complete_stage = "merge-cleanup" if preflight_action == "cleanup" else "merge"
+            complete_command = [*command[:-2], "complete", complete_stage,
+                                *_lease_argument(task, token, "complete")]
+            try:
+                completion = _tool_preflight(execution, complete_command, working_dir)
+            except RuntimeError as exc:
+                return {"action": "defer", "mode": "tool", "defer_for": "10m",
+                        "reason": f"direct MERGE completion unavailable: {exc}"}
+            if completion.get("action") != "completed":
+                return {"action": "defer", "mode": "tool", "defer_for": "10m",
+                        "reason": "direct MERGE refused: " + str(
+                            completion.get("error") or completion.get("reason")
+                            or completion.get("action")), "completion": completion}
+            return {"action": "complete_empty", "mode": "tool", "verdict": "ГОТОВО",
+                    "reason": f"pipelinectl {complete_stage} completed for PR #"
+                              f"{(preflight.get('target') or {}).get('number')}",
+                    "profile_id": profile_id, "queue_id": queue.get("id"),
+                    "preflight": preflight, "completion": completion}
+
     preflight_action = preflight["action"].lower()
     preflight_reason = str(
         preflight.get("reason") or preflight.get("error") or preflight_action
@@ -3269,12 +3577,26 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                         "preflight": preflight,
                     }
             if mode == "auto":
+                if stage == "merge" and queue.get("item_blockers") is True:
+                    from .pipeline_item_holds import register_target
+                    target = fallback_lease["target"]
+                    register_target(task, target["number"], target["head"], "merge")
                 gate_command = [*command[:-2], "gate-fallback", stage,
-                                "--lease", preflight["handoff"]["lease"]]
+                                *_lease_argument(task, preflight["handoff"]["lease"], "gate")]
                 envelope = {"protocol": "promptpilot-fallback-target-v1",
                             "next_already_run": True, "command": command,
                             "gate_command": gate_command, "preflight": preflight}
                 pre_review_guard = ""
+                if stage == "merge":
+                    pre_review_guard = (
+                        "После подтверждения неизменного блокера следуй разделу "
+                        "Ожидание и парковка канонического MERGE и разрешённой "
+                        "передаче legacy-протокола: stale ship снимается с проверкой, "
+                        "подтверждённый конфликт/провал CI паркуется через needs-decision. "
+                        "Не оставляй разрешённую передачу незавершённой ради одной "
+                        "диагностики. Отказ scheduling gate не разрешает никаких мутаций. "
+                        "Повторное ship не заменяет обязательный source proof.\n\n"
+                    )
                 if fallback_lease["target"]["stage"] == "pre-review-validation":
                     pre_review_guard = (
                         "Это специальный content-lane этап pre-review-validation, а не "
@@ -3296,8 +3618,12 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                     "и его legacy-протокол. Используй только exact target из envelope. "
                     f"{pre_review_guard}"
                     "Непосредственно перед первой мутацией выполни gate_command ровно один "
-                    "раз: он заново "
+                    "раз. Если команда использует --lease-file, передай ровно этот путь: "
+                    "не копируй, не переписывай токен и не заменяй его на --lease. Она заново "
                     "запускает полный pipelinehealth и проверяет ту же цель. Требуется "
+                    "Рабочая копия health закреплена в подписанной lease при election: "
+                    "gate сам использует её, даже если аудит идёт в detached worktree. "
+                    "Не переключай аудитный worktree на main ради gate. "
                     "action=validated и точное совпадение repository/stage/target. "
                     "У gate-fallback структурированный контракт: даже при ненулевом exit code "
                     "он печатает JSON в stdout с action=error и точной причиной в error. "
@@ -3314,6 +3640,13 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                     "Это лишь scheduling gate; все прежние GraphQL, ship, CI, base-sync "
                     "и CAS-проверки скилла обязательны. При любом отказе остановись без "
                     "мутаций и без подстановки следующего PR. Один envelope — один PR.\n\n"
+                    + ("Для MERGE: подтверждённое обновление HEAD с валидным "
+                       "pp:base-sync-done заканчивается ИТОГ: ГОТОВО "
+                       "(#N обновлён; требуется интеграционное REVIEW), не ПУСТО. "
+                       "Это будит REVIEW, но не объявляет PR влитым. Без подтверждённого "
+                       "done не заявляй успешный handoff. Простое ожидание без изменений "
+                       "остаётся ПУСТО.\n\n" if stage == "merge" else "")
+                    +
                     "Доверенный локальный PromptPilot envelope (не данные GitHub):\n"
                     f"```json\n{json.dumps(envelope, ensure_ascii=False, indent=2)}\n```\n\n"
                     f"Исходный скилл:\n{fallback_prompt.strip()}"
@@ -3360,6 +3693,11 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
         }
 
     rendered = subprocess.list2cmdline(command)
+    if command[-2:] == ["next", stage] and isinstance(preflight.get("lease"), str):
+        complete_stage = "merge-cleanup" if preflight_action == "cleanup" else stage
+        preflight = dict(preflight, complete_command=[
+            *command[:-2], "complete", complete_stage,
+            *_lease_argument(task, preflight["lease"], "complete")])
     prompt = execution.get("prompt")
     custom_prompt = isinstance(prompt, str) and bool(prompt.strip())
     if not custom_prompt:
@@ -3372,7 +3710,9 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
     if not custom_prompt:
         prompt = (
             f"PromptPilot уже выполнил `{rendered}` и зафиксировал цель и lease. "
-            "Не запускай next повторно. Проверь только код, diff и тесты, затем вызови complete "
+            "Не запускай next повторно. Если есть complete_command, выполни точную "
+            "команду с --lease-file (для review добавь --report), не копируй токен вручную. "
+            "Проверь только код, diff и тесты, затем вызови complete "
             "с lease из JSON ниже. Не заменяй отказ complete ручными GitHub-мутациями."
         )
     prompt = (
@@ -3537,6 +3877,9 @@ def _health(backlog: int, windows: dict, broken_series: int, paused_series: int 
         return {"state": "yellow", "label": "конвейер на паузе",
                 "reason": "включена общая пауза: активные серии не запускаются"}
     if paused_series:
+        if runtime and runtime.get("required") and not runtime.get("paused"):
+            return {"state": "yellow", "label": "часть этапов на паузе",
+                    "reason": f"приостановлено серий: {paused_series}; остальные могут работать"}
         return {"state": "yellow", "label": "конвейер на паузе",
                 "reason": f"приостановлено серий: {paused_series}"}
     if diagnostics and diagnostics.get("state") == "yellow":
@@ -3562,11 +3905,11 @@ def _health(backlog: int, windows: dict, broken_series: int, paused_series: int 
 def _profile_active(profile: dict, series: list[dict]) -> bool:
     if profile.get("always_sample"):
         return True
-    # Individually paused pipelines need no background samples. A global pause
-    # is enforced by sample_active_profiles() and analyze(), including profiles
-    # that opt into always_sample.
+    # Automatic pauses need fresh observations to recover when their external
+    # blocker disappears. Explicit operator pauses do not.
     titles = [item.get("title", "").lower() for item in series
-              if not item.get("ended") and not item.get("paused")]
+              if not item.get("ended") and (not item.get("paused")
+                  or item.get("auto_pause_reason"))]
     return any(queue.get("series_contains", "").lower() in title
                for queue in profile.get("queues", []) for title in titles
                if queue.get("series_contains"))
@@ -3660,6 +4003,11 @@ def _queue_replica_status(queue: dict, series: list[dict]) -> dict:
             "working_dir": working_dir or None,
             "task_id": item.get("next_task_id"),
             "task_status": item.get("next_status"),
+            "task_error": (item.get("next_error")
+                           if item.get("next_status") in {"pending", "rate_limited"} else None),
+            "task_next_run_at": (item.get("next_run_at")
+                                 if item.get("next_status") in {"pending", "rate_limited"}
+                                 else None),
             "interval": item.get("effective_recurrence"),
             "paused": bool(item.get("paused")),
             "broken": bool(item.get("broken")),
@@ -3834,6 +4182,12 @@ def _refresh_local_state(result: dict, profile: dict, series: list[dict], *,
             "series_id": matching["id"] if matching else None,
             "task_id": matching.get("next_task_id") if matching else None,
             "task_status": matching.get("next_status") if matching else None,
+            "task_error": (matching.get("next_error")
+                           if matching and matching.get("next_status") in {"pending", "rate_limited"}
+                           else None),
+            "task_next_run_at": (matching.get("next_run_at")
+                                 if matching and matching.get("next_status") in {"pending", "rate_limited"}
+                                 else None),
             **projection,
         })
         backlog = queue.get("backlog")
@@ -3914,6 +4268,7 @@ def _refresh_local_state(result: dict, profile: dict, series: list[dict], *,
     data["outcomes"] = {
         "safe_deferrals_now": safe_deferrals,
         "stale_reselections_5h": aggregate_runs.get("stale", 0),
+        "safe_refusals_5h": aggregate_runs.get("safe_refusal", 0),
         "real_errors_5h": (
             aggregate_runs.get("unresolved_unable", aggregate_runs.get("unable", 0))
             + aggregate_runs.get("unresolved_failed", aggregate_runs.get("failed", 0))
@@ -4083,6 +4438,14 @@ def _with_persisted_refresh_status(result: dict, profile_id: str,
         return result
     status = event.get("status")
     if not isinstance(status, dict):
+        return result
+    # An execution admission denial is not a failed queue refresh. TAIL/FIX
+    # budget contention must not poison a fresh shared snapshot for every
+    # other stage. Unknown legacy routes remain conservative.
+    route = (status.get("github_budget") or {}).get("budget_route")
+    cache = result.get("cache") or {}
+    if (route in {"skill", "tool_preflight", "tool", "fallback_targeted"}
+            and cache.get("complete") is True and cache.get("stale") is False):
         return result
     raw_defer_until = status.get("refresh_deferred_until")
     defer_until = _parse_time(raw_defer_until)
@@ -4428,6 +4791,7 @@ def _analyze_without_budget(profile_id: str, series: list[dict], *,
                 "task_status": matching.get("next_status") if matching else None,
                 **projection,
                 "membership_complete": membership_complete, "age": age,
+                "admission_items": ordered_members,
                 "items": ordered_members[:priority_settings["max_items"]]
                 if priority_settings else [],
                 "execution": _execution_status(item, matching.get("working_dir") if matching else None),
@@ -4611,6 +4975,687 @@ def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True,
     return _with_live_github_budget_state(result, profile)
 
 
+def _report_series_ids(profile: dict, series: list[dict]) -> list[int]:
+    """Resolve current and ended recurring runs belonging to one profile.
+
+    The operational projection intentionally ignores ended series and may cap
+    legacy duplicates. A historical report must include their completed tasks:
+    ending or replacing a schedule during the selected period cannot erase the
+    work it already performed.
+    """
+    markers = {
+        str(queue.get("series_contains") or "").strip().lower()
+        for queue in profile.get("queues", [])
+        if str(queue.get("series_contains") or "").strip()
+    }
+    result = set()
+    for item in series:
+        identity = "\n".join((
+            str(item.get("title") or ""),
+            str(item.get("prompt") or ""),
+        )).lower()
+        series_id = item.get("id")
+        if series_id is not None and any(marker in identity for marker in markers):
+            result.add(int(series_id))
+    return sorted(result)
+
+
+def _report_snapshot_rows(profile_id: str, profile: dict,
+                          now: datetime, hours: int) -> list[dict]:
+    """Read the retained, configuration-compatible history for a report."""
+    profile_hash = _profile_fingerprint(profile)
+    rows = db.list_pipeline_snapshots(
+        profile_id,
+        # Queue cadence is capped at 24h. One extra cadence interval finds the
+        # nearest pre-window baseline without decoding a month for every 24h
+        # report opened in the Web UI or bot.
+        since=now - timedelta(hours=hours + 24),
+        limit=10000,
+    )
+    compatible = []
+    for row in rows:
+        payload = row.get("payload")
+        captured = _parse_time(row.get("captured_at"))
+        if (row.get("repository") != profile.get("repository")
+                or not isinstance(payload, dict)
+                or payload.get("profile_hash") != profile_hash
+                or not isinstance(payload.get("queues"), dict)
+                or captured is None):
+            continue
+        compatible.append((captured, row))
+    compatible.sort(key=lambda pair: (pair[0], int(pair[1].get("id") or 0)))
+    return [row for _captured, row in compatible]
+
+
+def _report_window_metrics(rows: list[dict], current_at: datetime,
+                           requested_end: datetime, hours: int,
+                           series_ids: list[int]) -> tuple[dict, dict | None]:
+    """Calculate movement around the requested wall-clock window.
+
+    The baseline nearest to the requested start wins, with an equally distant
+    post-start sample preferred. Coverage is the actual intersection with the
+    requested period. A baseline/tail gap beyond one cache TTL makes the window
+    explicitly incomplete instead of presenting a sparse 48h delta as 24h.
+    """
+    requested_start = requested_end - timedelta(hours=hours)
+    candidates = [
+        (row, _parse_time(row.get("captured_at"))) for row in rows
+    ]
+    candidates = [(row, stamp) for row, stamp in candidates
+                  if stamp is not None and stamp <= current_at]
+    if not candidates:
+        return {}, None
+    tolerance = float(_CACHE_TTL_SECONDS)
+    candidates = [
+        (row, stamp) for row, stamp in candidates
+        if stamp >= requested_start - timedelta(seconds=tolerance)
+    ]
+    if not candidates:
+        return {}, None
+    baseline_row, baseline_at = min(
+        candidates,
+        key=lambda pair: (
+            abs((pair[1] - requested_start).total_seconds()),
+            0 if pair[1] >= requested_start else 1,
+            pair[1],
+        ),
+    )
+    if baseline_at >= current_at:
+        return {
+            "hours": hours, "coverage_hours": 0.0, "complete": False,
+            "backlog_delta": None, "entered": None, "exited": None,
+            "moved": None, "transitions": None, "churn_items": None,
+            "queue_deltas": {}, "queue_throughput": {},
+        }, baseline_row
+
+    selected_rows = [row for row, stamp in candidates if stamp >= baseline_at]
+    actual_hours = (current_at - baseline_at).total_seconds() / 3600
+    movement = _window_metrics(
+        selected_rows, selected_rows[-1]["payload"], series_ids,
+        current_at, actual_hours)
+    observed_start = max(requested_start, baseline_at)
+    observed_end = min(requested_end, current_at)
+    coverage_seconds = max(0.0, (observed_end - observed_start).total_seconds())
+    baseline_gap = abs((baseline_at - requested_start).total_seconds())
+    tail_gap = max(0.0, (requested_end - current_at).total_seconds())
+    movement["hours"] = hours
+    movement["coverage_hours"] = round(
+        min(hours, coverage_seconds / 3600), 1)
+    movement["complete"] = (
+        baseline_gap < tolerance and tail_gap < tolerance
+        and coverage_seconds >= hours * 3600 - tolerance
+    )
+    return movement, baseline_row
+
+
+def _snapshot_membership_complete(payload: dict, expected_ids: set[str]) -> bool:
+    queues = payload.get("queues") if isinstance(payload, dict) else None
+    return bool(expected_ids) and isinstance(queues, dict) \
+        and set(queues) == expected_ids and all(
+            isinstance(queue, dict) and bool(queue.get("membership_complete"))
+            for queue in queues.values())
+
+
+def _report_attention(snapshot_queues: dict, repository: str) -> tuple[list[dict], bool]:
+    """Collect current human-attention labels once per issue/PR key."""
+    selected: dict[str, dict] = {}
+    membership = []
+    label_order = {label: index for index, label in enumerate(_ATTENTION_LABELS)}
+    for queue_id, queue in snapshot_queues.items():
+        if not isinstance(queue, dict):
+            continue
+        membership.append(bool(queue.get("membership_complete")))
+        for item in queue.get("items", []):
+            if not isinstance(item, dict):
+                continue
+            labels = {str(label).strip().lower()
+                      for label in item.get("labels", []) if str(label).strip()}
+            attention_labels = labels.intersection(_ATTENTION_LABELS)
+            if not attention_labels:
+                continue
+            key = str(item.get("key") or "").strip()
+            kind = str(item.get("kind") or "").strip().lower()
+            number = item.get("number")
+            if not key and kind in {"pr", "issue"} and isinstance(number, int):
+                key = f"{kind}:{number}"
+            if not key:
+                continue
+            if not kind and ":" in key:
+                kind = key.split(":", 1)[0]
+            if not isinstance(number, int):
+                try:
+                    number = int(key.split(":", 1)[1])
+                except (IndexError, TypeError, ValueError):
+                    continue
+            entry = selected.setdefault(key, {
+                "key": key, "kind": kind, "number": number,
+                "title": item.get("title") or f"#{number}",
+                "url": item.get("url"), "labels": set(), "queues": set(),
+            })
+            if not entry.get("url") and item.get("url"):
+                entry["url"] = item["url"]
+            if (not entry.get("title") or entry.get("title") == f"#{number}") \
+                    and item.get("title"):
+                entry["title"] = item["title"]
+            entry["labels"].update(attention_labels)
+            entry["queues"].add(str(queue_id))
+
+    result = []
+    for entry in selected.values():
+        labels = sorted(entry.pop("labels"), key=lambda label: label_order[label])
+        queues = sorted(entry.pop("queues"))
+        if not entry.get("url"):
+            path = "pull" if entry.get("kind") == "pr" else "issues"
+            entry["url"] = f"https://github.com/{repository}/{path}/{entry['number']}"
+        result.append({**entry, "labels": labels, "queues": queues})
+    result.sort(key=lambda item: (
+        min(label_order[label] for label in item["labels"]),
+        item["kind"], item["number"],
+    ))
+    return result, bool(membership) and all(membership)
+
+
+def _empty_delivery(status: str, reason: str, **extra) -> dict:
+    return {
+        "status": status, "exact": False, "reason": reason,
+        "merged_prs": [], "closed_issues": [], **extra,
+    }
+
+
+def _delivery_items(search: dict, repository: str, kind: str,
+                    start: datetime, end: datetime) -> tuple[list[dict], int]:
+    """Apply the exact timestamp boundary after GitHub's day-level search."""
+    result = []
+    missing_timestamps = 0
+    for item in search.get("items", []):
+        if not isinstance(item, dict):
+            continue
+        stamp = _parse_time(
+            item.get("merged_at") if kind == "pr" else item.get("closed_at"))
+        if stamp is None and kind == "pr":
+            # A merged PR is closed at merge time. GitHub's search result has
+            # historically omitted pull_request.merged_at in some API versions.
+            stamp = _parse_time(item.get("closed_at"))
+        if stamp is None:
+            missing_timestamps += 1
+            continue
+        if stamp < start or stamp > end:
+            continue
+        number = int(item["number"])
+        url = item.get("url")
+        if not url:
+            path = "pull" if kind == "pr" else "issues"
+            url = f"https://github.com/{repository}/{path}/{number}"
+        result.append({
+            "key": f"{kind}:{number}", "kind": kind, "number": number,
+            "title": item.get("title") or f"#{number}", "url": url,
+            "delivered_at": stamp.isoformat(),
+        })
+    result.sort(key=lambda item: (item["delivered_at"], item["number"]),
+                reverse=True)
+    return result, missing_timestamps
+
+
+def _refresh_report_delivery(profile_id: str, profile: dict, *,
+                             start: datetime, end: datetime) -> dict:
+    """Refresh exact delivered items under the ordinary insights admission."""
+    # A paused worker is an operator request for zero external pipeline I/O.
+    # Check before admission because budget admission itself probes /rate_limit
+    # (and may inspect GraphQL reservations) before _github_search sees pause.
+    if db.is_paused():
+        return _empty_delivery(
+            "blocked", "Конвейер на паузе; GitHub не запрашивался.",
+            blocker="worker_paused", retry_at=None)
+    repository = str(profile["repository"])
+    with _github_scan_admission(
+            profile, f"pipeline report delivery {profile_id}",
+            # Use the same quota class without publishing queue-refresh state:
+            # this enrichment neither refreshes nor invalidates queue snapshots.
+            budget_route="insights") as admission:
+        if not admission.get("allowed"):
+            return _empty_delivery(
+                "blocked",
+                str(admission.get("reason") or "GitHub refresh was not admitted"),
+                blocker=str(admission.get("state") or "github_budget"),
+                retry_at=admission.get("defer_until"),
+                github_budget=_public_budget_decision(admission),
+            )
+        try:
+            since_day = start.strftime("%Y-%m-%d")
+            merged_search = _github_search(
+                repository, f"is:pr is:merged merged:>={since_day}")
+            closed_search = _github_search(
+                repository, f"is:issue is:closed closed:>={since_day}")
+            _ensure_github_scan_lease(renew=True)
+            merged, missing_merged = _delivery_items(
+                merged_search, repository, "pr", start, end)
+            closed, missing_closed = _delivery_items(
+                closed_search, repository, "issue", start, end)
+            exact = (
+                bool(merged_search.get("membership_complete"))
+                and bool(closed_search.get("membership_complete"))
+                and missing_merged == 0 and missing_closed == 0
+            )
+            reason = None
+            if not exact:
+                reasons = []
+                if (not merged_search.get("membership_complete")
+                        or not closed_search.get("membership_complete")):
+                    reasons.append("GitHub вернул неполный состав результатов")
+                if missing_merged or missing_closed:
+                    reasons.append(
+                        "нет точного времени закрытия у элементов: "
+                        f"{missing_merged + missing_closed}")
+                reason = "; ".join(reasons)
+            return {
+                "status": "refreshed" if exact else "partial",
+                "exact": exact, "reason": reason,
+                "refreshed_at": end.isoformat(),
+                "merged_prs": merged, "closed_issues": closed,
+            }
+        except _GitHubScanPaused as exc:
+            return _empty_delivery(
+                "blocked", str(exc), blocker="worker_paused", retry_at=None)
+        except Exception as exc:
+            # Delivery is an optional enrichment. Queue movement and local run
+            # history remain useful even when GitHub or the scan lease fails.
+            return _empty_delivery(
+                "failed", str(exc) or type(exc).__name__,
+                blocker=type(exc).__name__, retry_at=None)
+
+
+def build_period_report(profile_id: str, series: list[dict], *, hours: int = 24,
+                        refresh_delivery: bool = False) -> dict:
+    """Build a deterministic pipeline digest, with GitHub strictly opt-in.
+
+    The default path reads only SQLite and the durable insights cache. Passing
+    ``refresh_delivery=True`` adds exact merged-PR/closed-issue lists through
+    the same scan lease and GitHub budget route as an explicit insights refresh.
+    """
+    if isinstance(hours, bool) or hours not in _REPORT_HOURS:
+        raise ValueError("hours должен быть одним из значений: 24, 168 или 720")
+    profiles = _profiles()
+    if profile_id not in profiles:
+        raise KeyError(profile_id)
+    profile = profiles[profile_id]
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(hours=hours)
+    cached = read_cached(profile_id, series)
+    series_ids = _report_series_ids(profile, series)
+    runs_raw = db.pipeline_run_metrics(series_ids, start)
+    rows = _report_snapshot_rows(profile_id, profile, now, hours)
+
+    movement = copy.deepcopy(
+        (cached.get("history") or {}).get(f"{hours}h") or {})
+    snapshot_queues = {}
+    data_through = None
+    current_at = None
+    baseline_row = None
+    if rows:
+        current_row = rows[-1]
+        snapshot_queues = current_row["payload"]["queues"]
+        current_at = _parse_time(current_row.get("captured_at"))
+        if current_at is not None:
+            movement, baseline_row = _report_window_metrics(
+                rows, current_at, now, hours, series_ids)
+            data_through = current_at.isoformat()
+    if not snapshot_queues:
+        snapshot_queues = {
+            str(queue.get("id")): {
+                "backlog": queue.get("backlog"),
+                "items": queue.get("items") or [],
+                "membership_complete": bool(queue.get("membership_complete")),
+            }
+            for queue in cached.get("queues", []) if isinstance(queue, dict)
+        }
+    if data_through is None and cached.get("generated_at") is not None:
+        try:
+            generated = datetime.fromtimestamp(
+                float(cached["generated_at"]), timezone.utc)
+            data_through = generated.isoformat()
+            current_at = generated
+        except (TypeError, ValueError, OSError):
+            pass
+
+    attention, observed_membership_complete = _report_attention(
+        snapshot_queues, str(profile["repository"]))
+    expected_queue_ids = {str(config.get("id"))
+                          for config in profile.get("queues", [])}
+    attention_complete = (
+        bool(rows) and observed_membership_complete
+        and _snapshot_membership_complete(rows[-1]["payload"], expected_queue_ids)
+    )
+    membership_complete = (
+        attention_complete and baseline_row is not None
+        and _snapshot_membership_complete(
+            baseline_row["payload"], expected_queue_ids)
+    )
+    if not membership_complete and movement:
+        # Backlog counts remain meaningful, but set-based movement does not:
+        # an incomplete endpoint can make entries/exits and transitions up.
+        for key in ("entered", "exited", "moved", "transitions", "churn_items"):
+            movement[key] = None
+        movement["entered_per_hour"] = None
+        movement["exited_per_hour"] = None
+        movement["queue_throughput"] = {
+            queue_id: None for queue_id in expected_queue_ids}
+        movement["queue_throughput_per_hour"] = {
+            queue_id: None for queue_id in expected_queue_ids}
+    queue_deltas = movement.get("queue_deltas") or {}
+    queue_throughput = movement.get("queue_throughput") or {}
+    cached_queues = {str(queue.get("id")): queue
+                     for queue in cached.get("queues", [])
+                     if isinstance(queue, dict)}
+    queues = []
+    for config in profile.get("queues", []):
+        queue_id = str(config.get("id"))
+        local = cached_queues.get(queue_id, {})
+        saved = snapshot_queues.get(queue_id, {})
+        # Movement/deltas are anchored to the latest durable snapshot, so its
+        # backlog must win too. A separately published cache can be newer after
+        # a fenced snapshot write failed; mixing the two creates impossible
+        # totals for one report timestamp.
+        backlog = (saved.get("backlog") if rows
+                   else local.get("backlog", saved.get("backlog")))
+        queues.append({
+            "id": queue_id, "title": config.get("title") or queue_id,
+            "backlog": backlog if isinstance(backlog, int) else None,
+            "delta": (int(queue_deltas[queue_id])
+                      if isinstance(queue_deltas.get(queue_id), (int, float))
+                      else None),
+            "throughput": (int(queue_throughput[queue_id])
+                           if isinstance(queue_throughput.get(queue_id), (int, float))
+                           else None),
+            "membership_complete": bool(saved.get("membership_complete")),
+        })
+
+    if rows:
+        capacities = {
+            str(config.get("id")): max(1, int(config.get("capacity", 1)))
+            for config in profile.get("queues", [])
+        }
+        bottleneck_queue = max(
+            (queue for queue in queues
+             if isinstance(queue.get("backlog"), int) and queue["backlog"] > 0),
+            key=lambda queue: queue["backlog"] / capacities[queue["id"]],
+            default=None,
+        )
+    else:
+        bottleneck_id = cached.get("bottleneck")
+        bottleneck_queue = next(
+            (queue for queue in queues if queue["id"] == bottleneck_id), None)
+    bottleneck = ({
+        "id": bottleneck_queue["id"], "title": bottleneck_queue["title"],
+        "backlog": bottleneck_queue["backlog"],
+    } if bottleneck_queue else None)
+    verdicts = {key: int(runs_raw.get(key, 0)) for key in (
+        "ready", "empty", "no_change", "human", "stale", "safe_refusal",
+        "unable", "failed", "other",
+    )}
+    errors = {key: int(runs_raw.get(key, 0)) for key in (
+        "unable", "failed", "unresolved_unable", "unresolved_failed",
+        "recovered_unable", "recovered_failed",
+    )}
+    run_report = {
+        "total": int(runs_raw.get("runs", 0)), "verdicts": verdicts,
+        "tokens": {
+            "known_runs": int(runs_raw.get("tokens_known_runs", 0)),
+            "input": int(runs_raw.get("input_tokens", 0)),
+            "output": int(runs_raw.get("output_tokens", 0)),
+            "total": int(runs_raw.get("total_tokens", 0)),
+        },
+        "cost": {
+            "known_runs": int(runs_raw.get("cost_known_runs", 0)),
+            "total_usd": float(runs_raw.get("total_cost_usd", 0.0)),
+        },
+        "errors": errors,
+    }
+    coverage_hours = movement.get("coverage_hours")
+    period_snapshot_count = 0
+    if current_at is not None:
+        threshold = now - timedelta(hours=hours)
+        period_snapshot_count = sum(
+            1 for row in rows
+            if threshold <= (_parse_time(row.get("captured_at"))
+                             or datetime.min.replace(tzinfo=timezone.utc)) <= now
+        )
+    cache = copy.deepcopy(cached.get("cache") or {})
+    snapshot_age_seconds = (
+        max(0, round((now - current_at).total_seconds()))
+        if current_at is not None else None)
+    fresh = (snapshot_age_seconds is not None
+             and snapshot_age_seconds < _CACHE_TTL_SECONDS)
+    baseline_at = (_parse_time(baseline_row.get("captured_at"))
+                   if baseline_row is not None else None)
+    baseline_gap_seconds = (
+        abs((baseline_at - start).total_seconds())
+        if baseline_at is not None else None)
+    movement_period = ({
+        "from": baseline_at.isoformat(), "to": current_at.isoformat(),
+    } if baseline_at is not None and current_at is not None else None)
+    coverage = {
+        "snapshot_count": period_snapshot_count,
+        "coverage_hours": coverage_hours,
+        "complete": (bool(movement.get("complete"))
+                     and membership_complete and fresh),
+        "data_through": data_through,
+        "snapshot_age_seconds": snapshot_age_seconds,
+        "tail_gap_hours": (round(snapshot_age_seconds / 3600, 2)
+                           if snapshot_age_seconds is not None else None),
+        "baseline_gap_hours": (round(baseline_gap_seconds / 3600, 2)
+                               if baseline_gap_seconds is not None else None),
+        "movement_period": movement_period,
+        "fresh": fresh,
+        "membership_complete": membership_complete,
+        "attention_complete": attention_complete,
+        "source": "snapshots" if rows else str(cache.get("source") or "none"),
+    }
+    delivery = _empty_delivery(
+        "not_requested",
+        "Точное обновление результата в GitHub не запрошено; запросов к GitHub не было.")
+    if refresh_delivery:
+        delivery = _refresh_report_delivery(
+            profile_id, profile, start=start, end=now)
+
+    current_backlog = None if rows else cached.get("backlog_total")
+    if not isinstance(current_backlog, int):
+        known = [queue["backlog"] for queue in queues
+                 if isinstance(queue.get("backlog"), int)]
+        current_backlog = sum(known) if len(known) == len(queues) else None
+    unresolved_errors = (
+        errors["unresolved_unable"] + errors["unresolved_failed"])
+    delivered_count = (
+        len(delivery["merged_prs"]) + len(delivery["closed_issues"])
+        if delivery.get("exact") else None)
+    live_series = [item for item in series
+                   if item.get("id") in series_ids and not item.get("ended")]
+    current_tasks = [{
+        "task_id": item.get("next_task_id"), "title": item.get("title"),
+        "status": item.get("next_status"),
+        "error": (item.get("next_error")
+                  if item.get("next_status") in {"pending", "rate_limited"} else None),
+        "started_at": item.get("next_started_at"),
+        "scheduled_at": item.get("next_run_at"),
+        "paused": bool(item.get("paused")),
+    } for item in live_series]
+    diagnostics = cached.get("diagnostics") or {}
+    from .pipeline_board import build_board
+    board = build_board(
+        delivery, diagnostics, current_tasks,
+        available=(fresh and cache.get("complete") is True
+                   and bool(diagnostics) and not diagnostics.get("checker_failed")),
+        classifications=profile.get("delivery_classifications"))
+    report = {
+        "profile_id": profile_id, "title": profile["title"],
+        "repository": profile["repository"], "hours": hours,
+        "period": {"from": start.isoformat(), "to": now.isoformat()},
+        "generated_at": now.isoformat(),
+        "summary": {
+            "backlog_current": current_backlog,
+            "backlog_delta": movement.get("backlog_delta"),
+            "entered": movement.get("entered"),
+            "exited": movement.get("exited"),
+            "moved": movement.get("moved"),
+            "runs": run_report["total"],
+            "useful_runs": verdicts["ready"],
+            "empty_or_no_change_runs": verdicts["empty"] + verdicts["no_change"],
+            "safe_reselections": verdicts["stale"] + verdicts["safe_refusal"],
+            "errors": unresolved_errors,
+            "total_tokens": run_report["tokens"]["total"],
+            "total_cost_usd": run_report["cost"]["total_usd"],
+            "attention": len(attention), "delivered": delivered_count,
+            "merged_prs": (len(delivery["merged_prs"])
+                           if delivery.get("exact") else None),
+            "closed_issues": (len(delivery["closed_issues"])
+                              if delivery.get("exact") else None),
+        },
+        "coverage": coverage,
+        "health": copy.deepcopy(cached.get("health") or {}),
+        "bottleneck": bottleneck,
+        "queues": queues, "runs": run_report,
+        "attention": attention, "delivery": delivery, "cache": cache,
+        "board": board,
+        "current": {
+            "observed_at": now.isoformat(), "tasks": current_tasks,
+            "integration_owner": (copy.deepcopy(diagnostics.get("integration_owner"))
+                                  if fresh else None),
+        },
+        "decisions": {
+            "waiting_ship": copy.deepcopy(diagnostics.get("reviewed_waiting_ship") or []),
+            "human_waiting": copy.deepcopy(diagnostics.get("human_waiting") or []),
+            "available": bool(diagnostics) and not diagnostics.get("checker_failed"),
+        },
+    }
+    return report
+
+
+def _markdown_escape(value) -> str:
+    return (str(value).replace("\\", "\\\\").replace("[", "\\[")
+            .replace("]", "\\]").replace("\r", " ").replace("\n", " "))
+
+
+def _markdown_link(title, url) -> str:
+    text = _markdown_escape(title)
+    target = str(url or "")
+    return f"[{text}]({target})" if target.startswith(("https://", "http://")) else text
+
+
+def render_period_report_markdown(report: dict) -> str:
+    """Render the public report shape as compact, human-readable Markdown."""
+    hours = int(report["hours"])
+    period_name = {24: "24 часа", 168: "7 дней", 720: "30 дней"}.get(
+        hours, f"{hours} часов")
+    summary = report["summary"]
+    coverage = report["coverage"]
+    health = report.get("health") or {}
+
+    def number(value, unknown="нет данных"):
+        return unknown if value is None else str(value)
+
+    def delta(value):
+        if value is None:
+            return "нет данных"
+        return f"{int(value):+d}"
+
+    lines = [
+        f"# {_markdown_escape(report['title'])} — итоги за {period_name}",
+        "",
+        (f"Период: `{report['period']['from']}` — `{report['period']['to']}`. "
+         f"Данные очередей по: `{coverage.get('data_through') or 'нет данных'}`."),
+        "",
+        "## Главное",
+        "",
+        (f"- Backlog: {number(summary.get('backlog_current'))} "
+         f"(изменение {delta(summary.get('backlog_delta'))})."),
+        (f"- Движение: пришло {number(summary.get('entered'))}, "
+         f"вышло {number(summary.get('exited'))}, между этапами перешло "
+         f"{number(summary.get('moved'))}."),
+        (f"- Прогоны: {summary.get('runs', 0)}; полезных {summary.get('useful_runs', 0)}; "
+         f"пустых или без изменений {summary.get('empty_or_no_change_runs', 0)}; "
+         f"безопасных перевыборов {summary.get('safe_reselections', 0)}; "
+         f"активных ошибок {summary.get('errors', 0)}."),
+        (f"- Токены: {summary.get('total_tokens', 0)} "
+         f"в {report['runs']['tokens'].get('known_runs', 0)} измеренных прогонах."),
+        (f"- Стоимость: ${summary.get('total_cost_usd', 0):.4f} "
+         f"в {report['runs']['cost'].get('known_runs', 0)} "
+         f"из {report['runs'].get('total', 0)} прогонов."),
+        (f"- Состояние: {_markdown_escape(health.get('label') or health.get('state') or 'нет данных')}"
+         + (f" — {_markdown_escape(health['reason'])}" if health.get("reason") else "")),
+    ]
+    bottleneck = report.get("bottleneck")
+    if bottleneck:
+        lines.append(
+            f"- Узкое место: {_markdown_escape(bottleneck['title'])} "
+            f"({number(bottleneck.get('backlog'))}).")
+    if not coverage.get("complete"):
+        lines.append(
+            f"- Покрытие неполное: {number(coverage.get('coverage_hours'))} ч; "
+            f"снимков {coverage.get('snapshot_count', 0)}; "
+            f"состав очередей полный: {'да' if coverage.get('membership_complete') else 'нет'}.")
+    if not coverage.get("complete") and coverage.get("movement_period"):
+        movement_period = coverage["movement_period"]
+        gaps = []
+        if coverage.get("baseline_gap_hours") is not None:
+            gaps.append(
+                f"отклонение начала {number(coverage.get('baseline_gap_hours'))} ч")
+        if coverage.get("tail_gap_hours") is not None:
+            gaps.append(
+                f"непокрытый хвост {number(coverage.get('tail_gap_hours'))} ч")
+        lines.append(
+            f"- Движение очередей рассчитано за фактическое окно "
+            f"`{movement_period['from']}` — `{movement_period['to']}`; "
+            f"{'; '.join(gaps) or 'окно неполное'}.")
+
+    delivery = report.get("delivery") or {}
+    lines.extend(["", "## Результат в GitHub", ""])
+    if not delivery.get("exact"):
+        status = _markdown_escape(delivery.get("status") or "unknown")
+        reason = _markdown_escape(
+            delivery.get("reason") or "точное обновление недоступно")
+        lines.append(f"- Точного списка нет (`{status}`): {reason}")
+    for item in delivery.get("merged_prs", []):
+        lines.append(
+            f"- Влит PR {_markdown_link('#' + str(item['number']) + ' ' + item['title'], item.get('url'))}"
+            f" — `{item['delivered_at']}`.")
+    for item in delivery.get("closed_issues", []):
+        lines.append(
+            f"- Закрыт issue {_markdown_link('#' + str(item['number']) + ' ' + item['title'], item.get('url'))}"
+            f" — `{item['delivered_at']}`.")
+    if delivery.get("exact") and not (
+            delivery.get("merged_prs") or delivery.get("closed_issues")):
+        lines.append("- За период не было влитых PR и закрытых issues.")
+
+    lines.extend(["", "## Очереди", ""])
+    if report.get("queues"):
+        for queue in report["queues"]:
+            lines.append(
+                f"- {_markdown_escape(queue['title'])}: "
+                f"{number(queue.get('backlog'))} (изменение {delta(queue.get('delta'))}, "
+                f"вышло {number(queue.get('throughput'))}).")
+    else:
+        lines.append("- Нет данных об очередях.")
+
+    lines.extend(["", "## Нужно внимание", ""])
+    if report.get("attention"):
+        for item in report["attention"]:
+            labels = ", ".join(f"`{_markdown_escape(label)}`"
+                               for label in item.get("labels", []))
+            lines.append(
+                f"- {_markdown_link('#' + str(item['number']) + ' ' + item['title'], item.get('url'))}"
+                f" — {labels}.")
+    else:
+        if coverage.get("attention_complete"):
+            lines.append(
+                "- В кэшированных очередях нет элементов с `ship`, "
+                "`needs-decision` или `hold`.")
+        else:
+            lines.append(
+                "- Полного снимка состава нет; среди доступных элементов "
+                "не найдено `ship`, `needs-decision` или `hold`.")
+
+    return "\n".join(lines) + "\n"
+
+
 def sample_active_profiles(series: list[dict]) -> dict[str, str]:
     """Refresh every configured pipeline that has a matching live series."""
     if db.is_paused():
@@ -4620,7 +5665,15 @@ def sample_active_profiles(series: list[dict]) -> dict[str, str]:
         if not _profile_active(profile, series):
             continue
         try:
-            data = analyze(profile_id, series, use_cache=False)
+            data = None
+            if (profile.get("github_budget") or {}).get("essential_snapshot_headroom") is True:
+                candidate = read_cached(profile_id, series)
+                cache = candidate.get("cache") or {}
+                if (cache.get("complete") is True and cache.get("stale") is False
+                        and not cache.get("refresh_blocked")):
+                    data = candidate
+            if data is None:
+                data = analyze(profile_id, series, use_cache=False)
             if db.is_paused():
                 outcomes[profile_id] = "paused"
                 break
@@ -4632,9 +5685,17 @@ def sample_active_profiles(series: list[dict]) -> dict[str, str]:
             if current_profile is None:
                 outcomes[profile_id] = "profile removed"
                 continue
+            resumed = (_resume_resolved_blockers(current_profile, data, series)
+                       if _wake_cache_guard(
+                           profile_id, current_profile, data.get("cache") or {})
+                       else [])
             woken = _wake_ready_queues(
                 profile_id, current_profile, data, series)
-            outcomes[profile_id] = "ok" + (f"; woken={','.join(woken)}" if woken else "")
+            outcomes[profile_id] = (
+                "ok"
+                + (f"; resumed={','.join(map(str, resumed))}" if resumed else "")
+                + (f"; woken={','.join(woken)}" if woken else "")
+            )
         except Exception as exc:  # one external repository must not stop the sampler
             outcomes[profile_id] = str(exc)
     return outcomes

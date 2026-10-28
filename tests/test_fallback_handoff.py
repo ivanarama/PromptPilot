@@ -14,6 +14,7 @@ import pytest
 
 from promptpilot import fallback_handoff as handoff
 from promptpilot import pipeline_insights, project_pipeline as pp
+from promptpilot.models import TaskCreate
 
 
 HEAD = "a" * 40
@@ -57,6 +58,41 @@ def health(target_stage="integration-review"):
                                           if target_stage in handoff.CONTENT_REVIEW_STAGES
                                           else []),
             "merge_executable": [] if reviewing else [target]}
+
+
+@pytest.mark.parametrize("change", [
+    {"number": 99}, {"head": "b" * 40}, {"review_depth": 2},
+    {"stage": "integration-review"},
+])
+def test_parallel_review_allowlist_cannot_expand_content_authority(change):
+    value = health()
+    content = {"number": 43, "head": "c" * 40,
+               "stage": "review", "review_depth": 0}
+    value["content_review_candidates"] = [content]
+    value["parallel_review_candidates"] = [dict(content, **change)]
+    with pytest.raises(pp.PipelineError, match="parallel REVIEW"):
+        handoff.validate_health(value)
+
+
+def test_parallel_review_allowlist_requires_integration_review_owner():
+    value = health("integration-merge-ready")
+    content = {"number": 43, "head": "c" * 40,
+               "stage": "review", "review_depth": 0}
+    value["content_review_candidates"] = [content]
+    value["review_candidates"] = [content]
+    value["parallel_review_candidates"] = [content]
+    with pytest.raises(pp.PipelineError, match="no integration-review owner"):
+        handoff.validate_health(value)
+
+
+def test_parallel_review_cannot_duplicate_integration_owner():
+    value = health()
+    duplicate = {"number": 42, "head": HEAD,
+                 "stage": "review", "review_depth": 0}
+    value["content_review_candidates"] = [duplicate]
+    value["parallel_review_candidates"] = [duplicate]
+    with pytest.raises(pp.PipelineError, match="includes its integration owner"):
+        handoff.validate_health(value)
 
 
 def invoke(argv):
@@ -116,6 +152,11 @@ def test_cli_dispatch_handoff_runs_exactly_election_and_fresh_gate(config, monke
     assert "не повторяй gate_command и next" in route["prompt"]
     assert "ИТОГ: НЕ СМОГ (gate-fallback: <точный error" in route["prompt"]
     assert "Один envelope — один PR" in route["prompt"]
+    if stage == "merge":
+        assert "pp:base-sync-done заканчивается ИТОГ: ГОТОВО" in route["prompt"]
+        assert "не объявляет PR влитым" in route["prompt"]
+    else:
+        assert "Для MERGE:" not in route["prompt"]
     if target_stage == handoff.PRE_REVIEW_VALIDATION_STAGE:
         assert "все восемь полей pre_review_sync" in route["prompt"]
         assert "полную стабильную GraphQL-проверку" in route["prompt"]
@@ -145,6 +186,60 @@ def test_documented_scan_budget_uses_local_productive_wake_up():
     assert "два scan вместо прежних четырёх" in readme
     assert "`4 → 2`" in readme
     assert "Профиль без\nлокального графа сохраняет совместимый третий scan" in readme
+
+
+def test_cli_gate_uses_signed_election_checkout_after_detached_audit(
+        config, monkeypatch, tmp_path):
+    base = tmp_path / "base"
+    audit = tmp_path / "detached-audit"
+    base.mkdir()
+    audit.mkdir()
+    config["sync_base_before_health"] = True
+    config["health_command"] = ["fixture-health"]
+    snapshot = health()
+    monkeypatch.setattr(pp, "load_config", lambda _: dict(config))
+    monkeypatch.setattr(pp, "GitHub", ReadOnlyGitHub)
+    calls = []
+
+    def subprocess_run(command, **kwargs):
+        location = Path(kwargs.get("cwd") or Path.cwd())
+        calls.append((command, location))
+        if command[-2:] == ["branch", "--show-current"]:
+            output = "main\n" if location == base else ""
+        elif command == ["fixture-health"]:
+            output = json.dumps(snapshot)
+        else:
+            output = ""
+        return SimpleNamespace(returncode=0, stdout=output, stderr="")
+
+    monkeypatch.setattr(pp.subprocess, "run", subprocess_run)
+    monkeypatch.chdir(base)
+    code, elected = invoke(["--config", str(tmp_path / "config.json"), "next", "review"])
+    assert code == 0 and elected["action"] == "fallback"
+    lease = pp.decode_signed_lease(elected["handoff"]["lease"])
+    assert lease["health_checkout"] == str(base.resolve())
+    calls.clear()
+    monkeypatch.chdir(audit)
+    code, gated = invoke(["--config", str(tmp_path / "config.json"),
+                          "gate-fallback", "review", "--lease", elected["handoff"]["lease"]])
+    assert code == 0 and gated["action"] == "validated"
+    assert gated["mutation_authorized"] is False
+    assert len(calls) == 5 and all(location == base for _, location in calls)
+    assert Path.cwd() == audit
+
+
+def test_cli_gate_still_rejects_dirty_pinned_checkout(config, monkeypatch, tmp_path):
+    config["sync_base_before_health"] = True
+    monkeypatch.chdir(tmp_path)
+    elected = handoff.create(config, health(), "review", health()["integration_owner"], "audit")
+    monkeypatch.setattr(pp, "load_config", lambda _: dict(config))
+    monkeypatch.setattr(pp, "GitHub", ReadOnlyGitHub)
+    def subprocess_run(command, **kwargs):
+        output = "main\n" if command[-2:] == ["branch", "--show-current"] else " M file.go\n"
+        return SimpleNamespace(returncode=0, stdout=output, stderr="")
+    monkeypatch.setattr(pp.subprocess, "run", subprocess_run)
+    code, error = invoke(["gate-fallback", "review", "--lease", elected["handoff"]["lease"]])
+    assert code == 2 and "tracked changes" in error["error"]
 
 
 @pytest.mark.parametrize("field,value", [
@@ -375,6 +470,111 @@ def test_merge_cleanup_still_precedes_opted_in_election(config, monkeypatch):
     assert pp.next_merge(object(), config) == {"action": "cleanup"}
 
 
+def test_signed_fallback_cli_accepts_opaque_file_and_rejects_tampering(config, monkeypatch, tmp_path, isolated_db):
+    source = health("integration-merge-ready")
+    result = handoff.create(config, source, "merge", source["integration_owner"], "carry")
+    argument = pipeline_insights._lease_argument(SimpleNamespace(id=123), result["handoff"]["lease"], "gate")
+    assert argument[0] == "--lease-file"
+    monkeypatch.setattr(pp, "load_config", lambda _: dict(config))
+    monkeypatch.setattr(pp, "GitHub", ReadOnlyGitHub)
+    monkeypatch.setattr(pp, "run_health", lambda *_, **__: source)
+    monkeypatch.setattr(pp, "pending_merge_intents", lambda *_: [])
+    code, gated = invoke(["gate-fallback", "merge", *argument])
+    assert code == 0 and gated["action"] == "validated"
+    assert gated["mutation_authorized"] is False
+    path = Path(argument[1])
+    token = path.read_text(encoding="ascii")
+    path.write_text(("A" if token[0] != "A" else "B") + token[1:], encoding="ascii")
+    code, refused = invoke(["gate-fallback", "merge", *argument])
+    assert code == 2 and "signature" in refused["error"]
+
+
+def test_cli_missing_lease_file_is_structured_refusal(tmp_path):
+    code, result = invoke(["gate-fallback", "merge", "--lease-file", str(tmp_path / "missing.lease")])
+    assert code == 2 and result["action"] == "error"
+
+
+@pytest.mark.parametrize("action", ["merge", "cleanup"])
+@pytest.mark.parametrize("completion_action", ["completed", "error"])
+def test_opted_in_direct_merge_completion_never_launches_provider(
+        monkeypatch, action, completion_action):
+    queue = {"id": "merge", "execution": {"mode": "auto", "direct_complete": True,
+             "command": ["ctl", "next", "merge"]}}
+    monkeypatch.setattr(pipeline_insights, "_matching_queue", lambda _: ("example", {}, queue))
+    monkeypatch.setattr(pipeline_insights, "_tool_available", lambda *_: (True, ""))
+    commands = []
+    def preflight(_execution, command, _directory):
+        commands.append(command)
+        if len(commands) == 1:
+            return {"action": action, "lease": "opaque", "target": {"number": 42}}
+        assert command == ["ctl", "complete", "merge-cleanup" if action == "cleanup" else "merge",
+                           "--lease", "opaque"]
+        return {"action": completion_action, "error": "fresh gate refused"}
+    monkeypatch.setattr(pipeline_insights, "_tool_preflight", preflight)
+    route = pipeline_insights.execution_route(SimpleNamespace(), "/skill")
+    assert len(commands) == 2
+    if completion_action == "completed":
+        assert route["action"] == "complete_empty" and route["verdict"] == "ГОТОВО"
+    else:
+        assert route["action"] == "defer" and "fresh gate refused" in route["reason"]
+
+
+def test_cli_blocked_by_pending_ci_returns_wait_before_full_fallback(config, monkeypatch):
+    config["required_checks"] = ["build", "lint"]
+    monkeypatch.setattr(pp, "load_config", lambda _: dict(config))
+    monkeypatch.setattr(pp, "GitHub", ReadOnlyGitHub)
+    monkeypatch.setattr(pp, "pending_merge_intents", lambda *_: [])
+    monkeypatch.setattr(pp, "run_health", lambda *_, **__: health("merge"))
+    monkeypatch.setattr(pp, "list_ship", lambda *_: [{
+        "number": 42, "head": {"sha": HEAD}, "title": "pending CI"}])
+    monkeypatch.setattr(pp, "stable_timeline", lambda *_: {
+        "headRefOid": HEAD, "state": "OPEN", "isDraft": False,
+        "baseRefName": "main", "labelsComplete": True, "labels": ["ship"],
+        "edges": [{"cursor": "c1", "node": {"__typename": "PullRequestCommit",
+                   "id": "head-anchor", "commit": {"oid": HEAD}}}],
+    })
+    monkeypatch.setattr(pp, "proof", lambda *_: {"review": 1})
+    monkeypatch.setattr(pp, "trusted_ship_authorized", lambda *_: True)
+    monkeypatch.setattr(pp, "pr_checks", lambda *_: (
+        {"mergeStateStatus": "BLOCKED", "mergeable": "MERGEABLE"},
+        [{"name": "build", "status": "IN_PROGRESS"},
+         {"name": "lint", "conclusion": "SUCCESS"}]))
+    monkeypatch.setattr(pp, "fallback_target", lambda *_: pytest.fail("CI wait launched fallback"))
+    code, result = invoke(["next", "merge"])
+    assert code == 0
+    assert result == {"action": "wait", "number": 42,
+                      "reason": "required CI checks are still running"}
+
+
+@pytest.mark.parametrize("owner_stage", ["integration-review", "legacy-integration-review"])
+@pytest.mark.parametrize("legacy_null", [False, True])
+def test_merge_dispatch_waits_for_review_owner_without_provider(
+        config, monkeypatch, owner_stage, legacy_null):
+    source = health(owner_stage)
+    if legacy_null:
+        source["merge_executable"] = None
+    monkeypatch.setattr(pp, "run_health", lambda *_, **__: source)
+    monkeypatch.setattr(pp, "pending_merge_intents", lambda *_: [])
+    monkeypatch.setattr(pp, "list_ship", lambda *_: pytest.fail("must not bypass owner"))
+    monkeypatch.setattr(pp, "GitHub", ReadOnlyGitHub)
+    monkeypatch.setattr(pp, "load_config", lambda _: dict(config))
+    queue = {"id": "merge", "execution": {
+        "mode": "auto", "command": ["ctl", "next", "merge"]}}
+    monkeypatch.setattr(pipeline_insights, "_matching_queue", lambda _: ("example", {}, queue))
+    monkeypatch.setattr(pipeline_insights, "_tool_available", lambda *_: (True, ""))
+
+    def preflight(*_):
+        code, result = invoke(["next", "merge"])
+        assert code == 0
+        return result
+
+    monkeypatch.setattr(pipeline_insights, "_tool_preflight", preflight)
+    route = pipeline_insights.execution_route(SimpleNamespace(), "/skill")
+    assert route["action"] == "complete_empty"
+    assert route["preflight"]["number"] == 42
+    assert "waiting for integration REVIEW" in route["reason"]
+
+
 @pytest.mark.parametrize("stage", ["review", "merge"])
 def test_opted_in_red_health_never_routes_to_manual_mutations(config, monkeypatch, stage):
     monkeypatch.setattr(pp, "run_health", lambda *_, **__: {"state": "red"})
@@ -431,11 +631,44 @@ def test_gate_rejects_signed_review_token_and_forged_fallback_target(config):
         handoff.validate(preflight, "review")
 
 
-def test_fresh_ordinary_merge_priority_change_closes_target_gate(config):
+def test_fresh_ordinary_merge_priority_change_keeps_exact_target_gate(config):
     source = health("merge")
     target = source["merge_executable"][0]
     source["merge_executable"].insert(0, {"number": 9, "head": HEAD, "stage": "merge"})
+    handoff.health_gate(source, "merge", target, election=False)
     with pytest.raises(pp.PipelineError, match="exact executable"):
+        handoff.health_gate(source, "merge", target, election=True)
+
+
+def test_public_merge_gate_keeps_elected_target_after_unrelated_reorder(config, monkeypatch):
+    source = health("merge")
+    target = source["merge_executable"][0]
+    preflight = handoff.create(config, source, "merge", target, "needs full skill")
+    fresh = copy.deepcopy(source)
+    fresh["merge_executable"].insert(0, {"number": 9, "head": HEAD, "stage": "merge"})
+    monkeypatch.setattr(pp, "load_config", lambda _: dict(config))
+    monkeypatch.setattr(pp, "run_health", lambda *_args, **_kwargs: fresh)
+    monkeypatch.setattr(pp, "GitHub", ReadOnlyGitHub)
+    monkeypatch.setattr(pp, "pending_merge_intents", lambda *_: [])
+
+    code, result = invoke(["gate-fallback", "merge", "--lease", preflight["handoff"]["lease"]])
+    assert code == 0
+    assert result["action"] == "validated"
+    assert result["target"] == handoff.identity(target)
+    assert result["mutation_authorized"] is False
+
+
+def test_fresh_ordinary_merge_still_closes_when_owner_or_target_changes():
+    source = health("merge")
+    target = source["merge_executable"][0]
+    source["merge_executable"] = [{"number": 9, "head": HEAD, "stage": "merge"}]
+    with pytest.raises(pp.PipelineError, match="exact executable"):
+        handoff.health_gate(source, "merge", target, election=False)
+
+    source = health("integration-merge-ready")
+    target = source["integration_owner"]
+    source["merge_executable"].insert(0, {"number": 9, "head": HEAD, "stage": "merge"})
+    with pytest.raises(pp.PipelineError):
         handoff.health_gate(source, "merge", target, election=False)
 
 
@@ -452,3 +685,58 @@ def test_module_cli_helper_errors_are_json_and_visible_without_tracebacks(config
     assert payload["error"]
     assert result.stderr.strip() == f"pipelinectl gate-fallback: {payload['error']}"
     assert "Traceback" not in result.stderr
+
+
+def test_validated_merge_fallback_parks_exact_target_with_stale_dashboard(
+        config, isolated_db, monkeypatch):
+    source = health("merge")
+    target = source["merge_executable"][0]
+    preflight = handoff.create(config, source, "merge", target, "full skill required")
+    queue = {"id": "merge", "item_blockers": True,
+             "execution": {"mode": "auto", "command": ["pp", "next", "merge"]}}
+    monkeypatch.setattr(pipeline_insights, "_matching_queue", lambda _: ("p", {}, queue))
+    monkeypatch.setattr(pipeline_insights, "_tool_available", lambda *_: (True, ""))
+    monkeypatch.setattr(pipeline_insights, "_tool_preflight", lambda *_: preflight)
+    monkeypatch.setattr(pipeline_insights, "read_cached", lambda *_: {"cache": {"stale": True}})
+    task = isolated_db.create_task(TaskCreate(prompt="merge", recurrence="15m"))
+    route = pipeline_insights.execution_route(task, "canonical skill")
+    assert route["action"] == "prompt"
+    isolated_db.mark_completed(
+        task.id, f'ИТОГ: НУЖЕН ЧЕЛОВЕК (#{target["number"]} — conflict requires owner)',
+        verdict="НУЖЕН ЧЕЛОВЕК")
+    assert not isolated_db.pause_pipeline_series_on_repeated_blocker(
+        task.series_id, task.id)["suppress_recurrence"]
+    from promptpilot.pipeline_item_holds import prepare
+    fresh = {"cache": {"complete": True}, "diagnostics": source}
+    successor = SimpleNamespace(id=task.id + 1, series_id=task.series_id)
+    assert prepare(successor, queue, fresh) == [target["number"]]
+
+
+@pytest.mark.parametrize("verdict", ["НЕ СМОГ", "НУЖЕН ЧЕЛОВЕК"])
+def test_repeated_merge_target_with_stale_snapshot_keeps_series_guard(
+        config, isolated_db, monkeypatch, verdict):
+    source = health("merge")
+    target = source["merge_executable"][0]
+    preflight = handoff.create(config, source, "merge", target, "full skill required")
+    queue = {"id": "merge", "item_blockers": True,
+             "execution": {"mode": "auto", "command": ["pp", "next", "merge"]}}
+    monkeypatch.setattr(pipeline_insights, "_matching_queue", lambda _: ("p", {}, queue))
+    monkeypatch.setattr(pipeline_insights, "_tool_available", lambda *_: (True, ""))
+    monkeypatch.setattr(pipeline_insights, "_tool_preflight", lambda *_a, **_k: preflight)
+    monkeypatch.setattr(pipeline_insights, "read_cached", lambda *_: {"cache": {"stale": True}})
+    result = f'ИТОГ: {verdict} (#{target["number"]} — conflict requires owner)'
+    first = isolated_db.create_task(TaskCreate(prompt="merge", recurrence="15m"))
+    assert pipeline_insights.execution_route(first, "canonical skill")["action"] == "prompt"
+    isolated_db.mark_completed(first.id, result, verdict=verdict)
+    assert not isolated_db.pause_pipeline_series_on_repeated_blocker(
+        first.series_id, first.id)["suppress_recurrence"]
+    # Repairing the same occurrence remains idempotent.
+    assert not isolated_db.pause_pipeline_series_on_repeated_blocker(
+        first.series_id, first.id)["suppress_recurrence"]
+    second = isolated_db.create_task(TaskCreate(
+        prompt="merge", recurrence="15m", series_id=first.series_id))
+    assert pipeline_insights.execution_route(second, "canonical skill")["action"] == "prompt"
+    isolated_db.mark_completed(second.id, result, verdict=verdict)
+    guard = isolated_db.pause_pipeline_series_on_repeated_blocker(second.series_id, second.id)
+    assert guard["suppress_recurrence"] and guard["previous_task_id"] == first.id
+    assert isolated_db.list_series()[0]["paused"]

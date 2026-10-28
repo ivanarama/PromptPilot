@@ -9,6 +9,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -16,8 +17,10 @@ from typing import Optional
 
 from . import db, worktree
 from .config import (BASE_DELAY, CONCURRENCY, DEFAULT_CLI, MAX_DELAY, MIN_FREE_MB,
-                     POLL_INTERVAL, TASK_TIMEOUT, VERDICT_REQUIRED, build_cmd,
-                     get_provider_env, load_providers)
+                     POLL_INTERVAL, TASK_TIMEOUT, VERDICT_REPAIR,
+                     VERDICT_REPAIR_TIMEOUT, VERDICT_REQUIRED, RightsUnsupported,
+                     build_cmd, get_provider_env, load_providers, rights_args,
+                     rights_supported)
 from .process_tree import OwnedProcess, ProcessTreeError
 
 # Our quota is spent — the wait is measured in hours and nothing else will get
@@ -159,6 +162,63 @@ def parse_verdict(text: str) -> str:
     """
     matches = VERDICT_RE.findall(text or "")
     return matches[-1].upper() if matches else ""
+
+
+VERDICT_REPAIR_PROMPT = (
+    "Предыдущий ответ не содержал финальной строки вердикта. Конец отчёта:\n\n"
+    "{tail}\n\n"
+    "Не запускай никаких инструментов и ничего не меняй. Ответь ровно одной "
+    "финальной строкой:\n"
+    "ИТОГ: ГОТОВО — сделано\n"
+    "ИТОГ: УЖЕ СДЕЛАНО — оказалось, что уже исправлено\n"
+    "ИТОГ: НУЖЕН ЧЕЛОВЕК — нужно решение или доступ человека\n"
+    "ИТОГ: НЕ СМОГ — не получилось\n"
+    "ИТОГ: ПУСТО — проснулся по расписанию, а делать нечего\n"
+    "После двоеточия можно коротко пояснить причину."
+)
+
+
+def _repair_verdict(task, provider: str, provider_cfg: dict,
+                    report_tail: str, run_dir: str) -> str:
+    """One micro-request asking the same provider to restate the verdict.
+
+    Long multi-step runs on cheap models keep the quality but lose the closing
+    ИТОГ line (issue #82): the work is done, the report is complete, the parser
+    finds nothing. A short repeat-request costs a fraction of a full retry and
+    keeps the pipeline moving. Returns "" on any failure — the caller then
+    falls back to its existing no-verdict behavior.
+    """
+    prompt = VERDICT_REPAIR_PROMPT.format(tail=(report_tail or "")[-4000:])
+    try:
+        # Restating a verdict needs no tools; confine the micro-request when
+        # the provider can be confined.
+        cmd = build_cmd(provider, prompt,
+                        model=getattr(task, "model", None),
+                        effort=getattr(task, "effort", None),
+                        guard=True,
+                        rights=("none" if rights_supported(provider_cfg, "none")
+                                else getattr(task, "rights", None)))
+        prompt_stdin = prompt if provider_cfg.get("prompt_stdin") else None
+        env = get_provider_env(provider)
+        env.pop("PP_TASK_ID", None)
+        result = subprocess.run(
+            cmd,
+            cwd=run_dir,
+            env=env,
+            input=prompt_stdin,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=VERDICT_REPAIR_TIMEOUT,
+        )
+    except Exception as exc:
+        print(f"  !! Verdict repair request failed: {type(exc).__name__}: {exc}")
+        return ""
+    stdout = result.stdout or ""
+    if is_stream_json(stdout):
+        stdout = parse_stream_json(stdout).get("text", "")
+    return parse_verdict(stdout)
 
 
 def effective_prompt(task) -> str:
@@ -493,11 +553,21 @@ def parse_stream_json(stdout: str) -> dict:
             meta["is_error"] = event.get("is_error")
             meta["subtype"] = event.get("subtype")
             usage = event.get("usage", {})
-            meta["input_tokens"] = usage.get("input_tokens")
+            inputs = [usage.get("input_tokens"), usage.get("cache_read_input_tokens", 0),
+                      usage.get("cache_creation_input_tokens", 0)]
+            meta["input_tokens"] = (sum(inputs) if all(type(n) is int and n >= 0 for n in inputs)
+                                    else None)
+            meta["cached_input_tokens"] = inputs[1]
+            meta["cache_creation_input_tokens"] = inputs[2]
             meta["output_tokens"] = usage.get("output_tokens")
             model_usage = event.get("modelUsage", {})
-            if model_usage:
+            if len(model_usage) == 1:
                 meta["model"] = list(model_usage.keys())[0]
+            elif len(model_usage) > 1:
+                meta.pop("model", None)
+            # Aggregated multi-model usage and cache-write TTL mixtures cannot
+            # be honestly priced from these compact counters.
+            meta["cost_attributable"] = len(model_usage) <= 1 and not inputs[2]
             # Extract result text (always for errors, fallback for empty output)
             if event.get("result"):
                 if event.get("is_error") or not text_parts:
@@ -572,14 +642,42 @@ def parse_stream_json(stdout: str) -> dict:
     return {"text": text, "meta": meta, "rate_limit_info": rate_limit_info}
 
 
+def detect_unrecognized_model(raw: str) -> str | None:
+    """Catch the claude-z bridge's silent model fallback (issue #81).
+
+    When the CLI does not recognize the requested model name it prints
+    ``[claude-code:unrecognized_model] {...}`` (usually on stderr), keeps
+    running on its baked-in default and never surfaces the substitution
+    anywhere else. Return the unrecognized name so the warning can be stored
+    with the task result; the Meta block's ``Model:`` shows the fallback model
+    actually used.
+    """
+    if not raw:
+        return None
+    m = re.search(r"\[claude-code:unrecognized_model\]\s*(.+)", raw)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(1)).get("model")
+    except (json.JSONDecodeError, TypeError):
+        return "unknown"
+
+
 def format_result(parsed: dict) -> str:
     """Format parsed result for storage — human-readable text + JSON meta."""
     parts = []
 
+    meta = parsed["meta"]
+    if meta.get("unrecognized_model"):
+        parts.append(
+            f"⚠️ Модель «{meta['unrecognized_model']}» не распознана провайдером — "
+            "CLI молча откатился на дефолт. Фактически задачу выполняла модель из Meta ниже."
+        )
+        parts.append("")
+
     if parsed["text"]:
         parts.append(parsed["text"])
 
-    meta = parsed["meta"]
     if meta:
         parts.append("")
         parts.append("--- Meta ---")
@@ -626,13 +724,53 @@ def _remember_stream_session(task_id: int, line: str) -> None:
         db.set_session_id(task_id, session_id)
 
 
-def _read_process_pipe(pipe, chunks: list[str], task_id: int | None = None) -> None:
+def _windows_output_encoding() -> str | None:
+    """cmd.exe uses the console/OEM code page even when the CLI uses UTF-8."""
+    if os.name != "nt":
+        return None
+    import ctypes
+    code_page = (ctypes.windll.kernel32.GetConsoleOutputCP()
+                 or ctypes.windll.kernel32.GetOEMCP())
+    return f"cp{code_page}"
+
+
+def _decode_process_line(line: str, fallback_encoding: str | None) -> str:
+    # The pipe uses surrogateescape so malformed UTF-8 is still recoverable.
+    raw = line.encode("utf-8", errors="surrogateescape")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode(fallback_encoding or "utf-8", errors="replace")
+
+
+def _write_process_input(pipe, prompt: str) -> None:
+    """Keep a provider that does not read stdin from blocking cancellation."""
+    try:
+        pipe.write(prompt)
+    except (BrokenPipeError, OSError, ValueError):
+        pass
+    finally:
+        try:
+            pipe.close()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+
+
+def _read_process_pipe(pipe, chunks: list[str], task_id: int | None = None,
+                       fallback_encoding: str | None = None) -> None:
     """Drain one provider pipe without blocking the cancellation poll loop."""
     try:
         for line in iter(pipe.readline, ""):
+            line = _decode_process_line(line, fallback_encoding)
             chunks.append(line)
             if task_id is not None:
-                _remember_stream_session(task_id, line)
+                # HOTFIX: исключение здесь (напр. sqlite 'database is locked' из
+                # set_session_id) убивало поток-читатель, finally закрывал пайп,
+                # и провайдер падал с os error 109. Чтение обязано продолжаться.
+                try:
+                    _remember_stream_session(task_id, line)
+                except Exception:
+                    pass
     finally:
         pipe.close()
 
@@ -896,6 +1034,43 @@ def _close_registered_provider_tree(task_id: int) -> bool:
     return True
 
 
+SPAWN_RETRY_DELAY_S = 20.0
+
+
+class _SpawnCancelled(Exception):
+    """Cancellation observed before a provider process was created."""
+
+
+def _start_owned_with_spawn_retry(build, cmd, attempts=2,
+                                  delay_s=None, sleep=None, exists=None, cancel_check=None):
+    """U16: FileNotFoundError у СУЩЕСТВУЮЩЕГО исполняемого файла — транзиентное
+    давление ресурсов (255MB Electron-бинарник goose.exe при параллельных
+    тяжёлых задачах; инцидент 2026-10-03: ревью-слоты падали «CLI not found»,
+    одиночный запуск того же провайдера проходил). Один повтор через паузу;
+    действительно отсутствующий CLI падает сразу, без ожидания."""
+    import os as _os
+    delay_s = SPAWN_RETRY_DELAY_S if delay_s is None else delay_s
+    sleep = time.sleep if sleep is None else sleep
+    exists = _os.path.isfile if exists is None else exists
+    def check_cancel():
+        if cancel_check is not None and cancel_check():
+            raise _SpawnCancelled()
+    try:
+        return build()
+    except FileNotFoundError:
+        exe = str(cmd[0]) if cmd else ""
+        if attempts <= 1 or not exe or not exists(exe):
+            raise
+        remaining = delay_s
+        while remaining > 0:
+            check_cancel()
+            interval = min(0.25, remaining) if cancel_check is not None else remaining
+            sleep(interval)
+            remaining -= interval
+        check_cancel()
+        return build()
+
+
 def _effective_timeout(task):
     """Per-task timeout in seconds; None = no limit (0 disables the global one)."""
     if task.task_timeout == 0:
@@ -934,9 +1109,55 @@ def _recur_after_run(task):
         db.consume_pipeline_series_wake(fresh.series_id)
 
 
+def _pipeline_repeat_guard(task) -> dict | None:
+    """Apply the repeat-blocker circuit breaker to configured pipeline work."""
+    if not task.series_id:
+        return None
+    try:
+        from . import pipeline_insights
+        matched = pipeline_insights._matching_queue(task)
+        if matched is None:
+            return None
+        if matched[2].get("item_blockers") is not True:
+            db.set_setting(f"pipeline_item_hold_mode:v1:{task.series_id}", "0")
+        state = db.pause_pipeline_series_on_repeated_blocker(
+            task.series_id, task.id)
+    except Exception as exc:
+        # Profile visibility is optional infrastructure. Do not silently kill
+        # an otherwise healthy generic schedule when it cannot be classified.
+        print(
+            f"  !! repeat-blocker guard unavailable for #{task.id}: {exc}",
+            flush=True,
+        )
+        return None
+    if not state.get("suppress_recurrence"):
+        return state
+    if state.get("newly_paused"):
+        print(
+            f"  -> Series #{task.series_id} paused: tasks "
+            f"#{state['previous_task_id']} and #{task.id} reported the same blocker",
+            flush=True,
+        )
+        if task.tg_chat_id:
+            try:
+                db.add_notification(
+                    task.tg_chat_id,
+                    f"⏸ Серия «{task.prompt.splitlines()[0]}» приостановлена: "
+                    "два запуска подряд вернули одинаковый блокер. "
+                    "После устранения причины нажмите Resume.",
+                    task_id=task.id,
+                )
+            except Exception as exc:
+                print(f"  -> notify repeat-blocker pause failed: {exc}")
+    return state
+
+
 def _maybe_recur(task, failed: bool = False):
     """Enqueue the next occurrence of a recurring task."""
     if not task.recurrence:
+        return
+    repeat_guard = _pipeline_repeat_guard(task)
+    if repeat_guard and repeat_guard.get("suppress_recurrence"):
         return
     series = db.prepare_series_recurrence(task.series_id, task.verdict) if task.series_id else None
     recurrence = series["effective_recurrence"] if series else task.recurrence
@@ -975,6 +1196,8 @@ def _maybe_recur(task, failed: bool = False):
         machine=task.machine,
         keep_pane=task.keep_pane,
         worktree=task.worktree,
+        # What the run may do is part of the schedule too.
+        rights=task.rights,
     ))
     print(f"  -> Recurring: next run at {next_dt.strftime('%Y-%m-%d %H:%M UTC')}"
           f"{' (после падения)' if failed else ''}")
@@ -1203,6 +1426,13 @@ def _execute_herdr_task(task, provider_cfg, host=None, machine=None, prompt_over
             lambda: db.set_worktree(task.id, path, branch),
             f"сохранение worktree задачи #{task.id}",
         )
+        # Снимок фактического дерева старта рана (см. _execute_task_body):
+        # база доказательств no-diff/чекпоинта — дерево, где работает агент.
+        try:
+            from . import workflows as _workflows
+            _workflows.record_run_snapshot(task.id, path)
+        except Exception as exc:  # noqa: BLE001 — телеметрия
+            print(f"  !! run.snapshot #{task.id}: {exc}", flush=True)
         print(f"  -> Worktree {path} ({branch})")
 
     def on_started(_pane_id):
@@ -1333,6 +1563,7 @@ def _mark_cancelled(task, *args, **kwargs):
 
 def _execute_task_body(task, admission_complete=None):
     """Run CLI with the task's prompt."""
+    prompt_constraint = None
     if task.series_id:
         # Optional profile-owned gates are deterministic and token-free. They
         # stop empty stages before a provider is launched and defer dependent
@@ -1345,6 +1576,8 @@ def _execute_task_body(task, admission_complete=None):
             print(f"  !! pipeline dispatch gate unavailable for #{task.id}: {exc}", flush=True)
         if gate:
             reason = gate["reason"]
+            if gate["action"] == "restrict_prompt":
+                prompt_constraint = gate["prompt_constraint"]
             if gate["action"] == "defer":
                 next_run = _pipeline_defer_time(gate)
                 if next_run:
@@ -1370,6 +1603,8 @@ def _execute_task_body(task, admission_complete=None):
                 return
 
     agent_prompt = effective_prompt(task)
+    if prompt_constraint:
+        agent_prompt += "\n\n" + prompt_constraint
     require_closing_verdict = False
     allow_targeted_stale = False
     pipeline_replicas = None
@@ -1453,6 +1688,8 @@ def _execute_task_body(task, admission_complete=None):
             print(f"  -> Pipeline preflight completed without agent: {reason}")
             return
         agent_prompt = route["prompt"]
+        if prompt_constraint and prompt_constraint not in agent_prompt:
+            agent_prompt += "\n\n" + prompt_constraint
         raw_replicas = route.get("pipeline_replicas")
         if type(raw_replicas) is int and 2 <= raw_replicas <= 16:
             pipeline_replicas = str(raw_replicas)
@@ -1556,6 +1793,24 @@ def _execute_task_body(task, admission_complete=None):
             return
         host = machine_remote(m)
 
+    rights = getattr(task, "rights", None)
+    if rights and provider_cfg.get("executor") == "herdr":
+        # Checked before any pane exists: a session that cannot be confined
+        # must not be opened at all. A task aimed at an already running
+        # session cannot be confined either — its agent keeps its own rights.
+        problem = None
+        if getattr(task, "herdr_target", None) and rights != "full":
+            problem = "задачу в открытую сессию herdr нельзя ограничить: агент уже запущен"
+        else:
+            try:
+                rights_args(provider_cfg, rights)
+            except RightsUnsupported as exc:
+                problem = str(exc)
+        if problem:
+            _mark_failed(task, f"Права «{rights}»: {problem}", exit_code=-1)
+            print(f"  -> Failed (rights): {problem}")
+            return
+
     if provider_cfg.get("executor") == "herdr":
         # herdr sessions work the same way on any machine: the CLI calls go
         # over ssh, the pane lives there (attach with `herdr --remote <host>`).
@@ -1601,9 +1856,26 @@ def _execute_task_body(task, admission_complete=None):
         wt_note = "\n\n" + worktree.summary(wt["path"], wt["branch"], wt["copied"])
         print(f"  -> Worktree {wt['path']} ({wt['branch']})")
 
-    cmd = build_cmd(provider, agent_prompt, skip_permissions=task.skip_permissions,
-                    session_id=task.session_id, model=task.model, guard=not machine,
-                    effort=task.effort)
+    # Доказательная база рана (no-diff/чекпоинт): снимок ФАКТИЧЕСКОГО дерева
+    # старта — в worktree, если он создан. Диспатч-снимок берётся раньше, из
+    # working_dir: между диспатчем и стартом воркера ветка успела уйти, и
+    # сравнение «до/после» без снимка старта приписывало сдвиг ветки
+    # исполнителю.
+    try:
+        from . import workflows as _workflows
+        _workflows.record_run_snapshot(task.id, run_dir)
+    except Exception as exc:  # noqa: BLE001 — телеметрия, не ломать запуск
+        print(f"  !! run.snapshot #{task.id}: {exc}", flush=True)
+
+    try:
+        cmd = build_cmd(provider, agent_prompt, skip_permissions=task.skip_permissions,
+                        session_id=task.session_id, model=task.model, guard=not machine,
+                        effort=task.effort, rights=getattr(task, "rights", None))
+    except RightsUnsupported as exc:
+        # Fail closed: a run that asked for narrow rights must not start wide.
+        _mark_failed(task, f"Права «{task.rights}»: {exc}", exit_code=-1)
+        print(f"  -> Failed (rights): {exc}")
+        return
     prompt_stdin = agent_prompt if provider_cfg.get("prompt_stdin") else None
 
     env = get_provider_env(provider)
@@ -1649,7 +1921,25 @@ def _execute_task_body(task, admission_complete=None):
         else:
             kwargs["start_new_session"] = True
         try:
-            proc = subprocess.Popen(cmd, **kwargs)
+            # A detached CLI must also receive its prompt, without a pipe writer
+            # that would be lost when the worker exits. The child inherits this
+            # temporary file handle; closing the parent's copy is safe.
+            with tempfile.TemporaryFile() as input_file:
+                if prompt_stdin is not None:
+                    input_file.write(prompt_stdin.encode("utf-8"))
+                    input_file.seek(0)
+                    kwargs["stdin"] = input_file
+                    # Supplying stdin makes Windows inherit all three handles.
+                    # A detached CLI must not keep or block the worker's pipes.
+                    kwargs["stdout"] = subprocess.DEVNULL
+                    kwargs["stderr"] = subprocess.DEVNULL
+                    if os.name == "nt":
+                        # DETACHED_PROCESS lets cmd.exe allocate a console and
+                        # replace redirected stdin. CREATE_NO_WINDOW preserves
+                        # the inherited file while keeping the CLI independent.
+                        kwargs["creationflags"] = (subprocess.CREATE_NO_WINDOW
+                                                   | subprocess.CREATE_NEW_PROCESS_GROUP)
+                proc = subprocess.Popen(cmd, **kwargs)
             _mark_completed(task, f"Запущен в фоне (PID {proc.pid}){wt_note}", exit_code=0)
             print(f"  -> Detached (PID {proc.pid})")
         except FileNotFoundError:
@@ -1661,17 +1951,24 @@ def _execute_task_body(task, admission_complete=None):
     if callable(target_heartbeat):
         target_heartbeat(force=True)
     try:
-        tree = OwnedProcess.start(
+        tree = _start_owned_with_spawn_retry(
+            lambda: OwnedProcess.start(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="surrogateescape",
+                cwd=run_dir,
+                stdin=subprocess.PIPE if prompt_stdin is not None else subprocess.DEVNULL,
+                env=env,
+            ),
             cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            cwd=run_dir,
-            stdin=subprocess.PIPE if prompt_stdin is not None else subprocess.DEVNULL,
-            env=env,
+            cancel_check=lambda: db.is_cancel_requested(task.id),
         )
+    except _SpawnCancelled:
+        _mark_cancelled(task, "Отменена пользователем до повторного запуска CLI")
+        return
     except FileNotFoundError:
         _mark_failed(task, f"CLI '{provider}' not found. Is it installed and in PATH?", exit_code=-1)
         return
@@ -1683,30 +1980,26 @@ def _execute_task_body(task, admission_complete=None):
     _register_provider_tree(task.id, tree)
     proc = tree.process
 
-    if prompt_stdin is not None:
-        # Write once and detach the handle before polling communicate(). This
-        # avoids resending after TimeoutExpired and preserves newlines through
-        # Windows .CMD provider shims.
-        try:
-            proc.stdin.write(prompt_stdin)
-            proc.stdin.close()
-        except (BrokenPipeError, OSError, ValueError):
-            pass
-        finally:
-            proc.stdin = None
-
     # Drain both pipes while polling. Besides avoiding pipe deadlocks, the
     # stdout reader persists Codex/Claude session ids immediately, so a worker
     # crash can resume the same conversation instead of mistaking its own dirty
     # checkout for foreign work on a fresh run.
     stdout_parts: list[str] = []
     stderr_parts: list[str] = []
+    fallback_encoding = _windows_output_encoding() if not machine else None
     stdout_thread = threading.Thread(
-        target=_read_process_pipe, args=(proc.stdout, stdout_parts, task.id), daemon=True)
+        target=_read_process_pipe,
+        args=(proc.stdout, stdout_parts, task.id, fallback_encoding), daemon=True)
     stderr_thread = threading.Thread(
-        target=_read_process_pipe, args=(proc.stderr, stderr_parts), daemon=True)
+        target=_read_process_pipe,
+        args=(proc.stderr, stderr_parts, None, fallback_encoding), daemon=True)
     stdout_thread.start()
     stderr_thread.start()
+    stdin_thread = None
+    if prompt_stdin is not None:
+        stdin_thread = threading.Thread(
+            target=_write_process_input, args=(proc.stdin, prompt_stdin), daemon=True)
+        stdin_thread.start()
 
     # Poll instead of blocking: allows user-requested cancellation of a
     # RUNNING task (Web UI/bot) and the per-task timeout.
@@ -1736,6 +2029,8 @@ def _execute_task_body(task, admission_complete=None):
                     pass
                 stdout_thread.join(timeout=10)
                 stderr_thread.join(timeout=10)
+                if stdin_thread is not None:
+                    stdin_thread.join(timeout=10)
                 changed = _commit_terminal_or_defer(
                     task,
                     "headless cancellation",
@@ -1763,6 +2058,8 @@ def _execute_task_body(task, admission_complete=None):
                     pass
                 stdout_thread.join(timeout=10)
                 stderr_thread.join(timeout=10)
+                if stdin_thread is not None:
+                    stdin_thread.join(timeout=10)
                 _commit_terminal_or_defer(
                     task,
                     "headless timeout",
@@ -1777,6 +2074,8 @@ def _execute_task_body(task, admission_complete=None):
     _forget_provider_tree(task.id, tree)
     stdout_thread.join(timeout=10)
     stderr_thread.join(timeout=10)
+    if stdin_thread is not None:
+        stdin_thread.join(timeout=10)
     stdout = "".join(stdout_parts)
     stderr = "".join(stderr_parts)
 
@@ -1852,12 +2151,21 @@ def _execute_task_body(task, admission_complete=None):
         return
 
     # Parse output
+    reported_usage = None
     model_used = None
     session_id = None
     if is_stream_json(result.stdout):
         parsed = parse_stream_json(result.stdout)
+        unrecognized = (detect_unrecognized_model(result.stdout)
+                        or detect_unrecognized_model(result.stderr))
+        if unrecognized:
+            # Silent fallback would otherwise leave no trace in the stored
+            # result (issue #81): the marker line is non-JSON noise the user
+            # never sees, and Meta's Model is the fallback actually used.
+            parsed["meta"]["unrecognized_model"] = unrecognized
         output = format_result(parsed)
         verdict_source = parsed["text"]
+        reported_usage = parsed["meta"]
         model_used = parsed["meta"].get("model")
         session_id = parsed["meta"].get("session_id")
         # Check for rate limit in stream events — only if no text was returned
@@ -1896,6 +2204,16 @@ def _execute_task_body(task, admission_complete=None):
         from .herdr_exec import _closing_workflow_verdict
         verdict = _closing_workflow_verdict(
             verdict_source, allow_targeted_stale=allow_targeted_stale)
+        if not verdict and VERDICT_REPAIR and not machine:
+            # Issue #82: one micro-request beats failing the whole pipeline
+            # round (and paying for a full re-run) over a dropped last line.
+            repaired = _repair_verdict(task, provider, provider_cfg,
+                                       verdict_source or output, run_dir)
+            if repaired:
+                verdict = _closing_workflow_verdict(
+                    repaired, allow_targeted_stale=allow_targeted_stale)
+                if verdict:
+                    print(f"  -> Verdict repaired via micro-request: {verdict}")
         if not verdict:
             changed = _commit_terminal_or_defer(
                 task,
@@ -1912,6 +2230,13 @@ def _execute_task_body(task, admission_complete=None):
             return
     else:
         verdict = parse_verdict(output)
+        if (not verdict and VERDICT_REQUIRED and VERDICT_REPAIR
+                and not machine):
+            repaired = _repair_verdict(task, provider, provider_cfg,
+                                       verdict_source or output, run_dir)
+            if repaired:
+                verdict = repaired
+                print(f"  -> Verdict repaired via micro-request: {verdict}")
     changes = None
     if wt_note:
         output += wt_note
@@ -1924,7 +2249,7 @@ def _execute_task_body(task, admission_complete=None):
         "headless successful outcome",
         lambda: _mark_completed(
             task, output, exit_code=0, model_used=model_used,
-            session_id=session_id, verdict=verdict or None,
+            session_id=session_id, verdict=verdict or None, usage=reported_usage,
         ),
     )
     if changed:
@@ -2246,6 +2571,102 @@ def _occupied_worker_slots(in_flight: dict, recoveries: dict) -> int:
     return len(in_flight) + len(recoveries)
 
 
+def admission_snapshot():
+    """Честная диагностика очереди — read-only повтор правил допуска воркера.
+
+    Повторяет фильтры get_next_runnable (pending/rate_limited,
+    scheduled_at/next_run_at наступили, серия не на паузе и не завершена).
+    При CONCURRENCY > 1 учитывает занятость lock_key RUNNING-задачами и
+    более ранними готовыми кандидатами; последовательный воркер не
+    исключает повторяющиеся каталоги. Никаких мутаций: claim не меняется.
+    Проекция для /api/tasks и панели. Позиция — ранг среди ГОТОВЫХ;
+    не-готовые получают wait_reason. Относительно опциональной lane-политики
+    проекта позиция базовая: lanes могут как менять порядок, так и запрещать
+    допуск. Lane-политика, бюджетная fairness, свободные слоты и глобальная
+    пауза не моделируются. ready означает только базовый допуск по указанным
+    фильтрам. Возвращает {task_id: dict(queue_position, wait_reason, ready)}.
+
+    Не более двух SELECT (running + кандидаты) независимо от длины очереди:
+    колонки lock_key приезжают в тех же строках. Прежняя версия звала
+    get_task на каждую строку — N+1, измерение на очереди в 500 задач
+    давало ~600 запросов и ~1.2 с на каждый GET /api/tasks.
+    """
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+
+    from . import db as _db
+
+    def _lock_view(row):
+        # Только поля lock_key: работаем со строкой, без get_task на задачу
+        return SimpleNamespace(
+            id=row["id"],
+            machine=row["machine"],
+            herdr_target=row["herdr_target"],
+            worktree=row["worktree"],
+            working_dir=row["working_dir"],
+        )
+
+    parallel = CONCURRENCY > 1
+    keys = {}
+
+    def _key(row):
+        identity = (row["machine"], row["herdr_target"],
+                    row["worktree"], row["working_dir"])
+        if identity not in keys:
+            keys[identity] = lock_key(_lock_view(row))
+        return keys[identity]
+
+    now = datetime.now(timezone.utc).isoformat()
+    snapshot = {}
+    with _db._connect() as conn:
+        running_keys = {
+            _key(row)
+            for row in conn.execute(
+                """SELECT id, machine, herdr_target, worktree, working_dir
+                   FROM tasks WHERE status = 'running'""")
+        } if parallel else set()
+        rows = conn.execute(
+            """SELECT t.id, t.machine, t.herdr_target, t.worktree,
+                      t.working_dir,
+                      (t.scheduled_at IS NULL OR t.scheduled_at <= ?) AS sched_ok,
+                      (t.next_run_at IS NULL OR t.next_run_at <= ?) AS next_ok,
+                      (t.series_id IS NULL OR EXISTS (
+                         SELECT 1 FROM task_series s WHERE s.id = t.series_id
+                           AND s.paused = 0 AND s.ended_at IS NULL)) AS series_ok
+               FROM tasks t
+               WHERE t.status IN ('pending', 'rate_limited')
+               ORDER BY t.priority ASC, t.created_at ASC, t.id ASC""",
+            (now, now)).fetchall()
+    taken = set(running_keys)
+    position = 0
+    for row in rows:
+        task = _lock_view(row)
+        if not row["series_ok"]:
+            snapshot[task.id] = {"queue_position": None,
+                                 "wait_reason": "paused_series", "ready": False}
+            continue
+        if not row["sched_ok"] or not row["next_ok"]:
+            snapshot[task.id] = {"queue_position": None,
+                                 "wait_reason": "scheduled_future",
+                                 "ready": False}
+            continue
+        key = _key(row) if parallel else ""
+        if key and key in taken:
+            snapshot[task.id] = {
+                "queue_position": None,
+                "wait_reason": ("busy_session" if task.herdr_target
+                                else "busy_working_dir"),
+                "ready": False,
+            }
+            continue
+        position += 1
+        snapshot[task.id] = {"queue_position": position,
+                             "wait_reason": None, "ready": True}
+        if key:
+            taken.add(key)
+    return snapshot
+
+
 def lock_key(task) -> str:
     """What a task must not share with another task running at the same time.
 
@@ -2395,7 +2816,22 @@ def run_worker():
     if alive:
         print(f"Живые прогоны найдены по метке в окружении, не трогаю: {sorted(alive)}")
     db.recover_running(keep_ids=alive)
-    repaired_series = db.repair_active_series_occurrences()
+
+    # Import/page-in routing after stale attempts have been recovered but
+    # before terminal-gap repair. Repair is intentionally generic; only
+    # profile-matched project series opt into repeat-blocker pausing.
+    pipeline_runtime = _warm_pipeline_runtime()
+    try:
+        repeat_guard_series_ids = pipeline_runtime.repeat_guard_series_ids(
+            db.list_series())
+    except Exception as exc:
+        print(
+            f"  !! repeat-blocker startup classification unavailable: {exc}",
+            flush=True,
+        )
+        repeat_guard_series_ids = ()
+    repaired_series = db.repair_active_series_occurrences(
+        repeat_guard_series_ids=repeat_guard_series_ids)
     if repaired_series:
         print(
             "Восстановлены потерянные в аварийном окне серии: "
@@ -2410,11 +2846,6 @@ def run_worker():
         workflows.sync_all_tasks()
     except Exception as exc:
         print(f"Не удалось синхронизировать workflow после восстановления: {exc}")
-
-    # Import/page-in the routing stack after stale attempts have been recovered
-    # but before a new queue item can be claimed. A slow startup remains visible
-    # through the heartbeat without making any task look actively running.
-    _warm_pipeline_runtime()
 
     code_snapshot = _code_snapshot()
 

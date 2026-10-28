@@ -5,7 +5,9 @@ against PP_TG_ALLOWED_PHONES env var (comma-separated) or ~/.promptpilot/tg_conf
 After authorization all task management features are available.
 """
 
+import asyncio
 import functools
+import html
 import json
 import logging
 import os
@@ -15,6 +17,7 @@ import time
 import unicodedata
 import uuid
 from datetime import timezone
+from pathlib import Path
 from typing import Optional
 
 from telegram import (
@@ -37,7 +40,7 @@ from telegram.ext import (
     filters,
 )
 
-from . import db, pipeline_insights
+from . import db, epf_tools, pipeline_insights
 from .config import (
     DEFAULT_CLI, HERDR_RENOTIFY_COOLDOWN, HERDR_WATCH, HERDR_WATCH_INTERVAL, LOG_PROMPTS,
     get_provider_models, get_proxy_url, get_skills, load_machines, load_providers,
@@ -55,6 +58,10 @@ logger = logging.getLogger(__name__)
  ASK_SCHEDULE, ASK_REPLY, ASK_SKILL_ARGS, ASK_MODEL, ASK_RECURRENCE,
  ASK_HERDR_REPLY, ASK_HERDR_TARGET, ASK_MACHINE, ASK_CONFIRM, ASK_EXTRAS,
  ASK_EFFORT, ASK_LAST) = range(18)
+
+# 1С-доработка (epf_conv): отдельная нумерация, чтобы не пересекаться
+# с состояниями мастера задач
+(EPF_ASK_FILE, EPF_ASK_TASK, EPF_ASK_BASE) = range(100, 103)
 
 
 class _MsgSend:
@@ -95,17 +102,32 @@ REPLY_LABEL = "💬 Ответить"
 # Keyboards
 # ---------------------------------------------------------------------------
 
+_EPF_AVAILABLE: Optional[bool] = None
+
+
+def _epf_available() -> bool:
+    """Фича-флаг 1С-доработки. Платформа не появляется/не исчезает в процессе,
+    поэтому определяемся один раз за жизнь процесса."""
+    global _EPF_AVAILABLE
+    if _EPF_AVAILABLE is None:
+        try:
+            _EPF_AVAILABLE = epf_tools.is_available()
+        except Exception:
+            _EPF_AVAILABLE = False
+    return _EPF_AVAILABLE
+
+
 def _main_menu() -> ReplyKeyboardMarkup:
     pause_label = "▶ Продолжить" if db.is_paused() else "⏸ Пауза"
-    return ReplyKeyboardMarkup(
-        [
-            ["📋 Задачи", "🖥 Окна", "➕ Добавить задачу"],
-            ["📊 Статистика", "🗓 Расписание", "🔌 Провайдеры"],
-            ["📈 Очередь", "⚡ Скилы"],
-            [pause_label],
-        ],
-        resize_keyboard=True,
-    )
+    rows = [
+        ["📋 Задачи", "🖥 Окна", "➕ Добавить задачу"],
+        ["📊 Статистика", "🗓 Расписание", "🔌 Провайдеры"],
+        ["📈 Очередь", "🧾 Итоги", "⚡ Скилы"],
+    ]
+    if _epf_available():
+        rows.append(["🔧 1С обработка"])
+    rows.append([pause_label])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 
 def _contact_keyboard() -> ReplyKeyboardMarkup:
@@ -266,6 +288,20 @@ def require_auth(func):
             return ConversationHandler.END
         return await func(update, context, *a, **kw)
     return wrapper
+
+
+async def _check_task_creation_access(update: Update) -> bool:
+    """Recheck current access after awaited work, immediately before enqueue."""
+    user, chat = update.effective_user, update.effective_chat
+    if user is not None and is_authorized(user.id) and chat is not None and chat.type == "private":
+        return True
+    query = update.callback_query
+    message = update.message or (query.message if query else None)
+    if message:
+        await message.reply_text("Нет доступа. Задача не создана.")
+    elif query:
+        await query.answer("Нет доступа.", show_alert=True)
+    return False
 
 
 # Password gate for task creation (PP_TASK_PASSWORD). Entering it correctly in
@@ -718,6 +754,8 @@ async def cb_rerun_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _pw_ok(query.from_user.id):
         await query.answer("Сначала введите пароль через ➕ Добавить задачу.", show_alert=True)
         return
+    if not await _check_task_creation_access(update):
+        return ConversationHandler.END
     new = db.create_task(TaskCreate(
         prompt=task.prompt,
         working_dir=task.working_dir,
@@ -730,6 +768,7 @@ async def cb_rerun_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keep_pane=task.keep_pane,
         machine=task.machine,
         worktree=task.worktree,
+        rights=task.rights,
     ))
     await query.answer(f"Задача #{new.id} добавлена.")
     await query.message.reply_text(
@@ -793,6 +832,12 @@ def _series_keyboard(series: dict) -> InlineKeyboardMarkup:
     sid = series["id"]
     state = "▶ Возобновить" if series["paused"] else "⏸ Пауза"
     state_action = "resume" if series["paused"] else "pause"
+    action_buttons = [
+        InlineKeyboardButton(state, callback_data=f"sera:{sid}:{state_action}")]
+    if not series["paused"]:
+        action_buttons.insert(
+            0, InlineKeyboardButton(
+                "▶ Сейчас", callback_data=f"sera:{sid}:run_now"))
     rows = [
         [InlineKeyboardButton("30м", callback_data=f"seri:{sid}:30m"),
          InlineKeyboardButton("1ч", callback_data=f"seri:{sid}:1h"),
@@ -800,8 +845,7 @@ def _series_keyboard(series: dict) -> InlineKeyboardMarkup:
          InlineKeyboardButton("4ч", callback_data=f"seri:{sid}:4h")],
         [InlineKeyboardButton("⚡ временно 30м", callback_data=f"serb:{sid}:30m"),
          InlineKeyboardButton("⚡ временно 1ч", callback_data=f"serb:{sid}:1h")],
-        [InlineKeyboardButton("▶ Сейчас", callback_data=f"sera:{sid}:run_now"),
-         InlineKeyboardButton(state, callback_data=f"sera:{sid}:{state_action}")],
+        action_buttons,
         [InlineKeyboardButton("← К расписанию", callback_data="series:list")],
     ]
     return InlineKeyboardMarkup(rows)
@@ -813,8 +857,10 @@ def _series_text(s: dict) -> str:
         boost = (f"\n⚡ Временно: {s['effective_recurrence']}; "
                  f"ПУСТО {s['temporary_empty_count']}/{s['temporary_empty_limit'] or '∞'}")
     state = "завершена" if s["ended"] else "пауза" if s["paused"] else "активна"
+    pause_reason = (f"\nПричина автопаузы: {s['auto_pause_reason']}"
+                    if s.get("auto_pause_reason") else "")
     return (f"{s['title']}\n\nСостояние: {state}\nОсновной интервал: {s['recurrence']}"
-            f"{boost}\nЭффорт: {s['effort'] or 'по умолчанию'}\n"
+            f"{pause_reason}{boost}\nЭффорт: {s['effort'] or 'по умолчанию'}\n"
             f"Следующий запуск: {_local_str(s['next_run_at'])}\n"
             f"Прогонов: {s['runs']}; ошибок {round(s['failure_rate']*100)}%; "
             f"ПУСТО {round(s['empty_rate']*100)}%")
@@ -936,13 +982,14 @@ def _pipeline_text(data: dict) -> str:
              f"Вход / выход: {rate(entered_rate)} / {rate(exited_rate)}; "
              f"переходов {recent.get('transitions', 0)}; покрытие {coverage}",
              f"Тренд backlog: 7 дней {week_trend}; 30 дней {month_trend}",
-             f"Узкое место: " + (
+             "Узкое место: " + (
                  f"{bottleneck['title']} (ETA {bottleneck.get('eta_hours', '—')} ч)"
                  if bottleneck else "нет"),
              "Безопасные ожидания / ошибки: "
-             f"{outcomes.get('safe_deferrals_now', 0) + outcomes.get('stale_reselections_5h', 0)} / "
+             f"{outcomes.get('safe_deferrals_now', 0) + outcomes.get('stale_reselections_5h', 0) + outcomes.get('safe_refusals_5h', 0)} / "
              f"{outcomes.get('real_errors_5h', 0)} "
-             f"(stale-перевыборов {outcomes.get('stale_reselections_5h', 0)}).",
+             f"(stale-перевыборов {outcomes.get('stale_reselections_5h', 0)}, "
+             f"безопасных отказов {outcomes.get('safe_refusals_5h', 0)}).",
              f"Цель оценки: текущая очередь примерно за {data['target_clear_hours']:g} ч.", ""]
     runtime = data.get("runtime", {})
     if runtime:
@@ -1056,6 +1103,223 @@ async def cb_pipeline_profile(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.answer()
     profile_id = query.data.split(":", 1)[1]
     await _send_pipeline_insights(query.message, profile_id)
+
+
+# ---------------------------------------------------------------------------
+# Pipeline period report
+# ---------------------------------------------------------------------------
+
+_REPORT_PERIODS = ((24, "24 часа"), (168, "7 дней"), (720, "30 дней"))
+_REPORT_PROFILE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def _report_profiles_keyboard(profiles: list[dict]) -> InlineKeyboardMarkup:
+    rows = []
+    for profile in profiles:
+        profile_id = str(profile.get("id", ""))
+        callback = f"report:profile:{profile_id}"
+        longest_callback = f"report:refresh:720:{profile_id}"
+        # Telegram limits callback_data to 64 UTF-8 bytes. Profile ids are
+        # configuration keys, but still validate them before putting them into
+        # a button because callback payloads must never be trusted as ids.
+        if (_REPORT_PROFILE_ID_RE.fullmatch(profile_id)
+                and len(longest_callback.encode("utf-8")) <= 64):
+            rows.append([InlineKeyboardButton(
+                str(profile.get("title") or profile_id)[:55],
+                callback_data=callback,
+            )])
+    return InlineKeyboardMarkup(rows)
+
+
+def _report_period_keyboard(profile_id: str) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(
+        label, callback_data=f"report:period:{hours}:{profile_id}")
+        for hours, label in _REPORT_PERIODS]]
+    rows.append([InlineKeyboardButton(
+        "← К проектам", callback_data="report:profiles")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _report_result_keyboard(profile_id: str, hours: int) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(
+        "↻ Уточнить результат в GitHub",
+        callback_data=f"report:refresh:{hours}:{profile_id}",
+    )]]
+    rows.extend(_report_period_keyboard(profile_id).inline_keyboard)
+    return InlineKeyboardMarkup(rows)
+
+
+def _report_profile(profile_id: str) -> dict | None:
+    """Resolve an untrusted callback id against the current configuration."""
+    return next(
+        (profile for profile in pipeline_insights.list_profiles()
+         if str(profile.get("id")) == profile_id),
+        None,
+    )
+
+
+def _clip_report_markdown(text: str, limit: int = TG_LIMIT) -> str:
+    """Clip a rendered report at a complete line, preserving Markdown links."""
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    suffix = "\n…"
+    cut_at = text.rfind("\n", 0, limit - len(suffix))
+    if cut_at < 1:
+        return _clip(text, limit)
+    return text[:cut_at].rstrip() + suffix
+
+
+def _report_markdown_as_plain(text: str) -> str:
+    """Readable fallback when Telegram rejects otherwise valid Markdown."""
+    text = re.sub(
+        r"\[([^\]]+)]\((https?://[^\s)]+)\)",
+        lambda match: f"{match.group(1)} — {match.group(2)}",
+        text,
+    )
+    text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
+    text = re.sub(r"\\([\\_*\[\]()~`>#+\-=|{}.!])", r"\1", text)
+    return html.unescape(text.replace("**", "").replace("`", ""))
+
+
+def _build_pipeline_period_report(
+        profile_id: str, hours: int, refresh_delivery: bool) -> tuple[dict, str]:
+    """Keep DB and potentially remote delivery reads off the bot event loop."""
+    report = pipeline_insights.build_period_report(
+        profile_id,
+        db.list_series(),
+        hours=hours,
+        refresh_delivery=refresh_delivery,
+    )
+    return report, pipeline_insights.render_period_report_markdown(report)
+
+
+@require_auth
+async def show_pipeline_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    profiles = pipeline_insights.list_profiles()
+    keyboard = _report_profiles_keyboard(profiles)
+    if not profiles:
+        await update.message.reply_text(
+            "🧾 Профили конвейеров не настроены. Добавьте их в "
+            "~/.promptpilot/pipeline_profiles.json."
+        )
+        return
+    if not keyboard.inline_keyboard:
+        await update.message.reply_text(
+            "🧾 Идентификаторы профилей не подходят для Telegram-кнопок. "
+            "Используйте латинские буквы, цифры, точку, дефис или подчёркивание."
+        )
+        return
+    await update.message.reply_text(
+        "🧾 Итоги конвейера\n\nВыберите проект:",
+        reply_markup=keyboard,
+    )
+
+
+@require_auth
+async def cb_report_profiles(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    profiles = pipeline_insights.list_profiles()
+    keyboard = _report_profiles_keyboard(profiles)
+    if not keyboard.inline_keyboard:
+        await query.edit_message_text("Профили конвейеров не настроены.")
+        return
+    await query.edit_message_text(
+        "🧾 Итоги конвейера\n\nВыберите проект:",
+        reply_markup=keyboard,
+    )
+
+
+@require_auth
+async def cb_report_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    profile_id = query.data.split(":", 2)[2]
+    profile = _report_profile(profile_id)
+    if profile is None:
+        await query.edit_message_text(
+            "Профиль больше не настроен. Откройте /report заново."
+        )
+        return
+    await query.edit_message_text(
+        f"🧾 {profile['title']}\n\nЗа какой период показать итоги?",
+        reply_markup=_report_period_keyboard(profile_id),
+    )
+
+
+@require_auth
+async def cb_report_period(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    _, _, hours_text, profile_id = query.data.split(":", 3)
+    try:
+        hours = int(hours_text)
+    except ValueError:
+        hours = 0
+    if hours not in {period for period, _ in _REPORT_PERIODS}:
+        await query.edit_message_text("Неизвестный период. Откройте /report заново.")
+        return
+    profile = _report_profile(profile_id)
+    if profile is None:
+        await query.edit_message_text(
+            "Профиль больше не настроен. Откройте /report заново."
+        )
+        return
+
+    await _send_pipeline_period_report(query, profile_id, hours, refresh_delivery=False)
+
+
+@require_auth
+async def cb_report_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    _, _, hours_text, profile_id = query.data.split(":", 3)
+    try:
+        hours = int(hours_text)
+    except ValueError:
+        hours = 0
+    if hours not in {period for period, _ in _REPORT_PERIODS}:
+        await query.edit_message_text("Неизвестный период. Откройте /report заново.")
+        return
+    if _report_profile(profile_id) is None:
+        await query.edit_message_text(
+            "Профиль больше не настроен. Откройте /report заново."
+        )
+        return
+    await _send_pipeline_period_report(query, profile_id, hours, refresh_delivery=True)
+
+
+async def _send_pipeline_period_report(
+        query, profile_id: str, hours: int, *, refresh_delivery: bool):
+    status = ("🧾 Уточняю результат в GitHub…" if refresh_delivery
+              else "🧾 Собираю итоги из локальной истории…")
+    await query.edit_message_text(status)
+    try:
+        _report, rendered = await asyncio.to_thread(
+            _build_pipeline_period_report, profile_id, hours, refresh_delivery)
+        text = _clip_report_markdown(str(rendered))
+        keyboard = _report_result_keyboard(profile_id, hours)
+        try:
+            # The shared renderer produces ordinary Markdown. Keep its issue/PR
+            # links clickable, but fall back to plain text if Telegram's more
+            # restrictive parser rejects a title or other external text.
+            await query.edit_message_text(
+                text,
+                parse_mode="Markdown",
+                reply_markup=keyboard,
+            )
+        except BadRequest:
+            await query.edit_message_text(
+                _clip(_report_markdown_as_plain(str(rendered))),
+                reply_markup=keyboard,
+            )
+    except Exception as exc:
+        logger.warning("pipeline period report failed for %s: %s", profile_id, exc)
+        await query.edit_message_text(
+            "Не удалось собрать итоги. Текущая очередь доступна в /pipeline.",
+            reply_markup=_report_result_keyboard(profile_id, hours),
+        )
 
 
 async def toggle_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2013,6 +2277,7 @@ async def _show_confirm(send, context):
     return ASK_CONFIRM
 
 
+@require_auth
 async def cb_wiz_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -2032,7 +2297,7 @@ async def cb_wiz_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_reply_markup(reply_markup=None)
     except BadRequest:
         pass
-    return await _finish_add_task_from_query(query, context)
+    return await _finish_add_task_from_query(update, context)
 
 
 async def cb_wiz_drop_attachments(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2345,8 +2610,11 @@ async def add_task_got_recurrence(update: Update, context: ContextTypes.DEFAULT_
     return await _show_extras(update.message.reply_text, context)
 
 
-async def _finish_add_task_from_query(query, context):
+async def _finish_add_task_from_query(update, context):
     """Called after inline button — uses query.message for reply."""
+    if not await _check_task_creation_access(update):
+        return ConversationHandler.END
+    query = update.callback_query
     from .models import TaskCreate
     _save_last_settings(query.message.chat_id, context)
     prompt = context.user_data.pop("new_prompt", "")
@@ -2474,6 +2742,7 @@ async def cb_reply_task_start(update: Update, context: ContextTypes.DEFAULT_TYPE
     return ASK_REPLY
 
 
+@require_auth
 async def reply_got_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
     entered = update.message.text.strip()
     try:
@@ -2502,13 +2771,24 @@ async def reply_got_password(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return ASK_REPLY
 
 
+@require_auth
 async def reply_got_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prompt = update.message.text
     parent_id = context.user_data.pop("reply_task_id", None)
     session_id = context.user_data.pop("reply_session_id", None)
     provider = context.user_data.pop("reply_provider", None)
     working_dir = context.user_data.pop("reply_dir", None)
-    skip_permissions = context.user_data.pop("reply_skip_permissions", False)
+    context.user_data.pop("reply_skip_permissions", None)  # legacy dialog data
+    parent = db.get_task(parent_id) if parent_id is not None else None
+    if parent is None:
+        await update.message.reply_text(
+            "Исходная задача больше недоступна. Продолжение не создано.",
+            reply_markup=_main_menu(),
+        )
+        return ConversationHandler.END
+
+    if not await _check_task_creation_access(update):
+        return ConversationHandler.END
 
     task = db.create_task(TaskCreate(
         prompt=prompt,
@@ -2517,7 +2797,8 @@ async def reply_got_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         priority=5,
         session_id=session_id,
         parent_task_id=parent_id,
-        skip_permissions=skip_permissions,
+        skip_permissions=parent.skip_permissions,
+        rights=parent.rights,
         tg_chat_id=update.effective_chat.id,
     ))
 
@@ -2881,6 +3162,11 @@ def _herdr_blocked_keyboard(ref: str) -> list:
     ]
 
 
+def _herdr_done_keyboard(ref: str):
+    return [[InlineKeyboardButton("\U0001f4fa \u042d\u043a\u0440\u0430\u043d", callback_data=f"hd_screen:{ref}"),
+             InlineKeyboardButton(REPLY_LABEL, callback_data=f"hd_reply:{ref}")]]
+
+
 def _screen_chrome(line: str) -> bool:
     """Terminal-UI furniture worth dropping on a phone: the full-width rules
     Claude Code draws around its input box eat a third of the message and wrap
@@ -2926,10 +3212,7 @@ async def _herdr_notify(bot, pane_id: str, status: str, agent: dict, machine: st
             text += f"\n\n{tail}"
     else:
         text = f"✅ herdr{where}: {label} в панели {pane_id} завершил работу"
-        buttons = [
-            [InlineKeyboardButton("📺 Экран", callback_data=f"hd_screen:{ref}"),
-             InlineKeyboardButton(REPLY_LABEL, callback_data=f"hd_reply:{ref}")],
-        ]
+        buttons = _herdr_done_keyboard(ref)
     title = (agent.get("terminal_title_stripped") or "").strip()
     if title and status != "blocked":
         text += f"\n{title[:120]}"
@@ -2967,21 +3250,41 @@ def _herdr_watch_targets():
 async def _herdr_watch_loop(bot):
     import asyncio
     notified = {}  # (machine, pane_id) -> status already notified about
+    initialized = set()  # machines whose existing agents were already observed
     while True:
         await asyncio.sleep(HERDR_WATCH_INTERVAL)
         try:
-            await _herdr_watch_tick(bot, notified)
+            await _herdr_watch_tick(bot, notified, initialized)
         except Exception as e:  # one bad poll must not stop the whole watcher
             logger.warning("herdr watch tick упал: %s", e)
 
 
-async def _herdr_watch_tick(bot, notified):
+def _herdr_completion_sequence(agent):
+    value = agent.get("completion_seq")
+    return agent.get("state_change_seq") if value is None else value
+
+
+def _herdr_watch_source(machine, host):
+    import hashlib
+    return hashlib.sha256(json.dumps([machine, host], sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+
+def _herdr_completion_notice(machine, pane, agent):
+    where = f" \u043d\u0430 {machine}" if machine else ""
+    title = str(agent.get("terminal_title_stripped") or "").strip()[:120]
+    return f"\u2705 herdr{where}: {_herdr_agent_label(agent)} \u0432 \u043f\u0430\u043d\u0435\u043b\u0438 {pane} \u0437\u0430\u0432\u0435\u0440\u0448\u0438\u043b \u0440\u0430\u0431\u043e\u0442\u0443" + (f"\n{title}" if title else "")
+
+
+async def _herdr_watch_tick(bot, notified, initialized):
         seen = set()
         for machine, host in _herdr_watch_targets():
             data = await _herdr_json("agent", "list", host=host)
             if data is None:
                 continue  # herdr not installed / server down / ssh — stay quiet
-            agents = ((data.get("result") or {}).get("agents")) or []
+            agents = (data.get("result") or {}).get("agents")
+            if not isinstance(agents, list):
+                continue  # A failed/unknown response cannot establish a baseline.
+
             current = {}
             for a in agents:
                 pane = a.get("pane_id")
@@ -2989,26 +3292,54 @@ async def _herdr_watch_tick(bot, notified):
                 if not pane or name.startswith("pp-t"):
                     continue  # PromptPilot's own tasks notify via the worker
                 current[pane] = a
+            completions = [
+                {"pane": pane, "terminal_id": agent.get("terminal_id"),
+                 "agent_session": agent.get("agent_session"),
+                 "sequence": _herdr_completion_sequence(agent),
+                 "message": _herdr_completion_notice(machine, pane, agent)}
+                for pane, agent in current.items()
+                if agent.get("agent_status") == "done" and _herdr_completion_sequence(agent) is not None
+            ]
+            db.queue_herdr_completions(_herdr_watch_source(machine, host), completions,
+                                      [int(chat) for chat in list_authorized()], machine=machine, present_panes=list(current))
             seen.update((machine, pane) for pane in current)
             now = time.monotonic()
             for pane, a in current.items():
                 key = (machine, pane)
                 status = a.get("agent_status")
                 if status in ("blocked", "done"):
-                    prev = notified.get(key)  # (status, screen tail, когда видели)
-                    if prev and prev[0] == status and now - prev[2] < HERDR_WATCH_INTERVAL * 3:
+                    prev = notified.get(key)  # (status, screen tail, seen at, completion seq)
+                    completion_seq = _herdr_completion_sequence(a) if status == "done" else None
+                    if status == "done" and completion_seq is not None:
+                        notified[key] = (status, "", now, completion_seq)
+                        continue  # Delivery was durably queued with the cursor above.
+                    if status == "done" and machine not in initialized:
+                        # On bot startup, old kept sessions are already done.
+                        # Remember them without re-announcing every task.
+                        notified[key] = (status, "", now, completion_seq)
+                        continue
+                    if (status == "done" and prev and prev[0] == "done"
+                            and completion_seq is not None
+                            and prev[3] == completion_seq):
+                        notified[key] = (status, prev[1], now, completion_seq)
+                        continue
+                    if (prev and prev[0] == status
+                            and (status != "done" or completion_seq is None)
+                            and now - prev[2] < HERDR_WATCH_INTERVAL * 3):
                         # Висит непрерывно (или статус мигнул working на
                         # один-два опроса — датчик herdr не идеален): уже
                         # сказано, только освежаем время наблюдения. Экран
                         # ради этого не перечитываем.
-                        notified[key] = (prev[0], prev[1], now)
+                        notified[key] = (prev[0], prev[1], now, completion_seq)
                         continue
                     tail = await _herdr_screen_tail(pane, machine) if status == "blocked" else ""
                     dup = (prev and prev[0] == status and prev[1] == tail
+                           and (status != "done" or completion_seq is None
+                                or prev[3] == completion_seq)
                            and now - prev[2] < HERDR_RENOTIFY_COOLDOWN)
                     if not dup:
                         await _herdr_notify(bot, pane, status, a, machine, tail=tail)
-                    notified[key] = (status, tail, now)
+                    notified[key] = (status, tail, now, completion_seq)
                 # Состояние ушло из blocked/done — запись НЕ удаляем: раньше
                 # мигание статуса стирало её, и следующий же blocked давал
                 # дубль уведомления. Тот же диалог в течение cooldown молчит,
@@ -3017,6 +3348,7 @@ async def _herdr_watch_tick(bot, notified):
             # panes on machines we DID reach may be forgotten.
             for key in [k for k in notified if k[0] == machine and k not in seen]:
                 notified.pop(key)
+            initialized.add(machine)
 
 
 def _parse_hd_ref(ref: str):
@@ -3098,17 +3430,37 @@ async def cb_herdr_screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.message.reply_text(f"📺 {pane}{f' ({machine})' if machine else ''}:\n{tail}")
 
 
-@require_auth
+async def _check_herdr_reply_access(update: Update) -> bool:
+    """Use current private-chat authorization, including after awaited callbacks."""
+    user, chat = update.effective_user, update.effective_chat
+    if user is not None and is_authorized(user.id) and chat is not None and chat.type == "private":
+        return True
+    query = update.callback_query
+    message = update.message or (query.message if query else None)
+    if message:
+        await message.reply_text("Нет доступа. Команда не отправлена.")
+    elif query:
+        await query.answer("Нет доступа.", show_alert=True)
+    return False
+
+
 async def cb_herdr_reply_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("herdr_reply_pane", None)
+    context.user_data.pop("herdr_reply_host", None)
+    context.user_data.pop("herdr_reply_machine", None)
+    if not await _check_herdr_reply_access(update):
+        return ConversationHandler.END
     query = update.callback_query
     ref = await _hd_ref_or_alert(query, query.data.split(":", 1)[1])
     if ref is None:
         return ConversationHandler.END
     machine, pane, host = ref
+    await query.answer()
+    if not await _check_herdr_reply_access(update):
+        return ConversationHandler.END
     context.user_data["herdr_reply_pane"] = pane
     context.user_data["herdr_reply_host"] = host
     context.user_data["herdr_reply_machine"] = machine
-    await query.answer()
     where = f" на {machine}" if machine else ""
     await query.message.reply_text(f"Текст для агента в панели {pane}{where} (или /cancel):")
     return ASK_HERDR_REPLY
@@ -3139,6 +3491,8 @@ async def herdr_reply_got_text(update: Update, context: ContextTypes.DEFAULT_TYP
     host = context.user_data.pop("herdr_reply_host", None)
     machine = context.user_data.pop("herdr_reply_machine", "")
     if not pane:
+        return ConversationHandler.END
+    if not await _check_herdr_reply_access(update):
         return ConversationHandler.END
     res = await _herdr_json("agent", "prompt", pane, update.message.text, host=host)
     if res and res.get("result"):
@@ -3359,6 +3713,63 @@ def _silent_completion(task) -> bool:
     )
 
 
+def _flow_keyboard(flow_ref: str) -> InlineKeyboardMarkup | None:
+    parts = flow_ref.split(":")
+    if len(parts) != 3 or not parts[0].isdigit() or not parts[2].isdigit():
+        return None  # Old notifications cannot acquire a new occurrence token.
+    item_id, kind, version = parts
+    if kind == "approval":
+        return InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Одобрить", callback_data=f"flowdec2:{item_id}:{version}:a"),
+            InlineKeyboardButton("✖ Отклонить", callback_data=f"flowdec2:{item_id}:{version}:r"),
+        ]])
+    if kind != "action":
+        return None
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔁 Повторить", callback_data=f"flowact2:{item_id}:{version}:retry"),
+        InlineKeyboardButton("⏭ Пропустить", callback_data=f"flowact2:{item_id}:{version}:skip"),
+        InlineKeyboardButton("✖ Снять", callback_data=f"flowact2:{item_id}:{version}:cancel"),
+    ]])
+
+
+FLOW_ACTION_WORDS = {"retry": "шаг повторяется", "skip": "шаг пропущен", "cancel": "заявка снята"}
+
+
+@require_auth
+async def cb_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """A button under a flow notification: decide an approval, or move a stuck item."""
+    from . import flows
+
+    query = update.callback_query
+    parts = query.data.split(":")
+    user = update.effective_user
+    who = f"telegram:{user.username or user.id}"
+    try:
+        if parts[0] in {"flowdec", "flowact"}:
+            raise flows.FlowError("Кнопка устарела. Откройте заявку заново.")
+        if parts[0] == "flowdec2":
+            _, item_id, version, verdict = parts
+            decision = "approve" if verdict == "a" else "reject"
+            await asyncio.to_thread(flows.decide, int(item_id), decision, "", who,
+                                    expected_version=int(version))
+            word = "одобрено" if decision == "approve" else "отклонено"
+        else:
+            _, item_id, version, action = parts
+            call = {"retry": flows.retry, "skip": flows.skip, "cancel": flows.cancel}[action]
+            action_result = await asyncio.to_thread(call, int(item_id), who, expected_version=int(version))
+            word = ("остановка запрошена" if action == "cancel" and action_result["status"] == "cancelling"
+                    else FLOW_ACTION_WORDS[action])
+    except flows.FlowError as exc:
+        await query.answer(str(exc)[:190], show_alert=True)
+        return
+    await query.answer(word.capitalize())
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text(f"Заявка #{item_id}: {word}.")
+    except BadRequest:
+        pass
+
+
 async def _notify_loop(bot):
     """Background loop: send notifications for completed/failed tasks every 10s.
 
@@ -3381,11 +3792,14 @@ async def _notify_loop(bot):
         for note in notes:
             try:
                 kb = None
-                if note.get("pane_id"):
+                if note.get("flow_ref"):
+                    kb = _flow_keyboard(note["flow_ref"])
+                elif note.get("pane_id"):
                     # A blocked own task: same confirm/screen/reply buttons the
                     # foreign-agent watcher gets — not just an ssh suggestion.
                     ref = f"{note.get('machine') or ''}:{note['pane_id']}"
-                    kb = InlineKeyboardMarkup(_herdr_blocked_keyboard(ref))
+                    kb = InlineKeyboardMarkup(_herdr_done_keyboard(ref) if note.get("kind") == "herdr.done"
+                                              else _herdr_blocked_keyboard(ref))
                 await bot.send_message(chat_id=note["tg_chat_id"], text=_clip(note["message"]),
                                        reply_markup=kb)
                 db.mark_notification_sent(note["id"])
@@ -3451,6 +3865,13 @@ async def _notify_loop(bot):
                     await bot.send_message(chat_id=task.tg_chat_id, text=text,
                                            reply_markup=note_kb)
                 db.mark_notified(task.id)
+                if task.status.value == "completed":
+                    # 1С-доработка: у задач из /epf собираем и присылаем .epf.
+                    # Для обычных задач get_epf_job_by_task пуст — это no-op.
+                    try:
+                        await _epf_maybe_deliver(task, bot)
+                    except Exception as e:
+                        logger.warning("epf: доставка .epf для задачи %s: %s", task.id, e)
             except (Forbidden, BadRequest) as e:
                 logger.warning("notify task %s: постоянная ошибка (%s) — помечаю уведомлённым", task.id, e)
                 try:
@@ -3459,6 +3880,356 @@ async def _notify_loop(bot):
                     pass
             except Exception as e:
                 logger.warning("Failed to notify task %s: %s", task.id, e)
+
+
+# ---------------------------------------------------------------------------
+# 1С: доработка внешних обработок (.epf/.erf) — /epf
+# ---------------------------------------------------------------------------
+
+_EPF_MAX_FILE_MB = 20
+
+
+def _epf_base_keyboard(bases: list[dict], page: int = 0) -> InlineKeyboardMarkup:
+    """Пресеты конфигураций + пагинация всех обнаруженных баз."""
+    rows = [[InlineKeyboardButton("🧩 Авто (Stub-DB)", callback_data="epfb:stub")]]
+    rows.append([
+        InlineKeyboardButton("💼 УТ 11", callback_data="epfb:ut11"),
+        InlineKeyboardButton("📒 БП 3.0", callback_data="epfb:bp3"),
+    ])
+    rows.append([
+        InlineKeyboardButton("🏭 ERP", callback_data="epfb:erp"),
+        InlineKeyboardButton("🏪 УНФ", callback_data="epfb:unf"),
+        InlineKeyboardButton("🚗 АА", callback_data="epfb:aa"),
+    ])
+
+    per_page = PAGE_SIZE
+    total_pages = max(1, (len(bases) + per_page - 1) // per_page)
+    page = max(0, min(page, total_pages - 1))
+    for idx, b in enumerate(bases[page * per_page:(page + 1) * per_page]):
+        global_idx = page * per_page + idx
+        rows.append([InlineKeyboardButton(
+            f"[{b['category']}] {b['name'][:32]}",
+            callback_data=f"epfb:pick:{global_idx}",
+        )])
+    if total_pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("⬅️", callback_data=f"epfb:list:{page - 1}"))
+        nav.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="epfb:noop"))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton("➡️", callback_data=f"epfb:list:{page + 1}"))
+        rows.append(nav)
+    return InlineKeyboardMarkup(rows)
+
+
+async def epf_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_user.id):
+        await _deny(update)
+        return ConversationHandler.END
+    for key in ("epf_file", "epf_name", "epf_task", "epf_bases"):
+        context.user_data.pop(key, None)
+    if not _epf_available():
+        await update.message.reply_text(
+            "❌ 1С-доработка недоступна: не найден 1cv8.exe.\n"
+            "Задайте PP_1C_EXE_PATH (или секцию \"1c\" в tg_config.json)."
+        )
+        return ConversationHandler.END
+    await update.message.reply_text(
+        "🔧 Доработка обработки 1С.\n\n"
+        "1️⃣ Пришлите файл обработки (.epf или .erf) — прикрепите к сообщению.\n"
+        "Затем попрошу текст задачи и базу 1С."
+    )
+    return EPF_ASK_FILE
+
+
+async def epf_got_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    doc = update.message.document
+    if not doc or not doc.file_name or not doc.file_name.lower().endswith((".epf", ".erf")):
+        await update.message.reply_text(
+            "📎 Это не похоже на обработку 1С — нужен файл .epf или .erf."
+        )
+        return EPF_ASK_FILE
+    if (doc.file_size or 0) > _EPF_MAX_FILE_MB * 1024 * 1024:
+        await update.message.reply_text(
+            f"📦 Файл больше {_EPF_MAX_FILE_MB} МБ — Telegram не отдаёт такие боту. "
+            "Положите его в каталог проекта и укажите путь в задаче."
+        )
+        return EPF_ASK_FILE
+
+    from .config import DB_DIR
+    dest = DB_DIR / "attachments" / str(uuid.uuid4()) / _safe_attachment_name(doc.file_name)
+    try:
+        tg_file = await context.bot.get_file(doc.file_id)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        await tg_file.download_to_drive(custom_path=str(dest))
+    except Exception as e:
+        logger.warning("epf: не смог скачать %s: %s", doc.file_name, e)
+        shutil.rmtree(dest.parent, ignore_errors=True)
+        await update.message.reply_text("Не удалось скачать файл. Попробуйте ещё раз.")
+        return EPF_ASK_FILE
+
+    context.user_data["epf_file"] = str(dest)
+    context.user_data["epf_name"] = doc.file_name
+    await update.message.reply_text(
+        f"📥 Получена обработка: {doc.file_name}\n\n"
+        "2️⃣ Опишите задачу для доработки одним сообщением:"
+    )
+    return EPF_ASK_TASK
+
+
+async def epf_got_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["epf_task"] = update.message.text.strip()
+    bases = context.user_data.get("epf_bases")
+    if bases is None:
+        bases = await asyncio.to_thread(epf_tools.scan_available_bases)
+        context.user_data["epf_bases"] = bases
+    preview = context.user_data["epf_task"][:150]
+    if len(context.user_data["epf_task"]) > 150:
+        preview += "..."
+    await update.message.reply_text(
+        f"📝 Задача: {preview}\n\n3️⃣ Выберите базу 1С для декомпиляции/сборки:",
+        reply_markup=_epf_base_keyboard(bases),
+    )
+    return EPF_ASK_BASE
+
+
+@require_auth
+async def epf_base_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выбор базы (epfb:<key>), пагинация (epfb:list:N) и запуск пре-фазы."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    if data == "epfb:noop":
+        return EPF_ASK_BASE
+
+    if data.startswith("epfb:list:"):
+        page = int(data.split(":")[2])
+        bases = context.user_data.get("epf_bases") or []
+        await query.edit_message_reply_markup(reply_markup=_epf_base_keyboard(bases, page))
+        return EPF_ASK_BASE
+
+    base_key = data.split(":")[1]
+    if base_key not in ("stub",) and not base_key.startswith(("ut", "bp", "erp", "unf", "aa")):
+        # epfb:pick:<idx> — база из списка сканирования
+        try:
+            idx = int(data.split(":")[2])
+            bases = context.user_data.get("epf_bases") or []
+            base_key = bases[idx]["path"]
+        except (IndexError, ValueError, KeyError):
+            await query.edit_message_text("❌ База не найдена, начните заново: /epf")
+            return ConversationHandler.END
+
+    epf_file = context.user_data.get("epf_file")
+    epf_name = context.user_data.get("epf_name") or "file.epf"
+    task_text = context.user_data.get("epf_task", "")
+    if not epf_file or not Path(epf_file).exists():
+        await query.edit_message_text("❌ Файл не найден, начните заново: /epf")
+        return ConversationHandler.END
+
+    base_path, base_label = await asyncio.to_thread(epf_tools.resolve_base, base_key)
+    status = await query.edit_message_text(
+        f"⏳ Подготовка проекта 1С...\n🎯 База: {base_label}"
+    )
+
+    # Живой статус: prepare_project работает в потоке и пишет шаги в список,
+    # тикер в event loop редактирует сообщение.
+    steps: list[str] = []
+    started = time.time()
+    stop = asyncio.Event()
+
+    async def _ticker():
+        while not stop.is_set():
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                elapsed = int(time.time() - started)
+                text = "\n".join(steps) + (f"\n⏱ {elapsed} с" if steps else "...")
+                try:
+                    await status.edit_text(text)
+                except Exception:
+                    pass
+
+    ticker_task = asyncio.create_task(_ticker())
+    try:
+        projects_root = Path(PROJECTS_ROOT) if PROJECTS_ROOT else Path.cwd() / "pp-epf-projects"
+        projects_root.mkdir(parents=True, exist_ok=True)
+        project_dir, warnings = await asyncio.to_thread(
+            epf_tools.prepare_project,
+            Path(epf_file), epf_name, base_path, projects_root,
+            progress=lambda text: steps.append(text),
+        )
+    except epf_tools.EpfError as e:
+        stop.set()
+        ticker_task.cancel()
+        await status.edit_text(
+            f"❌ Не удалось декомпилировать обработку:\n{str(e)[:1200]}\n\n"
+            "Выберите другую базу 1С:",
+            reply_markup=_epf_base_keyboard(context.user_data.get("epf_bases") or []),
+        )
+        return EPF_ASK_BASE
+    except Exception as e:
+        stop.set()
+        ticker_task.cancel()
+        logger.exception("epf: сбой подготовки проекта")
+        await status.edit_text(f"❌ Ошибка подготовки: {e}")
+        return ConversationHandler.END
+    finally:
+        stop.set()
+        ticker_task.cancel()
+        try:
+            await ticker_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        for key in ("epf_file", "epf_name", "epf_task", "epf_bases"):
+            context.user_data.pop(key, None)
+
+    if not await _check_task_creation_access(update):
+        return ConversationHandler.END
+    task = db.create_task(TaskCreate(
+        prompt=task_text,
+        working_dir=str(project_dir),
+        skip_permissions=True,  # агенту нужны запуск 1cv8/epf-build и правка файлов
+        tg_chat_id=query.message.chat_id,
+    ))
+    db.create_epf_job(
+        task_id=task.id,
+        project_dir=str(project_dir),
+        original_name=epf_name,
+        base_key=base_key,
+        base_label=base_label,
+        chat_id=query.message.chat_id,
+    )
+
+    warn_text = ("\n\n⚠️ " + "; ".join(warnings)) if warnings else ""
+    await status.edit_text(
+        f"✅ Проект готов: {project_dir}\n"
+        f"🎯 База: {base_label}\n\n"
+        f"🤖 Задача #{task.id} поставлена в очередь PromptPilot.\n"
+        "Когда агент закончит, пришлю собранный .epf." + warn_text
+    )
+    return ConversationHandler.END
+
+
+async def epf_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    epf_file = context.user_data.pop("epf_file", None)
+    for key in ("epf_name", "epf_task", "epf_bases"):
+        context.user_data.pop(key, None)
+    if epf_file:
+        shutil.rmtree(Path(epf_file).parent, ignore_errors=True)
+    await update.message.reply_text("Отменил. Файл можно прислать заново: /epf",
+                                    reply_markup=_main_menu())
+    return ConversationHandler.END
+
+
+def _epf_result_keyboard(job_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💼 УТ 11", callback_data=f"epfb2:{job_id}:ut11"),
+         InlineKeyboardButton("📒 БП 3.0", callback_data=f"epfb2:{job_id}:bp3")],
+        [InlineKeyboardButton("🏭 ERP", callback_data=f"epfb2:{job_id}:erp"),
+         InlineKeyboardButton("🏪 УНФ", callback_data=f"epfb2:{job_id}:unf")],
+        [InlineKeyboardButton("🖥 Открыть в терминале", callback_data=f"epfterm:{job_id}")],
+    ])
+
+
+async def _epf_build_and_send(bot, chat_id: int, job: dict) -> None:
+    """Сборка проекта 1С и отправка .epf в чат (общая для хука и пересборки)."""
+    job_id = job["id"]
+    db.update_epf_job(job_id, {"status": "building"})
+    project_dir = Path(job["project_dir"])
+
+    await asyncio.to_thread(
+        epf_tools.git_commit_all, project_dir,
+        f"Доработка: задача #{job['task_id']}",
+    )
+
+    base_path, base_label = await asyncio.to_thread(epf_tools.resolve_base, job["base_key"])
+    built, err = await asyncio.to_thread(
+        epf_tools.build_epf, project_dir, base_path, use_stub=not base_path,
+    )
+    kb = _epf_result_keyboard(job_id)
+
+    if built:
+        db.update_epf_job(job_id, {"status": "built", "epf_path": str(built)})
+        try:
+            with open(built, "rb") as f:
+                await bot.send_document(
+                    chat_id=chat_id, document=f, filename=built.name,
+                    caption=f"✅ Обработка собрана ({base_label})",
+                    reply_markup=kb,
+                )
+        except Exception as e:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=f"⚠️ Не удалось отправить файл: {e}\nПуть: {built}",
+                reply_markup=kb,
+            )
+    else:
+        db.update_epf_job(job_id, {"status": "build_failed", "error": (err or "")[:1500]})
+        await bot.send_message(
+            chat_id=chat_id,
+            text=f"⚠️ Сборка не удалась:\n{(err or '')[:800]}\n\nМожно пересобрать в другой базе:",
+            reply_markup=kb,
+        )
+
+
+async def _epf_maybe_deliver(task, bot) -> None:
+    """Хук завершения: для задач из /epf — собрать и прислать .epf.
+
+    Вызывается из notify-цикла после штатного уведомления. Для обычных
+    задач — no-op (у задачи нет epf_job).
+    """
+    job = db.get_epf_job_by_task(task.id)
+    if not job or job["status"] != "queued":
+        return
+    chat_id = job["chat_id"] or task.tg_chat_id
+    if not chat_id:
+        return
+    await _epf_build_and_send(bot, int(chat_id), job)
+
+
+async def cb_epf_rebuild(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """epfb2:<job_id>:<base_key> — пересборка в другой конфигурации."""
+    query = update.callback_query
+    await query.answer()
+    try:
+        _, job_id_s, base_key = query.data.split(":")
+        job = db.get_epf_job(int(job_id_s))
+    except (ValueError, KeyError):
+        job = None
+    if not job or not Path(job["project_dir"]).exists():
+        await query.message.reply_text("❌ Проект 1С не найден.")
+        return
+
+    base_path, base_label = await asyncio.to_thread(epf_tools.resolve_base, base_key)
+    db.update_epf_job(job["id"], {"base_key": base_key, "base_label": base_label})
+    job = {**job, "base_key": base_key, "base_label": base_label}
+    await query.message.reply_text(f"🔨 Пересборка ({base_label})...")
+    await _epf_build_and_send(context.bot, query.message.chat_id, job)
+
+
+async def cb_epf_term(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """epfterm:<job_id> — открыть интерактивную сессию AI в терминале."""
+    query = update.callback_query
+    await query.answer()
+    try:
+        job = db.get_epf_job(int(query.data.split(":")[1]))
+    except (ValueError, KeyError):
+        job = None
+    if not job or not Path(job["project_dir"]).exists():
+        await query.message.reply_text("❌ Проект 1С не найден.")
+        return
+    task = db.get_task(job["task_id"])
+    task_text = (task.prompt if task else "") or "Продолжите доработку обработки"
+    ok, msg = await asyncio.to_thread(
+        epf_tools.open_interactive, Path(job["project_dir"]), task_text,
+    )
+    if ok:
+        await query.message.reply_text(
+            f"🖥 {msg}.\n📁 {job['project_dir']}\n"
+            "После правок пересоберите кнопкой выше или пришлите /epf."
+        )
+    else:
+        await query.message.reply_text(f"❌ {msg}")
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3475,10 +4246,11 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "➕ Добавить задачу — мастер: промпт → где выполнить → папка → 🚀 Запустить\n"
         "   (приоритет, права, worktree, повтор, отложенный запуск — «⚙ Дополнительно»)\n"
         "📊 Статистика — сводка по статусам и расходы\n"
+        "🧾 Итоги — что влито, закрыто и продвинулось за 24 часа, 7 или 30 дней\n"
         "🔌 Провайдеры — список и настройки\n"
         "⚡ Скилы — запустить /skill Claude Code\n"
         "⏸ Пауза — приостановить воркер без потери задач\n\n"
-        "Команды: /tasks, /windows, /add, /stats, /providers, /pause, /skills, /help\n"
+        "Команды: /tasks, /windows, /add, /stats, /report, /providers, /pause, /skills, /help\n"
         "/cancel — прервать текущий мастер или диалог\n\n"
         "Совет: задайте PP_PROJECTS_ROOT в .env — рабочую папку можно будет "
         "выбирать кнопками, а не печатать путь.",
@@ -3503,9 +4275,11 @@ def run_bot():
                 BotCommand("tasks", "Список задач"),
                 BotCommand("windows", "Окна herdr"),
                 BotCommand("add", "Новая задача"),
+                BotCommand("epf", "Доработка обработки 1С"),
                 BotCommand("stats", "Статистика"),
                 BotCommand("schedule", "Расписание и ускорение серий"),
                 BotCommand("pipeline", "Узкие места внешней очереди"),
+                BotCommand("report", "Итоги конвейера за период"),
                 BotCommand("providers", "Провайдеры"),
                 BotCommand("pause", "Пауза / продолжить воркер"),
                 BotCommand("skills", "Скилы Claude Code"),
@@ -3694,6 +4468,27 @@ def run_bot():
         persistent=True,
     )
 
+    epf_conv = ConversationHandler(
+        entry_points=[
+            MessageHandler(filters.Regex("^🔧 1С обработка$"), epf_start),
+            CommandHandler("epf", epf_start),
+        ],
+        states={
+            EPF_ASK_FILE: [
+                MessageHandler(filters.Document.ALL, epf_got_file),
+            ],
+            EPF_ASK_TASK: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, epf_got_task),
+            ],
+            EPF_ASK_BASE: [
+                CallbackQueryHandler(epf_base_cb, pattern=r"^epfb:"),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", epf_cancel)],
+        allow_reentry=True,
+        conversation_timeout=3600,
+    )
+
     # Group -1: skills navigation runs before ConversationHandlers (group 0).
     # ConversationHandler eats all callbacks when in an active state, so
     # skills_dir / skills_proj_picker / skills_back must be in a higher-priority group.
@@ -3714,6 +4509,22 @@ def run_bot():
     app.add_handler(CallbackQueryHandler(cb_windows_refresh, pattern=r"^win_rf$"), group=-1)
     app.add_handler(CallbackQueryHandler(cb_windows_list, pattern=r"^win_ls$"), group=-1)
 
+    # Report buttons can be opened from /report even while a task wizard is
+    # active, so they must not be swallowed by that wizard's callback fallback.
+    app.add_handler(CallbackQueryHandler(
+        cb_report_profiles, pattern=r"^report:profiles$"), group=-1)
+    app.add_handler(CallbackQueryHandler(
+        cb_report_profile, pattern=r"^report:profile:[A-Za-z0-9_.-]+$"), group=-1)
+    app.add_handler(CallbackQueryHandler(
+        cb_report_period,
+        pattern=r"^report:period:(24|168|720):[A-Za-z0-9_.-]+$"), group=-1)
+    app.add_handler(CallbackQueryHandler(
+        cb_report_refresh,
+        pattern=r"^report:refresh:(24|168|720):[A-Za-z0-9_.-]+$"), group=-1)
+    app.add_handler(CallbackQueryHandler(
+        cb_flow, pattern=r"^(flowdec2:\d+:\d+:[ar]|flowact2:\d+:\d+:(retry|skip|cancel)|flowdec:\d+:[a-z0-9_]+:[ar]|flowact:\d+:(retry|skip|cancel))$"),
+        group=-1)
+
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("skills", cmd_skills))
@@ -3724,17 +4535,20 @@ def run_bot():
     app.add_handler(CommandHandler("stats", show_stats))
     app.add_handler(CommandHandler("schedule", show_schedule))
     app.add_handler(CommandHandler("pipeline", show_pipeline_insights))
+    app.add_handler(CommandHandler("report", show_pipeline_report))
     app.add_handler(CommandHandler("providers", show_providers))
     app.add_handler(CommandHandler("pause", toggle_pause))
     app.add_handler(MessageHandler(filters.CONTACT, handle_contact))
     app.add_handler(herdr_reply_conv)
     app.add_handler(reply_conv)
     app.add_handler(add_conv)
+    app.add_handler(epf_conv)
     app.add_handler(MessageHandler(filters.Regex("^📋 Задачи$"), show_tasks))
     app.add_handler(MessageHandler(filters.Regex("^🖥 Окна$"), show_windows))
     app.add_handler(MessageHandler(filters.Regex("^📊 Статистика$"), show_stats))
     app.add_handler(MessageHandler(filters.Regex("^🗓 Расписание$"), show_schedule))
     app.add_handler(MessageHandler(filters.Regex("^📈 Очередь$"), show_pipeline_insights))
+    app.add_handler(MessageHandler(filters.Regex("^🧾 Итоги$"), show_pipeline_report))
     app.add_handler(MessageHandler(filters.Regex("^🔌 Провайдеры$"), show_providers))
     app.add_handler(MessageHandler(filters.Regex("^⚡ Скилы$"), cmd_skills))
     app.add_handler(MessageHandler(filters.Regex(r"^(⏸ Пауза|▶ Продолжить)$"), toggle_pause))
@@ -3748,6 +4562,9 @@ def run_bot():
     app.add_handler(CallbackQueryHandler(cb_delete_task_confirm, pattern=r"^del_yes:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_rerun_task, pattern=r"^rerun:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_full_result, pattern=r"^full_result:\d+$"))
+    # 1С-доработка: пересборка в другой базе и интерактивный запуск
+    app.add_handler(CallbackQueryHandler(cb_epf_rebuild, pattern=r"^epfb2:"))
+    app.add_handler(CallbackQueryHandler(cb_epf_term, pattern=r"^epfterm:"))
     app.add_handler(CallbackQueryHandler(cb_provider_detail, pattern=r"^prov_detail:"))
     app.add_handler(CallbackQueryHandler(cb_provider_list, pattern=r"^prov_list$"))
     app.add_handler(CallbackQueryHandler(show_schedule, pattern=r"^series:list$"))
