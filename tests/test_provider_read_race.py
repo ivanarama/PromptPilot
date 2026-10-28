@@ -12,6 +12,7 @@ from promptpilot import config as cfg
 @pytest.fixture()
 def isolated_providers(tmp_path, monkeypatch):
     monkeypatch.setenv("PP_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(cfg, "DB_DIR", tmp_path)
     yield tmp_path
     (tmp_path / "providers.json").unlink(missing_ok=True)
 

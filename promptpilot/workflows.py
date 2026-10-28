@@ -128,6 +128,13 @@ WORKFLOW_VERDICT_INSTRUCTION = """
 
 SUCCESS_VERDICTS = {"ГОТОВО", "УЖЕ СДЕЛАНО"}
 
+STAGE_PROMPTS_NOTE = (
+    "executor_prompt и reviewer_prompt необязательны и содержат только указания "
+    "этого этапа: код, название и проверяемую цель этапа (objective), разрешённые "
+    "пути, ожидаемые результаты, отчёты, замечания аудита, результаты gate и формат "
+    "ответа аудитора PromptPilot добавляет к ним сам."
+)
+
 DEFAULT_PLANNER_PROMPT = """Ты — ведущий инженер-планировщик PromptPilot.
 Изучи репозиторий и разложи общую задачу на короткие последовательные этапы,
 которые сможет надёжно выполнить более слабый исполнитель.
@@ -148,7 +155,7 @@ DEFAULT_PLANNER_PROMPT = """Ты — ведущий инженер-планир�
 Для каждого этапа обязательны code, title, objective; доступны stage_type
 (implementation/integration), dependencies, allowed_paths, deliverables,
 acceptance_gates, executor_prompt, reviewer_prompt, max_revision_rounds.
-"""
+""" + STAGE_PROMPTS_NOTE + "\n"
 
 PLAN_OUTPUT_CONTRACT = """
 <promptpilot-plan-contract version="stage-plan-v1">
@@ -181,6 +188,25 @@ DEFAULT_EXECUTOR_PROMPT = """Ты — исполнитель в автономн
 commit SHA, незакрытые ограничения и пути к evidence.
 """
 
+# The auditor's answer format. Every reviewer prompt carries it exactly once,
+# whatever the role template or stage text says (``{{audit_contract}}``).
+AUDIT_RESPONSE_CONTRACT = """В конце отчёта обязательно выведи
+две машинно-читаемые строки (каждая целиком на одной строке):
+AUDIT_FINDINGS_JSON: []
+AUDIT_VERDICT: PASS
+
+Для замечаний верни JSON-массив объектов с полями fingerprint, severity
+(blocker/high/medium/low/info), category, title, status (open/resolved/reopened/
+accepted_risk), payload. AUDIT_VERDICT допускает только PASS,
+REVISION_REQUIRED или HUMAN_REQUIRED.
+
+Если список незакрытых замечаний выше не пуст, верни в AUDIT_FINDINGS_JSON
+каждый прежний fingerprint: со status=resolved, когда исправление проверено, либо
+со status=open/reopened и вердиктом REVISION_REQUIRED. Не возвращай PASS с
+пустым массивом, пока в реестре есть незакрытые замечания.
+"""
+AUDIT_CONTRACT_PLACEHOLDER = "{{audit_contract}}"
+
 DEFAULT_REVIEWER_PROMPT = """Ты — независимый аудитор в автономном workflow PromptPilot.
 Не исправляй код и не принимай заявления исполнителя на веру.
 
@@ -200,21 +226,32 @@ Deterministic gate:
 Незакрытые замечания предыдущих аудитов:
 {{open_findings}}
 
-Проверь diff, историю Git, тесты и evidence. В конце отчёта обязательно выведи
-две машинно-читаемые строки (каждая целиком на одной строке):
-AUDIT_FINDINGS_JSON: []
-AUDIT_VERDICT: PASS
+Проверь diff, историю Git, тесты и evidence. """ + AUDIT_RESPONSE_CONTRACT
 
-Для замечаний верни JSON-массив объектов с полями fingerprint, severity
-(blocker/high/medium/low/info), category, title, status (open/resolved/reopened/
-accepted_risk), payload. AUDIT_VERDICT допускает только PASS,
-REVISION_REQUIRED или HUMAN_REQUIRED.
-
-Если список незакрытых замечаний выше не пуст, верни в AUDIT_FINDINGS_JSON
-каждый прежний fingerprint: со status=resolved, когда исправление проверено, либо
-со status=open/reopened и вердиктом REVISION_REQUIRED. Не возвращай PASS с
-пустым массивом, пока в реестре есть незакрытые замечания.
-"""
+# Context a stage text or a custom role template must not lose: the placeholders
+# that already place a section, and the section added when none of them is in
+# the text.
+_CONTEXT_SECTIONS = {
+    # The card's verifiable goal must reach the agent even when the stage text
+    # only says how to work, and an edited goal must not be silently ignored.
+    "stage_goal": (("stage_goal",),
+                   "Этап: {{stage_label}}\nПроверяемая цель этапа:\n{{stage_goal}}"),
+    "executor_report": (("executor_report",), "Отчёт исполнителя:\n{{executor_report}}"),
+    "gate_evidence": (("gate_evidence",),
+                      "Результаты автоматических проверок (gate):\n{{gate_evidence}}"),
+    "open_findings": (("open_findings",),
+                      "Незакрытые замечания предыдущих аудитов:\n{{open_findings}}"),
+    "allowed_paths": (("allowed_paths",), "Разрешённые пути:\n{{allowed_paths}}"),
+    "deliverables": (("deliverables",), "Ожидаемые результаты:\n{{deliverables}}"),
+    "previous_review": (("previous_review",),
+                        "Замечания предыдущего независимого аудита:\n{{previous_review}}"),
+}
+_ROLE_CONTEXT = {
+    "reviewer": ("stage_goal", "executor_report", "gate_evidence", "open_findings",
+                 "allowed_paths", "deliverables"),
+    "executor": ("stage_goal", "allowed_paths", "deliverables", "previous_review",
+                 "gate_evidence"),
+}
 
 
 def _workflow_row(conn: sqlite3.Connection, workflow_id: str) -> sqlite3.Row:
@@ -597,110 +634,6 @@ def replace_plan(workflow_id: str,
             {"stage_count": len(stages), "stage_codes": [stage.code for stage in stages]},
         )
         return stages
-
-
-def amend_plan(workflow_id: str,
-               amendment) -> list:
-    """F5: динамическая перепланировка хвоста утверждённого плана (opt-in).
-
-    planning.allow_editing_approved_plan=true разрешает менять ТОЛЬКО
-    будущие карточки: замороженный префикс (завершённые этапы + текущий)
-    сохраняет свои id/статусы/времена как git-коммиты; финал обязан
-    остаться integration; deps хвоста — только на существующие коды.
-    Каждая правка пишет событие plan.amended с причиной (append-only)."""
-    with db._connect(immediate=True) as conn:
-        workflow = _workflow_row(conn, workflow_id)
-        _require_version(workflow, amendment.expected_version)
-        status = WorkflowStatus(workflow["status"])
-        live = status in {
-            WorkflowStatus.QUEUED, WorkflowStatus.EXECUTING,
-            WorkflowStatus.GATING, WorkflowStatus.REVIEWING,
-            WorkflowStatus.REVISION_REQUIRED, WorkflowStatus.AWAITING_HUMAN,
-        }
-        if not live:
-            raise db.WorkflowConflictError(
-                "amend доступен только живому воркфлоу после утверждения "
-                f"(статус {status.value}); до утверждения используйте обычную правку плана")
-        planning = _config_for(db._row_to_workflow(workflow)).planning
-        if not planning.allow_editing_approved_plan:
-            raise db.WorkflowConflictError(
-                "planning.allow_editing_approved_plan выключен — "
-                "утверждённый план неизменяем (поведение по умолчанию)")
-
-        existing = conn.execute(
-            "SELECT * FROM workflow_stages WHERE workflow_id=? ORDER BY position",
-            (workflow_id,)).fetchall()
-        if not existing:
-            raise db.WorkflowConflictError("workflow plan has no stages")
-        # замороженный префикс: все до и включая текущий этап
-        frozen_n = 0
-        for row in existing:
-            frozen_n += 1
-            if row["id"] == workflow["current_stage_id"]:
-                break
-        else:
-            frozen_n = 0
-        frozen_codes = [row["code"] for row in existing[:frozen_n]]
-        incoming_codes = [stage.code for stage in amendment.stages]
-        if incoming_codes[:frozen_n] != frozen_codes:
-            raise db.WorkflowConflictError(
-                "замороженный префикс плана неприкосновенен (завершённые + "
-                f"текущий этап): ожидались коды {frozen_codes}, получено "
-                f"{incoming_codes[:frozen_n]}")
-        if len(amendment.stages) > planning.max_stages:
-            raise db.WorkflowConflictError(
-                f"plan exceeds max_stages={planning.max_stages}")
-        if amendment.stages[-1].stage_type.value != "integration":
-            raise db.WorkflowConflictError(
-                "the final workflow stage must have stage_type=integration")
-        # зависимости хвоста — на замороженные коды или предыдущие хвостовые
-        known = set(frozen_codes)
-        for stage in amendment.stages[frozen_n:]:
-            unknown = set(stage.dependencies) - known
-            if unknown:
-                raise db.WorkflowConflictError(
-                    f"stage {stage.code} dependencies must reference earlier stages: "
-                    + ", ".join(sorted(unknown)))
-            known.add(stage.code)
-
-        # пересобрать ТОЛЬКО хвост: замороженный префикс не трогаем вовсе
-        # (id/статусы/времена и FK от workflow_rounds остаются целыми)
-        frozen_ids = [row["id"] for row in existing[:frozen_n]]
-        placeholders = ",".join("?" * len(frozen_ids))
-        conn.execute(
-            f"DELETE FROM workflow_stages WHERE workflow_id=? AND id NOT IN ({placeholders})",
-            [workflow_id, *frozen_ids])
-        now = db._now()
-        for position, stage in enumerate(amendment.stages[frozen_n:], start=frozen_n + 1):
-            spec = stage.model_dump(
-                mode="json", exclude={"code", "title", "objective", "stage_type"})
-            conn.execute(
-                """INSERT INTO workflow_stages
-                   (id, workflow_id, position, code, title, objective, stage_type,
-                    status, spec_json, created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                (db._new_id("stage"), workflow_id, position, stage.code,
-                 stage.title, stage.objective, stage.stage_type.value,
-                 "pending", db._json_dump(spec), now))
-        conn.execute(
-            "UPDATE workflow_plans SET updated_at=? WHERE workflow_id=?",
-            (now, workflow_id))
-        old_codes = [row["code"] for row in existing]
-        _touch(
-            conn, workflow, "plan.amended",
-            {
-                "reason": amendment.reason,
-                "frozen_codes": frozen_codes,
-                "old_codes": old_codes,
-                "new_codes": incoming_codes,
-                "added": [c for c in incoming_codes if c not in old_codes],
-                "removed": [c for c in old_codes if c not in incoming_codes],
-            },
-        )
-        rows = conn.execute(
-            "SELECT * FROM workflow_stages WHERE workflow_id=? ORDER BY position",
-            (workflow_id,)).fetchall()
-        return [db._row_to_workflow_stage(r) for r in rows]
 
 
 def approve_plan(workflow_id: str,
@@ -1551,6 +1484,37 @@ def _operator_notes_block(notes: list[str]) -> str:
     return "\n\n".join(notes) if notes else "(нет)"
 
 
+def _context_block(text: str, kind: str) -> str:
+    """Sections of the role context that ``text`` does not place itself."""
+    parts = []
+    for name in _ROLE_CONTEXT[kind]:
+        placeholders, section = _CONTEXT_SECTIONS[name]
+        if not any("{{" + item + "}}" in text for item in placeholders):
+            parts.append(section)
+    if kind == "reviewer" and not _has_audit_contract(text):
+        parts.append(AUDIT_CONTRACT_PLACEHOLDER)
+    if not parts:
+        return ""
+    return ("<контекст-этапа>\nЭти разделы добавил PromptPilot к заданию этапа.\n\n"
+            + "\n\n".join(parts) + "\n</контекст-этапа>")
+
+
+def _has_audit_contract(text: str) -> bool:
+    return (AUDIT_CONTRACT_PLACEHOLDER in text
+            or AUDIT_RESPONSE_CONTRACT.strip() in text)
+
+
+def _place_audit_contract(text: str, role: WorkflowRole) -> str:
+    """Put the auditor's answer format into a reviewer prompt exactly once."""
+    if role is not WorkflowRole.REVIEWER or AUDIT_RESPONSE_CONTRACT.strip() in text:
+        return text.replace(AUDIT_CONTRACT_PLACEHOLDER, "")
+    head, placed, tail = text.partition(AUDIT_CONTRACT_PLACEHOLDER)
+    if not placed:
+        return text
+    return (head + AUDIT_RESPONSE_CONTRACT.strip()
+            + tail.replace(AUDIT_CONTRACT_PLACEHOLDER, ""))
+
+
 def _render_role_prompt(workflow: WorkflowInDB, role: WorkflowRole,
                         template: str) -> str:
     round_no = workflow.current_round
@@ -1570,6 +1534,8 @@ def _render_role_prompt(workflow: WorkflowInDB, role: WorkflowRole,
         "stage_code": str(stage.get("code") or ""),
         "stage_title": str(stage.get("title") or ""),
         "stage_goal": str(stage.get("objective") or stage.get("goal") or workflow.objective),
+        "stage_label": (f"{stage.get('code') or ''} {stage.get('title') or ''}".strip()
+                        or "единственный этап workflow"),
         "allowed_paths": "\n".join(stage.get("allowed_paths") or []) or "(не ограничены планом)",
         "deliverables": "\n".join(stage.get("deliverables") or []) or "(см. цель этапа)",
         "previous_review": _latest_run_output(
@@ -1596,17 +1562,29 @@ def _render_role_prompt(workflow: WorkflowInDB, role: WorkflowRole,
     }
     notes = _operator_notes(workflow.id, role)
     values["human_input"] = _operator_notes_block(notes)
-    rendered = template or (
+    stage_text = ""
+    if stage_row:
+        stage_text = (
+            stage_row.executor_prompt
+            if role is WorkflowRole.EXECUTOR else stage_row.reviewer_prompt
+        ) or ""
+    base = stage_text or template or (
         DEFAULT_EXECUTOR_PROMPT
         if role is WorkflowRole.EXECUTOR else DEFAULT_REVIEWER_PROMPT
     )
-    if stage_row:
-        override = (
-            stage_row.executor_prompt
-            if role is WorkflowRole.EXECUTOR else stage_row.reviewer_prompt
-        )
-        if override:
-            rendered = override
+    builtin = not (stage_text or template)
+    # A stage text or custom template supplements the role: PromptPilot adds
+    # the context and answer format it does not place itself. The built-in
+    # templates already carry every section.
+    block = "" if builtin else _context_block(base, role.value)
+    rendered = base.rstrip() + "\n\n" + block if block else base
+    rendered = _place_audit_contract(rendered, role)
+    # Placeholders are filled in one pass, so a report quoting "{{...}}" is
+    # left as written.
+    placed_by_template = "{{human_input}}" in rendered
+    places_executor_report = "{{executor_report}}" in rendered
+    rendered = re.sub(r"\{\{([a-z_]+)\}\}",
+                      lambda match: values.get(match.group(1), match.group(0)), rendered)
     # Only a run of this same stage: the first round of the next stage has
     # another goal and other allowed paths, so its predecessor's report is
     # not a session to resume.
@@ -1614,7 +1592,7 @@ def _render_role_prompt(workflow: WorkflowInDB, role: WorkflowRole,
         workflow.id, WorkflowRole.EXECUTOR, stage_id=workflow.current_stage_id)
     if (role is WorkflowRole.EXECUTOR
             and previous_executor != "(нет: это первый раунд)"
-            and "{{executor_report}}" not in rendered):
+            and not places_executor_report):
         # A resumed executor may run in a fresh CLI session. Give it the prior
         # result as context; the repository remains the source of truth.
         if len(previous_executor) > 12000:
@@ -1628,9 +1606,6 @@ def _render_role_prompt(workflow: WorkflowInDB, role: WorkflowRole,
         )
     # A template may place the notes itself; otherwise they go last, marked
     # as outranking the round's instructions — the same rule as a task note.
-    placed_by_template = "{{human_input}}" in rendered
-    for name, value in values.items():
-        rendered = rendered.replace("{{" + name + "}}", value)
     if notes and not placed_by_template:
         rendered = (
             rendered.rstrip()
@@ -1796,23 +1771,27 @@ def parse_reviewer_report(report: str) -> WorkflowReviewDecision | None:
     (инциденты 2026-10-04: цитированный PASS порождал ложный
     «PASS + открытый blocker» и человеческий блокер при фактической
     REVISION_REQUIRED)."""
-    verdict_matches = re.findall(
-        r"(?mi)^AUDIT_VERDICT:\s*(PASS|REVISION_REQUIRED|HUMAN_REQUIRED)\s*$",
-        report or "",
-    )
-    if not verdict_matches:
+    lines = (report or "").splitlines()
+    verdicts = [(i, line.split(":", 1)[1].strip().upper()) for i, line in enumerate(lines)
+                if re.match(r"(?i)^AUDIT_VERDICT:", line)]
+    blocks = [(i, line.split(":", 1)[1].strip()) for i, line in enumerate(lines)
+              if re.match(r"(?i)^AUDIT_FINDINGS_JSON:", line)]
+    if not verdicts or not blocks:
+        return None
+    verdict_index, verdict_text = verdicts[-1]
+    findings_index, findings_text = blocks[-1]
+    if (findings_index >= verdict_index or any(line.strip() for line in lines[findings_index + 1:verdict_index])
+            or verdict_text not in {verdict.value for verdict in ReviewVerdict}):
         return None
     findings: list[ReviewFindingInput] = []
-    findings_matches = re.findall(
-        r"(?mi)^AUDIT_FINDINGS_JSON:\s*(\[.*\])\s*$", report or ""
-    )
-    if findings_matches:
-        try:
-            raw_findings = json.loads(findings_matches[-1])
-            findings = [ReviewFindingInput.model_validate(item) for item in raw_findings]
-        except (json.JSONDecodeError, ValueError, TypeError):
+    try:
+        raw_findings = json.loads(findings_text)
+        if not isinstance(raw_findings, list):
             return None
-    verdict = ReviewVerdict(verdict_matches[-1].upper())
+        findings = [ReviewFindingInput.model_validate(item) for item in raw_findings]
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return None
+    verdict = ReviewVerdict(verdict_text)
     if verdict is ReviewVerdict.REVISION_REQUIRED and not findings:
         digest = hashlib.sha256((report or "").encode("utf-8")).hexdigest()[:16]
         findings = [ReviewFindingInput(

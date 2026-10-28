@@ -3,7 +3,43 @@ import sqlite3
 import pytest
 
 from promptpilot import db
+from promptpilot.models import TaskCreate
 
+
+def test_series_covering_index_upgrades_existing_database(isolated_db):
+    task = isolated_db.create_task(TaskCreate(prompt="retained", recurrence="1h"))
+    with isolated_db._connect() as conn:
+        conn.execute("DROP INDEX idx_tasks_series_summary")
+        conn.execute("CREATE INDEX idx_tasks_series ON tasks(series_id, id)")
+    before = isolated_db.list_series()
+
+    isolated_db.init_db()
+
+    assert isolated_db.list_series() == before
+    assert isolated_db.get_task(task.id).prompt == "retained"
+    with isolated_db._connect() as conn:
+        indexes = {row[1] for row in conn.execute("PRAGMA index_list(tasks)")}
+    assert "idx_tasks_series_summary" in indexes
+    assert "idx_tasks_series" not in indexes
+
+
+
+def test_init_db_does_not_rebuild_the_replaced_series_index(isolated_db, monkeypatch):
+    # Migrations replay on every start: creating the old index before dropping
+    # it would scan the whole task table on each server/worker/bot start.
+    statements = []
+    real_connect = sqlite3.connect
+
+    def tracing_connect(*args, **kwargs):
+        conn = real_connect(*args, **kwargs)
+        conn.set_trace_callback(statements.append)
+        return conn
+
+    monkeypatch.setattr(sqlite3, "connect", tracing_connect)
+    isolated_db.init_db()
+
+    assert not any("idx_tasks_series ON" in statement for statement in statements)
+    assert any("idx_tasks_series_summary" in statement for statement in statements)
 
 def test_init_db_retries_transient_busy(monkeypatch):
     attempts = []

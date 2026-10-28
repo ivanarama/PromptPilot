@@ -119,6 +119,28 @@ def validate_health(health: dict) -> None:
     reviewing = queues["review_candidates"]
     content = queues["content_review_candidates"]
     merging = queues["merge_executable"]
+    parallel = health.get("parallel_review_candidates", [])
+    if not isinstance(parallel, list):
+        raise PipelineError("fallback parallel REVIEW allowlist is invalid")
+    content_keys = set()
+    for item in health["content_review_candidates"]:
+        depth = item.get("review_depth")
+        if type(depth) is int and depth >= 0:
+            content_keys.add((item["number"], item["head"], item["stage"], depth))
+    parallel_numbers = set()
+    for item in parallel:
+        exact = identity(item)
+        depth = item.get("review_depth")
+        if (exact["stage"] != "review" or type(depth) is not int
+                or not 0 <= depth < 2
+                or (exact["number"], exact["head"], exact["stage"], depth)
+                not in content_keys or exact["number"] in parallel_numbers):
+            raise PipelineError("fallback parallel REVIEW contradicts content backlog")
+        parallel_numbers.add(exact["number"])
+    if parallel and (owner is None or owner["stage"] not in INTEGRATION_REVIEW_STAGES):
+        raise PipelineError("fallback parallel REVIEW has no integration-review owner")
+    if owner is not None and owner["number"] in parallel_numbers:
+        raise PipelineError("fallback parallel REVIEW includes its integration owner")
     if owner is not None and owner["stage"] in INTEGRATION_REVIEW_STAGES:
         if reviewing != [owner] or merging:
             raise PipelineError("fallback integration REVIEW contradicts executable queues")

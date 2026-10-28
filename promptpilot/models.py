@@ -92,6 +92,14 @@ class TaskInDB(BaseModel):
     series_id: Optional[int] = None
     series_title: Optional[str] = None
     series_paused: bool = False
+    # Атрибуция задач (очередь/миссия): None = задача вне воркфлоу / не в ожидании.
+    workflow_id: Optional[str] = None
+    role: Optional[str] = None
+    # Базовый ранг по времени, состоянию серии и параллельным lock_key.
+    # Lanes, fairness, слоты и глобальная пауза не моделируются. Исключённые
+    # задачи несут wait_reason; у кандидатов базового допуска он None.
+    queue_position: Optional[int] = None
+    wait_reason: Optional[str] = None
 
 
 class Stats(BaseModel):
@@ -266,10 +274,7 @@ class WorkflowPlanningConfig(BaseModel):
     # P21: потолок поднят 20 → 100 по директиве владельца (раунды ревизий
     # съедают лимит на «уже сделано»-циклах; 422 при PATCH>20 ломал resume).
     max_revisions_per_stage: int = Field(default=3, ge=1, le=100)
-    # F5: динамическая перепланировка хвоста утверждённого плана.
-    # False (дефолт) — план неизменяем после утверждения (поведение автора).
     prompt_template: str = ""
-    allow_editing_approved_plan: bool = False
 
 
 class WorkflowConfig(BaseModel):
@@ -453,13 +458,6 @@ class WorkflowPlanReplace(BaseModel):
         if self.stages[-1].stage_type is not WorkflowStageType.INTEGRATION:
             raise ValueError("the final workflow stage must have stage_type=integration")
         return self
-
-
-class WorkflowPlanAmend(BaseModel):
-    """F5: правка хвоста утверждённого плана (замороженный префикс неприкосновенен)."""
-    expected_version: int = Field(ge=0)
-    stages: list[WorkflowStageSpec] = Field(min_length=1, max_length=50)
-    reason: str = Field(min_length=3, max_length=2000)
 
 
 class WorkflowStageInDB(WorkflowStageSpec):
