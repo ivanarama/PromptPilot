@@ -35,7 +35,8 @@ def _git(repo, *args, data=None, index=None):
     if index:
         env["GIT_INDEX_FILE"] = str(index)
     result = subprocess.run(["git", "-C", str(repo), *args], input=data,
-                            capture_output=True, timeout=30, env=env)
+                            capture_output=True, timeout=30, env=env,
+                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     if result.returncode:
         raise CheckpointError(result.stderr.decode("utf-8", "replace")[:400])
     return result.stdout

@@ -8,7 +8,7 @@ import sqlite3
 import time
 import unicodedata
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -77,6 +77,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     pipeline_priority_restore INTEGER,
     verdict TEXT
     ,series_id INTEGER REFERENCES task_series(id)
+    ,rights TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_series (
@@ -423,6 +424,8 @@ MIGRATIONS = [
         updated_at TEXT NOT NULL
     )""",
     "CREATE INDEX IF NOT EXISTS idx_epf_jobs_task ON epf_jobs(task_id)",
+    # what the agent run may do (models.TaskRights); NULL = skip_permissions decides
+    "ALTER TABLE tasks ADD COLUMN rights TEXT",
 ]
 
 WORKFLOW_SCHEMA_VERSION = "workflow_orchestrator_w0_v1"
@@ -1055,8 +1058,9 @@ def _insert_task(conn: sqlite3.Connection, task: TaskCreate) -> TaskInDB:
         """INSERT INTO tasks (prompt, working_dir, provider, status, priority,
            scheduled_at, created_at, max_retries, skip_permissions, model,
            session_id, parent_task_id, tg_chat_id, recurrence, task_timeout,
-           detached, keep_pane, herdr_target, machine, worktree, effort, series_id)
-           VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           detached, keep_pane, herdr_target, machine, worktree, effort, series_id,
+           rights)
+           VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             task.prompt,
             task.working_dir,
@@ -1079,6 +1083,7 @@ def _insert_task(conn: sqlite3.Connection, task: TaskCreate) -> TaskInDB:
             int(task.worktree),
             task.effort,
             series_id,
+            task.rights,
         ),
     )
     return get_task(cur.lastrowid, conn=conn)
@@ -2314,6 +2319,7 @@ def _recreate_series_occurrence(conn, series_id: int, series,
         herdr_target=latest.herdr_target,
         machine=latest.machine,
         worktree=latest.worktree,
+        rights=latest.rights,
         series_id=series_id,
     ))
     return True
@@ -4936,10 +4942,10 @@ def append_workflow_event(event: WorkflowEventCreate) -> WorkflowEventInDB:
         return _append_workflow_event(conn, event)
 
 
-def create_workflow(data: WorkflowCreate, workflow_id: str = None) -> WorkflowInDB:
+def create_workflow(data: WorkflowCreate, workflow_id: str = None, *, conn=None) -> WorkflowInDB:
     workflow_id = workflow_id or _new_id("wf")
     now = _now()
-    with _connect(immediate=True) as conn:
+    with (nullcontext(conn) if conn is not None else _connect(immediate=True)) as conn:
         try:
             conn.execute(
                 """INSERT INTO workflows
@@ -4970,6 +4976,37 @@ def create_workflow(data: WorkflowCreate, workflow_id: str = None) -> WorkflowIn
             "SELECT * FROM workflows WHERE id = ?", (workflow_id,)
         ).fetchone()
         return _row_to_workflow(row)
+
+
+def abort_draft_workflow(workflow_id: str) -> bool:
+    """Компенсация неатомарного создания миссии с готовым планом.
+
+    Отменяет ТОЛЬКО draft-миссию: терминальный cancelled + slug вида
+    «aborted-<slug>-<id>», освобождая исходный slug для повторного запроса.
+    Физическое удаление строки невозможно по схеме: workflow_events держит
+    FK ON DELETE RESTRICT (при foreign_keys=ON), а события append-only —
+    журнал целостности важнее. Планы/этапы/раунды draft-а удаляются.
+    """
+    with _connect(immediate=True) as conn:
+        row = conn.execute(
+            "SELECT status, slug FROM workflows WHERE id = ?", (workflow_id,)
+        ).fetchone()
+        if not row or row["status"] != "draft":
+            return False
+        conn.execute(
+            "DELETE FROM workflow_stages WHERE workflow_id = ?", (workflow_id,))
+        conn.execute(
+            "DELETE FROM workflow_plans WHERE workflow_id = ?", (workflow_id,))
+        conn.execute(
+            "DELETE FROM workflow_rounds WHERE workflow_id = ?", (workflow_id,))
+        cur = conn.execute(
+            """UPDATE workflows
+               SET status = 'cancelled',
+                   slug = 'aborted-' || substr(slug, 1, 40) || '-' || substr(id, 4, 8),
+                   updated_at = ?
+               WHERE id = ? AND status = 'draft'""",
+            (_now(), workflow_id))
+        return cur.rowcount > 0
 
 
 def get_workflow(workflow_id: str, *, conn=None) -> Optional[WorkflowInDB]:
@@ -5082,7 +5119,8 @@ def _replace_workflow_stages(conn: sqlite3.Connection, workflow_id: str,
 
 
 def update_workflow(workflow_id: str, update: WorkflowUpdate) -> WorkflowInDB:
-    changes = update.model_dump(exclude={"expected_version"}, exclude_none=True)
+    changes = update.model_dump(
+        exclude={"expected_version", "allow_terminal_config"}, exclude_none=True)
     if not changes:
         raise ValueError("workflow update contains no changed fields")
     if "config" in changes:
@@ -5104,9 +5142,14 @@ def update_workflow(workflow_id: str, update: WorkflowUpdate) -> WorkflowInDB:
                 "workflow metadata except config can only be edited while status is draft"
             )
         if current["status"] in {"completed", "failed", "cancelled"}:
-            raise WorkflowConflictError(
-                "terminal workflow configuration cannot be edited"
-            )
+            # allow_terminal_config: явная семантика правки конфига
+            # терминальной миссии (только config; на выполнение не влияет)
+            if not (getattr(update, "allow_terminal_config", False)
+                    and set(changes) <= {"config_json"}):
+                raise WorkflowConflictError(
+                    "terminal workflow configuration cannot be edited "
+                    "(allow_terminal_config=true разрешает правку только config)"
+                )
         if current["state_version"] != update.expected_version:
             raise WorkflowConflictError(
                 f"workflow version is {current['state_version']}, "
