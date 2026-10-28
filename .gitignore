@@ -25,3 +25,4 @@ scripts/oneservice/.os_keeper.json
 scripts/oneservice/_template.html
 NUL
 scripts/oneservice/.tg_lock
+.promptpilot-data/
