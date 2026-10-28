@@ -1769,24 +1769,35 @@ def _run_gate_commands(workflow: WorkflowInDB) -> WorkflowGateDecision:
 
 
 def parse_reviewer_report(report: str) -> WorkflowReviewDecision | None:
-    """Parse the strict reviewer tail while retaining a safe human fallback."""
-    match = re.search(
-        r"(?mi)^AUDIT_VERDICT:\s*(PASS|REVISION_REQUIRED|HUMAN_REQUIRED)\s*$",
-        report or "",
-    )
-    if not match:
+    """Parse the strict reviewer tail while retaining a safe human fallback.
+
+    P24: отчёты ревью цитируют прошлые аудиты и вывод гейта — в них
+    встречаются ЧУЖИЕ строки AUDIT_VERDICT/AUDIT_FINDINGS_JSON. Решающее
+    значение имеет ПОСЛЕДНЯЯ пара строк (финал отчёта), а не первый матч
+    (инциденты 2026-10-04: цитированный PASS порождал ложный
+    «PASS + открытый blocker» и человеческий блокер при фактической
+    REVISION_REQUIRED)."""
+    lines = (report or "").splitlines()
+    verdicts = [(i, line.split(":", 1)[1].strip().upper()) for i, line in enumerate(lines)
+                if re.match(r"(?i)^AUDIT_VERDICT:", line)]
+    blocks = [(i, line.split(":", 1)[1].strip()) for i, line in enumerate(lines)
+              if re.match(r"(?i)^AUDIT_FINDINGS_JSON:", line)]
+    if not verdicts or not blocks:
+        return None
+    verdict_index, verdict_text = verdicts[-1]
+    findings_index, findings_text = blocks[-1]
+    if (findings_index >= verdict_index or any(line.strip() for line in lines[findings_index + 1:verdict_index])
+            or verdict_text not in {verdict.value for verdict in ReviewVerdict}):
         return None
     findings: list[ReviewFindingInput] = []
-    findings_match = re.search(
-        r"(?mi)^AUDIT_FINDINGS_JSON:\s*(\[.*\])\s*$", report or ""
-    )
-    if findings_match:
-        try:
-            raw_findings = json.loads(findings_match.group(1))
-            findings = [ReviewFindingInput.model_validate(item) for item in raw_findings]
-        except (json.JSONDecodeError, ValueError, TypeError):
+    try:
+        raw_findings = json.loads(findings_text)
+        if not isinstance(raw_findings, list):
             return None
-    verdict = ReviewVerdict(match.group(1).upper())
+        findings = [ReviewFindingInput.model_validate(item) for item in raw_findings]
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return None
+    verdict = ReviewVerdict(verdict_text)
     if verdict is ReviewVerdict.REVISION_REQUIRED and not findings:
         digest = hashlib.sha256((report or "").encode("utf-8")).hexdigest()[:16]
         findings = [ReviewFindingInput(

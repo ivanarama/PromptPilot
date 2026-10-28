@@ -284,7 +284,9 @@ class WorkflowPlanningConfig(BaseModel):
     enabled: bool = False
     require_approval: bool = True
     max_stages: int = Field(default=20, ge=1, le=50)
-    max_revisions_per_stage: int = Field(default=3, ge=1, le=20)
+    # P21: потолок поднят 20 → 100 по директиве владельца (раунды ревизий
+    # съедают лимит на «уже сделано»-циклах; 422 при PATCH>20 ломал resume).
+    max_revisions_per_stage: int = Field(default=3, ge=1, le=100)
     prompt_template: str = ""
 
 
