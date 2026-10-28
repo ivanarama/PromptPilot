@@ -79,5 +79,18 @@ services:
   #     - promptpilot-data:/data
   #   restart: unless-stopped
 
+  # ── Flows runner (docs/FLOWS.md) ──────────────────────────────────────────
+  # Uncomment when flow files are in /data/flows. Pass the mailbox credentials
+  # the flows name in user_env / password_env.
+  # flows:
+  #   build: .
+  #   image: promptpilot
+  #   command: ["flows", "run"]
+  #   environment:
+  #     - PP_FLOWS_INTERVAL=${PP_FLOWS_INTERVAL:-15}
+  #   volumes:
+  #     - promptpilot-data:/data
+  #   restart: unless-stopped
+
 volumes:
   promptpilot-data:

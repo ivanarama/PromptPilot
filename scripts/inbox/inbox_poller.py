@@ -39,6 +39,7 @@ import email
 import imaplib
 import json
 import re
+import ssl
 import sys
 import time
 import urllib.request
@@ -242,11 +243,15 @@ def dkim_passed(msg: email.message.Message, authserv: str, domain: str) -> bool:
     sender wrote with our authserv-id in it, and a letter our own server
     stamped dkim=fail would pass on the forgery below it.
     """
-    signer = re.compile(r"header\.(?:d=|i=@?)(?:[\w-]+\.)*" + re.escape(domain) + r"\b")
+    domain = domain.strip().lower().rstrip(".")
+    if not domain:
+        return False
+    signer = re.compile(r"header\.(?:d=|i=@?)(?:[\w-]+\.)*"
+                        + re.escape(domain) + r"(?![\w.-])")
     for header in msg.get_all("Authentication-Results") or []:
         value = " ".join(str(header).split()).lower()
         server, _, results = value.partition(";")
-        if server.strip() != authserv:
+        if server.strip() != authserv.strip().lower():
             continue
         return any(clause.strip().startswith("dkim=pass") and signer.search(clause.strip())
                    for clause in results.split(";"))
@@ -623,7 +628,8 @@ def write_kt_feed(env: dict, state: dict) -> None:
 
 def connect(env: dict) -> imaplib.IMAP4_SSL:
     imaplib.Commands["ID"] = ("AUTH", "SELECTED", "NONAUTH")
-    client = imaplib.IMAP4_SSL(env["IMAP_HOST"], int(env.get("IMAP_PORT", "993")))
+    client = imaplib.IMAP4_SSL(env["IMAP_HOST"], int(env.get("IMAP_PORT", "993")),
+                                ssl_context=ssl.create_default_context(), timeout=30)
     client.login(env["IMAP_USER"], env["IMAP_PASSWORD"])
     # Mail.ru отбрасывает клиентов без IMAP ID (RFC 2971).
     client._simple_command("ID", '("name" "InboxPilot" "version" "1.0")')
