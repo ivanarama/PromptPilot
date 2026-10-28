@@ -28,7 +28,7 @@ const elements = {
 };
 const buttons = [{disabled:false}, {disabled:false}];
 const requests = [], toasts = [];
-let pending = null, fail = false;
+let pending = null, fail = false, failSummary = false, failManage = false;
 const context = {
   providersData:{...server}, machinesData:{remote:{providers:['beta','alpha']}},
   API:'/api', esc:escape, escAttr:escape,
@@ -46,6 +46,8 @@ const context = {
       names.forEach((name,index)=>{server[name].ui_order=index;});
       return {ok:true};
     }
+    if (url.endsWith('/providers') && failSummary) throw Error('summary offline');
+    if (url.endsWith('/providers/manage') && failManage) throw Error('manage offline');
     if (url.endsWith('/providers') || url.endsWith('/providers/manage')) return server;
     throw Error(`Unexpected request ${url}`);
   },
@@ -95,6 +97,24 @@ const names = data => JSON.parse(JSON.stringify(context.orderedProviderEntries(d
   assert.equal(toasts.length,1);
   fail=false;
   await context.provMove('alpha',-1); // failed save releases the UI lock
+  assert.deepEqual(names(server),['alpha','beta','hidden','session']);
+
+  toasts.length=0; failSummary=true;
+  await context.provMove('beta',-1);
+  assert.deepEqual(names(server),['beta','alpha','hidden','session']);
+  assert.equal(toasts.length,1);
+  assert.match(toasts[0], /Порядок сохранён/);
+  assert.doesNotMatch(toasts[0], /не сохранён/);
+  failSummary=false;
+
+  toasts.length=0; fail=true; failManage=true;
+  await context.provMove('alpha',-1); // neither POST nor finally-refresh can strand the UI
+  assert.equal(toasts.length,1);
+  const orderButtons = elements.provList.innerHTML.match(/<button[^>]+data-provider[^>]*>/g);
+  assert.equal(orderButtons.length,8);
+  assert.equal(orderButtons.filter(markup=>markup.includes(' disabled')).length,2);
+  fail=false; failManage=false;
+  await context.provMove('alpha',-1);
   assert.deepEqual(names(server),['alpha','beta','hidden','session']);
   console.log('Provider labels/order: escaped display, stable execution IDs, hidden/session filters, serialized save and retry');
 })().catch(error=>{console.error(error);process.exitCode=1;});

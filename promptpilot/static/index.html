@@ -4105,6 +4105,10 @@ let providerOrderSaving = false;
 
 async function renderProvList() {
   const data = await fetchJSON(`${API}/providers/manage`);
+  renderProviderCards(data);
+}
+
+function renderProviderCards(data) {
   provManageData = data;
   const entries = orderedProviderEntries(data);
   document.getElementById('provList').innerHTML = entries.map(([name, p], index) => {
@@ -4141,18 +4145,30 @@ async function provMove(name, direction) {
   if (index < 0 || next < 0 || next >= names.length) return;
   [names[index], names[next]] = [names[next], names[index]];
   providerOrderSaving = true;
+  let saved = false, errorReported = false;
   document.querySelectorAll('#provList button[data-provider]').forEach(button => { button.disabled = true; });
   try {
     await fetchJSON(`${API}/providers/reorder`, {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({names}),
     });
+    saved = true;
+    names.forEach((id, order) => { provManageData[id].ui_order = order; });
     await loadProviders();
   } catch (error) {
-    toast('Порядок не сохранён: ' + error.message);
+    toast((saved ? 'Порядок сохранён, но обновление интерфейса не удалось: '
+                 : 'Не удалось подтвердить сохранение порядка: ') + error.message);
+    errorReported = true;
   } finally {
     providerOrderSaving = false;
-    await renderProvList();
+    try {
+      await renderProvList();
+    } catch (error) {
+      // Keep the known cards usable if a refresh fails. Re-rendering also
+      // restores the correct boundary buttons instead of enabling all of them.
+      renderProviderCards(provManageData);
+      if (!errorReported) toast('Не удалось обновить список помощников: ' + error.message);
+    }
   }
 }
 
