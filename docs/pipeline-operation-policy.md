@@ -85,6 +85,11 @@ barrier remains intact. A stale/partial snapshot does not authorize exclusion.
 Search timestamps are change hints, not mutation authority; every actual
 mutation still requires canonical fresh project checks.
 
+If another occurrence re-elects the same target, HEAD and stage while its hold
+is still live, the ordinary repeated-blocker guard decides whether to pause the
+series. Reprocessing the same occurrence does not extend the hold or trigger
+this fallback.
+
 This local ledger does not mutate GitHub labels or resolve a blocker. Holds
 without measured state, ambiguous handoffs and execution errors retain the
 series-level fallback described below. Turning this opt-in off restores that

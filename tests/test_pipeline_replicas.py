@@ -1,13 +1,10 @@
-import json
 import os
 import sqlite3
 import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -196,7 +193,7 @@ def test_deleting_task_releases_target_reservation(isolated_db):
 
 
 def test_running_task_cannot_be_deleted_or_release_reservation(isolated_db):
-    task = isolated_db.create_task(TaskCreate(prompt="running reserved task"))
+    isolated_db.create_task(TaskCreate(prompt="running reserved task"))
     running = isolated_db.get_next_runnable()
     isolated_db.reserve_pipeline_target(
         "owner/repo", "review", 10, HEAD_A, running.id, 300)
@@ -253,7 +250,7 @@ def test_reset_before_preflight_fences_old_attempt_from_new_claim(isolated_db):
     "failed", "rate_limited", "deferred", "cancelled", "attempt_failed",
 ])
 def test_every_attempt_exit_releases_target_reservation(isolated_db, transition):
-    task = isolated_db.create_task(TaskCreate(prompt=f"exit {transition}"))
+    isolated_db.create_task(TaskCreate(prompt=f"exit {transition}"))
     running = isolated_db.get_next_runnable()
     isolated_db.reserve_pipeline_target(
         "owner/repo", "review", 10, HEAD_A, running.id, 300)
@@ -476,6 +473,44 @@ def test_review_election_reserves_then_selects_next_candidate(
     assert exhausted is None
 
 
+def test_integration_owner_and_content_review_use_distinct_replica_reservations(
+        isolated_db, monkeypatch):
+    config = {
+        "repository": "owner/repo", "review_completion_gate": "target-v1",
+        "fallback_handoff": "target-v1", "parallel_content_review": True,
+        "review_lease_seconds": 300, "target_reservation_ttl_seconds": 300,
+    }
+    owner = {"number": 10, "head": HEAD_A, "stage": "integration-review"}
+    content = _candidate(11, HEAD_B)
+    health = {
+        "state": "yellow",
+        "findings": [{"code": "single_flight_barrier", "severity": "yellow", "pr": 10}],
+        "integration_owner": owner, "review_candidates": [owner],
+        "content_review_candidates": [content],
+        "parallel_review_candidates": [content], "merge_executable": [],
+    }
+    fallback_handoff.validate_health(health)
+    monkeypatch.setenv("PP_PIPELINE_REPLICAS", "2")
+    attempts = []
+    for index in range(2):
+        isolated_db.create_task(TaskCreate(prompt=f"parallel replica {index}"))
+        attempts.append(isolated_db.get_next_runnable())
+
+    candidates = health["review_candidates"] + pipelinectl.parallel_content_candidates(
+        config, health)
+    _set_replica_attempt_env(monkeypatch, attempts[0])
+    first, first_reservation, _ = pipelinectl._elect_review_candidate(
+        config, health, candidates)
+    _set_replica_attempt_env(monkeypatch, attempts[1])
+    second, second_reservation, _ = pipelinectl._elect_review_candidate(
+        config, health, candidates)
+
+    assert (first["number"], second["number"]) == (10, 11)
+    assert first_reservation["task_id"] == attempts[0].id
+    assert second_reservation["task_id"] == attempts[1].id
+    assert health["merge_executable"] == []
+
+
 def test_expired_owned_reservation_fails_without_retargeting(
         isolated_db, monkeypatch):
     config = {
@@ -684,6 +719,21 @@ def test_replica_projection_keeps_per_run_capacity_separate(tmp_path):
     assert len(projection["series_replicas"]) == 2
 
 
+def test_replica_projection_exposes_only_current_pending_wait_reason(tmp_path):
+    queue = {"series_contains": "Project - REVIEW"}
+    pending = _replica_series(1, tmp_path)
+    pending["next_error"] = "GitHub API budget is reserved by another run"
+    projection = pipeline_insights._queue_replica_projection(
+        queue, [pending], capacity=1)
+    assert projection["series_replicas"][0]["task_error"] == pending["next_error"]
+
+    running = _replica_series(1, tmp_path, status="running")
+    running["next_error"] = pending["next_error"]
+    projection = pipeline_insights._queue_replica_projection(
+        queue, [running], capacity=1)
+    assert projection["series_replicas"][0]["task_error"] is None
+
+
 def test_replica_projection_has_no_capacity_without_active_series(tmp_path):
     first = tmp_path / "review-1"
     second = tmp_path / "review-2"
@@ -771,6 +821,7 @@ def test_cached_dashboard_health_is_red_for_invalid_replica_set(
         }},
     }
     series = [_replica_series(1, first)]
+    series[0]["next_error"] = "WIP: active PRs exceed the intake limit"
     monkeypatch.setattr(
         pipeline_insights, "_pipeline_runtime",
         lambda *_args, **_kwargs: {"required": True, "state": "online", "stalled": []},
@@ -783,6 +834,7 @@ def test_cached_dashboard_health_is_red_for_invalid_replica_set(
     assert result["health"]["state"] == "red"
     assert result["health"]["label"] == "невалидная конфигурация реплик"
     assert "review" in result["health"]["reason"]
+    assert result["queues"][0]["task_error"] == series[0]["next_error"]
 
 
 def test_replica_set_is_invalid_when_worker_has_too_few_slots(

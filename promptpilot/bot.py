@@ -290,6 +290,20 @@ def require_auth(func):
     return wrapper
 
 
+async def _check_task_creation_access(update: Update) -> bool:
+    """Recheck current access after awaited work, immediately before enqueue."""
+    user, chat = update.effective_user, update.effective_chat
+    if user is not None and is_authorized(user.id) and chat is not None and chat.type == "private":
+        return True
+    query = update.callback_query
+    message = update.message or (query.message if query else None)
+    if message:
+        await message.reply_text("Нет доступа. Задача не создана.")
+    elif query:
+        await query.answer("Нет доступа.", show_alert=True)
+    return False
+
+
 # Password gate for task creation (PP_TASK_PASSWORD). Entering it correctly in
 # the add-task flow authorizes the user for a while, so the skill/reply shortcuts
 # can require it too instead of silently bypassing the password.
@@ -740,6 +754,8 @@ async def cb_rerun_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _pw_ok(query.from_user.id):
         await query.answer("Сначала введите пароль через ➕ Добавить задачу.", show_alert=True)
         return
+    if not await _check_task_creation_access(update):
+        return ConversationHandler.END
     new = db.create_task(TaskCreate(
         prompt=task.prompt,
         working_dir=task.working_dir,
@@ -966,7 +982,7 @@ def _pipeline_text(data: dict) -> str:
              f"Вход / выход: {rate(entered_rate)} / {rate(exited_rate)}; "
              f"переходов {recent.get('transitions', 0)}; покрытие {coverage}",
              f"Тренд backlog: 7 дней {week_trend}; 30 дней {month_trend}",
-             f"Узкое место: " + (
+             "Узкое место: " + (
                  f"{bottleneck['title']} (ETA {bottleneck.get('eta_hours', '—')} ч)"
                  if bottleneck else "нет"),
              "Безопасные ожидания / ошибки: "
@@ -2261,6 +2277,7 @@ async def _show_confirm(send, context):
     return ASK_CONFIRM
 
 
+@require_auth
 async def cb_wiz_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -2280,7 +2297,7 @@ async def cb_wiz_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_reply_markup(reply_markup=None)
     except BadRequest:
         pass
-    return await _finish_add_task_from_query(query, context)
+    return await _finish_add_task_from_query(update, context)
 
 
 async def cb_wiz_drop_attachments(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2593,8 +2610,11 @@ async def add_task_got_recurrence(update: Update, context: ContextTypes.DEFAULT_
     return await _show_extras(update.message.reply_text, context)
 
 
-async def _finish_add_task_from_query(query, context):
+async def _finish_add_task_from_query(update, context):
     """Called after inline button — uses query.message for reply."""
+    if not await _check_task_creation_access(update):
+        return ConversationHandler.END
+    query = update.callback_query
     from .models import TaskCreate
     _save_last_settings(query.message.chat_id, context)
     prompt = context.user_data.pop("new_prompt", "")
@@ -2722,6 +2742,7 @@ async def cb_reply_task_start(update: Update, context: ContextTypes.DEFAULT_TYPE
     return ASK_REPLY
 
 
+@require_auth
 async def reply_got_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
     entered = update.message.text.strip()
     try:
@@ -2750,13 +2771,24 @@ async def reply_got_password(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return ASK_REPLY
 
 
+@require_auth
 async def reply_got_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prompt = update.message.text
     parent_id = context.user_data.pop("reply_task_id", None)
     session_id = context.user_data.pop("reply_session_id", None)
     provider = context.user_data.pop("reply_provider", None)
     working_dir = context.user_data.pop("reply_dir", None)
-    skip_permissions = context.user_data.pop("reply_skip_permissions", False)
+    context.user_data.pop("reply_skip_permissions", None)  # legacy dialog data
+    parent = db.get_task(parent_id) if parent_id is not None else None
+    if parent is None:
+        await update.message.reply_text(
+            "Исходная задача больше недоступна. Продолжение не создано.",
+            reply_markup=_main_menu(),
+        )
+        return ConversationHandler.END
+
+    if not await _check_task_creation_access(update):
+        return ConversationHandler.END
 
     task = db.create_task(TaskCreate(
         prompt=prompt,
@@ -2765,7 +2797,8 @@ async def reply_got_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         priority=5,
         session_id=session_id,
         parent_task_id=parent_id,
-        skip_permissions=skip_permissions,
+        skip_permissions=parent.skip_permissions,
+        rights=parent.rights,
         tg_chat_id=update.effective_chat.id,
     ))
 
@@ -3215,15 +3248,16 @@ def _herdr_watch_targets():
 async def _herdr_watch_loop(bot):
     import asyncio
     notified = {}  # (machine, pane_id) -> status already notified about
+    initialized = set()  # machines whose existing agents were already observed
     while True:
         await asyncio.sleep(HERDR_WATCH_INTERVAL)
         try:
-            await _herdr_watch_tick(bot, notified)
+            await _herdr_watch_tick(bot, notified, initialized)
         except Exception as e:  # one bad poll must not stop the whole watcher
             logger.warning("herdr watch tick упал: %s", e)
 
 
-async def _herdr_watch_tick(bot, notified):
+async def _herdr_watch_tick(bot, notified, initialized):
         seen = set()
         for machine, host in _herdr_watch_targets():
             data = await _herdr_json("agent", "list", host=host)
@@ -3243,20 +3277,37 @@ async def _herdr_watch_tick(bot, notified):
                 key = (machine, pane)
                 status = a.get("agent_status")
                 if status in ("blocked", "done"):
-                    prev = notified.get(key)  # (status, screen tail, когда видели)
-                    if prev and prev[0] == status and now - prev[2] < HERDR_WATCH_INTERVAL * 3:
+                    prev = notified.get(key)  # (status, screen tail, seen at, completion seq)
+                    completion_seq = (
+                        a.get("completion_seq") or a.get("state_change_seq")
+                    ) if status == "done" else None
+                    if status == "done" and machine not in initialized:
+                        # On bot startup, old kept sessions are already done.
+                        # Remember them without re-announcing every task.
+                        notified[key] = (status, "", now, completion_seq)
+                        continue
+                    if (status == "done" and prev and prev[0] == "done"
+                            and completion_seq is not None
+                            and prev[3] == completion_seq):
+                        notified[key] = (status, prev[1], now, completion_seq)
+                        continue
+                    if (prev and prev[0] == status
+                            and (status != "done" or completion_seq is None)
+                            and now - prev[2] < HERDR_WATCH_INTERVAL * 3):
                         # Висит непрерывно (или статус мигнул working на
                         # один-два опроса — датчик herdr не идеален): уже
                         # сказано, только освежаем время наблюдения. Экран
                         # ради этого не перечитываем.
-                        notified[key] = (prev[0], prev[1], now)
+                        notified[key] = (prev[0], prev[1], now, completion_seq)
                         continue
                     tail = await _herdr_screen_tail(pane, machine) if status == "blocked" else ""
                     dup = (prev and prev[0] == status and prev[1] == tail
+                           and (status != "done" or completion_seq is None
+                                or prev[3] == completion_seq)
                            and now - prev[2] < HERDR_RENOTIFY_COOLDOWN)
                     if not dup:
                         await _herdr_notify(bot, pane, status, a, machine, tail=tail)
-                    notified[key] = (status, tail, now)
+                    notified[key] = (status, tail, now, completion_seq)
                 # Состояние ушло из blocked/done — запись НЕ удаляем: раньше
                 # мигание статуса стирало её, и следующий же blocked давал
                 # дубль уведомления. Тот же диалог в течение cooldown молчит,
@@ -3265,6 +3316,7 @@ async def _herdr_watch_tick(bot, notified):
             # panes on machines we DID reach may be forgotten.
             for key in [k for k in notified if k[0] == machine and k not in seen]:
                 notified.pop(key)
+            initialized.add(machine)
 
 
 def _parse_hd_ref(ref: str):
@@ -3878,6 +3930,7 @@ async def epf_got_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return EPF_ASK_BASE
 
 
+@require_auth
 async def epf_base_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Выбор базы (epfb:<key>), пагинация (epfb:list:N) и запуск пре-фазы."""
     query = update.callback_query
@@ -3967,6 +4020,8 @@ async def epf_base_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for key in ("epf_file", "epf_name", "epf_task", "epf_bases"):
             context.user_data.pop(key, None)
 
+    if not await _check_task_creation_access(update):
+        return ConversationHandler.END
     task = db.create_task(TaskCreate(
         prompt=task_text,
         working_dir=str(project_dir),

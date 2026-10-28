@@ -9,6 +9,21 @@ permissions:
   contents: read
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ruff
+        run: python -m pip install ruff==0.16.9
+      # Pyflakes-class errors only (see [tool.ruff.lint] in pyproject.toml):
+      # undefined names, unused imports/variables — the kind of mistake that
+      # otherwise surfaces as a NameError in production.
+      - name: Lint
+        run: ruff check promptpilot tests tools main.py
+
   pytest:
     strategy:
       matrix:
@@ -21,6 +36,6 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install test dependencies
-        run: python -m pip install -e ".[dev]"
+        run: python -m pip install -e ".[dev]" -c ci/requirements-ci.txt
       - name: Run tests
         run: python -m pytest -q -W error

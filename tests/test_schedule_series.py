@@ -897,6 +897,19 @@ def test_paused_series_is_visible_without_history():
     assert health["label"] == "конвейер на паузе"
 
 
+def test_partial_series_pause_does_not_claim_whole_pipeline_is_paused():
+    health = pipeline_insights._health(
+        10, {"5h": {"complete": False}}, 0, paused_series=2,
+        runtime={"required": True, "paused": False, "state": "online", "stalled": []},
+    )
+
+    assert health == {
+        "state": "yellow",
+        "label": "часть этапов на паузе",
+        "reason": "приостановлено серий: 2; остальные могут работать",
+    }
+
+
 def test_global_worker_pause_is_visible_for_active_pipeline(isolated_db, monkeypatch):
     profile = {
         "title": "Example", "repository": "owner/example",
@@ -1146,6 +1159,17 @@ def test_list_series_uses_constant_lightweight_queries(
                for statement in selects) == 1
     assert prohibited_reads == []
     assert all("SELECT *" not in statement.upper() for statement in selects)
+    # Selecting few columns is not enough: a non-covering scan still visits
+    # every task table page, including rows with large off-page payloads.
+    with real_connect() as conn:
+        history_plan = [row[3] for row in conn.execute(
+            "EXPLAIN QUERY PLAN " + selects[1])]
+        picked_plan = [row[3] for row in conn.execute(
+            "EXPLAIN QUERY PLAN " + selects[2])]
+    assert any("COVERING INDEX" in step and "SCAN t " in step
+               for step in history_plan), history_plan
+    assert any("COVERING INDEX" in step and "tasks" in step
+               for step in picked_plan), picked_plan
 
 
 def test_series_settings_persist_and_update_pending_occurrence(isolated_db):
