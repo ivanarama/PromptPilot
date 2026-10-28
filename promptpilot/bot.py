@@ -3430,17 +3430,37 @@ async def cb_herdr_screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.message.reply_text(f"📺 {pane}{f' ({machine})' if machine else ''}:\n{tail}")
 
 
-@require_auth
+async def _check_herdr_reply_access(update: Update) -> bool:
+    """Use current private-chat authorization, including after awaited callbacks."""
+    user, chat = update.effective_user, update.effective_chat
+    if user is not None and is_authorized(user.id) and chat is not None and chat.type == "private":
+        return True
+    query = update.callback_query
+    message = update.message or (query.message if query else None)
+    if message:
+        await message.reply_text("Нет доступа. Команда не отправлена.")
+    elif query:
+        await query.answer("Нет доступа.", show_alert=True)
+    return False
+
+
 async def cb_herdr_reply_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("herdr_reply_pane", None)
+    context.user_data.pop("herdr_reply_host", None)
+    context.user_data.pop("herdr_reply_machine", None)
+    if not await _check_herdr_reply_access(update):
+        return ConversationHandler.END
     query = update.callback_query
     ref = await _hd_ref_or_alert(query, query.data.split(":", 1)[1])
     if ref is None:
         return ConversationHandler.END
     machine, pane, host = ref
+    await query.answer()
+    if not await _check_herdr_reply_access(update):
+        return ConversationHandler.END
     context.user_data["herdr_reply_pane"] = pane
     context.user_data["herdr_reply_host"] = host
     context.user_data["herdr_reply_machine"] = machine
-    await query.answer()
     where = f" на {machine}" if machine else ""
     await query.message.reply_text(f"Текст для агента в панели {pane}{where} (или /cancel):")
     return ASK_HERDR_REPLY
@@ -3471,6 +3491,8 @@ async def herdr_reply_got_text(update: Update, context: ContextTypes.DEFAULT_TYP
     host = context.user_data.pop("herdr_reply_host", None)
     machine = context.user_data.pop("herdr_reply_machine", "")
     if not pane:
+        return ConversationHandler.END
+    if not await _check_herdr_reply_access(update):
         return ConversationHandler.END
     res = await _herdr_json("agent", "prompt", pane, update.message.text, host=host)
     if res and res.get("result"):
