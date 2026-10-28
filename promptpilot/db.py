@@ -5389,9 +5389,11 @@ def save_memory(workflow_id: str, name: str, content: str,
     обрезка: агент должен знать, что не влезло, и разбить сам.
     scope_stage привязывает заметку к этапу — конвейер удалит её при
     закрытии этапа (уборка — работа пайплайна)."""
-    name = (name or "memory.md").strip().lower()[:64]
-    if not name:
+    name = name or "memory.md"
+    if not name.strip():
         return False, "пустое имя заметки"
+    if len(name) > 64:
+        return False, "имя заметки длиннее 64 символов"
     if len(content.encode("utf-8")) > MEMORY_MAX_BYTES:
         return False, (f"заметка {name} больше {MEMORY_MAX_BYTES} байт — "
                        f"сократи или раздели на несколько заметок")

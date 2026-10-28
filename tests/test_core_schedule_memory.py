@@ -103,6 +103,25 @@ def test_memory_save_list_delete_roundtrip(isolated_db, tmp_path):
     assert db.delete_memory(workflow.id, "memory.md") is True
 
 
+def test_http_memory_names_roundtrip_without_case_change_or_truncation(isolated_db, tmp_path):
+    workflow = _wf(isolated_db, tmp_path)
+    async def request():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=api.app),
+                                    base_url="http://127.0.0.1:8420") as client:
+            path = f"/api/workflows/{workflow.id}/memory"
+            saved = await client.put(path, json={"name": "FOO.md", "content": "kept"})
+            assert saved.status_code == 200
+            assert saved.json()["name"] == "FOO.md"
+            names = [note["name"] for note in (await client.get(path)).json()]
+            assert names == ["FOO.md"]
+            assert (await client.delete(path + "/" + saved.json()["name"])).status_code == 200
+            prefix = "x" * 64
+            assert (await client.put(path, json={"name": prefix, "content": "original"})).status_code == 200
+            assert (await client.put(path, json={"name": prefix + "extra", "content": "replacement"})).status_code == 400
+            assert (await client.get(path)).json()[0]["content"] == "original"
+    asyncio.run(request())
+
+
 def test_events_tail_returns_last_in_order(isolated_db, tmp_path):
     workflow = _wf(isolated_db, tmp_path)
     for i in range(5):
