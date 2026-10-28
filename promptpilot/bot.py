@@ -752,6 +752,7 @@ async def cb_rerun_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keep_pane=task.keep_pane,
         machine=task.machine,
         worktree=task.worktree,
+        rights=task.rights,
     ))
     await query.answer(f"Задача #{new.id} добавлена.")
     await query.message.reply_text(
