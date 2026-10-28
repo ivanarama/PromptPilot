@@ -107,6 +107,9 @@ def test_planner_approval_and_two_stage_autonomous_lifecycle(isolated_db):
     )
     assert approved.status.value == "queued"
     assert approved.current_stage_id == stages[0].id
+    assert isolated_db.save_memory(workflow.id, "global.md", "keep")[0]
+    assert isolated_db.save_memory(workflow.id, "stage.md", "temporary", scope_stage=stages[0].id)[0]
+    assert isolated_db.save_memory(workflow.id, "final.md", "final", scope_stage=stages[1].code)[0]
     workflows.advance_workflow(workflow.id)
 
     executor = isolated_db.list_tasks(status=TaskStatus.PENDING)[0]
@@ -121,9 +124,12 @@ def test_planner_approval_and_two_stage_autonomous_lifecycle(isolated_db):
     current_stage = isolated_db.get_workflow_stage(second.current_stage_id)
     assert current_stage.code == "FINAL"
     assert isolated_db.list_workflow_stages(workflow.id)[0].status.value == "completed"
+    assert {row["name"] for row in isolated_db.list_memory(workflow.id)} == {"global.md", "final.md"}
+    assert not isolated_db.save_memory(workflow.id, "late.md", "no", scope_stage=stages[0].id)[0]
 
     finish_task(isolated_db, "executor FINAL")
     finish_task(isolated_db, reviewer_pass())
+    assert [row["name"] for row in isolated_db.list_memory(workflow.id)] == ["global.md"]
     completed = isolated_db.get_workflow(workflow.id)
     assert completed.status.value == "completed"
     assert all(
