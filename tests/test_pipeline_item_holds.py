@@ -201,3 +201,113 @@ def test_unproven_legacy_or_partial_membership_cannot_exclude_items(
         # search cannot prove that every active member is held.
         data["queues"][0]["backlog"] = 2
     assert holds.prepare(successor, queue, data) == []
+
+
+@pytest.mark.parametrize("stage,field,number", [
+    ("fix", "review_candidates", 1180),
+    ("merge", "human_waiting", 2108),
+])
+def test_handoff_outside_stage_search_parks_only_target(isolated_db, stage, field, number):
+    task = isolated_db.create_task(TaskCreate(prompt=stage, recurrence="15m"))
+    queue = {"id": stage, "item_blockers": True}
+    data = {"cache": {"complete": True, "stale": False},
+            "queues": [{"id": stage, "membership_complete": True,
+                        "backlog": 0, "admission_items": []}],
+            "diagnostics": {field: [{"number": number, "stage": "review", "head": "a" * 40}]}}
+    assert holds.prepare(task, queue, data) == []
+    isolated_db.mark_completed(task.id, f"ИТОГ: НУЖЕН ЧЕЛОВЕК (#{number} — routing blocker)",
+                               verdict="НУЖЕН ЧЕЛОВЕК")
+    assert not isolated_db.pause_pipeline_series_on_repeated_blocker(
+        task.series_id, task.id)["suppress_recurrence"]
+    successor = SimpleNamespace(id=task.id + 1, series_id=task.series_id)
+    assert holds.prepare(successor, queue, data) == [number]
+    assert not isolated_db.list_series()[0]["paused"]
+    data["diagnostics"][field][0]["head"] = "b" * 40
+    assert holds.prepare(successor, queue, data) == []
+
+
+@pytest.mark.parametrize("stage", ["fix", "merge"])
+def test_conflicting_diagnostic_versions_cannot_scope_hold(stage):
+    data = {"cache": {"complete": True}, "queues": [], "diagnostics": {
+        "review_candidates": [{"number": 7, "head": "a" * 40}],
+        "human_waiting": [{"number": 7, "head": "b" * 40}]}}
+    assert "7" not in holds.fingerprints(data, {"id": stage})
+    data["diagnostics"]["human_waiting"][0]["head"] = "a" * 40
+    assert "7" in holds.fingerprints(data, {"id": stage})
+    data["diagnostics"]["checker_failed"] = True
+    assert "7" not in holds.fingerprints(data, {"id": stage})
+
+
+@pytest.mark.parametrize("stage,verdict", [
+    ("merge", "НУЖЕН ЧЕЛОВЕК"), ("review", "НЕ СМОГ"),
+])
+def test_exact_tool_target_is_parked_without_fresh_search(isolated_db, stage, verdict):
+    task = isolated_db.create_task(TaskCreate(prompt=stage, recurrence="15m"))
+    queue = {"id": stage, "item_blockers": True}
+    holds.prepare(task, queue, {"cache": {"complete": False, "stale": True}})
+    holds.register_target(task, 7, "a" * 40, stage)
+    isolated_db.mark_completed(task.id, f"ИТОГ: {verdict} (#7 — route needs recovery)", verdict=verdict)
+    assert not isolated_db.pause_pipeline_series_on_repeated_blocker(
+        task.series_id, task.id)["suppress_recurrence"]
+    successor = SimpleNamespace(id=task.id + 1, series_id=task.series_id)
+    field = "merge_executable" if stage == "merge" else "review_candidates"
+    data = {"cache": {"complete": True}, "queues": [],
+            "diagnostics": {field: [{"number": 7, "head": "a" * 40, "stage": stage}]}}
+    assert holds.prepare(successor, queue, data) == [7]
+    data["diagnostics"][field][0]["head"] = "b" * 40
+    assert holds.prepare(successor, queue, data) == []
+
+
+@pytest.mark.parametrize("reason", ["GitHub authentication failed", "#8 — unrelated target"])
+def test_global_or_wrong_target_failure_keeps_repeat_guard(isolated_db, reason):
+    first = isolated_db.create_task(TaskCreate(prompt="review", recurrence="15m"))
+    holds.register_target(first, 7, "a" * 40, "review")
+    result = f"ИТОГ: НЕ СМОГ ({reason})"
+    isolated_db.mark_completed(first.id, result, verdict="НЕ СМОГ")
+    assert not isolated_db.pause_pipeline_series_on_repeated_blocker(
+        first.series_id, first.id)["suppress_recurrence"]
+    second = isolated_db.create_task(TaskCreate(
+        prompt="review", recurrence="15m", series_id=first.series_id))
+    holds.register_target(second, 7, "a" * 40, "review")
+    isolated_db.mark_completed(second.id, result, verdict="НЕ СМОГ")
+    assert isolated_db.pause_pipeline_series_on_repeated_blocker(
+        second.series_id, second.id)["suppress_recurrence"]
+
+
+@pytest.mark.parametrize("stage", ["review", "merge"])
+@pytest.mark.parametrize("verdict", ["НЕ СМОГ", "НУЖЕН ЧЕЛОВЕК"])
+def test_re_elected_live_exact_hold_falls_back_to_series_guard(isolated_db, stage, verdict):
+    first = isolated_db.create_task(TaskCreate(prompt=stage, recurrence="15m"))
+    holds.register_target(first, 7, "a" * 40, stage)
+    result = f"ИТОГ: {verdict} (#7 — route needs recovery)"
+    isolated_db.mark_completed(first.id, result, verdict=verdict)
+    assert not isolated_db.pause_pipeline_series_on_repeated_blocker(
+        first.series_id, first.id)["suppress_recurrence"]
+    saved = isolated_db.get_setting(holds.PREFIX + str(first.series_id))
+    assert not isolated_db.pause_pipeline_series_on_repeated_blocker(
+        first.series_id, first.id)["suppress_recurrence"]
+    assert isolated_db.get_setting(holds.PREFIX + str(first.series_id)) == saved
+    second = isolated_db.create_task(TaskCreate(
+        prompt=stage, recurrence="15m", series_id=first.series_id))
+    holds.register_target(second, 7, "a" * 40, stage)
+    isolated_db.mark_completed(second.id, result, verdict=verdict)
+    assert isolated_db.pause_pipeline_series_on_repeated_blocker(
+        second.series_id, second.id)["suppress_recurrence"]
+    assert isolated_db.get_setting(holds.PREFIX + str(first.series_id)) == saved
+
+
+@pytest.mark.parametrize("changed", ["head", "stage"])
+def test_new_exact_identity_can_be_held_after_an_earlier_failure(isolated_db, changed):
+    first = isolated_db.create_task(TaskCreate(prompt="merge", recurrence="15m"))
+    holds.register_target(first, 7, "a" * 40, "merge")
+    result = "ИТОГ: НЕ СМОГ (#7 — route needs recovery)"
+    isolated_db.mark_completed(first.id, result, verdict="НЕ СМОГ")
+    assert not isolated_db.pause_pipeline_series_on_repeated_blocker(
+        first.series_id, first.id)["suppress_recurrence"]
+    second = isolated_db.create_task(TaskCreate(
+        prompt="merge", recurrence="15m", series_id=first.series_id))
+    holds.register_target(second, 7, "b" * 40 if changed == "head" else "a" * 40,
+                          "review" if changed == "stage" else "merge")
+    isolated_db.mark_completed(second.id, result, verdict="НЕ СМОГ")
+    assert not isolated_db.pause_pipeline_series_on_repeated_blocker(
+        second.series_id, second.id)["suppress_recurrence"]
