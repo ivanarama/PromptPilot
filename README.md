@@ -1278,6 +1278,11 @@ checker'ом `parallel_review_candidates`. Уже взятый содержат�
 
 #### Детерминированный `pipelinectl` и fallback на скилл
 
+Отдельная команда `pp pipelinectl --config pipelinectl.json inventory`
+показывает идентичность PR из GitHub в режиме чтения. Байтовый контракт,
+эталонные фикстуры и границы первого среза описаны в
+[PR_IDENTITY_V1.md](docs/PR_IDENTITY_V1.md). Протокол разрешений v2 пока выключен.
+
 Для REVIEW/MERGE повторяемые GitHub-проверки можно вынести из промпта в
 проектный CLI. PromptPilot не привязан ни к Claude, ни к Codex: он сам выполняет
 безопасный preflight до запуска провайдера и только затем решает, нужна ли
