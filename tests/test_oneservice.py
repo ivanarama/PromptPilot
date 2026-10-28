@@ -8,6 +8,7 @@ issue text, branches growing out of each other.
 
 import importlib.util
 import pathlib
+import subprocess
 import sys
 from email.message import EmailMessage
 from types import SimpleNamespace
@@ -91,6 +92,7 @@ class FakeGit:
     def __init__(self, current="task/5"):
         self.calls, self.current = [], current
         self.branches = {"main", "task/5"}
+        self.heads = {}
 
     def __call__(self, repo, *args):
         self.calls.append(args)
@@ -98,6 +100,13 @@ class FakeGit:
             return 0, "origin/main\n"
         if args[0] == "rev-parse":
             ref = args[-1]
+            if ref.endswith("^{tree}"):
+                return 0, "d" * 40
+            if ref.endswith("^{commit}"):
+                ref = ref.removesuffix("^{commit}")
+                if ref == "HEAD":
+                    ref = self.current
+                return 0, self.heads.get(ref, ("a" if ref == "main" else "b") * 40)
             known = ref.replace("refs/heads/", "") in self.branches or ref == "origin/main"
             return (0, "") if known else (1, "")
         if args[0] == "checkout":
@@ -106,6 +115,10 @@ class FakeGit:
                 self.current = args[2]
             else:
                 self.current = args[1]
+        if args[0] == "write-tree":
+            return 0, "d" * 40
+        if args[0] == "commit":
+            self.heads[self.current] = "c" * 40
         return 0, ""
 
 
@@ -338,16 +351,96 @@ def test_merge_needs_a_passed_review_and_pushes_the_base(os_env, monkeypatch):
     with pytest.raises(RuntimeError, match="не прошёл ревью"):
         os_env.exec.do_merge(os_env.env, state, iid)
 
-    state["work"][str(iid)]["stage"] = "готово-к-мержу"
+    w = state["work"][str(iid)]
+    os_env.pp.finish(w["pp_task"], "ИТОГ: ГОТОВО")
+    os_env.exec.watch(os_env.env, state, {})
+    os_env.pp.finish(w["review_task"], "РЕШЕНИЕ: PASS\nИТОГ: ГОТОВО")
+    os_env.exec.watch(os_env.env, state, {})
     notified = []
     monkeypatch.setattr(os_env.exec, "notify_author",
                         lambda env, number, text: notified.append(number))
     monkeypatch.setattr(os_env.exec, "run_shell", lambda cmd, cwd: (0, ""))
     os_env.exec.do_merge(os_env.env, state, iid)
 
-    assert ("push", "origin", "main") in os_env.git.calls
+    assert ("push", "origin", "c" * 40 + ":refs/heads/main") in os_env.git.calls
     assert os_env.gitlab.issues[iid]["state"] == "closed"
     assert notified == [iid]
+
+
+@pytest.mark.parametrize("status,exit_code", [("failed", None), ("cancelled", None), ("completed", 1)])
+def test_failed_review_with_partial_pass_never_opens_merge(os_env, status, exit_code):
+    iid, state = claimed(os_env)
+    w = state["work"][str(iid)]
+    os_env.pp.finish(w["pp_task"], "ИТОГ: ГОТОВО")
+    os_env.exec.watch(os_env.env, state, {})
+    os_env.pp.finish(w["review_task"], "РЕШЕНИЕ: PASS\nИТОГ: ГОТОВО", status=status)
+    os_env.pp.tasks[w["review_task"]]["exit_code"] = exit_code
+    os_env.exec.watch(os_env.env, state, {})
+    assert w["stage"] == os_env.intake.LABEL_HUMAN
+    assert "готово-к-мержу" not in os_env.gitlab.issues[iid]["labels"]
+    with pytest.raises(RuntimeError, match="не прошёл ревью"):
+        os_env.exec.do_merge(os_env.env, state, iid)
+
+
+def test_review_sha_change_never_opens_merge(os_env):
+    iid, state = claimed(os_env)
+    w = state["work"][str(iid)]
+    os_env.pp.finish(w["pp_task"], "ИТОГ: ГОТОВО")
+    os_env.exec.watch(os_env.env, state, {})
+    os_env.git.heads[w["branch"]] = "e" * 40
+    os_env.pp.finish(w["review_task"], "РЕШЕНИЕ: PASS\nИТОГ: ГОТОВО")
+    os_env.exec.watch(os_env.env, state, {})
+    assert w["stage"] == os_env.intake.LABEL_HUMAN
+
+
+@pytest.mark.parametrize("gate_failure", [False, True])
+def test_merge_gates_real_candidate_tree_instead_of_previous_checkout(os_env, monkeypatch, tmp_path, gate_failure):
+    root = tmp_path / "repository"
+    root.mkdir()
+    def git(*args):
+        return subprocess.check_output(["git", *args], cwd=root, text=True, encoding="utf8").strip()
+    git("init", "-q", "-b", "main")
+    git("config", "user.name", "Test")
+    git("config", "user.email", "test@example.invalid")
+    (root / "code.txt").write_text("old", encoding="utf8")
+    git("add", ".")
+    git("commit", "-qm", "base")
+    base = git("rev-parse", "HEAD")
+    git("checkout", "-qb", "task/1")
+    (root / "code.txt").write_text("candidate", encoding="utf8")
+    git("commit", "-qam", "candidate")
+    candidate = git("rev-parse", "HEAD")
+    git("checkout", "-qb", "unrelated", "main")
+    state = {"work": {"1": {"stage": "готово-к-мержу", "branch": "task/1", "base": "main", "review_head": candidate, "review_base_head": base}}}
+    issue = os_env.gitlab.add()
+    assert issue["iid"] == 1
+    actual_git = load("os_exec").git
+    pushes = []
+    def transport(repo, *args):
+        if args[0] == "push":
+            pushes.append(args)
+            return 0, "no network"
+        return actual_git(repo, *args)
+    monkeypatch.setattr(os_env.exec, "git", transport)
+    monkeypatch.setattr(os_env.exec, "repo", lambda: root)
+    monkeypatch.setattr(os_env.exec, "changelog_entry", lambda *args: None)
+    monkeypatch.setattr(os_env.exec, "notify_author", lambda *args: None)
+    checked = []
+    def gate(env, repo):
+        checked.append((repo / "code.txt").read_text(encoding="utf8"))
+        if gate_failure:
+            raise RuntimeError("gate failed")
+    monkeypatch.setattr(os_env.exec, "gate", gate)
+    if gate_failure:
+        with pytest.raises(RuntimeError, match="gate failed"):
+            os_env.exec.do_merge(os_env.env, state, 1)
+        assert pushes == [] and git("rev-parse", "main") == base
+        assert os_env.gitlab.issues[1]["state"] == "opened"
+    else:
+        os_env.exec.do_merge(os_env.env, state, 1)
+        assert git("show", "HEAD:code.txt") == "candidate"
+        assert pushes == [("push", "origin", git("rev-parse", "HEAD") + ":refs/heads/main")]
+    assert checked == ["candidate"]
 
 
 def test_author_notification_uses_the_remembered_chat(os_env, monkeypatch):

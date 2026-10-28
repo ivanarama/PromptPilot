@@ -74,6 +74,20 @@ def git(repo: Path, *args: str) -> tuple[int, str]:
     return result.returncode, (result.stdout or "") + (result.stderr or "")
 
 
+def checked_git(repo_dir: Path, *args: str) -> str:
+    code, out = git(repo_dir, *args)
+    if code:
+        raise RuntimeError(f"git {args[0]}: {out[-800:]}")
+    return out.strip()
+
+
+def commit_oid(repo_dir: Path, ref: str) -> str:
+    sha = checked_git(repo_dir, "rev-parse", "--verify", f"{ref}^{{commit}}")
+    if not re.fullmatch(r"[0-9a-f]{40,64}", sha):
+        raise RuntimeError("git не вернул точный SHA коммита")
+    return sha
+
+
 def base_branch(env: dict, repo_dir: Path) -> str:
     """The branch tasks start from and merge into.
 
@@ -277,10 +291,17 @@ def watch(env: dict, state: dict, config: dict) -> None:
 def start_review(env: dict, state: dict, iid: int, w: dict) -> None:
     reviewer = env.get("OS_REVIEW_PROVIDER", "claude-z")
     base = w.get("base") or "main"
+    repo_dir = repo()
+    if checked_git(repo_dir, "status", "--porcelain", "--untracked-files=all"):
+        raise RuntimeError("перед ревью нужно закоммитить изменения")
+    checked_git(repo_dir, "checkout", w["branch"])
+    candidate = commit_oid(repo_dir, w["branch"])
+    base_sha = commit_oid(repo_dir, base)
     prompt = (
         f"Ты — ревьюер репозитория oneservice-cc_v2. Проверь изменения в ветке "
         f"{w['branch']} относительно {base}.\n\n"
-        f"Сначала выполни: git -C . diff {base}...HEAD\n"
+        f"Точный HEAD ревью: {candidate}; база: {base_sha}.\n"
+        f"Сначала выполни: git -C . diff {base_sha}...{candidate}\n"
         "Затем сверь изменения с ТЗ ниже и с духом проекта (ламповая "
         "практичность, без лишнего).\n\n"
         f"ТЗ (issue #{iid}):\n{issue_spec_of(env, iid)}\n\n"
@@ -294,15 +315,26 @@ def start_review(env: dict, state: dict, iid: int, w: dict) -> None:
     task = pp_request(env, "/api/tasks", "POST", payload)
     w["stage"] = "ревью"
     w["review_task"] = task["id"]
+    w["review_head"] = candidate
+    w["review_base_head"] = base_sha
     project_api(env, f"/issues/{iid}", "PUT", {"labels": "в работе,ревью"})
     save_state(state)
     print(f"🔍 issue #{iid}: ревью ({reviewer}), задача #{task['id']}")
 
 
 def review_verdict(task: dict, env: dict, state: dict, iid: int, w: dict) -> None:
+    if task.get("status") != "completed" or task.get("exit_code") not in (None, 0):
+        finish_human(env, iid, w, f"ревьюер не завершился успешно (статус {task.get('status')})")
+        save_state(state)
+        return
     result = (task.get("result") or "").split(META_CUT)[0]
-    decisions = re.findall(r"^РЕШЕНИЕ:\s*(PASS|FAIL)\b", result, re.M | re.I)
-    passed = bool(decisions) and decisions[-1].upper() == "PASS"
+    decisions = re.findall(r"^РЕШЕНИЕ:[ \t]*([^\r\n]*)", result, re.M | re.I)
+    passed = (bool(decisions) and decisions[-1].strip().upper() == "PASS"
+              and parse_verdict(result).startswith("ГОТОВО"))
+    if passed and (not w.get("review_head") or commit_oid(repo(), w["branch"]) != w["review_head"]):
+        finish_human(env, iid, w, "HEAD изменился после запуска ревью")
+        save_state(state)
+        return
     remarks_match = re.search(r"^ЗАМЕЧАНИЯ:\s*([\s\S]*?)(?:\nИТОГ:|$)", result, re.M | re.I)
     remarks = remarks_match.group(1).strip() if remarks_match else ""
     note = (f"🔍 **Ревью** ({env.get('OS_REVIEW_PROVIDER', 'claude-z')}, задача #{w['review_task']})\n\n"
@@ -406,15 +438,30 @@ def do_merge(env: dict, state: dict, iid: int, force: bool = False) -> None:
     branch = w.get("branch") or f"task/{iid}"
     repo_dir = repo()
     base = w.get("base") or base_branch(env, repo_dir)
-    gate(env, repo_dir)
+    if checked_git(repo_dir, "status", "--porcelain", "--untracked-files=all"):
+        raise RuntimeError("merge: рабочая папка или индекс не чисты")
+    candidate = commit_oid(repo_dir, branch)
+    base_sha = commit_oid(repo_dir, base)
+    if not force and (candidate != w.get("review_head") or base_sha != w.get("review_base_head")):
+        raise RuntimeError("merge: HEAD или база изменились после ревью; нужно новое ревью")
     code, out = git(repo_dir, "checkout", base)
     if code != 0:
         raise RuntimeError(f"checkout {base}: {out}")
-    code, out = git(repo_dir, "merge", "--no-ff", branch, "-m",
-                    f"Merge task #{iid}: {w.get('title', '')}")
+    code, out = git(repo_dir, "merge", "--no-ff", "--no-commit", candidate)
     if code != 0:
         raise RuntimeError(f"merge конфликт: {out[-800:]}")
-    code, out = git(repo_dir, "push", "origin", base)
+    tree = checked_git(repo_dir, "write-tree")
+    gate(env, repo_dir)
+    if (checked_git(repo_dir, "write-tree") != tree
+            or checked_git(repo_dir, "diff", "--name-only")
+            or checked_git(repo_dir, "ls-files", "--others", "--exclude-standard")
+            or commit_oid(repo_dir, "HEAD") != base_sha):
+        raise RuntimeError("merge: дерево изменилось во время gate")
+    checked_git(repo_dir, "commit", "-m", f"Merge task #{iid}: {w.get('title', '')}")
+    merged = commit_oid(repo_dir, "HEAD")
+    if checked_git(repo_dir, "rev-parse", "HEAD^{tree}") != tree:
+        raise RuntimeError("merge: коммит не соответствует проверенному дереву")
+    code, out = git(repo_dir, "push", "origin", f"{merged}:refs/heads/{base}")
     if code != 0:
         raise RuntimeError(f"push: {out[-800:]}")
     git(repo_dir, "branch", "-d", branch)
@@ -448,7 +495,7 @@ def changelog_entry(env: dict, repo_dir: Path, iid: int, w: dict, base: str) -> 
     with doc.open("a", encoding="utf-8") as fh:
         fh.write(entry)
     for args in (("add", "docs/CHANGELOG-TEAM.md"),
-                 ("commit", "-m", f"docs: changelog task #{iid}"),
+                 ("commit", "--only", "-m", f"docs: changelog task #{iid}", "--", "docs/CHANGELOG-TEAM.md"),
                  # the base branch the merge went into — it used to push
                  # «main» even when the base was another branch
                  ("push", "origin", base)):
