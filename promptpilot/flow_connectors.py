@@ -17,12 +17,14 @@ The rules of engagement live here once instead of in every intake script:
 
 import email
 import imaplib
+import hashlib
 import json
 import os
 import re
 import smtplib
 import subprocess
 import tempfile
+import ssl
 import time
 from email import policy
 from email.header import decode_header
@@ -101,16 +103,20 @@ def dkim_passed(msg, authserv: str, domain: str) -> bool:
     Only the header whose authserv-id is the configured server counts: a
     sender can write an Authentication-Results header of its own.
     """
-    signer = re.compile(r"header\.(?:d=|i=@?)(?:[\w-]+\.)*" + re.escape(domain) + r"\b")
+    domain = domain.strip().lower().rstrip(".")
+    if not domain:
+        return False
+    signer = re.compile(r"header\.(?:d=|i=@?)(?:[\w-]+\.)*"
+                        + re.escape(domain) + r"(?![\w.-])")
     for header in msg.get_all("Authentication-Results") or []:
         value = " ".join(str(header).split()).lower()
         server, _, results = value.partition(";")
-        if server.strip() != authserv.lower():
+        if server.strip() != authserv.strip().lower():
             continue
-        for clause in results.split(";"):
-            clause = clause.strip()
-            if clause.startswith("dkim=pass") and signer.search(clause):
-                return True
+        # The receiving server prepends its result. Never override its failure
+        # with an older header supplied in the original message.
+        return any(clause.strip().startswith("dkim=pass") and signer.search(clause.strip())
+                   for clause in results.split(";"))
     return False
 
 
@@ -212,15 +218,19 @@ def letter_request(msg, source) -> dict:
     }
 
 
+def _uid_payload(client, uid: bytes, parts: str) -> bytes | None:
+    typ, data = client.uid("fetch", uid, parts)
+    if typ != "OK":
+        raise RuntimeError("IMAP UID FETCH failed")
+    for value in data or []:
+        if isinstance(value, tuple) and len(value) > 1 and isinstance(value[1], bytes):
+            return value[1]
+    return None  # Expunged between UID SEARCH and FETCH; do not mark it seen.
+
+
 def poll_mailbox(source, seen: set, credentials: tuple[str, str], *,
                  connect=None, keep_attachments: bool = False) -> tuple[list[dict], list[str]]:
-    """New requests from the mailbox and the Message-IDs judged this time.
-
-    Nothing is marked read (BODY.PEEK). A letter seen before costs one small
-    fetch of its Message-ID; a new one is judged by its headers, and only a
-    letter that passes letter_rejection is fetched whole. Judged ids are
-    returned so the caller never judges a rejected letter again either.
-    """
+    """Use stable UIDs; sequence numbers are never durable message identity."""
     user, password = credentials
     client = (connect or _connect_imap)(source, user, password)
     requests, judged = [], []
@@ -229,20 +239,42 @@ def poll_mailbox(source, seen: set, credentials: tuple[str, str], *,
             typ, _ = client.select(folder, readonly=True)
             if typ != "OK":
                 continue
-            typ, data = client.search(None, "ALL")
-            for num in (data[0] or b"").split():
-                typ, md = client.fetch(num, "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])")
-                probe = email.message_from_bytes(md[0][1], policy=policy.default)
-                message_id = (probe.get("Message-ID") or "").strip() or f"<{folder}-{num.decode()}>"
+            _, values = client.response("UIDVALIDITY")
+            validity = next((value.decode("ascii") for value in values or []
+                             if isinstance(value, bytes) and value.isdigit() and len(value) <= 10
+                             and 0 < int(value) < 2**32), None)
+            typ, data = client.uid("search", None, "ALL")
+            if typ != "OK":
+                raise RuntimeError("IMAP UID SEARCH failed")
+            for uid in (data[0] or b"").split():
+                if not uid.isdigit() or len(uid) > 10 or not 0 < int(uid) < 2**32:
+                    raise RuntimeError("Malformed IMAP UID")
+                raw = _uid_payload(client, uid, "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])")
+                if raw is None:
+                    continue
+                probe = email.message_from_bytes(raw, policy=policy.default)
+                message_id = (probe.get("Message-ID") or "").strip()
+                if not message_id:
+                    if validity is None:
+                        raise RuntimeError("IMAP server did not prove UIDVALIDITY for a message without Message-ID")
+                    identity = json.dumps([source.host.lower(), source.port, user, folder,
+                                           validity, uid.decode("ascii")],
+                                          ensure_ascii=False, separators=(",", ":"))
+                    message_id = "<imap-uid:" + hashlib.sha256(identity.encode("utf-8")).hexdigest() + ">"
                 if message_id in seen:
                     continue
-                judged.append(message_id)
-                typ, md = client.fetch(num, "(BODY.PEEK[HEADER])")
-                header = email.message_from_bytes(md[0][1], policy=policy.default)
-                if letter_rejection(header, source):
+                raw = _uid_payload(client, uid, "(BODY.PEEK[HEADER])")
+                if raw is None:
                     continue
-                typ, md = client.fetch(num, "(BODY.PEEK[])")
-                full = email.message_from_bytes(md[0][1], policy=policy.default)
+                header = email.message_from_bytes(raw, policy=policy.default)
+                if letter_rejection(header, source):
+                    judged.append(message_id)
+                    continue
+                raw = _uid_payload(client, uid, "(BODY.PEEK[])")
+                if raw is None:
+                    continue
+                full = email.message_from_bytes(raw, policy=policy.default)
+                judged.append(message_id)
                 if letter_rejection(full, source):
                     continue
                 request = letter_request(full, source)
@@ -262,7 +294,8 @@ def poll_mailbox(source, seen: set, credentials: tuple[str, str], *,
 
 def _connect_imap(source, user: str, password: str):
     imaplib.Commands["ID"] = ("AUTH", "SELECTED", "NONAUTH")
-    client = imaplib.IMAP4_SSL(source.host, source.port)
+    client = imaplib.IMAP4_SSL(source.host, source.port,
+                                ssl_context=ssl.create_default_context(), timeout=30)
     client.login(user, password)
     try:
         # Mail.ru drops clients that do not identify themselves (RFC 2971).
@@ -470,7 +503,7 @@ def send_reply(source, request: dict, *, text: str, subject: str, smtp_host: str
     last_error = None
     for attempt in range(2):  # mail.ru turns automation away in waves
         try:
-            with factory(smtp_host, smtp_port, timeout=30) as smtp:
+            with factory(smtp_host, smtp_port, timeout=30, context=ssl.create_default_context()) as smtp:
                 smtp.login(user, password)
                 smtp.send_message(message)
             return recipient

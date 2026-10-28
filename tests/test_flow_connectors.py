@@ -9,6 +9,7 @@ text from outside reaches a program as data on stdin, never as argv.
 import base64
 import json
 import subprocess
+import ssl
 import sys
 from email.message import EmailMessage
 from pathlib import Path
@@ -43,6 +44,10 @@ def finish_task(env, item_id, fields):
     assert running.id == item["wait"]["task_id"]
     env.db.mark_completed(running.id, flows.RESULT_BEGIN + "\n"
                           + json.dumps(fields, ensure_ascii=False) + "\n" + flows.RESULT_END)
+
+
+def decide_current(item_id, *args, **kwargs):
+    return flows.decide(item_id, *args, expected_version=flows.get_item(item_id)["version"], **kwargs)
 
 
 def advance(flow, item_id):
@@ -208,6 +213,16 @@ class FakeIMAP:
     def select(self, folder, readonly=False):
         return "OK", [b"1"]
 
+    def response(self, name):
+        assert name == "UIDVALIDITY"
+        return "UIDVALIDITY", [b"1"]
+
+    def uid(self, command, *args):
+        if command == "search":
+            return self.search(*args)
+        assert command == "fetch"
+        return self.fetch(*args)
+
     def search(self, charset, *criteria):
         return "OK", [" ".join(str(i + 1) for i in range(len(self.raw))).encode()]
 
@@ -239,8 +254,10 @@ def letter(sender, body="Не работает выгрузка", subject="[OS] 
 class FakeSMTP:
     sent: list = []
 
-    def __init__(self, host, port, timeout=30):
+    def __init__(self, host, port, timeout=30, context=None):
         self.host, self.port = host, port
+        assert context is not None and context.verify_mode == ssl.CERT_REQUIRED
+        assert context.check_hostname is True
 
     def __enter__(self):
         return self
@@ -307,7 +324,7 @@ def test_reply_goes_to_the_author_after_a_person_approves(env, smtp):
     advance(flow, item["id"])
     assert smtp.sent == []  # nothing leaves before the decision
 
-    flows.decide(item["id"], "approve", note="", flows={flow.name: flow})
+    decide_current(item["id"], "approve", note="", flows={flow.name: flow})
     done = advance(flow, item["id"])
 
     assert done["status"] == "done"
@@ -323,7 +340,7 @@ def test_the_persons_own_text_replaces_the_draft(env, smtp):
     item = flows.poll_input(flow, connect=lambda *a: FakeIMAP([letter("a@known.ru")]))[0]
     advance(flow, item["id"])
 
-    flows.decide(item["id"], "approve", note="Исправлено, проверьте, пожалуйста.",
+    decide_current(item["id"], "approve", note="Исправлено, проверьте, пожалуйста.",
                  flows={flow.name: flow})
     advance(flow, item["id"])
 
@@ -334,7 +351,7 @@ def test_nobody_to_answer_is_a_stop_not_a_letter_to_the_form(env, smtp):
     flow = load(mail_flow(env.root, require_from_domain="form.test", allow_from=[]))
     item = flows.poll_input(flow, connect=lambda *a: FakeIMAP([letter("robot@form.test")]))[0]
     advance(flow, item["id"])
-    flows.decide(item["id"], "approve", flows={flow.name: flow})
+    decide_current(item["id"], "approve", flows={flow.name: flow})
 
     stuck = advance(flow, item["id"])
 
@@ -427,7 +444,7 @@ def test_exclusive_section_lets_one_item_in_at_a_time(env):
     waiting = advance(flow, second["id"])
     assert waiting["status"] == "active" and "work" not in waiting["data"]["steps"]
 
-    flows.decide(first["id"], "approve", flows={flow.name: flow})
+    decide_current(first["id"], "approve", flows={flow.name: flow})
     assert advance(flow, first["id"])["status"] == "done"
     assert advance(flow, second["id"])["status"] == "waiting_human"
 
@@ -483,3 +500,36 @@ def test_examples_are_valid(env, name):
     for step in flow.steps:
         if getattr(step, "prompt_file", ""):
             assert (EXAMPLES / step.prompt_file).is_file()
+
+
+def test_command_stdin_survives_communicate_polling(env):
+    body = "mail body " * 20000
+    flow = load({"name": "stdin-poll", "trust": "owner", "steps": [
+        {"id": "process", "kind": "command", "run": [PY, "-c",
+         "import sys,time; text=sys.stdin.read(); time.sleep(.5); print(len(text))"],
+         "stdin": "{{input.body}}", "timeout": 10},
+        {"id": "done", "kind": "finish"},
+    ]})
+    item = flows.create_item(flow, {"body": body})
+    done = advance(flow, item["id"])
+    assert done["status"] == "done"
+    assert done["data"]["steps"]["process"]["output"].strip() == str(len(body))
+
+
+def test_gitlab_admission_is_atomic_per_author(env, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+    source = team_flow(env.root)
+    source["limits"] = {"per_author": 1}
+    flow = load(source)
+    barrier = threading.Barrier(2)
+    requests = [{"iid": 1, "title": "one", "author": "same"},
+                {"iid": 2, "title": "two", "author": "same"}]
+    def fetch(*args):
+        barrier.wait(timeout=10)
+        return requests
+    monkeypatch.setattr(flow_connectors, "gitlab_issues", fetch)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: flows.poll_input(flow), range(2)))
+    assert sum(len(items) for items in results) == 1
+    assert len(flows.list_items(flow=flow.name)) == 1

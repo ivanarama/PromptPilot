@@ -20,7 +20,7 @@ def autonomous_config(*, max_rounds=3, commands=None):
             "executor": {"provider": None},
             "reviewer": {"provider": None},
         },
-        "gate": {"commands": commands or []},
+        "gate": {"enabled": bool(commands), "commands": commands or []},
         "limits": {"max_rounds": max_rounds},
     }
 

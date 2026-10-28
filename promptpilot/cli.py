@@ -708,7 +708,9 @@ def workflow_review(reference, verdict, summary, findings_file):
 @click.argument("reference")
 @click.argument("text")
 @click.option("--resume", is_flag=True)
-def workflow_input(reference, text, resume):
+@click.option("--note", default="",
+              help="Указание агенту: уйдёт в следующий запуск исполнителя и аудитора")
+def workflow_input(reference, text, resume, note):
     """Append a human decision and optionally resume the workflow."""
     from . import workflows
     from .models import WorkflowHumanInput
@@ -721,6 +723,7 @@ def workflow_input(reference, text, resume):
             expected_version=item.state_version,
             text=text,
             resume=resume,
+            note=note,
         ),
     )
     click.echo(f"Workflow {updated.slug}: {updated.status.value}")
@@ -922,54 +925,87 @@ def flows_add(flow_name, title, text, file_path):
     click.echo(f"Заявка #{item['id']} заведена; её поведёт `pp flows run`.")
 
 
-def _flow_decision(item_id, decision, note):
+def _flow_version(item_id, observed):
+    from . import flows
+    if observed is not None:
+        return observed
+    item = _flow_call_cli(flows.get_item, item_id)
+    if item is None:
+        raise click.ClickException("Flow item not found")
+    return item["version"]
+
+
+def _flow_decision(item_id, decision, note, observed):
     from . import flows
 
-    item = _flow_call_cli(flows.decide, item_id, decision, note, "cli")
+    item = _flow_call_cli(flows.decide, item_id, decision, note, "cli",
+                          expected_version=_flow_version(item_id, observed))
     click.echo(_flow_line(item))
 
 
 @flows_group.command("approve")
 @click.argument("item_id", type=int)
 @click.option("--note", default="", help="Указание к решению — попадёт в следующие шаги")
-def flows_approve(item_id, note):
+@click.option("--expected-version", type=click.IntRange(min=0), default=None,
+              help="Observed version; default: fetch current state and submit with CAS")
+def flows_approve(item_id, note, expected_version):
     """Одобрить согласование, которого ждёт заявка."""
-    _flow_decision(item_id, "approve", note)
+    _flow_decision(item_id, "approve", note, expected_version)
 
 
 @flows_group.command("reject")
 @click.argument("item_id", type=int)
 @click.option("--note", default="", help="Причина")
-def flows_reject(item_id, note):
+@click.option("--expected-version", type=click.IntRange(min=0), default=None,
+              help="Observed version; default: fetch current state and submit with CAS")
+def flows_reject(item_id, note, expected_version):
     """Отклонить согласование, которого ждёт заявка."""
-    _flow_decision(item_id, "reject", note)
+    _flow_decision(item_id, "reject", note, expected_version)
 
 
 @flows_group.command("retry")
 @click.argument("item_id", type=int)
-def flows_retry(item_id):
+@click.option("--expected-version", type=click.IntRange(min=0), default=None,
+              help="Observed version; default: fetch current state and submit with CAS")
+@click.option("--confirm-command-stopped", is_flag=True, help="Only after verifying previous execution stopped")
+@click.option("--note", default="", help="Reason for verified recovery")
+def flows_retry(item_id, expected_version, confirm_command_stopped, note):
     """Повторить шаг, на котором заявка остановилась (после исчерпанных повторов — ещё круг)."""
     from . import flows
 
-    click.echo(_flow_line(_flow_call_cli(flows.retry, item_id, "cli")))
+    click.echo(_flow_line(_flow_call_cli(flows.retry, item_id, "cli",
+                                          expected_version=_flow_version(item_id, expected_version),
+                                          confirm_command_stopped=confirm_command_stopped, note=note)))
 
 
 @flows_group.command("skip")
 @click.argument("item_id", type=int)
-def flows_skip(item_id):
+@click.option("--expected-version", type=click.IntRange(min=0), default=None,
+              help="Observed version; default: fetch current state and submit with CAS")
+@click.option("--confirm-command-stopped", is_flag=True, help="Only after verifying previous execution stopped")
+@click.option("--note", default="", help="Reason for verified recovery")
+def flows_skip(item_id, expected_version, confirm_command_stopped, note):
     """Пропустить шаг, на котором заявка остановилась."""
     from . import flows
 
-    click.echo(_flow_line(_flow_call_cli(flows.skip, item_id, "cli")))
+    click.echo(_flow_line(_flow_call_cli(flows.skip, item_id, "cli",
+                                          expected_version=_flow_version(item_id, expected_version),
+                                          confirm_command_stopped=confirm_command_stopped, note=note)))
 
 
 @flows_group.command("cancel")
 @click.argument("item_id", type=int)
-def flows_cancel(item_id):
+@click.option("--expected-version", type=click.IntRange(min=0), default=None,
+              help="Observed version; default: fetch current state and submit with CAS")
+@click.option("--confirm-command-stopped", is_flag=True, help="Only after verifying previous execution stopped")
+@click.option("--note", default="", help="Reason for verified recovery")
+def flows_cancel(item_id, expected_version, confirm_command_stopped, note):
     """Снять заявку (и остановить задачу её шага)."""
     from . import flows
 
-    click.echo(_flow_line(_flow_call_cli(flows.cancel, item_id, "cli")))
+    click.echo(_flow_line(_flow_call_cli(flows.cancel, item_id, "cli",
+                                          expected_version=_flow_version(item_id, expected_version),
+                                          confirm_command_stopped=confirm_command_stopped, note=note)))
 
 
 @flows_group.command("run")
@@ -1108,6 +1144,16 @@ def pipelinectl(args):
     """Run the bundled project pipeline adapter."""
     from .project_pipeline import run
     raise SystemExit(run(list(args)))
+
+
+@cli.command(name="bot-vk")
+def bot_vk():
+    """Start the VK community bot (requires PP_VK_TOKEN and PP_VK_GROUP_ID)."""
+    from .bot_vk import run_vk_bot
+    try:
+        run_vk_bot()
+    except SystemExit as e:
+        raise click.ClickException(str(e))
 
 
 @cli.command()

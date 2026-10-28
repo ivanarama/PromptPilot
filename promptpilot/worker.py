@@ -9,6 +9,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -195,7 +196,8 @@ def _repair_verdict(task, provider: str, provider_cfg: dict,
                         model=getattr(task, "model", None),
                         effort=getattr(task, "effort", None),
                         guard=True,
-                        rights="none" if rights_supported(provider_cfg, "none") else None)
+                        rights=("none" if rights_supported(provider_cfg, "none")
+                                else getattr(task, "rights", None)))
         prompt_stdin = prompt if provider_cfg.get("prompt_stdin") else None
         env = get_provider_env(provider)
         env.pop("PP_TASK_ID", None)
@@ -206,6 +208,7 @@ def _repair_verdict(task, provider: str, provider_cfg: dict,
             input=prompt_stdin,
             capture_output=True,
             text=True,
+            encoding="utf-8",
             errors="replace",
             timeout=VERDICT_REPAIR_TIMEOUT,
         )
@@ -550,11 +553,21 @@ def parse_stream_json(stdout: str) -> dict:
             meta["is_error"] = event.get("is_error")
             meta["subtype"] = event.get("subtype")
             usage = event.get("usage", {})
-            meta["input_tokens"] = usage.get("input_tokens")
+            inputs = [usage.get("input_tokens"), usage.get("cache_read_input_tokens", 0),
+                      usage.get("cache_creation_input_tokens", 0)]
+            meta["input_tokens"] = (sum(inputs) if all(type(n) is int and n >= 0 for n in inputs)
+                                    else None)
+            meta["cached_input_tokens"] = inputs[1]
+            meta["cache_creation_input_tokens"] = inputs[2]
             meta["output_tokens"] = usage.get("output_tokens")
             model_usage = event.get("modelUsage", {})
-            if model_usage:
+            if len(model_usage) == 1:
                 meta["model"] = list(model_usage.keys())[0]
+            elif len(model_usage) > 1:
+                meta.pop("model", None)
+            # Aggregated multi-model usage and cache-write TTL mixtures cannot
+            # be honestly priced from these compact counters.
+            meta["cost_attributable"] = len(model_usage) <= 1 and not inputs[2]
             # Extract result text (always for errors, fallback for empty output)
             if event.get("result"):
                 if event.get("is_error") or not text_parts:
@@ -711,10 +724,44 @@ def _remember_stream_session(task_id: int, line: str) -> None:
         db.set_session_id(task_id, session_id)
 
 
-def _read_process_pipe(pipe, chunks: list[str], task_id: int | None = None) -> None:
+def _windows_output_encoding() -> str | None:
+    """cmd.exe uses the console/OEM code page even when the CLI uses UTF-8."""
+    if os.name != "nt":
+        return None
+    import ctypes
+    code_page = (ctypes.windll.kernel32.GetConsoleOutputCP()
+                 or ctypes.windll.kernel32.GetOEMCP())
+    return f"cp{code_page}"
+
+
+def _decode_process_line(line: str, fallback_encoding: str | None) -> str:
+    # The pipe uses surrogateescape so malformed UTF-8 is still recoverable.
+    raw = line.encode("utf-8", errors="surrogateescape")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode(fallback_encoding or "utf-8", errors="replace")
+
+
+def _write_process_input(pipe, prompt: str) -> None:
+    """Keep a provider that does not read stdin from blocking cancellation."""
+    try:
+        pipe.write(prompt)
+    except (BrokenPipeError, OSError, ValueError):
+        pass
+    finally:
+        try:
+            pipe.close()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+
+
+def _read_process_pipe(pipe, chunks: list[str], task_id: int | None = None,
+                       fallback_encoding: str | None = None) -> None:
     """Drain one provider pipe without blocking the cancellation poll loop."""
     try:
         for line in iter(pipe.readline, ""):
+            line = _decode_process_line(line, fallback_encoding)
             chunks.append(line)
             if task_id is not None:
                 # HOTFIX: исключение здесь (напр. sqlite 'database is locked' из
@@ -985,6 +1032,43 @@ def _close_registered_provider_tree(task_id: int) -> bool:
         return False
     _forget_provider_tree(task_id, tree)
     return True
+
+
+SPAWN_RETRY_DELAY_S = 20.0
+
+
+class _SpawnCancelled(Exception):
+    """Cancellation observed before a provider process was created."""
+
+
+def _start_owned_with_spawn_retry(build, cmd, attempts=2,
+                                  delay_s=None, sleep=None, exists=None, cancel_check=None):
+    """U16: FileNotFoundError у СУЩЕСТВУЮЩЕГО исполняемого файла — транзиентное
+    давление ресурсов (255MB Electron-бинарник goose.exe при параллельных
+    тяжёлых задачах; инцидент 2026-10-03: ревью-слоты падали «CLI not found»,
+    одиночный запуск того же провайдера проходил). Один повтор через паузу;
+    действительно отсутствующий CLI падает сразу, без ожидания."""
+    import os as _os
+    delay_s = SPAWN_RETRY_DELAY_S if delay_s is None else delay_s
+    sleep = time.sleep if sleep is None else sleep
+    exists = _os.path.isfile if exists is None else exists
+    def check_cancel():
+        if cancel_check is not None and cancel_check():
+            raise _SpawnCancelled()
+    try:
+        return build()
+    except FileNotFoundError:
+        exe = str(cmd[0]) if cmd else ""
+        if attempts <= 1 or not exe or not exists(exe):
+            raise
+        remaining = delay_s
+        while remaining > 0:
+            check_cancel()
+            interval = min(0.25, remaining) if cancel_check is not None else remaining
+            sleep(interval)
+            remaining -= interval
+        check_cancel()
+        return build()
 
 
 def _effective_timeout(task):
@@ -1342,6 +1426,13 @@ def _execute_herdr_task(task, provider_cfg, host=None, machine=None, prompt_over
             lambda: db.set_worktree(task.id, path, branch),
             f"сохранение worktree задачи #{task.id}",
         )
+        # Снимок фактического дерева старта рана (см. _execute_task_body):
+        # база доказательств no-diff/чекпоинта — дерево, где работает агент.
+        try:
+            from . import workflows as _workflows
+            _workflows.record_run_snapshot(task.id, path)
+        except Exception as exc:  # noqa: BLE001 — телеметрия
+            print(f"  !! run.snapshot #{task.id}: {exc}", flush=True)
         print(f"  -> Worktree {path} ({branch})")
 
     def on_started(_pane_id):
@@ -1765,6 +1856,17 @@ def _execute_task_body(task, admission_complete=None):
         wt_note = "\n\n" + worktree.summary(wt["path"], wt["branch"], wt["copied"])
         print(f"  -> Worktree {wt['path']} ({wt['branch']})")
 
+    # Доказательная база рана (no-diff/чекпоинт): снимок ФАКТИЧЕСКОГО дерева
+    # старта — в worktree, если он создан. Диспатч-снимок берётся раньше, из
+    # working_dir: между диспатчем и стартом воркера ветка успела уйти, и
+    # сравнение «до/после» без снимка старта приписывало сдвиг ветки
+    # исполнителю.
+    try:
+        from . import workflows as _workflows
+        _workflows.record_run_snapshot(task.id, run_dir)
+    except Exception as exc:  # noqa: BLE001 — телеметрия, не ломать запуск
+        print(f"  !! run.snapshot #{task.id}: {exc}", flush=True)
+
     try:
         cmd = build_cmd(provider, agent_prompt, skip_permissions=task.skip_permissions,
                         session_id=task.session_id, model=task.model, guard=not machine,
@@ -1819,7 +1921,25 @@ def _execute_task_body(task, admission_complete=None):
         else:
             kwargs["start_new_session"] = True
         try:
-            proc = subprocess.Popen(cmd, **kwargs)
+            # A detached CLI must also receive its prompt, without a pipe writer
+            # that would be lost when the worker exits. The child inherits this
+            # temporary file handle; closing the parent's copy is safe.
+            with tempfile.TemporaryFile() as input_file:
+                if prompt_stdin is not None:
+                    input_file.write(prompt_stdin.encode("utf-8"))
+                    input_file.seek(0)
+                    kwargs["stdin"] = input_file
+                    # Supplying stdin makes Windows inherit all three handles.
+                    # A detached CLI must not keep or block the worker's pipes.
+                    kwargs["stdout"] = subprocess.DEVNULL
+                    kwargs["stderr"] = subprocess.DEVNULL
+                    if os.name == "nt":
+                        # DETACHED_PROCESS lets cmd.exe allocate a console and
+                        # replace redirected stdin. CREATE_NO_WINDOW preserves
+                        # the inherited file while keeping the CLI independent.
+                        kwargs["creationflags"] = (subprocess.CREATE_NO_WINDOW
+                                                   | subprocess.CREATE_NEW_PROCESS_GROUP)
+                proc = subprocess.Popen(cmd, **kwargs)
             _mark_completed(task, f"Запущен в фоне (PID {proc.pid}){wt_note}", exit_code=0)
             print(f"  -> Detached (PID {proc.pid})")
         except FileNotFoundError:
@@ -1831,17 +1951,24 @@ def _execute_task_body(task, admission_complete=None):
     if callable(target_heartbeat):
         target_heartbeat(force=True)
     try:
-        tree = OwnedProcess.start(
+        tree = _start_owned_with_spawn_retry(
+            lambda: OwnedProcess.start(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="surrogateescape",
+                cwd=run_dir,
+                stdin=subprocess.PIPE if prompt_stdin is not None else subprocess.DEVNULL,
+                env=env,
+            ),
             cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            cwd=run_dir,
-            stdin=subprocess.PIPE if prompt_stdin is not None else subprocess.DEVNULL,
-            env=env,
+            cancel_check=lambda: db.is_cancel_requested(task.id),
         )
+    except _SpawnCancelled:
+        _mark_cancelled(task, "Отменена пользователем до повторного запуска CLI")
+        return
     except FileNotFoundError:
         _mark_failed(task, f"CLI '{provider}' not found. Is it installed and in PATH?", exit_code=-1)
         return
@@ -1853,30 +1980,26 @@ def _execute_task_body(task, admission_complete=None):
     _register_provider_tree(task.id, tree)
     proc = tree.process
 
-    if prompt_stdin is not None:
-        # Write once and detach the handle before polling communicate(). This
-        # avoids resending after TimeoutExpired and preserves newlines through
-        # Windows .CMD provider shims.
-        try:
-            proc.stdin.write(prompt_stdin)
-            proc.stdin.close()
-        except (BrokenPipeError, OSError, ValueError):
-            pass
-        finally:
-            proc.stdin = None
-
     # Drain both pipes while polling. Besides avoiding pipe deadlocks, the
     # stdout reader persists Codex/Claude session ids immediately, so a worker
     # crash can resume the same conversation instead of mistaking its own dirty
     # checkout for foreign work on a fresh run.
     stdout_parts: list[str] = []
     stderr_parts: list[str] = []
+    fallback_encoding = _windows_output_encoding() if not machine else None
     stdout_thread = threading.Thread(
-        target=_read_process_pipe, args=(proc.stdout, stdout_parts, task.id), daemon=True)
+        target=_read_process_pipe,
+        args=(proc.stdout, stdout_parts, task.id, fallback_encoding), daemon=True)
     stderr_thread = threading.Thread(
-        target=_read_process_pipe, args=(proc.stderr, stderr_parts), daemon=True)
+        target=_read_process_pipe,
+        args=(proc.stderr, stderr_parts, None, fallback_encoding), daemon=True)
     stdout_thread.start()
     stderr_thread.start()
+    stdin_thread = None
+    if prompt_stdin is not None:
+        stdin_thread = threading.Thread(
+            target=_write_process_input, args=(proc.stdin, prompt_stdin), daemon=True)
+        stdin_thread.start()
 
     # Poll instead of blocking: allows user-requested cancellation of a
     # RUNNING task (Web UI/bot) and the per-task timeout.
@@ -1906,6 +2029,8 @@ def _execute_task_body(task, admission_complete=None):
                     pass
                 stdout_thread.join(timeout=10)
                 stderr_thread.join(timeout=10)
+                if stdin_thread is not None:
+                    stdin_thread.join(timeout=10)
                 changed = _commit_terminal_or_defer(
                     task,
                     "headless cancellation",
@@ -1933,6 +2058,8 @@ def _execute_task_body(task, admission_complete=None):
                     pass
                 stdout_thread.join(timeout=10)
                 stderr_thread.join(timeout=10)
+                if stdin_thread is not None:
+                    stdin_thread.join(timeout=10)
                 _commit_terminal_or_defer(
                     task,
                     "headless timeout",
@@ -1947,6 +2074,8 @@ def _execute_task_body(task, admission_complete=None):
     _forget_provider_tree(task.id, tree)
     stdout_thread.join(timeout=10)
     stderr_thread.join(timeout=10)
+    if stdin_thread is not None:
+        stdin_thread.join(timeout=10)
     stdout = "".join(stdout_parts)
     stderr = "".join(stderr_parts)
 
@@ -2022,6 +2151,7 @@ def _execute_task_body(task, admission_complete=None):
         return
 
     # Parse output
+    reported_usage = None
     model_used = None
     session_id = None
     if is_stream_json(result.stdout):
@@ -2035,6 +2165,7 @@ def _execute_task_body(task, admission_complete=None):
             parsed["meta"]["unrecognized_model"] = unrecognized
         output = format_result(parsed)
         verdict_source = parsed["text"]
+        reported_usage = parsed["meta"]
         model_used = parsed["meta"].get("model")
         session_id = parsed["meta"].get("session_id")
         # Check for rate limit in stream events — only if no text was returned
@@ -2118,7 +2249,7 @@ def _execute_task_body(task, admission_complete=None):
         "headless successful outcome",
         lambda: _mark_completed(
             task, output, exit_code=0, model_used=model_used,
-            session_id=session_id, verdict=verdict or None,
+            session_id=session_id, verdict=verdict or None, usage=reported_usage,
         ),
     )
     if changed:
@@ -2438,6 +2569,102 @@ def _active_worker_task_ids(in_flight: dict, recoveries: dict) -> set[int]:
 def _occupied_worker_slots(in_flight: dict, recoveries: dict) -> int:
     """A quarantined provider keeps its slot until ownership is resolved."""
     return len(in_flight) + len(recoveries)
+
+
+def admission_snapshot():
+    """Честная диагностика очереди — read-only повтор правил допуска воркера.
+
+    Повторяет фильтры get_next_runnable (pending/rate_limited,
+    scheduled_at/next_run_at наступили, серия не на паузе и не завершена).
+    При CONCURRENCY > 1 учитывает занятость lock_key RUNNING-задачами и
+    более ранними готовыми кандидатами; последовательный воркер не
+    исключает повторяющиеся каталоги. Никаких мутаций: claim не меняется.
+    Проекция для /api/tasks и панели. Позиция — ранг среди ГОТОВЫХ;
+    не-готовые получают wait_reason. Относительно опциональной lane-политики
+    проекта позиция базовая: lanes могут как менять порядок, так и запрещать
+    допуск. Lane-политика, бюджетная fairness, свободные слоты и глобальная
+    пауза не моделируются. ready означает только базовый допуск по указанным
+    фильтрам. Возвращает {task_id: dict(queue_position, wait_reason, ready)}.
+
+    Не более двух SELECT (running + кандидаты) независимо от длины очереди:
+    колонки lock_key приезжают в тех же строках. Прежняя версия звала
+    get_task на каждую строку — N+1, измерение на очереди в 500 задач
+    давало ~600 запросов и ~1.2 с на каждый GET /api/tasks.
+    """
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+
+    from . import db as _db
+
+    def _lock_view(row):
+        # Только поля lock_key: работаем со строкой, без get_task на задачу
+        return SimpleNamespace(
+            id=row["id"],
+            machine=row["machine"],
+            herdr_target=row["herdr_target"],
+            worktree=row["worktree"],
+            working_dir=row["working_dir"],
+        )
+
+    parallel = CONCURRENCY > 1
+    keys = {}
+
+    def _key(row):
+        identity = (row["machine"], row["herdr_target"],
+                    row["worktree"], row["working_dir"])
+        if identity not in keys:
+            keys[identity] = lock_key(_lock_view(row))
+        return keys[identity]
+
+    now = datetime.now(timezone.utc).isoformat()
+    snapshot = {}
+    with _db._connect() as conn:
+        running_keys = {
+            _key(row)
+            for row in conn.execute(
+                """SELECT id, machine, herdr_target, worktree, working_dir
+                   FROM tasks WHERE status = 'running'""")
+        } if parallel else set()
+        rows = conn.execute(
+            """SELECT t.id, t.machine, t.herdr_target, t.worktree,
+                      t.working_dir,
+                      (t.scheduled_at IS NULL OR t.scheduled_at <= ?) AS sched_ok,
+                      (t.next_run_at IS NULL OR t.next_run_at <= ?) AS next_ok,
+                      (t.series_id IS NULL OR EXISTS (
+                         SELECT 1 FROM task_series s WHERE s.id = t.series_id
+                           AND s.paused = 0 AND s.ended_at IS NULL)) AS series_ok
+               FROM tasks t
+               WHERE t.status IN ('pending', 'rate_limited')
+               ORDER BY t.priority ASC, t.created_at ASC, t.id ASC""",
+            (now, now)).fetchall()
+    taken = set(running_keys)
+    position = 0
+    for row in rows:
+        task = _lock_view(row)
+        if not row["series_ok"]:
+            snapshot[task.id] = {"queue_position": None,
+                                 "wait_reason": "paused_series", "ready": False}
+            continue
+        if not row["sched_ok"] or not row["next_ok"]:
+            snapshot[task.id] = {"queue_position": None,
+                                 "wait_reason": "scheduled_future",
+                                 "ready": False}
+            continue
+        key = _key(row) if parallel else ""
+        if key and key in taken:
+            snapshot[task.id] = {
+                "queue_position": None,
+                "wait_reason": ("busy_session" if task.herdr_target
+                                else "busy_working_dir"),
+                "ready": False,
+            }
+            continue
+        position += 1
+        snapshot[task.id] = {"queue_position": position,
+                             "wait_reason": None, "ready": True}
+        if key:
+            taken.add(key)
+    return snapshot
 
 
 def lock_key(task) -> str:

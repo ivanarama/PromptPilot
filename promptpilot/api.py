@@ -2,27 +2,33 @@
 
 import asyncio
 import base64
+import json
+import os
+import time
+import ipaddress
 import secrets
 import subprocess
 import sys
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-import os
 import re as _re
 
 from . import db, epf_tools, flows, workflows
 from . import pipeline_insights
-from .config import API_TOKEN, DB_DIR, DEFAULT_CLI, EFFORT_LEVELS, PIPELINE_SNAPSHOT_INTERVAL, get_provider_models, get_skills, load_providers, mask_secret_value, provider_available, RIGHTS_LEVELS, rights_supported, PROJECTS_ROOT
+from .config import ALLOWED_HOSTS, ALLOWED_ORIGINS, API_TOKEN, DB_DIR, DEFAULT_CLI, EFFORT_LEVELS, PIPELINE_SNAPSHOT_INTERVAL, get_provider_models, get_skills, load_providers, mask_secret_value, provider_available, RIGHTS_LEVELS, rights_supported, save_catalog_provider, PROJECTS_ROOT
+from .provider_catalog import CATALOG, catalog_entry, slugify, build_provider_entry
 from .models import (
+    WorkflowPlanAmend,
     CostStats,
     FindingStatus,
     Stats,
@@ -103,6 +109,83 @@ app = FastAPI(title="PromptPilot", version="0.1.0", lifespan=_lifespan)
 _SAFE_METHODS = ("GET", "HEAD", "OPTIONS")
 
 
+def _hostname(authority: str) -> str:
+    """Lowercased host part of a Host header or URL authority, without port."""
+    value = (authority or "").strip().lower()
+    if value.startswith("["):
+        end = value.find("]")
+        return value[1:end] if end > 0 else ""
+    if value.count(":") == 1:
+        value = value.split(":", 1)[0]
+    return value.rstrip(".")
+
+
+def _trusted_host(authority: str) -> bool:
+    """Whether a page served from elsewhere could have produced this Host.
+
+    DNS rebinding points an attacker's own hostname at 127.0.0.1, so the
+    browser treats the attacker's page as same-origin with this server and the
+    request carries the attacker's hostname. It cannot make the browser send a
+    localhost name (browsers resolve *.localhost themselves) or an IP literal,
+    so those stay allowed together with the names in PP_ALLOWED_HOSTS.
+    """
+    hostname = _hostname(authority)
+    if not hostname:
+        return False
+    if "*" in ALLOWED_HOSTS or hostname in ALLOWED_HOSTS:
+        return True
+    if hostname == "localhost" or hostname.endswith(".localhost"):
+        return True
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        return False
+    return True
+
+
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _origin_key(value: str) -> tuple[str, str, int] | None:
+    """(scheme, host, port) of a serialized origin, or None if it is not one.
+
+    Default ports are filled in: https://pp.example.com and
+    https://pp.example.com:443 are one origin, another scheme or port of the
+    same name is not.
+    """
+    try:
+        parts = urlsplit((value or "").strip())
+    except ValueError:
+        return None
+    if (parts.scheme not in _DEFAULT_PORTS or not parts.hostname
+            or parts.username is not None or parts.password is not None
+            or parts.path not in ("", "/") or parts.query or parts.fragment):
+        return None
+    try:
+        port = parts.port
+    except ValueError:
+        return None
+    return parts.scheme, parts.hostname.rstrip("."), port or _DEFAULT_PORTS[parts.scheme]
+
+
+def _same_origin(origin: str, authority: str, scheme: str) -> bool:
+    """Whether a browser Origin header is this server or an allowed origin.
+
+    Origins compare as (scheme, host, port). A page on another port of the
+    same machine is "same-site", not same-origin, and so is another scheme or
+    port of a proxied name. Behind a reverse proxy the request reaches the
+    upstream address while Origin keeps the public URL: that URL must be
+    listed in full in PP_ALLOWED_ORIGINS — PP_ALLOWED_HOSTS only admits a
+    Host name.
+    """
+    key = _origin_key(origin)
+    if key is None:
+        return False
+    if key == _origin_key(f"{scheme}://{(authority or '').strip()}"):
+        return True
+    return any(key == _origin_key(allowed) for allowed in ALLOWED_ORIGINS)
+
+
 @app.middleware("http")
 async def _auth(request, call_next):
     """Optional auth: enabled by PP_API_TOKEN. Accepts Bearer <token> or
@@ -112,11 +195,34 @@ async def _auth(request, call_next):
     cross-site is refused: without this, a malicious page open in the user's
     browser could POST to the loopback server (no token by default) and queue a
     task that runs with --dangerously-skip-permissions. curl/scripts don't send
-    Sec-Fetch-Site, so they're unaffected."""
+    Sec-Fetch-Site, so they're unaffected.
+
+    Without a token the loopback bind is the only boundary, and "cross-site"
+    does not cover every way around it: DNS rebinding makes a hostile page
+    same-origin with this server, and a page on another localhost port is
+    "same-site". So a foreign Host is refused on every request, and a
+    state-changing request whose Origin is neither this server nor an origin
+    listed in PP_ALLOWED_ORIGINS — compared as scheme, host and port — is
+    refused too. Scripts send neither a foreign Host nor an Origin and keep
+    working."""
     if request.method not in _SAFE_METHODS:
         if request.headers.get("sec-fetch-site") == "cross-site":
             return Response(status_code=403, content="cross-site request refused")
     if not API_TOKEN:
+        host = request.headers.get("host", "")
+        if not _trusted_host(host):
+            return Response(
+                status_code=403,
+                content="host not allowed: add it to PP_ALLOWED_HOSTS or set PP_API_TOKEN",
+            )
+        origin = request.headers.get("origin")
+        if (request.method not in _SAFE_METHODS and origin is not None
+                and not _same_origin(origin, host, request.url.scheme)):
+            return Response(
+                status_code=403,
+                content="cross-origin request refused: add the page origin to "
+                        "PP_ALLOWED_ORIGINS or set PP_API_TOKEN",
+            )
         return await call_next(request)
     header = request.headers.get("authorization", "")
     ok = False
@@ -162,9 +268,51 @@ def _task_with_epf(task: TaskInDB) -> dict:
     return d
 
 
+def _attach_workflow_attribution(tasks: list) -> list:
+    """Атрибуция и честная позиция для карточек задач.
+
+    Принадлежность задачи к миссии (workflow_id/role из workflow_runs) и
+    позиция в очереди. Базовый ранг учитывает paused-серии, отложенные
+    scheduled/next_run_at и, в параллельном режиме, занятые рабочие деревья.
+    Lanes, budget fairness, слоты и глобальная пауза не моделируются;
+    исключённые базовыми фильтрами задачи получают wait_reason.
+    Расчёт read-only (worker.admission_snapshot), claim не меняется.
+    """
+    if not tasks:
+        return tasks
+    task_ids = [t.id for t in tasks]
+    marks = ",".join("?" * len(task_ids))
+    runs = {}
+    with db._connect() as conn:
+        for row in conn.execute(
+            f"""SELECT task_id, workflow_id, role FROM workflow_runs
+                WHERE task_id IN ({marks})""", task_ids,
+        ):
+            runs[row["task_id"]] = (row["workflow_id"], row["role"])
+    try:
+        from .worker import admission_snapshot
+        admission = (admission_snapshot() if any(
+            task.status in {TaskStatus.PENDING, TaskStatus.RATE_LIMITED}
+            for task in tasks) else {})
+    except Exception as exc:  # noqa: BLE001 - проекция не должна ронять API
+        print(f"  !! admission_snapshot недоступен: {exc}", flush=True)
+        admission = {}
+    for task in tasks:
+        attribution = runs.get(task.id)
+        if attribution:
+            task.workflow_id, task.role = attribution
+        info = admission.get(task.id)
+        if info is not None:
+            task.queue_position = info["queue_position"]
+            task.wait_reason = info["wait_reason"]
+    return tasks
+
+
 @app.get("/api/tasks")
 def api_list_tasks(status: Optional[TaskStatus] = None, limit: int = 50, offset: int = 0):
-    return [_task_with_epf(t) for t in db.list_tasks(status=status, limit=limit, offset=offset)]
+    tasks = _attach_workflow_attribution(
+        db.list_tasks(status=status, limit=limit, offset=offset))
+    return [_task_with_epf(t) for t in tasks]
 
 
 @app.post("/api/tasks", response_model=TaskInDB, status_code=201)
@@ -268,6 +416,7 @@ class SeriesUpdate(BaseModel):
 
 class SeriesAction(BaseModel):
     action: str
+    retry_blocked: bool = False
 
 
 class PipelinePriorityUpdate(BaseModel):
@@ -326,7 +475,9 @@ def api_update_series(series_id: int, update: SeriesUpdate):
 def api_series_action(series_id: int, body: SeriesAction):
     if body.action not in ("run_now", "pause", "resume", "end"):
         raise HTTPException(400, "Неизвестное действие")
-    if not db.series_action(series_id, body.action):
+    if body.retry_blocked and body.action != "run_now":
+        raise HTTPException(400, "Повтор блокированных задач доступен только для run_now")
+    if not db.series_action(series_id, body.action, retry_blocked=body.retry_blocked):
         raise HTTPException(400, "Действие неприменимо к этой серии")
     return {"ok": True, "series": db.get_series(series_id)}
 
@@ -447,8 +598,19 @@ def _setup_check(code: str, status: str, message: str) -> WorkflowSetupCheck:
     return WorkflowSetupCheck(code=code, status=status, message=message)
 
 
-def _validate_gate_syntax(command: str) -> tuple[bool, str]:
-    """Parse one gate command without executing it."""
+# Preflight probes start other programs, and starting one is not instant: a
+# cold powershell.exe on a loaded Windows machine takes seconds. This is a
+# "the process hung" limit, not a measure of how long a parse should take.
+_PROBE_TIMEOUT = 20
+
+
+def _validate_gate_syntax(command: str) -> tuple[str, str]:
+    """Parse one gate command without executing it.
+
+    Returns the check status: "ok" when the parser accepted the command,
+    "error" when it rejected it, and "warning" when the parser could not be
+    run at all — not managing to check is not proof the command is broken.
+    """
     try:
         if os.name == "nt":
             env = os.environ.copy()
@@ -461,17 +623,20 @@ def _validate_gate_syntax(command: str) -> tuple[bool, str]:
             )
             parsed = subprocess.run(
                 ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
-                capture_output=True, text=True, timeout=5, errors="replace", env=env,
+                capture_output=True, text=True, timeout=_PROBE_TIMEOUT,
+                errors="replace", env=env,
             )
         else:
             parsed = subprocess.run(
                 ["/bin/sh", "-n", "-c", command], capture_output=True,
-                text=True, timeout=5, errors="replace",
+                text=True, timeout=_PROBE_TIMEOUT, errors="replace",
             )
+    except subprocess.TimeoutExpired:
+        return "warning", f"синтаксис не проверен: парсер не ответил за {_PROBE_TIMEOUT} с"
     except (OSError, subprocess.SubprocessError) as exc:
-        return False, f"не удалось запустить parser: {exc}"
+        return "warning", f"синтаксис не проверен: не удалось запустить parser ({exc})"
     detail = ((parsed.stdout or "") + (parsed.stderr or "")).strip()
-    return parsed.returncode == 0, detail
+    return ("ok" if parsed.returncode == 0 else "error"), detail
 
 
 @app.post(
@@ -481,6 +646,9 @@ def _validate_gate_syntax(command: str) -> tuple[bool, str]:
 def api_validate_workflow_setup(request: WorkflowSetupValidationRequest):
     """Validate repository, branch, providers and gate syntax without mutation."""
     checks: list[WorkflowSetupCheck] = []
+    # Required checks that could not be performed at all (a probe timed out).
+    # They are not errors and not successes: nothing was proven either way.
+    unverified: list[str] = []
     repo = Path(request.repository_path).expanduser()
     if not repo.exists():
         checks.append(_setup_check("repository", "error", "Каталог репозитория не найден"))
@@ -490,7 +658,7 @@ def api_validate_workflow_setup(request: WorkflowSetupValidationRequest):
         try:
             git = subprocess.run(
                 ["git", "-C", str(repo), "rev-parse", "--show-toplevel"],
-                capture_output=True, text=True, timeout=5, errors="replace",
+                capture_output=True, text=True, timeout=_PROBE_TIMEOUT, errors="replace",
             )
             if git.returncode:
                 checks.append(_setup_check(
@@ -500,18 +668,32 @@ def api_validate_workflow_setup(request: WorkflowSetupValidationRequest):
                 checks.append(_setup_check(
                     "repository", "ok", f"Git-репозиторий: {git.stdout.strip()}",
                 ))
+        # A git that did not answer in time proves nothing about the directory;
+        # a git that cannot be started at all is a real problem. Keep them apart
+        # — TimeoutExpired is a SubprocessError, so it has to be caught first.
+        except subprocess.TimeoutExpired:
+            unverified.append("repository")
+            checks.append(_setup_check(
+                "repository", "warning",
+                f"не проверен: git не ответил за {_PROBE_TIMEOUT} с",
+            ))
         except (OSError, subprocess.SubprocessError) as exc:
             checks.append(_setup_check("repository", "error", f"Git недоступен: {exc}"))
 
     try:
         branch = subprocess.run(
             ["git", "check-ref-format", "--branch", request.candidate_branch],
-            capture_output=True, text=True, timeout=5, errors="replace",
+            capture_output=True, text=True, timeout=_PROBE_TIMEOUT, errors="replace",
         )
         checks.append(_setup_check(
             "branch", "ok" if branch.returncode == 0 else "error",
             (f"Допустимое имя ветки: {request.candidate_branch}"
              if branch.returncode == 0 else "Недопустимое имя Git-ветки"),
+        ))
+    except subprocess.TimeoutExpired:
+        unverified.append("branch")
+        checks.append(_setup_check(
+            "branch", "warning", f"не проверено: git не ответил за {_PROBE_TIMEOUT} с",
         ))
     except (OSError, subprocess.SubprocessError) as exc:
         checks.append(_setup_check("branch", "error", f"Git недоступен: {exc}"))
@@ -531,24 +713,51 @@ def api_validate_workflow_setup(request: WorkflowSetupValidationRequest):
             "gate", "warning", "Gate-команды не заданы: функциональная готовность не проверяется",
         ))
     for index, command in enumerate(request.gate_commands, start=1):
-        ok, detail = _validate_gate_syntax(command)
+        status, detail = _validate_gate_syntax(command)
+        if status == "warning":
+            # A gate the operator did specify, whose syntax we could not check.
+            unverified.append(f"gate#{index}")
         checks.append(_setup_check(
-            "gate", "ok" if ok else "error",
-            (f"Gate #{index}: синтаксис корректен"
-             if ok else f"Gate #{index}: {detail or 'ошибка синтаксиса'}"),
+            "gate", status,
+            (f"Gate #{index}: синтаксис корректен" if status == "ok"
+             else f"Gate #{index}: {detail or 'ошибка синтаксиса'}"),
         ))
 
+    # ready opens «Создать и запустить» in the wizard, so it must mean «checked
+    # and fine», not merely «nothing came back wrong». A probe that did not
+    # answer keeps its own warning status — the message says what was not
+    # checked — but readiness is withheld: an unchecked gate must not let an
+    # unattended run start. A gate nobody specified is a different thing: there
+    # is nothing to check, and that warning stays non-blocking.
     return WorkflowSetupValidationResponse(
-        ready=not any(check.status == "error" for check in checks), checks=checks,
+        ready=(not any(check.status == "error" for check in checks)
+               and not unverified),
+        checks=checks,
     )
 
 
 @app.post("/api/workflows", response_model=WorkflowInDB, status_code=201)
 def api_create_workflow(workflow: WorkflowCreate):
     try:
-        return db.create_workflow(workflow)
+        # One transaction: no other request can observe/start an intermediate
+        # draft before its supplied plan and approval barrier have been stored.
+        if workflow.plan:
+            WorkflowPlanReplace(
+                expected_version=0, stages=workflow.plan)
+        with db._connect(immediate=True) as conn:
+            created = db.create_workflow(workflow, conn=conn)
+            if workflow.plan:
+                workflows.provide_plan(created.id, WorkflowPlanReplace(
+                    expected_version=created.state_version,
+                    stages=workflow.plan,
+                ), conn=conn)
+            return db.get_workflow(created.id, conn=conn)
     except db.WorkflowConflictError as exc:
         raise HTTPException(409, str(exc)) from exc
+    except ValueError as exc:
+        # невалидный план (например, финал не integration) — миссии в БД нет,
+        # slug свободен, повторный запрос с исправленным планом пройдёт
+        raise HTTPException(422, str(exc)) from exc
 
 
 @app.get("/api/workflows", response_model=List[WorkflowInDB])
@@ -575,7 +784,7 @@ def api_get_workflow(workflow_id: str):
 @app.patch("/api/workflows/{workflow_id}", response_model=WorkflowInDB)
 def api_update_workflow(workflow_id: str, update: WorkflowUpdate):
     try:
-        updated = db.update_workflow(workflow_id, update)
+        db.update_workflow(workflow_id, update)
         return workflows.advance_workflow(workflow_id)
     except db.WorkflowNotFoundError as exc:
         raise HTTPException(404, "Workflow not found") from exc
@@ -606,6 +815,103 @@ def api_list_workflow_runs(workflow_id: str, round_id: str):
     return db.list_workflow_runs(round_id)
 
 
+@app.get("/api/stats/tokens")
+def api_token_stats():
+    """Structured counters recorded atomically by the completing worker."""
+    from . import usage_conveyor
+
+    return usage_conveyor.summary()
+
+
+class NoteBody(BaseModel):
+    text: str = ""
+
+
+HEALTH_PROCESS_NAMES = (
+    "server", "worker", "cascade", "verdict_watcher",
+    "bot", "bot_vk", "quota_failover",
+)
+HEALTH_LABELS = {
+    "server": "сервер API", "worker": "воркер задач",
+    "cascade": "каскад ревью", "verdict_watcher": "вотчер вердиктов",
+    "bot": "Telegram-бот", "bot_vk": "VK-бот",
+    "quota_failover": "вотчер лестницы смен",
+}
+HEALTH_PIDS_PATH = Path(__file__).resolve().parent.parent / ".pp-pids.json"
+# квен-H3: якорь = корень репозитория (тот же, что у лаунчеров);
+# DB_DIR.parent в frozen/Docker расползается с этим путём
+
+
+def _pid_alive(pid: int):
+    """True/False/None(не знаем). Квен-L11: ACCESS_DENIED — не «смерть»;
+    прототипы ctypes заданы явно, HANDLE не урезается."""
+    if not pid or pid <= 0:
+        return False
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except (PermissionError, OSError, OverflowError):
+            return None
+        return True
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32  # noqa: N806 - win api
+        kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int,
+                                         ctypes.c_uint32]
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.GetLastError.restype = ctypes.c_uint32
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = ctypes.c_int
+        handle = kernel32.OpenProcess(0x1000, 0, int(pid))
+        if not handle:
+            # 5 = ERROR_ACCESS_DENIED: процесс чужой/элевированный — жив
+            return None if kernel32.GetLastError() == 5 else False
+        kernel32.CloseHandle(handle)
+        return True
+    except Exception:  # noqa: BLE001 - не-Windows или без прав: не знаем
+        return None
+
+
+@app.get("/api/health/processes")
+def api_health_processes():
+    try:
+        pids = json.loads(HEALTH_PIDS_PATH.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        pids = {}
+    if not isinstance(pids, dict):
+        pids = {}
+    runtime = db.worker_runtime_status()
+    worker_state = ("alive" if runtime["state"] == "online" else
+                    "dead" if runtime.get("heartbeat_at") else "unknown")
+    processes = [
+        {"name": "server", "label": HEALTH_LABELS["server"], "pid": os.getpid(),
+         "state": "alive", "alive": True},
+        {"name": "worker", "label": HEALTH_LABELS["worker"],
+         "pid": runtime.get("pid"), "state": worker_state,
+         "alive": None if worker_state == "unknown" else worker_state == "alive",
+         "heartbeat_at": runtime.get("heartbeat_at"), "paused": runtime["paused"]},
+    ]
+    for name in HEALTH_PROCESS_NAMES:
+        if name in {"server", "worker"}:
+            continue
+        raw = pids.get(name)
+        pid = raw if type(raw) is int and 0 < raw <= 2**32 - 1 else 0
+        if not pid:
+            continue  # Optional companions are not required by a core install.
+        alive = _pid_alive(pid)
+        state = "unknown" if alive is None else "alive" if alive else "dead"
+        processes.append({"name": name, "label": HEALTH_LABELS.get(name, name),
+                          "pid": pid, "state": state, "alive": alive})
+    return {
+        "ok": all(p["state"] == "alive" for p in processes),
+        "processes": processes,
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 @app.get(
     "/api/workflows/{workflow_id}/events",
     response_model=List[WorkflowEventInDB],
@@ -633,6 +939,33 @@ def api_list_workflow_findings(
     return db.list_workflow_findings(
         workflow_id, status=status.value if status else None
     )
+
+
+@app.get("/api/workflows/{workflow_id}/memory")
+def api_get_memory(workflow_id: str):
+    return db.list_memory(workflow_id)
+
+
+@app.put("/api/workflows/{workflow_id}/memory")
+def api_put_memory(workflow_id: str, body: dict):
+    """Заметки памяти миссии (например memory.md). Замена целиком;
+    лимит 16КБ на заметку — осознанный отказ, не обрезка."""
+    if not db.get_workflow(workflow_id):
+        raise HTTPException(404, "Workflow not found")
+    name = str(body.get("name") or "memory.md")
+    content = str(body.get("content") or "")
+    ok, msg = db.save_memory(workflow_id, name, content,
+                             scope_stage=body.get("scope_stage"))
+    if not ok:
+        raise HTTPException(400, msg)
+    return {"ok": True, "name": name}
+
+
+@app.delete("/api/workflows/{workflow_id}/memory/{name}")
+def api_delete_memory(workflow_id: str, name: str):
+    if not db.delete_memory(workflow_id, name):
+        raise HTTPException(404, "Note not found")
+    return {"ok": True}
 
 
 @app.get(
@@ -700,6 +1033,20 @@ def api_dispatch_workflow_planner(
     if dispatch.provider and dispatch.provider not in load_providers():
         raise HTTPException(400, f"Неизвестный провайдер «{dispatch.provider}»")
     return _workflow_action(workflows.dispatch_planner, workflow_id, dispatch)
+
+
+@app.post(
+    "/api/workflows/{workflow_id}/plan/amend",
+    response_model=List[WorkflowStageInDB],
+)
+def api_amend_workflow_plan(
+    workflow_id: str, amendment: WorkflowPlanAmend,
+):
+    """F5: правка хвоста утверждённого плана (opt-in, замороженный префикс
+    неприкосновенен, событие plan.amended с причиной)."""
+    if not db.get_workflow(workflow_id):
+        raise HTTPException(404, "Workflow not found")
+    return _workflow_action(workflows.amend_plan, workflow_id, amendment)
 
 
 @app.put(
@@ -1255,6 +1602,8 @@ def api_providers_manage():
 @app.post("/api/providers", status_code=201)
 def api_provider_create(p: ProviderCreate):
     from .config import save_provider
+    source = load_providers().get(p.source_name or p.name, {})
+    stdin_transport = bool(source.get("prompt_stdin") and source.get("cmd") == p.cmd)
     if not _re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,31}", p.name):
         raise HTTPException(400, "Имя: латиница/цифры/-/_, до 32 символов")
     # "***" — оставленный без изменений секрет: берём сохранённое значение
@@ -1277,21 +1626,261 @@ def api_provider_create(p: ProviderCreate):
                       executor=p.executor, kind=p.kind, keep_pane=p.keep_pane,
                       models=p.models or None, args=p.args or None, effort=p.effort)
     else:
-        if not p.cmd or "{prompt}" not in p.cmd:
+        if not p.cmd or ("{prompt}" not in p.cmd and not stdin_transport):
             raise HTTPException(400, "cmd обязателен и должен содержать {prompt}")
         # Остальные флаги cmd-провайдера живут в шаблоне, а эффорт — поле:
         # он единственный, который приходится менять от этапа к этапу.
         save_provider(p.name, p.cmd, p.description, env=p.env or None,
-                      models=p.models or None, effort=p.effort)
+                      models=p.models or None, effort=p.effort, prompt_stdin=stdin_transport)
+    return {"ok": True}
+
+
+@app.get("/api/providers/{name}/models")
+def api_provider_models(name: str):
+    """U13: живой список моделей с эндпоинта провайдера (ключ не покидает сервер).
+
+    Работает для OpenAI-совместимых провайдеров: env провайдера ищет
+    OPENAI_BASE_URL/OPENAI_API_KEY или LLM_BASE_URL/LLM_API_KEY, дергает
+    GET {base}/models. Ответ содержит только id моделей и сам эндпоинт —
+    секреты не возвращаются никогда.
+    """
+    from .provider_catalog import fetch_models
+    cfg = load_providers().get(name)
+    if not cfg:
+        raise HTTPException(404, "Provider not found")
+    env = cfg.get("env") or {}
+    base = env.get("OPENAI_BASE_URL") or env.get("LLM_BASE_URL") or env.get("ANTHROPIC_BASE_URL") or ""
+    key = env.get("OPENAI_API_KEY") or env.get("LLM_API_KEY") or env.get("ANTHROPIC_AUTH_TOKEN") or ""
+    try:
+        ids = fetch_models(base, key, "anthropic" if env.get("ANTHROPIC_BASE_URL") else "openai")
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
+    except RuntimeError:
+        raise HTTPException(502, "Could not fetch models; check endpoint and credentials") from None
+    return {"endpoint": base, "models": ids, "count": len(ids)}
+
+
+
+# ── Каталог известных CLI: визард «Установить → Настроить → Подобрать модель» ──
+
+class CatalogConfig(_BaseModel):
+    base: str = ""
+    key: str = ""
+    model: str = ""
+    title: str = ""
+
+
+@app.get("/api/provider-catalog")
+def api_provider_catalog():
+    """Каталог известных CLI-агентов + статус установки + уже подключённые."""
+    from .provider_catalog import resolve_cli
+    providers = load_providers()
+    items = []
+    for e in CATALOG:
+        configured = [name for name, p in providers.items()
+                      if p.get("catalog_id") == e["id"]]
+        items.append({
+            "id": e["id"], "title": e["title"], "icon": e["icon"],
+            "desc": e["desc"], "default_base": e.get("default_base", ""),
+            "install_hint": e.get("install_hint", ""),
+            "installed": bool(resolve_cli(e)),
+            "configured": configured,
+        })
+    return {"items": items}
+
+
+@app.post("/api/provider-catalog/{cid}/install")
+def api_provider_catalog_install(cid: str):
+    """Поставить CLI в систему (npm-пакет или официальный zip)."""
+    import shutil
+    import subprocess
+    entry = catalog_entry(cid)
+    if not entry:
+        raise HTTPException(404, "Нет в каталоге")
+    from .provider_catalog import install_command
+    try:
+        argv = install_command(entry)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
+    resolved = shutil.which(argv[0])
+    if not resolved:
+        raise HTTPException(400, f"«{argv[0]}» не найден в системе — {entry.get('install_hint', 'установите вручную')}")
+    argv[0] = resolved
+    try:
+        from .process_tree import run_owned
+        proc = run_owned(argv, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=900,
+                              check=False)
+    except subprocess.TimeoutExpired:
+        raise HTTPException(504, "Установка не успела за 15 минут — проверьте сеть и повторите")
+    tail = "\n".join(((proc.stdout or "") + "\n" + (proc.stderr or "")).splitlines()[-15:])
+    return {"ok": proc.returncode == 0, "returncode": proc.returncode, "output": tail}
+
+
+@app.post("/api/provider-catalog/{cid}/models")
+def api_provider_catalog_models(cid: str, body: CatalogConfig):
+    """Подобрать известные модели: запрос идёт с сервера, ключ не возвращается."""
+    from .provider_catalog import fetch_models
+    entry = catalog_entry(cid)
+    if not entry:
+        raise HTTPException(404, "Not in catalog")
+    try:
+        ids = fetch_models(body.base or entry.get("default_base", ""), body.key, entry["api"])
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
+    except RuntimeError:
+        raise HTTPException(502, "Could not fetch models; check endpoint and credentials") from None
+    return {"models": ids, "count": len(ids)}
+
+
+
+@app.post("/api/provider-catalog/{cid}/create")
+def api_provider_catalog_create(cid: str, body: CatalogConfig):
+    """Создать помощника по выбору: короткое имя «CLI · Модель», cmd уже с моделью."""
+    entry = catalog_entry(cid)
+    if not entry:
+        raise HTTPException(404, "Нет в каталоге")
+    if not body.model:
+        raise HTTPException(400, "Сначала подберите модель")
+    from .config import _PROVIDER_WRITE_LOCK
+    try:
+        prov = build_provider_entry(entry, body.base, body.key, body.model, body.title)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
+    with _PROVIDER_WRITE_LOCK:
+        providers = load_providers()
+        slug = f"{cid}-{slugify(body.model) or 'model'}"[:32]
+        name, n = slug, 2
+        while name in providers:
+            suffix = f"-{n}"
+            name = slug[:32 - len(suffix)] + suffix
+            n += 1
+        save_catalog_provider(name, prov)
+    return {"ok": True, "name": name, "label": prov["human"]["label"]}
+
+
+
+@app.post("/api/providers/{name}/probe")
+def api_provider_probe(name: str, body: dict | None = None):
+    """Проверка провайдера ДО включения в конвейер.
+
+    Зонд идёт тем же путём, что и реальные задачи (build_cmd + env +
+    stdin/argv по конфигу), и проверяет три вещи:
+      1) процесс вообще запускается (и не упёрся в лимит длины командной строки);
+      2) промпт ДОСТАВЛЕН — модель повторила контрольную строку со случайным
+         токеном (ловит «-» вместо промпта, неработающий stdin и т.п.);
+      3) модель держит контракт вердикта — в ответе есть строка «ИТОГ:».
+    long=True прогоняет промпт ~40К символов: argv-провайдеры без stdin
+    на нём честно падают — так заранее видно, тянет ли провайдер роль исполнителя.
+    """
+    from .config import build_cmd, get_provider_env
+    providers = load_providers()
+    cfg = providers.get(name)
+    if not cfg:
+        raise HTTPException(404, "Провайдер не найден")
+    long_mode = bool((body or {}).get("long"))
+    token = "ПРОБА-" + secrets.token_hex(3)
+    prompt = ("Это тестовая проверка связи. Напиши ровно две строки и ничего больше:\n"
+              f"{token}\nИТОГ: ГОТОВО — тест")
+    if long_mode:
+        prompt += ("\n\n(Далее длинный служебный текст для проверки доставки больших промптов; "
+                   "читать и повторять его не нужно:)\n" + ("наполнитель-пробы-доставки. " * 2400))
+    try:
+        cmd = build_cmd(name, prompt, guard=True)
+    except Exception as exc:
+        raise HTTPException(400, "Не удалось собрать команду") from exc
+    env = get_provider_env(name)
+    use_stdin = bool(cfg.get("prompt_stdin"))
+    # .CMD-шимы (npm CLIs: qwen, opencode) не запускаются по «голому» имени —
+    # резолвим полный путь так же, как это делает воркер (worker.py:1786).
+    import shutil as _shutil
+    resolved = _shutil.which(cmd[0], path=env.get("PATH"))
+    if resolved:
+        cmd[0] = resolved
+    import tempfile
+    from .process_tree import run_owned
+    started = time.time()
+    try:
+        with tempfile.TemporaryDirectory(prefix="pp-provider-probe-") as cwd:
+            proc = run_owned(
+                cmd, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=300,
+                input=prompt if use_stdin else None, env=env, cwd=cwd)
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "delivered": False, "verdict": False,
+                "issues": ["Provider probe timed out after 300 seconds"]}
+    except OSError:
+        return {"ok": False, "delivered": False, "verdict": False,
+                "issues": ["Provider could not be started"]}
+
+    from .worker import is_stream_json, parse_stream_json, parse_verdict
+    text = (parse_stream_json(proc.stdout)["text"] if is_stream_json(proc.stdout or "")
+            else proc.stdout or "")
+    delivered = token in text
+    verdict = parse_verdict(text) == "ГОТОВО"
+    issues = []
+    if not delivered:
+        issues.append("ПРОМПТ НЕ ДОСТАВЛЕН: ответ не содержит контрольную строку. "
+                      "Типичные причины: провайдер не читает stdin (символ «-» уходит в модель "
+                      "как текст), сломанный шаблон {prompt}, чужая ошибка авторизации.")
+    if not verdict:
+        issues.append("Нет строки «ИТОГ:» — контракт вердикта не соблюдён; для ролей конвейера "
+                      "это критично (задачи будут падать в ожидание человека).")
+    if delivered and verdict and long_mode and not use_stdin:
+        issues.append("Примечание: длинный тест прошёл, но провайдер работает через argv — "
+                      "промпты заметно длиннее 30К символов могут не пройти.")
+    return {
+        "ok": delivered and verdict and proc.returncode == 0,
+        "delivered": delivered,
+        "verdict": verdict,
+        "stdin_mode": use_stdin,
+        "long_mode": long_mode,
+        "exit_code": proc.returncode,
+        "latency_s": round(time.time() - started, 1),
+        "issues": issues,
+    }
+
+
+@app.post("/api/providers/reorder")
+def api_providers_reorder(body: dict):
+    """Save the helper-card order (list of provider names, desired order)."""
+    from .config import set_providers_ui_order
+    names = body.get("names")
+    if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
+        raise HTTPException(400, "Ожидается {\"names\": [имена провайдеров по порядку]}")
+    set_providers_ui_order(names)
     return {"ok": True}
 
 
 @app.delete("/api/providers/{name}")
 def api_provider_delete(name: str):
-    from .config import remove_provider
-    if not remove_provider(name):
-        raise HTTPException(404, "Провайдер не найден среди кастомных (встроенные можно только скрыть)")
+    from .config import BUILTIN_PROVIDERS, remove_provider
+    if name in BUILTIN_PROVIDERS:
+        raise HTTPException(409, "Built-in providers can only be hidden")
+
+    def references(value):
+        if isinstance(value, dict):
+            return value.get("provider") == name or any(references(v) for v in value.values())
+        return isinstance(value, list) and any(references(v) for v in value)
+
+    with db._connect(immediate=True) as conn:
+        busy = conn.execute(
+            "SELECT 1 FROM tasks WHERE provider=? AND status NOT IN ('completed','failed','cancelled') LIMIT 1", (name,)).fetchone()
+        busy = busy or conn.execute(
+            "SELECT 1 FROM task_series WHERE provider=? AND ended_at IS NULL LIMIT 1", (name,)).fetchone()
+        configs = conn.execute(
+            "SELECT config_json FROM workflows WHERE status NOT IN ('completed','failed','cancelled')").fetchall()
+        for row in configs:
+            try:
+                busy = busy or references(json.loads(row["config_json"]))
+            except (ValueError, TypeError):
+                busy = True
+        if busy:
+            raise HTTPException(409, "Provider is referenced by active tasks, series or workflows")
+        if not remove_provider(name):
+            raise HTTPException(404, "Custom provider not found")
     return {"ok": True}
+
 
 
 @app.post("/api/providers/{name}/hide")
@@ -1342,7 +1931,13 @@ def api_projects():
 
 # --- Flows (маршруты заявок) ---
 
-class FlowDecisionRequest(BaseModel):
+class FlowActionRequest(BaseModel):
+    expected_version: int = Field(ge=0, strict=True)
+    confirm_command_stopped: bool = False
+    note: str = ""
+
+
+class FlowDecisionRequest(FlowActionRequest):
     decision: str
     note: str = ""
     step: Optional[str] = None  # the approval the caller saw; stale buttons are refused
@@ -1401,16 +1996,19 @@ def api_flow_item(item_id: int):
 def api_flow_decision(item_id: int, body: FlowDecisionRequest):
     if body.decision not in ("approve", "reject"):
         raise HTTPException(400, "decision: approve | reject")
-    item = _flow_call(flows.decide, item_id, body.decision, body.note, "web", step_id=body.step)
+    item = _flow_call(flows.decide, item_id, body.decision, body.note, "web", step_id=body.step,
+                      expected_version=body.expected_version)
     return flows.summary(item)
 
 
 @app.post("/api/flows/items/{item_id}/{action}")
-def api_flow_action(item_id: int, action: str):
+def api_flow_action(item_id: int, action: str, body: FlowActionRequest):
     calls = {"retry": flows.retry, "skip": flows.skip, "cancel": flows.cancel}
     if action not in calls:
         raise HTTPException(404, "Действие: retry | skip | cancel")
-    return flows.summary(_flow_call(calls[action], item_id, "web"))
+    return flows.summary(_flow_call(calls[action], item_id, "web",
+                                    expected_version=body.expected_version,
+                                    confirm_command_stopped=body.confirm_command_stopped, note=body.note))
 
 
 @app.post("/api/flows/{name}/items", status_code=201)
