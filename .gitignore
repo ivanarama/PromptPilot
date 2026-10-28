@@ -27,3 +27,4 @@ scripts/oneservice/_template.html
 scripts/oneservice/os_iceberg.html
 NUL
 scripts/oneservice/.tg_lock
+.promptpilot-data/
