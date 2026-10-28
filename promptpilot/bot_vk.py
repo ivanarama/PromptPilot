@@ -1074,7 +1074,7 @@ class _NotifyLoop(threading.Thread):
         тревога, дальше напоминание каждые 2 часа, живое = молчим."""
         if not self._peers():
             return
-        for workflow in db.list_workflows():
+        for workflow in db.list_workflows(limit=-1):
             status = workflow.status.value
             if status not in {"awaiting_human", "revision_required"}:
                 self._stands.pop(workflow.id, None)

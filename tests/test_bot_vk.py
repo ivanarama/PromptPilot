@@ -229,6 +229,17 @@ def test_notifications_use_one_global_stream_beyond_workflow_list_limits(isolate
     loop._drain()
     assert len(fake.sent) == 61
 
+    # Autonomous reminders must cover older waiting missions as well.
+    fake.sent.clear()
+    with isolated_db._connect(immediate=True) as conn:
+        conn.execute("UPDATE workflows SET status='awaiting_human'")
+    for workflow in isolated_db.list_workflows(limit=-1):
+        loop._stands[workflow.id] = 0
+    monkeypatch.setattr(bot_vk.time, "time", lambda: 3600)
+    loop._check_stands()
+    assert len(fake.sent) == 61
+    assert any("global-0:" in message[1] for message in fake.sent)
+
 
 def test_transport_keyboard_json(isolated_db, tmp_path):
     kb = bot_vk.main_keyboard()
@@ -615,7 +626,7 @@ def test_stand_detector_alerts_after_threshold(isolated_db, monkeypatch):
     monkeypatch.setattr(bot_vk._NotifyLoop, "_load_last_seq",
                         lambda self: 0)
     loop = bot_vk._NotifyLoop(transport=fake, peers={7: None})
-    monkeypatch.setattr(bot_vk.db, "list_workflows", lambda: [type(
+    monkeypatch.setattr(bot_vk.db, "list_workflows", lambda *args, **kwargs: [type(
         "W", (), {"id": "wf1", "slug": "s", "status": type(
             "S", (), {"value": "revision_required"})(),
         "current_round": 41})()])
@@ -644,7 +655,7 @@ def test_stand_detector_resets_when_running(isolated_db, monkeypatch):
     monkeypatch.setattr(bot_vk._NotifyLoop, "_load_last_seq",
                         lambda self: 0)
     loop = bot_vk._NotifyLoop(transport=fake, peers={7: None})
-    monkeypatch.setattr(bot_vk.db, "list_workflows", lambda: [type(
+    monkeypatch.setattr(bot_vk.db, "list_workflows", lambda *args, **kwargs: [type(
         "W", (), {"id": "wf1", "slug": "s", "status": type(
             "S", (), {"value": "executing"})(),
         "current_round": 41})()])
