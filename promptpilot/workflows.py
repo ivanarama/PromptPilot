@@ -1603,6 +1603,16 @@ def _resume_pending_checkpoint(workflow_id: str,
 def _complete_pending_checkpoint(workflow_id, expected_version, pending, said, *, resume):
     owned = {"version": expected_version}
 
+    def record_note(conn, workflow):
+        if resume and said.get("note"):
+            db._append_workflow_event(conn, WorkflowEventCreate(
+                workflow_id=workflow_id,
+                round_id=_current_round_row(conn, workflow)["id"],
+                event_type="human.input",
+                idempotency_key=f"human.input:checkpoint:{pending['pending_seq']}:{expected_version}",
+                payload={**said, "resume": True, "checkpoint_pending": True},
+            ))
+
     def validate(conn, version):
         workflow = _workflow_row(conn, workflow_id)
         _require_version(workflow, version)
@@ -1623,14 +1633,7 @@ def _complete_pending_checkpoint(workflow_id, expected_version, pending, said, *
                 "pending_seq": pending["pending_seq"],
                 "stage_code": pending["stage_code"],
             }, round_id=_current_round_row(conn, workflow)["id"])
-            if resume and said.get("note"):
-                db._append_workflow_event(conn, WorkflowEventCreate(
-                    workflow_id=workflow_id,
-                    round_id=_current_round_row(conn, workflow)["id"],
-                    event_type="human.input",
-                    idempotency_key=f"human.input:checkpoint:{pending['pending_seq']}:{expected_version}",
-                    payload={**said, "resume": True, "checkpoint_pending": True},
-                ))
+            record_note(conn, workflow)
             owned["version"] = workflow["state_version"]
 
     @contextmanager
@@ -1675,6 +1678,7 @@ def _complete_pending_checkpoint(workflow_id, expected_version, pending, said, *
     except (stage_checkpoint.CheckpointError, OSError, subprocess.SubprocessError) as exc:
         with db._connect(immediate=True) as conn:
             workflow = validate(conn, owned["version"])
+            record_note(conn, workflow)
             workflow = _touch(conn, workflow, "stage.checkpoint_failed", {
                 **said, "stage_code": pending["stage_code"], "reason": str(exc)[:800],
             }, round_id=_current_round_row(conn, workflow)["id"])
