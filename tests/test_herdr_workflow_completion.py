@@ -14,6 +14,10 @@ from promptpilot.herdr_exec import (
 )
 
 
+def _submitted_screen(prompt, text):
+    return "> " + prompt.replace("\n", "\n  ") + "\n" + text
+
+
 def _current_review_screen(text):
     return "> OneBase - REVIEW\n</promptpilot-workflow-contract>\n" + text
 
@@ -233,6 +237,8 @@ def test_run_in_herdr_requires_pipeline_verdict_end_to_end(monkeypatch):
     read_count = 0
     get_count = 0
 
+    submitted = []
+
     def fake_run(args, host=None, timeout=None):
         nonlocal read_count, get_count
         if args[:2] == ["tab", "create"]:
@@ -243,6 +249,7 @@ def test_run_in_herdr_requires_pipeline_verdict_end_to_end(monkeypatch):
         if args[:2] == ["agent", "start"]:
             return 0, {"result": {"agent": {"agent_status": "idle"}}}, ""
         if args[:2] == ["agent", "prompt"]:
+            submitted.append(args[3])
             return 0, {"result": {"agent": {"agent_status": "done"}}}, ""
         if args[:2] == ["agent", "read"]:
             read_count += 1
@@ -253,7 +260,7 @@ def test_run_in_herdr_requires_pipeline_verdict_end_to_end(monkeypatch):
                 4: "Проверки завершены.\nИТОГ: ГОТОВО (reviewed #1414)",
                 5: "Проверки завершены.\nИТОГ: ГОТОВО (reviewed #1414)",
             }
-            return 0, None, _current_review_screen(values[read_count])
+            return 0, None, _submitted_screen(submitted[-1], values[read_count])
         if args[:2] == ["agent", "get"]:
             get_count += 1
             status = {1: "done", 2: "working", 3: "done"}[get_count]
@@ -326,6 +333,8 @@ def test_herdr_deduplicates_permission_flag_and_forwards_pipeline_paths(
         monkeypatch, tmp_path, kind, args, expected_flag):
     calls = []
 
+    submitted = []
+
     def fake_run(args, host=None, timeout=None):
         calls.append(args)
         if args[:2] == ["tab", "create"]:
@@ -336,9 +345,10 @@ def test_herdr_deduplicates_permission_flag_and_forwards_pipeline_paths(
         if args[:2] == ["agent", "start"]:
             return 0, {"result": {"agent": {"agent_status": "idle"}}}, ""
         if args[:2] == ["agent", "prompt"]:
+            submitted.append(args[3])
             return 0, {"result": {"agent": {"agent_status": "done"}}}, ""
         if args[:2] == ["agent", "read"]:
-            return 0, None, "done"
+            return 0, None, _submitted_screen(submitted[-1], "done")
         raise AssertionError(args)
 
     task = SimpleNamespace(
@@ -383,6 +393,8 @@ def test_remote_herdr_does_not_forward_local_pipeline_paths(
         monkeypatch, tmp_path):
     calls = []
 
+    submitted = []
+
     def fake_run(args, host=None, timeout=None):
         calls.append((args, host))
         if args[:2] == ["tab", "create"]:
@@ -393,9 +405,10 @@ def test_remote_herdr_does_not_forward_local_pipeline_paths(
         if args[:2] == ["agent", "start"]:
             return 0, {"result": {"agent": {"agent_status": "idle"}}}, ""
         if args[:2] == ["agent", "prompt"]:
+            submitted.append(args[3])
             return 0, {"result": {"agent": {"agent_status": "done"}}}, ""
         if args[:2] == ["agent", "read"]:
-            return 0, None, "done"
+            return 0, None, _submitted_screen(submitted[-1], "done")
         raise AssertionError(args)
 
     task = SimpleNamespace(
@@ -623,6 +636,8 @@ def test_required_completion_without_verdict_fails_and_closes_owned_tab(
     reads = iter(["Работа оборвалась без итога", "Работа оборвалась без итога"])
     closed = []
 
+    submitted = []
+
     def fake_run(args, host=None, timeout=None):
         if args[:2] == ["tab", "create"]:
             return 0, {"result": {
@@ -632,9 +647,10 @@ def test_required_completion_without_verdict_fails_and_closes_owned_tab(
         if args[:2] == ["agent", "start"]:
             return 0, {"result": {"agent": {"agent_status": "idle"}}}, ""
         if args[:2] == ["agent", "prompt"]:
+            submitted.append(args[3])
             return 0, {"result": {"agent": {"agent_status": "done"}}}, ""
         if args[:2] == ["agent", "read"]:
-            return 0, None, next(reads)
+            return 0, None, _submitted_screen(submitted[-1], next(reads))
         if args[:2] == ["agent", "get"]:
             return 0, {"result": {"agent": {"agent_status": "done"}}}, ""
         raise AssertionError(args)
@@ -673,3 +689,64 @@ def test_unknown_terminal_without_current_prompt_cannot_replay_screen():
     assert cleaned == ""
     assert _closing_workflow_verdict(cleaned) == ""
     assert _retry_reason(cleaned) is None
+
+
+@pytest.mark.parametrize("same_task", [False, True])
+def test_public_herdr_attempt_rejects_old_response_even_with_shared_or_identical_prompt(monkeypatch, same_task):
+    heading = "The shared workflow executor instructions"
+    first_text = heading + "\nOLD task"
+    current_text = first_text if same_task else heading + "\nNEW task"
+    submitted, old_screen = [], []
+    def fake_run(args, host=None, timeout=None):
+        if args[:2] == ["agent", "get"]:
+            return 0, {"result": {"agent": {"agent_status": "done", "pane_id": "w1:p1", "state_change_seq": 3}}}, ""
+        if args[:2] == ["agent", "prompt"]:
+            submitted.append(args[3])
+            return 0, {"result": {"agent": {"agent_status": "done", "pane_id": "w1:p1", "state_change_seq": 5}}}, ""
+        if args[:2] == ["agent", "read"]:
+            if not old_screen:
+                old_screen.append(_submitted_screen(submitted[-1], "Current first response\n" + "\u0418\u0422\u041e\u0413: \u0413\u041e\u0422\u041e\u0412\u041e"))
+            return 0, None, old_screen[0]
+        raise AssertionError(args)
+    monkeypatch.setattr(herdr_exec, "_ensure_server", lambda host: None)
+    monkeypatch.setattr(herdr_exec, "_run", fake_run)
+    monkeypatch.setattr(herdr_exec, "WORKFLOW_IDLE_GRACE_SECONDS", 0)
+    monkeypatch.setattr(herdr_exec.time, "sleep", lambda seconds: None)
+    task = SimpleNamespace(id=987, herdr_target="existing-user-session", detached=False,
+                           model=None, effort=None, session_id=None, skip_permissions=False,
+                           working_dir=".", worktree=False)
+    first = herdr_exec.run_in_herdr(task, {"kind": "agy"}, prompt_override=first_text, require_closing_verdict=True)
+    assert first["ok"] is True
+    second = herdr_exec.run_in_herdr(task, {"kind": "agy"}, prompt_override=current_text, require_closing_verdict=True)
+    assert second["ok"] is False and second["rate_limited"] is False
+    assert "not correlated" in second["error"]
+    assert herdr_exec._turn_marker(submitted[0]) != herdr_exec._turn_marker(submitted[1])
+
+
+def test_turn_read_widens_only_to_real_herdr_history_cap(monkeypatch):
+    prompt = herdr_exec._with_turn_marker("Task with an old quoted quota exceeded warning")
+    calls = []
+    def read(args, host=None, timeout=None):
+        limit = int(args[args.index("--lines") + 1])
+        calls.append(limit)
+        if limit < 1000:
+            return 0, None, "Old response with quota exceeded"
+        return 0, None, _submitted_screen(prompt, "Fresh response")
+    monkeypatch.setattr(herdr_exec, "_run", read)
+    monkeypatch.setattr(herdr_exec, "HERDR_READ_LINES", 300)
+    code, _, raw = herdr_exec._read_turn_screen("test", prompt)
+    assert code == 0 and calls == [300, 1000]
+    assert herdr_exec._trim_transcript(raw, prompt) == "Fresh response"
+    assert herdr_exec._retry_reason(herdr_exec._trim_transcript(raw, prompt)) is None
+    monkeypatch.setattr(herdr_exec, "HERDR_READ_LINES", 2000)
+    calls.clear()
+    herdr_exec._read_turn_screen("test", prompt)
+    assert calls == [1000]
+
+
+def test_old_quoted_turn_footer_cannot_replace_the_owned_suffix():
+    old = herdr_exec._with_turn_marker("Old task")
+    current = herdr_exec._with_turn_marker("New task quotes old material:\n" + old)
+    screen = _submitted_screen(current, "Current answer")
+    assert herdr_exec._turn_marker(old) != herdr_exec._turn_marker(current)
+    assert herdr_exec._trim_transcript(screen, current) == "Current answer"

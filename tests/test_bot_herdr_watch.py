@@ -105,3 +105,47 @@ def test_durable_completion_keeps_screen_and_reply_buttons():
     buttons = bot._herdr_done_keyboard("build:w1:p2")
     callbacks = [button.callback_data for row in buttons for button in row]
     assert callbacks == ["hd_screen:build:w1:p2", "hd_reply:build:w1:p2"]
+
+
+def test_reused_pane_new_terminal_is_new_completion_but_rename_is_not(isolated_db, monkeypatch):
+    agents = [{"pane_id": "w1:pA", "terminal_id": "terminal-old", "name": "worker",
+               "agent_status": "done", "completion_seq": 0}]
+    install_watch(monkeypatch, agents)
+    poll()
+    agents.clear()
+    poll()
+    agents.append({"pane_id": "w1:pA", "terminal_id": "terminal-new", "name": "worker",
+                   "agent_status": "done", "completion_seq": 0})
+    poll()
+    assert len(db.get_unsent_notifications()) == 1
+    agents[0]["name"] = "renamed"
+    poll()
+    assert len(db.get_unsent_notifications()) == 1
+    agents[0]["pane_id"] = "w2:pB"
+    poll()
+    assert len(db.get_unsent_notifications()) == 1  # Layout move is not new work.
+
+
+def test_session_fallback_and_observed_legacy_absence(isolated_db, monkeypatch):
+    agent = {"pane_id": "w1:pA", "name": "worker", "agent_status": "done", "completion_seq": 0,
+             "agent_session": {"source": "native", "agent": "claude", "kind": "id", "value": "first"}}
+    agents = [agent]
+    install_watch(monkeypatch, agents)
+    poll()
+    agent["agent_session"]["value"] = "second"
+    poll()
+    assert len(db.get_unsent_notifications()) == 1
+    agents.clear()
+    poll()
+    legacy = {"pane_id": "w2:pA", "name": "old", "agent_status": "done", "completion_seq": 0}
+    agents.append(legacy)
+    poll()
+    assert len(db.get_unsent_notifications()) == 2
+    legacy["name"] = "renamed"
+    poll()
+    assert len(db.get_unsent_notifications()) == 2
+    agents.clear()
+    poll()
+    agents.append(dict(legacy))
+    poll()
+    assert len(db.get_unsent_notifications()) == 3

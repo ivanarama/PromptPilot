@@ -3293,14 +3293,15 @@ async def _herdr_watch_tick(bot, notified, initialized):
                     continue  # PromptPilot's own tasks notify via the worker
                 current[pane] = a
             completions = [
-                {"pane": pane, "name": agent.get("name") or "",
+                {"pane": pane, "terminal_id": agent.get("terminal_id"),
+                 "agent_session": agent.get("agent_session"),
                  "sequence": _herdr_completion_sequence(agent),
                  "message": _herdr_completion_notice(machine, pane, agent)}
                 for pane, agent in current.items()
                 if agent.get("agent_status") == "done" and _herdr_completion_sequence(agent) is not None
             ]
             db.queue_herdr_completions(_herdr_watch_source(machine, host), completions,
-                                      [int(chat) for chat in list_authorized()], machine=machine)
+                                      [int(chat) for chat in list_authorized()], machine=machine, present_panes=list(current))
             seen.update((machine, pane) for pane in current)
             now = time.monotonic()
             for pane, a in current.items():
