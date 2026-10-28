@@ -295,3 +295,43 @@ def test_fix_reuses_negative_admission_exclusions(
     monkeypatch.delenv("PP_PIPELINE_EXCLUDED_NUMBERS")
     assert fix_handoff.gate(None, dict(CONFIG), preflight["handoff"]["lease"])[
         "action"] == "validated"
+
+
+@pytest.mark.parametrize("purpose", ["admission", "ownership"])
+@pytest.mark.parametrize("slow_operation", ["actor", "renewal"])
+def test_public_gate_rechecks_expiry_after_slow_operations(
+        isolated_db, monkeypatch, tmp_path, capsys, purpose, slow_operation):
+    original_identity = pipelinectl.ensure_identity
+    _setup_handoff(isolated_db, monkeypatch, tmp_path, [
+        {"stage": "review", "number": 10, "head": HEAD_A}])
+    _, preflight = _cli(monkeypatch, capsys, tmp_path, "next", "fix")
+    _, admitted = _cli(monkeypatch, capsys, tmp_path, "gate-fallback", "fix",
+                         "--lease", preflight["handoff"]["lease"])
+    token = (preflight["handoff"]["lease"] if purpose == "admission"
+             else admitted["ownership_lease"])
+    clock = [pipelinectl.decode_signed_lease(token)["expires_at"] - 1]
+    monkeypatch.setattr(fix_handoff.time, "time", lambda: clock[0])
+    if slow_operation == "actor":
+        class SlowGitHub:
+            def json(self, *args):
+                assert args == ("api", "user")
+                clock[0] += 2
+                return {"login": "owner"}
+
+        monkeypatch.setattr(pipelinectl, "GitHub", SlowGitHub)
+        monkeypatch.setattr(pipelinectl, "ensure_identity", original_identity)
+    else:
+        renew = pipelinectl.renew_lease_target_reservation
+
+        def slow_renew(*args):
+            result = renew(*args)
+            clock[0] += 2
+            return result
+
+        monkeypatch.setattr(pipelinectl, "renew_lease_target_reservation", slow_renew)
+    command = (["gate-fallback", "fix"] if purpose == "admission"
+               else ["gate-fix-owner"])
+    code, value = _cli(monkeypatch, capsys, tmp_path, *command, "--lease", token)
+    assert code == 2 and value["action"] == "error"
+    assert "expired" in value["error"]
+    assert "ownership_lease" not in value

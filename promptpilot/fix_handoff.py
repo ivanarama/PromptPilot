@@ -255,4 +255,7 @@ def gate(gh, config: dict, lease_value: str, *, config_path=None,
         result["ownership_lease"] = pp.encode_signed_lease({
             **lease, "purpose": OWNER_PROTOCOL,
         })
+    # Actor I/O, DB renewal and progress-token key reads all consume lifetime.
+    # Do not return admission (or a newly minted token) after signed expiry.
+    validate_lease(lease, purpose=purpose)
     return result
