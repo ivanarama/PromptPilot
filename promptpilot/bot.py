@@ -43,6 +43,7 @@ from telegram.ext import (
 from . import db, epf_tools, pipeline_insights
 from .config import (
     DEFAULT_CLI, HERDR_RENOTIFY_COOLDOWN, HERDR_WATCH, HERDR_WATCH_INTERVAL, LOG_PROMPTS,
+    ensure_herdr_launch_provider, herdr_launch_kind,
     get_provider_models, get_proxy_url, get_skills, load_machines, load_providers,
     load_providers_detailed, mask_proxy_url, pickable_providers,
     PROJECTS_ROOT, TASK_PASSWORD, EFFORT_LEVELS,
@@ -57,7 +58,7 @@ logger = logging.getLogger(__name__)
 (ASK_PASSWORD, ASK_PROMPT, ASK_PROVIDER, ASK_PRIORITY, ASK_DIR, ASK_DIR_MANUAL,
  ASK_SCHEDULE, ASK_REPLY, ASK_SKILL_ARGS, ASK_MODEL, ASK_RECURRENCE,
  ASK_HERDR_REPLY, ASK_HERDR_TARGET, ASK_MACHINE, ASK_CONFIRM, ASK_EXTRAS,
- ASK_EFFORT, ASK_LAST) = range(18)
+ ASK_EFFORT, ASK_LAST, ASK_HERDR_AGENT, ASK_DIR_CREATE) = range(20)
 
 # 1С-доработка (epf_conv): отдельная нумерация, чтобы не пересекаться
 # с состояниями мастера задач
@@ -325,8 +326,9 @@ def _pw_grant(user_id: int):
 _WIZARD_KEYS = ("new_prompt", "new_provider", "new_priority", "new_dir", "new_schedule",
                 "new_recurrence", "new_detached", "new_keep_pane", "new_model", "new_effort",
                 "new_skip_permissions", "new_skill_name", "new_herdr_target", "new_machine",
-                "new_worktree", "pw_attempts", "model_list", "herdr_targets",
+                "new_worktree", "pw_attempts", "model_list", "herdr_targets", "herdr_new_providers",
                 "last_settings", "dir_base", "dir_subs", "dir_page", "dir_hist",
+                "dir_create_base", "dir_create_path", "dir_create_token",
                 "att_media_group")
 
 
@@ -578,7 +580,7 @@ async def cb_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     icon = STATUS_ICON.get(task.status.value, "•")
     created = _local_str(task.created_at)
     completed = _local_str(task.completed_at) if task.completed_at else None
-    provider_str = _esc(task.provider) if task.provider else "claude \\(по умолчанию\\)"
+    provider_str = _esc(_provider_label(task.provider)) if task.provider else "claude \\(по умолчанию\\)"
 
     proj = _project_name(task.working_dir)
     status_ru = STATUS_RU.get(task.status.value, task.status.value)
@@ -1499,18 +1501,26 @@ async def add_task_got_password(update: Update, context: ContextTypes.DEFAULT_TY
     return ASK_PROMPT
 
 
-def _provider_buttons(machine: str = None):
+def _provider_label(provider: str) -> str:
+    return load_providers().get(provider, {}).get("herdr_source") or provider
+
+
+def _available_providers(machine: str = None):
     if machine:
         # Availability is decided by the machine's own probe — a provider may
         # be installed there and missing here (and vice versa).
         allowed = set(load_machines().get(machine, {}).get("providers") or [])
-        providers = {n: i for n, i in load_providers().items()
-                     if n in allowed and not i.get("hidden")}
-    else:
-        providers = pickable_providers()
+        return {n: i for n, i in load_providers().items()
+                if n in allowed and not i.get("hidden")}
+    return pickable_providers()
+
+
+def _provider_buttons(machine: str = None):
+    providers = _available_providers(machine)
     row, buttons = [], []
-    for name in providers:
-        row.append(InlineKeyboardButton(name, callback_data=f"pickprov:{name}"))
+    for name, info in providers.items():
+        label = "🖥 Окна Herdr" if info.get("session_target") else name
+        row.append(InlineKeyboardButton(label, callback_data=f"pickprov:{name}"))
         if len(row) == 2:
             buttons.append(row)
             row = []
@@ -1546,7 +1556,10 @@ def _load_last_settings(chat_id: int) -> Optional[dict]:
 
 
 def _last_settings_line(last: dict) -> str:
-    parts = [last.get("new_provider") or f"{DEFAULT_CLI} (по умолчанию)"]
+    provider = last.get("new_provider")
+    parts = [_provider_label(provider) if provider else f"{DEFAULT_CLI} (по умолчанию)"]
+    if load_providers().get(provider, {}).get("herdr_source"):
+        parts.append("новое окно Herdr")
     if last.get("new_model"):
         parts.append(last["new_model"])
     if last.get("new_effort"):
@@ -1763,51 +1776,18 @@ async def add_task_got_provider(update: Update, context: ContextTypes.DEFAULT_TY
     await query.answer()
     provider = query.data.split(":", 1)[1] or None
     context.user_data["new_provider"] = provider
+    for key in ("new_herdr_target", "herdr_targets", "herdr_new_providers", "new_model", "new_effort"):
+        context.user_data.pop(key, None)
 
     if load_providers().get(provider or DEFAULT_CLI, {}).get("session_target"):
-        machine = context.user_data.get("new_machine")
-        host = _machine_remote(machine)
-        data = await _herdr_json("agent", "list", host=host)
-        agents = ((data or {}).get("result") or {}).get("agents") or []
-        agents = [a for a in agents if a.get("pane_id")]
-        if not agents:
-            # Keep the wizard (and the typed prompt) alive: let the user open
-            # a pane and tap the provider again, or pick another one.
-            where = f" на машине {machine}" if machine else ""
-            buttons = _provider_buttons(machine)
-            await query.edit_message_text(
-                f"Нет открытых herdr-сессий{where}.\n"
-                "Открой панель с агентом и выбери провайдера ещё раз:",
-                reply_markup=InlineKeyboardMarkup(buttons) if buttons else None,
-            )
-            return ASK_PROVIDER
-        ws = await _herdr_json("workspace", "list", host=host)
-        ws_labels = {w.get("workspace_id"): w.get("label") or w.get("workspace_id")
-                     for w in ((ws or {}).get("result") or {}).get("workspaces") or []}
-        multi_ws = len(set(a.get("workspace_id") for a in agents)) > 1
-        status_icon = {"blocked": "⏸", "done": "✅", "working": "🔄"}
+        return await _show_herdr_targets(query, context)
 
-        def _label(a):
-            icon = status_icon.get(a.get("agent_status"), "•")
-            what = (a.get("terminal_title_stripped") or a.get("name") or a.get("pane_id") or "")[:35]
-            wsl = ws_labels.get(a.get("workspace_id"), "")
-            return f"{icon} {wsl}: {what}" if multi_ws and wsl else f"{icon} {what}"
+    return await _ask_provider_model(query, context)
 
-        # Selection by index into a cached list: an agent name in callback_data
-        # can pass 64 bytes, and Telegram then rejects the WHOLE keyboard.
-        targets = [a.get("name") or a.get("pane_id") for a in agents]
-        context.user_data["herdr_targets"] = targets
-        buttons = [[InlineKeyboardButton(_label(a), callback_data=f"hst_i:{i}")]
-                   for i, a in enumerate(agents[:20])]
-        if len(agents) > 20:
-            buttons.append([InlineKeyboardButton(
-                f"… ещё {len(agents) - 20} — сузь список, закрыв лишние панели",
-                callback_data="hst_more")])
-        await query.edit_message_text("В какую сессию отправить промпт?",
-                                      reply_markup=InlineKeyboardMarkup(buttons))
-        return ASK_HERDR_TARGET
 
+async def _ask_provider_model(query, context):
     import asyncio
+    provider = context.user_data.get("new_provider")
     models = await asyncio.to_thread(get_provider_models, provider or DEFAULT_CLI)
     if models:
         context.user_data["model_list"] = models
@@ -1815,6 +1795,103 @@ async def add_task_got_provider(update: Update, context: ContextTypes.DEFAULT_TY
         return ASK_MODEL
 
     return await _ask_dir(query, context)
+
+
+async def _show_herdr_targets(query, context):
+    machine = context.user_data.get("new_machine")
+    host = _machine_remote(machine)
+    data = await _herdr_json("agent", "list", host=host)
+    agents = ((data or {}).get("result") or {}).get("agents") or []
+    agents = [a for a in agents if a.get("pane_id")]
+    ws_labels = {}
+    if agents:
+        ws = await _herdr_json("workspace", "list", host=host)
+        ws_labels = {w.get("workspace_id"): w.get("label") or w.get("workspace_id")
+                     for w in ((ws or {}).get("result") or {}).get("workspaces") or []}
+    multi_ws = len(set(a.get("workspace_id") for a in agents)) > 1
+    status_icon = {"blocked": "⏸", "done": "✅", "working": "🔄"}
+
+    def label(agent):
+        icon = status_icon.get(agent.get("agent_status"), "•")
+        what = (agent.get("terminal_title_stripped") or agent.get("name") or agent["pane_id"])[:35]
+        workspace = ws_labels.get(agent.get("workspace_id"), "")
+        return f"{icon} {workspace}: {what}" if multi_ws and workspace else f"{icon} {what}"
+
+    # Use indices: long agent names exceed Telegram's 64-byte callback limit.
+    context.user_data["herdr_targets"] = [a.get("name") or a["pane_id"] for a in agents]
+    buttons = [[InlineKeyboardButton("➕ Новое окно", callback_data="hst_new")]]
+    buttons += [[InlineKeyboardButton(label(a), callback_data=f"hst_i:{i}")]
+                for i, a in enumerate(agents[:20])]
+    if len(agents) > 20:
+        buttons.append([InlineKeyboardButton(
+            f"… ещё {len(agents) - 20} — сузь список, закрыв лишние панели",
+            callback_data="hst_more")])
+    buttons.append([InlineKeyboardButton(BACK_LABEL, callback_data="hst_back")])
+    text = "В какое окно Herdr отправить задачу?"
+    if not agents:
+        text = ("Нет открытых окон Herdr. Можно создать новое." if data is not None else
+                "Не удалось получить окна Herdr. Можно попробовать создать новое.")
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+    return ASK_HERDR_TARGET
+
+
+def _herdr_new_choices(machine=None):
+    providers = _available_providers(machine)
+    if not any(info.get("executor") == "herdr" for info in providers.values()):
+        return {}
+    return {name: info for name, info in providers.items() if herdr_launch_kind(name, info)}
+
+
+async def cb_herdr_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    choices = _herdr_new_choices(context.user_data.get("new_machine"))
+    if not choices:
+        await query.answer("Нет доступных агентов для нового окна Herdr на этой машине.", show_alert=True)
+        return ASK_HERDR_TARGET
+    await query.answer()
+    context.user_data.pop("new_herdr_target", None)
+    context.user_data["herdr_new_providers"] = list(choices)
+    buttons = [[InlineKeyboardButton(name, callback_data=f"hnew_i:{i}")]
+               for i, name in enumerate(choices)]
+    buttons.append([InlineKeyboardButton(BACK_LABEL, callback_data="hnew_back")])
+    await query.edit_message_text("Выберите агента для нового окна Herdr:",
+                                  reply_markup=InlineKeyboardMarkup(buttons))
+    return ASK_HERDR_AGENT
+
+
+@require_auth
+async def cb_herdr_new_agent(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    choices = context.user_data.get("herdr_new_providers") or []
+    idx = int(query.data.split(":")[1])
+    available = _herdr_new_choices(context.user_data.get("new_machine"))
+    if idx >= len(choices) or choices[idx] not in available:
+        await query.answer("Список агентов устарел — выберите новое окно заново.", show_alert=True)
+        return ASK_HERDR_AGENT
+    await query.answer()
+    if not await _check_task_creation_access(update):
+        return ConversationHandler.END
+    try:
+        provider = ensure_herdr_launch_provider(choices[idx])
+    except (OSError, ValueError):
+        logger.exception("Не удалось настроить запуск нового окна Herdr")
+        await query.message.reply_text("Не удалось подготовить новое окно Herdr. Попробуйте ещё раз.")
+        return ASK_HERDR_AGENT
+    context.user_data["new_provider"] = provider
+    for key in ("new_herdr_target", "new_model", "new_effort", "model_list"):
+        context.user_data.pop(key, None)
+    return await _ask_provider_model(query, context)
+
+
+async def cb_herdr_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data.pop("herdr_new_providers", None)
+    if query.data == "hnew_back":
+        return await _show_herdr_targets(query, context)
+    buttons = _provider_buttons(context.user_data.get("new_machine"))
+    await query.edit_message_text("Выберите провайдера:", reply_markup=InlineKeyboardMarkup(buttons))
+    return ASK_PROVIDER
 
 
 async def add_task_got_herdr_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1966,8 +2043,28 @@ def _manual_dir_prompt() -> str:
 
 
 def _clear_dir_nav(context):
-    for k in ("dir_base", "dir_subs", "dir_page", "dir_hist"):
+    for k in ("dir_base", "dir_subs", "dir_page", "dir_hist",
+              "dir_create_base", "dir_create_path", "dir_create_token"):
         context.user_data.pop(k, None)
+
+
+def _dir_create_buttons(context):
+    if context.user_data.get("new_machine"):
+        return []
+    return [[InlineKeyboardButton("➕ Новая папка", callback_data="dir_new")]]
+
+
+def _resolve_local_dir(context, text):
+    path = os.path.expanduser(text.strip())
+    if not path:
+        raise ValueError("Введите имя папки или полный путь.")
+    if not os.path.isabs(path):
+        if os.path.splitdrive(path)[0]:
+            raise ValueError("Укажите полный путь с диском или имя новой папки.")
+        base = (context.user_data.get("dir_create_base") or context.user_data.get("dir_base")
+                or PROJECTS_ROOT or os.path.expanduser("~"))
+        path = os.path.join(base, path)
+    return os.path.abspath(path)
 
 
 def _dir_screen(context):
@@ -2013,6 +2110,7 @@ def _dir_screen(context):
         buttons.append(nav)
     if not at_root:
         buttons.append([InlineKeyboardButton(BACK_LABEL, callback_data="dir_up")])
+    buttons += _dir_create_buttons(context)
     buttons.append([
         InlineKeyboardButton("✏️ Ввести вручную", callback_data="dir:__manual__"),
         InlineKeyboardButton("⏭ Пропустить", callback_data="dir:__skip__"),
@@ -2052,6 +2150,7 @@ async def _ask_dir(query, context):
         context.user_data["dir_hist"] = hist
         buttons = [[InlineKeyboardButton(_short_dir(d), callback_data=f"dirh:{i}")]
                    for i, d in enumerate(hist)]
+        buttons += _dir_create_buttons(context)
         buttons.append([
             InlineKeyboardButton("✏️ Ввести вручную", callback_data="dir:__manual__"),
             InlineKeyboardButton("⏭ Пропустить", callback_data="dir:__skip__"),
@@ -2062,7 +2161,9 @@ async def _ask_dir(query, context):
         )
         return ASK_DIR
 
-    await query.edit_message_text(_manual_dir_prompt())
+    rows = _dir_create_buttons(context)
+    await query.edit_message_text(_manual_dir_prompt(),
+                                  reply_markup=InlineKeyboardMarkup(rows) if rows else None)
     return ASK_DIR_MANUAL
 
 
@@ -2156,25 +2257,115 @@ async def add_task_got_dir_btn(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.edit_message_text("Директория: не указана")
         return await _after_dir_from_query(query, context)
     if value == "__manual__":
-        await query.edit_message_text(_manual_dir_prompt())
+        for key in ("dir_create_base", "dir_create_path", "dir_create_token"):
+            context.user_data.pop(key, None)
+        rows = _dir_create_buttons(context)
+        await query.edit_message_text(_manual_dir_prompt(),
+                                      reply_markup=InlineKeyboardMarkup(rows) if rows else None)
         return ASK_DIR_MANUAL
     return await _pick_dir(query, context, os.path.join(PROJECTS_ROOT, value))
 
 
 async def add_task_got_dir(update: Update, context: ContextTypes.DEFAULT_TYPE):
     path = os.path.expanduser(update.message.text.strip())
+    for key in ("dir_create_path", "dir_create_token"):
+        context.user_data.pop(key, None)
     # A local path can be checked right now — a typo caught here beats a task
     # that fails at start. A remote machine's filesystem is not ours to ask.
-    if path and not context.user_data.get("new_machine") and not os.path.isdir(path):
-        await update.message.reply_text(
-            f"Каталог не найден: {path}\nВведите ещё раз или /skip:")
-        return ASK_DIR_MANUAL
+    if path and not context.user_data.get("new_machine"):
+        try:
+            path = _resolve_local_dir(context, path)
+        except ValueError as exc:
+            await update.message.reply_text(str(exc))
+            return ASK_DIR_MANUAL
+        if not os.path.isdir(path):
+            if os.path.exists(path):
+                await update.message.reply_text(f"Это файл, а нужна папка: {path}\nВведите другой путь:")
+                return ASK_DIR_MANUAL
+            token = uuid.uuid4().hex[:12]
+            context.user_data.update(dir_create_path=path, dir_create_token=token)
+            await update.message.reply_text(
+                f"Каталог не найден: {path}\nСоздать его и использовать для задачи?",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📁 Создать и выбрать", callback_data=f"dir_make:{token}")],
+                    [InlineKeyboardButton("✏️ Другой путь", callback_data="dir:__manual__")],
+                ]))
+            return ASK_DIR_MANUAL
     context.user_data["new_dir"] = path or None
+    _clear_dir_nav(context)
     return await _after_dir(update, context)
+
+
+async def cb_dir_create_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if context.user_data.get("new_machine"):
+        await query.answer("Создание папки доступно для локальной машины.", show_alert=True)
+        return None
+    await query.answer()
+    base = context.user_data.get("dir_base") or PROJECTS_ROOT or os.path.expanduser("~")
+    context.user_data["dir_create_base"] = base
+    context.user_data.pop("dir_create_path", None)
+    context.user_data.pop("dir_create_token", None)
+    await query.edit_message_text(
+        f"Новая папка внутри: {base}\nВведите имя папки или полный путь:",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(BACK_LABEL, callback_data="dir_create_back")]]))
+    return ASK_DIR_CREATE
+
+
+async def _create_and_pick_dir(update, context, path, retry_state):
+    import asyncio
+    if not await _check_task_creation_access(update):
+        return ConversationHandler.END
+    query = update.callback_query or _MsgSend(update.message)
+    if context.user_data.get("new_machine"):
+        await query.message.reply_text("Создание папки доступно для локальной машины.")
+        return retry_state
+    try:
+        await asyncio.to_thread(os.makedirs, path, exist_ok=True)
+    except (OSError, ValueError) as exc:
+        await query.message.reply_text(f"Не удалось создать папку: {exc}\nВведите другой путь:")
+        return retry_state
+    return await _pick_dir(query, context, path)
+
+
+@require_auth
+async def add_task_got_new_dir(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        path = _resolve_local_dir(context, update.message.text)
+    except ValueError as exc:
+        await update.message.reply_text(str(exc))
+        return ASK_DIR_CREATE
+    return await _create_and_pick_dir(update, context, path, ASK_DIR_CREATE)
+
+
+@require_auth
+async def cb_dir_create_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    path = context.user_data.get("dir_create_path")
+    token = query.data.split(":", 1)[1]
+    if not path or token != context.user_data.get("dir_create_token"):
+        await query.answer("Этот путь уже не выбран. Введите путь заново.", show_alert=True)
+        return ASK_DIR_MANUAL
+    await query.answer()
+    return await _create_and_pick_dir(update, context, path, ASK_DIR_MANUAL)
+
+
+async def cb_dir_create_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    for key in ("dir_create_base", "dir_create_path", "dir_create_token"):
+        context.user_data.pop(key, None)
+    if context.user_data.get("dir_base"):
+        text, kb = _dir_screen(context)
+        await query.edit_message_text(text, reply_markup=kb)
+        return ASK_DIR
+    return await _ask_dir(query, context)
 
 
 async def add_task_skip_dir(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["new_dir"] = None
+    _clear_dir_nav(context)
     return await _after_dir(update, context)
 
 
@@ -2211,7 +2402,8 @@ def _wizard_summary(context) -> str:
     prompt = ud.get("new_prompt", "")
     if len(prompt) > 200:
         prompt = prompt[:200] + "…"
-    prov = ud.get("new_provider") or f"{DEFAULT_CLI} (по умолчанию)"
+    provider = ud.get("new_provider")
+    prov = _provider_label(provider) if provider else f"{DEFAULT_CLI} (по умолчанию)"
     model = f" · {ud['new_model']}" if ud.get("new_model") else ""
     if ud.get("new_effort"):
         model += f" · эффорт {ud['new_effort']}"
@@ -2230,6 +2422,8 @@ def _wizard_summary(context) -> str:
     if ud.get("new_herdr_target"):
         lines.append(f"🖥 Сессия: {ud['new_herdr_target']}")
     else:
+        if load_providers().get(provider or DEFAULT_CLI, {}).get("executor") == "herdr":
+            lines.append("🖥 Новое окно Herdr")
         lines.append(f"📂 {ud.get('new_dir') or 'директория не указана'}")
     sched = ud.get("new_schedule")
     when = _local_str(sched) if sched else "сейчас"
@@ -2314,7 +2508,10 @@ async def cb_wiz_drop_machine(update: Update, context: ContextTypes.DEFAULT_TYPE
     ud.pop("new_machine", None)
     ud.pop("new_herdr_target", None)
     # Провайдер выбирался из списка той машины — локально его может не быть
-    if ud.get("new_provider") and ud["new_provider"] not in pickable_providers():
+    provider = ud.get("new_provider")
+    source = load_providers().get(provider, {}).get("herdr_source")
+    if provider and provider not in pickable_providers() and not (
+            source and source in _herdr_new_choices()):
         ud.pop("new_provider", None)
         ud.pop("new_model", None)
         ud.pop("new_effort", None)
@@ -2660,7 +2857,7 @@ async def _finish_add_task_from_query(update, context):
     att_str = f"\nВложения: {len(attachments)}" if attachments else ""
     await query.message.reply_text(
         f"✅ Задача #{task.id} добавлена!\n"
-        f"Провайдер: {provider or f'{DEFAULT_CLI} (по умолчанию)'}\n"
+        f"Провайдер: {_provider_label(provider) if provider else f'{DEFAULT_CLI} (по умолчанию)'}\n"
         f"Директория: {working_dir or 'не указана'}{wt_str}{att_str}\n"
         f"Запуск: {sched_str}{skip_str}{detached_str}",
         reply_markup=_main_menu(),
@@ -4293,8 +4490,15 @@ def run_bot():
                 att_midway,
             ],
             ASK_HERDR_TARGET: [
+                CallbackQueryHandler(cb_herdr_new, pattern=r"^hst_new$"),
+                CallbackQueryHandler(cb_herdr_back, pattern=r"^hst_back$"),
                 CallbackQueryHandler(add_task_got_herdr_target,
                                      pattern=r"^(hst_i:\d+|hst_more)$"),
+                att_midway,
+            ],
+            ASK_HERDR_AGENT: [
+                CallbackQueryHandler(cb_herdr_new_agent, pattern=r"^hnew_i:\d+$"),
+                CallbackQueryHandler(cb_herdr_back, pattern=r"^hnew_back$"),
                 att_midway,
             ],
             ASK_MODEL: [
@@ -4307,6 +4511,7 @@ def run_bot():
                 att_midway,
             ],
             ASK_DIR: [
+                CallbackQueryHandler(cb_dir_create_start, pattern=r"^dir_new$"),
                 CallbackQueryHandler(cb_dir_nav, pattern=r"^dirn:\d+$"),
                 CallbackQueryHandler(cb_dir_pick_idx, pattern=r"^dirp:\d+$"),
                 CallbackQueryHandler(cb_dir_here, pattern=r"^dir_here$"),
@@ -4317,8 +4522,16 @@ def run_bot():
                 att_midway,
             ],
             ASK_DIR_MANUAL: [
+                CallbackQueryHandler(cb_dir_create_start, pattern=r"^dir_new$"),
+                CallbackQueryHandler(cb_dir_create_confirm, pattern=r"^dir_make:[a-f0-9]{12}$"),
+                CallbackQueryHandler(add_task_got_dir_btn, pattern=r"^dir:__manual__$"),
                 CommandHandler("skip", add_task_skip_dir),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, add_task_got_dir),
+                att_midway,
+            ],
+            ASK_DIR_CREATE: [
+                CallbackQueryHandler(cb_dir_create_back, pattern=r"^dir_create_back$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_task_got_new_dir),
                 att_midway,
             ],
             ASK_CONFIRM: [

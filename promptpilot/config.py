@@ -647,6 +647,44 @@ def pickable_providers() -> dict:
     }
 
 
+def herdr_launch_kind(name: str, info: dict) -> str:
+    """Interactive kind for a provider that can open a new Herdr pane."""
+    if info.get("session_target"):
+        return ""
+    if info.get("executor"):
+        return (info.get("kind") or "claude") if info["executor"] == "herdr" else ""
+    kind = info.get("kind") or {"claude": "claude", "claude-z": "claude",
+                               "codex": "codex", "opencode": "opencode"}.get(name)
+    return kind if kind in {"claude", "codex", "opencode"} else ""
+
+
+@_provider_write
+def ensure_herdr_launch_provider(source: str) -> str:
+    """Register a hidden interactive route, also visible to an existing worker.
+
+    Headless command templates/arguments cannot be reused by an interactive
+    agent. Keep only its environment, models and capability settings.
+    """
+    info = load_providers().get(source, {})
+    kind = herdr_launch_kind(source, info)
+    if not kind:
+        raise ValueError("Этот агент не поддерживает новое окно Herdr")
+    if info.get("executor") == "herdr":
+        return source
+    name = f"__herdr_window_{source}"
+    custom = _load_custom_providers()
+    if name in custom and custom[name].get("herdr_source") != source:
+        raise ValueError("Имя запуска Herdr уже занято другим провайдером")
+    entry = {k: info[k] for k in ("env", "models", "effort", "supports_skills",
+                                  "supports_effort") if k in info}
+    entry.update(executor="herdr", kind=kind, hidden=True, herdr_source=source,
+                 description=f"{source} — новое окно Herdr")
+    if custom.get(name) != entry:
+        custom[name] = entry
+        _write_custom_providers(custom)
+    return name
+
+
 @_provider_write
 def remove_provider(name: str) -> bool:
     """Remove a custom provider from providers.json."""
