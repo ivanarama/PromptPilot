@@ -23,10 +23,13 @@
 
 import argparse
 import datetime
+import functools
 import json
+import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -36,11 +39,11 @@ EXEC_STATE = ROOT / ".os_exec.json"
 sys.path.insert(0, str(ROOT))
 from os_intake import (  # noqa: E402
     LABEL_HUMAN, ROOT as INTAKE_ROOT, author_chat, load_env, project_api,
-    pp_request,
+    pp_request, single_instance_lock,
 )
 
 # Stages that occupy the single shared checkout.
-BUSY_STAGES = ("в работе", "ревью")
+BUSY_STAGES = ("подготовка", "в работе", "ревью", "готово-к-мержу")
 KEEPER_NOTE_MARK = "🧊 **Хранитель целесообразности**"
 META_CUT = "--- Meta ---"
 
@@ -58,8 +61,40 @@ def load_state() -> dict:
 
 
 def save_state(state: dict) -> None:
-    EXEC_STATE.write_text(json.dumps(state, ensure_ascii=False, indent=1),
-                          encoding="utf-8")
+    EXEC_STATE.parent.mkdir(parents=True, exist_ok=True)
+    state["revision"] = int(state.get("revision", 0)) + 1
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=EXEC_STATE.parent,
+                                         prefix=EXEC_STATE.name, suffix=".tmp", delete=False) as stream:
+            temporary = Path(stream.name)
+            json.dump(state, stream, ensure_ascii=False, indent=1)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, EXEC_STATE)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def checkout_operation(function):
+    """Serialize controller state and Git mutations across CLI processes."""
+    @functools.wraps(function)
+    def owned(env, state, *args, **kwargs):
+        EXEC_STATE.parent.mkdir(parents=True, exist_ok=True)
+        handle = single_instance_lock(EXEC_STATE.with_suffix(".lock"))
+        if handle is None:
+            raise RuntimeError("shared checkout controller is busy; retry after the current operation")
+        with handle:
+            recorded = load_state()
+            if int(recorded.get("revision", 0)) > int(state.get("revision", 0)):
+                state.clear()
+                state.update(recorded)
+            try:
+                return function(env, state, *args, **kwargs)
+            finally:
+                save_state(state)
+    return owned
 
 
 def repo() -> Path:
@@ -140,6 +175,8 @@ def task_spec(env: dict, issue: dict) -> str:
     the raw request is exactly the text written by an outside person.
     """
     bot_id = str(env.get("GITLAB_BOT_USER_ID", "")).strip()
+    if not bot_id.isdecimal() or int(bot_id) <= 0:
+        return issue_spec(issue)  # No authenticated keeper identity is configured.
     try:
         notes = project_api(
             env, f"/issues/{issue['iid']}/notes?sort=desc&order_by=created_at&per_page=50")
@@ -149,7 +186,7 @@ def task_spec(env: dict, issue: dict) -> str:
     for note in notes or []:
         body = note.get("body") or ""
         author_id = str((note.get("author") or {}).get("id", ""))
-        if not body.startswith(KEEPER_NOTE_MARK) or (bot_id and author_id != bot_id):
+        if not body.startswith(KEEPER_NOTE_MARK) or author_id != bot_id:
             continue
         index = body.upper().find("ТЕХНИЧЕСКОЕ ЗАДАНИЕ:")
         if index >= 0:
@@ -195,6 +232,7 @@ def dispatch_executor(env: dict, prompt: str) -> int:
 
 # --- claim ------------------------------------------------------------------
 
+@checkout_operation
 def claim(env: dict, state: dict, issue_iid: int | None = None) -> None:
     repo_dir = repo()
     busy = [iid for iid, w in state["work"].items() if w.get("stage") in BUSY_STAGES]
@@ -222,6 +260,15 @@ def claim(env: dict, state: dict, issue_iid: int | None = None) -> None:
 
     base = base_branch(env, repo_dir)
     branch = f"task/{issue_iid}"
+    # Persist ownership before checkout or a potentially ambiguous task POST.
+    # A crash leaves an explicit reservation rather than releasing a live agent.
+    state["work"][str(issue_iid)] = {
+        "stage": "подготовка", "branch": branch, "base": base,
+        "author": issue_meta(issue), "title": issue["title"],
+    }
+    save_state(state)
+    if checked_git(repo_dir, "status", "--porcelain", "--untracked-files=all"):
+        raise RuntimeError("claim: shared checkout must be clean")
     git(repo_dir, "fetch", "origin")  # offline is fine: the local base is used then
     code, _ = git(repo_dir, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}")
     if code == 0:
@@ -260,7 +307,11 @@ def parse_verdict(result: str) -> str:
     return matches[-1].strip().upper() if matches else ""
 
 
+@checkout_operation
 def watch(env: dict, state: dict, config: dict) -> None:
+    owners = [iid for iid, w in state["work"].items() if w.get("stage") in BUSY_STAGES]
+    if len(owners) > 1:
+        raise RuntimeError("shared checkout has multiple owners; resolve the conflicting reservations")
     for iid, w in list(state["work"].items()):
         if w["stage"] == "ревью" and w.get("review_task"):
             task = pp_request(env, f"/api/tasks/{w['review_task']}")
@@ -429,7 +480,12 @@ def notify_author(env: dict, iid: int, text: str) -> None:
         print(f"  !! TG notify: {exc}", flush=True)
 
 
+@checkout_operation
 def do_merge(env: dict, state: dict, iid: int, force: bool = False) -> None:
+    others = [number for number, work in state["work"].items()
+              if str(number) != str(iid) and work.get("stage") in BUSY_STAGES]
+    if others:
+        raise RuntimeError("merge: shared checkout is owned by another task: " + ", ".join(others))
     w = state["work"].get(str(iid)) or {}
     if w.get("stage") != "готово-к-мержу" and not force:
         raise RuntimeError(
@@ -521,7 +577,6 @@ def main() -> int:
     state = load_state()
     if args.mode == "claim":
         claim(env, state, args.issue)
-        save_state(state)
         return 0
     if args.mode == "merge":
         if not args.issue:
@@ -532,7 +587,6 @@ def main() -> int:
     while True:
         try:
             watch(env, state, load_env(INTAKE_ROOT / ".env"))
-            save_state(state)
         except Exception as exc:
             print(f"!! watch: {type(exc).__name__}: {exc}", flush=True)
         if args.once:

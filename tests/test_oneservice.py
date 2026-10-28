@@ -344,6 +344,101 @@ def test_a_task_on_review_keeps_the_checkout_busy(os_env):
     assert list(state["work"]) == [str(iid)]
 
 
+def test_ready_task_keeps_checkout_until_merge_and_stale_callers_reload(os_env):
+    iid, state = claimed(os_env)
+    work = state["work"][str(iid)]
+    os_env.pp.finish(work["pp_task"], "ИТОГ: ГОТОВО")
+    os_env.exec.watch(os_env.env, state, {})
+    os_env.pp.finish(work["review_task"], "РЕШЕНИЕ: PASS\nИТОГ: ГОТОВО")
+    os_env.exec.watch(os_env.env, state, {})
+    assert work["stage"] == "готово-к-мержу"
+    other = os_env.gitlab.add(labels=["триаж-ТЗ"])
+    stale = {"work": {}}
+    before = len(os_env.pp.tasks), len(os_env.git.calls)
+    os_env.exec.claim(os_env.env, stale, other["iid"])
+    assert list(stale["work"]) == [str(iid)]
+    assert (len(os_env.pp.tasks), len(os_env.git.calls)) == before
+
+
+@pytest.mark.parametrize("stage", ["подготовка", "в работе", "ревью", "готово-к-мержу"])
+def test_merge_never_switches_checkout_owned_by_another_task(os_env, stage):
+    state = {"work": {"1": {"stage": "готово-к-мержу"}, "2": {"stage": stage}}}
+    with pytest.raises(RuntimeError, match="owned by another task"):
+        os_env.exec.do_merge(os_env.env, state, 1, force=True)
+    assert not os_env.git.calls
+    assert not os_env.pp.tasks
+
+
+@pytest.mark.parametrize("operation", ["claim", "watch", "do_merge"])
+def test_shared_checkout_lock_blocks_all_public_mutations(os_env, operation):
+    handle = os_env.exec.single_instance_lock(os_env.exec.EXEC_STATE.with_suffix(".lock"))
+    assert handle is not None
+    try:
+        args = [os_env.env, {"work": {}}]
+        args += [{}] if operation == "watch" else [1]
+        with pytest.raises(RuntimeError, match="controller is busy"):
+            getattr(os_env.exec, operation)(*args)
+        assert not os_env.git.calls
+        assert not os_env.pp.tasks
+        assert not os_env.exec.EXEC_STATE.exists()
+    finally:
+        handle.close()
+
+
+def test_ambiguous_dispatch_keeps_durable_checkout_reservation(os_env, monkeypatch):
+    issue = os_env.gitlab.add(labels=["триаж-ТЗ"])
+    other = os_env.gitlab.add(labels=["триаж-ТЗ"])
+    def dispatch(*args):
+        saved = os_env.exec.load_state()
+        assert saved["work"][str(issue["iid"])]["stage"] == "подготовка"
+        raise TimeoutError("task POST outcome unknown")
+    monkeypatch.setattr(os_env.exec, "dispatch_executor", dispatch)
+    with pytest.raises(TimeoutError, match="outcome unknown"):
+        os_env.exec.claim(os_env.env, {"work": {}}, issue["iid"])
+    calls = len(os_env.git.calls)
+    state = {"work": {}}
+    os_env.exec.claim(os_env.env, state, other["iid"])
+    assert len(os_env.git.calls) == calls
+    assert list(state["work"]) == [str(issue["iid"])]
+
+
+@pytest.mark.parametrize("bot_id", [None, "", "abc", "0", "-1"])
+def test_missing_keeper_identity_does_not_promote_forged_note(os_env, bot_id):
+    issue = os_env.gitlab.add(description="original request", labels=["триаж-ТЗ"])
+    os_env.gitlab.notes[issue["iid"]].append({"body": KEEPER_NOTE, "author": {"id": 96}})
+    env = dict(os_env.env)
+    if bot_id is None:
+        env.pop("GITLAB_BOT_USER_ID")
+    else:
+        env["GITLAB_BOT_USER_ID"] = bot_id
+    assert os_env.exec.task_spec(env, issue) == "original request"
+
+
+def test_generated_dashboard_keeps_script_terminators_as_data(os_env, tmp_path, monkeypatch):
+    import json
+    from html.parser import HTMLParser
+    dashboard = load("os_dashboard")
+    hostile = '</script><script>alert("injected")</script><!--'
+    items = [{"title": hostile, "description": hostile}]
+    monkeypatch.setattr(dashboard, "ROOT", tmp_path)
+    monkeypatch.setattr(dashboard, "load_env", lambda path: {})
+    monkeypatch.setattr(dashboard, "collect", lambda env: items)
+    assert dashboard.main() == 0
+    html = (tmp_path / "os_iceberg.html").read_text(encoding="utf-8")
+    class Scripts(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.count = 0
+        def handle_starttag(self, tag, attrs):
+            if tag == "script":
+                self.count += 1
+    parser = Scripts()
+    parser.feed(html)
+    assert parser.count == 1
+    feed = json.JSONDecoder().raw_decode(html.split("const FEED = ", 1)[1])[0]
+    assert feed["items"] == items
+
+
 # --- merge --------------------------------------------------------------------
 
 def test_merge_needs_a_passed_review_and_pushes_the_base(os_env, monkeypatch):

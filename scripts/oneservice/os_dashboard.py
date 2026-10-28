@@ -181,7 +181,7 @@ def main() -> int:
     items = collect(env)
     html = TEMPLATE.replace("__FEED__", json.dumps(
         {"updated": time.strftime("%Y-%m-%d %H:%M"), "items": items},
-        ensure_ascii=False)).replace("__STAMP__", time.strftime("%Y-%m-%d %H:%M"))
+        ensure_ascii=False).replace("<", "\\u003c")).replace("__STAMP__", time.strftime("%Y-%m-%d %H:%M"))
     html = html.replace("__ISSUES_URL__", issues_url(env))
     out = ROOT / "os_iceberg.html"
     out.write_text(html, encoding="utf-8")
