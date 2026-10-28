@@ -2179,6 +2179,9 @@ GET    /api/workflows/{id}/artifacts — зарегистрированные а
 
 ## Архитектура
 
+Карта ядра и надстроек, точки подключения конвейера, процессы и границы
+доверия — [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
 ```
 promptpilot/
 ├── config.py       — настройки, провайдеры, скилы, build_cmd
