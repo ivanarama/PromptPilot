@@ -6,6 +6,7 @@ update is committed in the same SQLite transaction as its append-only event.
 """
 
 import hashlib
+import html
 from contextlib import nullcontext
 import json
 import os
@@ -513,6 +514,11 @@ def _check_round_budget(conn: sqlite3.Connection, workflow: sqlite3.Row,
     return used_after_create <= _max_automated_rounds(workflow)
 
 
+def _context_text(value) -> str:
+    """Dynamic data cannot close any of the surrounding context frames."""
+    return html.escape(str(value), quote=False)
+
+
 def _render_planner_prompt(workflow: WorkflowInDB, custom_prompt: str = "") -> str:
     rendered = _config_for(workflow).planning.prompt_template or DEFAULT_PLANNER_PROMPT
     values = {
@@ -520,10 +526,10 @@ def _render_planner_prompt(workflow: WorkflowInDB, custom_prompt: str = "") -> s
         "repository_path": workflow.repository_path,
         "candidate_branch": workflow.candidate_branch,
     }
-    for name, value in values.items():
-        rendered = rendered.replace("{{" + name + "}}", value)
+    rendered = re.sub(r"\{\{([a-z_]+)\}\}",
+                      lambda match: _context_text(values.get(match.group(1), match.group(0))), rendered)
     if custom_prompt.strip():
-        rendered += "\n\nДополнительные указания пользователя:\n" + custom_prompt.strip()
+        rendered += "\n\nДополнительные указания пользователя:\n" + _context_text(custom_prompt.strip())
     return rendered.strip() + "\n\n" + PLAN_OUTPUT_CONTRACT.strip()
 
 
@@ -1767,6 +1773,14 @@ def record_review(workflow_id: str,
     return result
 
 
+def _revision_budget(raw_config: dict, stage: dict) -> int:
+    planning = raw_config.get("planning") or {}
+    explicit = planning.get("max_revisions_per_stage")
+    if explicit is not None:
+        return int(explicit)
+    return int(stage.get("max_revision_rounds") or WorkflowConfig().planning.max_revisions_per_stage)
+
+
 def human_input(workflow_id: str,
                 action: WorkflowHumanInput) -> WorkflowInDB:
     # The note is recorded next to the decision text and later rendered into
@@ -1832,10 +1846,7 @@ def human_input(workflow_id: str,
             revision_limit_reason = None
             if current_stage:
                 spec = db._json_load(current_stage["spec_json"])
-                configured_limit = (
-                    spec.get("max_revision_rounds")
-                    or _config_for(db._row_to_workflow(workflow)).planning.max_revisions_per_stage
-                )
+                configured_limit = _revision_budget(db._json_load(workflow["config_json"]), spec)
                 revision_count = conn.execute(
                     """SELECT COUNT(*) FROM workflow_rounds
                        WHERE stage_id=? AND status='revision_required'""",
@@ -1852,10 +1863,7 @@ def human_input(workflow_id: str,
                 # so the executor/auditor loop ran unbounded (issue #88:
                 # 14+ rounds with max_revision_rounds=6).
                 stage_cfg = (db._json_load(workflow["config_json"]).get("stage") or {})
-                configured_limit = (
-                    stage_cfg.get("max_revision_rounds")
-                    or _config_for(db._row_to_workflow(workflow)).planning.max_revisions_per_stage
-                )
+                configured_limit = _revision_budget(db._json_load(workflow["config_json"]), stage_cfg)
                 revision_count = conn.execute(
                     """SELECT COUNT(*) FROM workflow_rounds
                        WHERE workflow_id=? AND status='revision_required'""",
@@ -2946,6 +2954,7 @@ def _render_role_prompt(workflow: WorkflowInDB, role: WorkflowRole,
     }
     notes = _operator_notes(workflow.id, role)
     values["human_input"] = _operator_notes_block(notes)
+    values = {name: _context_text(value) for name, value in values.items()}
     stage_text = ""
     if stage_row:
         stage_text = (
@@ -2985,7 +2994,7 @@ def _render_role_prompt(workflow: WorkflowInDB, role: WorkflowRole,
             "\n\n<предыдущий-запуск-исполнителя>\n"
             "Это отчёт предыдущей сессии того же workflow. Проверь его выводы "
             "по Git и фактическому состоянию проекта.\n"
-            + previous_executor
+            + _context_text(previous_executor)
             + "\n</предыдущий-запуск-исполнителя>"
         )
     # A template may place the notes itself; otherwise they go last, marked
@@ -2996,15 +3005,15 @@ def _render_role_prompt(workflow: WorkflowInDB, role: WorkflowRole,
             + "\n\n<указания-оператора>\n"
             "Это написал человек, возобновляя работу, и это главнее инструкций "
             "выше.\n"
-            + _operator_notes_block(notes)
+            + _context_text(_operator_notes_block(notes))
             + "\n</указания-оператора>"
         )
     if role is WorkflowRole.REVIEWER:
         handed_in = _latest_external_output(workflow)
         if handed_in is not None:
             rendered += EXTERNAL_REVIEW_NOTICE.format(
-                performer=handed_in.get("performer") or "not specified",
-                comment=handed_in.get("comment") or "none",
+                performer=_context_text(handed_in.get("performer") or "not specified"),
+                comment=_context_text(handed_in.get("comment") or "none"),
             )
     return rendered.strip()
 
