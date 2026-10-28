@@ -61,12 +61,111 @@ def test_bump_export_presets_sets_name_and_increments_code(release_kt):
     assert 'launcher_icons/main_192=""' in bumped
 
 
-def test_release_without_apk_uses_existing_gh_flag(release_kt, tmp_path, monkeypatch):
-    # gh не знает «--verify» (есть только --verify-tag): релиз без --export падал
-    calls = []
+@pytest.fixture
+def release_repo(release_kt, tmp_path, monkeypatch):
+    def git(*args):
+        return subprocess.check_output(["git", *args], cwd=tmp_path, text=True, encoding="utf8").strip()
+    git("init", "-q", "-b", "main")
+    git("config", "user.name", "Test")
+    git("config", "user.email", "test@example.invalid")
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src/game.gd").write_text("extends Node\n", encoding="utf8")
+    (tmp_path / "VERSION").write_text("0.1.0\n", encoding="utf8")
+    (tmp_path / "export_presets.cfg").write_text('version/code=1\nversion/name="0.1.0"\n', encoding="utf8")
+    (tmp_path / ".gitignore").write_text("builds/\n", encoding="utf8")
+    git("add", ".")
+    git("commit", "-qm", "initial")
     monkeypatch.setattr(release_kt, "GAME", tmp_path)
-    monkeypatch.setattr(release_kt, "run", lambda cmd, cwd=None, timeout=600: calls.append(cmd) or (0, ""))
-    release_kt.publish("0.1.1", do_export=False, do_release=True)
-    gh_call = next(cmd for cmd in calls if cmd[:3] == ["gh", "release", "create"])
-    assert "--verify-tag" in gh_call
-    assert "--verify" not in gh_call
+    monkeypatch.setattr(release_kt, "GODOT", pathlib.Path("fake-godot"))
+    original = release_kt.run
+    calls = []
+    def transport(cmd, cwd=None, timeout=600):
+        calls.append((cmd, cwd))
+        if cmd[0] == "fake-godot":
+            if "--export-release" in cmd:
+                pathlib.Path(cmd[-1]).write_bytes(b"APK from checked tree")
+            return 0, "PASSED"
+        if cmd[:2] == ["git", "push"] or cmd[0] == "gh":
+            return 0, "isolated: no network"
+        return original(cmd, cwd=cwd, timeout=timeout)
+    monkeypatch.setattr(release_kt, "run", transport)
+    return tmp_path, git, calls
+
+
+@pytest.mark.parametrize("when", ["before_bump", "before_publish"])
+def test_gate_rejects_staged_unchecked_source(release_kt, release_repo, when):
+    root, git, calls = release_repo
+    proof = release_kt.gate()
+    if when == "before_publish":
+        version = release_kt.bump(False, proof)
+    (root / "src/game.gd").write_text("BROKEN AFTER GATE\n", encoding="utf8")
+    git("add", "src/game.gd")
+    with pytest.raises(SystemExit, match="посторонние"):
+        if when == "before_bump":
+            release_kt.bump(False, proof)
+        else:
+            release_kt.publish(version, False, False, proof=proof)
+    assert not git("tag")
+    assert not any(cmd[:2] == ["git", "push"] for cmd, _ in calls)
+
+
+@pytest.mark.parametrize("when", ["before_bump", "before_publish"])
+def test_gate_rejects_moved_head(release_kt, release_repo, when):
+    _, git, calls = release_repo
+    proof = release_kt.gate()
+    version = release_kt.bump(False, proof) if when == "before_publish" else None
+    git("commit", "--allow-empty", "-qm", "head moved")
+    with pytest.raises(SystemExit, match="HEAD изменился"):
+        if when == "before_bump":
+            release_kt.bump(False, proof)
+        else:
+            release_kt.publish(version, False, False, proof=proof)
+    assert not any(cmd[:2] == ["git", "push"] for cmd, _ in calls)
+
+
+def test_release_without_export_ignores_old_apk(release_kt, release_repo):
+    root, git, calls = release_repo
+    (root / "builds").mkdir()
+    (root / "builds/fairytale_rpg.apk").write_bytes(b"stale APK")
+    proof = release_kt.gate()
+    version = release_kt.bump(False, proof)
+    release_kt.publish(version, False, True, proof=proof)
+    gh_call = next(cmd for cmd, _ in calls if cmd[:3] == ["gh", "release", "create"])
+    assert "--verify-tag" in gh_call and "--verify" not in gh_call
+    assert not any(arg.endswith(".apk") for arg in gh_call)
+    assert git("rev-parse", "v0.1.1") == git("rev-parse", "HEAD")
+    assert git("show", "v0.1.1:src/game.gd") == "extends Node"
+
+
+def test_export_uses_tested_versioned_checkout(release_kt, release_repo):
+    root, git, calls = release_repo
+    proof = release_kt.gate()
+    version = release_kt.bump(False, proof)
+    release_kt.publish(version, True, True, proof=proof)
+    export = next(cmd for cmd, _ in calls if "--export-release" in cmd)
+    checkout = export[export.index("--path") + 1]
+    assert pathlib.Path(checkout) != root
+    tests = [cmd for cmd, _ in calls if cmd[0] == "fake-godot" and "res://tests/test_runner.tscn" in cmd]
+    assert tests[-1][tests[-1].index("--path") + 1] == checkout
+    push = next(cmd for cmd, _ in calls if cmd[:2] == ["git", "push"])
+    assert "--atomic" in push
+    assert git("rev-parse", "HEAD") + ":refs/heads/main" in push
+    assert git("show", "HEAD:VERSION") == "0.1.1"
+    assert 'version/name="0.1.1"' in git("show", "HEAD:export_presets.cfg")
+    assert list((root / "builds").glob("fairytale_rpg-0.1.1-*.apk"))
+
+
+def test_final_commit_gate_failure_never_tags_or_pushes(release_kt, release_repo, monkeypatch):
+    _, git, calls = release_repo
+    proof = release_kt.gate()
+    version = release_kt.bump(False, proof)
+    original = release_kt.run
+    def fail_final(cmd, cwd=None, timeout=600):
+        if cmd[0] == "fake-godot":
+            return 0, "SCRIPT ERROR: failed\nPASSED"
+        return original(cmd, cwd=cwd, timeout=timeout)
+    monkeypatch.setattr(release_kt, "run", fail_final)
+    with pytest.raises(SystemExit, match="Godot не прошёл"):
+        release_kt.publish(version, False, True, proof=proof)
+    assert not git("tag")
+    assert not any(cmd[:2] == ["git", "push"] or cmd[0] == "gh" for cmd, _ in calls)
