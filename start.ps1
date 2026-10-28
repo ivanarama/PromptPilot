@@ -1,7 +1,9 @@
-# Start PromptPilot services (worker + server + optional bot)
+# Start PromptPilot services (worker + server + optional bot and flows)
 # Usage:
 #   .\start.ps1           - worker + server
 #   .\start.ps1 -Bot      - worker + server + bot (requires PP_TG_TOKEN)
+# The flows runner (pp flows run) starts by itself when flow files exist
+# (~\.promptpilot\flows\*.json or PP_FLOWS_DIR, see docs\FLOWS.md).
 
 param(
     [switch]$Bot
@@ -29,6 +31,14 @@ if (Test-Path -LiteralPath $envFile -PathType Leaf) {
 if (Test-Path $pidFile) {
     $old = Get-Content $pidFile | ConvertFrom-Json
     $alive = $old.PSObject.Properties | Where-Object {
+        # A watcher may survive a crashed core process.  It is discovered by
+        # command line in stop.ps1, but must not make a fresh core start look
+        # healthy or block recovery from a stale PID file.
+        if ($_.Name -eq 'verdict_watcher') { return $false }
+        # pid=0 means "not launched" (long-dead Telegram bot); Get-Process -Id 0
+        # succeeds on the System Idle process and made a fully dead stack look
+        # "already running" (incident 07.10: start-all refused to revive it).
+        if (-not $_.Value -or [int]$_.Value -le 0) { return $false }
         try { Get-Process -Id $_.Value -ErrorAction Stop; $true } catch { $false }
     }
     if ($alive) {
@@ -82,6 +92,24 @@ if ($Bot -or $env:PP_TG_TOKEN) {
     }
 }
 
-$pids | ConvertTo-Json | Set-Content -LiteralPath $pidFile -Encoding UTF8
+# Flows runner: only when there are flows to run.
+if ($env:PP_FLOWS_DIR) {
+    $flowsDir = $env:PP_FLOWS_DIR
+} elseif ($env:PP_DATA_DIR) {
+    $flowsDir = Join-Path $env:PP_DATA_DIR "flows"
+} else {
+    $flowsDir = Join-Path $HOME ".promptpilot\flows"
+}
+if (Test-Path -Path (Join-Path $flowsDir "*.json")) {
+    $f = Start-Process $exe -ArgumentList "flows", "run" `
+        -RedirectStandardOutput "$logDir\flows.log" `
+        -RedirectStandardError  "$logDir\flows.err" `
+        -WindowStyle Hidden -PassThru
+    $pids.flows = $f.Id
+    Write-Host "  Flows   PID $($f.Id)   logs\flows.log" -ForegroundColor Green
+}
+
+# ASCII: без BOM — PowerShell-UTF8 пишет BOM и ломает json-читателей
+$pids | ConvertTo-Json | Set-Content -LiteralPath $pidFile -Encoding Ascii
 
 Write-Host "`nAll logs in .\logs\   Stop with: .\stop.ps1" -ForegroundColor DarkGray

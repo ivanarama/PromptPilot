@@ -124,7 +124,11 @@ def cli(ctx):
 @click.option("-c", "--cli", "provider", default=None, help="CLI provider: claude, claude-z, or custom command")
 @click.option("-r", "--max-retries", default=5, type=int, help="Max retries on rate limit")
 @click.option("-w", "--worktree", is_flag=True, help="Run in a fresh git worktree of --dir (branch pp/t<id>)")
-def add(prompt, file_path, priority, scheduled_at, working_dir, provider, max_retries, worktree):
+@click.option("--rights", type=click.Choice(["none", "read", "write", "full"]), default=None,
+              help="What the agent may do: none (no tools), read, write (edit files in --dir, "
+                   "no commands), full")
+def add(prompt, file_path, priority, scheduled_at, working_dir, provider, max_retries, worktree,
+        rights):
     """Add a task (or multiple from file)."""
     from datetime import datetime
 
@@ -152,6 +156,13 @@ def add(prompt, file_path, priority, scheduled_at, working_dir, provider, max_re
         if provider not in load_providers() and not shutil.which(first):
             click.secho(f"⚠ Провайдер «{provider}» не найден среди известных и не в PATH — "
                         "задача, скорее всего, упадёт. Список: pp provider", fg="yellow")
+    if rights:
+        from .config import DEFAULT_CLI, load_providers, rights_supported
+        name = provider or DEFAULT_CLI
+        if not rights_supported(load_providers().get(name, {}), rights):
+            raise click.UsageError(
+                f"Провайдер «{name}» не умеет ограничивать права до «{rights}» "
+                "(задайте rights в providers.json)")
 
     for p in prompts:
         task = db.create_task(TaskCreate(
@@ -162,6 +173,7 @@ def add(prompt, file_path, priority, scheduled_at, working_dir, provider, max_re
             scheduled_at=dt,
             max_retries=max_retries,
             worktree=worktree,
+            rights=rights,
         ))
         cli_info = f" [{provider}]" if provider else ""
         time_info = f" at {dt}" if dt else ""
@@ -615,11 +627,71 @@ def workflow_dispatch(reference, role, prompt, file_path, provider, model,
     )
     click.echo(
         click.style(
-            f"Task #{result.task.id}, run {result.run.id}, "
+            f"Task #{result.task.id if result.task else '—'}, run {result.run.id}, "
             f"workflow {result.workflow.status.value} v{result.workflow.state_version}",
             fg="green",
         )
     )
+
+
+@workflow_group.command("external")
+@click.argument("reference")
+@click.option("--request", "hand_out", is_flag=True,
+              help="Выдать задание сейчас (для ручного режима: workflow в queued)")
+@click.option("--json", "as_json", is_flag=True, help="Save the assignment and its immutable submission token as JSON")
+def workflow_external(reference, hand_out, as_json):
+    """Задание стадии, которую выполняют вне PromptPilot (issue #122)."""
+    from . import workflows
+
+    item = _workflow_or_exit(reference)
+    if hand_out:
+        item = _workflow_call_cli(workflows.request_external, item.id, item.state_version)
+    assignment = workflows.external_assignment(item.id)
+    if assignment is None:
+        raise click.ClickException(
+            f"у текущего раунда нет внешнего задания (workflow {item.status.value})")
+    if as_json:
+        click.echo(assignment.model_dump_json(indent=2))
+        return
+    click.echo(f"# {assignment.stage_code} {assignment.stage_title} · раунд "
+               f"{assignment.round_no}, попытка {assignment.attempt_no} · {assignment.status.value}")
+    click.echo(assignment.assignment)
+
+
+@workflow_group.command("submit")
+@click.argument("reference")
+@click.option("-f", "--file", "file_path", type=click.Path(exists=True, dir_okay=False),
+              help="Результат из файла")
+@click.option("-t", "--text", default="", help="Результат текстом")
+@click.option("--comment", default="", help="Комментарий к результату")
+@click.option("--performer", default="", help="Кто выполнил: человек или инструмент")
+@click.option("--assignment", "assignment_path", required=True,
+              type=click.Path(exists=True, dir_okay=False), help="JSON saved with workflow external --json")
+def workflow_submit(reference, file_path, text, comment, performer, assignment_path):
+    """Сдать результат внешней стадии: дальше gate и независимое ревью."""
+    from . import workflows
+    from .models import WorkflowExternalAssignment, WorkflowExternalResult
+
+    if file_path:
+        with open(file_path, encoding="utf-8-sig") as handle:
+            text = handle.read()
+    if not text.strip():
+        raise click.ClickException("пустой результат: -f файл или -t текст")
+    item = _workflow_or_exit(reference)
+    try:
+        with open(assignment_path, encoding="utf-8-sig") as handle:
+            assignment = WorkflowExternalAssignment.model_validate_json(handle.read())
+    except (OSError, ValueError) as exc:
+        raise click.ClickException(f"Invalid assignment file: {exc}") from exc
+    if assignment.workflow_id != item.id:
+        raise click.ClickException("Assignment belongs to another workflow")
+    submitted = _workflow_call_cli(workflows.submit_external_result, item.id,
+                                   WorkflowExternalResult(
+                                       expected_version=assignment.expected_version, run_id=assignment.run_id,
+                                       input_sha256=assignment.input_sha256, result=text,
+                                       comment=comment, performer=performer))
+    advanced = workflows.advance_workflow(submitted.id)
+    click.echo(f"Workflow {advanced.slug}: {advanced.status.value}")
 
 
 @workflow_group.command("gate")
@@ -696,7 +768,9 @@ def workflow_review(reference, verdict, summary, findings_file):
 @click.argument("reference")
 @click.argument("text")
 @click.option("--resume", is_flag=True)
-def workflow_input(reference, text, resume):
+@click.option("--note", default="",
+              help="Указание агенту: уйдёт в следующий запуск исполнителя и аудитора")
+def workflow_input(reference, text, resume, note):
     """Append a human decision and optionally resume the workflow."""
     from . import workflows
     from .models import WorkflowHumanInput
@@ -709,6 +783,7 @@ def workflow_input(reference, text, resume):
             expected_version=item.state_version,
             text=text,
             resume=resume,
+            note=note,
         ),
     )
     click.echo(f"Workflow {updated.slug}: {updated.status.value}")
@@ -773,6 +848,246 @@ def workflow_import_history(reference, file_path):
             fg="green",
         )
     )
+
+
+@cli.group("flows")
+def flows_group():
+    """Маршруты заявок (flows): входы, шаги, согласования."""
+
+
+def _flow_call_cli(call, *args, **kwargs):
+    from . import flows
+
+    try:
+        return call(*args, **kwargs)
+    except flows.FlowError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+def _flow_line(item: dict) -> str:
+    from . import flows
+
+    status = flows.STATUS_WORDS.get(item["status"], item["status"])
+    where = f" · шаг {item['step_id']}" if item["step_id"] else ""
+    return f"#{item['id']:<5} {item['flow']:<18} {status:<14}{where}  {item['title']}"
+
+
+@flows_group.command("list")
+def flows_list():
+    """Маршруты из каталога, их заявки и файлы, которые не прошли проверку."""
+    from . import flows
+
+    loaded, errors = flows.load_flows()
+    counts = flows.status_counts()
+    click.echo(f"Каталог маршрутов: {flows.flows_dir()}")
+    if not loaded and not errors:
+        click.echo("  маршрутов нет — положите сюда *.json (см. docs/FLOWS.md)")
+    for flow in loaded.values():
+        tally = ", ".join(f"{flows.STATUS_WORDS.get(status, status)}: {count}"
+                          for status, count in sorted(counts.get(flow.name, {}).items()))
+        click.echo(f"  {flow.name}  [{flow.trust}]  {flow.title}  — {tally or 'заявок нет'}")
+    for name, error in errors.items():
+        click.echo(click.style(f"  ✗ {name}: {error}", fg="red"), err=True)
+    if errors:
+        sys.exit(1)
+
+
+@flows_group.command("check")
+@click.argument("file_path", type=click.Path(exists=True, dir_okay=False))
+def flows_check(file_path):
+    """Проверить файл маршрута, ничего не запуская."""
+    from pathlib import Path
+
+    from . import flows
+
+    try:
+        flow = flows.load_flow_file(Path(file_path))
+    except (OSError, ValueError) as exc:
+        raise click.ClickException(f"маршрут не принят:\n{exc}") from exc
+    click.echo(click.style(f"OK: {flow.name} [{flow.trust}], шагов: {len(flow.steps)}",
+                           fg="green"))
+    for step in flow.steps:
+        rights = getattr(step, "rights", None)
+        extra = f" права={rights}" if rights else ""
+        click.echo(f"  {step.id:<16} {step.kind:<8}{extra} {step.title}")
+
+
+@flows_group.command("items")
+@click.option("--flow", "flow_name", default=None, help="Только этот маршрут")
+@click.option("-s", "--status", default=None,
+              type=click.Choice(["active", "waiting_human", "needs_human", "done",
+                                 "rejected", "failed", "cancelled"]))
+@click.option("-n", "--limit", default=30, show_default=True)
+def flows_items(flow_name, status, limit):
+    """Заявки, новые сверху."""
+    from . import flows
+
+    items = flows.list_items(flow_name, status, limit)
+    if not items:
+        click.echo("Заявок нет.")
+    for item in items:
+        click.echo(_flow_line(item))
+        if item["error"]:
+            click.echo(click.style(f"        {item['error'][:200]}", fg="yellow"))
+
+
+@flows_group.command("show")
+@click.argument("item_id", type=int)
+@click.option("--json", "as_json", is_flag=True)
+def flows_show(item_id, as_json):
+    """Заявка целиком: вход, результаты шагов, журнал."""
+    import json as _json
+
+    from . import flows
+
+    item = flows.get_item(item_id)
+    if item is None:
+        raise click.ClickException("заявка не найдена")
+    events = flows.item_events(item_id)
+    if as_json:
+        click.echo(_json.dumps({**item, "events": events}, ensure_ascii=False, indent=2))
+        return
+    click.echo(_flow_line(item))
+    if item["error"]:
+        click.echo(click.style(f"Нужен человек: {item['error']}", fg="yellow"))
+    wait = item["wait"] or {}
+    if wait.get("approval"):
+        click.echo(f"Ждёт решения по шагу «{wait['approval']}»: {wait.get('text', '')}")
+        click.echo(f"  pp flows approve {item_id}   |   pp flows reject {item_id}")
+    click.echo("Результаты шагов:")
+    click.echo(_json.dumps(item["data"].get("steps", {}), ensure_ascii=False, indent=2))
+    click.echo("Журнал:")
+    for event in events:
+        detail = _json.dumps(event["payload"], ensure_ascii=False) if event["payload"] else ""
+        click.echo(f"  {event['created_at'][:19]}  {event['step_id'] or '-':<14} "
+                   f"{event['event_type']:<22} {detail[:160]}")
+
+
+@flows_group.command("add")
+@click.argument("flow_name")
+@click.argument("title")
+@click.option("-t", "--text", default="", help="Текст заявки")
+@click.option("-f", "--file", "file_path", type=click.Path(exists=True, dir_okay=False),
+              help="Текст заявки из файла")
+def flows_add(flow_name, title, text, file_path):
+    """Завести заявку вручную (как будто она пришла на вход маршрута)."""
+    from . import flows
+
+    loaded, errors = flows.load_flows()
+    flow = loaded.get(flow_name)
+    if flow is None:
+        raise click.ClickException(
+            f"маршрута «{flow_name}» нет или он не прошёл проверку (pp flows list)")
+    if file_path:
+        with open(file_path, encoding="utf-8-sig") as handle:
+            text = handle.read()
+    item = flows.create_item(flow, {"title": title, "body": text}, title=title, by="cli")
+    click.echo(f"Заявка #{item['id']} заведена; её поведёт `pp flows run`.")
+
+
+def _flow_version(item_id, observed):
+    from . import flows
+    if observed is not None:
+        return observed
+    item = _flow_call_cli(flows.get_item, item_id)
+    if item is None:
+        raise click.ClickException("Flow item not found")
+    return item["version"]
+
+
+def _flow_decision(item_id, decision, note, observed):
+    from . import flows
+
+    item = _flow_call_cli(flows.decide, item_id, decision, note, "cli",
+                          expected_version=_flow_version(item_id, observed))
+    click.echo(_flow_line(item))
+
+
+@flows_group.command("approve")
+@click.argument("item_id", type=int)
+@click.option("--note", default="", help="Указание к решению — попадёт в следующие шаги")
+@click.option("--expected-version", type=click.IntRange(min=0), default=None,
+              help="Observed version; default: fetch current state and submit with CAS")
+def flows_approve(item_id, note, expected_version):
+    """Одобрить согласование, которого ждёт заявка."""
+    _flow_decision(item_id, "approve", note, expected_version)
+
+
+@flows_group.command("reject")
+@click.argument("item_id", type=int)
+@click.option("--note", default="", help="Причина")
+@click.option("--expected-version", type=click.IntRange(min=0), default=None,
+              help="Observed version; default: fetch current state and submit with CAS")
+def flows_reject(item_id, note, expected_version):
+    """Отклонить согласование, которого ждёт заявка."""
+    _flow_decision(item_id, "reject", note, expected_version)
+
+
+@flows_group.command("retry")
+@click.argument("item_id", type=int)
+@click.option("--expected-version", type=click.IntRange(min=0), default=None,
+              help="Observed version; default: fetch current state and submit with CAS")
+@click.option("--confirm-command-stopped", is_flag=True, help="Only after verifying previous execution stopped")
+@click.option("--confirm-side-effect-reviewed", is_flag=True, help="Only after inspecting uncertain external delivery; retry may resend")
+@click.option("--note", default="", help="Reason for verified recovery")
+def flows_retry(item_id, expected_version, confirm_command_stopped, note, confirm_side_effect_reviewed):
+    """Повторить шаг, на котором заявка остановилась (после исчерпанных повторов — ещё круг)."""
+    from . import flows
+
+    click.echo(_flow_line(_flow_call_cli(flows.retry, item_id, "cli",
+                                          expected_version=_flow_version(item_id, expected_version),
+                                          confirm_command_stopped=confirm_command_stopped,
+                                          confirm_side_effect_reviewed=confirm_side_effect_reviewed, note=note)))
+
+
+@flows_group.command("skip")
+@click.argument("item_id", type=int)
+@click.option("--expected-version", type=click.IntRange(min=0), default=None,
+              help="Observed version; default: fetch current state and submit with CAS")
+@click.option("--confirm-command-stopped", is_flag=True, help="Only after verifying previous execution stopped")
+@click.option("--confirm-side-effect-reviewed", is_flag=True, help="Only after inspecting uncertain external delivery; retry may resend")
+@click.option("--note", default="", help="Reason for verified recovery")
+def flows_skip(item_id, expected_version, confirm_command_stopped, note, confirm_side_effect_reviewed):
+    """Пропустить шаг, на котором заявка остановилась."""
+    from . import flows
+
+    click.echo(_flow_line(_flow_call_cli(flows.skip, item_id, "cli",
+                                          expected_version=_flow_version(item_id, expected_version),
+                                          confirm_command_stopped=confirm_command_stopped,
+                                          confirm_side_effect_reviewed=confirm_side_effect_reviewed, note=note)))
+
+
+@flows_group.command("cancel")
+@click.argument("item_id", type=int)
+@click.option("--expected-version", type=click.IntRange(min=0), default=None,
+              help="Observed version; default: fetch current state and submit with CAS")
+@click.option("--confirm-command-stopped", is_flag=True, help="Only after verifying previous execution stopped")
+@click.option("--confirm-side-effect-reviewed", is_flag=True, help="Only after inspecting uncertain external delivery; retry may resend")
+@click.option("--note", default="", help="Reason for verified recovery")
+def flows_cancel(item_id, expected_version, confirm_command_stopped, note, confirm_side_effect_reviewed):
+    """Снять заявку (и остановить задачу её шага)."""
+    from . import flows
+
+    click.echo(_flow_line(_flow_call_cli(flows.cancel, item_id, "cli",
+                                          expected_version=_flow_version(item_id, expected_version),
+                                          confirm_command_stopped=confirm_command_stopped,
+                                          confirm_side_effect_reviewed=confirm_side_effect_reviewed, note=note)))
+
+
+@flows_group.command("run")
+@click.option("--once", is_flag=True, help="Один проход и выход")
+@click.option("--interval", type=int, default=None,
+              help="Секунд между проходами (по умолчанию PP_FLOWS_INTERVAL или 15)")
+def flows_run(once, interval):
+    """Вести заявки: читать входы, двигать шаги, обновлять публикации."""
+    from . import flows
+
+    if once:
+        result = flows.run_once(click.echo)
+        click.echo(f"маршрутов: {result['flows']}, новых заявок: {result['created']}, "
+                   f"продвинуто: {result['moved']}")
+        return
+    flows.run_forever(interval, click.echo)
 
 
 @cli.command()
@@ -895,6 +1210,16 @@ def pipelinectl(args):
     """Run the bundled project pipeline adapter."""
     from .project_pipeline import run
     raise SystemExit(run(list(args)))
+
+
+@cli.command(name="bot-vk")
+def bot_vk():
+    """Start the VK community bot (requires PP_VK_TOKEN and PP_VK_GROUP_ID)."""
+    from .bot_vk import run_vk_bot
+    try:
+        run_vk_bot()
+    except SystemExit as e:
+        raise click.ClickException(str(e))
 
 
 @cli.command()

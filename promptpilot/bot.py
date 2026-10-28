@@ -290,6 +290,20 @@ def require_auth(func):
     return wrapper
 
 
+async def _check_task_creation_access(update: Update) -> bool:
+    """Recheck current access after awaited work, immediately before enqueue."""
+    user, chat = update.effective_user, update.effective_chat
+    if user is not None and is_authorized(user.id) and chat is not None and chat.type == "private":
+        return True
+    query = update.callback_query
+    message = update.message or (query.message if query else None)
+    if message:
+        await message.reply_text("Нет доступа. Задача не создана.")
+    elif query:
+        await query.answer("Нет доступа.", show_alert=True)
+    return False
+
+
 # Password gate for task creation (PP_TASK_PASSWORD). Entering it correctly in
 # the add-task flow authorizes the user for a while, so the skill/reply shortcuts
 # can require it too instead of silently bypassing the password.
@@ -740,6 +754,8 @@ async def cb_rerun_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _pw_ok(query.from_user.id):
         await query.answer("Сначала введите пароль через ➕ Добавить задачу.", show_alert=True)
         return
+    if not await _check_task_creation_access(update):
+        return ConversationHandler.END
     new = db.create_task(TaskCreate(
         prompt=task.prompt,
         working_dir=task.working_dir,
@@ -752,6 +768,7 @@ async def cb_rerun_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keep_pane=task.keep_pane,
         machine=task.machine,
         worktree=task.worktree,
+        rights=task.rights,
     ))
     await query.answer(f"Задача #{new.id} добавлена.")
     await query.message.reply_text(
@@ -965,7 +982,7 @@ def _pipeline_text(data: dict) -> str:
              f"Вход / выход: {rate(entered_rate)} / {rate(exited_rate)}; "
              f"переходов {recent.get('transitions', 0)}; покрытие {coverage}",
              f"Тренд backlog: 7 дней {week_trend}; 30 дней {month_trend}",
-             f"Узкое место: " + (
+             "Узкое место: " + (
                  f"{bottleneck['title']} (ETA {bottleneck.get('eta_hours', '—')} ч)"
                  if bottleneck else "нет"),
              "Безопасные ожидания / ошибки: "
@@ -2260,6 +2277,7 @@ async def _show_confirm(send, context):
     return ASK_CONFIRM
 
 
+@require_auth
 async def cb_wiz_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -2279,7 +2297,7 @@ async def cb_wiz_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_reply_markup(reply_markup=None)
     except BadRequest:
         pass
-    return await _finish_add_task_from_query(query, context)
+    return await _finish_add_task_from_query(update, context)
 
 
 async def cb_wiz_drop_attachments(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2592,8 +2610,11 @@ async def add_task_got_recurrence(update: Update, context: ContextTypes.DEFAULT_
     return await _show_extras(update.message.reply_text, context)
 
 
-async def _finish_add_task_from_query(query, context):
+async def _finish_add_task_from_query(update, context):
     """Called after inline button — uses query.message for reply."""
+    if not await _check_task_creation_access(update):
+        return ConversationHandler.END
+    query = update.callback_query
     from .models import TaskCreate
     _save_last_settings(query.message.chat_id, context)
     prompt = context.user_data.pop("new_prompt", "")
@@ -2721,6 +2742,7 @@ async def cb_reply_task_start(update: Update, context: ContextTypes.DEFAULT_TYPE
     return ASK_REPLY
 
 
+@require_auth
 async def reply_got_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
     entered = update.message.text.strip()
     try:
@@ -2749,13 +2771,24 @@ async def reply_got_password(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return ASK_REPLY
 
 
+@require_auth
 async def reply_got_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prompt = update.message.text
     parent_id = context.user_data.pop("reply_task_id", None)
     session_id = context.user_data.pop("reply_session_id", None)
     provider = context.user_data.pop("reply_provider", None)
     working_dir = context.user_data.pop("reply_dir", None)
-    skip_permissions = context.user_data.pop("reply_skip_permissions", False)
+    context.user_data.pop("reply_skip_permissions", None)  # legacy dialog data
+    parent = db.get_task(parent_id) if parent_id is not None else None
+    if parent is None:
+        await update.message.reply_text(
+            "Исходная задача больше недоступна. Продолжение не создано.",
+            reply_markup=_main_menu(),
+        )
+        return ConversationHandler.END
+
+    if not await _check_task_creation_access(update):
+        return ConversationHandler.END
 
     task = db.create_task(TaskCreate(
         prompt=prompt,
@@ -2764,7 +2797,8 @@ async def reply_got_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         priority=5,
         session_id=session_id,
         parent_task_id=parent_id,
-        skip_permissions=skip_permissions,
+        skip_permissions=parent.skip_permissions,
+        rights=parent.rights,
         tg_chat_id=update.effective_chat.id,
     ))
 
@@ -3128,6 +3162,11 @@ def _herdr_blocked_keyboard(ref: str) -> list:
     ]
 
 
+def _herdr_done_keyboard(ref: str):
+    return [[InlineKeyboardButton("\U0001f4fa \u042d\u043a\u0440\u0430\u043d", callback_data=f"hd_screen:{ref}"),
+             InlineKeyboardButton(REPLY_LABEL, callback_data=f"hd_reply:{ref}")]]
+
+
 def _screen_chrome(line: str) -> bool:
     """Terminal-UI furniture worth dropping on a phone: the full-width rules
     Claude Code draws around its input box eat a third of the message and wrap
@@ -3173,10 +3212,7 @@ async def _herdr_notify(bot, pane_id: str, status: str, agent: dict, machine: st
             text += f"\n\n{tail}"
     else:
         text = f"✅ herdr{where}: {label} в панели {pane_id} завершил работу"
-        buttons = [
-            [InlineKeyboardButton("📺 Экран", callback_data=f"hd_screen:{ref}"),
-             InlineKeyboardButton(REPLY_LABEL, callback_data=f"hd_reply:{ref}")],
-        ]
+        buttons = _herdr_done_keyboard(ref)
     title = (agent.get("terminal_title_stripped") or "").strip()
     if title and status != "blocked":
         text += f"\n{title[:120]}"
@@ -3214,21 +3250,41 @@ def _herdr_watch_targets():
 async def _herdr_watch_loop(bot):
     import asyncio
     notified = {}  # (machine, pane_id) -> status already notified about
+    initialized = set()  # machines whose existing agents were already observed
     while True:
         await asyncio.sleep(HERDR_WATCH_INTERVAL)
         try:
-            await _herdr_watch_tick(bot, notified)
+            await _herdr_watch_tick(bot, notified, initialized)
         except Exception as e:  # one bad poll must not stop the whole watcher
             logger.warning("herdr watch tick упал: %s", e)
 
 
-async def _herdr_watch_tick(bot, notified):
+def _herdr_completion_sequence(agent):
+    value = agent.get("completion_seq")
+    return agent.get("state_change_seq") if value is None else value
+
+
+def _herdr_watch_source(machine, host):
+    import hashlib
+    return hashlib.sha256(json.dumps([machine, host], sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+
+def _herdr_completion_notice(machine, pane, agent):
+    where = f" \u043d\u0430 {machine}" if machine else ""
+    title = str(agent.get("terminal_title_stripped") or "").strip()[:120]
+    return f"\u2705 herdr{where}: {_herdr_agent_label(agent)} \u0432 \u043f\u0430\u043d\u0435\u043b\u0438 {pane} \u0437\u0430\u0432\u0435\u0440\u0448\u0438\u043b \u0440\u0430\u0431\u043e\u0442\u0443" + (f"\n{title}" if title else "")
+
+
+async def _herdr_watch_tick(bot, notified, initialized):
         seen = set()
         for machine, host in _herdr_watch_targets():
             data = await _herdr_json("agent", "list", host=host)
             if data is None:
                 continue  # herdr not installed / server down / ssh — stay quiet
-            agents = ((data.get("result") or {}).get("agents")) or []
+            agents = (data.get("result") or {}).get("agents")
+            if not isinstance(agents, list):
+                continue  # A failed/unknown response cannot establish a baseline.
+
             current = {}
             for a in agents:
                 pane = a.get("pane_id")
@@ -3236,26 +3292,54 @@ async def _herdr_watch_tick(bot, notified):
                 if not pane or name.startswith("pp-t"):
                     continue  # PromptPilot's own tasks notify via the worker
                 current[pane] = a
+            completions = [
+                {"pane": pane, "terminal_id": agent.get("terminal_id"),
+                 "agent_session": agent.get("agent_session"),
+                 "sequence": _herdr_completion_sequence(agent),
+                 "message": _herdr_completion_notice(machine, pane, agent)}
+                for pane, agent in current.items()
+                if agent.get("agent_status") == "done" and _herdr_completion_sequence(agent) is not None
+            ]
+            db.queue_herdr_completions(_herdr_watch_source(machine, host), completions,
+                                      [int(chat) for chat in list_authorized()], machine=machine, present_panes=list(current))
             seen.update((machine, pane) for pane in current)
             now = time.monotonic()
             for pane, a in current.items():
                 key = (machine, pane)
                 status = a.get("agent_status")
                 if status in ("blocked", "done"):
-                    prev = notified.get(key)  # (status, screen tail, когда видели)
-                    if prev and prev[0] == status and now - prev[2] < HERDR_WATCH_INTERVAL * 3:
+                    prev = notified.get(key)  # (status, screen tail, seen at, completion seq)
+                    completion_seq = _herdr_completion_sequence(a) if status == "done" else None
+                    if status == "done" and completion_seq is not None:
+                        notified[key] = (status, "", now, completion_seq)
+                        continue  # Delivery was durably queued with the cursor above.
+                    if status == "done" and machine not in initialized:
+                        # On bot startup, old kept sessions are already done.
+                        # Remember them without re-announcing every task.
+                        notified[key] = (status, "", now, completion_seq)
+                        continue
+                    if (status == "done" and prev and prev[0] == "done"
+                            and completion_seq is not None
+                            and prev[3] == completion_seq):
+                        notified[key] = (status, prev[1], now, completion_seq)
+                        continue
+                    if (prev and prev[0] == status
+                            and (status != "done" or completion_seq is None)
+                            and now - prev[2] < HERDR_WATCH_INTERVAL * 3):
                         # Висит непрерывно (или статус мигнул working на
                         # один-два опроса — датчик herdr не идеален): уже
                         # сказано, только освежаем время наблюдения. Экран
                         # ради этого не перечитываем.
-                        notified[key] = (prev[0], prev[1], now)
+                        notified[key] = (prev[0], prev[1], now, completion_seq)
                         continue
                     tail = await _herdr_screen_tail(pane, machine) if status == "blocked" else ""
                     dup = (prev and prev[0] == status and prev[1] == tail
+                           and (status != "done" or completion_seq is None
+                                or prev[3] == completion_seq)
                            and now - prev[2] < HERDR_RENOTIFY_COOLDOWN)
                     if not dup:
                         await _herdr_notify(bot, pane, status, a, machine, tail=tail)
-                    notified[key] = (status, tail, now)
+                    notified[key] = (status, tail, now, completion_seq)
                 # Состояние ушло из blocked/done — запись НЕ удаляем: раньше
                 # мигание статуса стирало её, и следующий же blocked давал
                 # дубль уведомления. Тот же диалог в течение cooldown молчит,
@@ -3264,6 +3348,7 @@ async def _herdr_watch_tick(bot, notified):
             # panes on machines we DID reach may be forgotten.
             for key in [k for k in notified if k[0] == machine and k not in seen]:
                 notified.pop(key)
+            initialized.add(machine)
 
 
 def _parse_hd_ref(ref: str):
@@ -3345,17 +3430,37 @@ async def cb_herdr_screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.message.reply_text(f"📺 {pane}{f' ({machine})' if machine else ''}:\n{tail}")
 
 
-@require_auth
+async def _check_herdr_reply_access(update: Update) -> bool:
+    """Use current private-chat authorization, including after awaited callbacks."""
+    user, chat = update.effective_user, update.effective_chat
+    if user is not None and is_authorized(user.id) and chat is not None and chat.type == "private":
+        return True
+    query = update.callback_query
+    message = update.message or (query.message if query else None)
+    if message:
+        await message.reply_text("Нет доступа. Команда не отправлена.")
+    elif query:
+        await query.answer("Нет доступа.", show_alert=True)
+    return False
+
+
 async def cb_herdr_reply_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("herdr_reply_pane", None)
+    context.user_data.pop("herdr_reply_host", None)
+    context.user_data.pop("herdr_reply_machine", None)
+    if not await _check_herdr_reply_access(update):
+        return ConversationHandler.END
     query = update.callback_query
     ref = await _hd_ref_or_alert(query, query.data.split(":", 1)[1])
     if ref is None:
         return ConversationHandler.END
     machine, pane, host = ref
+    await query.answer()
+    if not await _check_herdr_reply_access(update):
+        return ConversationHandler.END
     context.user_data["herdr_reply_pane"] = pane
     context.user_data["herdr_reply_host"] = host
     context.user_data["herdr_reply_machine"] = machine
-    await query.answer()
     where = f" на {machine}" if machine else ""
     await query.message.reply_text(f"Текст для агента в панели {pane}{where} (или /cancel):")
     return ASK_HERDR_REPLY
@@ -3386,6 +3491,8 @@ async def herdr_reply_got_text(update: Update, context: ContextTypes.DEFAULT_TYP
     host = context.user_data.pop("herdr_reply_host", None)
     machine = context.user_data.pop("herdr_reply_machine", "")
     if not pane:
+        return ConversationHandler.END
+    if not await _check_herdr_reply_access(update):
         return ConversationHandler.END
     res = await _herdr_json("agent", "prompt", pane, update.message.text, host=host)
     if res and res.get("result"):
@@ -3606,6 +3713,63 @@ def _silent_completion(task) -> bool:
     )
 
 
+def _flow_keyboard(flow_ref: str) -> InlineKeyboardMarkup | None:
+    parts = flow_ref.split(":")
+    if len(parts) != 3 or not parts[0].isdigit() or not parts[2].isdigit():
+        return None  # Old notifications cannot acquire a new occurrence token.
+    item_id, kind, version = parts
+    if kind == "approval":
+        return InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Одобрить", callback_data=f"flowdec2:{item_id}:{version}:a"),
+            InlineKeyboardButton("✖ Отклонить", callback_data=f"flowdec2:{item_id}:{version}:r"),
+        ]])
+    if kind != "action":
+        return None
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔁 Повторить", callback_data=f"flowact2:{item_id}:{version}:retry"),
+        InlineKeyboardButton("⏭ Пропустить", callback_data=f"flowact2:{item_id}:{version}:skip"),
+        InlineKeyboardButton("✖ Снять", callback_data=f"flowact2:{item_id}:{version}:cancel"),
+    ]])
+
+
+FLOW_ACTION_WORDS = {"retry": "шаг повторяется", "skip": "шаг пропущен", "cancel": "заявка снята"}
+
+
+@require_auth
+async def cb_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """A button under a flow notification: decide an approval, or move a stuck item."""
+    from . import flows
+
+    query = update.callback_query
+    parts = query.data.split(":")
+    user = update.effective_user
+    who = f"telegram:{user.username or user.id}"
+    try:
+        if parts[0] in {"flowdec", "flowact"}:
+            raise flows.FlowError("Кнопка устарела. Откройте заявку заново.")
+        if parts[0] == "flowdec2":
+            _, item_id, version, verdict = parts
+            decision = "approve" if verdict == "a" else "reject"
+            await asyncio.to_thread(flows.decide, int(item_id), decision, "", who,
+                                    expected_version=int(version))
+            word = "одобрено" if decision == "approve" else "отклонено"
+        else:
+            _, item_id, version, action = parts
+            call = {"retry": flows.retry, "skip": flows.skip, "cancel": flows.cancel}[action]
+            action_result = await asyncio.to_thread(call, int(item_id), who, expected_version=int(version))
+            word = ("остановка запрошена" if action == "cancel" and action_result["status"] == "cancelling"
+                    else FLOW_ACTION_WORDS[action])
+    except flows.FlowError as exc:
+        await query.answer(str(exc)[:190], show_alert=True)
+        return
+    await query.answer(word.capitalize())
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text(f"Заявка #{item_id}: {word}.")
+    except BadRequest:
+        pass
+
+
 async def _notify_loop(bot):
     """Background loop: send notifications for completed/failed tasks every 10s.
 
@@ -3628,11 +3792,14 @@ async def _notify_loop(bot):
         for note in notes:
             try:
                 kb = None
-                if note.get("pane_id"):
+                if note.get("flow_ref"):
+                    kb = _flow_keyboard(note["flow_ref"])
+                elif note.get("pane_id"):
                     # A blocked own task: same confirm/screen/reply buttons the
                     # foreign-agent watcher gets — not just an ssh suggestion.
                     ref = f"{note.get('machine') or ''}:{note['pane_id']}"
-                    kb = InlineKeyboardMarkup(_herdr_blocked_keyboard(ref))
+                    kb = InlineKeyboardMarkup(_herdr_done_keyboard(ref) if note.get("kind") == "herdr.done"
+                                              else _herdr_blocked_keyboard(ref))
                 await bot.send_message(chat_id=note["tg_chat_id"], text=_clip(note["message"]),
                                        reply_markup=kb)
                 db.mark_notification_sent(note["id"])
@@ -3826,6 +3993,7 @@ async def epf_got_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return EPF_ASK_BASE
 
 
+@require_auth
 async def epf_base_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Выбор базы (epfb:<key>), пагинация (epfb:list:N) и запуск пре-фазы."""
     query = update.callback_query
@@ -3915,6 +4083,8 @@ async def epf_base_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for key in ("epf_file", "epf_name", "epf_task", "epf_bases"):
             context.user_data.pop(key, None)
 
+    if not await _check_task_creation_access(update):
+        return ConversationHandler.END
     task = db.create_task(TaskCreate(
         prompt=task_text,
         working_dir=str(project_dir),
@@ -4351,6 +4521,9 @@ def run_bot():
     app.add_handler(CallbackQueryHandler(
         cb_report_refresh,
         pattern=r"^report:refresh:(24|168|720):[A-Za-z0-9_.-]+$"), group=-1)
+    app.add_handler(CallbackQueryHandler(
+        cb_flow, pattern=r"^(flowdec2:\d+:\d+:[ar]|flowact2:\d+:\d+:(retry|skip|cancel)|flowdec:\d+:[a-z0-9_]+:[ar]|flowact:\d+:(retry|skip|cancel))$"),
+        group=-1)
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))

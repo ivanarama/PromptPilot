@@ -23,7 +23,7 @@ def config(max_revisions=3, max_rounds=10, require_approval=True):
             "executor": {"provider": None},
             "reviewer": {"provider": None},
         },
-        "gate": {"commands": []},
+        "gate": {"enabled": False, "commands": []},
         "limits": {"max_rounds": max_rounds},
     }
 
@@ -107,6 +107,9 @@ def test_planner_approval_and_two_stage_autonomous_lifecycle(isolated_db):
     )
     assert approved.status.value == "queued"
     assert approved.current_stage_id == stages[0].id
+    assert isolated_db.save_memory(workflow.id, "global.md", "keep")[0]
+    assert isolated_db.save_memory(workflow.id, "stage.md", "temporary", scope_stage=stages[0].id)[0]
+    assert isolated_db.save_memory(workflow.id, "final.md", "final", scope_stage=stages[1].code)[0]
     workflows.advance_workflow(workflow.id)
 
     executor = isolated_db.list_tasks(status=TaskStatus.PENDING)[0]
@@ -121,9 +124,12 @@ def test_planner_approval_and_two_stage_autonomous_lifecycle(isolated_db):
     current_stage = isolated_db.get_workflow_stage(second.current_stage_id)
     assert current_stage.code == "FINAL"
     assert isolated_db.list_workflow_stages(workflow.id)[0].status.value == "completed"
+    assert {row["name"] for row in isolated_db.list_memory(workflow.id)} == {"global.md", "final.md"}
+    assert not isolated_db.save_memory(workflow.id, "late.md", "no", scope_stage=stages[0].id)[0]
 
     finish_task(isolated_db, "executor FINAL")
     finish_task(isolated_db, reviewer_pass())
+    assert [row["name"] for row in isolated_db.list_memory(workflow.id)] == ["global.md"]
     completed = isolated_db.get_workflow(workflow.id)
     assert completed.status.value == "completed"
     assert all(
@@ -140,6 +146,31 @@ def test_planner_approval_and_two_stage_autonomous_lifecycle(isolated_db):
     assert report["metrics"]["stages_by_status"] == {"completed": 2}
     assert [item["code"] for item in report["stages"]] == ["S1", "FINAL"]
     assert "## Stage plan" in workflows.workflow_report_markdown(workflow.id)
+
+
+def test_next_stage_executor_gets_no_report_of_the_previous_stage(isolated_db):
+    workflow = create(isolated_db, slug="stage-handoff")
+    workflows.dispatch_planner(
+        workflow.id, WorkflowPlanDispatch(expected_version=workflow.state_version))
+    finish_task(isolated_db, plan_result([
+        {"code": "S1", "title": "Контракт", "objective": "Зафиксировать контракт",
+         "acceptance_gates": []},
+        {"code": "FINAL", "title": "Интеграция", "objective": "Проверить результат целиком",
+         "stage_type": "integration", "dependencies": ["S1"], "acceptance_gates": []},
+    ]))
+    waiting = isolated_db.get_workflow(workflow.id)
+    workflows.approve_plan(
+        workflow.id, WorkflowPlanApproval(expected_version=waiting.state_version))
+    workflows.advance_workflow(workflow.id)
+    finish_task(isolated_db, "S1-ONLY-REPORT: правил только контракт")
+    finish_task(isolated_db, reviewer_pass())
+
+    final = isolated_db.list_tasks(status=TaskStatus.PENDING)[0].prompt
+
+    assert "Текущий этап: FINAL" in final
+    # Another stage is not a session to resume.
+    assert "<предыдущий-запуск-исполнителя>" not in final
+    assert "S1-ONLY-REPORT" not in final
 
 
 def test_invalid_planner_output_stops_for_human(isolated_db):
@@ -165,7 +196,7 @@ def test_plan_parser_rejects_forward_dependency():
 
 def test_stage_revision_limit_stops_autonomous_ping_pong(isolated_db):
     workflow = create(isolated_db, slug="revision-limit", max_revisions=1)
-    plan = workflows.dispatch_planner(
+    workflows.dispatch_planner(
         workflow.id, WorkflowPlanDispatch(expected_version=workflow.state_version)
     )
     finish_task(isolated_db, plan_result([
@@ -219,7 +250,7 @@ def test_llm_gate_commands_force_human_plan_approval(isolated_db):
     workflow = create(
         isolated_db, slug="unsafe-auto-plan", require_approval=False
     )
-    plan = workflows.dispatch_planner(
+    workflows.dispatch_planner(
         workflow.id, WorkflowPlanDispatch(expected_version=workflow.state_version)
     )
     finish_task(isolated_db, plan_result([{
@@ -235,7 +266,7 @@ def test_llm_gate_commands_force_human_plan_approval(isolated_db):
 
 def test_planned_workflow_honors_global_round_budget(isolated_db):
     workflow = create(isolated_db, slug="plan-round-budget", max_rounds=1)
-    plan = workflows.dispatch_planner(
+    workflows.dispatch_planner(
         workflow.id, WorkflowPlanDispatch(expected_version=workflow.state_version)
     )
     finish_task(isolated_db, plan_result([{

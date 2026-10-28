@@ -8,7 +8,7 @@ import sqlite3
 import time
 import unicodedata
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -77,6 +77,17 @@ CREATE TABLE IF NOT EXISTS tasks (
     pipeline_priority_restore INTEGER,
     verdict TEXT
     ,series_id INTEGER REFERENCES task_series(id)
+    ,rights TEXT
+);
+
+CREATE TABLE IF NOT EXISTS task_token_usage (
+    task_id INTEGER PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+    input_tokens INTEGER NOT NULL CHECK(input_tokens >= 0),
+    output_tokens INTEGER NOT NULL CHECK(output_tokens >= 0),
+    cached_input_tokens INTEGER NOT NULL CHECK(cached_input_tokens >= 0),
+    model TEXT,
+    cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0 CHECK(cache_creation_input_tokens >= 0),
+    cost_attributable INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS task_series (
@@ -118,7 +129,9 @@ CREATE TABLE IF NOT EXISTS notifications (
     created_at TEXT NOT NULL,
     sent_at TEXT,
     pane_id TEXT,
-    machine TEXT
+    machine TEXT,
+    flow_ref TEXT,
+    kind TEXT
 );
 
 CREATE TABLE IF NOT EXISTS prompt_log (
@@ -243,6 +256,7 @@ CREATE TABLE IF NOT EXISTS workflow_runs (
     task_id INTEGER,
     status TEXT NOT NULL DEFAULT 'pending',
     input_sha256 TEXT NOT NULL,
+    input_json TEXT,
     output_sha256 TEXT,
     output_json TEXT,
     started_at TEXT,
@@ -289,6 +303,15 @@ CREATE TABLE IF NOT EXISTS workflow_events (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS workflow_memory (
+    workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    content TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    updated_by_task INTEGER,
+    PRIMARY KEY (workflow_id, name)
+);
+
 CREATE TRIGGER IF NOT EXISTS workflow_events_no_update
 BEFORE UPDATE ON workflow_events
 BEGIN
@@ -301,6 +324,51 @@ BEGIN
     SELECT RAISE(ABORT, 'workflow_events is append-only');
 END;
 
+-- Flows (promptpilot/flows.py): one row per request going through a flow.
+CREATE TABLE IF NOT EXISTS flow_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    flow TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    step_index INTEGER NOT NULL DEFAULT 0,
+    step_id TEXT,
+    version INTEGER NOT NULL DEFAULT 0,
+    trust TEXT NOT NULL DEFAULT 'owner',
+    dedup_key TEXT,
+    author TEXT NOT NULL DEFAULT '',
+    title TEXT NOT NULL DEFAULT '',
+    data_json TEXT NOT NULL DEFAULT '{}',
+    wait_json TEXT,
+    error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(flow, dedup_key)
+);
+
+CREATE TABLE IF NOT EXISTS flow_events (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_id INTEGER NOT NULL REFERENCES flow_items(id) ON DELETE RESTRICT,
+    step_id TEXT,
+    event_type TEXT NOT NULL,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS flow_events_no_update
+BEFORE UPDATE ON flow_events
+BEGIN
+    SELECT RAISE(ABORT, 'flow_events is append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS flow_events_no_delete
+BEFORE DELETE ON flow_events
+BEGIN
+    SELECT RAISE(ABORT, 'flow_events is append-only');
+END;
+
+CREATE INDEX IF NOT EXISTS idx_flow_items_status ON flow_items(status, flow);
+CREATE INDEX IF NOT EXISTS idx_flow_items_flow ON flow_items(flow, created_at);
+CREATE INDEX IF NOT EXISTS idx_flow_events_item ON flow_events(item_id, seq);
+
 CREATE INDEX IF NOT EXISTS idx_workflows_status ON workflows(status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_workflow_stages_workflow ON workflow_stages(workflow_id, position);
 CREATE INDEX IF NOT EXISTS idx_workflow_rounds_workflow ON workflow_rounds(workflow_id, round_no);
@@ -311,6 +379,8 @@ CREATE INDEX IF NOT EXISTS idx_workflow_events_workflow ON workflow_events(workf
 """
 
 MIGRATIONS = [
+    "ALTER TABLE task_token_usage ADD COLUMN cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE task_token_usage ADD COLUMN cost_attributable INTEGER NOT NULL DEFAULT 1",
     "ALTER TABLE tasks ADD COLUMN provider TEXT",
     "ALTER TABLE tasks ADD COLUMN model_used TEXT",
     "ALTER TABLE tasks ADD COLUMN skip_permissions INTEGER DEFAULT 0",
@@ -343,7 +413,9 @@ MIGRATIONS = [
     "ALTER TABLE tasks ADD COLUMN effort TEXT",
     "ALTER TABLE notifications ADD COLUMN pane_id TEXT",
     "ALTER TABLE notifications ADD COLUMN machine TEXT",
+    "ALTER TABLE notifications ADD COLUMN kind TEXT",
     "ALTER TABLE workflows ADD COLUMN current_stage_id TEXT",
+    "ALTER TABLE workflow_memory ADD COLUMN scope_stage TEXT",
     """CREATE TABLE IF NOT EXISTS workflow_plans (
         workflow_id TEXT PRIMARY KEY REFERENCES workflows(id) ON DELETE RESTRICT,
         status TEXT NOT NULL DEFAULT 'draft', planner_task_id INTEGER,
@@ -371,7 +443,15 @@ MIGRATIONS = [
         task_timeout INTEGER, paused INTEGER NOT NULL DEFAULT 0, ended_at TEXT,
         created_at TEXT NOT NULL, updated_at TEXT NOT NULL
     )""",
-    "CREATE INDEX IF NOT EXISTS idx_tasks_series ON tasks(series_id, id)",
+    # Schedule refreshes scan narrow health columns for every occurrence. A
+    # covering index avoids visiting task rows containing large result payloads.
+    "CREATE INDEX IF NOT EXISTS idx_tasks_series_summary ON tasks(series_id, id, status, started_at, completed_at, verdict)",
+    # The covering index also supports every lookup using the older
+    # idx_tasks_series(series_id, id) prefix. Keeping both can make SQLite
+    # prefer the narrow, table-reading scan, so the old one is only dropped:
+    # migrations replay on every start, and creating it here first would
+    # rebuild it over the whole task table each time just to drop it again.
+    "DROP INDEX IF EXISTS idx_tasks_series",
     """CREATE TABLE IF NOT EXISTS pipeline_snapshots (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         profile_id TEXT NOT NULL, repository TEXT NOT NULL,
@@ -415,6 +495,13 @@ MIGRATIONS = [
         updated_at TEXT NOT NULL
     )""",
     "CREATE INDEX IF NOT EXISTS idx_epf_jobs_task ON epf_jobs(task_id)",
+    # the assignment of a stage done outside PromptPilot (issue #122)
+    "ALTER TABLE workflow_runs ADD COLUMN input_json TEXT",
+    # what the agent run may do (models.TaskRights); NULL = skip_permissions decides
+    "ALTER TABLE tasks ADD COLUMN rights TEXT",
+    # flow notifications carry "<item>:<step>" (approval) or "<item>:" (stuck item)
+    # so the bot adds the matching buttons
+    "ALTER TABLE notifications ADD COLUMN flow_ref TEXT",
 ]
 
 WORKFLOW_SCHEMA_VERSION = "workflow_orchestrator_w0_v1"
@@ -1047,8 +1134,9 @@ def _insert_task(conn: sqlite3.Connection, task: TaskCreate) -> TaskInDB:
         """INSERT INTO tasks (prompt, working_dir, provider, status, priority,
            scheduled_at, created_at, max_retries, skip_permissions, model,
            session_id, parent_task_id, tg_chat_id, recurrence, task_timeout,
-           detached, keep_pane, herdr_target, machine, worktree, effort, series_id)
-           VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           detached, keep_pane, herdr_target, machine, worktree, effort, series_id,
+           rights)
+           VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             task.prompt,
             task.working_dir,
@@ -1071,6 +1159,7 @@ def _insert_task(conn: sqlite3.Connection, task: TaskCreate) -> TaskInDB:
             int(task.worktree),
             task.effort,
             series_id,
+            task.rights,
         ),
     )
     return get_task(cur.lastrowid, conn=conn)
@@ -1340,7 +1429,7 @@ def _release_task_pipeline_targets(conn, task_id: int, started_at=None):
 
 def mark_completed(task_id: int, result: str, exit_code: int = 0,
                    model_used: str = None, session_id: str = None,
-                   verdict: str = None, *, expected_started_at=None) -> bool:
+                   verdict: str = None, *, expected_started_at=None, usage=None) -> bool:
     """Finalize a task, optionally committing its verdict atomically."""
     with _connect() as conn:
         attempt = _attempt_iso(expected_started_at)
@@ -1361,6 +1450,26 @@ def mark_completed(task_id: int, result: str, exit_code: int = 0,
         if cur.rowcount:
             _drop_cancel_flag(conn, task_id)
             _release_task_pipeline_targets(conn, task_id, attempt)
+            # Usage belongs to this successful attempt, never to assistant text.
+            conn.execute("DELETE FROM task_token_usage WHERE task_id = ?", (task_id,))
+            if isinstance(usage, dict):
+                counts = [usage.get("input_tokens"), usage.get("output_tokens"),
+                          usage.get("cached_input_tokens", 0),
+                          usage.get("cache_creation_input_tokens", 0)]
+                if counts[2] is None:
+                    counts[2] = 0
+                if (all(type(n) is int and 0 <= n <= 2**63 - 1 for n in counts)
+                        and counts[2] + counts[3] <= counts[0]):
+                    model = usage.get("model") or model_used
+                    if not isinstance(model, str):
+                        model = None
+                    conn.execute(
+                        """INSERT INTO task_token_usage
+                           (task_id,input_tokens,output_tokens,cached_input_tokens,
+                            cache_creation_input_tokens,model,cost_attributable)
+                           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                        (task_id, *counts, model, int(usage.get("cost_attributable", True) is True)),
+                    )
         return cur.rowcount > 0
 
 
@@ -1714,14 +1823,14 @@ def list_series() -> list:
                        GROUP BY series_id
                    )
                    SELECT 'active' AS kind, t.series_id, t.id, t.machine,
-                          t.scheduled_at, t.error, t.worktree, t.detached,
+                          t.scheduled_at, t.next_run_at, t.error, t.worktree, t.detached,
                           t.herdr_target
                    FROM tasks AS t
                    INNER JOIN picked ON picked.active_id = t.id
                    INNER JOIN task_series AS s ON s.id = t.series_id
                    UNION ALL
                    SELECT 'last' AS kind, t.series_id, t.id, t.machine,
-                          NULL AS scheduled_at, NULL AS error,
+                          NULL AS scheduled_at, NULL AS next_run_at, NULL AS error,
                           NULL AS worktree, NULL AS detached,
                           NULL AS herdr_target
                    FROM tasks AS t
@@ -1775,7 +1884,12 @@ def list_series() -> list:
                 "auto_pause_reason": auto_pause_reason if s["paused"] else None,
                 "next_task_id": active["id"] if active else None,
                 "next_status": active["status"] if active else None,
-                "next_run_at": active_detail["scheduled_at"] if active_detail else None,
+                # The worker requires both the schedule and retry deadline.
+                # Showing only scheduled_at hides a rate-limited retry entirely.
+                "next_run_at": max(
+                    (value for value in (active_detail["scheduled_at"],
+                                         active_detail["next_run_at"]) if value),
+                    key=_parse_dt, default=None) if active_detail else None,
                 "next_error": active_detail["error"] if active_detail else None,
                 "next_started_at": active["started_at"] if active else None,
                 "last_task_id": last["id"] if last else None,
@@ -2301,6 +2415,7 @@ def _recreate_series_occurrence(conn, series_id: int, series,
         herdr_target=latest.herdr_target,
         machine=latest.machine,
         worktree=latest.worktree,
+        rights=latest.rights,
         series_id=series_id,
     ))
     return True
@@ -2479,7 +2594,7 @@ def clear_pipeline_series_wake(series_id: int) -> bool:
         return deleted.rowcount > 0
 
 
-def series_action(series_id: int, action: str) -> bool:
+def series_action(series_id: int, action: str, *, retry_blocked: bool = False) -> bool:
     with _connect() as conn:
         row = conn.execute("SELECT * FROM task_series WHERE id = ?", (series_id,)).fetchone()
         if not row:
@@ -2505,14 +2620,14 @@ def series_action(series_id: int, action: str) -> bool:
                 (_pipeline_series_wake_intent_key(series_id),),
             )
         elif action == "resume":
-            conn.execute("DELETE FROM settings WHERE key = ?",
-                         (f"pipeline_item_holds:v1:{series_id}",))
             resumed = conn.execute(
                 """UPDATE task_series SET paused = 0, updated_at = ?
                    WHERE id = ? AND paused = 1 AND ended_at IS NULL""",
                 (now, series_id),
             ).rowcount > 0
             if resumed:
+                conn.execute("DELETE FROM settings WHERE key = ?",
+                             (f"pipeline_item_holds:v1:{series_id}",))
                 conn.execute(
                     "DELETE FROM settings WHERE key = ?",
                     (_pipeline_repeat_blocker_pause_key(series_id),),
@@ -2532,8 +2647,6 @@ def series_action(series_id: int, action: str) -> bool:
             # the run started; Resume is the only way out of this state.
             if row["paused"] or row["ended_at"]:
                 return False
-            conn.execute("DELETE FROM settings WHERE key = ?",
-                         (f"pipeline_item_holds:v1:{series_id}",))
             cur = conn.execute(
                 """UPDATE tasks
                    SET scheduled_at = ?, next_run_at = NULL,
@@ -2543,6 +2656,9 @@ def series_action(series_id: int, action: str) -> bool:
                 (now, series_id),
             )
             if cur.rowcount > 0:
+                if retry_blocked:
+                    conn.execute("DELETE FROM settings WHERE key = ?",
+                                 (f"pipeline_item_holds:v1:{series_id}",))
                 conn.execute(
                     "DELETE FROM settings WHERE key = ?",
                     (_pipeline_series_wake_intent_key(series_id),),
@@ -2563,6 +2679,9 @@ def series_action(series_id: int, action: str) -> bool:
             recreated = _recreate_series_occurrence(
                 conn, series_id, row, datetime.now(timezone.utc))
             if recreated:
+                if retry_blocked:
+                    conn.execute("DELETE FROM settings WHERE key = ?",
+                                 (f"pipeline_item_holds:v1:{series_id}",))
                 conn.execute(
                     "DELETE FROM settings WHERE key = ?",
                     (_pipeline_series_wake_intent_key(series_id),),
@@ -3181,11 +3300,17 @@ def pipeline_series_activity(series_ids: list[int]) -> dict[int, dict]:
     marks = ",".join("?" for _ in ids)
     with _connect() as conn:
         rows = conn.execute(
-            f"""SELECT id, series_id, status, verdict, started_at, completed_at,
-                       result
-                FROM tasks WHERE series_id IN ({marks})
-                  AND status IN ('completed', 'failed', 'cancelled')
-                ORDER BY id DESC""",
+            f"""WITH latest AS (
+                    SELECT series_id, MAX(id) AS id
+                    FROM tasks WHERE series_id IN ({marks})
+                      AND status IN ('completed', 'failed', 'cancelled')
+                    GROUP BY series_id
+                )
+                SELECT t.id, t.series_id, t.status, t.verdict,
+                       t.started_at, t.completed_at, t.result
+                FROM tasks AS t
+                INNER JOIN latest ON latest.id = t.id
+                ORDER BY t.id DESC""",
             ids,
         ).fetchall()
     activity = {}
@@ -4604,17 +4729,69 @@ def update_epf_job(job_id: int, fields: dict):
         )
 
 
+def queue_herdr_completions(source_key: str, completions: list[dict], chat_ids: list[int], *, machine: str = "",
+                            present_panes: Optional[list[str]] = None) -> int:
+    """Atomically observe completion identities and enqueue durable delivery.
+
+    First successful observation baselines old sessions. Later observations,
+    including the first after a restart, enqueue every visible new identity.
+    Delivery uses the existing persistent notification outbox.
+    """
+    key = "herdr_watch_completion_v2:" + source_key
+    queued = 0
+    with _connect(immediate=True) as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        state = _json_load(row["value"], {}) if row else {}
+        initialized = state.get("initialized", False)
+        observed = state.setdefault("observed", {})
+        if present_panes is not None:
+            present = set(present_panes)
+            # Without an instance identity, observed absence is the only proof
+            # that reusing a pane starts a new lifetime. Stable terminal/session
+            # cursors survive layout moves and temporary absence.
+            observed = {slot: value for slot, value in observed.items()
+                        if not slot.startswith("legacy:") or slot[7:] in present}
+            state["observed"] = observed
+        for completion in completions:
+            pane = completion["pane"]
+            terminal = completion.get("terminal_id")
+            session = completion.get("agent_session")
+            if isinstance(terminal, str) and terminal:
+                slot = "terminal:" + terminal
+            elif isinstance(session, dict) and session.get("value"):
+                slot = "session:" + _json_dump({field: session.get(field) for field in ("agent", "kind", "value")})
+            else:
+                slot = "legacy:" + pane
+            identity = {"sequence": completion["sequence"]}
+            if observed.get(slot) == identity:
+                continue
+            if initialized:
+                for chat_id in chat_ids:
+                    conn.execute(
+                        "INSERT INTO notifications(tg_chat_id,message,created_at,pane_id,machine,kind) VALUES(?,?,?,?,?,?)",
+                        (int(chat_id), completion["message"], _now(), pane, machine, "herdr.done"),
+                    )
+                    queued += 1
+            observed[slot] = identity
+        state["initialized"] = True
+        conn.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (key, _json_dump(state)))
+    return queued
+
+
 def add_notification(tg_chat_id: int, message: str, task_id: int = None,
-                     pane_id: str = None, machine: str = None):
+                     pane_id: str = None, machine: str = None,
+                     flow_ref: str = None):
     """Queue a free-form message for the bot's notify loop (e.g. blocked agent).
 
     pane_id/machine let the bot attach herdr action buttons (confirm/screen/
-    reply) to the delivered message instead of sending bare text."""
+    reply) to the delivered message instead of sending bare text; flow_ref
+    attaches flow buttons: "<item>:<step>" approve/reject an approval,
+    "<item>:" retry/skip/cancel an item that needs a person."""
     with _connect() as conn:
         conn.execute(
-            "INSERT INTO notifications (task_id, tg_chat_id, message, created_at, pane_id, machine)"
-            " VALUES (?, ?, ?, ?, ?, ?)",
-            (task_id, tg_chat_id, message, _now(), pane_id, machine),
+            "INSERT INTO notifications (task_id, tg_chat_id, message, created_at, pane_id,"
+            " machine, flow_ref) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (task_id, tg_chat_id, message, _now(), pane_id, machine, flow_ref),
         )
 
 
@@ -4816,6 +4993,7 @@ def _row_to_workflow_round(row: sqlite3.Row) -> WorkflowRoundInDB:
 
 def _row_to_workflow_run(row: sqlite3.Row) -> WorkflowRunInDB:
     data = dict(row)
+    data["input"] = _json_load(data.pop("input_json", None), None)
     data["output"] = _json_load(data.pop("output_json"), None)
     for field in ("started_at", "completed_at"):
         data[field] = _parse_dt(data[field])
@@ -4917,10 +5095,10 @@ def append_workflow_event(event: WorkflowEventCreate) -> WorkflowEventInDB:
         return _append_workflow_event(conn, event)
 
 
-def create_workflow(data: WorkflowCreate, workflow_id: str = None) -> WorkflowInDB:
+def create_workflow(data: WorkflowCreate, workflow_id: str = None, *, conn=None) -> WorkflowInDB:
     workflow_id = workflow_id or _new_id("wf")
     now = _now()
-    with _connect(immediate=True) as conn:
+    with (nullcontext(conn) if conn is not None else _connect(immediate=True)) as conn:
         try:
             conn.execute(
                 """INSERT INTO workflows
@@ -4951,6 +5129,37 @@ def create_workflow(data: WorkflowCreate, workflow_id: str = None) -> WorkflowIn
             "SELECT * FROM workflows WHERE id = ?", (workflow_id,)
         ).fetchone()
         return _row_to_workflow(row)
+
+
+def abort_draft_workflow(workflow_id: str) -> bool:
+    """Компенсация неатомарного создания миссии с готовым планом.
+
+    Отменяет ТОЛЬКО draft-миссию: терминальный cancelled + slug вида
+    «aborted-<slug>-<id>», освобождая исходный slug для повторного запроса.
+    Физическое удаление строки невозможно по схеме: workflow_events держит
+    FK ON DELETE RESTRICT (при foreign_keys=ON), а события append-only —
+    журнал целостности важнее. Планы/этапы/раунды draft-а удаляются.
+    """
+    with _connect(immediate=True) as conn:
+        row = conn.execute(
+            "SELECT status, slug FROM workflows WHERE id = ?", (workflow_id,)
+        ).fetchone()
+        if not row or row["status"] != "draft":
+            return False
+        conn.execute(
+            "DELETE FROM workflow_stages WHERE workflow_id = ?", (workflow_id,))
+        conn.execute(
+            "DELETE FROM workflow_plans WHERE workflow_id = ?", (workflow_id,))
+        conn.execute(
+            "DELETE FROM workflow_rounds WHERE workflow_id = ?", (workflow_id,))
+        cur = conn.execute(
+            """UPDATE workflows
+               SET status = 'cancelled',
+                   slug = 'aborted-' || substr(slug, 1, 40) || '-' || substr(id, 4, 8),
+                   updated_at = ?
+               WHERE id = ? AND status = 'draft'""",
+            (_now(), workflow_id))
+        return cur.rowcount > 0
 
 
 def get_workflow(workflow_id: str, *, conn=None) -> Optional[WorkflowInDB]:
@@ -5063,7 +5272,8 @@ def _replace_workflow_stages(conn: sqlite3.Connection, workflow_id: str,
 
 
 def update_workflow(workflow_id: str, update: WorkflowUpdate) -> WorkflowInDB:
-    changes = update.model_dump(exclude={"expected_version"}, exclude_none=True)
+    changes = update.model_dump(
+        exclude={"expected_version", "allow_terminal_config"}, exclude_none=True)
     if not changes:
         raise ValueError("workflow update contains no changed fields")
     if "config" in changes:
@@ -5085,9 +5295,14 @@ def update_workflow(workflow_id: str, update: WorkflowUpdate) -> WorkflowInDB:
                 "workflow metadata except config can only be edited while status is draft"
             )
         if current["status"] in {"completed", "failed", "cancelled"}:
-            raise WorkflowConflictError(
-                "terminal workflow configuration cannot be edited"
-            )
+            # allow_terminal_config: явная семантика правки конфига
+            # терминальной миссии (только config; на выполнение не влияет)
+            if not (getattr(update, "allow_terminal_config", False)
+                    and set(changes) <= {"config_json"}):
+                raise WorkflowConflictError(
+                    "terminal workflow configuration cannot be edited "
+                    "(allow_terminal_config=true разрешает правку только config)"
+                )
         if current["state_version"] != update.expected_version:
             raise WorkflowConflictError(
                 f"workflow version is {current['state_version']}, "
@@ -5341,6 +5556,66 @@ def list_workflow_findings(workflow_id: str,
         return [_row_to_workflow_finding(row) for row in rows]
 
 
+MEMORY_MAX_BYTES = 16 * 1024
+
+
+def list_memory(workflow_id: str) -> list[dict]:
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM workflow_memory WHERE workflow_id = ? ORDER BY name",
+            (workflow_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def save_memory(workflow_id: str, name: str, content: str,
+                updated_by_task: int = None,
+                scope_stage: str = None) -> tuple[bool, str]:
+    """Сохранить заметку миссии (замена целиком). Лимит 16КБ — ОТКАЗ, не
+    обрезка: агент должен знать, что не влезло, и разбить сам.
+    scope_stage привязывает заметку к этапу — конвейер удалит её при
+    закрытии этапа (уборка — работа пайплайна)."""
+    name = name or "memory.md"
+    if not name.strip():
+        return False, "пустое имя заметки"
+    if len(name) > 64:
+        return False, "имя заметки длиннее 64 символов"
+    if len(content.encode("utf-8")) > MEMORY_MAX_BYTES:
+        return False, (f"заметка {name} больше {MEMORY_MAX_BYTES} байт — "
+                       f"сократи или раздели на несколько заметок")
+    with _connect(immediate=True) as conn:
+        if scope_stage:
+            rows = conn.execute(
+                """SELECT id FROM workflow_stages WHERE workflow_id=?
+                   AND (id=? OR code=?) AND status NOT IN ('completed','skipped')""",
+                (workflow_id, scope_stage, scope_stage),
+            ).fetchall()
+            if len(rows) != 1:
+                return False, "scope_stage должен указывать на открытый этап этой миссии"
+            scope_stage = rows[0]["id"]
+        conn.execute(
+            """INSERT INTO workflow_memory (workflow_id, name, content, updated_at, updated_by_task, scope_stage)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(workflow_id, name) DO UPDATE SET
+                   content = excluded.content,
+                   updated_at = excluded.updated_at,
+                   updated_by_task = excluded.updated_by_task,
+                   scope_stage = excluded.scope_stage""",
+            (workflow_id, name, content, _now(), updated_by_task,
+             (scope_stage or None)),
+        )
+    return True, "сохранено"
+
+
+def delete_memory(workflow_id: str, name: str) -> bool:
+    with _connect() as conn:
+        cur = conn.execute(
+            "DELETE FROM workflow_memory WHERE workflow_id = ? AND name = ?",
+            (workflow_id, name),
+        )
+        return cur.rowcount > 0
+
+
 def create_workflow_artifact(data: WorkflowArtifactCreate,
                              artifact_id: str = None) -> WorkflowArtifactInDB:
     artifact_id = artifact_id or _new_id("artifact")
@@ -5428,15 +5703,35 @@ def list_workflow_artifacts(workflow_id: str,
         return [_row_to_workflow_artifact(row) for row in rows]
 
 
-def list_workflow_events(workflow_id: str, after_seq: int = 0,
-                         limit: int = 200) -> list[WorkflowEventInDB]:
+def list_workflow_notification_events(after_seq: int = 0, limit: int = 500,
+                                      *, tail: bool = False):
+    """One global event snapshot, including workflows beyond UI list limits."""
     with _connect() as conn:
         rows = conn.execute(
-            """SELECT * FROM workflow_events
+            "SELECT e.*, w.slug AS workflow_slug FROM workflow_events e "
+            "JOIN workflows w ON w.id=e.workflow_id WHERE e.seq>? ORDER BY e.seq "
+            + ("DESC" if tail else "ASC") + " LIMIT ?", (after_seq, limit),
+        ).fetchall()
+    if tail:
+        rows.reverse()
+    return [(row["workflow_slug"], _row_to_workflow_event(row)) for row in rows]
+
+
+def list_workflow_events(workflow_id: str, after_seq: int = 0,
+                         limit: int = 200,
+                         tail: bool = False) -> list[WorkflowEventInDB]:
+    """tail=True — последние `limit` событий в хронологическом порядке:
+    дешевле страницы «всё и отрезать» для длинных миссий."""
+    with _connect() as conn:
+        order = "DESC" if tail else "ASC"
+        rows = conn.execute(
+            f"""SELECT * FROM workflow_events
                WHERE workflow_id = ? AND seq > ?
-               ORDER BY seq LIMIT ?""",
+               ORDER BY seq {order} LIMIT ?""",
             (workflow_id, after_seq, limit),
         ).fetchall()
+        if tail:
+            rows = list(reversed(rows))
         return [_row_to_workflow_event(row) for row in rows]
 
 
