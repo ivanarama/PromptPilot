@@ -36,9 +36,16 @@ from pathlib import Path
 # message would be blocked, and a guard that fires on prose gets switched off.
 CMD = r"(?:^|[;&|]\s*|\$\(\s*|`\s*|\n\s*)"
 
-# A branch name may contain hyphens, so \b is too loose: it makes "main-fix"
-# look like "main".
-TRUNK = r"(?<![\w-])(?:main|master)(?![\w-])"
+# A branch name may contain hyphens and slashes, so \b is too loose: it makes
+# "main-fix" or "feature/main" look like "main". A full ref such as
+# HEAD:refs/heads/main still is main.
+TRUNK = r"(?:(?<![\w/-])|(?<=refs/heads/))(?:main|master)(?![\w/-])"
+
+# `git push`, also with global options in between: `git -C repo push --force`
+# and `git -c k=v push origin main` are the same pushes and used to slip past
+# every push rule.
+GIT_PUSH = (r"\bgit(?:\s+(?:-[Cc]\s+(?:'[^']*'|\"[^\"]*\"|\S+)"
+            r"|--?[\w-]+(?:=\S+)?))*\s+push\b")
 
 # (pattern, what the model is told). Matched case-insensitively against
 # "<tool name> <command or serialised arguments>".
@@ -50,10 +57,10 @@ DEFAULT_RULES = [
     (r"\brm\s+-[a-z]*r[a-z]*f?\s+[^|;&]*\.git(?:\s|/|$)",
      "Удаление .git запрещено: это вся история репозитория."),
 
-    (r"\bgit\s+push\b[^|;&]*(?:--force(?:-with-lease)?|--delete|\s-f\b)",
+    (GIT_PUSH + r"[^|;&]*(?:--force(?:-with-lease)?|--delete|\s-f\b)",
      "Форс-пуш и удаление веток на сервере запрещены: перепишешь чужую работу."),
 
-    (r"\bgit\s+push\b[^|;&]*" + TRUNK,
+    (GIT_PUSH + r"[^|;&]*" + TRUNK,
      "Пуш в main/master запрещён: работай в своей ветке, вливает человек."),
 
     (r"\bgit\s+worktree\s+(?:remove|prune)\b",
@@ -165,7 +172,7 @@ def check(command: str, cwd: str = "", tool: str = "") -> str:
     for pattern, reason in load_rules():
         if re.search(pattern, text, re.IGNORECASE):
             return reason
-    if re.search(r"\bgit\s+push\b", text, re.IGNORECASE):
+    if re.search(GIT_PUSH, text, re.IGNORECASE):
         branch = _current_branch(_effective_cwd(command, cwd))
         if branch in TRUNK_BRANCHES:
             return (f"Пуш из ветки {branch} запрещён: работай в своей ветке, "

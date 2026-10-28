@@ -3399,6 +3399,9 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                         "pipeline target reservation contradicts task, repository, or target")
                 target_reservation = reservation
                 validated_target_stage = target_stage
+                if target_stage == "review" and queue.get("item_blockers") is True:
+                    from .pipeline_item_holds import register_review_target
+                    register_review_target(task, number, head)
             except (project_pipeline.PipelineError, TypeError, ValueError) as exc:
                 return {
                     "action": "block", "mode": "tool",
@@ -3572,6 +3575,10 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                         "preflight": preflight,
                     }
             if mode == "auto":
+                if stage == "merge" and queue.get("item_blockers") is True:
+                    from .pipeline_item_holds import register_target
+                    target = fallback_lease["target"]
+                    register_target(task, target["number"], target["head"], "merge")
                 gate_command = [*command[:-2], "gate-fallback", stage,
                                 *_lease_argument(task, preflight["handoff"]["lease"], "gate")]
                 envelope = {"protocol": "promptpilot-fallback-target-v1",
@@ -3868,6 +3875,9 @@ def _health(backlog: int, windows: dict, broken_series: int, paused_series: int 
         return {"state": "yellow", "label": "конвейер на паузе",
                 "reason": "включена общая пауза: активные серии не запускаются"}
     if paused_series:
+        if runtime and runtime.get("required") and not runtime.get("paused"):
+            return {"state": "yellow", "label": "часть этапов на паузе",
+                    "reason": f"приостановлено серий: {paused_series}; остальные могут работать"}
         return {"state": "yellow", "label": "конвейер на паузе",
                 "reason": f"приостановлено серий: {paused_series}"}
     if diagnostics and diagnostics.get("state") == "yellow":
@@ -3991,6 +4001,11 @@ def _queue_replica_status(queue: dict, series: list[dict]) -> dict:
             "working_dir": working_dir or None,
             "task_id": item.get("next_task_id"),
             "task_status": item.get("next_status"),
+            "task_error": (item.get("next_error")
+                           if item.get("next_status") in {"pending", "rate_limited"} else None),
+            "task_next_run_at": (item.get("next_run_at")
+                                 if item.get("next_status") in {"pending", "rate_limited"}
+                                 else None),
             "interval": item.get("effective_recurrence"),
             "paused": bool(item.get("paused")),
             "broken": bool(item.get("broken")),
@@ -4165,6 +4180,12 @@ def _refresh_local_state(result: dict, profile: dict, series: list[dict], *,
             "series_id": matching["id"] if matching else None,
             "task_id": matching.get("next_task_id") if matching else None,
             "task_status": matching.get("next_status") if matching else None,
+            "task_error": (matching.get("next_error")
+                           if matching and matching.get("next_status") in {"pending", "rate_limited"}
+                           else None),
+            "task_next_run_at": (matching.get("next_run_at")
+                                 if matching and matching.get("next_status") in {"pending", "rate_limited"}
+                                 else None),
             **projection,
         })
         backlog = queue.get("backlog")
@@ -5449,6 +5470,8 @@ def build_period_report(profile_id: str, series: list[dict], *, hours: int = 24,
     current_tasks = [{
         "task_id": item.get("next_task_id"), "title": item.get("title"),
         "status": item.get("next_status"),
+        "error": (item.get("next_error")
+                  if item.get("next_status") in {"pending", "rate_limited"} else None),
         "started_at": item.get("next_started_at"),
         "scheduled_at": item.get("next_run_at"),
         "paused": bool(item.get("paused")),
@@ -5490,7 +5513,11 @@ def build_period_report(profile_id: str, series: list[dict], *, hours: int = 24,
         "queues": queues, "runs": run_report,
         "attention": attention, "delivery": delivery, "cache": cache,
         "board": board,
-        "current": {"observed_at": now.isoformat(), "tasks": current_tasks},
+        "current": {
+            "observed_at": now.isoformat(), "tasks": current_tasks,
+            "integration_owner": (copy.deepcopy(diagnostics.get("integration_owner"))
+                                  if fresh else None),
+        },
         "decisions": {
             "waiting_ship": copy.deepcopy(diagnostics.get("reviewed_waiting_ship") or []),
             "human_waiting": copy.deepcopy(diagnostics.get("human_waiting") or []),

@@ -14,6 +14,7 @@ import pytest
 
 from promptpilot import fallback_handoff as handoff
 from promptpilot import pipeline_insights, project_pipeline as pp
+from promptpilot.models import TaskCreate
 
 
 HEAD = "a" * 40
@@ -57,6 +58,41 @@ def health(target_stage="integration-review"):
                                           if target_stage in handoff.CONTENT_REVIEW_STAGES
                                           else []),
             "merge_executable": [] if reviewing else [target]}
+
+
+@pytest.mark.parametrize("change", [
+    {"number": 99}, {"head": "b" * 40}, {"review_depth": 2},
+    {"stage": "integration-review"},
+])
+def test_parallel_review_allowlist_cannot_expand_content_authority(change):
+    value = health()
+    content = {"number": 43, "head": "c" * 40,
+               "stage": "review", "review_depth": 0}
+    value["content_review_candidates"] = [content]
+    value["parallel_review_candidates"] = [dict(content, **change)]
+    with pytest.raises(pp.PipelineError, match="parallel REVIEW"):
+        handoff.validate_health(value)
+
+
+def test_parallel_review_allowlist_requires_integration_review_owner():
+    value = health("integration-merge-ready")
+    content = {"number": 43, "head": "c" * 40,
+               "stage": "review", "review_depth": 0}
+    value["content_review_candidates"] = [content]
+    value["review_candidates"] = [content]
+    value["parallel_review_candidates"] = [content]
+    with pytest.raises(pp.PipelineError, match="no integration-review owner"):
+        handoff.validate_health(value)
+
+
+def test_parallel_review_cannot_duplicate_integration_owner():
+    value = health()
+    duplicate = {"number": 42, "head": HEAD,
+                 "stage": "review", "review_depth": 0}
+    value["content_review_candidates"] = [duplicate]
+    value["parallel_review_candidates"] = [duplicate]
+    with pytest.raises(pp.PipelineError, match="includes its integration owner"):
+        handoff.validate_health(value)
 
 
 def invoke(argv):
@@ -649,3 +685,58 @@ def test_module_cli_helper_errors_are_json_and_visible_without_tracebacks(config
     assert payload["error"]
     assert result.stderr.strip() == f"pipelinectl gate-fallback: {payload['error']}"
     assert "Traceback" not in result.stderr
+
+
+def test_validated_merge_fallback_parks_exact_target_with_stale_dashboard(
+        config, isolated_db, monkeypatch):
+    source = health("merge")
+    target = source["merge_executable"][0]
+    preflight = handoff.create(config, source, "merge", target, "full skill required")
+    queue = {"id": "merge", "item_blockers": True,
+             "execution": {"mode": "auto", "command": ["pp", "next", "merge"]}}
+    monkeypatch.setattr(pipeline_insights, "_matching_queue", lambda _: ("p", {}, queue))
+    monkeypatch.setattr(pipeline_insights, "_tool_available", lambda *_: (True, ""))
+    monkeypatch.setattr(pipeline_insights, "_tool_preflight", lambda *_: preflight)
+    monkeypatch.setattr(pipeline_insights, "read_cached", lambda *_: {"cache": {"stale": True}})
+    task = isolated_db.create_task(TaskCreate(prompt="merge", recurrence="15m"))
+    route = pipeline_insights.execution_route(task, "canonical skill")
+    assert route["action"] == "prompt"
+    isolated_db.mark_completed(
+        task.id, f'ИТОГ: НУЖЕН ЧЕЛОВЕК (#{target["number"]} — conflict requires owner)',
+        verdict="НУЖЕН ЧЕЛОВЕК")
+    assert not isolated_db.pause_pipeline_series_on_repeated_blocker(
+        task.series_id, task.id)["suppress_recurrence"]
+    from promptpilot.pipeline_item_holds import prepare
+    fresh = {"cache": {"complete": True}, "diagnostics": source}
+    successor = SimpleNamespace(id=task.id + 1, series_id=task.series_id)
+    assert prepare(successor, queue, fresh) == [target["number"]]
+
+
+@pytest.mark.parametrize("verdict", ["НЕ СМОГ", "НУЖЕН ЧЕЛОВЕК"])
+def test_repeated_merge_target_with_stale_snapshot_keeps_series_guard(
+        config, isolated_db, monkeypatch, verdict):
+    source = health("merge")
+    target = source["merge_executable"][0]
+    preflight = handoff.create(config, source, "merge", target, "full skill required")
+    queue = {"id": "merge", "item_blockers": True,
+             "execution": {"mode": "auto", "command": ["pp", "next", "merge"]}}
+    monkeypatch.setattr(pipeline_insights, "_matching_queue", lambda _: ("p", {}, queue))
+    monkeypatch.setattr(pipeline_insights, "_tool_available", lambda *_: (True, ""))
+    monkeypatch.setattr(pipeline_insights, "_tool_preflight", lambda *_a, **_k: preflight)
+    monkeypatch.setattr(pipeline_insights, "read_cached", lambda *_: {"cache": {"stale": True}})
+    result = f'ИТОГ: {verdict} (#{target["number"]} — conflict requires owner)'
+    first = isolated_db.create_task(TaskCreate(prompt="merge", recurrence="15m"))
+    assert pipeline_insights.execution_route(first, "canonical skill")["action"] == "prompt"
+    isolated_db.mark_completed(first.id, result, verdict=verdict)
+    assert not isolated_db.pause_pipeline_series_on_repeated_blocker(
+        first.series_id, first.id)["suppress_recurrence"]
+    # Repairing the same occurrence remains idempotent.
+    assert not isolated_db.pause_pipeline_series_on_repeated_blocker(
+        first.series_id, first.id)["suppress_recurrence"]
+    second = isolated_db.create_task(TaskCreate(
+        prompt="merge", recurrence="15m", series_id=first.series_id))
+    assert pipeline_insights.execution_route(second, "canonical skill")["action"] == "prompt"
+    isolated_db.mark_completed(second.id, result, verdict=verdict)
+    guard = isolated_db.pause_pipeline_series_on_repeated_blocker(second.series_id, second.id)
+    assert guard["suppress_recurrence"] and guard["previous_task_id"] == first.id
+    assert isolated_db.list_series()[0]["paused"]

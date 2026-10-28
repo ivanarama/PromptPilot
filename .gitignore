@@ -16,6 +16,7 @@ promptpilot/_build_commit.py
 scripts/inbox/.state.json
 scripts/inbox/outbox/
 scripts/inbox/events.jsonl
+scripts/inbox/.tg_state.json
 scripts/oneservice/.os_state.json
 scripts/oneservice/.os_senders.json
 scripts/oneservice/.os_tg_allowed.json

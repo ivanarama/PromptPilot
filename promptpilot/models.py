@@ -92,6 +92,14 @@ class TaskInDB(BaseModel):
     series_id: Optional[int] = None
     series_title: Optional[str] = None
     series_paused: bool = False
+    # Атрибуция задач (очередь/миссия): None = задача вне воркфлоу / не в ожидании.
+    workflow_id: Optional[str] = None
+    role: Optional[str] = None
+    # Базовый ранг по времени, состоянию серии и параллельным lock_key.
+    # Lanes, fairness, слоты и глобальная пауза не моделируются. Исключённые
+    # задачи несут wait_reason; у кандидатов базового допуска он None.
+    queue_position: Optional[int] = None
+    wait_reason: Optional[str] = None
 
 
 class Stats(BaseModel):
@@ -634,6 +642,10 @@ class WorkflowHumanInput(BaseModel):
     text: str = Field(min_length=1)
     expected_version: int = Field(ge=0)
     resume: bool = False
+    # What the next agent run must be told. `text` is the journal record of
+    # the decision (automation writes its own boilerplate there); only `note`
+    # is delivered into the next executor/reviewer prompt.
+    note: str = Field(default="", max_length=20000)
 
 
 class HistoricalFactStatus(str, Enum):

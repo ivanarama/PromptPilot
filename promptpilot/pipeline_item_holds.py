@@ -31,7 +31,7 @@ def complete_members(queue):
     return None
 
 
-def fingerprints(data):
+def fingerprints(data, queue_config=None):
     cache = data.get("cache") or {}
     if cache.get("complete") is not True or cache.get("stale") or cache.get("refresh_blocked"):
         return None
@@ -45,6 +45,60 @@ def fingerprints(data):
                 continue
             items[str(number)] = item
     diagnostics = data.get("diagnostics") or {}
+    # REVIEW's project-owned election also includes re-review targets that are
+    # deliberately absent from the ordinary GitHub search (for example a PR
+    # carrying needs-decision after an owner review-again marker). These are
+    # still exact, versioned targets. A hold only removes work from admission;
+    # it never grants permission to review or mutate a PR.
+    stage = str((queue_config or {}).get("id") or "").lower()
+    execution = (queue_config or {}).get("execution") or {}
+    if isinstance(execution, dict):
+        stage = str(execution.get("stage") or stage).lower()
+    if stage == "review" and not diagnostics.get("checker_failed"):
+        candidates = diagnostics.get("review_candidates")
+        if isinstance(candidates, list):
+            seen = set()
+            ambiguous = set()
+            for candidate in candidates:
+                if not isinstance(candidate, dict) or candidate.get("stage") != "review":
+                    continue
+                number, head = candidate.get("number"), candidate.get("head")
+                if (type(number) is not int or number <= 0
+                        or not isinstance(head, str)
+                        or not re.fullmatch(r"[0-9a-fA-F]{40}", head)):
+                    continue
+                key = str(number)
+                if key in seen:
+                    ambiguous.add(key)
+                    continue
+                seen.add(key)
+                items.setdefault(key, {"number": number, "kind": "pr",
+                                       "updated_at": head.lower(), "head": head.lower()})
+            for key in ambiguous:
+                items.pop(key, None)
+    if stage in {"fix", "merge"} and not diagnostics.get("checker_failed"):
+        # A completed handoff can move a PR out of this stage's search before
+        # the next attempt. Measure all versioned diagnostic PRs as negative
+        # admission evidence, including human_waiting and review_candidates.
+        # This cannot add a PR to any executable allowlist.
+        versions = {}
+        for field in ("review_candidates", "content_review_candidates", "review_backlog",
+                      "fix_candidates", "merge_candidates", "merge_executable",
+                      "human_waiting", "reviewed_waiting_ship"):
+            for candidate in diagnostics.get(field) or []:
+                if not isinstance(candidate, dict):
+                    continue
+                number, head = candidate.get("number"), candidate.get("head")
+                if (type(number) is int and number > 0 and isinstance(head, str)
+                        and re.fullmatch(r"[0-9a-fA-F]{40}", head)):
+                    versions.setdefault(str(number), set()).add(head.lower())
+        for key, heads in versions.items():
+            if len(heads) != 1:
+                items.pop(key, None)
+                continue
+            head = next(iter(heads))
+            items.setdefault(key, {"number": int(key), "kind": "pr",
+                                   "updated_at": head, "head": head})
     result = {}
     for number, item in items.items():
         witnesses = []
@@ -63,7 +117,7 @@ def prepare(task, queue, data):
     """Remember pre-launch state, return only unchanged, unexpired exclusions."""
     if queue.get("item_blockers") is not True:
         return []
-    states = fingerprints(data)
+    states = fingerprints(data, queue)
     if states is None:
         return []
     db.set_setting(MODE + str(task.series_id), "1")
@@ -76,7 +130,13 @@ def prepare(task, queue, data):
         return []
     excluded = []
     for number, hold in holds.items():
-        if (isinstance(hold, dict) and hold.get("fingerprint") == states.get(number)
+        if not isinstance(number, str) or not number.isdigit() or not isinstance(hold, dict):
+            continue
+        current_head = _candidate_head(data, int(number), hold.get("stage", "review"))
+        unchanged = (hold.get("fingerprint") == states.get(number)
+                     if "fingerprint" in hold else
+                     current_head is not None and hold.get("head") == current_head)
+        if (unchanged
                 and type(hold.get("at")) in {int, float}
                 and 0 <= time.time() - hold["at"] < TTL
                 and number.isdigit() and int(number) > 0):
@@ -84,13 +144,56 @@ def prepare(task, queue, data):
     return sorted(excluded)
 
 
+def _candidate_head(data, number, stage):
+    diagnostics = data.get("diagnostics") or {}
+    if diagnostics.get("checker_failed"):
+        return None
+    candidates = diagnostics.get("review_candidates" if stage == "review" else "merge_executable")
+    if not isinstance(candidates, list):
+        return None
+    matching = [item.get("head", "").lower() for item in candidates
+                if isinstance(item, dict) and (item.get("stage") == "review"
+                                               if stage == "review" else True)
+                and item.get("number") == number and isinstance(item.get("head"), str)
+                and re.fullmatch(r"[0-9a-fA-F]{40}", item["head"])]
+    return matching[0] if len(matching) == 1 else None
+
+
+def register_review_target(task, number, head):
+    """Attach the already-validated exact REVIEW election to this attempt.
+
+    This only enables a negative admission hold. It never grants review or
+    mutation authority, and future dispatch still requires a fresh candidate.
+    """
+    register_target(task, number, head, "review")
+
+
+def register_target(task, number, head, stage):
+    """Remember a validated tool election, never an executor's claimed target."""
+    if (stage not in {"review", "merge"}
+            or not getattr(task, "series_id", None) or type(number) is not int or number <= 0
+            or not isinstance(head, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", head)):
+        return
+    key = BASELINE + str(task.series_id)
+    try:
+        baseline = json.loads(db.get_setting(key) or "{}")
+    except (TypeError, ValueError):
+        baseline = {}
+    if baseline.get("task_id") != task.id:
+        baseline = {"task_id": task.id, "states": {}, "at": time.time()}
+    baseline["review_target"] = {"number": number, "head": head.lower(), "stage": stage}
+    db.set_setting(MODE + str(task.series_id), "1")
+    db.set_setting(key, json.dumps(baseline))
+
+
 def record(conn, series_id, task_id, verdict, result):
     """Called inside recurrence's existing transaction; return True if held.
 
-    Only explicit unambiguous HUMAN targets with a measured pre-launch state
-    qualify. UNABLE and unmeasured/ambiguous failures retain the series guard.
+    Explicit HUMAN targets require measured state. UNABLE additionally requires
+    an exact validated tool election. Unscoped failures retain the series guard.
     """
-    if str(verdict or "").strip().upper() != "НУЖЕН ЧЕЛОВЕК":
+    outcome = str(verdict or "").strip().upper()
+    if outcome not in {"НУЖЕН ЧЕЛОВЕК", "НЕ СМОГ"}:
         return False
     mode = conn.execute("SELECT value FROM settings WHERE key=?", (MODE + str(series_id),)).fetchone()
     baseline = conn.execute("SELECT value FROM settings WHERE key=?", (BASELINE + str(series_id),)).fetchone()
@@ -113,7 +216,16 @@ def record(conn, series_id, task_id, verdict, result):
         if measured.get("task_id") != task_id or not 0 <= time.time() - measured["at"] < TTL:
             return False
         states = measured["states"]
-        if not all(number in states for number in numbers):
+        target = measured.get("review_target") or {}
+        exact_target = (len(numbers) == 1
+                        and str(target.get("number")) in numbers
+                        and isinstance(target.get("head"), str)
+                        and re.fullmatch(r"[0-9a-f]{40}", target["head"]))
+        if target and not exact_target:
+            return False
+        if outcome == "НЕ СМОГ" and not exact_target:
+            return False
+        if not all(number in states for number in numbers) and not exact_target:
             return False
         row = conn.execute("SELECT value FROM settings WHERE key=?", (PREFIX + str(series_id),)).fetchone()
         holds = json.loads(row["value"]) if row else {}
@@ -121,11 +233,24 @@ def record(conn, series_id, task_id, verdict, result):
             return False
     except (TypeError, ValueError, KeyError):
         return False
+    if exact_target:
+        old = holds.get(next(iter(numbers))) or {}
+        if (isinstance(old, dict)
+                and old.get("head") == target["head"]
+                and old.get("stage", "review") == target.get("stage", "review")
+                and old.get("task_id") not in (None, task_id)
+                and type(old.get("at")) in {int, float}
+                and 0 <= time.time() - old["at"] < TTL):
+            # A different occurrence re-elected this still-held target.
+            # Its hold did not exclude it; retain the series repeat guard.
+            return False
     # Preserve the initial timestamp: recurrence repair must not extend a hold.
     for number in numbers:
         old = holds.get(number) or {}
-        if old.get("fingerprint") != states[number]:
-            holds[number] = {"fingerprint": states[number], "at": time.time(),
+        identity = ({"head": target["head"], "stage": target.get("stage", "review")} if exact_target else
+                    {"fingerprint": states[number]})
+        if any(old.get(key) != value for key, value in identity.items()):
+            holds[number] = {**identity, "at": time.time(),
                              "reason": reason, "task_id": task_id}
     holds = {number: hold for number, hold in holds.items()
              if isinstance(hold, dict) and type(hold.get("at")) in {int, float}
