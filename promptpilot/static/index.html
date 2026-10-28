@@ -4391,13 +4391,20 @@ document.getElementById('promptInput').addEventListener('paste', e => {
 let machinesData = {};
 
 async function loadMachines() {
-  try { machinesData = await fetchJSON(`${API}/machines`); } catch (e) { machinesData = {}; }
+  // A failed refresh must not turn an existing remote selection into local.
+  const refreshed = await fetchJSON(`${API}/machines`);
   const label = document.getElementById('machineLabel');
   const sel = document.getElementById('machineInput');
+  const previous = sel.value;
+  machinesData = refreshed;
   const names = Object.keys(machinesData);
-  label.style.display = names.length ? 'flex' : 'none';
+  label.style.display = names.length || previous ? 'flex' : 'none';
   sel.innerHTML = '<option value="">💻 локально</option>'
     + names.map(n => `<option value="${escAttr(n)}">${esc(n)} (${esc(machinesData[n].host)})</option>`).join('');
+  if (previous && !names.includes(previous)) {
+    sel.innerHTML += `<option value="${escAttr(previous)}" disabled>${esc(previous)} · недоступна</option>`;
+  }
+  sel.value = previous;
 }
 
 function updateProvidersForMachine() {
@@ -4414,7 +4421,8 @@ function updateProvidersForMachine() {
 }
 
 function preferredTaskProvider(names, current = '') {
-  const remembered = localStorage.getItem('promptpilot.last-provider') || '';
+  let remembered = '';
+  try { remembered = localStorage.getItem('promptpilot.last-provider') || ''; } catch (_) {}
   return [current, remembered, 'agy', 'codex', names[0] || ''].find(name => names.includes(name)) || '';
 }
 
@@ -4422,18 +4430,13 @@ async function loadProviders() {
   providersData = await fetchJSON(`${API}/providers`);
   await loadMachines();
   const sel = document.getElementById('providerInput');
-  const previous = sel.value;
-  const choices = orderedProviderEntries().filter(([name, info]) => info.available !== false && !info.hidden);
-  sel.innerHTML = choices.map(([name, info]) => `<option value="${escAttr(name)}">${esc(providerLabel(name, info))} — ${esc(info.description || info)}</option>`).join('');
-  sel.value = preferredTaskProvider(choices.map(([name]) => name), previous);
   sel.onchange = () => {
-    localStorage.setItem('promptpilot.last-provider', sel.value);
+    try { localStorage.setItem('promptpilot.last-provider', sel.value); } catch (_) {}
     skillsCache = {}; updateSkillsToggle(); closeSkillsPanel(); updateModelSelect(); updateEffortSelect(); updateKeepPane();
   };
-  updateSkillsToggle();
-  updateModelSelect();
-  updateEffortSelect();
-  updateKeepPane();
+  // Rebuild once for the selected machine. A local-only intermediate rebuild
+  // would already lose a valid remote-only provider before it could be restored.
+  updateProvidersForMachine();
 }
 
 function updateKeepPane() {

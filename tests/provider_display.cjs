@@ -11,7 +11,7 @@ const source = [
   slice('function providerLabel(', 'function effortOptions('),
   slice('function workflowProviderOptions(', 'function wfChecked('),
   slice('let provManageData = {}', 'async function provToggleHide('),
-  slice('function updateProvidersForMachine(', 'function updateKeepPane('),
+  slice('async function loadMachines()', 'function updateKeepPane('),
 ].join('\n');
 const escape = value => String(value).replaceAll('&', '&amp;').replaceAll('<', '&lt;')
   .replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&#39;');
@@ -22,19 +22,30 @@ const server = {
   hidden: {human:{label:'Saved hidden'}, ui_order:2, available:true, hidden:true},
   session: {human:{label:'Live'}, session_target:true, available:true, hidden:false},
 };
+class Select {
+  constructor(value='') { this.value=value; this.markup=''; }
+  get innerHTML() { return this.markup; }
+  set innerHTML(value) {
+    this.markup=value;
+    const options=[...value.matchAll(/<option value="([^"]*)"([^>]*)>/g)];
+    this.value=(options.find(item=>item[2].includes('selected')) || options[0] || [null,''])[1];
+  }
+}
+const machineRegistry = {remote:{providers:['beta','alpha'], host:'fixture'}};
 const elements = {
-  providerInput: {value:'alpha', innerHTML:''}, machineInput:{value:''},
+  providerInput: new Select('alpha'), machineInput:new Select(),
+  machineLabel:{style:{}},
   provList:{innerHTML:''},
 };
 const buttons = [{disabled:false}, {disabled:false}];
 const requests = [], toasts = [];
-let pending = null, fail = false, failSummary = false, failManage = false;
+let pending = null, fail = false, failSummary = false, failManage = false, failMachines = false;
 const context = {
-  providersData:{...server}, machinesData:{remote:{providers:['beta','alpha']}},
+  providersData:{...server}, machinesData:machineRegistry,
   API:'/api', esc:escape, escAttr:escape,
   document:{getElementById:id=>elements[id], querySelectorAll:()=>buttons},
   localStorage:{getItem:()=> 'alpha', setItem:()=>{}},
-  loadMachines:async()=>{}, toast:message=>toasts.push(message),
+  toast:message=>toasts.push(message),
   updateSkillsToggle:()=>{}, updateModelSelect:()=>{}, updateEffortSelect:()=>{}, updateKeepPane:()=>{},
   closeSkillsPanel:()=>{}, skillsCache:{},
   fetchJSON:async(url, options)=>{
@@ -48,6 +59,8 @@ const context = {
     }
     if (url.endsWith('/providers') && failSummary) throw Error('summary offline');
     if (url.endsWith('/providers/manage') && failManage) throw Error('manage offline');
+    if (url.endsWith('/machines') && failMachines) throw Error('machines offline');
+    if (url.endsWith('/machines')) return machineRegistry;
     if (url.endsWith('/providers') || url.endsWith('/providers/manage')) return server;
     throw Error(`Unexpected request ${url}`);
   },
@@ -116,5 +129,34 @@ const names = data => JSON.parse(JSON.stringify(context.orderedProviderEntries(d
   fail=false; failManage=false;
   await context.provMove('alpha',-1);
   assert.deepEqual(names(server),['alpha','beta','hidden','session']);
+
+  server.beta.available=false; // installed on the remote machine, not here
+  elements.machineInput.value='remote';
+  context.updateProvidersForMachine();
+  elements.providerInput.value='beta';
+  await context.provMove('beta',-1);
+  assert.equal(elements.machineInput.value,'remote', 'display reorder preserves the selected machine');
+  assert.equal(elements.providerInput.value,'beta', 'remote-only execution ID must not become local fallback');
+  assert.match(elements.providerInput.innerHTML,/value="beta"/);
+
+  failMachines=true; toasts.length=0;
+  await context.provMove('alpha',-1);
+  assert.equal(elements.machineInput.value,'remote');
+  assert.equal(elements.providerInput.value,'beta');
+  assert.equal(toasts.length,1);
+  failMachines=false;
+
+  context.localStorage.getItem=()=>{throw Error('storage disabled');};
+  context.localStorage.setItem=()=>{throw Error('storage disabled');};
+  await context.loadProviders();
+  assert.equal(elements.machineInput.value,'remote');
+  assert.equal(elements.providerInput.value,'beta');
+  elements.providerInput.onchange(); // storage failure cannot abort current choice updates
+
+  delete machineRegistry.remote;
+  await context.loadProviders();
+  assert.equal(elements.machineInput.value,'remote', 'removed machine is visibly unavailable, never implicitly local');
+  assert.match(elements.machineInput.innerHTML,/disabled/);
+  assert.equal(elements.providerInput.value,'');
   console.log('Provider labels/order: escaped display, stable execution IDs, hidden/session filters, serialized save and retry');
 })().catch(error=>{console.error(error);process.exitCode=1;});
