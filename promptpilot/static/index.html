@@ -1383,10 +1383,22 @@ async function loadTasks() {
   uiRestoreScrolls(list, taskScrolls);
 }
 
+function providerLabel(name, info = providersData[name]) {
+  const label = info?.human?.label;
+  return typeof label === 'string' && label.trim() ? label.trim() : name;
+}
+
+function orderedProviderEntries(data = providersData) {
+  const order = info => Number.isSafeInteger(info?.ui_order) && info.ui_order >= 0
+    ? info.ui_order : Number.MAX_SAFE_INTEGER;
+  // Stable sort preserves the existing default order when no override exists.
+  return Object.entries(data).sort((a, b) => order(a[1]) - order(b[1]));
+}
+
 function providerOptions(current) {
-  return Object.entries(providersData)
+  return orderedProviderEntries()
     .filter(([name, p]) => !p.hidden || name === current)
-    .map(([name]) => `<option value="${escAttr(name)}"${name === current ? ' selected' : ''}>${esc(name)}</option>`)
+    .map(([name, info]) => `<option value="${escAttr(name)}"${name === current ? ' selected' : ''}>${esc(providerLabel(name, info))}</option>`)
     .join('');
 }
 
@@ -2265,13 +2277,13 @@ async function selectWorkflow(id) {
 }
 
 function workflowProviderOptions(selected = 'herdr-session', includeSession = true) {
-  const names = Object.entries(providersData).filter(([, p]) => !p.hidden);
+  const names = orderedProviderEntries().filter(([, p]) => !p.hidden);
   const filtered = names.filter(([, p]) => includeSession || !p.session_target);
   const defaultOption = selected ? '' : '<option value="" selected>провайдер PromptPilot по умолчанию</option>';
   const missingOption = selected && !filtered.some(([name]) => name === selected)
-    ? `<option value="${escAttr(selected)}" selected>${esc(selected)} · недоступен</option>` : '';
+    ? `<option value="${escAttr(selected)}" selected>${esc(providerLabel(selected))} · недоступен</option>` : '';
   return defaultOption + missingOption + filtered
-    .map(([name, p]) => `<option value="${escAttr(name)}"${name === selected ? ' selected' : ''}>${esc(name)}${p.session_target ? ' · живая сессия' : ''}</option>`).join('');
+    .map(([name, p]) => `<option value="${escAttr(name)}"${name === selected ? ' selected' : ''}>${esc(providerLabel(name, p))}${p.session_target ? ' · живая сессия' : ''}</option>`).join('');
 }
 
 function wfChecked(value) { return value ? ' checked' : ''; }
@@ -4089,11 +4101,17 @@ async function epfSaveSettings(event) {
 }
 
 let provManageData = {};
+let providerOrderSaving = false;
 
 async function renderProvList() {
   const data = await fetchJSON(`${API}/providers/manage`);
+  renderProviderCards(data);
+}
+
+function renderProviderCards(data) {
   provManageData = data;
-  document.getElementById('provList').innerHTML = Object.entries(data).map(([name, p]) => {
+  const entries = orderedProviderEntries(data);
+  document.getElementById('provList').innerHTML = entries.map(([name, p], index) => {
     const badges = [];
     badges.push(`<span class="prov-badge">${p.source === 'builtin' ? 'встроенный' : 'кастомный'}</span>`);
     if (!p.available) badges.push('<span class="prov-badge" style="color:var(--red)">не установлен</span>');
@@ -4105,16 +4123,53 @@ async function renderProvList() {
       + (p.effort ? `<br>эффорт: ${esc(p.effort)}` : '');
     const canDelete = p.source === 'providers.json';
     return `<div class="prov-row${(!p.available || p.hidden) ? ' dim' : ''}">
-      <span class="prov-name">${esc(name)}</span>${badges.join('')}
+      <span class="prov-name">${esc(providerLabel(name, p))}</span>${badges.join('')}
+      ${providerLabel(name, p) !== name ? `<div class="prov-cmd">${esc(name)}</div>` : ''}
       <div class="prov-cmd">${esc(p.description || '')}</div>
       <div class="prov-cmd">${what}</div>
       <div class="prov-actions">
+        <button class="btn btn-sm btn-ghost" data-provider="${escAttr(name)}" onclick="provMove(this.dataset.provider, -1)"${index === 0 || providerOrderSaving ? ' disabled' : ''} aria-label="Выше: ${escAttr(providerLabel(name, p))}">↑ Выше</button>
+        <button class="btn btn-sm btn-ghost" data-provider="${escAttr(name)}" onclick="provMove(this.dataset.provider, 1)"${index === entries.length - 1 || providerOrderSaving ? ' disabled' : ''} aria-label="Ниже: ${escAttr(providerLabel(name, p))}">↓ Ниже</button>
         <button class="btn btn-sm btn-ghost" onclick="provEdit('${esc(name)}')">Изменить</button>
         <button class="btn btn-sm btn-ghost" onclick="provToggleHide('${esc(name)}', ${p.hidden})">${p.hidden ? 'Показать' : 'Скрыть'}</button>
         ${canDelete ? `<button class="btn btn-sm btn-danger" onclick="provDelete('${esc(name)}')">${p.source === 'builtin + providers.json' ? 'Сбросить к встроенному' : 'Удалить'}</button>` : ''}
       </div>
     </div>`;
   }).join('');
+}
+
+async function provMove(name, direction) {
+  if (providerOrderSaving || ![-1, 1].includes(direction)) return;
+  const names = orderedProviderEntries(provManageData).map(([id]) => id);
+  const index = names.indexOf(name), next = index + direction;
+  if (index < 0 || next < 0 || next >= names.length) return;
+  [names[index], names[next]] = [names[next], names[index]];
+  providerOrderSaving = true;
+  let saved = false, errorReported = false;
+  document.querySelectorAll('#provList button[data-provider]').forEach(button => { button.disabled = true; });
+  try {
+    await fetchJSON(`${API}/providers/reorder`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({names}),
+    });
+    saved = true;
+    names.forEach((id, order) => { provManageData[id].ui_order = order; });
+    await loadProviders();
+  } catch (error) {
+    toast((saved ? 'Порядок сохранён, но обновление интерфейса не удалось: '
+                 : 'Не удалось подтвердить сохранение порядка: ') + error.message);
+    errorReported = true;
+  } finally {
+    providerOrderSaving = false;
+    try {
+      await renderProvList();
+    } catch (error) {
+      // Keep the known cards usable if a refresh fails. Re-rendering also
+      // restores the correct boundary buttons instead of enabling all of them.
+      renderProviderCards(provManageData);
+      if (!errorReported) toast('Не удалось обновить список помощников: ' + error.message);
+    }
+  }
 }
 
 async function provToggleHide(name, hidden) {
@@ -4336,13 +4391,20 @@ document.getElementById('promptInput').addEventListener('paste', e => {
 let machinesData = {};
 
 async function loadMachines() {
-  try { machinesData = await fetchJSON(`${API}/machines`); } catch (e) { machinesData = {}; }
+  // A failed refresh must not turn an existing remote selection into local.
+  const refreshed = await fetchJSON(`${API}/machines`);
   const label = document.getElementById('machineLabel');
   const sel = document.getElementById('machineInput');
+  const previous = sel.value;
+  machinesData = refreshed;
   const names = Object.keys(machinesData);
-  label.style.display = names.length ? 'flex' : 'none';
+  label.style.display = names.length || previous ? 'flex' : 'none';
   sel.innerHTML = '<option value="">💻 локально</option>'
     + names.map(n => `<option value="${escAttr(n)}">${esc(n)} (${esc(machinesData[n].host)})</option>`).join('');
+  if (previous && !names.includes(previous)) {
+    sel.innerHTML += `<option value="${escAttr(previous)}" disabled>${esc(previous)} · недоступна</option>`;
+  }
+  sel.value = previous;
 }
 
 function updateProvidersForMachine() {
@@ -4350,16 +4412,17 @@ function updateProvidersForMachine() {
   const allowed = machine ? (machinesData[machine]?.providers || []) : null;
   const sel = document.getElementById('providerInput');
   const previous = sel.value;
-  const choices = Object.entries(providersData)
+  const choices = orderedProviderEntries()
     // для машины наличие CLI определяет её собственная проба, а не эта машина
     .filter(([name, info]) => !info.hidden && (allowed ? allowed.includes(name) : info.available !== false));
-  sel.innerHTML = choices.map(([name, info]) => `<option value="${escAttr(name)}">${esc(name)} — ${esc(info.description || info)}</option>`).join('');
+  sel.innerHTML = choices.map(([name, info]) => `<option value="${escAttr(name)}">${esc(providerLabel(name, info))} — ${esc(info.description || info)}</option>`).join('');
   sel.value = preferredTaskProvider(choices.map(([name]) => name), previous);
   updateSkillsToggle(); updateModelSelect(); updateEffortSelect(); updateKeepPane();
 }
 
 function preferredTaskProvider(names, current = '') {
-  const remembered = localStorage.getItem('promptpilot.last-provider') || '';
+  let remembered = '';
+  try { remembered = localStorage.getItem('promptpilot.last-provider') || ''; } catch (_) {}
   return [current, remembered, 'agy', 'codex', names[0] || ''].find(name => names.includes(name)) || '';
 }
 
@@ -4367,18 +4430,13 @@ async function loadProviders() {
   providersData = await fetchJSON(`${API}/providers`);
   await loadMachines();
   const sel = document.getElementById('providerInput');
-  const previous = sel.value;
-  const choices = Object.entries(providersData).filter(([name, info]) => info.available !== false && !info.hidden);
-  sel.innerHTML = choices.map(([name, info]) => `<option value="${escAttr(name)}">${esc(name)} — ${esc(info.description || info)}</option>`).join('');
-  sel.value = preferredTaskProvider(choices.map(([name]) => name), previous);
   sel.onchange = () => {
-    localStorage.setItem('promptpilot.last-provider', sel.value);
+    try { localStorage.setItem('promptpilot.last-provider', sel.value); } catch (_) {}
     skillsCache = {}; updateSkillsToggle(); closeSkillsPanel(); updateModelSelect(); updateEffortSelect(); updateKeepPane();
   };
-  updateSkillsToggle();
-  updateModelSelect();
-  updateEffortSelect();
-  updateKeepPane();
+  // Rebuild once for the selected machine. A local-only intermediate rebuild
+  // would already lose a valid remote-only provider before it could be restored.
+  updateProvidersForMachine();
 }
 
 function updateKeepPane() {

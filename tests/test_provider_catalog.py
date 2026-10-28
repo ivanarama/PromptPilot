@@ -225,6 +225,62 @@ def test_reorder_and_hidden_builtin_keep_command_and_secret(isolated_providers):
     assert before["cmd"] == after["cmd"] and after["env"]["ANTHROPIC_AUTH_TOKEN"] == "real-secret"
 
 
+def test_public_provider_display_and_order_preserve_execution_identity(
+        isolated_providers, monkeypatch):
+    from promptpilot import api, config
+
+    monkeypatch.setattr(api, "get_provider_models", lambda _name: [])
+    monkeypatch.setattr(api, "provider_available", lambda _info: True)
+    config.save_catalog_provider("named-agent", {
+        "cmd": "agent --model selected -p {prompt}", "models": ["selected"],
+        "description": "Agent display test",
+        "env": {"OPENAI_API_KEY": "keep-private"},
+        "human": {"label": "Помощник <A> ' & B", "role": "reviewer", "desc": "Заметка",
+                  "other_secret": "not-display-metadata"},
+        "ui_order": 7,
+    })
+    before = config.load_providers()["named-agent"]
+    for route in ("/api/providers", "/api/providers/manage"):
+        response = _request("GET", route)
+        assert response.status_code == 200
+        info = response.json()["named-agent"]
+        assert info["human"] == {key: before["human"][key] for key in ("label", "role", "desc")}
+        assert info["ui_order"] == 7
+        assert "not-display-metadata" not in response.text
+        assert "keep-private" not in response.text
+
+    response = _request("POST", "/api/providers/reorder", json={
+        "names": ["named-agent", "codex", "claude"],
+    })
+    assert response.status_code == 200
+    after = config.load_providers()["named-agent"]
+    assert {key: value for key, value in after.items() if key != "ui_order"} == {
+        key: value for key, value in before.items() if key != "ui_order"}
+    assert after["ui_order"] == 0
+    assert _request("GET", "/api/providers").json()["named-agent"]["human"]["label"] == before["human"]["label"]
+    assert config.build_cmd("named-agent", "hello", guard=False) == [
+        "agent", "--model", "selected", "-p", "hello"]
+
+
+@pytest.mark.parametrize("human,order", [(None, True), (["wrong"], -1),
+                                        ({"label": ["wrong"]}, 2.5), ({}, 2**60)])
+def test_public_provider_display_rejects_malformed_optional_metadata(
+        isolated_providers, monkeypatch, human, order):
+    from promptpilot import api, config
+
+    monkeypatch.setattr(api, "get_provider_models", lambda _name: [])
+    monkeypatch.setattr(api, "provider_available", lambda _info: True)
+    config.save_catalog_provider("bad-display", {
+        "cmd": "agent -p {prompt}", "description": "Display test", "models": [],
+        "human": human, "ui_order": order,
+    })
+    for route in ("/api/providers", "/api/providers/manage"):
+        response = _request("GET", route)
+        assert response.status_code == 200
+        info = response.json()["bad-display"]
+        assert info["human"] == {} and info["ui_order"] is None
+
+
 def test_busy_provider_cannot_be_deleted(isolated_db, isolated_providers):
     from promptpilot import config
     from promptpilot.models import TaskCreate, WorkflowCreate
