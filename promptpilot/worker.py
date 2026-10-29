@@ -19,8 +19,7 @@ from . import db, worktree
 from .config import (BASE_DELAY, CONCURRENCY, DEFAULT_CLI, MAX_DELAY, MIN_FREE_MB,
                      POLL_INTERVAL, TASK_TIMEOUT, VERDICT_REPAIR,
                      VERDICT_REPAIR_TIMEOUT, VERDICT_REQUIRED, RightsUnsupported,
-                     build_cmd, get_provider_env, load_providers, rights_args,
-                     rights_supported)
+                     build_cmd, get_provider_env, load_providers, rights_args)
 from .process_tree import OwnedProcess, ProcessTreeError
 
 # Our quota is spent — the wait is measured in hours and nothing else will get
@@ -141,7 +140,6 @@ ENV_FAILURE_RE = re.compile(
 VERDICTS = (
     "ГОТОВО", "УЖЕ СДЕЛАНО", "НУЖЕН ЧЕЛОВЕК", "НЕ СМОГ", "ПУСТО",
 )
-VERDICT_RE = re.compile(r"^[ \t>*#-]*ИТОГ:\s*(" + "|".join(VERDICTS) + r")\b", re.M | re.I)
 
 VERDICT_INSTRUCTION = (
     "\n\nПоследней строкой ответа напиши ровно одну из:\n"
@@ -155,13 +153,12 @@ VERDICT_INSTRUCTION = (
 
 
 def parse_verdict(text: str) -> str:
-    """The task's own last word, or "" if it never said one.
+    """Read the five ordinary verdicts only from an explicit final line."""
+    from .herdr_exec import WORKFLOW_CLOSING_VERDICT_RE
 
-    Last match wins: the agent may quote the format earlier while explaining
-    itself, and only the closing line is the verdict.
-    """
-    matches = VERDICT_RE.findall(text or "")
-    return matches[-1].upper() if matches else ""
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    match = WORKFLOW_CLOSING_VERDICT_RE.fullmatch(lines[-1]) if lines else None
+    return match.group(1).upper() if match else ""
 
 
 VERDICT_REPAIR_PROMPT = (
@@ -190,14 +187,13 @@ def _repair_verdict(task, provider: str, provider_cfg: dict,
     """
     prompt = VERDICT_REPAIR_PROMPT.format(tail=(report_tail or "")[-4000:])
     try:
-        # Restating a verdict needs no tools; confine the micro-request when
-        # the provider can be confined.
+        # Restating a verdict never needs tools. The canonical provider
+        # builder refuses an unsupported narrow mode before spawning anything.
         cmd = build_cmd(provider, prompt,
                         model=getattr(task, "model", None),
                         effort=getattr(task, "effort", None),
                         guard=True,
-                        rights=("none" if rights_supported(provider_cfg, "none")
-                                else getattr(task, "rights", None)))
+                        rights="none")
         prompt_stdin = prompt if provider_cfg.get("prompt_stdin") else None
         env = get_provider_env(provider)
         env.pop("PP_TASK_ID", None)
@@ -215,9 +211,15 @@ def _repair_verdict(task, provider: str, provider_cfg: dict,
     except Exception as exc:
         print(f"  !! Verdict repair request failed: {type(exc).__name__}: {exc}")
         return ""
+    if result.returncode != 0:
+        return ""
     stdout = result.stdout or ""
     if is_stream_json(stdout):
-        stdout = parse_stream_json(stdout).get("text", "")
+        parsed = parse_stream_json(stdout)
+        meta = parsed.get("meta", {})
+        if meta.get("is_error") or str(meta.get("subtype") or "").startswith("error"):
+            return ""
+        stdout = parsed.get("text", "")
     return parse_verdict(stdout)
 
 
@@ -2210,10 +2212,10 @@ def _execute_task_body(task, admission_complete=None):
             repaired = _repair_verdict(task, provider, provider_cfg,
                                        verdict_source or output, run_dir)
             if repaired:
-                verdict = _closing_workflow_verdict(
-                    repaired, allow_targeted_stale=allow_targeted_stale)
-                if verdict:
-                    print(f"  -> Verdict repaired via micro-request: {verdict}")
+                # _repair_verdict already parsed the explicit final line. It
+                # returns the normalized value, not another full declaration.
+                verdict = repaired
+                print(f"  -> Verdict repaired via micro-request: {verdict}")
         if not verdict:
             changed = _commit_terminal_or_defer(
                 task,
