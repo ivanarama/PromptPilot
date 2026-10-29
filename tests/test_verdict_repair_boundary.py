@@ -74,3 +74,21 @@ def test_regular_worker_does_not_promote_quoted_or_old_verdict(
     settled, _ = run_task(isolated_db, tmp_path, monkeypatch, report, pipeline=False)
     assert settled.status.value == "completed"  # Process completion remains independent.
     assert settled.verdict is None
+
+
+@pytest.mark.parametrize("pipeline", [True, False])
+@pytest.mark.parametrize("footer", [True, False])
+@pytest.mark.parametrize("flags", [
+    {"is_error": True, "subtype": "success"},
+    {"is_error": False, "subtype": "error_during_execution"},
+])
+def test_original_structured_error_cannot_be_repaired_into_success(
+        isolated_db, tmp_path, monkeypatch, pipeline, footer, flags):
+    text = "Original execution failed" + ("\nИТОГ: ГОТОВО" if footer else "")
+    report = json.dumps({"type": "result", "result": text, **flags})
+    settled, calls = run_task(isolated_db, tmp_path, monkeypatch, report,
+                             repair="ИТОГ: ГОТОВО", pipeline=pipeline)
+    assert calls == []
+    assert settled.status.value == "failed"
+    assert settled.verdict is None
+    assert "Original execution failed" in settled.error

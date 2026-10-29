@@ -2197,6 +2197,20 @@ def _execute_task_body(task, admission_complete=None):
                 task, "headless stream rate-limit outcome",
                 commit_stream_rate_limit)
             return
+        meta = parsed.get("meta", {})
+        if meta.get("is_error") or str(meta.get("subtype") or "").startswith("error"):
+            # Wrapper exit zero is not execution success when its structured
+            # result explicitly reports failure. Never ask a second turn to
+            # turn that error into a success declaration.
+            _commit_terminal_or_defer(
+                task,
+                "headless structured execution failure",
+                lambda: _mark_failed(
+                    task, "Provider stream reported an execution error\n" + output[-4000:],
+                    exit_code=1,
+                ),
+            )
+            return
     else:
         # Plain text output (non-Claude CLIs)
         output = result.stdout
@@ -2231,7 +2245,7 @@ def _execute_task_body(task, admission_complete=None):
                 print("  -> Failed (pipeline result has no closing verdict)")
             return
     else:
-        verdict = parse_verdict(output)
+        verdict = parse_verdict(verdict_source)
         if (not verdict and VERDICT_REQUIRED and VERDICT_REPAIR
                 and not machine):
             repaired = _repair_verdict(task, provider, provider_cfg,
