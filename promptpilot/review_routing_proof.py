@@ -62,6 +62,9 @@ class Ledger:
     phases: tuple[Record, ...]
     resumes: tuple[Record, ...]
     ignored_ids: tuple[str, ...]
+    parking_id: str | None = None
+    resume_id: str | None = None
+    resuming_publication_id: str | None = None
 
     @property
     def budget_used(self):
@@ -84,7 +87,9 @@ class Ledger:
         if type(max_attempts) is not int or not 1 <= max_attempts <= 16:
             raise PipelineError('invalid explicit current routing attempt limit')
         proof=self.source_proof(source)
-        reason=('source is not the latest canonical completed REVIEW'
+        reason=('engineering parking is active'
+                if self.parking_id is not None
+                else 'source is not the latest canonical completed REVIEW'
                 if proof is None or proof is not self.proofs[-1]
                 else 'historical outcome does not authorize a technical attempt'
                 if proof.outcome!='technical-handoff'
@@ -103,6 +108,8 @@ class Ledger:
                 "proofs": [{"source": proof.source, "outcome": proof.outcome} for proof in self.proofs],
                 "phases": [{"id": record.id, **record.payload} for record in self.phases],
                 "resume_ids": [item.id for item in self.resumes],
+                "active_parking_id": self.parking_id, "active_resume_id": self.resume_id,
+                "resuming_publication_id": self.resuming_publication_id,
                 "ignored_ids": list(self.ignored_ids), "mutation_authorized": False}
 
 
@@ -228,6 +235,10 @@ def reduce(records, *, deleted_at=(), max_attempts=2):
                 raise PipelineError("conflicting technical attempt roots/executors")
             ignored.add(record.id)
             continue
+        latest=max((item for item in proofs if item.completion.order<record.order),
+                   key=lambda item:item.completion.order,default=None)
+        if latest is not proof:
+            raise PipelineError('technical attempt source is not the latest completed REVIEW')
         if (len(attempts) >= max_attempts or data["attempt"] != len(attempts) + 1
                 or previous != (attempts[-1].id if attempts else None)
                 or data["series"] != (attempts[0].payload["series"] if attempts else proof.completion.id)):
@@ -278,34 +289,47 @@ def reduce(records, *, deleted_at=(), max_attempts=2):
         if proof.publication.payload["budget_used"] != historical:
             raise PipelineError("routing publication budget differs from lifetime reservations")
     resumes = tuple(item for item in ordered if item.payload["kind"] == "resume")
-    parking={proof.completion.id:proof for proof in proofs if proof.outcome=='engineering-handoff'}
-    for item in resumes:
-        parked=parking.get(item.payload['parking_id'])
-        latest=max((proof for proof in parking.values() if proof.completion.order<item.order),
-                   key=lambda proof:proof.completion.order,default=None)
-        preceding=[root for root in attempts if root.order<item.order]
-        previous=preceding[-1].id if preceding else None
-        if (parked is None or parked is not latest or item.payload['previous']!=previous):
-            raise PipelineError("engineering resume lacks current parking/lifetime state")
-    used_resumes=set()
-    proof_by_publication={proof.publication.id:proof for proof in proofs}
-    resume_by_id={item.id:item for item in resumes}
-    for publication in publications:
-        own_proof=proof_by_publication.get(publication.id)
-        gate_order=own_proof.completion.order if own_proof else publication.order
-        prior_park=max((proof for proof in parking.values() if proof.publication.id!=publication.id
-                        and proof.completion.order<gate_order),
-                       key=lambda proof:proof.completion.order,default=None)
-        resume_id=publication.payload['resume_id']
-        if prior_park is None:
-            if resume_id is not None:
-                raise PipelineError("unparked routing REVIEW cannot consume engineering resume")
-            continue
-        resume=resume_by_id.get(resume_id)
-        if (resume is None or resume.id in used_resumes
-                or resume.payload['parking_id']!=prior_park.completion.id
-                or not prior_park.completion.order<resume.order<publication.order
-                or resume.payload['head']!=publication.payload['identity']['head_sha']):
-            raise PipelineError("engineering parking requires one exact-HEAD resume before REVIEW")
-        used_resumes.add(resume.id)
-    return Ledger(proofs, tuple(attempts), phases, resumes, tuple(sorted(ignored)))
+    # Parking is a chronological state, not max(all historical parking). A
+    # completed resumed REVIEW consumes/clears the old park; only a new
+    # engineering completion can establish another park and another grant.
+    publication_ids={item.id for item in publications}
+    completion_map={proof.completion.id:proof for proof in proofs}
+    active_park=None
+    active_resume=None
+    resuming_publication=None
+    for item in ordered:
+        data=item.payload
+        if data['kind']=='resume':
+            preceding=[root for root in attempts if root.order<item.order]
+            previous=preceding[-1].id if preceding else None
+            if (active_park is None or data['parking_id']!=active_park.completion.id
+                    or data['previous']!=previous or resuming_publication is not None):
+                raise PipelineError('engineering resume lacks current parking/lifetime state')
+            # Before consumption, a later explicit trusted action can change
+            # the chosen exact HEAD. It does not mint another resume slot.
+            active_resume=item
+        elif data['kind']=='publication' and item.id in publication_ids:
+            if active_park is None:
+                if data['resume_id'] is not None:
+                    raise PipelineError('unparked routing REVIEW cannot consume engineering resume')
+                continue
+            if (active_resume is None or resuming_publication is not None
+                    or data['resume_id']!=active_resume.id
+                    or active_resume.payload['head']!=data['identity']['head_sha']):
+                raise PipelineError('engineering parking requires one exact-HEAD resume before REVIEW')
+            resuming_publication=item.id
+        elif data['kind']=='completion' and item.id in completion_map:
+            proof=completion_map[item.id]
+            if active_park is not None:
+                if resuming_publication!=proof.publication.id:
+                    raise PipelineError('engineering parking appeared before REVIEW completion')
+                active_park=None
+                active_resume=None
+                resuming_publication=None
+            elif proof.publication.payload['resume_id'] is not None:
+                raise PipelineError('engineering resume was already consumed by another REVIEW')
+            if proof.outcome=='engineering-handoff':
+                active_park=proof
+    return Ledger(proofs, tuple(attempts), phases, resumes, tuple(sorted(ignored)),
+                  active_park.completion.id if active_park else None,
+                  active_resume.id if active_resume else None,resuming_publication)

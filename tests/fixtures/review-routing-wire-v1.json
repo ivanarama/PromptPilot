@@ -753,6 +753,9 @@
       }
     ],
     "resume_ids": [],
+    "active_parking_id": "1018",
+    "active_resume_id": null,
+    "resuming_publication_id": null,
     "ignored_ids": [],
     "mutation_authorized": false
   }

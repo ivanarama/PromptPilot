@@ -49,6 +49,17 @@ FIX. Resume ссылается на действующую engineering parking c
 lifetime состояние. Его потребляет один publication через resume_id; он не
 пополняет бюджет. Insufficient-data parking с нулём attempts тоже возобновима.
 Resume незапаркованной цели, старой parking или другого HEAD отказывает.
+После завершённого возобновлённого REVIEW прежняя parking закрыта: она не
+выдаёт ещё один resume и не мешает обычному следующему REVIEW после FIX.
+Незавершённый возобновлённый publication сохраняет видимыми parking и
+потреблённый grant для recovery, не для нового аудита.
+
+Локальный журнал связывает owner/phase с точными body и PR. Pending/ambiguous
+запрос блокирует новый owner/phase того же lifetime PR до точного read-back.
+Наблюдавшийся returned ID сохраняется отдельно от подтверждения: последующий
+GET не может забыть противоречивый ID. Внутренний Transport делает один POST
+либо восстанавливает receipt чтением; он требует внешнего полного stage guard,
+сам его не реализует и пока не подключён к командам next/complete.
 
 До будущей записи/dispatch обязательны полные public gates: совместимость всех
 читателей, trusted actor/immutability, coherent identity/epoch/lifecycle/labels,

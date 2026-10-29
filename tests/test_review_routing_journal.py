@@ -1,5 +1,6 @@
 """Crash/timeout receipts do not permit a second non-idempotent POST."""
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 import copy
 import json
 from pathlib import Path
@@ -68,7 +69,7 @@ def test_request_key_is_bound_to_exact_body_target_and_owner(tmp_path):
     changed=copy.deepcopy(PAYLOAD)
     changed['anchor']='OTHER_ANCHOR'
     for request in [dict(REQUEST,body=render(changed)),dict(REQUEST,number=43),dict(REQUEST,repository='owner/other')]:
-        with pytest.raises(PipelineError,match='another body/target'):
+        with pytest.raises(PipelineError,match='another body/target|wire target'):
             journal.prepare(**request)
     with pytest.raises(PipelineError,match='owner differs'):
         journal.prepare(**dict(REQUEST,owner='00000000-0000-4000-8000-000000000002'))
@@ -77,7 +78,26 @@ def test_request_key_is_bound_to_exact_body_target_and_owner(tmp_path):
 def test_unsupported_local_journal_version_fails_before_any_request(tmp_path):
     journal=Journal(tmp_path)
     import sqlite3
-    with sqlite3.connect(journal.path) as connection:
+    with closing(sqlite3.connect(journal.path)) as connection:
         connection.execute('PRAGMA user_version=2')
     with pytest.raises(PipelineError,match='unsupported routing journal'):
         Journal(tmp_path)
+
+
+def test_first_request_cannot_bind_pr42_wire_to_pr43_endpoint(tmp_path):
+    with pytest.raises(PipelineError,match='wire target'):
+        Journal(tmp_path).prepare(**dict(REQUEST,number=43))
+
+
+def test_new_owner_or_phase_cannot_bypass_an_unresolved_post_for_same_lifetime_pr(tmp_path):
+    journal=Journal(tmp_path)
+    journal.prepare(**REQUEST)
+    changed=copy.deepcopy(PAYLOAD)
+    changed['owner']='00000000-0000-4000-8000-000000000002'
+    for request in [dict(REQUEST,phase='another-phase'),dict(REQUEST,owner=changed['owner'],body=render(changed))]:
+        with pytest.raises(PipelineError,match='unresolved POST'):
+            Journal(tmp_path).prepare(**request)
+    # Resolving the exact earlier response permits the next guarded phase;
+    # it does not itself grant server lease ownership or budget authority.
+    journal.confirm(owner=OWNER,phase='publication',returned_id='10',body=BODY)
+    assert journal.prepare(**dict(REQUEST,phase='another-phase')) is True

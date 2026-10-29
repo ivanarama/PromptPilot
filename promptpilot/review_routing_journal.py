@@ -78,6 +78,8 @@ class Journal:
                 or type(number) is not int or not 1<=number<=2147483647):
             raise PipelineError('invalid routing journal target')
         payload=parse(body)
+        if payload['pr']['pr_number']!=number or (payload['kind']=='publication' and payload['identity']['base_repository']!=repository):
+            raise PipelineError('routing journal wire target differs from requested target')
         if 'owner' in payload and payload['owner']!=owner:
             raise PipelineError('routing journal owner differs from prepared wire body')
         body_sha=hashlib.sha256(body.encode('utf-8')).hexdigest()
@@ -92,6 +94,12 @@ class Journal:
                         connection.commit()
                         return False
                     raise PipelineError('routing POST result is ambiguous; exact read-back required before recovery')
+                # A fresh owner UUID/phase/repository spelling cannot erase
+                # uncertainty about an earlier request for the same lifetime
+                # PR. Only authenticated confirmation resolves that barrier.
+                unresolved=connection.execute("SELECT body FROM requests WHERE state IN ('pending','ambiguous')").fetchall()
+                if any(parse(row['body'])['pr']==payload['pr'] for row in unresolved):
+                    raise PipelineError('routing target has an unresolved POST; exact read-back required before a new owner/phase')
                 now=time.time()
                 connection.execute('INSERT INTO requests VALUES (?,?,?,?,?,?,?,NULL,?,?)',
                                    (owner,phase,repository,number,body,body_sha,'pending',now,now))
@@ -130,9 +138,28 @@ class Journal:
                 row=connection.execute('SELECT * FROM requests WHERE owner=? AND phase=?',(owner,phase)).fetchone()
                 if row is None or row['body']!=body or hashlib.sha256(body.encode('utf-8')).hexdigest()!=row['body_sha256']:
                     raise PipelineError('routing receipt does not match its prepared exact body')
-                if row['state']=='done' and row['returned_id']!=returned_id:
+                if row['returned_id'] is not None and row['returned_id']!=returned_id:
                     raise PipelineError('routing receipt conflicts with its known returned ID')
                 connection.execute("UPDATE requests SET state='done',returned_id=?,updated_at=? WHERE owner=? AND phase=?",
+                                   (returned_id,time.time(),owner,phase))
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+
+    def observe_returned_id(self,*,owner,phase,returned_id):
+        """Persist the POST's observed ID without claiming verified completion."""
+        self._key(owner,phase)
+        decimal_id(returned_id)
+        with closing(self._connect()) as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            try:
+                row=connection.execute('SELECT * FROM requests WHERE owner=? AND phase=?',(owner,phase)).fetchone()
+                if row is None:
+                    raise PipelineError('routing returned ID has no pending request')
+                if row['returned_id'] is not None and row['returned_id']!=returned_id:
+                    raise PipelineError('routing returned ID conflicts with its previous observation')
+                connection.execute('UPDATE requests SET returned_id=?,updated_at=? WHERE owner=? AND phase=?',
                                    (returned_id,time.time(),owner,phase))
                 connection.commit()
             except BaseException:
