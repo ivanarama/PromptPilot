@@ -80,6 +80,82 @@ def _running_task(database, prompt):
     return task
 
 
+def test_public_wip_gate_explains_existing_scan_lease(isolated_db, monkeypatch):
+    profile = _profile_with_costs(core=0)
+    profile["queues"][0]["dispatch_gate"] = {"backpressure": {
+        "max_active": 10, "active_fields": ["review_backlog"],
+        "candidate_field": "fix_candidates"}}
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"example": profile})
+    monkeypatch.setattr(pipeline_insights, "_cache", {})
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("An existing scan lease must prevent another GitHub scan")
+
+    monkeypatch.setattr(pipeline_insights, "_github_rate_limits", forbidden)
+    monkeypatch.setattr(pipeline_insights, "_github_search", forbidden)
+    lease = isolated_db.acquire_pipeline_scan_lease("github-default", "existing-scanner", 60)
+    assert lease["acquired"]
+    task = SimpleNamespace(series_id=1, series_title="Example - REVIEW", prompt="Example - REVIEW")
+    result = pipeline_insights.dispatch_gate(task)
+    assert result["action"] == "defer"
+    assert result["wip_diagnostics"]["snapshot"]["refresh_state"] == "scan_in_progress"
+
+
+def test_public_wip_gate_retains_real_scan_denial_beside_allowed_zero_cost_view(isolated_db, monkeypatch):
+    profile = _profile_with_costs(core=0)
+    profile["github_budget"]["minimum_remaining"] = {"core": 100, "search": 2, "graphql": 100}
+    profile["github_budget"]["costs"]["insights"]["search"] = 10
+    profile["queues"][0]["dispatch_gate"] = {"backpressure": {
+        "max_active": 10, "active_fields": ["review_backlog"], "candidate_field": "fix_candidates"}}
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"example": profile})
+    monkeypatch.setattr(pipeline_insights, "_cache", {})
+    monkeypatch.setattr(pipeline_insights, "_github_rate_limits", lambda: _limits(search=28))
+    monkeypatch.setattr(pipeline_insights, "_run_profile_health_check", lambda _: {
+        "state": "green", "findings": [], "fix_candidates": [],
+        "review_backlog": [{"number": n, "head": f"{n:040x}"} for n in range(1, 27)]})
+    scans = []
+
+    def search(*args, **kwargs):
+        scans.append(args)
+        return {"count": 0, "items": [], "membership_complete": True}
+
+    monkeypatch.setattr(pipeline_insights, "_github_search", search)
+    initial = pipeline_insights.analyze("example", [], use_cache=False, refresh_diagnostics=True)
+    assert initial["cache"]["complete"] is True
+    owner = _running_task(isolated_db, "WIP budget owner")
+    reserved = isolated_db.reserve_pipeline_github_budget(
+        "github-default", token="wip-owner", task_id=owner.id, task_started_at=owner.started_at,
+        profile_id="example", queue_id="review", route="skill",
+        cost={"core": 0, "search": 25, "graphql": 0}, limits=_limits(search=28),
+        minimum_remaining={"core": 100, "search": 2, "graphql": 100})
+    assert reserved["allowed"] is True
+    assert isolated_db.record_pipeline_github_rate_snapshot("github-default", _limits(search=28))
+    monkeypatch.setattr(pipeline_insights, "_CACHE_TTL_SECONDS", 0)
+    current = pipeline_insights.read_cached("example", [])
+    assert current["github_budget"]["allowed"] is True, current["github_budget"]
+    assert current["github_budget"]["requested_cost"]["search"] == 0
+    assert current["cache"]["stale"] is True
+    scans.clear()
+    result = pipeline_insights.dispatch_gate(SimpleNamespace(
+        series_id=1, series_title="Example - REVIEW", prompt="Example - REVIEW"))
+    assert result["action"] == "defer"
+    diagnostic = result["wip_diagnostics"]
+    blocked = diagnostic["refresh_budget"]["blocked_resources"][0]
+    assert blocked == {"resource": "search", "remaining": 28, "reserved_other": 25,
+                       "requested_cost": 10, "effective_after": -7, "minimum_remaining": 2}
+    assert diagnostic["wip"]["observed_active"] == 26
+    assert diagnostic["wip"]["max_active"] == 10
+    assert diagnostic["authoritative"] is False
+    assert "прогноз -7" in result["reason"]
+    assert scans == []  # The denied attempt did not run a GitHub queue scan.
+    assert isolated_db.pipeline_github_budget_reservations("github-default")["totals"]["search"] == 25
+    # The public cached read still describes the zero-cost view, while retaining
+    # the actual scan attempt separately for subsequent dispatch diagnostics.
+    after = pipeline_insights.read_cached("example", [])
+    assert after["github_budget"]["allowed"] is True
+    assert after["cache"]["refresh_budget"]["allowed"] is False
+
+
 def _reserve(database, task, token, *, core=500, remaining=1000,
              minimum=100, reset=None, starvation_timeout_seconds=0,
              now=None):
