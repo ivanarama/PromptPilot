@@ -5,6 +5,9 @@ Python parser/reducer, согласованное чтение timeline и ло�
 write-ahead receipts. Внутренний coordinator публикации восстанавливает
 publication/claim/completion, выбирает canonical owner, renewal/takeover и
 проверяет lifetime/resume/post-push ограничения до нового root. Он требует
+повторной semantic admission по последнему WRITE snapshot после journal commit;
+уже начатая resuming publication не может заново потребить тот же grant в другой
+эпохе. Known exact receipt восстанавливается чтением без повторного POST. Он требует
 внешний полный stage guard, сам не аутентифицирует signed request и не меняет
 метки; публичных writer,
 handoff/dispatch, нового CLI или включённого capability нет. Срез не завершает A

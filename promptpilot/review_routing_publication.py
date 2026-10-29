@@ -19,6 +19,8 @@ from .review_routing_wire import context, parse, records, render, sha
 
 class Publication:
     def __init__(self,gh,config,journal,guard,payload,*,clock=None):
+        if not callable(guard):
+            raise PipelineError('routing publication requires a fresh external stage guard')
         self.seed=parse(render(payload))
         if self.seed['kind']!='publication':
             raise PipelineError('routing publication requires a full publication root')
@@ -27,16 +29,37 @@ class Publication:
         self.trusted=config['trusted_account']
         self.journal=journal
         self.guard=guard
-        self.transport=Transport(gh,config,journal,guard)
+        self.transport=Transport(gh,config,journal,self._guarded_snapshot)
         self.clock=clock or (lambda:datetime.now(timezone.utc))
 
     def _state(self):
         snapshot=self.transport._snapshot(self.seed)
+        return self._decode_state(snapshot)
+
+    def _decode_state(self,snapshot):
         history,deleted=records(snapshot,trusted=self.trusted,expected_pr=self.seed['pr'])
         # Historical slots survive a lower *current* limit. Current admission
         # is a distinct stage-guard decision; the global wire bound is16.
         ledger=reduce(history,deleted_at=deleted,max_attempts=16)
         return history,ledger
+
+    def _guarded_snapshot(self,payload,*,write=False):
+        snapshot=self.guard(payload,write=write)
+        if not isinstance(snapshot,dict) or snapshot.get('pr_key')!=payload['pr']:
+            raise PipelineError('routing stage guard returned another PR identity')
+        if write and payload['kind']=='publication':
+            history,ledger=self._decode_state(snapshot)
+            body=render(payload)
+            if not any(render(item.payload)==body for item in history):
+                # A known exact receipt is recovered by Transport, not posted.
+                # Every genuinely new root must pass semantic admission on the
+                # *last* coherent snapshot, after durable journal preparation.
+                if any(item.payload['kind']=='publication'
+                       and (item.payload['identity']['head_sha'],item.payload['epoch'])==
+                           (self.seed['identity']['head_sha'],self.seed['epoch']) for item in history):
+                    raise PipelineError('canonical publication root appeared before POST; recover its owner')
+                self._admit(ledger)
+        return snapshot
 
     def _publish(self,payload):
         return self.transport.publish(payload,owner=payload['owner'],
@@ -49,6 +72,8 @@ class Publication:
             self.transport.publish(parse(request['body']),owner=request['owner'],phase=request['phase'])
 
     def _admit(self,ledger):
+        if ledger.resuming_publication_id is not None:
+            raise PipelineError('incomplete resuming publication already consumed this engineering grant')
         if self.seed['budget_used']!=ledger.budget_used:
             raise PipelineError('routing publication has a stale lifetime budget')
         resume=self.seed['resume_id']

@@ -172,3 +172,65 @@ def test_next_review_after_completed_fix_preserves_spent_slot_and_exact_new_head
     result=writer.run()
     assert result['action']=='completed' and result['source']['head']==HISTORY[8]['payload']['identity']['head_sha']
     assert server.posts==['publication','claim','completion']
+
+
+def test_incomplete_resumed_publication_cannot_reuse_the_grant_in_another_epoch(tmp_path):
+    from test_review_routing_proof import history, next_review, resume
+    grant=resume('1018','1011',head='d'*40)
+    existing=next_review(history()+[grant],head='d'*40,blocking=[],resume_id=grant.id)[:-1]
+    server=Server()
+    server.now+=timedelta(minutes=4)
+    for item in existing:
+        server.comments.append({'cursor':'C'+item.id,'node':{'__typename':'IssueComment',
+             'fullDatabaseId':item.id,'createdAt':item.created_at,'lastEditedAt':None,
+             'author':{'login':'owner'},'body':render(item.payload)}})
+    seed=copy.deepcopy(existing[-2].payload)
+    seed['epoch']='f'*64
+    seed['anchor']='OTHER_ANCHOR'
+    writer=Publication(server,CONFIG,Journal(tmp_path),server.guard,seed,clock=lambda:server.now)
+    with pytest.raises(PipelineError,match='resum|incomplete'):
+        writer.run()
+    assert server.posts==[]
+
+
+def test_final_fresh_snapshot_rechecks_semantic_admission_before_root_post(tmp_path):
+    server=history_server(3)
+    seed=copy.deepcopy(HISTORY[8]['payload'])
+    seed['budget_used']=0
+    original=server.guard
+
+    def late_attempt(payload,*,write=False):
+        if write and not any(item['node']['fullDatabaseId']=='4500' for item in server.comments):
+            server.comments.append({'cursor':'C4500','node':{'__typename':'IssueComment',
+                 'fullDatabaseId':'4500','createdAt':'2026-10-29T00:03:00Z','lastEditedAt':None,
+                 'author':{'login':'owner'},'body':render(HISTORY[3]['payload'])}})
+        return original(payload,write=write)
+
+    writer=Publication(server,CONFIG,Journal(tmp_path),late_attempt,seed,clock=lambda:server.now)
+    with pytest.raises(PipelineError,match='budget|post-push'):
+        writer.run()
+    assert server.posts==[]
+
+
+@pytest.mark.parametrize('change_report',[False,True])
+def test_final_snapshot_canonical_root_prevents_another_root_before_post(tmp_path,change_report):
+    from promptpilot.review_routing import inspect_report
+    server=history_server(3)
+    seed=copy.deepcopy(HISTORY[8]['payload']);seed['budget_used']=0
+    competing=copy.deepcopy(seed);competing['owner']=OWNER2
+    if change_report:
+        competing['report']['change']+=' different audit'
+        competing['report_sha256']=inspect_report(competing['report'],competing['identity']['head_sha'])['report_sha256']
+    original=server.guard
+
+    def late_root(payload,*,write=False):
+        if write and not any(item['node']['fullDatabaseId']=='4500' for item in server.comments):
+            server.comments.append({'cursor':'C4500','node':{'__typename':'IssueComment',
+                 'fullDatabaseId':'4500','createdAt':'2026-10-29T00:03:00Z','lastEditedAt':None,
+                 'author':{'login':'owner'},'body':render(competing)}})
+        return original(payload,write=write)
+
+    writer=Publication(server,CONFIG,Journal(tmp_path),late_root,seed,clock=lambda:server.now)
+    with pytest.raises(PipelineError,match='root appeared'):
+        writer.run()
+    assert server.posts==[]
