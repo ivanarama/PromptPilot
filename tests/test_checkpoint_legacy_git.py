@@ -32,6 +32,40 @@ posix_reader = pytest.mark.skipif(
 
 
 @posix_reader
+def test_legacy_reader_refuses_short_read_masking_multiline_head(tmp_path, monkeypatch, legacy_git):
+    repo = _git_repo(tmp_path)
+    path = repo / ".git/HEAD"
+    original = path.read_bytes()
+    path.write_bytes(original + original)
+    identity = path.stat()
+    real_text = stage_checkpoint._text
+    real_read = os.read
+
+    def text(directory, *args, **kwargs):
+        # Isolate the raw-reader boundary: Git's normal setup can itself
+        # refuse malformed HEAD before reaching this fallback.
+        if args == ("rev-parse", "--absolute-git-dir"):
+            return str(repo / ".git")
+        if args == ("rev-parse", "--path-format=absolute", "--git-path", "HEAD"):
+            return str(path)
+        if args == ("symbolic-ref", "HEAD"):
+            return original[5:].decode().strip()
+        return real_text(directory, *args, **kwargs)
+
+    def short_read(descriptor, limit):
+        info = os.fstat(descriptor)
+        data = real_read(descriptor, limit)
+        if (info.st_dev, info.st_ino) == (identity.st_dev, identity.st_ino):
+            return data[:len(original)]
+        return data
+
+    monkeypatch.setattr(stage_checkpoint, "_text", text)
+    monkeypatch.setattr(os, "read", short_read)
+    with pytest.raises(stage_checkpoint.CheckpointError, match="short read"):
+        stage_checkpoint._direct_head(repo)
+
+
+@posix_reader
 def test_legacy_git_publishes_reviewed_checkpoint_once(isolated_db, tmp_path, monkeypatch, legacy_git):
     repo, wf = _pending(isolated_db, tmp_path, monkeypatch)
     head = _git(repo, "rev-parse", "HEAD")

@@ -175,6 +175,9 @@ def decode_signed_lease(value: str) -> dict:
         )
     except (ValueError, TypeError) as exc:
         raise PipelineError(f"invalid signed lease: {exc}") from exc
+    canonical_signature = base64.urlsafe_b64encode(signature).decode("ascii").rstrip("=")
+    if encoded_signature != canonical_signature:
+        raise PipelineError("invalid pipeline lease signature encoding")
     expected = hmac.new(
         pipeline_lease_key(create=False), payload.encode("ascii"), hashlib.sha256,
     ).digest()
