@@ -99,7 +99,7 @@ def _context(task_id):
             if not guarded:
                 task = connection.execute("SELECT series_id FROM tasks WHERE id=?", (task_id,)).fetchone()
                 if task and task["series_id"] is not None:
-                    _, forbidden_series = db.workorder_origins(connection)
+                    _, forbidden_series = db.workorder_origins(connection, series_id=task["series_id"])
                     if task["series_id"] in forbidden_series:
                         raise WorkorderAuthorizationError("Recurring workorder descendants are unsupported")
                 return None

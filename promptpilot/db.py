@@ -1099,17 +1099,30 @@ def _create_series(conn: sqlite3.Connection, task: TaskCreate) -> int:
     return cur.lastrowid
 
 
-def workorder_origins(conn: sqlite3.Connection) -> tuple[set[int], set[int]]:
+def workorder_origins(conn: sqlite3.Connection, *, task_id=None, series_id=None) -> tuple[set[int], set[int]]:
     """Immutable guarded roots, including unsupported legacy series aliases."""
-    rows = conn.execute(
+    query = (
         "SELECT r.task_id, t.series_id, e.payload_json, w.config_json "
         "FROM workflow_runs r LEFT JOIN tasks t ON t.id=r.task_id "
         "JOIN workflows w ON w.id=r.workflow_id LEFT JOIN workflow_events e "
         "ON e.idempotency_key='workflow.created:' || w.id"
-    ).fetchall()
+    )
+    params = ()
+    if task_id is not None:
+        query += " WHERE r.task_id=?"
+        params = (task_id,)
+    elif series_id is not None:
+        query += " WHERE r.task_id IN (SELECT id FROM tasks WHERE series_id=?)"
+        params = (series_id,)
+    rows = conn.execute(query, params).fetchall()
     tasks, series = set(), set()
-    for row in conn.execute(
-            "SELECT value FROM settings WHERE key GLOB 'workorder_no_recurrence:v1:*'"):
+    fences = ()
+    if series_id is not None:
+        fences = conn.execute("SELECT value FROM settings WHERE key=?",
+                              (f"workorder_no_recurrence:v1:{series_id}",))
+    elif task_id is None:
+        fences = conn.execute("SELECT value FROM settings WHERE key GLOB 'workorder_no_recurrence:v1:*'")
+    for row in fences:
         series.add(int(row["value"]))
     for row in rows:
         try:
@@ -1135,11 +1148,11 @@ def _retain_workorder_series_fences(conn):
 
 def workorder_recurrence_forbidden(task_id: int, *, conn=None) -> bool:
     with (nullcontext(conn) if conn is not None else _connect()) as connection:
-        tasks, series = workorder_origins(connection)
-        if task_id in tasks:
+        if task_id in workorder_origins(connection, task_id=task_id)[0]:
             return True
         row = connection.execute("SELECT series_id FROM tasks WHERE id=?", (task_id,)).fetchone()
-        return bool(row and row["series_id"] in series)
+        return bool(row and row["series_id"] is not None
+                    and row["series_id"] in workorder_origins(connection, series_id=row["series_id"])[1])
 
 
 def _backfill_task_series(conn: sqlite3.Connection):
@@ -1224,7 +1237,7 @@ def create_series_occurrence_if_idle(task: TaskCreate) -> Optional[TaskInDB]:
     if not task.series_id:
         raise ValueError("series occurrence requires series_id")
     with _connect(immediate=True) as conn:
-        if task.series_id in workorder_origins(conn)[1]:
+        if task.series_id in workorder_origins(conn, series_id=task.series_id)[1]:
             return None
         series = conn.execute(
             "SELECT ended_at FROM task_series WHERE id = ?",
@@ -2466,7 +2479,7 @@ def pause_pipeline_series_on_repeated_blocker(
 
 def _recreate_series_occurrence(conn, series_id: int, series,
                                 scheduled_at: datetime) -> bool:
-    if series_id in workorder_origins(conn)[1]:
+    if series_id in workorder_origins(conn, series_id=series_id)[1]:
         return False
     latest_row = conn.execute(
         "SELECT * FROM tasks WHERE series_id = ? ORDER BY id DESC LIMIT 1",
