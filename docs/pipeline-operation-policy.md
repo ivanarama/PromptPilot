@@ -26,9 +26,13 @@ Release prompt upgrades preserve the existing local `FINITE OWNER INTEGRATION
 DECISION` records of the MERGE schedule byte for byte, including their absolute
 scope paths, SHA256 and exact source commits. They remain separate from the
 replaceable release annotation. Only the existing bounded record format is
-carried; malformed, duplicate or conflicting identities, unknown trailing
-instructions, excess size/count, or a record attached to another stage stop
-the upgrade. Pending occurrences receive the same preserved records, and
+carried. Validation covers framing, one well-formed scope pointer, matching
+PR/source identity, count/size limits and the MERGE stage. A reserved marker
+outside a correctly framed header, unknown standalone paragraphs, duplicate
+or conflicting identities, or excess size/count stop the upgrade before
+release annotations are replaced. Existing text within a record body is
+opaque: inline notes and incomplete policy prose are preserved verbatim,
+not semantically validated or endorsed. Pending occurrences receive the same preserved records, and
 rollback restores the original prompts. Running tasks are never rewritten.
 Preservation is not new authorization: the consumer still checks each actual
 scope file/hash, current proof/ship, lifecycle, ownership, CI and exact HEAD.

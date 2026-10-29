@@ -47,9 +47,12 @@ def split_finite_integration_decisions(prompt, stage):
     This reads the trusted schedule prompt, never GitHub text. Copying a
     pointer does not validate its file or authorize an operation: MERGE must
     still verify the immutable scope/hash, exact source and all project gates.
-    Unknown, conflicting or malformed records stop the upgrade before install.
+    Validate record framing, pointer identity, count and size, not the meaning
+    of existing local body text. Unknown standalone paragraphs or malformed
+    reserved markers stop the upgrade before annotation stripping.
     """
-    first = re.search(r"(?m)^FINITE OWNER INTEGRATION DECISION", prompt)
+    marker = re.compile(r"FINITE\s+OWNER\s+INTEGRATION\s+DECISION", re.IGNORECASE)
+    first = marker.search(prompt)
     if first is None:
         return prompt, ""
     start = first.start() - 2
@@ -67,7 +70,7 @@ def split_finite_integration_decisions(prompt, stage):
         pointers = list(re.finditer(
             r"Fully read (/[^\s,]+), SHA256 ([0-9a-f]{64})\. "
             r"Applies ONLY to source ([0-9a-f]{40}) and descendant main of minimum_base,", record))
-        if header is None or len(pointers) != 1:
+        if header is None or len(pointers) != 1 or len(marker.findall(record)) != 1:
             raise ValueError("invalid finite integration decision record")
         number = header.group(1)
         path = PurePosixPath(pointers[0].group(1))
