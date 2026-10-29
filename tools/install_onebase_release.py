@@ -8,7 +8,7 @@ import argparse
 from datetime import datetime, timezone
 import hashlib
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import plistlib
 import re
 import sqlite3
@@ -41,7 +41,51 @@ def api(path, payload=None):
         return json.load(response)
 
 
+def split_finite_integration_decisions(prompt, stage):
+    """Keep existing local operator records opaque, separate from release prose.
+
+    This reads the trusted schedule prompt, never GitHub text. Copying a
+    pointer does not validate its file or authorize an operation: MERGE must
+    still verify the immutable scope/hash, exact source and all project gates.
+    Validate record framing, pointer identity, count and size, not the meaning
+    of existing local body text. Unknown standalone paragraphs or malformed
+    reserved markers stop the upgrade before annotation stripping.
+    """
+    marker = re.compile(r"FINITE\s+OWNER\s+INTEGRATION\s+DECISION", re.IGNORECASE)
+    first = marker.search(prompt)
+    if first is None:
+        return prompt, ""
+    start = first.start() - 2
+    if stage != "merge-shepherd" or start < 0 or prompt[start:first.start()] != "\n\n":
+        raise ValueError("invalid finite integration decision placement or stage")
+    decisions = prompt[start:]
+    if len(decisions.encode("utf-8")) > 128 * 1024:
+        raise ValueError("finite integration decisions exceed size limit")
+    numbers = set()
+    for record in re.split(r"\n[ \t]*\n", decisions.strip("\n")):
+        record = record.strip("\n")
+        if not record:
+            continue
+        header = re.fullmatch(r"FINITE OWNER INTEGRATION DECISION #([1-9][0-9]*), [^:\r\n]+: [^\r\n]+", record)
+        pointers = list(re.finditer(
+            r"Fully read (/[^\s,]+), SHA256 ([0-9a-f]{64})\. "
+            r"Applies ONLY to source ([0-9a-f]{40}) and descendant main of minimum_base,", record))
+        if header is None or len(pointers) != 1 or len(marker.findall(record)) != 1:
+            raise ValueError("invalid finite integration decision record")
+        number = header.group(1)
+        path = PurePosixPath(pointers[0].group(1))
+        source = pointers[0].group(3)
+        if (number in numbers or ".." in path.parts or path.parent.name != "scopes"
+                or re.fullmatch(rf"integration-{number}-[0-9]{{8}}-{source[:12]}\.json", path.name) is None):
+            raise ValueError("conflicting finite integration scope identity")
+        numbers.add(number)
+        if len(numbers) > 32:
+            raise ValueError("finite integration decisions exceed count limit")
+    return prompt[:start], decisions
+
+
 def rewrite_prompt(prompt, stage, procedures, release_id, health_config=None):
+    prompt, decisions = split_finite_integration_decisions(prompt, stage)
     # Replace the canonical occurrence only, not the Codex adapter path. Old
     # operator hotfix annotations are ours, bounded by their exact prefix.
     prompt = prompt.split("\n\nОператорский runtime hotfix:", 1)[0]
@@ -71,7 +115,7 @@ def rewrite_prompt(prompt, stage, procedures, release_id, health_config=None):
             "это закреплённый checker данного релиза с его -contract/transport/cache "
             "параметрами. Не подменяй его устаревшей сборкой из рабочего checkout. "
             "Все глобальные owner/allowlist и локальные mutation-гейты обязательны.")
-    return result
+    return result + decisions
 
 
 def configure(profiles, config, binary, health, procedures, release_id):
