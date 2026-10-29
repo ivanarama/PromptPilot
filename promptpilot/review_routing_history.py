@@ -56,10 +56,29 @@ def verified_depth(snapshot,*,trusted):
                            'outcome':established['outcome'],'index':positions[str(established['completion_id'])]})
     history,deleted=records(snapshot,trusted=trusted,expected_pr=snapshot['pr_key'])
     ledger=reduce(history,deleted_at=deleted,max_attempts=16)
+    for proof in ledger.proofs:
+        payload=proof.publication.payload
+        # Structure and server ownership alone cannot prove that the audit
+        # belonged to a real historical HEAD epoch. Prove its anchor both
+        # when published and through completion; a mid-transaction HEAD or
+        # review-again transition must not be hidden by the current header.
+        for boundary in [proof.publication.id,proof.completion.id]:
+            prefix=dict(snapshot,headRefOid=payload['identity']['head_sha'],
+                        edges=edges[:positions[boundary]+1])
+            info=pp.epoch(prefix,trusted)
+            pp.validate_epoch_safety(info,trusted)
+            if (info['hash'],info['anchor_id'])!=(payload['epoch'],payload['anchor']):
+                raise PipelineError('routing typed proof has no matching historical server epoch/anchor')
     typed=[{'kind':'typed','completion_id':proof.completion.id,'publication_id':proof.publication.id,
             'head':proof.source['head'],'epoch':proof.source['epoch'],'outcome':proof.outcome,
             'index':positions[proof.completion.id]} for proof in ledger.proofs]
     completed=sorted(legacy+typed,key=lambda item:item['index'])
+    epochs=set()
+    for item in completed:
+        key=item['head'],item['epoch']
+        if key in epochs:
+            raise PipelineError('routing legacy/typed completions conflict in the same HEAD epoch')
+        epochs.add(key)
     # A typed root's declared depth is immutable reviewed context, and must
     # agree with independently verified transactions preceding that root.
     for proof in ledger.proofs:

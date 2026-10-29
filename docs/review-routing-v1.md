@@ -132,7 +132,10 @@ review/claim/completion должны образовать канонически
 Typed proofs берутся из полного reducer, а объявленный publication.depth должен
 совпадать с числом проверенных завершений до его root. Новый HEAD не обнуляет
 историю; отсутствующие references, удаление, edited trusted history и неверный
-epoch отказывают. Значение review_depth из health само proof не заменяет.
+epoch отказывают. Epoch/anchor typed root проверяются по реальному серверному
+префиксу при публикации и при completion; смена HEAD/epoch между фазами запрещена.
+Legacy и typed completion одной HEAD/epoch не считаются двумя кругами: конфликт
+отказывает. Значение review_depth из health само proof не заменяет.
 Прежние wire/reducer goldens показывают сериализацию и reduction, но не являются
 публичной приёмкой issuer или доказательством двух предшествующих legacy кругов.
 

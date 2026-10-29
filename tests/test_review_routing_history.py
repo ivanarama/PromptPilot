@@ -7,7 +7,7 @@ from promptpilot import project_pipeline as pp
 from promptpilot.pipeline_errors import PipelineError
 from promptpilot.review_routing_baseline import capture
 from promptpilot.review_routing_history import verified_depth
-from promptpilot.review_routing_wire import context
+from promptpilot.review_routing_wire import context,outcome
 from test_review_routing_baseline import snapshot,append,root
 
 
@@ -40,9 +40,10 @@ def history():
     return state
 
 
-def add_typed(state,*,depth=2):
+def add_typed(state,*,depth=2,epoch=None,anchor_id=None):
     data=root(state);info=pp.epoch(state,'owner')
-    data.update(depth=depth,epoch=info['hash'],anchor=info['anchor_id'],audit=capture(state))
+    data.update(depth=depth,epoch=epoch or info['hash'],anchor=anchor_id or info['anchor_id'],audit=capture(state))
+    data['outcome']=outcome(data['report'],depth=data['depth'],budget_used=data['budget_used'],max_attempts=data['max_attempts'])
     common={'protocol':data['protocol'],'pr':data['pr'],'owner':data['owner'],
             'context_sha256':context(data),'publication_id':'3000','lease_id':'3000'}
     append(state,data,'3000');append(state,dict(common,kind='claim'),'3001')
@@ -96,3 +97,28 @@ def test_untrusted_completion_prose_does_not_change_depth():
     state=history();extra=legacy_comment('999','<!-- pp:head-reviewed '+'a'*40+' review-comment=1 claim=2 epoch-sha256='+'f'*64+' -->')
     extra['node']['author']['login']='contributor';state['edges'].append(extra)
     assert verified_depth(state,trusted='owner')['depth']==2
+
+
+@pytest.mark.parametrize('change',['epoch','anchor'])
+def test_typed_proof_requires_a_real_historical_server_epoch(change):
+    state=history()
+    add_typed(state,**({'epoch':'f'*64} if change=='epoch' else {'anchor_id':'NO_SUCH_SERVER_ANCHOR'}))
+    with pytest.raises(PipelineError,match='historical server epoch/anchor'):
+        verified_depth(state,trusted='owner')
+
+
+@pytest.mark.parametrize('change',['head','review-again'])
+def test_typed_epoch_must_stay_the_same_through_completion(change):
+    state=history();add_typed(state)
+    if change=='head':
+        event={'cursor':'MID_HEAD','node':{'__typename':'HeadRefForcePushedEvent','id':'MID_HEAD',
+                                        'afterCommit':{'oid':'b'*40}}}
+    else:event=legacy_comment('4000','pp:review-again')
+    state['edges'].insert(len(state['edges'])-2,event)
+    with pytest.raises(PipelineError):verified_depth(state,trusted='owner')
+
+
+def test_legacy_and_typed_completion_cannot_count_twice_for_one_epoch():
+    state=snapshot();legacy(state,state['headRefOid'],100);add_typed(state,depth=1)
+    with pytest.raises(PipelineError,match='same HEAD epoch'):
+        verified_depth(state,trusted='owner')
