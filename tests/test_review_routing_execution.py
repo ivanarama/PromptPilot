@@ -191,6 +191,20 @@ def test_case_alias_with_state_reset_triggers_is_rejected_without_any_mutation(s
         assert connection.execute('SELECT count(*) FROM '+alias).fetchone()[0]==0
 
 
+@pytest.mark.parametrize('change',['trigger','missing-table'])
+def test_schema_is_checked_again_under_the_consume_writer_lock(start_scope,change):
+    db,scope=start_scope;store=OneUseStart(db.DB_PATH)
+    if change=='trigger':
+        update(db.DB_PATH,'CREATE TRIGGER late_reset AFTER INSERT ON '+TABLE+
+               " BEGIN UPDATE "+TABLE+" SET state='not-started' WHERE attempt_key=NEW.attempt_key; END")
+    else:update(db.DB_PATH,'DROP TABLE '+TABLE)
+    def forbidden(*args):pytest.fail('schema drift must stop before gate/factory')
+    with pytest.raises(PipelineError):store.invoke(scope,final_guard=forbidden,factory=forbidden)
+    with closing(sqlite3.connect(str(db.DB_PATH))) as connection:
+        if change=='trigger':assert connection.execute("SELECT 1 FROM sqlite_master WHERE name='late_reset'").fetchone()
+        else:assert connection.execute('SELECT 1 FROM sqlite_master WHERE name=?',(TABLE,)).fetchone() is None
+
+
 def test_child_observation_cannot_reset_or_rebind_a_consumed_start(start_scope):
     db,scope=start_scope;store=OneUseStart(db.DB_PATH)
     store.invoke(scope,final_guard=lambda _scope:True,factory=lambda:None)

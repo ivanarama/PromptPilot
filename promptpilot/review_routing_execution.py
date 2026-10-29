@@ -85,21 +85,27 @@ class OneUseStart:
         with closing(self._connect()) as connection:
             connection.execute('BEGIN IMMEDIATE')
             try:
-                stored=connection.execute('SELECT type,name,sql FROM sqlite_master WHERE name=? COLLATE NOCASE',(TABLE,)).fetchone()
-                if stored is not None:
-                    if (stored['type']!='table' or stored['name']!=TABLE
-                            or _schema_signature(stored['sql'] or '')!=_schema_signature(SCHEMA)):
-                        raise PipelineError('unknown technical start schema; preserve existing barriers')
-                    if connection.execute("SELECT 1 FROM sqlite_master WHERE tbl_name=? COLLATE NOCASE AND type IN ('trigger','index') AND sql IS NOT NULL LIMIT 1",(TABLE,)).fetchone():
-                        raise PipelineError('unknown technical start schema objects')
-                else:
-                    for table in ['tasks','settings','pipeline_target_reservations']:
-                        if not connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",(table,)).fetchone():
-                            raise PipelineError('technical start requires the actual scheduler schema')
-                    connection.execute(SCHEMA)
+                self._schema(connection,create=True)
                 connection.commit()
             except BaseException:
                 connection.rollback();raise
+
+    @staticmethod
+    def _schema(connection,*,create=False):
+        stored=connection.execute('SELECT type,name,sql FROM sqlite_master WHERE name=? COLLATE NOCASE',(TABLE,)).fetchone()
+        if stored is not None:
+            if (stored['type']!='table' or stored['name']!=TABLE
+                    or _schema_signature(stored['sql'] or '')!=_schema_signature(SCHEMA)):
+                raise PipelineError('unknown technical start schema; preserve existing barriers')
+            if connection.execute("SELECT 1 FROM sqlite_master WHERE tbl_name=? COLLATE NOCASE AND type IN ('trigger','index') AND sql IS NOT NULL LIMIT 1",(TABLE,)).fetchone():
+                raise PipelineError('unknown technical start schema objects')
+        elif not create:
+            raise PipelineError('technical start receipt table disappeared; preserve unknown outcome')
+        else:
+            for table in ['tasks','settings','pipeline_target_reservations']:
+                if not connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",(table,)).fetchone():
+                    raise PipelineError('technical start requires the actual scheduler schema')
+            connection.execute(SCHEMA)
 
     def _connect(self):
         connection=sqlite3.connect(str(self.database),timeout=10)
@@ -145,6 +151,7 @@ class OneUseStart:
         with closing(self._connect()) as connection:
             connection.execute('BEGIN IMMEDIATE')
             try:
+                self._schema(connection)
                 now=self._now();self._current_task(connection,scope,now)
                 previous=connection.execute('SELECT * FROM '+TABLE+' WHERE attempt_key=? OR source_key=?',
                                             (attempt_key,source_key)).fetchall()
@@ -171,6 +178,7 @@ class OneUseStart:
         with closing(self._connect()) as connection:
             connection.execute('BEGIN IMMEDIATE')
             try:
+                self._schema(connection)
                 connection.execute('UPDATE '+TABLE+" SET state=?,updated_at=? WHERE attempt_key=? AND generation=? AND scope_sha256=? AND state='spawn-attempting'",
                                    (state,self._now().isoformat(),attempt_key,generation,sha(scope)))
                 connection.commit()
@@ -199,6 +207,8 @@ class OneUseStart:
     def status(self,scope):
         scope=freeze_scope(scope);attempt_key,_source=self._keys(scope)
         with closing(self._connect()) as connection:
+            connection.execute('BEGIN')
+            self._schema(connection)
             row=connection.execute('SELECT state,scope_sha256,pid FROM '+TABLE+' WHERE attempt_key=?',(attempt_key,)).fetchone()
             return dict(row) if row is not None else None
 
@@ -213,6 +223,7 @@ class OneUseStart:
         with closing(self._connect()) as connection:
             connection.execute('BEGIN IMMEDIATE')
             try:
+                self._schema(connection)
                 row=connection.execute('SELECT state,scope_sha256,pid FROM '+TABLE+' WHERE attempt_key=?',(attempt_key,)).fetchone()
                 if row is None or row['scope_sha256']!=sha(scope):
                     raise PipelineError('technical start observation has no matching consumed scope')
