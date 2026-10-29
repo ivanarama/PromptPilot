@@ -196,3 +196,49 @@ def test_new_recovery_scope_preserves_old_root_limit_and_takes_over_after_expiry
     assert result['action']=='completed' and result['source']['publication_id']=='1000'
     assert peer.posts==['publication','lease','claim','completion']
     assert parse(peer.comments[0]['node']['body'])['max_attempts']==2
+
+
+@pytest.mark.parametrize('when',['actor','renewal','matching'])
+@pytest.mark.parametrize('what',['disabled','reader'])
+def test_late_local_policy_change_stops_the_first_post(setup_guard,tmp_path,monkeypatch,when,what):
+    peer,config,_health,path,root,_req,seed,make=setup_guard
+    changed=False
+    def change():
+        nonlocal changed
+        if changed:return
+        changed=True
+        if what=='disabled':
+            raw=json.loads(path.read_text(encoding='utf-8'));raw['technical_handoff']['enabled']=False
+            path.write_text(json.dumps(raw),encoding='utf-8')
+        else:
+            entry=root/'fix-approved/SKILL.md'
+            entry.write_text(entry.read_text(encoding='utf-8')+'\nnew policy\n',encoding='utf-8')
+    tx=Publication(peer,config,Journal(tmp_path/'journal'),make(),seed,clock=lambda:peer.now)
+    if when=='actor':
+        original_guard_call=StageGuard.__call__
+        def track_write(self,payload,*,write=False):
+            self._test_in_write=write
+            try:return original_guard_call(self,payload,write=write)
+            finally:self._test_in_write=False
+        monkeypatch.setattr(StageGuard,'__call__',track_write)
+        original=peer.json
+        def after_actor(*args,**kwargs):
+            result=original(*args,**kwargs)
+            if args==('api','user') and getattr(tx.guard,'_test_in_write',False):change()
+            return result
+        peer.json=after_actor
+    elif when=='renewal':
+        original=pp.renew_lease_target_reservation
+        def after_renewal(*args,**kwargs):
+            result=original(*args,**kwargs);change();return result
+        monkeypatch.setattr(pp,'renew_lease_target_reservation',after_renewal)
+    else:
+        original=tx.transport._matches
+        def after_matching(*args,**kwargs):
+            result=original(*args,**kwargs)
+            if tx.guard._ticket is not None:change()
+            return result
+        tx.transport._matches=after_matching
+    with pytest.raises(PipelineError):tx.run()
+    assert changed and peer.posts==[]
+    assert tx.journal.pending_for(seed['pr'])==[]

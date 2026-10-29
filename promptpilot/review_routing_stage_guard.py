@@ -7,6 +7,7 @@ the final-before-POST callback after reducer/matching/SQLite work.
 from __future__ import annotations
 
 from datetime import datetime,timezone
+import copy
 
 from . import project_pipeline as pp
 from . import review_routing_request as requests
@@ -115,7 +116,9 @@ class StageGuard:
         requests.require_current(request,config,write=write)
         if write:
             self._ticket={'snapshot':snapshot,'snapshot_sha256':sha(snapshot),'body':render(value),
-                          'config':config,'view':view,'reservation':renewed}
+                          'health':copy.deepcopy({name:health[name] for name in
+                              ['state','findings','review_routing_contract']}),
+                          'view':view,'reservation':renewed}
         return snapshot
 
     def final_before_post(self,payload,snapshot):
@@ -125,6 +128,17 @@ class StageGuard:
         if (ticket is None or snapshot is not ticket['snapshot']
                 or sha(snapshot)!=ticket['snapshot_sha256'] or render(payload)!=ticket['body']):
             raise PipelineError('typed REVIEW final guard has no matching fresh write snapshot')
+        # Actor reads, reservation renewal and semantic/exact matching may
+        # have taken arbitrarily long. Re-read the LOCAL effective config and
+        # all four actual consumer trees after them. The previously complete
+        # authenticated checker contract is comparison evidence, not cached
+        # permission. All this I/O remains before the last expiry check.
+        config=pp.load_config(self.config_path)
+        policy=preflight(config,ticket['health'])
+        if (policy.get('enabled') is not True
+                or policy['consumer_sha256']!=self.request['reader_sha256']
+                or policy['current_limit']!=self.request['current_limit']):
+            raise PipelineError('typed REVIEW final paired policy changed or was disabled')
         renewed=ticket['reservation']
         expiry=None
         if renewed is not None:
@@ -133,7 +147,7 @@ class StageGuard:
                 raise PipelineError('typed REVIEW renewed task reservation expiry is invalid') from exc
             if expiry.tzinfo is None or expiry.utcoffset() is None:
                 raise PipelineError('typed REVIEW renewed task reservation expiry is not timezone aware')
-        requests.require_current(self.request,ticket['config'],write=True)
+        requests.require_current(self.request,config,write=True)
         now=self.clock()
         if not isinstance(now,datetime) or now.tzinfo is None or now.utcoffset() is None:
             raise PipelineError('typed REVIEW final clock must be timezone aware')
