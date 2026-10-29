@@ -61,6 +61,17 @@ GET не может забыть противоречивый ID. Внутрен
 либо восстанавливает receipt чтением; он требует внешнего полного stage guard,
 сам его не реализует и пока не подключён к командам next/complete.
 
+Внутренний preflight сохраняет проектируемые три параметра technical_handoff:
+enabled, protocol и max_extra_attempts. Он не добавляет defaults в legacy config,
+не меняя digest существующих leases. Для совместимости он сравнивает полный
+сырой набор файлов четырёх canonical stage directories с reader_sha256 полного
+checker-контракта; только marker в одном SKILL недостаточен. Формат tree digest:
+UTF-8 `pp-review-routing-consumer-tree-v1` + LF, затем для каждого файла в порядке
+UTF-8 path: relative path + NUL + lowercase SHA-256 содержимого + LF. Генерируемые
+__pycache__/.pyc/.pyo не входят; symlinks и control characters запрещены.
+Эта negotiation также ещё не подключена к публичным командам и требует
+соответствующего Go-контракта/общих fixtures до включения.
+
 До будущей записи/dispatch обязательны полные public gates: совместимость всех
 читателей, trusted actor/immutability, coherent identity/epoch/lifecycle/labels,
 текущее владение returned ID/UUID, effective config и конечный budget. Неопределённый

@@ -64,7 +64,8 @@ class Transport:
         # a hold. The final stage guard runs after write-ahead commit.
         self._snapshot(payload)
         try:
-            response=self.gh.json('api','-X','POST',f'repos/{self.repository}/issues/{target}/comments',
+            response=self.gh.json('api',f'repos/{self.repository}/issues/{target}/comments',
+                                  '--method','POST','--input','-',
                                   input_value={'body':body})
             value=response['id']
             returned_id=decimal_id(str(value) if type(value) is int else value)

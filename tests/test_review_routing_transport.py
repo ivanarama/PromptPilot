@@ -40,7 +40,7 @@ class Server:
         return {'pr_key':payload['pr'],'edges':edges}
 
     def json(self,*args,input_value=None):
-        assert args==('api','-X','POST','repos/owner/repo/issues/42/comments')
+        assert args==('api','repos/owner/repo/issues/42/comments','--method','POST','--input','-')
         self.posts+=1
         self.body=input_value['body']
         if self.lose_response:
@@ -129,3 +129,22 @@ def test_oversized_evidence_is_rejected_before_guard_or_journal_or_post(tmp_path
     assert server.guards==0 and server.posts==0
     assert Journal(tmp_path).get(owner=OWNER,phase='publication') is None
     assert render(PAYLOAD)
+
+
+def test_real_github_client_supplies_json_stdin_to_explicit_api_input(tmp_path,monkeypatch):
+    from types import SimpleNamespace
+    from promptpilot import project_pipeline as pp
+    server=Server()
+    def command(args,**kwargs):
+        # Exercise the real GitHub.json/run boundary. input_value alone does
+        # not instruct gh api to read stdin; --input - is mandatory.
+        assert args[0]=='fixture-gh' and args[1]=='api'
+        assert '--input' in args and args[args.index('--input')+1]=='-'
+        assert any(value.endswith('/issues/42/comments') for value in args)
+        sent=json.loads(kwargs['input'])
+        server.body=sent['body'];server.posts+=1
+        return SimpleNamespace(returncode=0,stdout=json.dumps({'id':'1000'}),stderr='')
+    monkeypatch.setattr(pp.subprocess,'run',command)
+    github=pp.GitHub(executable='fixture-gh')
+    record=Transport(github,CONFIG,Journal(tmp_path),server.guard).publish(PAYLOAD,owner=OWNER,phase='publication')
+    assert record.id=='1000' and server.posts==1
