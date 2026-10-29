@@ -1797,6 +1797,14 @@ def _list_series(series_id: int | None = None) -> list:
         # The summary and its sparse occurrence details must describe the same
         # queue snapshot even if a worker completes a run between SELECTs.
         conn.execute("BEGIN")
+        # An older auxiliary process can recreate idx_tasks_series after our
+        # startup migration. SQLite may then choose it and visit every task
+        # payload page despite this narrow projection. Prefer the covering
+        # index explicitly while preserving reads of a pre-migration database
+        # where that index does not exist yet. Metadata is read once per call.
+        summary_hint = (" INDEXED BY idx_tasks_series_summary" if any(
+            row[1] == "idx_tasks_series_summary"
+            for row in conn.execute("PRAGMA index_list(tasks)")) else "")
         series_rows = [dict(r) for r in conn.execute(
             """SELECT s.id, s.title, s.prompt, s.working_dir,
                       s.base_recurrence, s.temporary_recurrence,
@@ -1817,7 +1825,7 @@ def _list_series(series_id: int | None = None) -> list:
         for row in conn.execute(
                 """SELECT t.id, t.series_id, t.status, t.started_at,
                           t.completed_at, t.verdict
-                   FROM tasks AS t
+                   FROM tasks AS t""" + summary_hint + """
                    INNER JOIN task_series AS s ON s.id = t.series_id
                 """ + history_filter + " ORDER BY t.series_id DESC, t.id DESC", bound):
             task_rows_by_series.setdefault(row["series_id"], []).append(dict(row))
@@ -1836,7 +1844,7 @@ def _list_series(series_id: int | None = None) -> list:
                               MAX(CASE WHEN status IN
                                   ('completed', 'failed', 'cancelled')
                                   THEN id END) AS last_id
-                       FROM tasks
+                       FROM tasks""" + summary_hint + """
                        WHERE series_id IS NOT NULL""" + picked_filter + """
                        GROUP BY series_id
                    )
