@@ -54,6 +54,8 @@ def setup_guard(tmp_path,monkeypatch):
         monkeypatch.delenv(name,raising=False)
     root,raw,health=peers(tmp_path)
     raw.update(repository='owner/repo',trusted_account='owner')
+    candidate={'number':42,'head':'a'*40,'stage':'review','review_depth':2}
+    health.update(review_candidates=[candidate],content_review_candidates=[candidate],merge_executable=[],integration_owner=None)
     path=tmp_path/'pipelinectl.json';path.write_text(json.dumps(raw),encoding='utf-8')
     config=pp.load_config(str(path));peer=Peer()
     monkeypatch.setattr(pp,'run_health',lambda *args,**kwargs:copy.deepcopy(health))

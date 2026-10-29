@@ -3410,6 +3410,27 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
 
         preflight_action = preflight["action"].lower()
         typed_response = preflight.get("protocol") == "review-routing-v1"
+        routing_request = None
+        token = preflight.get("lease")
+        signed_routing_claim = False
+        if preflight_action in {"audit", "recover"} and isinstance(token, str) and "." in token:
+            from . import project_pipeline
+            try:
+                advertised = project_pipeline.decode_lease(token.split(".", 1)[0]).get("protocol")
+            except project_pipeline.PipelineError:
+                advertised = None
+            signed_routing_claim = isinstance(advertised, str) and advertised.startswith("review-routing-")
+        if typed_response or signed_routing_claim:
+            from . import project_pipeline
+            try:
+                from .review_routing_request import decode as decode_routing_request
+                routing_request = decode_routing_request(str(token or ""))
+                if (not typed_queue or not typed_response
+                        or preflight_action not in {"audit", "recover"}
+                        or (preflight_action == "recover") != (routing_request["recovery"] is not None)):
+                    raise project_pipeline.PipelineError("typed REVIEW signed protocol/purpose contradicts its outer envelope or transport")
+            except (project_pipeline.PipelineError, TypeError, ValueError) as exc:
+                return {"action": "block", "mode": "tool", "reason": str(exc)}
         if typed_response and not typed_queue:
             return {"action": "block", "mode": "tool",
                     "reason": "typed REVIEW requires the scheduler's explicit versioned transport"}
@@ -3420,11 +3441,8 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
             try:
                 from . import project_pipeline
 
-                if typed_response:
-                    from .review_routing_request import decode as decode_routing_request
-                    lease = decode_routing_request(str(preflight.get("lease") or ""))
-                    if (preflight_action == "recover") != (lease["recovery"] is not None):
-                        raise project_pipeline.PipelineError("typed REVIEW action contradicts signed request purpose")
+                if routing_request is not None:
+                    lease = routing_request
                 elif preflight_action == "audit":
                     lease = project_pipeline.decode_signed_lease(
                         str(preflight.get("lease") or ""))

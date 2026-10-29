@@ -39,6 +39,35 @@ def _wait(item,reason,**details):
             'number':item['number'],'reason':reason,**details}
 
 
+def _recover_visible_pending(gh,config,snapshot,history,journal,pending):
+    """Confirm local receipts from authenticated history; never POST as owner.
+
+    The old signed task/request may be lost or expired. Exact read-back needs
+    no new WRITE authority and must not strand a completed older HEAD forever.
+    An invisible body or conflicting returned ID remains a durable barrier.
+    """
+    recovered=[]
+    for row in pending:
+        if (row['repository'],row['pr_number'])!=(config['repository'],snapshot['pr_key']['pr_number']):
+            raise PipelineError('pending REVIEW receipt belongs to another repository/PR')
+        payload=parse(row['body'])
+        if payload['pr']!=snapshot['pr_key']:
+            raise PipelineError('pending REVIEW receipt changes lifetime PR identity')
+        matches=[record for record in history if render(record.payload)==row['body']]
+        if not matches:return pending
+        if len(matches)!=1 or row['returned_id'] is not None and row['returned_id']!=matches[0].id:
+            raise PipelineError('pending REVIEW receipt has conflicting exact body or returned ID')
+        recovered.append((row,matches[0]))
+    if recovered:
+        pp.ensure_identity(gh,config)
+        try:
+            for row,record in recovered:
+                journal.confirm(owner=row['owner'],phase=row['phase'],returned_id=record.id,body=row['body'])
+        except sqlite3.Error as exc:
+            raise PipelineError('REVIEW receipt journal unavailable; preserve unresolved barriers') from exc
+    return []
+
+
 def _admit_audit(ledger,head):
     if ledger.resuming_publication_id is not None:
         raise PipelineError('an unfinished publication already consumed the engineering resume')
@@ -83,8 +112,12 @@ def next_review(gh,config,*,config_path,item,reservation,health):
     root=roots.get(current)
     completed={proof.publication.id for proof in ledger.proofs}
     directory=journal_directory(config)
-    pending=(_journal(config).pending_for(snapshot['pr_key'])
-             if (directory/'review-routing-journal.sqlite3').exists() else [])
+    pending=[]
+    if (directory/'review-routing-journal.sqlite3').exists():
+        journal=_journal(config)
+        try:pending=journal.pending_for(snapshot['pr_key'])
+        except sqlite3.Error as exc:raise PipelineError('REVIEW receipt journal unavailable') from exc
+        pending=_recover_visible_pending(gh,config,snapshot,history,journal,pending)
     if root is None and pending:
         return _wait(item,'unresolved local POST requires exact receipt recovery; no new audit')
     if root is not None:
@@ -109,6 +142,9 @@ def next_review(gh,config,*,config_path,item,reservation,health):
         request=requests.build(config,snapshot,policy,depth=verified['depth'],budget_used=ledger.budget_used,
                                resume_id=resume,reservation=reservation)
         action='audit'
+    if not pp.content_review_elected(health,{'number':request['number'],'head':request['head'],
+                                                'review_depth':request['depth']}):
+        raise PipelineError('typed REVIEW verified depth/target changed after health election')
     # Authenticate and renew before issuing even the model's bounded request.
     pp.ensure_identity(gh,config)
     pp.renew_lease_target_reservation(request,config)

@@ -108,6 +108,12 @@ class StageGuard:
                 or policy['consumer_sha256']!=request['reader_sha256']
                 or policy['current_limit']!=request['current_limit']):
             raise PipelineError('typed REVIEW paired policy changed or was disabled')
+        if write:
+            from .fallback_handoff import validate_health
+            validate_health(health)
+            if not pp.content_review_elected(health,{'number':request['number'],'head':request['head'],
+                                                      'review_depth':request['depth']}):
+                raise PipelineError('typed REVIEW target left the current exact content allowlist')
         snapshot=stable_timeline(self.gh,config,request['number'])
         try:
             pp.review_gate(snapshot,config,request)

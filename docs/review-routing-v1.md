@@ -172,6 +172,14 @@ report/audit/budget; report при recovery не принимается. Нез�
 без provider/model и без нового report. Отсутствие версии, чужая reservation или
 неизвестный результат не переводятся в свободный skill fallback. Эта версия
 очереди ещё не включена в рабочей конфигурации.
+Завершение каждой новой фазы повторно проверяет точное присутствие PR/HEAD/depth
+в свежем content allowlist, а подтверждение уже существующего receipt остаётся
+READ. Внешние action/protocol сверяются с протоколом и purpose подписанного
+request; удаление внешнего protocol не может отправить recovery на новый audit
+модели. Если после потерянного ответа completion стал виден уже на следующем
+HEAD, `next` подтверждает только точное тело и известный returned ID в локальном
+журнале по полной доверенной истории. Невидимая запись, конфликт ID или другой
+GitHub actor сохраняют барьер и не запускают новый audit.
 
 До будущей записи/dispatch обязательны полные public gates: совместимость всех
 читателей, trusted actor/immutability, coherent identity/epoch/lifecycle/labels,

@@ -100,9 +100,10 @@ def test_actual_entrypoints_fail_closed_without_a_compatible_current_peer(adapte
     assert code==2 and result['action']=='error' and peer.posts==[]
 
 
+@pytest.mark.parametrize('envelope_fault',[None,'missing-protocol','v2','empty-lease','no-transport'])
 @pytest.mark.parametrize('recover',[False,True])
 def test_single_lane_worker_uses_owned_request_and_recovers_without_model(
-        adapter,isolated_db,monkeypatch,tmp_path,recover):
+        adapter,isolated_db,monkeypatch,tmp_path,recover,envelope_fault):
     from contextlib import redirect_stdout
     from io import StringIO
     from promptpilot import pipeline_insights as insights
@@ -135,6 +136,7 @@ def test_single_lane_worker_uses_owned_request_and_recovers_without_model(
         peer.comments[0]['node']['createdAt']=(peer.now-timedelta(minutes=31)).isoformat().replace('+00:00','Z')
     queue={'id':'review','execution':{'mode':'auto','command':['pipelinectl','next','review'],
                                     'review_routing_protocol':'review-routing-v1'}}
+    if envelope_fault=='no-transport':queue['execution'].pop('review_routing_protocol')
     monkeypatch.setattr(insights,'_matching_queue',lambda _task:('p',{'repository':'owner/repo'},queue))
     monkeypatch.setattr(insights,'_tool_available',lambda *args:(True,''))
     monkeypatch.setattr(insights,'load_providers',lambda:{})
@@ -147,9 +149,17 @@ def test_single_lane_worker_uses_owned_request_and_recovers_without_model(
             with redirect_stdout(stream):code=pp.run(['--config',str(path),*command[1:]])
             result=json.loads(stream.getvalue())
             assert code==0,result
+            if envelope_fault is not None and command[-2:]==['next','review']:
+                result['action']='audit'
+                if envelope_fault in {'missing-protocol','no-transport'}:result.pop('protocol',None)
+                elif envelope_fault=='v2':result['protocol']='review-routing-v2'
+                else:result['lease']=''
             return result
     monkeypatch.setattr(insights,'_tool_preflight',actual_cli)
     route=insights.execution_route(task,'fallback skill',str(tmp_path))
+    if envelope_fault is not None:
+        assert route['action']=='block' and len(calls)==1,route
+        return
     assert route['action']==('complete_empty' if recover else 'prompt'),route
     if recover:
         assert route['completion']['action']=='completed' and len(calls)==2
@@ -157,3 +167,61 @@ def test_single_lane_worker_uses_owned_request_and_recovers_without_model(
     else:
         assert route['pipeline_replicas']==1 and route['review_routing_protocol']=='review-routing-v1'
         assert route['pipeline_target_reservation']['task_id']==task.id and len(calls)==1
+
+
+def test_completion_rechecks_current_content_membership_after_the_audit(adapter):
+    peer,health,_path,report,run=adapter
+    code,selected=run('next','review');assert code==0
+    health.update(review_candidates=[],content_review_candidates=[])
+    code,refused=run('complete','review','--lease',selected['lease'],'--report',str(report))
+    assert code==2 and refused['action']=='error',refused
+    assert peer.posts==[]
+
+
+@pytest.mark.parametrize('receipt',['visible','invisible','wrong-returned-id','wrong-actor'])
+def test_public_next_confirms_visible_old_pending_receipt_then_can_audit_new_head(adapter,receipt):
+    from promptpilot.pipeline_errors import PipelineError
+    from promptpilot.review_routing_wire import parse
+    from promptpilot.review_routing_adapter import _journal
+    peer,health,path,report,run=adapter
+    value=json.loads(report.read_text(encoding='utf-8'));value['blocking']=[]
+    report.write_text(json.dumps(value),encoding='utf-8')
+    code,selected=run('next','review');assert code==0
+    original=peer.json;blocked=False
+    def lost_completion(*args,**kwargs):
+        nonlocal blocked
+        if len(args)>1 and args[1]=='graphql' and blocked:raise PipelineError('temporary receipt read unavailable')
+        result=original(*args,**kwargs)
+        if kwargs.get('input_value') is not None and parse(kwargs['input_value']['body'])['kind']=='completion':
+            blocked=True;raise OSError('completion response lost')
+        return result
+    peer.json=lost_completion
+    code,failed=run('complete','review','--lease',selected['lease'],'--report',str(report))
+    assert code==2 and failed['action']=='error' and len(peer.posts)==3
+    peer.json=original
+    peer.current['data']['repository']['pullRequest']['headRefOid']='c'*40
+    peer.comments.append({'cursor':'AFTER_REVIEW','node':{'__typename':'PullRequestCommit','id':'AFTER_REVIEW','commit':{'oid':'c'*40}}})
+    health['review_candidates'][0]['head']='c'*40
+    health['review_candidates'][0]['review_depth']=3
+    journal=_journal(pp.load_config(str(path)))
+    key=requests.decode(selected['lease'])['pr_key']
+    if receipt=='invisible':peer.comments=[edge for edge in peer.comments if edge['node'].get('fullDatabaseId')!='1002']
+    elif receipt=='wrong-returned-id':
+        row=journal.pending_for(key)[0]
+        journal.observe_returned_id(owner=row['owner'],phase=row['phase'],returned_id='99999')
+    elif receipt=='wrong-actor':peer.actor='other'
+    code,current=run('next','review')
+    if receipt!='visible':
+        assert current['action'] in {'wait','error'} and journal.pending_for(key),current
+        assert peer.posts==['publication','claim','completion']
+        return
+    assert code==0 and current['action']=='audit' and current['target']['head']=='c'*40,current
+    assert journal.pending_for(key)==[]
+    assert peer.posts==['publication','claim','completion']
+
+
+def test_current_health_depth_must_agree_with_verified_history_before_model(adapter):
+    peer,health,_path,_report,run=adapter
+    health['review_candidates'][0]['review_depth']=3
+    code,refused=run('next','review')
+    assert code==2 and refused['action']=='error' and peer.posts==[]
