@@ -7,6 +7,7 @@ import os
 import time
 import ipaddress
 import secrets
+import sqlite3
 import subprocess
 import sys
 import uuid
@@ -480,9 +481,24 @@ def api_series_action(series_id: int, body: SeriesAction):
         raise HTTPException(400, "Неизвестное действие")
     if body.retry_blocked and body.action != "run_now":
         raise HTTPException(400, "Повтор блокированных задач доступен только для run_now")
-    if not db.series_action(series_id, body.action, retry_blocked=body.retry_blocked):
-        raise HTTPException(400, "Действие неприменимо к этой серии")
-    return {"ok": True, "series": db.get_series(series_id)}
+    try:
+        if not db.series_action(series_id, body.action, retry_blocked=body.retry_blocked):
+            raise HTTPException(400, "Действие неприменимо к этой серии")
+        return {"ok": True, "series": db.get_series(series_id)}
+    except sqlite3.OperationalError as exc:
+        code = getattr(exc, "sqlite_errorcode", None)
+        busy = (type(code) is int and code & 0xff in {5, 6}) or (
+            code is None and str(exc).lower().startswith((
+                "database is locked", "database table is locked", "database schema is locked")))
+        if not busy:
+            raise
+        # A write may already have committed before a readback became busy.
+        # Never claim it did not happen or automatically replay the action.
+        raise HTTPException(
+            503, "Действие не удалось подтвердить: расписание временно занято. "
+                 "Обновите состояние перед повтором действия.",
+            headers={"Retry-After": "1"},
+        ) from exc
 
 
 @app.get("/api/pipeline-insights/profiles")
@@ -1464,6 +1480,16 @@ def api_version():
     return check_for_update()
 
 
+def _provider_display(info: dict) -> dict:
+    human = info.get("human")
+    order = info.get("ui_order")
+    return {
+        "human": {key: human[key] for key in ("label", "role", "desc")
+                  if isinstance(human, dict) and isinstance(human.get(key), str)},
+        "ui_order": order if type(order) is int and 0 <= order <= 2**53 - 1 else None,
+    }
+
+
 @app.get("/api/providers")
 def api_providers():
     providers = load_providers()
@@ -1482,6 +1508,7 @@ def api_providers():
             "hidden": bool(info.get("hidden")),
             "executor": info.get("executor", ""),
             "session_target": bool(info.get("session_target")),
+            **_provider_display(info),
             # rights levels this provider can be confined to (models.TaskRights)
             "rights": [level for level in RIGHTS_LEVELS if rights_supported(info, level)],
         }
@@ -1630,6 +1657,7 @@ def api_providers_manage():
             "available": provider_available(info),
             "hidden": bool(info.get("hidden")),
             "source": info.get("_source", "builtin"),
+            **_provider_display(info),
         }
         for name, info in providers.items()
     }
