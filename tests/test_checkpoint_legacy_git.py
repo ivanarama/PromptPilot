@@ -51,6 +51,7 @@ def test_legacy_git_refuses_changed_head_without_publication(
     original = _git(repo, "symbolic-ref", "HEAD")
     head = _git(repo, "rev-parse", "HEAD")
     index = (repo / ".git/index").read_bytes()
+    original_head_file = (repo / ".git/HEAD").read_bytes()
     if replacement == "alias":
         _git(repo, "symbolic-ref", "refs/heads/alias", original)
         _git(repo, "symbolic-ref", "HEAD", "refs/heads/alias")
@@ -62,11 +63,19 @@ def test_legacy_git_refuses_changed_head_without_publication(
         target.write_bytes((repo / ".git/HEAD").read_bytes())
         (repo / ".git/HEAD").unlink()
         (repo / ".git/HEAD").symlink_to(target)
-    assert _resume(wf).status.value == "awaiting_human"
+    try:
+        assert _resume(wf).status.value == "awaiting_human"
+        assert (repo / ".git/index").read_bytes() == index
+        assert "stage.checkpoint" not in _types(isolated_db, wf)
+        assert "stage.advanced" not in _types(isolated_db, wf)
+    finally:
+        if replacement == "symlink":
+            # Git refuses repository discovery with a filesystem HEAD symlink.
+            # Restore the deliberately broken fixture before asking Git to
+            # verify that the original branch ref was not published.
+            (repo / ".git/HEAD").unlink()
+            (repo / ".git/HEAD").write_bytes(original_head_file)
     assert _git(repo, "rev-parse", original) == head
-    assert (repo / ".git/index").read_bytes() == index
-    assert "stage.checkpoint" not in _types(isolated_db, wf)
-    assert "stage.advanced" not in _types(isolated_db, wf)
 
 
 @posix_reader
