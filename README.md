@@ -2216,7 +2216,7 @@ GET    /api/stats/costs            — стоимость: today / week / total 
 GET    /api/stats/usage            — расход за окно лимита по всем сессиям (?hours=5)
 POST   /api/tasks/{id}/note        — дописать решателю ({"text": "..."}; пустой текст убирает)
 GET    /api/worker/status          — paused + state/heartbeat_at/age_seconds/pid
-POST   /api/worker/pause|resume    — пауза/возобновление воркера
+POST   /api/worker/pause|resume    — пауза/возобновление выбора новых задач; уже взятые продолжаются
 GET    /api/version                — проверка обновлений (кэш 24 ч)
 GET    /api/providers              — провайдеры (description, supports_skills, models, available, hidden, executor)
 GET    /api/providers/manage       — полная информация для настроек (env-секреты маскированы)
