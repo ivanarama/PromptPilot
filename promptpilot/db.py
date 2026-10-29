@@ -90,6 +90,23 @@ CREATE TABLE IF NOT EXISTS task_token_usage (
     cost_attributable INTEGER NOT NULL DEFAULT 1
 );
 
+-- Original provider text for workflow decisions; display metadata stays in tasks.result.
+CREATE TABLE IF NOT EXISTS task_reports (
+    task_id INTEGER PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+    task_started_at TEXT,
+    result_sha256 TEXT NOT NULL,
+    report_text TEXT NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS task_reports_invalidate
+AFTER UPDATE OF status, started_at, result ON tasks
+WHEN NEW.status != 'completed'
+  OR NEW.started_at IS NOT OLD.started_at
+  OR NEW.result IS NOT OLD.result
+BEGIN
+    DELETE FROM task_reports WHERE task_id = NEW.id;
+END;
+
 CREATE TABLE IF NOT EXISTS task_series (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     title TEXT NOT NULL,
@@ -1437,8 +1454,11 @@ def _release_task_pipeline_targets(conn, task_id: int, started_at=None):
 
 def mark_completed(task_id: int, result: str, exit_code: int = 0,
                    model_used: str = None, session_id: str = None,
-                   verdict: str = None, *, expected_started_at=None, usage=None) -> bool:
+                   verdict: str = None, *, expected_started_at=None, usage=None,
+                   report_text: str = None) -> bool:
     """Finalize a task, optionally committing its verdict atomically."""
+    if report_text is not None and not isinstance(report_text, str):
+        raise ValueError('report_text must be a string or None')
     with _connect() as conn:
         attempt = _attempt_iso(expected_started_at)
         where = "id = ?"
@@ -1458,6 +1478,22 @@ def mark_completed(task_id: int, result: str, exit_code: int = 0,
         if cur.rowcount:
             _drop_cancel_flag(conn, task_id)
             _release_task_pipeline_targets(conn, task_id, attempt)
+            # The raw/model boundary is recorded by the producer, never inferred
+            # by stripping renderer-looking text supplied by the model. Keep it
+            # out of ordinary task list projections and bind it to this result.
+            conn.execute("DELETE FROM task_reports WHERE task_id = ?", (task_id,))
+            if report_text is not None:
+                linked = conn.execute(
+                    "SELECT started_at FROM tasks WHERE id=? AND EXISTS "
+                    "(SELECT 1 FROM workflow_runs WHERE task_id=tasks.id)", (task_id,),
+                ).fetchone()
+                if linked:
+                    conn.execute(
+                        "INSERT INTO task_reports (task_id,task_started_at,result_sha256,report_text) "
+                        "VALUES (?, ?, ?, ?)",
+                        (task_id, linked['started_at'], hashlib.sha256(result.encode('utf-8')).hexdigest(),
+                         report_text),
+                    )
             # Usage belongs to this successful attempt, never to assistant text.
             conn.execute("DELETE FROM task_token_usage WHERE task_id = ?", (task_id,))
             if isinstance(usage, dict):

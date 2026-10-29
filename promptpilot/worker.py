@@ -1331,6 +1331,7 @@ def _finalize_herdr_outcome(task, outcome: dict, *,
         lambda: _mark_completed(
             task, outcome["output"], exit_code=0,
             verdict=verdict or None,
+            report_text=outcome.get("report_text"),
         ),
         f"завершение herdr-задачи #{task.id}",
     )
@@ -2266,6 +2267,7 @@ def _execute_task_body(task, admission_complete=None):
         lambda: _mark_completed(
             task, output, exit_code=0, model_used=model_used,
             session_id=session_id, verdict=verdict or None, usage=reported_usage,
+            report_text=verdict_source,
         ),
     )
     if changed:

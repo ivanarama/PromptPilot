@@ -84,6 +84,10 @@ Deterministic gate:
 AUDIT_FINDINGS_JSON: []
 AUDIT_VERDICT: PASS
 
+Весь текст отчёта и объяснения размещай перед этими строками. Выводи их
+обычным текстом, вне цитат и блоков кода. После AUDIT_VERDICT допустима
+только завершающая строка ИТОГ установленного workflow-формата.
+
 Для замечаний верни JSON-массив объектов с полями fingerprint, severity
 (blocker/high/medium/low/info), category, title, status (open/resolved/reopened/
 accepted_risk), payload. AUDIT_VERDICT допускает только PASS,

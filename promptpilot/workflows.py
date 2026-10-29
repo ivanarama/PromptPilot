@@ -19,6 +19,7 @@ from datetime import datetime
 from typing import Optional
 
 from . import db, stage_checkpoint
+from .process_tree import run_owned
 from .models import (
     FindingStatus,
     FindingSeverity,
@@ -257,6 +258,10 @@ AUDIT_RESPONSE_CONTRACT = """В конце отчёта обязательно �
 две машинно-читаемые строки (каждая целиком на одной строке):
 AUDIT_FINDINGS_JSON: []
 AUDIT_VERDICT: PASS
+
+Весь текст отчёта и объяснения размещай перед этими строками. Выводи их
+обычным текстом, вне цитат и блоков кода. После AUDIT_VERDICT допустима
+только завершающая строка ИТОГ установленного workflow-формата.
 
 Для замечаний верни JSON-массив объектов с полями fingerprint, severity
 (blocker/high/medium/low/info), category, title, status (open/resolved/reopened/
@@ -3080,36 +3085,6 @@ def _dispatch_configured_role(workflow: WorkflowInDB,
     ))
 
 
-def _run_gate_command_windows(argv: list[str], cwd: str, timeout: int) -> subprocess.CompletedProcess:
-    """subprocess.run для gate-команды, убивающий по timeout всё ДЕРЕВО процессов.
-
-    Обычный run() на Windows по таймауту убивает только прямого потомка
-    (powershell.exe). Выжившие дети (cmd.exe / java / gradle daemon) держат
-    унаследованные хэндлы stdout/stderr, и повторный communicate() внутри run()
-    блокируется до их смерти — на практике часами (см. #80: gate "timeout=1800s"
-    фиксировался ровно через 3 часа — idle TTL gradle-демона). taskkill /T /F
-    закрывает дерево, пайпы освобождаются, TimeoutExpired уходит наверх как раньше.
-    """
-    proc = subprocess.Popen(
-        argv, cwd=cwd,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, errors="replace",
-    )
-    try:
-        stdout, stderr = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        subprocess.run(
-            ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
-            capture_output=True,
-        )
-        try:
-            proc.communicate(timeout=30)  # забрать вывод и корректно похоронить
-        except subprocess.TimeoutExpired:
-            pass
-        raise
-    return subprocess.CompletedProcess(argv, proc.returncode, stdout or "", stderr or "")
-
-
 def _run_gate_commands(workflow: WorkflowInDB) -> WorkflowGateDecision:
     gate = _config_for(workflow).gate
     stage = (
@@ -3153,16 +3128,16 @@ def _run_gate_commands(workflow: WorkflowInDB) -> WorkflowGateDecision:
             if os.name == "nt" else ["/bin/sh", "-lc", command]
         )
         try:
-            completed = (
-                _run_gate_command_windows(argv, workflow.repository_path, gate.timeout_seconds)
-                if os.name == "nt" else subprocess.run(
-                    argv,
-                    cwd=workflow.repository_path,
-                    capture_output=True,
-                    text=True,
-                    timeout=gate.timeout_seconds,
-                    errors="replace",
-                )
+            # The shell can exit while descendants retain captured pipes or
+            # keep editing the checkout. Retain its private lifetime boundary
+            # through output collection and clean it on success and timeout.
+            completed = run_owned(
+                argv,
+                cwd=workflow.repository_path,
+                capture_output=True,
+                text=True,
+                timeout=gate.timeout_seconds,
+                errors="replace",
             )
             output = ((completed.stdout or "") + (completed.stderr or ""))[-4000:]
             evidence.append(
@@ -3225,10 +3200,22 @@ def parse_reviewer_report(report: str) -> WorkflowReviewDecision | None:
     «PASS + открытый blocker» и человеческий блокер при фактической
     REVISION_REQUIRED)."""
     lines = (report or "").splitlines()
+    plain_lines = set()
+    fence = None
+    for index, line in enumerate(lines):
+        marker = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", line)
+        if fence is not None:
+            if (marker and marker[1][0] == fence[0] and len(marker[1]) >= fence[1]
+                    and not marker[2].strip()):
+                fence = None
+        elif marker:
+            fence = (marker[1][0], len(marker[1]))
+        else:
+            plain_lines.add(index)
     verdicts = [(i, line.split(":", 1)[1].strip().upper()) for i, line in enumerate(lines)
-                if re.match(r"(?i)^AUDIT_VERDICT:", line)]
+                if i in plain_lines and re.match(r"(?i)^AUDIT_VERDICT:", line)]
     blocks = [(i, line.split(":", 1)[1].strip()) for i, line in enumerate(lines)
-              if re.match(r"(?i)^AUDIT_FINDINGS_JSON:", line)]
+              if i in plain_lines and re.match(r"(?i)^AUDIT_FINDINGS_JSON:", line)]
     if not verdicts or not blocks:
         return None
     verdict_index, verdict_text = verdicts[-1]
@@ -3236,6 +3223,14 @@ def parse_reviewer_report(report: str) -> WorkflowReviewDecision | None:
     if (findings_index >= verdict_index or any(line.strip() for line in lines[findings_index + 1:verdict_index])
             or verdict_text not in {verdict.value for verdict in ReviewVerdict}):
         return None
+    tail = [line.strip() for line in lines[verdict_index + 1:] if line.strip()]
+    if tail:
+        from .herdr_exec import WORKFLOW_CLOSING_VERDICT_RE
+
+        # The worker footer may follow the terminal audit pair. Current prose,
+        # a new incomplete audit or a quoted example cannot reuse an old PASS.
+        if len(tail) != 1 or not WORKFLOW_CLOSING_VERDICT_RE.fullmatch(tail[0]):
+            return None
     findings: list[ReviewFindingInput] = []
     try:
         raw_findings = json.loads(findings_text)
@@ -3461,7 +3456,9 @@ def advance_workflow(workflow_id: str, max_actions: int = 12) -> WorkflowInDB:
                     ).fetchone()[0]
                 if blocked_seq and blocked_seq >= reviewer_done_seq:
                     return workflow  # уже превращено в ожидание человека
-                report = (reviewer.output or {}).get("result") or ""
+                review_output = reviewer.output or {}
+                report = (review_output["report_text"] if "report_text" in review_output
+                          else review_output.get("result") or "")
                 decision = parse_reviewer_report(report)
                 if not decision:
                     return _pause_automation(
@@ -3593,6 +3590,17 @@ def sync_task(task_id: int) -> Optional[WorkflowRunInDB]:
                 "session_id": task_row["session_id"],
                 "verdict": task_row["verdict"],
             }
+            # Legacy outputs retain the exact old JSON/hash. New worker output
+            # has a separate boundary before display-only Meta/worktree notes.
+            provider_report = conn.execute(
+                "SELECT * FROM task_reports WHERE task_id=?", (task_id,),
+            ).fetchone()
+            if provider_report is not None:
+                valid_boundary = (
+                    provider_report["task_started_at"] == task_row["started_at"]
+                    and provider_report["result_sha256"]
+                    == hashlib.sha256((task_row["result"] or "").encode('utf-8')).hexdigest())
+                output["report_text"] = provider_report["report_text"] if valid_boundary else ""
             output_json = db._json_dump(output)
             output_sha = hashlib.sha256(output_json.encode("utf-8")).hexdigest()
             # A terminal run whose durable output is already projected is a
