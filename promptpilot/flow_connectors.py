@@ -1,14 +1,18 @@
 """Inputs and outputs of flows (promptpilot/flows.py).
 
 Everything here touches the outside world: a mailbox that anyone can write
-to, a public page that anyone can read. The rules of engagement live here
-once instead of in every intake script:
+to, a public page that anyone can read, a GitLab project, an SMTP server.
+The rules of engagement live here once instead of in every intake script:
 
 - a letter is judged by its headers before its body is fetched; its sender
   must be the one the flow expects (a form service, an allow-list), and
   where configured, proven by DKIM of *our* receiving server;
 - text that came from outside is published only as plain text, without
-  links, within a length cap.
+  links, within a length cap;
+- a reply goes only to the author of the request, never to an address a
+  template produced; header values cannot carry line breaks;
+- tokens and passwords come from the environment and never appear on a
+  command line.
 """
 
 import email
@@ -17,12 +21,25 @@ import hashlib
 import json
 import os
 import re
+import smtplib
+import subprocess
+import tempfile
 import ssl
 import time
 from email import policy
 from email.header import decode_header
+from email.message import EmailMessage
 from email.utils import parseaddr
 from pathlib import Path
+from urllib.parse import quote
+
+
+class ConnectorError(RuntimeError):
+    """The outside service refused or is unreachable; the step decides what next."""
+
+class DeliveryUncertain(ConnectorError):
+    """The server may have accepted the message; automatic resend is unsafe."""
+
 
 # Cyrillic look-alikes of Latin capitals: [КТ] typed on a Russian layout and
 # [KT] are the same marker.
@@ -113,6 +130,13 @@ def _in_domain(address: str, domain: str) -> bool:
     return host == domain or host.endswith("." + domain)
 
 
+def sender_allowed(address: str, allow_from) -> bool:
+    """The address, or its domain, is on the list. An empty list vouches for nobody."""
+    entries = [entry.strip().lower() for entry in allow_from or [] if entry.strip()]
+    return bool(address) and any(address == entry or _in_domain(address, entry)
+                                 for entry in entries)
+
+
 def letter_rejection(msg, source) -> str | None:
     """Why this letter is not a request for the flow (source: EmailInput), or None."""
     subject = decode_mime(msg.get("Subject"))
@@ -136,11 +160,38 @@ def letter_rejection(msg, source) -> str | None:
             return f"нет подписи DKIM {source.require_from_domain}"
     elif _NO_REPLY.match(address):
         return "no-reply отправитель"
-    if source.allow_from:
-        entries = [entry.strip().lower() for entry in source.allow_from if entry.strip()]
-        if not any(address == entry or _in_domain(address, entry) for entry in entries):
-            return f"отправитель {address or '?'} не в allow_from"
+    # allow_from_mode "mark": the letter is taken, input.sender_allowed says who vouched
+    if source.allow_from and source.allow_from_mode == "reject" and \
+            not sender_allowed(address, source.allow_from):
+        return f"отправитель {address or '?'} не в allow_from"
     return None
+
+
+def letter_attachments(msg, limit: int = 20, max_bytes: int = 25_000_000) -> list[tuple[str, bytes]]:
+    """Attachments of a letter: (safe file name, content), at most ``limit``."""
+    parts, total = [], 0
+    for part in msg.iter_attachments():
+        if len(parts) >= limit:
+            break
+        payload = part.get_payload(decode=True)
+        if not payload or total + len(payload) > max_bytes:
+            continue
+        total += len(payload)
+        name = decode_mime(part.get_filename()) or f"attachment-{len(parts) + 1}"
+        name = re.sub(r"[^\w.\-() ]+", "_", Path(name).name).strip(". ") or "attachment"
+        parts.append((f"{len(parts) + 1:02d}-{name[:80]}", payload))
+    return parts
+
+
+def write_attachments(directory: Path, parts: list[tuple[str, bytes]]) -> list[str]:
+    """Save attachments into the item's own folder; their paths."""
+    saved = []
+    for name, payload in parts:
+        directory.mkdir(parents=True, exist_ok=True)
+        target = directory / name
+        target.write_bytes(payload)
+        saved.append(str(target))
+    return saved
 
 
 def letter_request(msg, source) -> dict:
@@ -157,15 +208,17 @@ def letter_request(msg, source) -> dict:
         # A form sends one fixed subject; the first real line says more.
         title = next((line.strip() for line in body.splitlines()
                       if len(line.strip()) > 15), title or subject)
+    sender = address_of(decode_mime(msg.get("From")))
     return {
         "message_id": msg.get("Message-ID") or "",
-        "from": address_of(decode_mime(msg.get("From"))),
+        "from": sender,
         "reply_to": address_of(decode_mime(msg.get("Reply-To"))),
         "subject": subject,
         "title": title[:120],
         "author": author,
         "body": body,
         "date": msg.get("Date") or "",
+        "sender_allowed": sender_allowed(sender, source.allow_from),
     }
 
 
@@ -180,7 +233,7 @@ def _uid_payload(client, uid: bytes, parts: str) -> bytes | None:
 
 
 def poll_mailbox(source, seen: set, credentials: tuple[str, str], *,
-                 connect=None) -> tuple[list[dict], list[str]]:
+                 connect=None, keep_attachments: bool = False) -> tuple[list[dict], list[str]]:
     """Use stable UIDs; sequence numbers are never durable message identity."""
     user, password = credentials
     client = (connect or _connect_imap)(source, user, password)
@@ -230,6 +283,10 @@ def poll_mailbox(source, seen: set, credentials: tuple[str, str], *,
                     continue
                 request = letter_request(full, source)
                 request["message_id"] = message_id
+                if keep_attachments:
+                    # bytes, not paths: they are saved into the item's folder once
+                    # the item exists (flows._poll_mail)
+                    request["_attachments"] = letter_attachments(full)
                 requests.append(request)
     finally:
         try:
@@ -290,3 +347,191 @@ def write_json_feed(path: str, entries: list[dict]) -> bool:
         encoding="utf-8")
     temporary.replace(target)
     return True
+
+
+# --- GitLab ------------------------------------------------------------------------
+
+def _curl(cmd: list[str], data: bytes | None) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, input=data, capture_output=True, timeout=180,
+                          creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+
+
+def gitlab_request(connection, method: str, path: str, payload: dict | None = None):
+    """One GitLab API call through curl; parsed JSON, or ConnectorError.
+
+    curl, not urllib: it takes the system certificate store, which a
+    corporate GitLab behind its own CA needs (the oneservice scripts learned
+    this). The token goes in a header file, not on the command line.
+    """
+    base = (connection.url or os.environ.get(connection.url_env, "")).rstrip("/")
+    token = os.environ.get(connection.token_env, "")
+    if not base or not token:
+        raise ConnectorError(f"GitLab: не задан адрес или {connection.token_env}")
+    url = f"{base}/api/v4/projects/{connection.project}{path}"
+    handle, header_file = tempfile.mkstemp(suffix=".hdr", prefix="pp-gitlab-")
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as header:
+            header.write(f"PRIVATE-TOKEN: {token}\nContent-Type: application/json\n")
+        cmd = ["curl", "-sS", "-m", "120", "-X", method, "-H", f"@{header_file}",
+               "-w", "\n%{http_code}"]
+        data = None
+        if payload is not None:
+            data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            cmd += ["--data-binary", "@-"]
+        result = _curl(cmd + [url], data)
+    finally:
+        try:
+            os.unlink(header_file)
+        except OSError:
+            pass
+    output = (result.stdout or b"").decode("utf-8", errors="replace")
+    if result.returncode != 0:
+        error = (result.stderr or b"").decode("utf-8", errors="replace").strip()
+        raise ConnectorError(f"GitLab {method} {path}: curl {result.returncode}: {error[:300]}")
+    body, _, status = output.rstrip().rpartition("\n")
+    if not status.isdigit():
+        body, status = output, "0"
+    if not 200 <= int(status) < 300:
+        raise ConnectorError(f"GitLab {method} {path}: HTTP {status}: {body.strip()[:300]}")
+    try:
+        return json.loads(body) if body.strip() else {}
+    except ValueError as exc:
+        raise ConnectorError(f"GitLab {method} {path}: ответ не JSON: {body[:200]}") from exc
+
+
+def gitlab_issues(connection, source) -> list[dict]:
+    """Open issues that carry every label of the input and none of its exclusions."""
+    query = "state=opened&per_page=100&order_by=created_at&sort=asc"
+    if source.labels:
+        query += "&labels=" + quote(",".join(source.labels), safe=",")
+    issues = []
+    deadline = time.monotonic() + 300
+    for page in range(1, 101):
+        if time.monotonic() > deadline:
+            raise ConnectorError("GitLab intake time budget exhausted; narrow the input labels before retrying")
+        batch = gitlab_request(connection, "GET", f"/issues?{query}&page={page}")
+        if not isinstance(batch, list):
+            raise ConnectorError("GitLab issue listing is not a list")
+        issues.extend(batch)
+        if len(batch) < 100:
+            break
+    else:
+        raise ConnectorError("GitLab intake exceeds 100 pages; narrow the input labels before retrying")
+    requests = []
+    for issue in issues if isinstance(issues, list) else []:
+        labels = issue.get("labels") or []
+        if any(label in labels for label in source.exclude_labels):
+            continue
+        author = issue.get("author") or {}
+        requests.append({
+            "iid": int(issue["iid"]),
+            "title": (issue.get("title") or "")[:250],
+            "body": (issue.get("description") or "")[:source.body_limit],
+            "author": author.get("name") or author.get("username") or "",
+            "labels": labels,
+            "web_url": issue.get("web_url") or "",
+            "created_at": issue.get("created_at") or "",
+        })
+    return requests
+
+
+def gitlab_apply(connection, issue: int | None, *, create: dict | None = None,
+                 comment: str = "", labels: str | None = None, add_labels: str = "",
+                 remove_labels: str = "", assignee_id: str = "", state: str = "") -> dict:
+    """Do the operations of a gitlab step on one issue, in order; its iid and URL."""
+    result: dict = {}
+    if create is not None:
+        created = gitlab_request(connection, "POST", "/issues", {
+            "title": create["title"][:250] or "(без названия)",
+            "description": create.get("description", ""),
+            **({"labels": create["labels"]} if create.get("labels") else {}),
+        })
+        issue = int(created["iid"])
+        result["web_url"] = created.get("web_url", "")
+    if issue is None:
+        raise ConnectorError("GitLab: не указан issue")
+    result["iid"] = int(issue)
+    if comment:
+        gitlab_request(connection, "POST", f"/issues/{issue}/notes", {"body": comment})
+    update: dict = {}
+    if labels is not None:
+        update["labels"] = labels
+    if add_labels:
+        update["add_labels"] = add_labels
+    if remove_labels:
+        update["remove_labels"] = remove_labels
+    if assignee_id:
+        update["assignee_ids"] = [int(assignee_id)]
+    if state:
+        update["state_event"] = state
+    if update:
+        updated = gitlab_request(connection, "PUT", f"/issues/{issue}", update)
+        if isinstance(updated, dict) and updated.get("web_url"):
+            result["web_url"] = updated["web_url"]
+    return result
+
+
+# --- a reply by mail ------------------------------------------------------------------
+
+def base_subject(subject: str) -> str:
+    """The subject without Re:/Fwd: prefixes and line breaks."""
+    cleaned = re.sub(r"\s+", " ", subject or "").strip()
+    while True:
+        stripped = re.sub(r"^(re|fwd?|fw)\s*:\s*", "", cleaned, flags=re.I)
+        if stripped == cleaned:
+            return cleaned
+        cleaned = stripped
+
+
+def reply_address(request: dict, source) -> str:
+    """Where a reply to the request goes, or "" when there is nobody to answer.
+
+    A letter from a form service comes FROM the service; the author's own
+    address, if the form asked for it, is in Reply-To.
+    """
+    for candidate in (request.get("reply_to"), request.get("from")):
+        address = address_of(candidate or "")
+        if not address or _NO_REPLY.match(address):
+            continue
+        if source.require_from_domain and _in_domain(address, source.require_from_domain):
+            continue
+        return address
+    return ""
+
+
+def send_reply(source, request: dict, *, text: str, subject: str, smtp_host: str,
+               smtp_port: int, from_name: str, credentials: tuple[str, str],
+               smtp_factory=None) -> str:
+    """Answer the author of the request; the address it went to."""
+    recipient = reply_address(request, source)
+    if not recipient:
+        raise ConnectorError("у заявки нет адреса автора, на который можно ответить")
+    user, password = credentials
+    message = EmailMessage()
+    message["From"] = f"{from_name} <{user}>" if from_name else user
+    message["To"] = recipient
+    message["Subject"] = re.sub(r"[\r\n]+", " ", subject).strip()[:250]
+    message_id = (request.get("message_id") or "").strip()
+    if message_id.startswith("<") and "\n" not in message_id:
+        message["In-Reply-To"] = message_id
+        message["References"] = message_id
+    message.set_content(text.strip() + "\n")
+    factory = smtp_factory or smtplib.SMTP_SSL
+    sending = False
+    accepted = False
+    try:
+        with factory(smtp_host, smtp_port, timeout=30, context=ssl.create_default_context()) as smtp:
+            smtp.login(user, password)
+            sending = True
+            smtp.send_message(message)
+            accepted = True
+        return recipient
+    except (OSError, smtplib.SMTPException) as exc:
+        if accepted:
+            return recipient  # A failed QUIT cannot retract the accepted DATA.
+        definitive = isinstance(exc, (smtplib.SMTPRecipientsRefused,
+                                      smtplib.SMTPSenderRefused, smtplib.SMTPDataError))
+        error = f"SMTP: {type(exc).__name__}: {exc}"
+        if sending and not definitive:
+            raise DeliveryUncertain(error) from exc
+        raise ConnectorError(error) from exc

@@ -6,6 +6,7 @@
 <title>PromptPilot</title>
 <style>
   :root {
+    color-scheme: dark;
     --bg: #0f1117;
     --surface: #1a1d27;
     --surface2: #232733;
@@ -22,6 +23,29 @@
     --font: 'Inter', -apple-system, system-ui, sans-serif;
     --mono: 'JetBrains Mono', 'Fira Code', monospace;
   }
+
+  /* Appearance palette adapted from Evgeny Kerzhaev's operator package #106. */
+  :root[data-ui-theme="light"] {
+    color-scheme: light;
+    --bg: #f5f6f8;
+    --surface: #ffffff;
+    --surface2: #eef0f3;
+    --border: #d9dde3;
+    --text: #1a1d21;
+    --text2: #57606a;
+    --accent: #4c5fd5;
+    --accent2: #3b4fc0;
+    --green: #1a7f37;
+    --red: #cf222e;
+    --yellow: #9a6700;
+    --cyan: #0969da;
+  }
+
+  #settingsDialog { margin: auto; color: var(--text); max-width: 520px; }
+  #settingsDialog::backdrop { background: rgba(0,0,0,.55); }
+  #settingsDialog label { display: flex; align-items: center; gap: 12px; margin: 16px 0; }
+  #settingsDialog select { background: var(--surface2); color: var(--text); border: 1px solid var(--border); padding: 6px; border-radius: 6px; }
+  .settings-links { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 16px; }
 
   * { margin: 0; padding: 0; box-sizing: border-box; }
 
@@ -241,6 +265,11 @@
     color: var(--text2);
     font-family: var(--mono);
     white-space: nowrap;
+  }
+  .task-workflow {
+    margin-top: 6px;
+    white-space: normal;
+    overflow-wrap: anywhere;
   }
   .task-schedule {
     font-size: 11px;
@@ -527,7 +556,7 @@
   .wf-wizard-role label.check { flex-direction:row; align-items:center; }
   .wf-wizard-role input, .wf-wizard-role select { width:100%; background:var(--surface2); border:1px solid var(--border); border-radius:6px; color:var(--text); padding:7px; }
   .wf-wizard-role label.check input, .wf-wizard-fields label.check input { width:auto; }
-  .wf-wizard-danger { margin-top:8px; padding:8px 10px; border:1px solid #ed6e8666; border-radius:7px; color:#f59aad; font-size:11px; }
+  .wf-wizard-danger { margin-top:8px; padding:8px 10px; border:1px solid #ed6e8666; border-radius:7px; color:var(--red); font-size:11px; }
   .wf-wizard-summary { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin:10px 0; }
   .wf-wizard-summary > div { background:var(--bg); border:1px solid var(--border); border-radius:7px; padding:9px; font-size:11px; }
   .wf-wizard-summary b { display:block; margin-bottom:3px; color:var(--text); }
@@ -535,7 +564,7 @@
   .wf-preflight-row { padding:7px 9px; border-radius:6px; background:var(--bg); font-size:11px; border-left:3px solid var(--border); }
   .wf-preflight-row[data-status="ok"] { border-left-color:var(--green); }
   .wf-preflight-row[data-status="warning"] { border-left-color:var(--yellow); }
-  .wf-preflight-row[data-status="error"] { border-left-color:var(--red); color:#f59aad; }
+  .wf-preflight-row[data-status="error"] { border-left-color:var(--red); color:var(--red); }
   .wf-wizard-nav { display:flex; justify-content:space-between; align-items:center; gap:8px; margin-top:14px; padding-top:12px; border-top:1px solid var(--border); }
   .wf-wizard-nav-right { display:flex; gap:7px; }
   .wf-settings-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:10px; }
@@ -649,6 +678,7 @@
 <div class="container">
   <header>
     <div class="logo">Prompt<span>Pilot</span></div>
+    <button class="btn btn-ghost" onclick="openSettings()">⚙ Настройки</button>
     <div class="badges" id="badges"></div>
   </header>
 
@@ -1012,7 +1042,57 @@
   </div>
 </div>
 
+<dialog class="modal" id="settingsDialog" aria-labelledby="settingsTitle">
+  <h2 id="settingsTitle">⚙ Настройки
+    <button class="btn btn-sm btn-ghost" style="margin-left:auto" onclick="closeSettings()">Закрыть</button>
+  </h2>
+  <label>Оформление
+    <select id="appearanceTheme" onchange="applyUiTheme(this.value)">
+      <option value="dark">Тёмная тема</option>
+      <option value="light">Светлая тема</option>
+      <option value="system">Как в системе</option>
+    </select>
+  </label>
+  <p style="color:var(--text2);font-size:12px">Тема применяется сразу и сохраняется в этом браузере, если доступно локальное хранилище.</p>
+  <div class="settings-links">
+    <button class="btn btn-ghost" onclick="closeSettings();openProviders()">Помощники</button>
+    <button class="btn btn-ghost" onclick="closeSettings();openWorkflows()">Воркфлоу</button>
+    <button class="btn btn-ghost" onclick="closeSettings();openSchedule()">Расписание</button>
+  </div>
+</dialog>
+
 <script>
+let uiThemeChoice = 'dark';
+let uiThemeMedia = null;
+
+function applyUiTheme(choice, persist = true) {
+  uiThemeChoice = ['dark', 'light', 'system'].includes(choice) ? choice : 'dark';
+  const light = uiThemeChoice === 'light' || (uiThemeChoice === 'system' && uiThemeMedia?.matches);
+  document.documentElement.dataset.uiTheme = light ? 'light' : 'dark';
+  const select = document.getElementById('appearanceTheme');
+  if (select) select.value = uiThemeChoice;
+  if (persist) {
+    try { localStorage.setItem('pp-theme', uiThemeChoice); } catch (_) { /* Restricted browser storage. */ }
+  }
+}
+
+function initUiAppearance() {
+  let choice = 'dark';
+  try { choice = localStorage.getItem('pp-theme') || 'dark'; } catch (_) { /* Keep the default. */ }
+  try { uiThemeMedia = window.matchMedia('(prefers-color-scheme: light)'); } catch (_) { /* Dark fallback. */ }
+  applyUiTheme(choice, false);
+  if (uiThemeMedia?.addEventListener) {
+    uiThemeMedia.addEventListener('change', () => {
+      if (uiThemeChoice === 'system') applyUiTheme('system', false);
+    });
+  }
+}
+
+function openSettings() { document.getElementById('settingsDialog').showModal(); }
+function closeSettings() { document.getElementById('settingsDialog').close(); }
+
+initUiAppearance();
+
 const API = '/api';
 let currentFilter = '';
 let expandedId = null;
@@ -1165,6 +1245,20 @@ function taskDisplayTitle(t) {
   return firstLine ? firstLine.trim() : `Task #${t.id}`;
 }
 
+function taskWorkflowBadge(t) {
+  if (!t.workflow_id) return '';
+  const roles = {planner:'Планировщик', executor:'Исполнитель', gate:'Проверки',
+    reviewer:'Ревью', archiver:'Архив'};
+  const role = typeof roles[t.role] === 'string' ? roles[t.role] : 'Миссия';
+  const code = typeof t.workflow_stage_code === 'string' ? t.workflow_stage_code.trim() : '';
+  const title = typeof t.workflow_stage_title === 'string' ? t.workflow_stage_title.trim() : '';
+  const parts = [role];
+  if (code) parts.push(`этап ${code}${title ? ': ' + title : ''}`);
+  if (Number.isSafeInteger(t.workflow_round_no) && t.workflow_round_no > 0)
+    parts.push(`раунд ${t.workflow_round_no}`);
+  return `<div class="task-meta task-workflow">${esc(parts.join(' · '))}</div>`;
+}
+
 async function loadTasks() {
   const params = currentFilter ? `?status=${currentFilter}&limit=100` : '?limit=100';
   const tasks = await fetchJSON(`${API}/tasks${params}`);
@@ -1226,6 +1320,7 @@ async function loadTasks() {
         <span class="task-meta">P${t.priority}</span>
         <span class="task-meta">${time}</span>
       </div>
+      ${taskWorkflowBadge(t)}
       <div class="task-detail">
         <div class="detail-label">Prompt</div>
         <div class="result-block">
@@ -1308,10 +1403,22 @@ async function loadTasks() {
   uiRestoreScrolls(list, taskScrolls);
 }
 
+function providerLabel(name, info = providersData[name]) {
+  const label = info?.human?.label;
+  return typeof label === 'string' && label.trim() ? label.trim() : name;
+}
+
+function orderedProviderEntries(data = providersData) {
+  const order = info => Number.isSafeInteger(info?.ui_order) && info.ui_order >= 0
+    ? info.ui_order : Number.MAX_SAFE_INTEGER;
+  // Stable sort preserves the existing default order when no override exists.
+  return Object.entries(data).sort((a, b) => order(a[1]) - order(b[1]));
+}
+
 function providerOptions(current) {
-  return Object.entries(providersData)
+  return orderedProviderEntries()
     .filter(([name, p]) => !p.hidden || name === current)
-    .map(([name]) => `<option value="${escAttr(name)}"${name === current ? ' selected' : ''}>${esc(name)}</option>`)
+    .map(([name, info]) => `<option value="${escAttr(name)}"${name === current ? ' selected' : ''}>${esc(providerLabel(name, info))}</option>`)
     .join('');
 }
 
@@ -1658,7 +1765,9 @@ async function showFlowItem(id) {
         <button class="btn btn-sm btn-primary" onclick="decideFlowItem(${id}, 'approve', ${item.version})">Одобрить</button>
         <button class="btn btn-sm btn-danger" onclick="decideFlowItem(${id}, 'reject', ${item.version})">Отклонить</button></div>`;
     } else if (item.status === 'needs_human') {
-      const verifyStop = (wait.command || wait.ambiguous_task)
+      const verifyStop = wait.side_effect
+        ? '<label><input type="checkbox" id="flowEffectChecked"> Прежнее действие остановлено, последствия проверены; повтор может отправить ещё раз</label><textarea id="flowStopNote" placeholder="Что проверено и какое восстановление выбрано"></textarea>'
+        : (wait.command || wait.ambiguous_task)
         ? '<label><input type="checkbox" id="flowStopChecked"> Проверил, что прежнее выполнение остановлено</label><textarea id="flowStopNote" placeholder="Результат проверки"></textarea>' : '';
       actions = `<div class="flow-box"><b>Нужен человек.</b><div class="flow-error">${esc(item.error || '')}</div>${verifyStop}
         <button class="btn btn-sm btn-primary" onclick="flowItemAction(${id}, 'retry', ${item.version})">Повторить шаг</button>
@@ -1712,8 +1821,9 @@ async function flowItemAction(id, action, observedVersion) {
   if (action === 'cancel' && !confirm(`Снять заявку #${id}?`)) return;
   try {
     const confirm_command_stopped = !!(document.getElementById('flowStopChecked') || {}).checked;
+    const confirm_side_effect_reviewed = !!(document.getElementById('flowEffectChecked') || {}).checked;
     const note = (document.getElementById('flowStopNote') || {}).value || '';
-    const result = await fetchJSON(`${API}/flows/items/${id}/${action}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ expected_version, confirm_command_stopped, note }) });
+    const result = await fetchJSON(`${API}/flows/items/${id}/${action}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ expected_version, confirm_command_stopped, note, ...(confirm_side_effect_reviewed ? { confirm_side_effect_reviewed: true } : {}) }) });
     if (result.status === 'cancelling') {
       toast('Остановка запрошена', false);
       return showFlowItem(id);
@@ -2155,7 +2265,7 @@ async function selectWorkflow(id) {
   selectedWorkflowData = wf;
   const [rounds, events, findings, plan, stages] = await Promise.all([
     fetchJSON(`${API}/workflows/${id}/rounds`),
-    fetchJSON(`${API}/workflows/${id}/events?limit=200`),
+    fetchJSON(`${API}/workflows/${id}/events?limit=200&tail=true`),
     fetchJSON(`${API}/workflows/${id}/findings`),
     fetchJSON(`${API}/workflows/${id}/plan`),
     fetchJSON(`${API}/workflows/${id}/stages`),
@@ -2187,13 +2297,13 @@ async function selectWorkflow(id) {
 }
 
 function workflowProviderOptions(selected = 'herdr-session', includeSession = true) {
-  const names = Object.entries(providersData).filter(([, p]) => !p.hidden);
+  const names = orderedProviderEntries().filter(([, p]) => !p.hidden);
   const filtered = names.filter(([, p]) => includeSession || !p.session_target);
   const defaultOption = selected ? '' : '<option value="" selected>провайдер PromptPilot по умолчанию</option>';
   const missingOption = selected && !filtered.some(([name]) => name === selected)
-    ? `<option value="${escAttr(selected)}" selected>${esc(selected)} · недоступен</option>` : '';
+    ? `<option value="${escAttr(selected)}" selected>${esc(providerLabel(selected))} · недоступен</option>` : '';
   return defaultOption + missingOption + filtered
-    .map(([name, p]) => `<option value="${escAttr(name)}"${name === selected ? ' selected' : ''}>${esc(name)}${p.session_target ? ' · живая сессия' : ''}</option>`).join('');
+    .map(([name, p]) => `<option value="${escAttr(name)}"${name === selected ? ' selected' : ''}>${esc(providerLabel(name, p))}${p.session_target ? ' · живая сессия' : ''}</option>`).join('');
 }
 
 function wfChecked(value) { return value ? ' checked' : ''; }
@@ -2247,7 +2357,7 @@ function workflowSettingsHtml(wf) {
         <label class="check"><input id="wfCfgPlanningEnabled" type="checkbox"${wfChecked(planning.enabled)}> использовать planner и последовательные этапы</label>
         <label class="check"><input id="wfCfgPlanApproval" type="checkbox"${wfChecked(planning.require_approval !== false)}> требовать утверждение плана человеком</label>
         <label>Максимум этапов<input id="wfCfgMaxStages" type="number" min="1" max="50" value="${planning.max_stages || 20}"></label>
-        <label>Возвратов на один этап<input id="wfCfgStageRevisions" type="number" min="1" max="20" value="${planning.max_revisions_per_stage || 3}"></label>
+        <label>Возвратов на один этап<input id="wfCfgStageRevisions" type="number" min="1" max="100" value="${planning.max_revisions_per_stage ?? ''}" placeholder="Из плана (или 3)"></label>
         <label>Шаблон prompt планировщика<textarea id="wfCfgPlanningPrompt" placeholder="Пусто = встроенный шаблон">${esc(planning.prompt_template || '')}</textarea></label>
       </div>
       ${roleCard('Planner', 'Планировщик', planner, false)}
@@ -2256,7 +2366,7 @@ function workflowSettingsHtml(wf) {
     </div>
     <div class="wf-actions"><button class="btn btn-sm btn-primary" onclick="wfSaveSettings()">Сохранить настройки</button>
       <button class="btn btn-sm btn-ghost" onclick="wfAdvance()">Запустить следующий автоматический переход</button></div>
-    <div class="wf-meta">Переменные шаблонов: {{objective}}, {{stage_code}}, {{stage_title}}, {{stage_goal}}, {{repository_path}}, {{candidate_branch}}, {{round_no}}, {{previous_review}}, {{executor_report}}, {{gate_evidence}}, {{open_findings}}.</div>
+    <div class="wf-meta">Переменные шаблонов: {{objective}}, {{stage_code}}, {{stage_title}}, {{stage_goal}}, {{repository_path}}, {{candidate_branch}}, {{round_no}}, {{previous_review}}, {{executor_report}}, {{gate_evidence}}, {{open_findings}}, {{previous_stages}}, {{stage_review}}, {{acceptance_gates}}.</div>
   </details>`;
 }
 
@@ -2273,6 +2383,7 @@ function workflowStatusInfo(status, reviewerDone = false, automation = {}) {
       : ['Ручные проверки', 'Выполните проверки и выберите Gate PASS или FAIL.'],
     reviewing: ['Независимое ревью', 'Следующее действие: запустить проверяющего.'],
     revision_required: ['Нужны исправления', 'Следующее действие: открыть новый раунд доработок.'],
+    awaiting_external: ['Ожидает внешнего результата', 'Этап выполняют вне PromptPilot. Следующее действие: сдать результат — дальше проверки и независимое ревью.'],
     awaiting_human: reviewerDone
       ? ['Ожидается вердикт ревью', 'Следующее действие: принять, вернуть на доработку или запросить решение человека.']
       : ['Ожидается ваше решение', 'Предыдущая попытка не завершила этап. Следующее действие: продолжить текущий раунд.'],
@@ -2347,6 +2458,10 @@ function workflowOwnerInfo(wf, activeRun, reviewerDone, decisionState = {}) {
     who: 'Вы', detail: reviewerDone ? 'нужно зафиксировать решение по аудиту' : 'автоматический этап остановлен',
     next: reviewerDone ? 'Выбрать: принять / вернуть на доработку / нужен человек' : 'Проверить причину остановки', color: 'var(--red)',
   };
+  if (wf.status === 'awaiting_external') return {
+    who: 'Внешний исполнитель', detail: 'задание выдано, ждём результат — процесс не занят',
+    next: 'Дальше: сдать результат → gate → независимый аудитор', color: 'var(--yellow)',
+  };
   if (wf.status === 'revision_required') return {
     who: 'Вы', detail: 'аудитор вернул результат на доработку',
     next: 'Открыть следующий раунд исполнителя', color: 'var(--red)',
@@ -2412,6 +2527,7 @@ function workflowStageEditorCard(stage = {}, index = 0, frozen = false) {
       <input data-field="code" value="${escAttr(stage.code || '')}" placeholder="Код">
       <input data-field="title" value="${escAttr(stage.title || '')}" placeholder="Название">
       <select data-field="stage_type"><option value="implementation"${stage.stage_type !== 'integration' ? ' selected' : ''}>implementation</option><option value="integration"${stage.stage_type === 'integration' ? ' selected' : ''}>integration</option></select>
+      <select data-field="execution_mode" title="Кто выполняет этап"><option value="automatic"${stage.execution_mode !== 'external' ? ' selected' : ''}>исполняет агент</option><option value="external"${stage.execution_mode === 'external' ? ' selected' : ''}>вне PromptPilot</option></select>
       <textarea class="wide" data-field="objective" placeholder="Проверяемая цель">${esc(stage.objective || '')}</textarea>
       <input class="wide" data-field="dependencies" value="${escAttr((stage.dependencies || []).join(', '))}" placeholder="Зависимости: S1, S2">
       <textarea class="wide" data-field="allowed_paths" placeholder="Разрешённые пути — по одному на строку">${esc((stage.allowed_paths || []).join('\n'))}</textarea>
@@ -2432,7 +2548,7 @@ function workflowPlanHtml(wf, plan, stages) {
   // F5: живой план с allow_editing_approved_plan — редактор хвоста
   const amendable = !editable && wf.config?.planning?.allow_editing_approved_plan
     && plan?.status === 'approved' && stages.some(st => st.id === wf.current_stage_id)
-    && ['queued','executing','gating','reviewing','revision_required','awaiting_human'].includes(wf.status);
+    && ['queued','executing','gating','reviewing','revision_required','awaiting_human','awaiting_external'].includes(wf.status);
   const frozenN = amendable ? (() => {
     let n = 0;
     for (const st of stages) { n++; if (st.id === wf.current_stage_id) break; }
@@ -2448,6 +2564,7 @@ function workflowPlanHtml(wf, plan, stages) {
     acceptance_gates: st.acceptance_gates || [],
     executor_prompt: st.executor_prompt || '', reviewer_prompt: st.reviewer_prompt || '',
     max_revision_rounds: st.max_revision_rounds || null,
+    execution_mode: st.execution_mode || 'automatic',
   })) : null;
   // U1: монотонный собственный % прогресса на каждой карточке (переходы видны)
   const total = Math.max(stages.length, 1);
@@ -2465,7 +2582,7 @@ function workflowPlanHtml(wf, plan, stages) {
       <div class="wf-stage-title">${index + 1}/${total} · ${Math.max(0, pct)}% <span class="task-status" data-s="${escAttr(stage.status)}">${esc(stage.status)}</span></div>
       <div style="font-weight:600;margin:2px 0">${esc(stage.code)} · ${esc(stage.title)}</div>
       <div class="wf-round-summary" style="display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden">${esc(shortGoal)}</div>
-      <div class="wf-meta">${esc(stage.stage_type)} · gate: ${(stage.acceptance_gates || []).length} · возвратов: ${stage.max_revision_rounds || wf.config?.planning?.max_revisions_per_stage || 3}</div>
+      <div class="wf-meta">${esc(stage.stage_type)}${stage.execution_mode === 'external' ? ' · вне PromptPilot' : ''} · gate: ${(stage.acceptance_gates || []).length} · возвратов: ${wf.config?.planning?.max_revisions_per_stage ?? stage.max_revision_rounds ?? 3}</div>
     </div>`;
   }).join('');
   const controls = editable ? `<div class="wf-actions">
@@ -2481,6 +2598,27 @@ function workflowPlanHtml(wf, plan, stages) {
   return `<div class="wf-section-title">План этапов · ${stages.length}</div>
     ${editable ? '<div class="wf-meta">Последний этап должен иметь тип integration. Gate-команды выполняются только после ручного утверждения плана.</div>' : ''}
     <div class="wf-stage-list" id="wfStageList">${cards || '<div class="wf-meta">Планировщик ещё не сформировал этапы.</div>'}</div>${controls}`;
+}
+
+function workflowExternalFormHtml(wf, runs) {
+  const run = [...runs].reverse().find(r => r.input?.execution_mode === 'external'
+    && r.status === 'awaiting_external' && r.round_id === wf.current_round_id)
+    || [...runs].reverse().find(r => r.input?.execution_mode === 'external' && r.status === 'awaiting_external');
+  if (!run) return '<div class="wf-meta">Нет активного внешнего задания. Обновите workflow.</div>';
+  const id = escAttr(run.id);
+  const token = [wf.id, run.id, wf.state_version, run.input_sha256].map(x => escAttr(JSON.stringify(x))).join(', ');
+  return `<div class="wf-stage" style="border-color:var(--yellow)">
+    <b>Задание для внешнего исполнителя</b> ? попытка ${run.attempt_no}
+    <div class="result-block"><pre id="wfExternalAssignment">${esc(run.input?.assignment || '')}</pre></div>
+    <button class="btn btn-sm btn-ghost" onclick="wfCopyAssignment()">Скопировать задание</button>
+  </div><div class="wf-form wide" id="wfExternalForm-${id}"
+      data-workflow="${escAttr(wf.id)}" data-run="${id}" data-version="${wf.state_version}"
+      data-input-sha="${escAttr(run.input_sha256)}">
+    <textarea class="wide" id="wfExternalResult-${id}" placeholder="Результат, факты и ссылки"></textarea>
+    <input id="wfExternalPerformer-${id}" placeholder="Кто выполнил">
+    <input class="wide" id="wfExternalComment-${id}" placeholder="Комментарий (необязательно)">
+    <button class="btn btn-sm btn-primary" onclick="wfSubmitExternal(${token})">Сдать результат</button>
+  </div>`;
 }
 
 function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, plannerTask, orphanPane = null) {
@@ -2516,6 +2654,10 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, 
       : `<button class="btn btn-sm btn-primary" onclick="wfStart()">Начать первый раунд</button>`;
   } else if (wf.status === 'awaiting_human' && plan?.status === 'failed' && !wf.current_round) {
     action = plannerForm;
+  } else if (wf.status === 'awaiting_external') {
+    action = workflowExternalFormHtml(wf, runs);
+  } else if (wf.status === 'queued' && stage.execution_mode === 'external') {
+    action = `<div class="wf-form"><button class="btn btn-sm btn-primary" onclick="wfRequestExternal()">Выдать задание внешнему исполнителю</button></div>`;
   } else if (['queued','reviewing'].includes(wf.status)) {
     const role = wf.status === 'queued' ? 'executor' : 'reviewer';
     action = `<div class="wf-form wide">
@@ -2552,7 +2694,7 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, 
       <button class="btn btn-sm btn-ghost wide" onclick="wfReview('HUMAN_REQUIRED')">Нужен человек</button></div>`;
   }
   const runRows = (plannerTask ? [`<div class="wf-round${plannerRun ? ' current' : ''}"><b>planner</b> · ${esc(plannerTask.status)} · task #${plannerTask.id}</div>`] : [])
-    .concat(runs.map(r => `<div class="wf-round${r === activeRun ? ' current' : ''}"><b>${esc(r.role)} · попытка ${r.attempt_no}</b> · ${esc(r.status)}${r.task_id ? ` · task #${r.task_id}` : ''}</div>`)).join('');
+    .concat(runs.map(r => `<div class="wf-round${r === activeRun ? ' current' : ''}"><b>${esc(r.role)} · попытка ${r.attempt_no}</b> · ${esc(r.status)}${r.task_id ? ` · task #${r.task_id}` : ''}${r.input?.execution_mode === 'external' ? ` · вне PromptPilot${r.output?.external?.performer ? ': ' + esc(r.output.external.performer) : ''}` : ''}</div>`)).join('');
   const eventRows = [...events].reverse().slice(0, 30).map(e => `<div class="wf-event"><code>${esc(e.event_type)}</code> · ${formatTime(e.created_at)}</div>`).join('');
   const historyRows = pastRounds.map(r => workflowRoundRow(r)).join('');
   // Scroll-jump fix: the 5s auto-refresh rebuilds this pane from scratch.
@@ -2682,6 +2824,13 @@ async function wfSaveSettings() {
   if (!wasEnabled && enabled && !confirm('Включить автономный ping-pong? После сохранения PromptPilot сразу выполнит допустимый следующий переход.')) return;
   const commands = document.getElementById('wfCfgGateCommands').value
     .split(/\r?\n/).map(x => x.trim()).filter(Boolean);
+  const revisionText = document.getElementById('wfCfgStageRevisions').value.trim();
+  const revisionOverride = Number(revisionText);
+  if (revisionText && (!/^\d+$/.test(revisionText) || !Number.isSafeInteger(revisionOverride)
+      || revisionOverride < 1 || revisionOverride > 100)) {
+    toast('Бюджет: целое число от 1 до 100; пусто — лимит из плана');
+    return;
+  }
   const config = {
     ...old,
     schema_version: 1,
@@ -2697,7 +2846,6 @@ async function wfSaveSettings() {
       enabled: document.getElementById('wfCfgPlanningEnabled').checked,
       require_approval: document.getElementById('wfCfgPlanApproval').checked,
       max_stages: Math.max(1, parseInt(document.getElementById('wfCfgMaxStages').value, 10) || 20),
-      max_revisions_per_stage: Math.max(1, parseInt(document.getElementById('wfCfgStageRevisions').value, 10) || 3),
       prompt_template: document.getElementById('wfCfgPlanningPrompt').value,
     },
     automation: {
@@ -2718,6 +2866,8 @@ async function wfSaveSettings() {
       reviewer: wfRoleSettings('Reviewer', old.roles?.reviewer, false),
     },
   };
+  if (revisionText) config.planning.max_revisions_per_stage = revisionOverride;
+  else delete config.planning.max_revisions_per_stage;
   try {
     await fetchJSON(`${API}/workflows/${selectedWorkflowId}`, {
       method:'PATCH', headers:{'Content-Type':'application/json'},
@@ -2782,6 +2932,7 @@ function wfCollectPlanStages() {
     return {
       code: value('code'), title: value('title'), objective: value('objective'),
       stage_type: value('stage_type') || 'implementation',
+      execution_mode: value('execution_mode') || 'automatic',
       dependencies: wfStageListValue(card, 'dependencies', true),
       allowed_paths: wfStageListValue(card, 'allowed_paths'),
       deliverables: wfStageListValue(card, 'deliverables'),
@@ -2806,6 +2957,7 @@ function wfCollectAmendStages() {
     return {
       code: value('code'), title: value('title'), objective: value('objective'),
       stage_type: card.querySelector('[data-field="stage_type"]')?.value || 'implementation',
+      execution_mode: value('execution_mode') || 'automatic',
       dependencies: comma('dependencies'),
       allowed_paths: lines('allowed_paths'), deliverables: lines('deliverables'),
       acceptance_gates: lines('acceptance_gates'),
@@ -2901,6 +3053,25 @@ function wfResume() {
 function wfGate(verdict) { return wfPost('gate', {expected_version: selectedWorkflowData.state_version, verdict, gate_id: 'ui-manual-gate', summary: document.getElementById('wfDecisionSummary').value}); }
 function wfReview(verdict) { return wfPost('review', {expected_version: selectedWorkflowData.state_version, verdict, summary: document.getElementById('wfDecisionSummary').value, findings: []}); }
 function wfCancel() { if (confirm('Отменить workflow и все его активные задачи?')) return wfPost('cancel', {expected_version: selectedWorkflowData.state_version}); }
+function wfRequestExternal() { return wfPost('external-request', {expected_version: selectedWorkflowData.state_version}); }
+function wfSubmitExternal(workflowId, runId, expectedVersion, inputSha) {
+  if (workflowId !== selectedWorkflowId || !Number.isInteger(expectedVersion)) return;
+  const form = document.getElementById(`wfExternalForm-${runId}`);
+  if (!form || form.dataset.workflow !== workflowId || form.dataset.run !== runId
+      || form.dataset.version !== String(expectedVersion) || form.dataset.inputSha !== inputSha) return;
+  const result = document.getElementById(`wfExternalResult-${runId}`).value;
+  if (!result.trim()) { toast('Пустой результат'); return; }
+  return wfPost('external-result', {
+    expected_version: expectedVersion, run_id: runId, input_sha256: inputSha, result,
+    performer: document.getElementById(`wfExternalPerformer-${runId}`).value,
+    comment: document.getElementById(`wfExternalComment-${runId}`).value,
+  });
+}
+async function wfCopyAssignment() {
+  const text = document.getElementById('wfExternalAssignment')?.textContent || '';
+  try { await navigator.clipboard.writeText(text); toast('Задание скопировано', false); }
+  catch (e) { toast('Не удалось скопировать: выделите текст вручную.'); }
+}
 
 async function wfDispatch(role) {
   const provider = document.getElementById('wfProvider').value;
@@ -3950,11 +4121,17 @@ async function epfSaveSettings(event) {
 }
 
 let provManageData = {};
+let providerOrderSaving = false;
 
 async function renderProvList() {
   const data = await fetchJSON(`${API}/providers/manage`);
+  renderProviderCards(data);
+}
+
+function renderProviderCards(data) {
   provManageData = data;
-  document.getElementById('provList').innerHTML = Object.entries(data).map(([name, p]) => {
+  const entries = orderedProviderEntries(data);
+  document.getElementById('provList').innerHTML = entries.map(([name, p], index) => {
     const badges = [];
     badges.push(`<span class="prov-badge">${p.source === 'builtin' ? 'встроенный' : 'кастомный'}</span>`);
     if (!p.available) badges.push('<span class="prov-badge" style="color:var(--red)">не установлен</span>');
@@ -3966,16 +4143,53 @@ async function renderProvList() {
       + (p.effort ? `<br>эффорт: ${esc(p.effort)}` : '');
     const canDelete = p.source === 'providers.json';
     return `<div class="prov-row${(!p.available || p.hidden) ? ' dim' : ''}">
-      <span class="prov-name">${esc(name)}</span>${badges.join('')}
+      <span class="prov-name">${esc(providerLabel(name, p))}</span>${badges.join('')}
+      ${providerLabel(name, p) !== name ? `<div class="prov-cmd">${esc(name)}</div>` : ''}
       <div class="prov-cmd">${esc(p.description || '')}</div>
       <div class="prov-cmd">${what}</div>
       <div class="prov-actions">
+        <button class="btn btn-sm btn-ghost" data-provider="${escAttr(name)}" onclick="provMove(this.dataset.provider, -1)"${index === 0 || providerOrderSaving ? ' disabled' : ''} aria-label="Выше: ${escAttr(providerLabel(name, p))}">↑ Выше</button>
+        <button class="btn btn-sm btn-ghost" data-provider="${escAttr(name)}" onclick="provMove(this.dataset.provider, 1)"${index === entries.length - 1 || providerOrderSaving ? ' disabled' : ''} aria-label="Ниже: ${escAttr(providerLabel(name, p))}">↓ Ниже</button>
         <button class="btn btn-sm btn-ghost" onclick="provEdit('${esc(name)}')">Изменить</button>
         <button class="btn btn-sm btn-ghost" onclick="provToggleHide('${esc(name)}', ${p.hidden})">${p.hidden ? 'Показать' : 'Скрыть'}</button>
         ${canDelete ? `<button class="btn btn-sm btn-danger" onclick="provDelete('${esc(name)}')">${p.source === 'builtin + providers.json' ? 'Сбросить к встроенному' : 'Удалить'}</button>` : ''}
       </div>
     </div>`;
   }).join('');
+}
+
+async function provMove(name, direction) {
+  if (providerOrderSaving || ![-1, 1].includes(direction)) return;
+  const names = orderedProviderEntries(provManageData).map(([id]) => id);
+  const index = names.indexOf(name), next = index + direction;
+  if (index < 0 || next < 0 || next >= names.length) return;
+  [names[index], names[next]] = [names[next], names[index]];
+  providerOrderSaving = true;
+  let saved = false, errorReported = false;
+  document.querySelectorAll('#provList button[data-provider]').forEach(button => { button.disabled = true; });
+  try {
+    await fetchJSON(`${API}/providers/reorder`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({names}),
+    });
+    saved = true;
+    names.forEach((id, order) => { provManageData[id].ui_order = order; });
+    await loadProviders();
+  } catch (error) {
+    toast((saved ? 'Порядок сохранён, но обновление интерфейса не удалось: '
+                 : 'Не удалось подтвердить сохранение порядка: ') + error.message);
+    errorReported = true;
+  } finally {
+    providerOrderSaving = false;
+    try {
+      await renderProvList();
+    } catch (error) {
+      // Keep the known cards usable if a refresh fails. Re-rendering also
+      // restores the correct boundary buttons instead of enabling all of them.
+      renderProviderCards(provManageData);
+      if (!errorReported) toast('Не удалось обновить список помощников: ' + error.message);
+    }
+  }
 }
 
 async function provToggleHide(name, hidden) {
@@ -4197,13 +4411,20 @@ document.getElementById('promptInput').addEventListener('paste', e => {
 let machinesData = {};
 
 async function loadMachines() {
-  try { machinesData = await fetchJSON(`${API}/machines`); } catch (e) { machinesData = {}; }
+  // A failed refresh must not turn an existing remote selection into local.
+  const refreshed = await fetchJSON(`${API}/machines`);
   const label = document.getElementById('machineLabel');
   const sel = document.getElementById('machineInput');
+  const previous = sel.value;
+  machinesData = refreshed;
   const names = Object.keys(machinesData);
-  label.style.display = names.length ? 'flex' : 'none';
+  label.style.display = names.length || previous ? 'flex' : 'none';
   sel.innerHTML = '<option value="">💻 локально</option>'
     + names.map(n => `<option value="${escAttr(n)}">${esc(n)} (${esc(machinesData[n].host)})</option>`).join('');
+  if (previous && !names.includes(previous)) {
+    sel.innerHTML += `<option value="${escAttr(previous)}" disabled>${esc(previous)} · недоступна</option>`;
+  }
+  sel.value = previous;
 }
 
 function updateProvidersForMachine() {
@@ -4211,16 +4432,17 @@ function updateProvidersForMachine() {
   const allowed = machine ? (machinesData[machine]?.providers || []) : null;
   const sel = document.getElementById('providerInput');
   const previous = sel.value;
-  const choices = Object.entries(providersData)
+  const choices = orderedProviderEntries()
     // для машины наличие CLI определяет её собственная проба, а не эта машина
     .filter(([name, info]) => !info.hidden && (allowed ? allowed.includes(name) : info.available !== false));
-  sel.innerHTML = choices.map(([name, info]) => `<option value="${escAttr(name)}">${esc(name)} — ${esc(info.description || info)}</option>`).join('');
+  sel.innerHTML = choices.map(([name, info]) => `<option value="${escAttr(name)}">${esc(providerLabel(name, info))} — ${esc(info.description || info)}</option>`).join('');
   sel.value = preferredTaskProvider(choices.map(([name]) => name), previous);
   updateSkillsToggle(); updateModelSelect(); updateEffortSelect(); updateKeepPane();
 }
 
 function preferredTaskProvider(names, current = '') {
-  const remembered = localStorage.getItem('promptpilot.last-provider') || '';
+  let remembered = '';
+  try { remembered = localStorage.getItem('promptpilot.last-provider') || ''; } catch (_) {}
   return [current, remembered, 'agy', 'codex', names[0] || ''].find(name => names.includes(name)) || '';
 }
 
@@ -4228,18 +4450,13 @@ async function loadProviders() {
   providersData = await fetchJSON(`${API}/providers`);
   await loadMachines();
   const sel = document.getElementById('providerInput');
-  const previous = sel.value;
-  const choices = Object.entries(providersData).filter(([name, info]) => info.available !== false && !info.hidden);
-  sel.innerHTML = choices.map(([name, info]) => `<option value="${escAttr(name)}">${esc(name)} — ${esc(info.description || info)}</option>`).join('');
-  sel.value = preferredTaskProvider(choices.map(([name]) => name), previous);
   sel.onchange = () => {
-    localStorage.setItem('promptpilot.last-provider', sel.value);
+    try { localStorage.setItem('promptpilot.last-provider', sel.value); } catch (_) {}
     skillsCache = {}; updateSkillsToggle(); closeSkillsPanel(); updateModelSelect(); updateEffortSelect(); updateKeepPane();
   };
-  updateSkillsToggle();
-  updateModelSelect();
-  updateEffortSelect();
-  updateKeepPane();
+  // Rebuild once for the selected machine. A local-only intermediate rebuild
+  // would already lose a valid remote-only provider before it could be restored.
+  updateProvidersForMachine();
 }
 
 function updateKeepPane() {

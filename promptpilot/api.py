@@ -7,6 +7,7 @@ import os
 import time
 import ipaddress
 import secrets
+import sqlite3
 import subprocess
 import sys
 import uuid
@@ -39,6 +40,9 @@ from .models import (
     WorkflowArtifactInDB,
     WorkflowCreate,
     WorkflowEventInDB,
+    WorkflowExternalAssignment,
+    WorkflowExternalRequest,
+    WorkflowExternalResult,
     WorkflowFindingInDB,
     WorkflowInDB,
     WorkflowPlanApproval,
@@ -268,7 +272,7 @@ def _task_with_epf(task: TaskInDB) -> dict:
     return d
 
 
-def _attach_workflow_attribution(tasks: list) -> list:
+def _attach_workflow_attribution(tasks: list, *, queue_details: bool = True) -> list:
     """Атрибуция и честная позиция для карточек задач.
 
     Принадлежность задачи к миссии (workflow_id/role из workflow_runs) и
@@ -285,22 +289,37 @@ def _attach_workflow_attribution(tasks: list) -> list:
     runs = {}
     with db._connect() as conn:
         for row in conn.execute(
-            f"""SELECT task_id, workflow_id, role FROM workflow_runs
-                WHERE task_id IN ({marks})""", task_ids,
+            f"""SELECT r.task_id, r.workflow_id, r.role, q.round_no,
+                       s.id AS stage_id, s.code AS stage_code, s.title AS stage_title
+                FROM workflow_runs r
+                LEFT JOIN workflow_rounds q
+                  ON q.id=r.round_id AND q.workflow_id=r.workflow_id
+                LEFT JOIN workflow_stages s
+                  ON s.id=q.stage_id AND s.workflow_id=r.workflow_id
+                WHERE r.task_id IN ({marks})
+                UNION ALL
+                SELECT planner_task_id, workflow_id, 'planner', NULL, NULL, NULL, NULL
+                FROM workflow_plans WHERE planner_task_id IN ({marks})""", task_ids + task_ids,
         ):
-            runs[row["task_id"]] = (row["workflow_id"], row["role"])
+            runs.setdefault(row["task_id"], []).append(dict(row))
     try:
         from .worker import admission_snapshot
-        admission = (admission_snapshot() if any(
+        admission = (admission_snapshot() if queue_details and any(
             task.status in {TaskStatus.PENDING, TaskStatus.RATE_LIMITED}
             for task in tasks) else {})
     except Exception as exc:  # noqa: BLE001 - проекция не должна ронять API
         print(f"  !! admission_snapshot недоступен: {exc}", flush=True)
         admission = {}
     for task in tasks:
-        attribution = runs.get(task.id)
-        if attribution:
-            task.workflow_id, task.role = attribution
+        attribution = runs.get(task.id, [])
+        # Ambiguous stored links do not justify guessing a workflow or role.
+        if len(attribution) == 1:
+            item = attribution[0]
+            task.workflow_id, task.role = item["workflow_id"], item["role"]
+            task.workflow_round_no = item["round_no"]
+            task.workflow_stage_id = item["stage_id"]
+            task.workflow_stage_code = item["stage_code"]
+            task.workflow_stage_title = item["stage_title"]
         info = admission.get(task.id)
         if info is not None:
             task.queue_position = info["queue_position"]
@@ -339,7 +358,8 @@ def api_get_task(task_id: int):
     task = db.get_task(task_id)
     if not task:
         raise HTTPException(404, "Task not found")
-    return _task_with_epf(task)
+    # Point reads enrich only this task; queue ranking belongs to the list.
+    return _task_with_epf(_attach_workflow_attribution([task], queue_details=False)[0])
 
 
 @app.patch("/api/tasks/{task_id}", response_model=dict)
@@ -477,9 +497,24 @@ def api_series_action(series_id: int, body: SeriesAction):
         raise HTTPException(400, "Неизвестное действие")
     if body.retry_blocked and body.action != "run_now":
         raise HTTPException(400, "Повтор блокированных задач доступен только для run_now")
-    if not db.series_action(series_id, body.action, retry_blocked=body.retry_blocked):
-        raise HTTPException(400, "Действие неприменимо к этой серии")
-    return {"ok": True, "series": db.get_series(series_id)}
+    try:
+        if not db.series_action(series_id, body.action, retry_blocked=body.retry_blocked):
+            raise HTTPException(400, "Действие неприменимо к этой серии")
+        return {"ok": True, "series": db.get_series(series_id)}
+    except sqlite3.OperationalError as exc:
+        code = getattr(exc, "sqlite_errorcode", None)
+        busy = (type(code) is int and code & 0xff in {5, 6}) or (
+            code is None and str(exc).lower().startswith((
+                "database is locked", "database table is locked", "database schema is locked")))
+        if not busy:
+            raise
+        # A write may already have committed before a readback became busy.
+        # Never claim it did not happen or automatically replay the action.
+        raise HTTPException(
+            503, "Действие не удалось подтвердить: расписание временно занято. "
+                 "Обновите состояние перед повтором действия.",
+            headers={"Retry-After": "1"},
+        ) from exc
 
 
 @app.get("/api/pipeline-insights/profiles")
@@ -920,10 +955,11 @@ def api_list_workflow_events(
     workflow_id: str,
     after_seq: int = Query(default=0, ge=0),
     limit: int = Query(default=200, ge=1, le=1000),
+    tail: bool = Query(default=False),
 ):
     if not db.get_workflow(workflow_id):
         raise HTTPException(404, "Workflow not found")
-    return db.list_workflow_events(workflow_id, after_seq=after_seq, limit=limit)
+    return db.list_workflow_events(workflow_id, after_seq=after_seq, limit=limit, tail=tail)
 
 
 @app.get(
@@ -1100,6 +1136,39 @@ def api_record_workflow_review(
     workflow_id: str, decision: WorkflowReviewDecision
 ):
     return _workflow_action(workflows.record_review, workflow_id, decision)
+
+
+@app.get(
+    "/api/workflows/{workflow_id}/external",
+    response_model=WorkflowExternalAssignment,
+)
+def api_workflow_external(workflow_id: str):
+    """The assignment of the current stage done outside PromptPilot (issue #122)."""
+    try:
+        assignment = workflows.external_assignment(workflow_id)
+    except db.WorkflowNotFoundError as exc:
+        raise HTTPException(404, "Workflow not found") from exc
+    if assignment is None:
+        raise HTTPException(404, "У текущего раунда нет внешнего задания")
+    return assignment
+
+
+@app.post(
+    "/api/workflows/{workflow_id}/external-request",
+    response_model=WorkflowInDB,
+)
+def api_workflow_external_request(workflow_id: str, request: WorkflowExternalRequest):
+    return _workflow_action(workflows.request_external, workflow_id,
+                            request.expected_version)
+
+
+@app.post(
+    "/api/workflows/{workflow_id}/external-result",
+    response_model=WorkflowInDB,
+)
+def api_workflow_external_result(workflow_id: str, submission: WorkflowExternalResult):
+    submitted = _workflow_action(workflows.submit_external_result, workflow_id, submission)
+    return workflows.advance_workflow(submitted.id)
 
 
 @app.post(
@@ -1428,6 +1497,16 @@ def api_version():
     return check_for_update()
 
 
+def _provider_display(info: dict) -> dict:
+    human = info.get("human")
+    order = info.get("ui_order")
+    return {
+        "human": {key: human[key] for key in ("label", "role", "desc")
+                  if isinstance(human, dict) and isinstance(human.get(key), str)},
+        "ui_order": order if type(order) is int and 0 <= order <= 2**53 - 1 else None,
+    }
+
+
 @app.get("/api/providers")
 def api_providers():
     providers = load_providers()
@@ -1446,6 +1525,7 @@ def api_providers():
             "hidden": bool(info.get("hidden")),
             "executor": info.get("executor", ""),
             "session_target": bool(info.get("session_target")),
+            **_provider_display(info),
             # rights levels this provider can be confined to (models.TaskRights)
             "rights": [level for level in RIGHTS_LEVELS if rights_supported(info, level)],
         }
@@ -1594,6 +1674,7 @@ def api_providers_manage():
             "available": provider_available(info),
             "hidden": bool(info.get("hidden")),
             "source": info.get("_source", "builtin"),
+            **_provider_display(info),
         }
         for name, info in providers.items()
     }
@@ -1934,6 +2015,7 @@ def api_projects():
 class FlowActionRequest(BaseModel):
     expected_version: int = Field(ge=0, strict=True)
     confirm_command_stopped: bool = False
+    confirm_side_effect_reviewed: bool = False
     note: str = ""
 
 
@@ -2008,7 +2090,8 @@ def api_flow_action(item_id: int, action: str, body: FlowActionRequest):
         raise HTTPException(404, "Действие: retry | skip | cancel")
     return flows.summary(_flow_call(calls[action], item_id, "web",
                                     expected_version=body.expected_version,
-                                    confirm_command_stopped=body.confirm_command_stopped, note=body.note))
+                                    confirm_command_stopped=body.confirm_command_stopped,
+                                    confirm_side_effect_reviewed=body.confirm_side_effect_reviewed, note=body.note))
 
 
 @app.post("/api/flows/{name}/items", status_code=201)
