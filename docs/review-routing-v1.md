@@ -114,6 +114,28 @@ manual request. Recovery получает новый UUID и сохраняет 
 свежие внешние гейты; parser/validator не создают ключ или DB. Ни нового CLI,
 ни реального public writer, ни включённого capability этим модулем не добавлено.
 
+Внутренний `StageGuard` связывает этот request с точным publication payload.
+Для каждой фазы он заново загружает конфигурацию/checker, проверяет пользователя
+GitHub, два полных согласованных чтения PR, author/identity/epoch, audit prefix
+и канонический root. Обычное продвижение base подтверждается compare от точного
+подписанного SHA; другой base не маскируется исключением поля из hash.
+Обновление локальной task reservation предшествует финальной проверке срока.
+После journal/reducer/exact matching Transport вызывает отдельный one-use
+`final_before_post`: ещё раз читает локальную конфигурацию и четыре дерева
+обработчиков, затем проверяет request/task/server lease по последним часам.
+Known receipt после expiry остаётся read-only recovery. Это внутренний компонент,
+а не подключённый публичный `next/complete`, election или исполнитель FIX.
+
+`verified_depth` считает завершённые REVIEW по полной истории PR: legacy
+review/claim/completion должны образовать канонический proof в своём серверном
+префиксе HEAD/epoch; повторный completion того же review не добавляет круг.
+Typed proofs берутся из полного reducer, а объявленный publication.depth должен
+совпадать с числом проверенных завершений до его root. Новый HEAD не обнуляет
+историю; отсутствующие references, удаление, edited trusted history и неверный
+epoch отказывают. Значение review_depth из health само proof не заменяет.
+Прежние wire/reducer goldens показывают сериализацию и reduction, но не являются
+публичной приёмкой issuer или доказательством двух предшествующих legacy кругов.
+
 Внутренний preflight сохраняет проектируемые три параметра technical_handoff:
 enabled, protocol и max_extra_attempts. Он не добавляет defaults в legacy config,
 не меняя digest существующих leases. Для совместимости он сравнивает полный
