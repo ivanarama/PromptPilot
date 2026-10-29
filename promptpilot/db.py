@@ -1262,6 +1262,8 @@ def get_next_runnable(
 
     The whole select-then-claim runs under the write lock, so several workers
     (threads of one worker, or separate processes) never claim the same row.
+    Global pause is checked under this same lock: a worker that passed an
+    earlier pause precheck cannot claim after the pause was acknowledged.
 
     busy_keys/key_fn — when the caller already runs tasks, candidates whose
     key_fn(task) is in busy_keys are passed over: that is how two agents are
@@ -1274,6 +1276,11 @@ def get_next_runnable(
     now = _now()
     busy = set(busy_keys or ())
     with _connect(immediate=True) as conn:
+        paused = conn.execute(
+            "SELECT value FROM settings WHERE key = 'worker_paused'"
+        ).fetchone()
+        if paused and paused["value"] == "1":
+            return None
         # The admission baton must reach a worker slot too. Otherwise an
         # endless stream of higher-priority runnable tasks can repeatedly be
         # claimed and denied while the selected waiter never reaches preflight.
