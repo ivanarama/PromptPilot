@@ -848,7 +848,7 @@ def rights_supported(cfg: dict, rights: str) -> bool:
 
 def build_cmd(provider: str, prompt: str, skip_permissions: bool = False, session_id: str = None,
               model: str = None, guard: bool = True, effort: str = None,
-              rights: str = None):
+              rights: str = None, *, provider_snapshot: dict = None):
     """Build the full command list for a provider + prompt.
 
     guard=False for a run that happens on another machine: the settings file
@@ -857,7 +857,7 @@ def build_cmd(provider: str, prompt: str, skip_permissions: bool = False, sessio
     rights (models.TaskRights) wins over skip_permissions; RightsUnsupported
     when the provider cannot honour it.
     """
-    providers = load_providers()
+    providers = load_providers() if provider_snapshot is None else {provider: provider_snapshot}
     cfg = providers.get(provider, {})
     if provider in providers:
         template = cfg["cmd"]
@@ -964,7 +964,7 @@ def mask_secret_value(name: str, value: str) -> str:
     return "***"
 
 
-def get_provider_env(provider: str) -> dict:
+def get_provider_env(provider: str, *, provider_snapshot: dict = None) -> dict:
     """Environment for a provider's subprocess: current env minus PromptPilot's
     own secrets, plus the provider's declared env on top.
 
@@ -973,7 +973,7 @@ def get_provider_env(provider: str) -> dict:
     by name, so expose configured executables and well-known installations in
     PATH instead of making every agent rediscover them heuristically.
     """
-    providers = load_providers()
+    providers = load_providers() if provider_snapshot is None else {provider: provider_snapshot}
     extra = providers.get(provider, {}).get("env", {})
     env = os.environ.copy()
     for k in _SECRET_ENV:

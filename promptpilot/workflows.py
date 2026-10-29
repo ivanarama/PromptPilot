@@ -1100,6 +1100,11 @@ def dispatch_task(workflow_id: str,
     with db._connect(immediate=True) as conn:
         workflow = _workflow_row(conn, workflow_id)
         _require_version(workflow, dispatch.expected_version)
+        from .workorder_guard import prepare_dispatch, WorkorderAuthorizationError
+        try:
+            dispatch, workorder_binding = prepare_dispatch(conn, workflow, dispatch)
+        except WorkorderAuthorizationError as exc:
+            raise db.WorkflowConflictError(str(exc)) from exc
         state = WorkflowStatus(workflow["status"])
         required = (
             WorkflowStatus.QUEUED
@@ -1159,6 +1164,7 @@ def dispatch_task(workflow_id: str,
                 "provider": dispatch.provider,
                 "herdr_target": dispatch.herdr_target,
                 "machine": dispatch.machine,
+                **({"workorder_binding": workorder_binding} if workorder_binding is not None else {}),
             },
         ))
         if dispatch.role is WorkflowRole.EXECUTOR:
