@@ -18,7 +18,7 @@ import pytest
 from promptpilot.models import TaskCreate
 from promptpilot.pipeline_errors import PipelineError
 from promptpilot.pr_identity import PRIdentityV1
-from promptpilot.review_routing_execution import OneUseStart,TABLE
+from promptpilot.review_routing_execution import OneUseStart,TABLE,SCHEMA
 from promptpilot.review_routing_wire import context
 from test_review_routing_wire import publication
 
@@ -174,6 +174,21 @@ def test_unknown_existing_schema_is_preserved(start_scope):
     with pytest.raises(PipelineError,match='unknown technical start schema'):OneUseStart(db.DB_PATH)
     with closing(sqlite3.connect(str(db.DB_PATH))) as connection:
         assert connection.execute('SELECT * FROM '+TABLE).fetchall()==[('preserved',)]
+
+
+@pytest.mark.parametrize('alias',[TABLE.upper(),TABLE.title()])
+def test_case_alias_with_state_reset_triggers_is_rejected_without_any_mutation(start_scope,alias):
+    db,_scope=start_scope
+    update(db.DB_PATH,SCHEMA.replace(TABLE,alias))
+    for event in ['INSERT','UPDATE']:
+        update(db.DB_PATH,'CREATE TRIGGER reset_'+event+' AFTER '+event+' ON '+alias+
+               " BEGIN UPDATE "+alias+" SET state='not-started' WHERE attempt_key=NEW.attempt_key; END")
+    with closing(sqlite3.connect(str(db.DB_PATH))) as connection:
+        before=connection.execute("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name=? COLLATE NOCASE OR tbl_name=? COLLATE NOCASE ORDER BY name",(TABLE,TABLE)).fetchall()
+    with pytest.raises(PipelineError,match='unknown technical start schema'):OneUseStart(db.DB_PATH)
+    with closing(sqlite3.connect(str(db.DB_PATH))) as connection:
+        assert connection.execute("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name=? COLLATE NOCASE OR tbl_name=? COLLATE NOCASE ORDER BY name",(TABLE,TABLE)).fetchall()==before
+        assert connection.execute('SELECT count(*) FROM '+alias).fetchone()[0]==0
 
 
 def test_child_observation_cannot_reset_or_rebind_a_consumed_start(start_scope):

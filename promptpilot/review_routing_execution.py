@@ -85,11 +85,12 @@ class OneUseStart:
         with closing(self._connect()) as connection:
             connection.execute('BEGIN IMMEDIATE')
             try:
-                stored=connection.execute('SELECT type,sql FROM sqlite_master WHERE name=?',(TABLE,)).fetchone()
+                stored=connection.execute('SELECT type,name,sql FROM sqlite_master WHERE name=? COLLATE NOCASE',(TABLE,)).fetchone()
                 if stored is not None:
-                    if stored['type']!='table' or _schema_signature(stored['sql'] or '')!=_schema_signature(SCHEMA):
+                    if (stored['type']!='table' or stored['name']!=TABLE
+                            or _schema_signature(stored['sql'] or '')!=_schema_signature(SCHEMA)):
                         raise PipelineError('unknown technical start schema; preserve existing barriers')
-                    if connection.execute("SELECT 1 FROM sqlite_master WHERE tbl_name=? AND type IN ('trigger','index') AND sql IS NOT NULL LIMIT 1",(TABLE,)).fetchone():
+                    if connection.execute("SELECT 1 FROM sqlite_master WHERE tbl_name=? COLLATE NOCASE AND type IN ('trigger','index') AND sql IS NOT NULL LIMIT 1",(TABLE,)).fetchone():
                         raise PipelineError('unknown technical start schema objects')
                 else:
                     for table in ['tasks','settings','pipeline_target_reservations']:
