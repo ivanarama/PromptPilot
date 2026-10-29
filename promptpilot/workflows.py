@@ -1730,8 +1730,9 @@ def record_review(workflow_id: str,
                     try:
                         checkpoint_deferred["reviewed"] = stage_checkpoint.reviewed(
                             check_dir, checkpoint_paths, _file_sig)
-                    except (stage_checkpoint.CheckpointError, OSError, subprocess.SubprocessError):
+                    except (stage_checkpoint.CheckpointError, OSError, subprocess.SubprocessError) as exc:
                         checkpoint_deferred["reviewed"] = None
+                        checkpoint_deferred["reviewed_error"] = str(exc)[:400]
                     db._append_workflow_event(conn, WorkflowEventCreate(
                         workflow_id=workflow_id,
                         round_id=round_row["id"],

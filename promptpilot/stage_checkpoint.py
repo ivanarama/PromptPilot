@@ -26,24 +26,80 @@ class CheckpointBusyError(CheckpointError):
     pass
 
 
+class _GitError(CheckpointError):
+    def __init__(self, result):
+        self.returncode = result.returncode
+        self.stderr = result.stderr
+        super().__init__(result.stderr.decode("utf-8", "replace")[:400])
+
+
 def _digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def _git(repo, *args, data=None, index=None):
+def _git(repo, *args, data=None, index=None, english=False):
     env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
+    if english:
+        env["LC_ALL"] = "C"
     if index:
         env["GIT_INDEX_FILE"] = str(index)
     result = subprocess.run(["git", "-C", str(repo), *args], input=data,
                             capture_output=True, timeout=30, env=env,
                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     if result.returncode:
-        raise CheckpointError(result.stderr.decode("utf-8", "replace")[:400])
+        raise _GitError(result)
     return result.stdout
 
 
 def _text(repo, *args, **kwargs):
     return _git(repo, *args, **kwargs).decode("utf-8").strip()
+
+
+def _direct_head(repo):
+    """Read one symbolic hop, including on older POSIX Git (Apple Git 2.37).
+
+    Recursive symbolic-ref alone hides branch aliases. The legacy fallback
+    reads only the regular HEAD file in Git's worktree-specific directory;
+    publication still checks this identity under the prepared ref transaction.
+    """
+    try:
+        return _text(repo, "symbolic-ref", "--no-recurse", "HEAD", english=True)
+    except _GitError as exc:
+        unsupported = any(line.startswith(b"error: unknown option ")
+                          and b"`no-recurse'" in line for line in exc.stderr.splitlines())
+        if exc.returncode != 129 or not unsupported:
+            raise
+    if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_NONBLOCK"):
+        raise CheckpointError("Git lacks --no-recurse and safe HEAD reading is unavailable")
+    gitdir = Path(_text(repo, "rev-parse", "--absolute-git-dir")).resolve()
+    path = Path(_text(repo, "rev-parse", "--path-format=absolute", "--git-path", "HEAD"))
+    if path.name != "HEAD" or path.parent.resolve() != gitdir:
+        raise CheckpointError("unexpected checkpoint HEAD location")
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_size > 4096:
+            raise CheckpointError("checkpoint HEAD must be a bounded regular file")
+        data = os.read(descriptor, 4097)
+        after = os.fstat(descriptor)
+        current = path.stat(follow_symlinks=False)
+        def identity(s):
+            return s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns
+        if identity(before) != identity(after) or identity(after) != identity(current):
+            raise CheckpointError("checkpoint HEAD changed while reading")
+    finally:
+        os.close(descriptor)
+    if (not data.startswith(b"ref: refs/heads/") or not data.endswith(b"\n")
+            or data.count(b"\n") != 1 or b"\0" in data or len(data) > 4096):
+        raise CheckpointError("checkpoint requires a direct local branch HEAD")
+    try:
+        branch = data[5:-1].decode("utf-8")
+    except UnicodeDecodeError:
+        raise CheckpointError("checkpoint HEAD is not UTF-8") from None
+    _git(repo, "check-ref-format", branch)
+    if _text(repo, "symbolic-ref", "HEAD") != branch:
+        raise CheckpointError("symbolic branch aliases are unsupported")
+    return branch
 
 
 def _atomic(path, data):
@@ -63,7 +119,7 @@ def _atomic(path, data):
 def reviewed(repo, paths, signature):
     """Capture acceptance evidence before the pending checkpoint is persisted."""
     repo = Path(repo).resolve()
-    branch = _text(repo, "symbolic-ref", "--no-recurse", "HEAD")
+    branch = _direct_head(repo)
     head = _text(repo, "rev-parse", "HEAD")
     if _text(repo, "for-each-ref", "--format=%(symref)", branch):
         raise CheckpointError("symbolic branch aliases are unsupported")
@@ -163,7 +219,7 @@ class _RefTransaction:
             self.process.stdin.flush()
             self._expect(b"start: ok")
             self._expect(b"prepare: ok")
-            if _text(self.repo, "symbolic-ref", "--no-recurse", "HEAD") != self.branch:
+            if _direct_head(self.repo) != self.branch:
                 raise CheckpointError("checkpoint branch identity changed")
             if _text(self.repo, "for-each-ref", "--format=%(symref)", self.branch):
                 raise CheckpointError("symbolic branch aliases are unsupported")
@@ -233,7 +289,7 @@ def restart(pending, observed_head, admit):
             stream.write(marker)
             stream.flush()
             os.fsync(stream.fileno())
-        branch = _text(repo, "symbolic-ref", "--no-recurse", "HEAD")
+        branch = _direct_head(repo)
         evidence = pending.get("reviewed")
         if evidence and (evidence["repo"] != str(repo) or evidence["branch"] != branch):
             raise CheckpointError("restart repository/branch differs from reviewed identity")
@@ -279,6 +335,8 @@ def restart(pending, observed_head, admit):
 def publish(pending, signature, claim, admit):
     evidence = pending.get("reviewed")
     if not evidence:
+        if pending.get("reviewed_error"):
+            raise CheckpointError("checkpoint evidence capture failed: " + pending["reviewed_error"])
         raise CheckpointError("legacy checkpoint lacks reviewed content; renewed review required")
     repo = Path(evidence["repo"]).resolve()
     if repo != Path(pending["check_dir"]).resolve():
@@ -318,7 +376,7 @@ def publish(pending, signature, claim, admit):
         # The exact pending checkpoint/version is claimed before creating Git
         # objects. Preparation does not hold SQLite's global writer lock.
         claim()
-        if _text(repo, "symbolic-ref", "--no-recurse", "HEAD") != evidence["branch"]:
+        if _direct_head(repo) != evidence["branch"]:
             raise CheckpointError("checkout branch changed after review")
         intent_path = folder / "intent.json"
         current_index = index.read_bytes()
