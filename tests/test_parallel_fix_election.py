@@ -153,6 +153,26 @@ def test_fix_handoff_rejects_tampering_and_changed_health(
         fix_handoff.gate(None, dict(CONFIG), lease)
 
 
+def test_fix_handoff_rejects_all_noncanonical_signature_pad_bits(
+        isolated_db, monkeypatch, tmp_path):
+    import base64
+    candidate = {"stage": "review", "number": 10, "head": HEAD_A}
+    _setup_handoff(isolated_db, monkeypatch, tmp_path, [candidate])
+    preflight = pipelinectl.next_fix(None, dict(CONFIG))
+    lease = preflight["handoff"]["lease"]
+    payload, signature = lease.split(".")
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+    index = alphabet.index(signature[-1])
+    assert index % 4 == 0
+    raw = base64.urlsafe_b64decode(signature + "=")
+    for bits in (1, 2, 3):
+        alternate = signature[:-1] + alphabet[index + bits]
+        assert base64.urlsafe_b64decode(alternate + "=") == raw
+        with pytest.raises(pipelinectl.PipelineError, match="signature"):
+            fix_handoff.gate(None, dict(CONFIG), payload + "." + alternate)
+    assert fix_handoff.gate(None, dict(CONFIG), lease)["action"] == "validated"
+
+
 def test_fix_handoff_rejects_new_unreserved_priority_and_config_change(
         isolated_db, monkeypatch, tmp_path):
     candidate = {"stage": "review", "number": 10, "head": HEAD_A}
