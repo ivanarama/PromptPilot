@@ -22,6 +22,22 @@ Installation failures restore touched files/prompts/services, unless a concurren
 edit makes rollback unsafe. Backups stay in the release's `before` directory.
 There is no destructive whole-database restore.
 
+Release prompt upgrades preserve the existing local `FINITE OWNER INTEGRATION
+DECISION` records of the MERGE schedule byte for byte, including their absolute
+scope paths, SHA256 and exact source commits. They remain separate from the
+replaceable release annotation. Only the existing bounded record format is
+carried. Validation covers framing, one well-formed scope pointer, matching
+PR/source identity, count/size limits and the MERGE stage. A reserved marker
+outside a correctly framed header, unknown standalone paragraphs, duplicate
+or conflicting identities, or excess size/count stop the upgrade before
+release annotations are replaced. Existing text within a record body is
+opaque: inline notes and incomplete policy prose are preserved verbatim,
+not semantically validated or endorsed. Pending occurrences receive the same preserved records, and
+rollback restores the original prompts. Running tasks are never rewritten.
+Preservation is not new authorization: the consumer still checks each actual
+scope file/hash, current proof/ship, lifecycle, ownership, CI and exact HEAD.
+This installer reads the trusted local schedule, not GitHub prose.
+
 Stage prompts bind the canonical `go run ./tools/pipelinehealth -json` check to
 the full `health_command` in the installed `pipelinectl-onebase.json`, including
 its contract, transport and cache flags. This prevents a stage from silently
