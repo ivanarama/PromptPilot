@@ -373,6 +373,8 @@ CREATE INDEX IF NOT EXISTS idx_workflows_status ON workflows(status, updated_at)
 CREATE INDEX IF NOT EXISTS idx_workflow_stages_workflow ON workflow_stages(workflow_id, position);
 CREATE INDEX IF NOT EXISTS idx_workflow_rounds_workflow ON workflow_rounds(workflow_id, round_no);
 CREATE INDEX IF NOT EXISTS idx_workflow_runs_round ON workflow_runs(round_id, role, attempt_no);
+CREATE INDEX IF NOT EXISTS idx_workflow_runs_task ON workflow_runs(task_id);
+CREATE INDEX IF NOT EXISTS idx_workflow_plans_task ON workflow_plans(planner_task_id);
 CREATE INDEX IF NOT EXISTS idx_workflow_findings_workflow ON workflow_findings(workflow_id, status, severity);
 CREATE INDEX IF NOT EXISTS idx_workflow_artifacts_round ON workflow_artifacts(round_id, kind);
 CREATE INDEX IF NOT EXISTS idx_workflow_events_workflow ON workflow_events(workflow_id, seq);
