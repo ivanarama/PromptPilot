@@ -2265,7 +2265,7 @@ async function selectWorkflow(id) {
   selectedWorkflowData = wf;
   const [rounds, events, findings, plan, stages] = await Promise.all([
     fetchJSON(`${API}/workflows/${id}/rounds`),
-    fetchJSON(`${API}/workflows/${id}/events?limit=200`),
+    fetchJSON(`${API}/workflows/${id}/events?limit=200&tail=true`),
     fetchJSON(`${API}/workflows/${id}/findings`),
     fetchJSON(`${API}/workflows/${id}/plan`),
     fetchJSON(`${API}/workflows/${id}/stages`),
