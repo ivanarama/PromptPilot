@@ -1730,8 +1730,9 @@ def record_review(workflow_id: str,
                     try:
                         checkpoint_deferred["reviewed"] = stage_checkpoint.reviewed(
                             check_dir, checkpoint_paths, _file_sig)
-                    except (stage_checkpoint.CheckpointError, OSError, subprocess.SubprocessError):
+                    except (stage_checkpoint.CheckpointError, OSError, subprocess.SubprocessError) as exc:
                         checkpoint_deferred["reviewed"] = None
+                        checkpoint_deferred["reviewed_error"] = str(exc)[:400]
                     db._append_workflow_event(conn, WorkflowEventCreate(
                         workflow_id=workflow_id,
                         round_id=round_row["id"],
@@ -3145,6 +3146,7 @@ def _run_gate_commands(workflow: WorkflowInDB) -> WorkflowGateDecision:
                 "— либо явно выключите gate.enabled, если проверки не нужны",
             ],
         )
+    failures = 0
     for index, command in enumerate(commands, start=1):
         argv = (
             ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command]
@@ -3166,6 +3168,8 @@ def _run_gate_commands(workflow: WorkflowInDB) -> WorkflowGateDecision:
             evidence.append(
                 f"[{index}] exit={completed.returncode}: {command}\n{output}".rstrip()
             )
+            if completed.returncode:
+                failures += 1
             if completed.returncode and gate.stop_on_failure:
                 return WorkflowGateDecision(
                     expected_version=workflow.state_version,
@@ -3194,6 +3198,14 @@ def _run_gate_commands(workflow: WorkflowInDB) -> WorkflowGateDecision:
                 summary="Не удалось запустить deterministic gate",
                 evidence=evidence,
             )
+    if failures:
+        return WorkflowGateDecision(
+            expected_version=workflow.state_version,
+            verdict=GateVerdict.FAIL,
+            gate_id="automatic-gate",
+            summary=f"Команд gate с ошибкой: {failures} из {len(commands)}",
+            evidence=evidence,
+        )
     return WorkflowGateDecision(
         expected_version=workflow.state_version,
         verdict=GateVerdict.PASS,
@@ -3264,12 +3276,28 @@ def _latest_completed_reviewer(workflow: WorkflowInDB) -> Optional[WorkflowRunIn
     return reviewers[-1] if reviewers else None
 
 
-def _pause_automation(workflow_id: str, reason: str) -> WorkflowInDB:
+def _pause_automation(workflow_id: str, reason: str,
+                      *, expected_version: int) -> WorkflowInDB:
     with db._connect(immediate=True) as conn:
         workflow = _workflow_row(conn, workflow_id)
+        # A failed observation does not own a later operator action or run.
+        # Return that newer state instead of retrying the stale stop against it.
+        if workflow["state_version"] != expected_version:
+            return db._row_to_workflow(workflow)
         state = WorkflowStatus(workflow["status"])
         round_row = _current_round_row(conn, workflow)
         if state is WorkflowStatus.AWAITING_HUMAN:
+            latest = conn.execute(
+                """SELECT event_type, round_id, payload_json FROM workflow_events
+                   WHERE workflow_id = ? ORDER BY seq DESC LIMIT 1""",
+                (workflow_id,),
+            ).fetchone()
+            previous = db._json_load(latest["payload_json"]) if latest else {}
+            if (latest and latest["event_type"] == "automation.paused"
+                    and latest["round_id"] == round_row["id"]
+                    and previous.get("version") == expected_version
+                    and previous.get("reason") == reason):
+                return db._row_to_workflow(workflow)
             workflow = _touch(
                 conn, workflow, "automation.paused", {"reason": reason},
                 round_id=round_row["id"],
@@ -3285,6 +3313,9 @@ def _pause_automation(workflow_id: str, reason: str) -> WorkflowInDB:
 
 def advance_workflow(workflow_id: str, max_actions: int = 12) -> WorkflowInDB:
     """Advance all deterministic hand-offs until an agent or human must act."""
+    workflow = db.get_workflow(workflow_id)
+    if not workflow:
+        raise db.WorkflowNotFoundError(workflow_id)
     for _ in range(max_actions):
         workflow = db.get_workflow(workflow_id)
         if not workflow:
@@ -3436,6 +3467,7 @@ def advance_workflow(workflow_id: str, max_actions: int = 12) -> WorkflowInDB:
                     return _pause_automation(
                         workflow.id,
                         "Аудитор не вернул валидные AUDIT_VERDICT/AUDIT_FINDINGS_JSON",
+                        expected_version=workflow.state_version,
                     )
                 decision = decision.model_copy(update={
                     "expected_version": workflow.state_version
@@ -3464,14 +3496,17 @@ def advance_workflow(workflow_id: str, max_actions: int = 12) -> WorkflowInDB:
             if "version is" in str(exc) or "changed concurrently" in str(exc):
                 continue
             return _pause_automation(
-                workflow.id, f"WorkflowConflictError: {exc}"
+                workflow.id, f"WorkflowConflictError: {exc}",
+                expected_version=workflow.state_version,
             )
         except Exception as exc:
             return _pause_automation(
-                workflow.id, f"{type(exc).__name__}: {exc}"
+                workflow.id, f"{type(exc).__name__}: {exc}",
+                expected_version=workflow.state_version,
             )
     return _pause_automation(
-        workflow_id, f"Превышен лимит внутренних переходов: {max_actions}"
+        workflow_id, f"Превышен лимит внутренних переходов: {max_actions}",
+        expected_version=workflow.state_version,
     )
 
 

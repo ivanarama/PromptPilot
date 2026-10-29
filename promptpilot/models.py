@@ -107,6 +107,10 @@ class TaskInDB(BaseModel):
     # Атрибуция задач (очередь/миссия): None = задача вне воркфлоу / не в ожидании.
     workflow_id: Optional[str] = None
     role: Optional[str] = None
+    workflow_round_no: Optional[int] = None
+    workflow_stage_id: Optional[str] = None
+    workflow_stage_code: Optional[str] = None
+    workflow_stage_title: Optional[str] = None
     # Базовый ранг по времени, состоянию серии и параллельным lock_key.
     # Lanes, fairness, слоты и глобальная пауза не моделируются. Исключённые
     # задачи несут wait_reason; у кандидатов базового допуска он None.

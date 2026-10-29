@@ -266,6 +266,11 @@
     font-family: var(--mono);
     white-space: nowrap;
   }
+  .task-workflow {
+    margin-top: 6px;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
   .task-schedule {
     font-size: 11px;
     color: var(--yellow);
@@ -1240,6 +1245,20 @@ function taskDisplayTitle(t) {
   return firstLine ? firstLine.trim() : `Task #${t.id}`;
 }
 
+function taskWorkflowBadge(t) {
+  if (!t.workflow_id) return '';
+  const roles = {planner:'Планировщик', executor:'Исполнитель', gate:'Проверки',
+    reviewer:'Ревью', archiver:'Архив'};
+  const role = typeof roles[t.role] === 'string' ? roles[t.role] : 'Миссия';
+  const code = typeof t.workflow_stage_code === 'string' ? t.workflow_stage_code.trim() : '';
+  const title = typeof t.workflow_stage_title === 'string' ? t.workflow_stage_title.trim() : '';
+  const parts = [role];
+  if (code) parts.push(`этап ${code}${title ? ': ' + title : ''}`);
+  if (Number.isSafeInteger(t.workflow_round_no) && t.workflow_round_no > 0)
+    parts.push(`раунд ${t.workflow_round_no}`);
+  return `<div class="task-meta task-workflow">${esc(parts.join(' · '))}</div>`;
+}
+
 async function loadTasks() {
   const params = currentFilter ? `?status=${currentFilter}&limit=100` : '?limit=100';
   const tasks = await fetchJSON(`${API}/tasks${params}`);
@@ -1301,6 +1320,7 @@ async function loadTasks() {
         <span class="task-meta">P${t.priority}</span>
         <span class="task-meta">${time}</span>
       </div>
+      ${taskWorkflowBadge(t)}
       <div class="task-detail">
         <div class="detail-label">Prompt</div>
         <div class="result-block">
@@ -2245,7 +2265,7 @@ async function selectWorkflow(id) {
   selectedWorkflowData = wf;
   const [rounds, events, findings, plan, stages] = await Promise.all([
     fetchJSON(`${API}/workflows/${id}/rounds`),
-    fetchJSON(`${API}/workflows/${id}/events?limit=200`),
+    fetchJSON(`${API}/workflows/${id}/events?limit=200&tail=true`),
     fetchJSON(`${API}/workflows/${id}/findings`),
     fetchJSON(`${API}/workflows/${id}/plan`),
     fetchJSON(`${API}/workflows/${id}/stages`),

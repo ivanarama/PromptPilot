@@ -2,6 +2,7 @@
 заданием, клавиатуры. Все тесты без сети — транспорт подменяется/не нужен
 (handle_text работает с локальной БД)."""
 import json
+import time
 import urllib.request
 import pytest
 
@@ -16,6 +17,20 @@ from promptpilot.models import (
 def private_test_authorization(tmp_path, monkeypatch):
     monkeypatch.setattr(bot_vk, "VK_ALLOWED_ENV", "7")
     monkeypatch.setattr(bot_vk, "_vk_config_path", tmp_path / "vk_config.json")
+
+
+@pytest.fixture(autouse=True)
+def notification_test_clock(monkeypatch):
+    # Event tests must not also send the daily digest when CI runs at 09:00.
+    # Digest tests below explicitly override this clock with their own hour.
+    localtime = time.localtime
+
+    def afternoon(seconds=None):
+        value = list(localtime(seconds))
+        value[3] = 15
+        return time.struct_time(value)
+
+    monkeypatch.setattr(bot_vk.time, "localtime", afternoon)
 
 
 def _wf(db, tmp_path, status=None):

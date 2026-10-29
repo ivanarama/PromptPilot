@@ -7,6 +7,7 @@ import os
 import time
 import ipaddress
 import secrets
+import sqlite3
 import subprocess
 import sys
 import uuid
@@ -271,7 +272,7 @@ def _task_with_epf(task: TaskInDB) -> dict:
     return d
 
 
-def _attach_workflow_attribution(tasks: list) -> list:
+def _attach_workflow_attribution(tasks: list, *, queue_details: bool = True) -> list:
     """Атрибуция и честная позиция для карточек задач.
 
     Принадлежность задачи к миссии (workflow_id/role из workflow_runs) и
@@ -288,22 +289,37 @@ def _attach_workflow_attribution(tasks: list) -> list:
     runs = {}
     with db._connect() as conn:
         for row in conn.execute(
-            f"""SELECT task_id, workflow_id, role FROM workflow_runs
-                WHERE task_id IN ({marks})""", task_ids,
+            f"""SELECT r.task_id, r.workflow_id, r.role, q.round_no,
+                       s.id AS stage_id, s.code AS stage_code, s.title AS stage_title
+                FROM workflow_runs r
+                LEFT JOIN workflow_rounds q
+                  ON q.id=r.round_id AND q.workflow_id=r.workflow_id
+                LEFT JOIN workflow_stages s
+                  ON s.id=q.stage_id AND s.workflow_id=r.workflow_id
+                WHERE r.task_id IN ({marks})
+                UNION ALL
+                SELECT planner_task_id, workflow_id, 'planner', NULL, NULL, NULL, NULL
+                FROM workflow_plans WHERE planner_task_id IN ({marks})""", task_ids + task_ids,
         ):
-            runs[row["task_id"]] = (row["workflow_id"], row["role"])
+            runs.setdefault(row["task_id"], []).append(dict(row))
     try:
         from .worker import admission_snapshot
-        admission = (admission_snapshot() if any(
+        admission = (admission_snapshot() if queue_details and any(
             task.status in {TaskStatus.PENDING, TaskStatus.RATE_LIMITED}
             for task in tasks) else {})
     except Exception as exc:  # noqa: BLE001 - проекция не должна ронять API
         print(f"  !! admission_snapshot недоступен: {exc}", flush=True)
         admission = {}
     for task in tasks:
-        attribution = runs.get(task.id)
-        if attribution:
-            task.workflow_id, task.role = attribution
+        attribution = runs.get(task.id, [])
+        # Ambiguous stored links do not justify guessing a workflow or role.
+        if len(attribution) == 1:
+            item = attribution[0]
+            task.workflow_id, task.role = item["workflow_id"], item["role"]
+            task.workflow_round_no = item["round_no"]
+            task.workflow_stage_id = item["stage_id"]
+            task.workflow_stage_code = item["stage_code"]
+            task.workflow_stage_title = item["stage_title"]
         info = admission.get(task.id)
         if info is not None:
             task.queue_position = info["queue_position"]
@@ -342,7 +358,8 @@ def api_get_task(task_id: int):
     task = db.get_task(task_id)
     if not task:
         raise HTTPException(404, "Task not found")
-    return _task_with_epf(task)
+    # Point reads enrich only this task; queue ranking belongs to the list.
+    return _task_with_epf(_attach_workflow_attribution([task], queue_details=False)[0])
 
 
 @app.patch("/api/tasks/{task_id}", response_model=dict)
@@ -480,9 +497,24 @@ def api_series_action(series_id: int, body: SeriesAction):
         raise HTTPException(400, "Неизвестное действие")
     if body.retry_blocked and body.action != "run_now":
         raise HTTPException(400, "Повтор блокированных задач доступен только для run_now")
-    if not db.series_action(series_id, body.action, retry_blocked=body.retry_blocked):
-        raise HTTPException(400, "Действие неприменимо к этой серии")
-    return {"ok": True, "series": db.get_series(series_id)}
+    try:
+        if not db.series_action(series_id, body.action, retry_blocked=body.retry_blocked):
+            raise HTTPException(400, "Действие неприменимо к этой серии")
+        return {"ok": True, "series": db.get_series(series_id)}
+    except sqlite3.OperationalError as exc:
+        code = getattr(exc, "sqlite_errorcode", None)
+        busy = (type(code) is int and code & 0xff in {5, 6}) or (
+            code is None and str(exc).lower().startswith((
+                "database is locked", "database table is locked", "database schema is locked")))
+        if not busy:
+            raise
+        # A write may already have committed before a readback became busy.
+        # Never claim it did not happen or automatically replay the action.
+        raise HTTPException(
+            503, "Действие не удалось подтвердить: расписание временно занято. "
+                 "Обновите состояние перед повтором действия.",
+            headers={"Retry-After": "1"},
+        ) from exc
 
 
 @app.get("/api/pipeline-insights/profiles")
@@ -923,10 +955,11 @@ def api_list_workflow_events(
     workflow_id: str,
     after_seq: int = Query(default=0, ge=0),
     limit: int = Query(default=200, ge=1, le=1000),
+    tail: bool = Query(default=False),
 ):
     if not db.get_workflow(workflow_id):
         raise HTTPException(404, "Workflow not found")
-    return db.list_workflow_events(workflow_id, after_seq=after_seq, limit=limit)
+    return db.list_workflow_events(workflow_id, after_seq=after_seq, limit=limit, tail=tail)
 
 
 @app.get(
