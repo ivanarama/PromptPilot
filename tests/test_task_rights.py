@@ -137,10 +137,12 @@ def test_verdict_repair_runs_without_tools(isolated_db, providers, monkeypatch):
     assert seen and "--tools" in seen[0] and "" in seen[0]
 
 
-def test_verdict_repair_cannot_widen_an_existing_codex_read_task(isolated_db, providers, monkeypatch):
+@pytest.mark.parametrize("rights", ["read", "write", "full"])
+def test_verdict_repair_requires_tool_confinement_even_for_a_full_task(
+        isolated_db, providers, monkeypatch, rights):
     seen = []
     monkeypatch.setattr(worker.subprocess, "run", lambda *a, **k: seen.append(a))
-    task = SimpleNamespace(model=None, effort=None, rights="read")
+    task = SimpleNamespace(model=None, effort=None, rights=rights)
     assert worker._repair_verdict(task, "codex", config.load_providers()["codex"], "report", ".") == ""
     assert seen == []  # No permissive fallback when the narrow contract is unavailable.
 

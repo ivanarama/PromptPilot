@@ -8,7 +8,7 @@ from promptpilot import workflows
 from promptpilot.api import app
 from promptpilot.models import (
     TaskCreate, WorkflowCreate, WorkflowPlanApproval, WorkflowPlanDispatch,
-    WorkflowPlanReplace, WorkflowStageSpec, WorkflowRoundCreate,
+    WorkflowPlanReplace, WorkflowStageSpec, WorkflowRoundCreate, WorkflowRunCreate,
 )
 
 
@@ -117,3 +117,18 @@ def test_single_task_read_does_not_scan_unrelated_history_or_rank_the_queue(
     response = get(f"/api/tasks/{task.id}")
     assert response.status_code == 200
     assert response.json()["workflow_id"] is None
+
+
+def test_ambiguous_task_run_links_remain_unattributed(isolated_db, tmp_path):
+    task = isolated_db.create_task(TaskCreate(prompt="ambiguous stored link"))
+    for number, role in enumerate(("executor", "reviewer")):
+        workflow = isolated_db.create_workflow(WorkflowCreate(
+            slug=f"ambiguous-{number}", objective="link", repository_path=str(tmp_path),
+            candidate_branch="main"))
+        round_data = isolated_db.create_workflow_round(WorkflowRoundCreate(
+            workflow_id=workflow.id, round_no=1))
+        isolated_db.create_workflow_run(WorkflowRunCreate(
+            workflow_id=workflow.id, round_id=round_data.id, role=role,
+            input_sha256="fixture", task_id=task.id))
+    for item in (get(f"/api/tasks/{task.id}").json(), get("/api/tasks").json()[0]):
+        assert item["workflow_id"] is item["role"] is item["workflow_stage_id"] is None
