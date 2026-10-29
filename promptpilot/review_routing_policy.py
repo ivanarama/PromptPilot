@@ -2,13 +2,43 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from pathlib import Path
+import stat
 
 from .pipeline_errors import PipelineError
 from .review_routing import VERSION
 
 
 ROLES={'review':'review-queue','fix':'fix-approved','merge':'merge-shepherd','tail':'tail-issues'}
+
+
+def _file_bytes(path):
+    """Bound before reading; never block opening a FIFO or follow a link."""
+    try:
+        before=path.lstat()
+        if not stat.S_ISREG(before.st_mode):
+            raise PipelineError('paired routing consumer is not a regular file')
+        if before.st_size>1048576:
+            raise PipelineError('paired routing consumer file exceeds bounded size')
+        flags=os.O_RDONLY|getattr(os,'O_BINARY',0)|getattr(os,'O_NONBLOCK',0)|getattr(os,'O_NOFOLLOW',0)
+        descriptor=os.open(path,flags)
+        try:
+            opened=os.fstat(descriptor)
+            if (not stat.S_ISREG(opened.st_mode)
+                    or (opened.st_dev,opened.st_ino)!=(before.st_dev,before.st_ino)):
+                raise PipelineError('paired routing consumer changed while opening')
+            with os.fdopen(descriptor,'rb') as stream:
+                descriptor=None
+                data=stream.read(1048577)
+            if len(data)>1048576:
+                raise PipelineError('paired routing consumer file exceeds bounded size')
+            return data
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+    except OSError as exc:
+        raise PipelineError('paired routing consumer file is unavailable') from exc
 
 
 def settings(config):
@@ -36,8 +66,9 @@ def consumer_tree(root,role):
     if entry.is_symlink():
         raise PipelineError('paired routing consumer entry cannot be linked')
     try:
-        text=entry.read_text(encoding='utf-8')
-    except (OSError,UnicodeError) as exc:
+        entry_bytes=_file_bytes(entry)
+        text=entry_bytes.decode('utf-8')
+    except UnicodeError as exc:
         raise PipelineError('paired routing consumer entry is unavailable') from exc
     marker=f'<!-- pp:review-routing-v1-consumer stage={role} -->'
     if text.splitlines().count(marker)!=1:
@@ -49,7 +80,7 @@ def consumer_tree(root,role):
             continue
         if path.is_symlink():
             raise PipelineError('paired routing consumer tree contains a symbolic link')
-        if path.is_file():
+        if not path.is_dir():
             name=relative.as_posix()
             if any(ord(char)<32 or ord(char)==127 for char in name):
                 raise PipelineError('paired routing consumer path contains a control character')
@@ -59,7 +90,7 @@ def consumer_tree(root,role):
     digest=hashlib.sha256(b'pp-review-routing-consumer-tree-v1\n')
     total=0
     for name,path in sorted(files,key=lambda item:item[0].encode('utf-8')):
-        with path.open('rb') as stream:data=stream.read(1048577)
+        data=entry_bytes if path==entry else _file_bytes(path)
         total+=len(data)
         if len(data)>1048576 or total>4194304:
             raise PipelineError('paired routing consumer tree exceeds bounded size')

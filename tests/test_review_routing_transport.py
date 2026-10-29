@@ -60,6 +60,41 @@ def test_normal_publication_and_lost_response_with_visible_receipt_have_one_post
         assert server.posts==1
 
 
+def test_receipt_appearing_in_the_final_write_guard_prevents_a_second_post(tmp_path):
+    server=Server()
+    original=server.guard
+
+    def delayed_receipt(payload,*,write=False):
+        if write:
+            server.body=render(payload)
+        return original(payload,write=write)
+
+    server.guard=delayed_receipt
+    assert invoke(server,tmp_path).id=='1000'
+    assert server.posts==0
+    assert Journal(tmp_path).get(owner=OWNER,phase='publication')['returned_id']=='1000'
+
+
+def test_cache_loss_recovery_keeps_its_first_observed_id_after_a_conflict(tmp_path):
+    server=Server()
+    server.body=render(PAYLOAD)
+    original=server.guard
+
+    def changed_receipt(payload,*,write=False):
+        snapshot=original(payload,write=write)
+        if server.guards>=2:
+            snapshot['edges'][0]['node']['fullDatabaseId']='1001'
+        return snapshot
+
+    server.guard=changed_receipt
+    with pytest.raises(PipelineError,match='returned ID differs'):
+        invoke(server,tmp_path)
+    assert Journal(tmp_path).get(owner=OWNER,phase='publication')['returned_id']=='1000'
+    with pytest.raises(PipelineError,match='returned ID differs'):
+        invoke(server,tmp_path)
+    assert server.posts==0
+
+
 def test_accepted_but_not_yet_visible_request_stays_ambiguous_across_process_restarts(tmp_path):
     server=Server(lose_response=True,visible=False)
     for _attempt in range(2):

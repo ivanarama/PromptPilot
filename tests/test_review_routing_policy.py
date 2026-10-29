@@ -1,5 +1,8 @@
 """One future flag must not enable a half-upgraded four-stage protocol."""
 import copy
+import os
+import subprocess
+import sys
 
 import pytest
 
@@ -72,3 +75,42 @@ def test_partial_or_red_peer_and_changed_legacy_gate_refuse(tmp_path):
     c['fallback_handoff']='legacy'
     with pytest.raises(PipelineError,match='both target-v1'):
         policy.preflight(c,h)
+
+
+def test_oversized_entry_is_refused_before_an_unbounded_text_read(tmp_path,monkeypatch):
+    from pathlib import Path
+    root,_,_=peers(tmp_path)
+    entry=root/'review-queue/SKILL.md'
+    entry.write_bytes(b'x'*1048577)
+    original=Path.read_text
+
+    def forbidden_unbounded(path,*args,**kwargs):
+        if path==entry:
+            pytest.fail('oversized entry was read without a bound')
+        return original(path,*args,**kwargs)
+
+    monkeypatch.setattr(Path,'read_text',forbidden_unbounded)
+    with pytest.raises(PipelineError,match='size|oversized'):
+        policy.consumer_tree(root,'review')
+
+
+@pytest.mark.skipif(not hasattr(os,'mkfifo'),reason='POSIX named pipe boundary')
+@pytest.mark.parametrize('entry',[True,False])
+def test_named_pipe_consumer_is_refused_without_waiting_for_a_writer(tmp_path,entry):
+    root,_,_=peers(tmp_path)
+    path=root/'review-queue'/('SKILL.md' if entry else 'extra-reader')
+    if path.exists():
+        path.unlink()
+    os.mkfifo(path)
+    code=("from promptpilot.review_routing_policy import consumer_tree\n"
+          "from promptpilot.pipeline_errors import PipelineError\n"
+          "import sys\n"
+          "try: consumer_tree(sys.argv[1],'review')\n"
+          "except PipelineError as error:\n"
+          " print(error)\n"
+          " raise SystemExit(0)\n"
+          "raise SystemExit('special file was accepted')\n")
+    result=subprocess.run([sys.executable,'-c',code,str(root)],capture_output=True,
+                          text=True,timeout=5)
+    assert result.returncode==0,result.stderr
+    assert 'regular file' in result.stdout

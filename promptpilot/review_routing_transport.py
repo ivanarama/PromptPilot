@@ -67,6 +67,7 @@ class Transport:
             # server phase. Bind/recheck its immutable exact receipt instead.
             record=self._exact(snapshot,payload,body)
             self.journal.prepare(owner=owner,phase=phase,repository=self.repository,number=target,body=body)
+            self.journal.observe_returned_id(owner=owner,phase=phase,returned_id=record.id)
             record=self._exact(self._snapshot(payload),payload,body,returned_id=record.id)
             self.journal.confirm(owner=owner,phase=phase,returned_id=record.id,body=body)
             return record
@@ -76,7 +77,15 @@ class Transport:
             return self.publish(payload,owner=owner,phase=phase)
         # SQLite lock waits/encoding/identity reads may have crossed expiry or
         # a hold. The final stage guard runs after write-ahead commit.
-        self._snapshot(payload,write=True)
+        snapshot=self._snapshot(payload,write=True)
+        if self._matches(snapshot,payload,body):
+            # A delayed receipt can become visible during the write-ahead
+            # transaction. The last fresh snapshot must suppress another POST.
+            record=self._exact(snapshot,payload,body)
+            self.journal.observe_returned_id(owner=owner,phase=phase,returned_id=record.id)
+            record=self._exact(self._snapshot(payload),payload,body,returned_id=record.id)
+            self.journal.confirm(owner=owner,phase=phase,returned_id=record.id,body=body)
+            return record
         try:
             response=self.gh.json('api',f'repos/{self.repository}/issues/{target}/comments',
                                   '--method','POST','--input','-',
