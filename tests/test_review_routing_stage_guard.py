@@ -14,7 +14,7 @@ from promptpilot.review_routing_journal import Journal
 from promptpilot.review_routing_publication import Publication
 from promptpilot.review_routing_snapshot import stable_timeline
 from promptpilot.review_routing_stage_guard import StageGuard
-from promptpilot.review_routing_wire import context,parse,render
+from promptpilot.review_routing_wire import context,parse,render,sha
 from test_review_routing_policy import peers
 from test_review_routing_snapshot import page
 from test_review_routing_wire import publication
@@ -242,3 +242,91 @@ def test_late_local_policy_change_stops_the_first_post(setup_guard,tmp_path,monk
     with pytest.raises(PipelineError):tx.run()
     assert changed and peer.posts==[]
     assert tx.journal.pending_for(seed['pr'])==[]
+
+
+def historical_guard(setup_guard):
+    """Actual two legacy transactions, rather than a synthetic declared depth."""
+    from test_review_routing_history import history
+    peer,config,health,path,_root,_req,seed,_make=setup_guard
+    peer.current['data']['repository']['pullRequest']['timelineItems']['edges']=history()['edges']
+    state=stable_timeline(peer,config,42)
+    request=requests.build(config,state,policy.preflight(config,health),depth=2,budget_used=0,
+                           now=int(peer.now.timestamp()))
+    seed=copy.deepcopy(seed)
+    seed.update(epoch=request['epoch'],anchor=request['anchor'],audit=request['audit'],owner=request['owner_uuid'])
+    token=requests.encode(request)
+    return peer,config,seed,lambda:StageGuard(peer,str(path),token,seed,clock=lambda:peer.now)
+
+
+@pytest.mark.parametrize('change',['head','hold','closed'])
+def test_exact_completed_receipt_survives_later_head_or_admission_change(setup_guard,tmp_path,change):
+    peer,config,seed,make=historical_guard(setup_guard)
+    original=Publication(peer,config,Journal(tmp_path/'first'),make(),seed,clock=lambda:peer.now).run()
+    pr=peer.current['data']['repository']['pullRequest']
+    if change=='head':
+        pr['headRefOid']='c'*40
+        peer.comments.append({'cursor':'NEW_HEAD','node':{'__typename':'PullRequestCommit',
+                              'id':'NEW_HEAD','commit':{'oid':'c'*40}}})
+    elif change=='hold':pr['labels']['nodes']=[{'name':'hold'}]
+    else:pr['state']='CLOSED'
+    assert Publication(peer,config,Journal(tmp_path/'lost-cache'),make(),seed,clock=lambda:peer.now).run()==original
+    assert original['mutation_authorized'] is False
+    with pytest.raises(PipelineError):make()(seed,write=True)
+    assert peer.posts==['publication','claim','completion']
+
+
+def test_lost_post_response_can_confirm_old_root_without_continuing_on_new_head(setup_guard,tmp_path):
+    peer,config,seed,make=historical_guard(setup_guard)
+    journal=Journal(tmp_path/'journal');original=peer.json
+    def response_lost(*args,**kwargs):
+        result=original(*args,**kwargs)
+        if kwargs.get('input_value') is not None:
+            peer.current['data']['repository']['pullRequest']['headRefOid']='c'*40
+            peer.comments.append({'cursor':'NEW_HEAD','node':{'__typename':'PullRequestCommit',
+                                  'id':'NEW_HEAD','commit':{'oid':'c'*40}}})
+            raise OSError('response lost after accepted root')
+        return result
+    peer.json=response_lost
+    with pytest.raises(PipelineError):
+        Publication(peer,config,journal,make(),seed,clock=lambda:peer.now).run()
+    row=journal.get(owner=seed['owner'],phase='publication:'+sha(seed))
+    assert row['state']=='done' and row['returned_id']=='1000'
+    assert peer.posts==['publication']
+
+
+@pytest.mark.parametrize('change',['actor','head-ref','author','edited','missing-legacy','duplicate-receipt'])
+def test_old_receipt_does_not_bypass_identity_or_history_validation(setup_guard,tmp_path,change):
+    peer,config,seed,make=historical_guard(setup_guard)
+    Publication(peer,config,Journal(tmp_path/'first'),make(),seed,clock=lambda:peer.now).run()
+    pr=peer.current['data']['repository']['pullRequest'];pr['labels']['nodes']=[{'name':'hold'}]
+    if change=='actor':peer.actor='other'
+    elif change=='head-ref':pr['headRefName']='other'
+    elif change=='author':pr['author']['id']='U_OTHER'
+    elif change=='edited':peer.comments[0]['node']['lastEditedAt']=peer.now.isoformat()
+    elif change=='missing-legacy':
+        pr['timelineItems']['edges']=[edge for edge in pr['timelineItems']['edges'] if edge['node'].get('fullDatabaseId')!='100']
+    else:
+        twin=copy.deepcopy(peer.comments[0]);twin.update(cursor='DUPLICATE')
+        twin['node'].update(id='IC_DUPLICATE',fullDatabaseId='9999');peer.comments.append(twin)
+    with pytest.raises(PipelineError):
+        Publication(peer,config,Journal(tmp_path/'recovery'),make(),seed,clock=lambda:peer.now).run()
+    assert peer.posts==['publication','claim','completion']
+
+
+def test_invisible_ambiguous_root_stays_a_barrier_after_head_change(setup_guard,tmp_path):
+    peer,config,seed,make=historical_guard(setup_guard)
+    journal=Journal(tmp_path/'journal');original=peer.json
+    def invisible(*args,**kwargs):
+        result=original(*args,**kwargs)
+        if kwargs.get('input_value') is not None:
+            peer.comments.clear()
+            peer.current['data']['repository']['pullRequest']['headRefOid']='c'*40
+            raise OSError('root accepted but receipt not visible')
+        return result
+    peer.json=invisible
+    tx=Publication(peer,config,journal,make(),seed,clock=lambda:peer.now)
+    for _ in range(2):
+        with pytest.raises(PipelineError):tx.run()
+    row=journal.get(owner=seed['owner'],phase='publication:'+sha(seed))
+    assert row['state']=='ambiguous' and row['returned_id'] is None
+    assert peer.posts==['publication']

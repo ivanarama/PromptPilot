@@ -72,6 +72,26 @@ class StageGuard:
                 or (comparison.get('merge_base_commit') or {}).get('sha')!=before):
             raise PipelineError('typed REVIEW integration base did not advance from its signed base')
 
+    def _historical_receipt(self,snapshot,value,config):
+        """Observe an exact old receipt without granting another WRITE ticket.
+
+        A later HEAD/hold/close must not turn a visible accepted POST into an
+        unresolved local send. This exception requires an actual unique body
+        in a fully verified lifetime history; invisible requests still refuse.
+        """
+        from .review_routing_history import verified_depth
+
+        request=self.request
+        current=dict(snapshot['identity']);original=dict(request['identity'])
+        current.pop('head_sha');original.pop('head_sha')
+        if (current!=original or snapshot['author']!=request['author']
+                or snapshot['pr_key']!=request['pr_key'] or not snapshot['labelsComplete']):
+            raise PipelineError('typed REVIEW old receipt belongs to a changed PR identity/author')
+        verified_depth(snapshot,trusted=config['trusted_account'])
+        history,deleted=records(snapshot,trusted=config['trusted_account'],expected_pr=request['pr_key'])
+        if deleted or sum(render(record.payload)==render(value) for record in history)!=1:
+            raise PipelineError('typed REVIEW historical read requires a unique exact existing receipt')
+
     def __call__(self,payload,*,write=False):
         self._ticket=None
         value=self._phase(payload,write=write)
@@ -89,12 +109,17 @@ class StageGuard:
                 or policy['current_limit']!=request['current_limit']):
             raise PipelineError('typed REVIEW paired policy changed or was disabled')
         snapshot=stable_timeline(self.gh,config,request['number'])
-        pp.review_gate(snapshot,config,request)
-        if (snapshot['identity']!=request['identity'] or snapshot['author']!=request['author']
-                or snapshot['identity_sha256']!=request['identity_sha256']):
-            raise PipelineError('typed REVIEW current full identity/author changed')
-        verify(snapshot,request['audit'],publication_context=self.context,trusted=config['trusted_account'])
-        self._base(snapshot)
+        try:
+            pp.review_gate(snapshot,config,request)
+            if (snapshot['identity']!=request['identity'] or snapshot['author']!=request['author']
+                    or snapshot['identity_sha256']!=request['identity_sha256']):
+                raise PipelineError('typed REVIEW current full identity/author changed')
+            verify(snapshot,request['audit'],publication_context=self.context,trusted=config['trusted_account'])
+            self._base(snapshot)
+        except PipelineError as original:
+            if write:raise
+            try:self._historical_receipt(snapshot,value,config)
+            except PipelineError:raise original
         history,deleted=records(snapshot,trusted=config['trusted_account'],expected_pr=request['pr_key'])
         reduce(history,deleted_at=deleted,max_attempts=16)
         roots=[item for item in history if item.payload['kind']=='publication'
