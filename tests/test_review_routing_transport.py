@@ -28,7 +28,7 @@ class Server:
         self.hold_at_guard=hold_at_guard
         self.body=None
 
-    def guard(self,payload):
+    def guard(self,payload,*,write=False):
         self.guards+=1
         if self.hold_at_guard and self.guards>=self.hold_at_guard:
             raise PipelineError('phase gate closed by late hold')
@@ -110,7 +110,7 @@ def test_missing_stage_guard_or_wrong_pr_identity_cannot_publish(tmp_path):
     server=Server()
     with pytest.raises(PipelineError,match='fresh stage guard'):
         Transport(server,CONFIG,Journal(tmp_path),None)
-    def wrong(payload):
+    def wrong(payload,*,write=False):
         changed=copy.deepcopy(payload['pr']);changed['pr_id']='OTHER'
         return {'pr_key':changed,'edges':[]}
     with pytest.raises(PipelineError,match='another PR identity'):
@@ -148,3 +148,32 @@ def test_real_github_client_supplies_json_stdin_to_explicit_api_input(tmp_path,m
     github=pp.GitHub(executable='fixture-gh')
     record=Transport(github,CONFIG,Journal(tmp_path),server.guard).publish(PAYLOAD,owner=OWNER,phase='publication')
     assert record.id=='1000' and server.posts==1
+
+
+def test_lost_local_journal_recovers_existing_exact_server_phase_without_reposting(tmp_path):
+    server=Server()
+    server.body=render(PAYLOAD)  # Surviving immutable own server record.
+    record=invoke(server,tmp_path/'fresh-host-journal')
+    assert record.id=='1000' and server.posts==0
+
+
+def test_expired_write_lease_can_confirm_known_server_receipt_without_new_side_effect(tmp_path):
+    server=Server()
+    server.body=render(PAYLOAD)
+    modes=[]
+    def guard(payload,*,write):
+        modes.append(write)
+        if write:raise PipelineError('write lease expired')
+        return server.guard(payload,write=write)
+    result=Transport(server,CONFIG,Journal(tmp_path),guard).publish(PAYLOAD,owner=OWNER,phase='publication')
+    assert result.id=='1000' and server.posts==0 and modes==[False,False]
+
+
+def test_expired_write_lease_with_no_existing_receipt_never_posts(tmp_path):
+    server=Server()
+    def guard(payload,*,write):
+        if write:raise PipelineError('write lease expired')
+        return server.guard(payload,write=write)
+    with pytest.raises(PipelineError,match='write lease expired'):
+        Transport(server,CONFIG,Journal(tmp_path),guard).publish(PAYLOAD,owner=OWNER,phase='publication')
+    assert server.posts==0

@@ -60,6 +60,10 @@ Resume незапаркованной цели, старой parking или др
 GET не может забыть противоречивый ID. Внутренний Transport делает один POST
 либо восстанавливает receipt чтением; он требует внешнего полного stage guard,
 сам его не реализует и пока не подключён к командам next/complete.
+Guard получает явный write-флаг: подтверждение уже существующего immutable
+receipt может быть чтением после истечения write lease; новый POST всегда
+повторяет актуальные права/TTL после write-ahead commit. Потеря локального
+журнала не дублирует surviving exact own server phase.
 
 Внутренний preflight сохраняет проектируемые три параметра technical_handoff:
 enabled, protocol и max_extra_attempts. Он не добавляет defaults в legacy config,

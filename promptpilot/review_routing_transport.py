@@ -22,15 +22,20 @@ class Transport:
         self.journal=journal
         self.guard=guard
 
-    def _snapshot(self,payload):
-        snapshot=self.guard(payload)
+    def _snapshot(self,payload,*,write=False):
+        snapshot=self.guard(payload,write=write)
         if not isinstance(snapshot,dict) or snapshot.get('pr_key')!=payload['pr']:
             raise PipelineError('routing stage guard returned another PR identity')
         return snapshot
 
+    def _matches(self,snapshot,payload,body):
+        history,deleted=records(snapshot,trusted=self.trusted,expected_pr=payload['pr'])
+        if deleted:
+            raise PipelineError('routing deletion fence prevents receipt recovery/publication')
+        return [record for record in history if render(record.payload)==body]
+
     def _exact(self,snapshot,payload,body,*,returned_id=None):
-        history,_deleted=records(snapshot,trusted=self.trusted,expected_pr=payload['pr'])
-        matches=[record for record in history if render(record.payload)==body]
+        matches=self._matches(snapshot,payload,body)
         if len(matches)!=1:
             raise PipelineError('routing POST has no unique authenticated exact-body receipt; do not repeat')
         record=matches[0]
@@ -56,13 +61,22 @@ class Transport:
             record=self._exact(snapshot,payload,body,returned_id=expected_id)
             self.journal.confirm(owner=owner,phase=phase,returned_id=record.id,body=body)
             return record
+        matches=self._matches(snapshot,payload,body)
+        if matches:
+            # Local cache/database loss must not duplicate a surviving own
+            # server phase. Bind/recheck its immutable exact receipt instead.
+            record=self._exact(snapshot,payload,body)
+            self.journal.prepare(owner=owner,phase=phase,repository=self.repository,number=target,body=body)
+            record=self._exact(self._snapshot(payload),payload,body,returned_id=record.id)
+            self.journal.confirm(owner=owner,phase=phase,returned_id=record.id,body=body)
+            return record
         if not self.journal.prepare(owner=owner,phase=phase,repository=self.repository,number=target,body=body):
             # Another process could have completed between get and prepare.
             # Repeat only the guarded READ path, never a network POST.
             return self.publish(payload,owner=owner,phase=phase)
         # SQLite lock waits/encoding/identity reads may have crossed expiry or
         # a hold. The final stage guard runs after write-ahead commit.
-        self._snapshot(payload)
+        self._snapshot(payload,write=True)
         try:
             response=self.gh.json('api',f'repos/{self.repository}/issues/{target}/comments',
                                   '--method','POST','--input','-',
