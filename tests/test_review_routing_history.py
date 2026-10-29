@@ -122,3 +122,13 @@ def test_legacy_and_typed_completion_cannot_count_twice_for_one_epoch():
     state=snapshot();legacy(state,state['headRefOid'],100);add_typed(state,depth=1)
     with pytest.raises(PipelineError,match='same HEAD epoch'):
         verified_depth(state,trusted='owner')
+
+
+@pytest.mark.parametrize('valid',[True,False])
+def test_unfinished_typed_root_needs_a_real_epoch_but_does_not_add_a_round(valid):
+    state=history();add_typed(state,**({} if valid else {'epoch':'f'*64}))
+    del state['edges'][-2:]
+    if valid:assert verified_depth(state,trusted='owner')['depth']==2
+    else:
+        with pytest.raises(PipelineError,match='historical server epoch/anchor'):
+            verified_depth(state,trusted='owner')
