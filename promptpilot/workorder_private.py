@@ -1,4 +1,8 @@
-"""Keep orchestration tokens and test databases outside the agent's OS identity."""
+"""Restrict worker storage to its OS account, without claiming child isolation.
+
+The worker and its child normally share that account. Untrusted execution needs
+an externally enforced identity or sandbox that denies worker-private files.
+"""
 
 import os
 import re

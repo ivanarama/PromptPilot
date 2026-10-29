@@ -1158,6 +1158,8 @@ def _maybe_recur(task, failed: bool = False):
     """Enqueue the next occurrence of a recurring task."""
     if not task.recurrence:
         return
+    if db.workorder_recurrence_forbidden(task.id):
+        return
     repeat_guard = _pipeline_repeat_guard(task)
     if repeat_guard and repeat_guard.get("suppress_recurrence"):
         return
@@ -1563,7 +1565,7 @@ def _mark_cancelled(task, *args, **kwargs):
     return db.mark_cancelled(task.id, *args, **kwargs)
 
 
-def _execute_task_body(task, admission_complete=None):
+def _execute_task_body(task, admission_complete=None, workorder_check=None):
     """Run CLI with the task's prompt."""
     prompt_constraint = None
     if task.series_id:
@@ -1763,6 +1765,8 @@ def _execute_task_body(task, admission_complete=None):
     provider = task.provider or DEFAULT_CLI
 
     provider_cfg = load_providers().get(provider, {})
+    if workorder_check is not None:
+        provider_cfg = workorder_check.provider_snapshot(task, provider_cfg)
     if pipeline_replicas is not None:
         actual_ownership_kind = (
             "herdr" if provider_cfg.get("executor") == "herdr" else "headless")
@@ -1870,9 +1874,10 @@ def _execute_task_body(task, admission_complete=None):
         print(f"  !! run.snapshot #{task.id}: {exc}", flush=True)
 
     try:
+        snapshot_args = ({"provider_snapshot": provider_cfg} if workorder_check is not None else {})
         cmd = build_cmd(provider, agent_prompt, skip_permissions=task.skip_permissions,
                         session_id=task.session_id, model=task.model, guard=not machine,
-                        effort=task.effort, rights=getattr(task, "rights", None))
+                        effort=task.effort, rights=getattr(task, "rights", None), **snapshot_args)
     except RightsUnsupported as exc:
         # Fail closed: a run that asked for narrow rights must not start wide.
         _mark_failed(task, f"Права «{task.rights}»: {exc}", exit_code=-1)
@@ -1880,7 +1885,7 @@ def _execute_task_body(task, admission_complete=None):
         return
     prompt_stdin = agent_prompt if provider_cfg.get("prompt_stdin") else None
 
-    env = get_provider_env(provider)
+    env = get_provider_env(provider, **snapshot_args)
     # Marks the run in its own environment, inherited by the agent process. That
     # is what lets a live run be found by process rather than by our bookkeeping.
     env.pop("PP_PIPELINE_REPLICAS", None)
@@ -1953,15 +1958,13 @@ def _execute_task_body(task, admission_complete=None):
     if callable(target_heartbeat):
         target_heartbeat(force=True)
     try:
-        from .workorder_guard import check_task, configuration
-
-        check_task(task.id)
-        if configuration(task.id):
+        if workorder_check is not None:
             for key in list(env):
                 if key.startswith("WORKORDERS_") or key in {"PP_API_TOKEN", "PP_TG_TOKEN"}:
                     env.pop(key)
         def launch_owned():
-            check_task(task.id)
+            if workorder_check is not None:
+                workorder_check(task, force=True, provider_cfg=provider_cfg, cmd=cmd)
             return OwnedProcess.start(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -2079,12 +2082,18 @@ def _execute_task_body(task, admission_complete=None):
                     commit_timeout,
                 )
                 return
+            if workorder_check is not None:
+                remaining = (effective_timeout - (time.monotonic() - started)
+                             if effective_timeout else 8)
+                workorder_check(task, timeout=min(8, max(0.1, remaining)))
 
     # A successful wrapper may exit while a child still owns the pipes. Close
     # the task boundary before joining readers so such a child cannot survive
     # (or hold this worker forever).
     tree.close()
     _forget_provider_tree(task.id, tree)
+    if workorder_check is not None:
+        workorder_check(task, force=True)
     stdout_thread.join(timeout=10)
     stderr_thread.join(timeout=10)
     if stdin_thread is not None:
@@ -2231,7 +2240,7 @@ def _execute_task_body(task, admission_complete=None):
         from .herdr_exec import _closing_workflow_verdict
         verdict = _closing_workflow_verdict(
             verdict_source, allow_targeted_stale=allow_targeted_stale)
-        if not verdict and VERDICT_REPAIR and not machine:
+        if not verdict and VERDICT_REPAIR and not machine and workorder_check is None:
             # Issue #82: one micro-request beats failing the whole pipeline
             # round (and paying for a full re-run) over a dropped last line.
             repaired = _repair_verdict(task, provider, provider_cfg,
@@ -2258,7 +2267,7 @@ def _execute_task_body(task, admission_complete=None):
     else:
         verdict = parse_verdict(verdict_source)
         if (not verdict and VERDICT_REQUIRED and VERDICT_REPAIR
-                and not machine):
+                and not machine and workorder_check is None):
             repaired = _repair_verdict(task, provider, provider_cfg,
                                        verdict_source or output, run_dir)
             if repaired:
@@ -2291,9 +2300,11 @@ def _execute_task_body(task, admission_complete=None):
             print(f"  -> Removed empty worktree {wt['path']}")
 
 
-def _execute_task_inner(task, admission_complete=None):
+def _execute_task_inner(task, admission_complete=None, workorder_check=None):
     """Run one task and always release its exact GitHub budget reservation."""
     try:
+        if workorder_check is not None:
+            return _execute_task_body(task, admission_complete, workorder_check=workorder_check)
         if admission_complete is None:
             return _execute_task_body(task)
         return _execute_task_body(task, admission_complete)
@@ -2323,12 +2334,26 @@ def execute_task(task, admission_complete=None):
     try:
         from .workorder_guard import WorkorderAuthorizationError, watch_task
 
-        with watch_task(task.id, _close_registered_provider_tree):
+        with watch_task(task.id, _close_registered_provider_tree) as workorder_check:
+            if workorder_check is not None:
+                return _execute_task_inner(task, admission_complete, workorder_check=workorder_check)
             if admission_complete is None:
                 return _execute_task_inner(task)
             return _execute_task_inner(task, admission_complete)
     except WorkorderAuthorizationError as exc:
-        _mark_failed(task, f"Workorder guard refused execution: {exc}", exit_code=-1)
+        message = f"Workorder guard refused execution: {exc}"
+        commit_refusal = lambda: _mark_failed(task, message, exit_code=-1)
+        try:
+            stopped = _close_registered_provider_tree(task.id)
+        except Exception:
+            stopped = False
+        if not stopped:
+            raise ProviderOwnershipError(
+                "Workorder refusal is waiting for owned process cleanup",
+                lambda: "" if _close_registered_provider_tree(task.id) else "Workorder process cleanup is unconfirmed",
+                on_cleaned=commit_refusal,
+            ) from exc
+        _commit_terminal_or_defer(task, "workorder refusal", commit_refusal)
         return
     finally:
         # Project-pipeline election reserves an exact target before any

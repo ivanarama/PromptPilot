@@ -53,6 +53,12 @@ def test_guard_reserves_task_identity_and_checks_exact_site(isolated_db, monkeyp
     monkeypatch.setenv("WORKORDERS_SITE_URL", "http://localhost:8000")
 
     class Response:
+        def __init__(self, url):
+            self.url = url
+
+        def geturl(self):
+            return self.url
+
         def __enter__(self):
             return self
 
@@ -64,9 +70,9 @@ def test_guard_reserves_task_identity_and_checks_exact_site(isolated_db, monkeyp
 
     def urlopen(request, timeout):
         calls.append(request)
-        return Response()
+        return Response(request.full_url)
 
-    monkeypatch.setattr(workorder_guard.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(workorder_guard, "_open", urlopen)
     workorder_guard.check_task(task.id, reserve=True)
     assert calls[0].full_url.endswith("/runs/run-id/reserve/")
     assert json.loads(calls[0].data)["stage_key"] == f"task:{task.id}:pending"
@@ -114,6 +120,6 @@ def test_network_failure_is_an_authorization_refusal(isolated_db, monkeypatch):
     def unavailable(*args, **kwargs):
         raise OSError("offline")
 
-    monkeypatch.setattr(workorder_guard.urllib.request, "urlopen", unavailable)
+    monkeypatch.setattr(workorder_guard, "_open", unavailable)
     with pytest.raises(workorder_guard.WorkorderAuthorizationError):
         workorder_guard.check_task(task.id, reserve=True)

@@ -1082,18 +1082,6 @@ def _input_sha(dispatch: WorkflowTaskDispatch, working_dir: str) -> str:
 
 def dispatch_task(workflow_id: str,
                   dispatch: WorkflowTaskDispatch) -> WorkflowDispatchResult:
-    guarded = db.get_workflow(workflow_id)
-    if guarded and guarded.config.get("workorder_guard"):
-        from .config import DEFAULT_CLI, load_providers
-        selected = load_providers().get(dispatch.provider or DEFAULT_CLI, {})
-        if selected.get("executor") or dispatch.worktree:
-            raise db.WorkflowConflictError("Workorders require an owned local headless process")
-        if dispatch.working_dir and os.path.realpath(dispatch.working_dir) != os.path.realpath(guarded.repository_path):
-            raise db.WorkflowConflictError("Workorder working directory is pinned")
-        if (dispatch.skip_permissions or dispatch.machine or dispatch.herdr_target
-                or dispatch.max_retries != 0 or not dispatch.task_timeout
-                or dispatch.task_timeout > 3600):
-            raise db.WorkflowConflictError("Workorder tasks require bounded local execution without retries")
     if dispatch.role not in {WorkflowRole.EXECUTOR, WorkflowRole.REVIEWER}:
         raise db.WorkflowConflictError("W1 can dispatch only executor or reviewer")
     external = dispatch.execution_mode is WorkflowExecutionMode.EXTERNAL
@@ -1112,6 +1100,11 @@ def dispatch_task(workflow_id: str,
     with db._connect(immediate=True) as conn:
         workflow = _workflow_row(conn, workflow_id)
         _require_version(workflow, dispatch.expected_version)
+        from .workorder_guard import prepare_dispatch, WorkorderAuthorizationError
+        try:
+            dispatch, workorder_binding = prepare_dispatch(conn, workflow, dispatch)
+        except WorkorderAuthorizationError as exc:
+            raise db.WorkflowConflictError(str(exc)) from exc
         state = WorkflowStatus(workflow["status"])
         required = (
             WorkflowStatus.QUEUED
@@ -1171,6 +1164,7 @@ def dispatch_task(workflow_id: str,
                 "provider": dispatch.provider,
                 "herdr_target": dispatch.herdr_target,
                 "machine": dispatch.machine,
+                **({"workorder_binding": workorder_binding} if workorder_binding is not None else {}),
             },
         ))
         if dispatch.role is WorkflowRole.EXECUTOR:

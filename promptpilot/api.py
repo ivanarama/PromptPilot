@@ -407,6 +407,8 @@ def api_update_task(task_id: int, update: TaskUpdate):
         recurrence = update.recurrence.strip()
         if recurrence and db.parse_recurrence(recurrence) is None:
             raise HTTPException(400, "Повтор не разобран: «6h», «90m», «daily@09:00»")
+        if recurrence and db.workorder_recurrence_forbidden(task_id):
+            raise HTTPException(409, "Workorder tasks cannot acquire a recurring schedule")
         fields["recurrence"] = recurrence or None
     if update.scheduled_at is not None:
         fields["scheduled_at"] = update.scheduled_at
