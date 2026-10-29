@@ -52,6 +52,21 @@ def transaction(server,tmp_path,*,owner=None):
     return Publication(server,CONFIG,Journal(tmp_path),server.guard,seed,clock=lambda:server.now)
 
 
+def test_publication_forwards_final_gate_after_each_semantic_phase(tmp_path):
+    server=Server();phases=[]
+    class Gate:
+        def __call__(self,payload,*,write=False):return server.guard(payload,write=write)
+        def final_before_post(self,payload,snapshot):
+            phases.append(payload['kind'])
+            if payload['kind']=='completion':raise PipelineError('final server lease expired')
+    journal=Journal(tmp_path)
+    with pytest.raises(PipelineError,match='final server lease expired'):
+        Publication(server,CONFIG,journal,Gate(),PAYLOAD,clock=lambda:server.now).run()
+    assert phases==['publication','claim','completion']
+    assert server.posts==['publication','claim']
+    assert journal.pending_for(PAYLOAD['pr'])==[]
+
+
 def test_three_immutable_phases_complete_once_and_cache_loss_does_not_repeat(tmp_path):
     server=Server()
     result=transaction(server,tmp_path/'first').run()

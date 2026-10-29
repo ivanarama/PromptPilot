@@ -13,7 +13,7 @@ from .review_routing_wire import records, render
 
 
 class Transport:
-    def __init__(self,gh,config,journal,guard):
+    def __init__(self,gh,config,journal,guard,*,final_before_post=None):
         if not callable(guard):
             raise PipelineError('routing transport requires a fresh stage guard')
         self.gh=gh
@@ -21,6 +21,10 @@ class Transport:
         self.trusted=config['trusted_account']
         self.journal=journal
         self.guard=guard
+        final=final_before_post if final_before_post is not None else getattr(guard,'final_before_post',None)
+        if final is not None and not callable(final):
+            raise PipelineError('routing final-before-POST guard must be callable')
+        self.final_before_post=final
 
     def _snapshot(self,payload,*,write=False):
         snapshot=self.guard(payload,write=write)
@@ -83,6 +87,11 @@ class Transport:
         try:
             snapshot=self._snapshot(payload,write=True)
             matches=self._matches(snapshot,payload,body)
+            if not matches and self.final_before_post is not None:
+                # Reducer/exact-body matching and every SQLite wait have
+                # finished. The public guard repeats cheap request/server
+                # expiry here, immediately before the network boundary.
+                self.final_before_post(payload,snapshot)
         except Exception:
             self.journal.refuse_before_post(owner=owner,phase=phase,generation=generation,body=body)
             raise

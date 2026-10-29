@@ -54,6 +54,54 @@ def invoke(server,tmp_path):
     return Transport(server,CONFIG,Journal(tmp_path),server.guard).publish(PAYLOAD,owner=OWNER,phase='publication')
 
 
+def test_final_expiry_after_slow_exact_matching_refuses_without_post(tmp_path):
+    server=Server();events=[]
+    class Gate:
+        expired=False
+        def __call__(self,payload,*,write=False):
+            events.append('write' if write else 'read')
+            return server.guard(payload,write=write)
+        def final_before_post(self,payload,snapshot):
+            events.append('final')
+            if self.expired:raise PipelineError('request expired during exact matching')
+    gate=Gate();journal=Journal(tmp_path)
+    transport=Transport(server,CONFIG,journal,gate)
+    original=transport._matches
+    def delayed_matching(*args):
+        result=original(*args)
+        if events[-1]=='write':gate.expired=True
+        return result
+    transport._matches=delayed_matching
+    with pytest.raises(PipelineError,match='expired during exact matching'):
+        transport.publish(PAYLOAD,owner=OWNER,phase='publication')
+    assert events==['read','write','final'] and server.posts==0
+    assert journal.get(owner=OWNER,phase='publication')['state']=='not-sent'
+    # A definite pre-network refusal does not invent uncertainty. Retry needs
+    # every normal gate again and may send just once after a fresh request.
+    transport._matches=original;gate.expired=False
+    assert transport.publish(PAYLOAD,owner=OWNER,phase='publication').id=='1000'
+    assert server.posts==1
+
+
+def test_final_guard_is_not_used_for_readonly_exact_receipt_recovery(tmp_path):
+    server=Server();server.body=render(PAYLOAD)
+    def forbid(*args):pytest.fail('known receipt must stay a read-only recovery')
+    transport=Transport(server,CONFIG,Journal(tmp_path),server.guard,final_before_post=forbid)
+    assert transport.publish(PAYLOAD,owner=OWNER,phase='publication').id=='1000'
+    assert server.posts==0
+
+
+def test_final_guard_crash_keeps_sending_fence_and_never_retries_post(tmp_path):
+    server=Server();journal=Journal(tmp_path)
+    def crash(*args):raise SystemExit('process died at final boundary')
+    transport=Transport(server,CONFIG,journal,server.guard,final_before_post=crash)
+    with pytest.raises(SystemExit):transport.publish(PAYLOAD,owner=OWNER,phase='publication')
+    assert journal.get(owner=OWNER,phase='publication')['state']=='attempting'
+    with pytest.raises(PipelineError,match='unique authenticated'):
+        invoke(server,tmp_path)
+    assert server.posts==0
+
+
 def test_normal_publication_and_lost_response_with_visible_receipt_have_one_post(tmp_path):
     for index,server in enumerate([Server(),Server(lose_response=True)]):
         directory=tmp_path/str(index)

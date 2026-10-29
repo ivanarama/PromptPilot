@@ -29,7 +29,8 @@ class Publication:
         self.trusted=config['trusted_account']
         self.journal=journal
         self.guard=guard
-        self.transport=Transport(gh,config,journal,self._guarded_snapshot)
+        self.transport=Transport(gh,config,journal,self._guarded_snapshot,
+                                 final_before_post=getattr(guard,'final_before_post',None))
         self.clock=clock or (lambda:datetime.now(timezone.utc))
 
     def _state(self):
