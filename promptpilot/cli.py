@@ -720,6 +720,30 @@ def workflow_gate(reference, verdict, gate_id, summary, evidence):
     click.echo(f"Workflow {updated.slug}: {updated.status.value}")
 
 
+@workflow_group.command("recover-gate")
+@click.argument("reference")
+@click.option("--execution-id", required=True)
+@click.option("--recovery-nonce", required=True)
+@click.option("--expected-version", required=True, type=click.IntRange(min=0))
+@click.option("--reason", required=True)
+@click.option("--acknowledge-gate-effects-reviewed", is_flag=True, required=True,
+              help="I checked that old processes stopped and reviewed effects/checkout. "
+                   "The server cannot verify this acknowledgement.")
+def workflow_recover_gate(reference, execution_id, recovery_nonce, expected_version,
+                          reason, acknowledge_gate_effects_reviewed):
+    """Resolve one UNKNOWN execution and await a fresh gate, without spawning."""
+    from .gate_execution import recover_unknown_gate
+    from .models import WorkflowGateRecovery
+
+    item = _workflow_or_exit(reference)
+    updated = _workflow_call_cli(recover_unknown_gate, item.id, WorkflowGateRecovery(
+        execution_id=execution_id, recovery_nonce=recovery_nonce,
+        expected_version=expected_version, reason=reason,
+        acknowledge_gate_effects_reviewed=acknowledge_gate_effects_reviewed,
+    ))
+    click.echo(f"Workflow {updated.slug}: {updated.status.value}; next advance starts a new gate")
+
+
 @workflow_group.command("review")
 @click.argument("reference")
 @click.argument(

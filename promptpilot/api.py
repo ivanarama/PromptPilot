@@ -51,6 +51,7 @@ from .models import (
     WorkflowPlanReplace,
     WorkflowDispatchResult,
     WorkflowGateDecision,
+    WorkflowGateRecovery,
     WorkflowHistoryImport,
     WorkflowHumanInput,
     WorkflowReviewDecision,
@@ -1131,6 +1132,13 @@ def api_record_workflow_gate(
     workflow_id: str, decision: WorkflowGateDecision
 ):
     return _workflow_action(workflows.record_gate, workflow_id, decision)
+
+
+@app.post("/api/workflows/{workflow_id}/gate/recover", response_model=WorkflowInDB)
+def api_recover_workflow_gate(workflow_id: str, request: WorkflowGateRecovery):
+    from .gate_execution import recover_unknown_gate
+
+    return _workflow_action(recover_unknown_gate, workflow_id, request)
 
 
 @app.post(
