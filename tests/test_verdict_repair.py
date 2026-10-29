@@ -56,11 +56,11 @@ def test_repair_verdict_uses_stdin_transport_for_stdin_providers(monkeypatch):
     run, _ = _fake_run(stdout="ИТОГ: НЕ СМОГ — не вышло\n", capture=calls)
     monkeypatch.setattr(worker.subprocess, "run", run)
 
-    verdict = _repair_verdict(TASK, "codex", {"prompt_stdin": True}, "хвост", "/tmp")
+    verdict = _repair_verdict(TASK, "claude", {"prompt_stdin": True}, "хвост", "/tmp")
 
     assert verdict == "НЕ СМОГ"
     cmd, kwargs = calls[0]
-    assert cmd[-1] == "-"
+    assert "-p" in cmd
     assert kwargs["input"].startswith("Предыдущий ответ не содержал")
     assert "хвост" in kwargs["input"]
 
