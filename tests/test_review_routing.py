@@ -123,7 +123,9 @@ def test_report_hash_binds_category_evidence_head_and_exact_unicode_without_norm
     b'\xef\xbb\xbf{}', b'\xff', b'{"head":1,"head":2}',
     b'{"head":NaN}', b'{"head":Infinity}', b'[]', b'{}',
     b' ' * (MAX_REPORT_BYTES + 1),
-], ids=["bom", "invalid-utf8", "duplicate-key", "nan", "infinity", "array", "empty", "oversized"])
+    b'[' * 5000 + b'0' + b']' * 5000,
+], ids=["bom", "invalid-utf8", "duplicate-key", "nan", "infinity", "array", "empty", "oversized",
+        "excessive-nesting"])
 def test_public_cli_rejects_ambiguous_invalid_and_oversized_json(tmp_path, capsys, data):
     report = tmp_path / "report.json"
     report.write_bytes(data)

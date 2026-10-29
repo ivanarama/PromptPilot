@@ -279,6 +279,9 @@ def load_config(path: str) -> dict:
     data.setdefault("review_lease_seconds", 7200)
     data.setdefault("target_reservation_ttl_seconds", data["review_lease_seconds"])
     data.setdefault("fallback_handoff", "legacy")
+    data.setdefault("parallel_fix_enabled", False)
+    if type(data["parallel_fix_enabled"]) is not bool:
+        raise PipelineError("parallel_fix_enabled must be a boolean")
     data.setdefault("parallel_content_review", False)
     if not isinstance(data["parallel_content_review"], bool):
         raise PipelineError("parallel_content_review must be a boolean")
@@ -1225,10 +1228,14 @@ def ensure_identity(gh: GitHub, config: dict) -> None:
 def capabilities(config: dict) -> dict:
     return {"protocol": "promptpilot-pipelinectl-v1", "repository": config["repository"],
             "stages": {"review": "content-or-integration",
-                       "merge": "clean-ordinary-with-cleanup-recovery"},
+                       "merge": "clean-ordinary-with-cleanup-recovery",
+                       "fix": "signed-target-repository-gates" if config.get(
+                           "parallel_fix_enabled") else "off"},
             "review_completion_gate": config.get("review_completion_gate", "health"),
             "fallback_handoff": config.get("fallback_handoff", "legacy"),
             "target_reservations": "sqlite-task-lease-v1",
+            "parallel_fix_election": "disabled-by-default" if not config.get(
+                "parallel_fix_enabled") else "signed-target-v1",
             # Opt-in but unfinished (issue #42): see _base_sync_owner_action.
             "base_sync_merge": "experimental" if config.get("base_sync_merge") else "off",
             "fallback": "repository skill"}
@@ -1383,6 +1390,105 @@ def _review_health_without_targets(health: dict, unavailable: set[tuple]) -> dic
             filtered[field] = [value for value in values
                                if _target_key(value) not in unavailable]
     return filtered
+
+
+def _fix_candidate_key(candidate: dict) -> tuple[str, int, str]:
+    """Normalize a FIX election candidate, without granting mutation authority.
+
+    The health report currently calls PR-rework candidates ``review``. An
+    issue has no commit HEAD: its 40-hex eligibility digest must be supplied
+    by the versioned health contract, never inferred from display text or
+    ``updated_at`` alone. The live GitHub state still needs a separate gate.
+    """
+    if not isinstance(candidate, dict):
+        raise PipelineError("pipeline health returned an invalid FIX candidate")
+    raw_stage = candidate.get("stage")
+    if raw_stage in {"review", "fix-pr"}:
+        stage = "fix-pr"
+        revision = candidate.get("head")
+    elif raw_stage == "fix-issue":
+        stage = "fix-issue"
+        revision = candidate.get("eligibility_digest")
+    else:
+        raise PipelineError("pipeline health returned an unknown FIX target kind")
+    number = candidate.get("number")
+    if (type(number) is not int or number <= 0
+            or not isinstance(revision, str)
+            or not re.fullmatch(r"[0-9a-f]{40}", revision)):
+        raise PipelineError("pipeline health returned an unversioned FIX target")
+    return stage, number, revision
+
+
+def _ordered_fix_candidates(candidates: list[dict]) -> list[dict]:
+    """Keep canonical FIX precedence and health's priority order within each kind."""
+    if not isinstance(candidates, list):
+        raise PipelineError("pipeline health returned invalid FIX candidates")
+    keyed = [(_fix_candidate_key(item), item) for item in candidates]
+    prs = [pair for pair in keyed if pair[0][0] == "fix-pr"]
+    issues = [pair for pair in keyed if pair[0][0] == "fix-issue"]
+    return [item for _key, item in (*prs, *issues)]
+
+
+def _elect_fix_candidate(config: dict, candidates: list[dict]) -> tuple[dict | None, dict | None]:
+    """Atomically reserve one exact FIX target for a claimed task attempt.
+
+    The disabled-by-default route also requires its signed handoff, a paired
+    repository consumer and live ownership/project gates before each write.
+    """
+    if config.get("parallel_fix_enabled") is not True:
+        raise PipelineError("parallel FIX election is disabled")
+    ordered = _ordered_fix_candidates(candidates)
+    task_id = _pipeline_task_id(required=True)
+    task_started_at = _pipeline_task_started_at(required=True)
+    ownership_kind = _provider_ownership_kind(required=True)
+    from . import db as scheduler_db
+
+    keys = [_fix_candidate_key(item) for item in ordered]
+    own = next((item for item in scheduler_db.list_pipeline_target_reservations(
+        repository=config["repository"])
+                if int(item["task_id"]) == task_id), None)
+    if own is not None:
+        own_key = (own["stage"], int(own["number"]), own["head"])
+        if own_key not in keys:
+            raise PipelineError(
+                "existing FIX target reservation is no longer eligible; start a new task")
+        ordered = [ordered[keys.index(own_key)]]
+    for candidate in ordered:
+        stage, number, revision = _fix_candidate_key(candidate)
+        reservation = scheduler_db.reserve_pipeline_target(
+            config["repository"], stage, number, revision, task_id,
+            int(config.get("target_reservation_ttl_seconds", 7200)),
+            task_started_at=task_started_at,
+            ownership_kind=ownership_kind,
+        )
+        if reservation is not None:
+            return candidate, reservation
+        if own is not None:
+            raise PipelineError(
+                "existing FIX target reservation was lost; start a new task")
+    return None, None
+
+
+def next_fix(gh: GitHub, config: dict, *, config_path: str | None = None) -> dict:
+    """Select one exact FIX target; never expose an untargeted skill fallback."""
+    if config.get("parallel_fix_enabled") is not True:
+        raise PipelineError("parallel FIX route is disabled")
+    if _configured_replica_count() < 2:
+        raise PipelineError("parallel FIX route requires at least two replicas")
+    from . import fix_handoff
+
+    health = run_health(config, config_path=config_path)
+    fix_handoff.consumer_digest(config, str(Path.cwd().resolve()))
+    ordered = fix_handoff.ordered_health_candidates(
+        health, excluded=admission_exclusions())
+    if not ordered:
+        return {"action": "empty", "stage": "fix", "verdict": "ПУСТО",
+                "reason": "no executable FIX target"}
+    candidate, reservation = _elect_fix_candidate(config, ordered)
+    if candidate is None:
+        return {"action": "wait", "stage": "fix", "verdict": "ПУСТО",
+                "reason": "all current FIX targets are reserved by other replicas"}
+    return fix_handoff.create(config, health, candidate, reservation)
 
 
 def _elect_review_candidate(config: dict, health: dict,
@@ -2284,12 +2390,16 @@ def run(argv=None) -> int:
     inventory_parser = sub.add_parser("inventory")
     inventory_parser.add_argument("--health-file", help="read an existing health JSON snapshot")
     next_parser = sub.add_parser("next")
-    next_parser.add_argument("stage", choices=("review", "merge"))
+    next_parser.add_argument("stage", choices=("review", "merge", "fix"))
     gate_parser = sub.add_parser("gate-fallback")
-    gate_parser.add_argument("stage", choices=("review", "merge"))
+    gate_parser.add_argument("stage", choices=("review", "merge", "fix"))
     gate_lease = gate_parser.add_mutually_exclusive_group(required=True)
     gate_lease.add_argument("--lease")
     gate_lease.add_argument("--lease-file")
+    owner_parser = sub.add_parser("gate-fix-owner")
+    owner_lease = owner_parser.add_mutually_exclusive_group(required=True)
+    owner_lease.add_argument("--lease")
+    owner_lease.add_argument("--lease-file")
     complete_parser = sub.add_parser("complete")
     complete_parser.add_argument("stage", choices=("review", "merge", "merge-cleanup"))
     complete_lease = complete_parser.add_mutually_exclusive_group(required=True)
@@ -2328,13 +2438,24 @@ def run(argv=None) -> int:
                     health = run_health(dict(config, sync_base_before_health=False))
                 value = inventory(gh, config, health)
             elif args.command == "next":
-                value = (next_review(gh, config, config_path=args.config)
-                         if args.stage == "review"
-                         else next_merge(gh, config, config_path=args.config))
+                if args.stage == "review":
+                    value = next_review(gh, config, config_path=args.config)
+                elif args.stage == "merge":
+                    value = next_merge(gh, config, config_path=args.config)
+                else:
+                    value = next_fix(gh, config, config_path=args.config)
+            elif args.command == "gate-fix-owner":
+                from .fix_handoff import gate
+                value = gate(gh, config, args.lease, config_path=args.config,
+                             ownership_only=True)
             elif args.command == "gate-fallback":
-                from .fallback_handoff import gate
-
-                value = gate(gh, config, args.stage, args.lease, config_path=args.config)
+                if args.stage == "fix":
+                    from .fix_handoff import gate
+                    value = gate(gh, config, args.lease, config_path=args.config)
+                else:
+                    from .fallback_handoff import gate
+                    value = gate(gh, config, args.stage, args.lease,
+                                 config_path=args.config)
             elif args.stage == "review":
                 if not args.report:
                     raise PipelineError("complete review requires --report")

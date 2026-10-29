@@ -151,6 +151,8 @@ def inspect_file(path: str, expected_head: str) -> dict:
                             parse_constant=lambda value: _reject_constant(value))
     except UnicodeError as exc:
         raise PipelineError("routing report is not strict UTF-8") from exc
+    except RecursionError as exc:
+        raise PipelineError("routing report JSON nesting is too deep") from exc
     return inspect_report(report, expected_head)
 
 

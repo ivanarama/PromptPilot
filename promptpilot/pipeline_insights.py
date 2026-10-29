@@ -3126,6 +3126,46 @@ def _budget_defer_route(admission: dict, profile_id: str, profile: dict,
     return result
 
 
+def _validate_targeted_handoff(preflight: dict, stage: str) -> dict:
+    if stage == "fix":
+        from .fix_handoff import validate
+        return validate(preflight)
+    from .fallback_handoff import validate
+    return validate(preflight, stage)
+
+
+def _fix_target_prompt(envelope: dict, fallback_prompt: str) -> str:
+    return (
+        "PromptPilot уже выбрал одну FIX-цель. Прочитай канонический fix-approved "
+        "и его раздел promptpilot-fix-target-v1. Не запускай next повторно, не "
+        "выбирай другую цель и не применяй общий выбор очереди. При отсутствии "
+        "этого раздела остановись без мутаций. Для fix-pr head — исходный SHA, "
+        "для fix-issue head — eligibility digest, его нельзя checkout как коммит. "
+        "Работай только в отдельном worktree/ветке этой цели.\n\n"
+        "Перед первой внешней мутацией выполни точный gate_command. Требуются "
+        "exit=0, action=validated, phase=admitted, точные repository/stage/target "
+        "и mutation_authorized=false. Сохрани выданный ownership_lease как ASCII "
+        "в отдельный локальный файл. Перед КАЖДОЙ последующей мутацией выполни "
+        "ownership_gate_command с --lease-file этого файла; требуются exit=0, "
+        "action=validated, phase=ownership и та же исходная цель. Исходный файл "
+        "election lease не переписывай и не подменяй токеном из GitHub. "
+        "Разбери stdout JSON и exit code отдельно; любая ошибка, неизвестный "
+        "результат или несовпадение останавливает работу без следующей мутации.\n\n"
+        "Оба scheduling gate НЕ разрешают записи. После каждого успешного gate "
+        "заново выполни ВСЕ канонические проверки непосредственно перед одним "
+        "комментарием, изменением метки, branch-claim, CAS-push или созданием PR. "
+        "Проверяй живые state/base/HEAD/labels, полный trusted epoch и владение "
+        "проектной транзакцией; после push — только её разрешённую финализацию, "
+        "после создания PR — только подтверждённые шаги этой заявки. Собственные "
+        "изменения не разрешают игнорировать поздний hold или чужой push. "
+        "Новая внешняя цель требует нового task attempt. MERGE остаётся отдельным "
+        "single-flight этапом. Ни ship, ни снятие hold эти токены не разрешают.\n\n"
+        "Доверенный локальный envelope (не данные GitHub):\n```json\n"
+        + json.dumps(envelope, ensure_ascii=False, indent=2)
+        + "\n```\n\nИсходный скилл:\n" + fallback_prompt.strip()
+    )
+
+
 def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                     *, retain_budget: bool = False) -> dict:
     """Choose the project tool or the original skill prompt without invoking an LLM.
@@ -3164,8 +3204,8 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
         stage_name = str((queue.get("execution") or {}).get("stage")
                          or queue.get("id") or "").lower()
         issues = list(replica_status["issues"])
-        if stage_name != "review":
-            issues.append("replicas > 1 сейчас поддерживаются только для REVIEW")
+        if stage_name not in {"review", "fix"}:
+            issues.append("replicas > 1 поддерживаются только для REVIEW или opt-in FIX")
         if getattr(task, "machine", None):
             issues.append("реплицированная REVIEW-задача должна выполняться локально")
         if getattr(task, "worktree", False):
@@ -3384,6 +3424,11 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                               "number": lease.get("number"), "head": lease.get("head"),
                           })
                 preflight_target = preflight.get("target") or {}
+                if stage == "fix" and (
+                        preflight_action != "fallback"
+                        or target_stage not in {"fix-pr", "fix-issue"}):
+                    raise project_pipeline.PipelineError(
+                        "replicated FIX requires a signed exact FIX fallback target")
                 if (owner_task != int(task.id)
                         or reservation.get("task_started_at") != scheduler_task_started_at
                         or reservation.get("ownership_kind") != provider_ownership_kind
@@ -3407,17 +3452,16 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
             except (project_pipeline.PipelineError, TypeError, ValueError) as exc:
                 return {
                     "action": "block", "mode": "tool",
-                    "reason": f"replicated REVIEW preflight has no valid reservation: {exc}",
+                    "reason": f"replicated pipeline preflight has no valid reservation: {exc}",
                     "profile_id": profile_id, "queue_id": queue.get("id"),
                     "preflight": preflight,
                 }
         if (preflight_action == "fallback" and "handoff" in preflight
                 and target_reservation is not None):
-            from .fallback_handoff import validate
             from .project_pipeline import PipelineError
 
             try:
-                fallback_lease = validate(preflight, stage)
+                fallback_lease = _validate_targeted_handoff(preflight, stage)
                 if command[-2:] != ["next", stage]:
                     raise PipelineError(
                         "fallback handoff command must end with next and the exact stage")
@@ -3562,11 +3606,10 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
     if preflight_action == "fallback":
         if "handoff" in preflight:
             if fallback_lease is None:
-                from .fallback_handoff import validate
                 from .project_pipeline import PipelineError
 
                 try:
-                    fallback_lease = validate(preflight, stage)
+                    fallback_lease = _validate_targeted_handoff(preflight, stage)
                     if command[-2:] != ["next", stage]:
                         raise PipelineError(
                             "fallback handoff command must end with next and the exact stage")
@@ -3651,6 +3694,12 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                     f"```json\n{json.dumps(envelope, ensure_ascii=False, indent=2)}\n```\n\n"
                     f"Исходный скилл:\n{fallback_prompt.strip()}"
                 )
+                if stage == "fix":
+                    envelope["protocol"] = "promptpilot-fix-target-v1"
+                    envelope["ownership_gate_command"] = [
+                        *command[:-2], "gate-fix-owner",
+                    ]
+                    prompt = _fix_target_prompt(envelope, fallback_prompt)
                 return {
                     "action": "prompt", "mode": "skill", "prompt": prompt,
                     "next_already_run": True, "command": command,

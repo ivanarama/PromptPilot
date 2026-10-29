@@ -7,17 +7,18 @@
 
 ## Инвентаризация существующего маршрута
 
-Основание — main `d7be4eb24e862d7028bcd863ddea7e24ff546076`, включающий
-независимо принятую в PR #144 парковку одной цели.
+Основание — main `5b31b8b9d469155ded04249b1e4f30a99a51416a`, включающий
+независимо принятую в PR #144 парковку одной цели и подписанный FIX-маршрут
+PR #141. Ни один из них не включает техническую передачу по новому отчёту.
 
 | Точка входа | Текущий контракт и ограничение для следующего среза |
 |---|---|
-| `project_pipeline.run` | `next` принимает только review/merge, `complete` — review/merge/merge-cleanup. Публичного `next fix` пока нет: его нужно согласовать с проектным исполнителем, а не объявить готовым в процедуре. |
+| `project_pipeline.run` | `next` принимает review/merge/fix, `complete` — review/merge/merge-cleanup. Подписанный `next fix` из PR #141 требует явного opt-in и совместимого проектного consumer. Он не читает новый технический outcome; отдельную передачу REVIEW → FIX ещё нужно согласовать и реализовать. |
 | `project_pipeline.next_review` | При depth >= 2 возвращает fallback с причиной third review round requires human-escalation rules; технический outcome не выдаёт. |
 | `project_pipeline.format_review` / `complete_review` | Legacy blockers — строки. Completion проверяет lease, identity, target/global gate и публикует review/claim/label/completion; новый report должен получить отдельный совместимый путь и привязку hash. |
 | `project_pipeline.content_review_target_gate` / `review_gate` | Текущие HEAD/epoch/routing и allowlist остаются mutation gates, их не заменяет offline validator. |
 | `fallback_handoff.gate` | HMAC/expiry и свежий допуск точной цели должны сохраняться для fallback; новый outcome сам по себе полномочий не добавляет. |
-| `pipeline_insights.execution_route` | Выбирает инструмент/полный проектный prompt. Будущий FIX нельзя добавить лишь новым label в health, без совместимого публичного dispatch. |
+| `pipeline_insights.execution_route` | Выбирает инструмент/полный проектный prompt; для opt-in FIX привязывает точную цель и TaskAttempt к подписанному handoff. Техническую передачу по новому отчёту нельзя добавить лишь новым label в health, без совместимого публичного dispatch. |
 | `pipeline_item_holds.register_review_target`, `prepare`, `record` | Уже сохраняют точную цель REVIEW и локальную парковку одной работы. Использовать существующий механизм, не создавать вторую парковку для #144. |
 
 Эта инвентаризация не доказывает готовность durable technical intent/recovery:
@@ -82,7 +83,8 @@ health. Она проверяет формат, совпадение с явно
 Порядок массивов и точный Unicode-текст сохраняются без нормализации.
 Кодировка строгая UTF-8 без BOM. SHA-256 включает весь отчёт, включая HEAD,
 категории, evidence, checks и tail. Входной JSON ограничен 256 KiB;
-повторяющиеся ключи и non-finite значения запрещены. Hash не удостоверяет автора.
+повторяющиеся ключи и non-finite значения запрещены. Чрезмерная глубина JSON
+возвращает обычный структурированный отказ команды. Hash не удостоверяет автора.
 
 ## Что требуется до рабочего среза A
 
