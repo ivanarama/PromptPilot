@@ -16,6 +16,7 @@ from promptpilot.review_routing_wire import render
 PAYLOAD=json.loads((Path(__file__).parent/'fixtures/review-routing-wire-v1.json').read_text(encoding='utf-8'))['records'][0]['payload']
 OWNER=PAYLOAD['owner']
 BODY=render(PAYLOAD)
+LEGACY_SCHEMA=(Path(__file__).parent/'fixtures/review-routing-journal-v1.sql').read_text(encoding='utf-8')
 REQUEST={'owner':OWNER,'phase':'publication','repository':'owner/repo','number':42,'body':BODY}
 
 
@@ -135,9 +136,7 @@ def test_legacy_pending_and_known_receipts_migrate_without_pre_network_rights(tm
     tmp_path.mkdir(exist_ok=True)
     database=tmp_path/'review-routing-journal.sqlite3'
     with closing(sqlite3.connect(database)) as connection:
-        connection.execute('''CREATE TABLE requests(owner TEXT,phase TEXT,repository TEXT,
-            pr_number INTEGER,body TEXT,body_sha256 TEXT,state TEXT,returned_id TEXT,
-            created_at REAL,updated_at REAL,PRIMARY KEY(owner,phase))''')
+        connection.execute(LEGACY_SCHEMA)
         connection.execute('INSERT INTO requests VALUES (?,?,?,?,?,?,?,?,?,?)',
             (OWNER,'publication','owner/repo',42,BODY,hashlib.sha256(BODY.encode()).hexdigest(),
              'pending',None,1.0,1.0))
@@ -156,3 +155,63 @@ def test_legacy_pending_and_known_receipts_migrate_without_pre_network_rights(tm
         journal.prepare(**REQUEST,with_generation=True)
     journal.confirm(owner=OWNER,phase='publication',returned_id='124',body=BODY)
     assert Journal(tmp_path).get(owner=OWNER,phase='publication')['returned_id']=='124'
+
+
+def test_interrupted_legacy_constructor_recovers_its_unversioned_empty_schema(tmp_path):
+    import sqlite3
+    class Interrupted(sqlite3.Connection):
+        def execute(self,statement,*args,**kwargs):
+            if statement=='PRAGMA user_version=1':
+                raise SystemExit('crash after old autocommitted CREATE TABLE')
+            return super().execute(statement,*args,**kwargs)
+    database=tmp_path/'review-routing-journal.sqlite3'
+    with pytest.raises(SystemExit):
+        with closing(sqlite3.connect(database,factory=Interrupted)) as connection:
+            with connection:
+                connection.execute(LEGACY_SCHEMA)
+                connection.execute('PRAGMA user_version=1')
+    with closing(sqlite3.connect(database)) as connection:
+        assert connection.execute('PRAGMA user_version').fetchone()[0]==0
+        assert len(connection.execute('PRAGMA table_info(requests)').fetchall())==10
+    journal=Journal(tmp_path)
+    generation=journal.prepare(**REQUEST,with_generation=True)
+    assert isinstance(generation,str)
+    journal.arm(owner=OWNER,phase='publication',generation=generation,body=BODY)
+    journal.refuse_before_post(owner=OWNER,phase='publication',generation=generation,body=BODY)
+
+
+@pytest.mark.parametrize('version',[0,1,2])
+def test_unknown_schema_is_refused_without_false_version_upgrade(tmp_path,version):
+    import sqlite3
+    database=tmp_path/'review-routing-journal.sqlite3'
+    with closing(sqlite3.connect(database)) as connection:
+        connection.execute('CREATE TABLE requests(owner TEXT,unexpected_data BLOB)')
+        connection.execute(f'PRAGMA user_version={version}')
+    with pytest.raises(PipelineError,match='schema'):
+        Journal(tmp_path)
+    with closing(sqlite3.connect(database)) as connection:
+        assert connection.execute('PRAGMA user_version').fetchone()[0]==version
+        assert [row[1] for row in connection.execute('PRAGMA table_info(requests)')]==['owner','unexpected_data']
+
+
+@pytest.mark.parametrize('variant',['history','literal','index'])
+def test_unversioned_database_is_not_inferred_empty_or_known_from_column_names(tmp_path,variant):
+    import hashlib
+    import sqlite3
+    database=tmp_path/'review-routing-journal.sqlite3'
+    with closing(sqlite3.connect(database)) as connection:
+        schema=LEGACY_SCHEMA.replace("'done'","'d one'") if variant=='literal' else LEGACY_SCHEMA
+        connection.execute(schema)
+        if variant=='history':
+            connection.execute('INSERT INTO requests VALUES (?,?,?,?,?,?,?,?,?,?)',
+                (OWNER,'publication','owner/repo',42,BODY,hashlib.sha256(BODY.encode()).hexdigest(),
+                 'pending',None,1.0,1.0))
+        if variant=='index':
+            connection.execute('CREATE INDEX unknown_custom_index ON requests(updated_at)')
+        connection.commit()
+    with pytest.raises(PipelineError,match='schema'):
+        Journal(tmp_path)
+    with closing(sqlite3.connect(database)) as connection:
+        assert connection.execute('PRAGMA user_version').fetchone()[0]==0
+        assert len(connection.execute('PRAGMA table_info(requests)').fetchall())==10
+        assert connection.execute('SELECT COUNT(*) FROM requests').fetchone()[0]==(1 if variant=='history' else 0)

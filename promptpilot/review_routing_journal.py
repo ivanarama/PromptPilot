@@ -20,6 +20,30 @@ from .review_routing_lease import decimal_id, owner_id
 from .review_routing_wire import parse
 
 
+LEGACY_SCHEMA='''CREATE TABLE IF NOT EXISTS requests (
+    owner TEXT NOT NULL,
+    phase TEXT NOT NULL,
+    repository TEXT NOT NULL,
+    pr_number INTEGER NOT NULL,
+    body TEXT NOT NULL,
+    body_sha256 TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('pending','ambiguous','done')),
+    returned_id TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY(owner,phase))'''
+SCHEMA=LEGACY_SCHEMA.replace("('pending','ambiguous','done')",
+    "('pending','attempting','ambiguous','done','not-sent')").replace(
+    'PRIMARY KEY(owner,phase)','generation TEXT, PRIMARY KEY(owner,phase)')
+
+
+def _schema_signature(value):
+    # SQLite removes IF NOT EXISTS when storing the original CREATE TABLE.
+    # Ignore layout only outside quoted SQL literals; 'd one' is not 'done'.
+    tokens=re.findall(r"'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"|[^\s'\"]+",value)
+    return ''.join(tokens).replace('IFNOTEXISTS','')
+
+
 class Journal:
     def __init__(self, directory):
         directory=Path(directory)
@@ -39,21 +63,26 @@ class Journal:
                 version=connection.execute('PRAGMA user_version').fetchone()[0]
                 if version not in (0,1,2):
                     raise PipelineError('unsupported routing journal version')
+                stored=connection.execute("SELECT type,sql FROM sqlite_master WHERE name='requests'").fetchone()
+                if stored is not None:
+                    expected=SCHEMA if version==2 else LEGACY_SCHEMA
+                    if stored['type']!='table' or _schema_signature(stored['sql'] or '')!=_schema_signature(expected):
+                        raise PipelineError('unsupported routing journal schema; preserve existing database')
+                    extras=connection.execute("SELECT name FROM sqlite_master WHERE tbl_name='requests' AND type IN ('trigger','index') AND sql IS NOT NULL").fetchall()
+                    if extras:
+                        raise PipelineError('unsupported routing journal schema objects; preserve existing database')
+                    if version==0:
+                        # v1 CREATE TABLE was autocommitted before its version
+                        # write. Only its known empty interrupted-init shape
+                        # is safe to recover as v1, never an unknown database.
+                        if connection.execute('SELECT 1 FROM requests LIMIT 1').fetchone():
+                            raise PipelineError('unversioned routing journal schema contains unknown history')
+                        version=1
+                elif version!=0:
+                    raise PipelineError('versioned routing journal schema is missing')
                 if version==1:
                     connection.execute('ALTER TABLE requests RENAME TO requests_v1')
-                connection.execute('''CREATE TABLE IF NOT EXISTS requests (
-                    owner TEXT NOT NULL,
-                    phase TEXT NOT NULL,
-                    repository TEXT NOT NULL,
-                    pr_number INTEGER NOT NULL,
-                    body TEXT NOT NULL,
-                    body_sha256 TEXT NOT NULL,
-                    state TEXT NOT NULL CHECK(state IN ('pending','attempting','ambiguous','done','not-sent')),
-                    returned_id TEXT,
-                    created_at REAL NOT NULL,
-                    updated_at REAL NOT NULL,
-                    generation TEXT,
-                    PRIMARY KEY(owner,phase))''')
+                connection.execute(SCHEMA)
                 if version==1:
                     # A legacy pending operation may already have sent a POST.
                     # NULL generation can never acquire pre-network refusal rights.
