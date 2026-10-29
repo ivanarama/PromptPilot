@@ -2,7 +2,11 @@
 
 Это внутренний подготовительный контракт #151. Сейчас доступны внутренние
 Python parser/reducer, согласованное чтение timeline и локальный SQLite-журнал
-write-ahead receipts; публичных writer,
+write-ahead receipts. Внутренний coordinator публикации восстанавливает
+publication/claim/completion, выбирает canonical owner, renewal/takeover и
+проверяет lifetime/resume/post-push ограничения до нового root. Он требует
+внешний полный stage guard, сам не аутентифицирует signed request и не меняет
+метки; публичных writer,
 handoff/dispatch, нового CLI или включённого capability нет. Срез не завершает A
 плана OneBase195, не снимает hold #1908 и не даёт полномочий на FIX или MERGE.
 

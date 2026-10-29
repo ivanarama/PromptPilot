@@ -115,6 +115,12 @@ class Journal:
             row=connection.execute('SELECT * FROM requests WHERE owner=? AND phase=?',(owner,phase)).fetchone()
             return dict(row) if row else None
 
+    def pending_for(self,pr):
+        """Recovery inventory only; no pending operation is permission to POST."""
+        with closing(self._connect()) as connection:
+            rows=connection.execute("SELECT * FROM requests WHERE state IN ('pending','ambiguous') ORDER BY created_at,owner,phase").fetchall()
+            return [dict(row) for row in rows if parse(row['body'])['pr']==pr]
+
     def ambiguous(self,*,owner,phase):
         self._key(owner,phase)
         with closing(self._connect()) as connection:
