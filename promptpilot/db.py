@@ -130,7 +130,8 @@ CREATE TABLE IF NOT EXISTS notifications (
     sent_at TEXT,
     pane_id TEXT,
     machine TEXT,
-    flow_ref TEXT
+    flow_ref TEXT,
+    kind TEXT
 );
 
 CREATE TABLE IF NOT EXISTS prompt_log (
@@ -255,6 +256,7 @@ CREATE TABLE IF NOT EXISTS workflow_runs (
     task_id INTEGER,
     status TEXT NOT NULL DEFAULT 'pending',
     input_sha256 TEXT NOT NULL,
+    input_json TEXT,
     output_sha256 TEXT,
     output_json TEXT,
     started_at TEXT,
@@ -371,6 +373,8 @@ CREATE INDEX IF NOT EXISTS idx_workflows_status ON workflows(status, updated_at)
 CREATE INDEX IF NOT EXISTS idx_workflow_stages_workflow ON workflow_stages(workflow_id, position);
 CREATE INDEX IF NOT EXISTS idx_workflow_rounds_workflow ON workflow_rounds(workflow_id, round_no);
 CREATE INDEX IF NOT EXISTS idx_workflow_runs_round ON workflow_runs(round_id, role, attempt_no);
+CREATE INDEX IF NOT EXISTS idx_workflow_runs_task ON workflow_runs(task_id);
+CREATE INDEX IF NOT EXISTS idx_workflow_plans_task ON workflow_plans(planner_task_id);
 CREATE INDEX IF NOT EXISTS idx_workflow_findings_workflow ON workflow_findings(workflow_id, status, severity);
 CREATE INDEX IF NOT EXISTS idx_workflow_artifacts_round ON workflow_artifacts(round_id, kind);
 CREATE INDEX IF NOT EXISTS idx_workflow_events_workflow ON workflow_events(workflow_id, seq);
@@ -411,6 +415,7 @@ MIGRATIONS = [
     "ALTER TABLE tasks ADD COLUMN effort TEXT",
     "ALTER TABLE notifications ADD COLUMN pane_id TEXT",
     "ALTER TABLE notifications ADD COLUMN machine TEXT",
+    "ALTER TABLE notifications ADD COLUMN kind TEXT",
     "ALTER TABLE workflows ADD COLUMN current_stage_id TEXT",
     "ALTER TABLE workflow_memory ADD COLUMN scope_stage TEXT",
     """CREATE TABLE IF NOT EXISTS workflow_plans (
@@ -492,6 +497,8 @@ MIGRATIONS = [
         updated_at TEXT NOT NULL
     )""",
     "CREATE INDEX IF NOT EXISTS idx_epf_jobs_task ON epf_jobs(task_id)",
+    # the assignment of a stage done outside PromptPilot (issue #122)
+    "ALTER TABLE workflow_runs ADD COLUMN input_json TEXT",
     # what the agent run may do (models.TaskRights); NULL = skip_permissions decides
     "ALTER TABLE tasks ADD COLUMN rights TEXT",
     # flow notifications carry "<item>:<step>" (approval) or "<item>:" (stuck item)
@@ -549,13 +556,12 @@ def _row_to_task(row: sqlite3.Row) -> TaskInDB:
 def _connect(immediate: bool = False):
     DB_DIR.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(DB_PATH), timeout=10)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys=ON")
-    if immediate:
-        # Take the write lock before reading: a claim that decides on a stale
-        # snapshot would hand the same task to two workers.
-        conn.execute("BEGIN IMMEDIATE")
     try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
+        if immediate:
+            # Setup can fail under contention too; always close the connection.
+            conn.execute("BEGIN IMMEDIATE")
         yield conn
         conn.commit()
     except Exception:
@@ -1256,6 +1262,8 @@ def get_next_runnable(
 
     The whole select-then-claim runs under the write lock, so several workers
     (threads of one worker, or separate processes) never claim the same row.
+    Global pause is checked under this same lock: a worker that passed an
+    earlier pause precheck cannot claim after the pause was acknowledged.
 
     busy_keys/key_fn — when the caller already runs tasks, candidates whose
     key_fn(task) is in busy_keys are passed over: that is how two agents are
@@ -1268,6 +1276,11 @@ def get_next_runnable(
     now = _now()
     busy = set(busy_keys or ())
     with _connect(immediate=True) as conn:
+        paused = conn.execute(
+            "SELECT value FROM settings WHERE key = 'worker_paused'"
+        ).fetchone()
+        if paused and paused["value"] == "1":
+            return None
         # The admission baton must reach a worker slot too. Otherwise an
         # endless stream of higher-priority runnable tasks can repeatedly be
         # claimed and denied while the selected waiter never reaches preflight.
@@ -1770,10 +1783,28 @@ def _effective_series_recurrence(row: dict, now: Optional[datetime] = None) -> s
 
 def list_series() -> list:
     """Durable recurring series with current occurrence and health counters."""
+    return _list_series()
+
+
+def _list_series(series_id: int | None = None) -> list:
+    # The dashboard needs every series, while a control acknowledgement needs
+    # only its target. Apply the same bound ID to every snapshot projection.
+    series_filter = " WHERE s.id = ?" if series_id is not None else ""
+    history_filter = " WHERE t.series_id = ?" if series_id is not None else ""
+    picked_filter = " AND series_id = ?" if series_id is not None else ""
+    bound = (series_id,) if series_id is not None else ()
     with _connect() as conn:
         # The summary and its sparse occurrence details must describe the same
         # queue snapshot even if a worker completes a run between SELECTs.
         conn.execute("BEGIN")
+        # An older auxiliary process can recreate idx_tasks_series after our
+        # startup migration. SQLite may then choose it and visit every task
+        # payload page despite this narrow projection. Prefer the covering
+        # index explicitly while preserving reads of a pre-migration database
+        # where that index does not exist yet. Metadata is read once per call.
+        summary_hint = (" INDEXED BY idx_tasks_series_summary" if any(
+            row[1] == "idx_tasks_series_summary"
+            for row in conn.execute("PRAGMA index_list(tasks)")) else "")
         series_rows = [dict(r) for r in conn.execute(
             """SELECT s.id, s.title, s.prompt, s.working_dir,
                       s.base_recurrence, s.temporary_recurrence,
@@ -1784,8 +1815,8 @@ def list_series() -> list:
                FROM task_series AS s
                LEFT JOIN settings AS auto_pause
                  ON auto_pause.key = ? || CAST(s.id AS TEXT)
-               ORDER BY s.id DESC""",
-            (_PIPELINE_REPEAT_BLOCKER_PAUSE_PREFIX,))]
+            """ + series_filter + " ORDER BY s.id DESC",
+            (_PIPELINE_REPEAT_BLOCKER_PAUSE_PREFIX,) + bound)]
         # Keep this read deliberately narrow.  Task result/prompt/note payloads
         # can be very large and none of them contributes to series health.
         # Fetching all series histories in one pass also avoids the old N+1
@@ -1794,9 +1825,9 @@ def list_series() -> list:
         for row in conn.execute(
                 """SELECT t.id, t.series_id, t.status, t.started_at,
                           t.completed_at, t.verdict
-                   FROM tasks AS t
+                   FROM tasks AS t""" + summary_hint + """
                    INNER JOIN task_series AS s ON s.id = t.series_id
-                   ORDER BY t.series_id DESC, t.id DESC"""):
+                """ + history_filter + " ORDER BY t.series_id DESC, t.id DESC", bound):
             task_rows_by_series.setdefault(row["series_id"], []).append(dict(row))
 
         # Only the current active occurrence exposes its error/schedule, and
@@ -1813,8 +1844,8 @@ def list_series() -> list:
                               MAX(CASE WHEN status IN
                                   ('completed', 'failed', 'cancelled')
                                   THEN id END) AS last_id
-                       FROM tasks
-                       WHERE series_id IS NOT NULL
+                       FROM tasks""" + summary_hint + """
+                       WHERE series_id IS NOT NULL""" + picked_filter + """
                        GROUP BY series_id
                    )
                    SELECT 'active' AS kind, t.series_id, t.id, t.machine,
@@ -1830,7 +1861,7 @@ def list_series() -> list:
                           NULL AS herdr_target
                    FROM tasks AS t
                    INNER JOIN picked ON picked.last_id = t.id
-                   INNER JOIN task_series AS s ON s.id = t.series_id"""):
+                   INNER JOIN task_series AS s ON s.id = t.series_id""", bound):
             task_details[(row["kind"], row["series_id"])] = dict(row)
 
         out = []
@@ -1901,7 +1932,7 @@ def list_series() -> list:
 
 
 def get_series(series_id: int) -> Optional[dict]:
-    return next((s for s in list_series() if s["id"] == series_id), None)
+    return next(iter(_list_series(series_id)), None)
 
 
 SERIES_EDITABLE_FIELDS = ("title", "base_recurrence", "temporary_recurrence",
@@ -2590,7 +2621,7 @@ def clear_pipeline_series_wake(series_id: int) -> bool:
 
 
 def series_action(series_id: int, action: str, *, retry_blocked: bool = False) -> bool:
-    with _connect() as conn:
+    with _connect(immediate=True) as conn:
         row = conn.execute("SELECT * FROM task_series WHERE id = ?", (series_id,)).fetchone()
         if not row:
             return False
@@ -4724,6 +4755,55 @@ def update_epf_job(job_id: int, fields: dict):
         )
 
 
+def queue_herdr_completions(source_key: str, completions: list[dict], chat_ids: list[int], *, machine: str = "",
+                            present_panes: Optional[list[str]] = None) -> int:
+    """Atomically observe completion identities and enqueue durable delivery.
+
+    First successful observation baselines old sessions. Later observations,
+    including the first after a restart, enqueue every visible new identity.
+    Delivery uses the existing persistent notification outbox.
+    """
+    key = "herdr_watch_completion_v2:" + source_key
+    queued = 0
+    with _connect(immediate=True) as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        state = _json_load(row["value"], {}) if row else {}
+        initialized = state.get("initialized", False)
+        observed = state.setdefault("observed", {})
+        if present_panes is not None:
+            present = set(present_panes)
+            # Without an instance identity, observed absence is the only proof
+            # that reusing a pane starts a new lifetime. Stable terminal/session
+            # cursors survive layout moves and temporary absence.
+            observed = {slot: value for slot, value in observed.items()
+                        if not slot.startswith("legacy:") or slot[7:] in present}
+            state["observed"] = observed
+        for completion in completions:
+            pane = completion["pane"]
+            terminal = completion.get("terminal_id")
+            session = completion.get("agent_session")
+            if isinstance(terminal, str) and terminal:
+                slot = "terminal:" + terminal
+            elif isinstance(session, dict) and session.get("value"):
+                slot = "session:" + _json_dump({field: session.get(field) for field in ("agent", "kind", "value")})
+            else:
+                slot = "legacy:" + pane
+            identity = {"sequence": completion["sequence"]}
+            if observed.get(slot) == identity:
+                continue
+            if initialized:
+                for chat_id in chat_ids:
+                    conn.execute(
+                        "INSERT INTO notifications(tg_chat_id,message,created_at,pane_id,machine,kind) VALUES(?,?,?,?,?,?)",
+                        (int(chat_id), completion["message"], _now(), pane, machine, "herdr.done"),
+                    )
+                    queued += 1
+            observed[slot] = identity
+        state["initialized"] = True
+        conn.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (key, _json_dump(state)))
+    return queued
+
+
 def add_notification(tg_chat_id: int, message: str, task_id: int = None,
                      pane_id: str = None, machine: str = None,
                      flow_ref: str = None):
@@ -4939,6 +5019,7 @@ def _row_to_workflow_round(row: sqlite3.Row) -> WorkflowRoundInDB:
 
 def _row_to_workflow_run(row: sqlite3.Row) -> WorkflowRunInDB:
     data = dict(row)
+    data["input"] = _json_load(data.pop("input_json", None), None)
     data["output"] = _json_load(data.pop("output_json"), None)
     for field in ("started_at", "completed_at"):
         data[field] = _parse_dt(data[field])

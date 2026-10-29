@@ -11,7 +11,7 @@ from click.testing import CliRunner
 from promptpilot import bot, pipeline_insights
 from promptpilot.api import HERDR_UI_KEYS, app
 from promptpilot.cli import cli
-from promptpilot.models import TaskCreate, WorkflowCreate
+from promptpilot.models import TaskCreate, WorkflowCreate, WorkflowEventCreate
 
 
 def payload(slug="api-workflow"):
@@ -68,6 +68,33 @@ def test_workflow_api_create_read_update_and_history(isolated_db):
     assert request("GET", f"/api/workflows/{created['id']}/rounds").json() == []
     assert request("GET", f"/api/workflows/{created['id']}/findings").json() == []
     assert request("GET", f"/api/workflows/{created['id']}/artifacts").json() == []
+
+
+def test_workflow_event_tail_uses_latest_page_in_chronological_order(isolated_db):
+    workflow = isolated_db.create_workflow(WorkflowCreate(**payload("event-tail")))
+    other = isolated_db.create_workflow(WorkflowCreate(**payload("other-events")))
+    for index in range(5):
+        for item in (workflow, other):
+            isolated_db.append_workflow_event(WorkflowEventCreate(
+                workflow_id=item.id, event_type="test.observed",
+                idempotency_key=f"tail:{item.id}:{index}", payload={"index": index},
+            ))
+    path = f"/api/workflows/{workflow.id}/events"
+    all_events = request("GET", path).json()
+    initial = request("GET", path, params={"limit": 2}).json()
+    assert initial == all_events[:2]
+    latest = request("GET", path, params={"limit": 2, "tail": "true"})
+    assert latest.status_code == 200
+    assert latest.json() == all_events[-2:]
+    assert [item["seq"] for item in latest.json()] == sorted(item["seq"] for item in latest.json())
+    after = all_events[-2]["seq"]
+    assert request("GET", path, params={"after_seq": after, "tail": True}).json() == all_events[-1:]
+    assert request("GET", path, params={"after_seq": all_events[-1]["seq"], "tail": True}).json() == []
+    assert request("GET", path, params={"tail": "false", "limit": 2}).json() == initial
+    for params in ({"tail": "invalid"}, {"tail": True, "limit": 0},
+                   {"tail": True, "limit": 1001}, {"tail": True, "after_seq": -1}):
+        assert request("GET", path, params=params).status_code == 422
+    assert request("GET", "/api/workflows/missing/events", params={"tail": True}).status_code == 404
 
 
 def test_openapi_contains_read_models_and_workflow_routes(isolated_db):

@@ -1,0 +1,41 @@
+{
+  "name": "oneservice-mail",
+  "title": "Oneservice — письма [OS] в GitLab",
+  "description": "Замена os_intake.py email: письмо с [OS] в теме становится issue с меткой «подано». Отправитель не из allow_from — issue всё равно появляется, но с меткой «непроверенный отправитель»: хранитель (маршрут oneservice) его не возьмёт, пока человек не снимет метку. Telegram-вход остаётся за os_intake.py tg.",
+  "trust": "client",
+  "gitlab": {"url_env": "GITLAB_URL", "token_env": "GITLAB_TOKEN", "project": "group%2Foneservice-cc_v2"},
+  "input": {
+    "type": "email",
+    "host": "imap.mail.ru",
+    "user_env": "OS_IMAP_USER",
+    "password_env": "OS_IMAP_PASSWORD",
+    "folders": ["INBOX"],
+    "subject_marker": "OS",
+    "allow_from": ["colleague@example.com", "example.ru"],
+    "allow_from_mode": "mark"
+  },
+  "limits": {"per_day": 50},
+  "steps": [
+    {
+      "id": "issue",
+      "kind": "gitlab",
+      "when": {"input": "sender_allowed", "in": [true]},
+      "create": {
+        "title": "{{input.title}}",
+        "description": "**Автор:** {{input.from}}\n**Канал:** email\n**Дата:** {{input.date}}\n\n---\n\n{{input.body}}",
+        "labels": "подано"
+      }
+    },
+    {
+      "id": "unverified",
+      "kind": "gitlab",
+      "when": {"input": "sender_allowed", "in": [false]},
+      "create": {
+        "title": "{{input.title}}",
+        "description": "**Автор:** {{input.from}} (не из списка — проверьте отправителя и снимите метку)\n**Канал:** email\n**Дата:** {{input.date}}\n\n---\n\n{{input.body}}",
+        "labels": "подано,непроверенный отправитель"
+      }
+    },
+    {"id": "done", "kind": "finish", "status": "done"}
+  ]
+}

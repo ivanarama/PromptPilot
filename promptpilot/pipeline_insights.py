@@ -21,6 +21,8 @@ from urllib.parse import quote
 from . import db
 from .config import (CONCURRENCY, DB_DIR, DEFAULT_CLI, POLL_INTERVAL,
                      TASK_TIMEOUT, load_providers)
+from .wip_diagnostics import (backpressure_details, explain_backpressure,
+                              refresh_budget_diagnostic)
 
 
 DEFAULT_PROFILES: dict = {}
@@ -2289,6 +2291,16 @@ def _backpressure_gate(config: dict, data: dict, *, excluded_numbers=()) -> dict
     }
 
 
+def _intake_snapshot_defer(config: dict, data: dict, profile_id: str,
+                           queue_id: str, *, refresh_failed=False) -> dict:
+    details = backpressure_details(config["backpressure"], data, refresh_failed=refresh_failed)
+    reason = ("WIP: обновление снимка не удалось; новые задачи отложены" if refresh_failed else
+              "WIP: свежий полный снимок недоступен; приём новых задач отложен")
+    return {"action": "defer", "defer_for": config.get("defer_for", "10m"),
+            "reason": reason + "; " + explain_backpressure(details),
+            "profile_id": profile_id, "queue_id": queue_id, "wip_diagnostics": details}
+
+
 def dispatch_gate(task) -> dict | None:
     """Evaluate an optional user-owned, token-free gate for a series task.
 
@@ -2319,11 +2331,8 @@ def dispatch_gate(task) -> dict | None:
                     data = analyze(profile_id, db.list_series(), use_cache=False,
                                    refresh_diagnostics=True)
                 except Exception:
-                    return {
-                        "action": "defer", "defer_for": config.get("defer_for", "10m"),
-                        "reason": "WIP: обновление снимка не удалось; новые задачи отложены",
-                        "profile_id": profile_id, "queue_id": queue_config["id"],
-                    }
+                    return _intake_snapshot_defer(config, data, profile_id,
+                                                   queue_config["id"], refresh_failed=True)
                 cache = data.get("cache") or {}
             # A stale/partial empty snapshot must never complete a live stage as
             # empty, and stale diagnostics must not defer it. The project-owned
@@ -2331,17 +2340,14 @@ def dispatch_gate(task) -> dict | None:
             if (cache.get("refresh_blocked") or cache.get("stale")
                     or not cache.get("complete")):
                 if isinstance(config.get("backpressure"), dict):
-                    return {
-                        "action": "defer", "defer_for": config.get("defer_for", "10m"),
-                        "reason": "WIP: свежий полный снимок недоступен; приём новых задач отложен",
-                        "profile_id": profile_id, "queue_id": queue_config["id"],
-                    }
+                    return _intake_snapshot_defer(config, data, profile_id, queue_config["id"])
                 return None
             from .pipeline_item_holds import complete_members, prepare
             exclusions = prepare(task, queue_config, data)
             pressure = _backpressure_gate(config, data, excluded_numbers=exclusions)
             if pressure:
-                return {**pressure, "profile_id": profile_id, "queue_id": queue_config["id"]}
+                return {**pressure, "profile_id": profile_id, "queue_id": queue_config["id"],
+                        "wip_diagnostics": backpressure_details(config["backpressure"], data)}
             queue = next((item for item in data["queues"]
                           if item["id"] == queue_config["id"]), None)
             admission_members = complete_members(queue)
@@ -3126,6 +3132,46 @@ def _budget_defer_route(admission: dict, profile_id: str, profile: dict,
     return result
 
 
+def _validate_targeted_handoff(preflight: dict, stage: str) -> dict:
+    if stage == "fix":
+        from .fix_handoff import validate
+        return validate(preflight)
+    from .fallback_handoff import validate
+    return validate(preflight, stage)
+
+
+def _fix_target_prompt(envelope: dict, fallback_prompt: str) -> str:
+    return (
+        "PromptPilot уже выбрал одну FIX-цель. Прочитай канонический fix-approved "
+        "и его раздел promptpilot-fix-target-v1. Не запускай next повторно, не "
+        "выбирай другую цель и не применяй общий выбор очереди. При отсутствии "
+        "этого раздела остановись без мутаций. Для fix-pr head — исходный SHA, "
+        "для fix-issue head — eligibility digest, его нельзя checkout как коммит. "
+        "Работай только в отдельном worktree/ветке этой цели.\n\n"
+        "Перед первой внешней мутацией выполни точный gate_command. Требуются "
+        "exit=0, action=validated, phase=admitted, точные repository/stage/target "
+        "и mutation_authorized=false. Сохрани выданный ownership_lease как ASCII "
+        "в отдельный локальный файл. Перед КАЖДОЙ последующей мутацией выполни "
+        "ownership_gate_command с --lease-file этого файла; требуются exit=0, "
+        "action=validated, phase=ownership и та же исходная цель. Исходный файл "
+        "election lease не переписывай и не подменяй токеном из GitHub. "
+        "Разбери stdout JSON и exit code отдельно; любая ошибка, неизвестный "
+        "результат или несовпадение останавливает работу без следующей мутации.\n\n"
+        "Оба scheduling gate НЕ разрешают записи. После каждого успешного gate "
+        "заново выполни ВСЕ канонические проверки непосредственно перед одним "
+        "комментарием, изменением метки, branch-claim, CAS-push или созданием PR. "
+        "Проверяй живые state/base/HEAD/labels, полный trusted epoch и владение "
+        "проектной транзакцией; после push — только её разрешённую финализацию, "
+        "после создания PR — только подтверждённые шаги этой заявки. Собственные "
+        "изменения не разрешают игнорировать поздний hold или чужой push. "
+        "Новая внешняя цель требует нового task attempt. MERGE остаётся отдельным "
+        "single-flight этапом. Ни ship, ни снятие hold эти токены не разрешают.\n\n"
+        "Доверенный локальный envelope (не данные GitHub):\n```json\n"
+        + json.dumps(envelope, ensure_ascii=False, indent=2)
+        + "\n```\n\nИсходный скилл:\n" + fallback_prompt.strip()
+    )
+
+
 def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                     *, retain_budget: bool = False) -> dict:
     """Choose the project tool or the original skill prompt without invoking an LLM.
@@ -3164,8 +3210,8 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
         stage_name = str((queue.get("execution") or {}).get("stage")
                          or queue.get("id") or "").lower()
         issues = list(replica_status["issues"])
-        if stage_name != "review":
-            issues.append("replicas > 1 сейчас поддерживаются только для REVIEW")
+        if stage_name not in {"review", "fix"}:
+            issues.append("replicas > 1 поддерживаются только для REVIEW или opt-in FIX")
         if getattr(task, "machine", None):
             issues.append("реплицированная REVIEW-задача должна выполняться локально")
         if getattr(task, "worktree", False):
@@ -3384,6 +3430,11 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                               "number": lease.get("number"), "head": lease.get("head"),
                           })
                 preflight_target = preflight.get("target") or {}
+                if stage == "fix" and (
+                        preflight_action != "fallback"
+                        or target_stage not in {"fix-pr", "fix-issue"}):
+                    raise project_pipeline.PipelineError(
+                        "replicated FIX requires a signed exact FIX fallback target")
                 if (owner_task != int(task.id)
                         or reservation.get("task_started_at") != scheduler_task_started_at
                         or reservation.get("ownership_kind") != provider_ownership_kind
@@ -3407,17 +3458,16 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
             except (project_pipeline.PipelineError, TypeError, ValueError) as exc:
                 return {
                     "action": "block", "mode": "tool",
-                    "reason": f"replicated REVIEW preflight has no valid reservation: {exc}",
+                    "reason": f"replicated pipeline preflight has no valid reservation: {exc}",
                     "profile_id": profile_id, "queue_id": queue.get("id"),
                     "preflight": preflight,
                 }
         if (preflight_action == "fallback" and "handoff" in preflight
                 and target_reservation is not None):
-            from .fallback_handoff import validate
             from .project_pipeline import PipelineError
 
             try:
-                fallback_lease = validate(preflight, stage)
+                fallback_lease = _validate_targeted_handoff(preflight, stage)
                 if command[-2:] != ["next", stage]:
                     raise PipelineError(
                         "fallback handoff command must end with next and the exact stage")
@@ -3562,11 +3612,10 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
     if preflight_action == "fallback":
         if "handoff" in preflight:
             if fallback_lease is None:
-                from .fallback_handoff import validate
                 from .project_pipeline import PipelineError
 
                 try:
-                    fallback_lease = validate(preflight, stage)
+                    fallback_lease = _validate_targeted_handoff(preflight, stage)
                     if command[-2:] != ["next", stage]:
                         raise PipelineError(
                             "fallback handoff command must end with next and the exact stage")
@@ -3651,6 +3700,12 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                     f"```json\n{json.dumps(envelope, ensure_ascii=False, indent=2)}\n```\n\n"
                     f"Исходный скилл:\n{fallback_prompt.strip()}"
                 )
+                if stage == "fix":
+                    envelope["protocol"] = "promptpilot-fix-target-v1"
+                    envelope["ownership_gate_command"] = [
+                        *command[:-2], "gate-fix-owner",
+                    ]
+                    prompt = _fix_target_prompt(envelope, fallback_prompt)
                 return {
                     "action": "prompt", "mode": "skill", "prompt": prompt,
                     "next_already_run": True, "command": command,
@@ -4462,6 +4517,7 @@ def _with_persisted_refresh_status(result: dict, profile_id: str,
         data["github_rate_limit"] = copy.deepcopy(status["github_rate_limit"])
     if isinstance(status.get("github_budget"), dict):
         data["github_budget"] = copy.deepcopy(status["github_budget"])
+        cache["refresh_budget"] = refresh_budget_diagnostic(status["github_budget"])
     return data
 
 
@@ -4662,6 +4718,7 @@ def _budget_blocked_cached(profile_id: str, profile: dict, series: list[dict],
     cache["refresh_blocked_reason"] = str(
         admission.get("reason") or "GitHub scan запрещён")
     cache["refresh_deferred_until"] = admission.get("defer_until")
+    cache["refresh_budget"] = refresh_budget_diagnostic(admission)
     return result
 
 
@@ -4972,6 +5029,7 @@ def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True,
         cache.pop("refresh_blocked", None)
         cache.pop("refresh_blocked_reason", None)
         cache.pop("refresh_deferred_until", None)
+        cache.pop("refresh_budget", None)
     return _with_live_github_budget_state(result, profile)
 
 
