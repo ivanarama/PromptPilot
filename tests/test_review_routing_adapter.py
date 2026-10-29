@@ -100,7 +100,18 @@ def test_actual_entrypoints_fail_closed_without_a_compatible_current_peer(adapte
     assert code==2 and result['action']=='error' and peer.posts==[]
 
 
-@pytest.mark.parametrize('envelope_fault',[None,'missing-protocol','v2','empty-lease','no-transport'])
+ENVELOPE_FAULTS={
+    'missing-protocol':('audit',None,True),'v2':('audit','review-routing-v2',True),
+    'empty-lease':('audit','review-routing-v1',True),'no-transport':('audit',None,False),
+    'merge-no-protocol':('merge',None,True),'merge-v2':('merge','review-routing-v2',True),
+    'cleanup-no-protocol':('cleanup',None,True),'cleanup-v2':('cleanup','review-routing-v2',True),
+    'wait-no-protocol':('wait',None,True),'empty-v2':('empty','review-routing-v2',True),
+    'error-no-protocol':('error',None,True),'unknown-v2':('unexpected','review-routing-v2',True),
+    'generic-merge':('merge',None,False),'generic-cleanup':('cleanup','review-routing-v2',False),
+}
+
+
+@pytest.mark.parametrize('envelope_fault',[None,*ENVELOPE_FAULTS])
 @pytest.mark.parametrize('recover',[False,True])
 def test_single_lane_worker_uses_owned_request_and_recovers_without_model(
         adapter,isolated_db,monkeypatch,tmp_path,recover,envelope_fault):
@@ -136,7 +147,8 @@ def test_single_lane_worker_uses_owned_request_and_recovers_without_model(
         peer.comments[0]['node']['createdAt']=(peer.now-timedelta(minutes=31)).isoformat().replace('+00:00','Z')
     queue={'id':'review','execution':{'mode':'auto','command':['pipelinectl','next','review'],
                                     'review_routing_protocol':'review-routing-v1'}}
-    if envelope_fault=='no-transport':queue['execution'].pop('review_routing_protocol')
+    if envelope_fault is not None and not ENVELOPE_FAULTS[envelope_fault][2]:
+        queue['execution'].pop('review_routing_protocol')
     monkeypatch.setattr(insights,'_matching_queue',lambda _task:('p',{'repository':'owner/repo'},queue))
     monkeypatch.setattr(insights,'_tool_available',lambda *args:(True,''))
     monkeypatch.setattr(insights,'load_providers',lambda:{})
@@ -150,10 +162,11 @@ def test_single_lane_worker_uses_owned_request_and_recovers_without_model(
             result=json.loads(stream.getvalue())
             assert code==0,result
             if envelope_fault is not None and command[-2:]==['next','review']:
-                result['action']='audit'
-                if envelope_fault in {'missing-protocol','no-transport'}:result.pop('protocol',None)
-                elif envelope_fault=='v2':result['protocol']='review-routing-v2'
-                else:result['lease']=''
+                action,protocol,_transport=ENVELOPE_FAULTS[envelope_fault]
+                result['action']=action
+                if protocol is None:result.pop('protocol',None)
+                else:result['protocol']=protocol
+                if envelope_fault=='empty-lease':result['lease']=''
             return result
     monkeypatch.setattr(insights,'_tool_preflight',actual_cli)
     route=insights.execution_route(task,'fallback skill',str(tmp_path))

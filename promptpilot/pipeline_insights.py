@@ -3413,7 +3413,7 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
         routing_request = None
         token = preflight.get("lease")
         signed_routing_claim = False
-        if preflight_action in {"audit", "recover"} and isinstance(token, str) and "." in token:
+        if isinstance(token, str) and "." in token:
             from . import project_pipeline
             try:
                 advertised = project_pipeline.decode_lease(token.split(".", 1)[0]).get("protocol")
