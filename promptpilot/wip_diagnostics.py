@@ -10,6 +10,7 @@ STATES = {
     "low", "budget_in_flight", "ledger_changed", "priority_waiter", "fairness_waiter",
     "invalid_config", "lease_unavailable", "ledger_unavailable", "rate_limit_unavailable",
     "reservation_unavailable", "lease_lost", "busy", "worker_paused", "github_budget", "ok",
+    "scan_in_progress",
 }
 
 
@@ -29,7 +30,7 @@ def _retry_at(value):
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
         return parsed.astimezone(timezone.utc).isoformat() if parsed.tzinfo else None
-    except ValueError:
+    except (ValueError, OverflowError):
         return None
 
 

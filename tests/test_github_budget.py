@@ -80,6 +80,27 @@ def _running_task(database, prompt):
     return task
 
 
+def test_public_wip_gate_explains_existing_scan_lease(isolated_db, monkeypatch):
+    profile = _profile_with_costs(core=0)
+    profile["queues"][0]["dispatch_gate"] = {"backpressure": {
+        "max_active": 10, "active_fields": ["review_backlog"],
+        "candidate_field": "fix_candidates"}}
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"example": profile})
+    monkeypatch.setattr(pipeline_insights, "_cache", {})
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("An existing scan lease must prevent another GitHub scan")
+
+    monkeypatch.setattr(pipeline_insights, "_github_rate_limits", forbidden)
+    monkeypatch.setattr(pipeline_insights, "_github_search", forbidden)
+    lease = isolated_db.acquire_pipeline_scan_lease("github-default", "existing-scanner", 60)
+    assert lease["acquired"]
+    task = SimpleNamespace(series_id=1, series_title="Example - REVIEW", prompt="Example - REVIEW")
+    result = pipeline_insights.dispatch_gate(task)
+    assert result["action"] == "defer"
+    assert result["wip_diagnostics"]["snapshot"]["refresh_state"] == "scan_in_progress"
+
+
 def test_public_wip_gate_retains_real_scan_denial_beside_allowed_zero_cost_view(isolated_db, monkeypatch):
     profile = _profile_with_costs(core=0)
     profile["github_budget"]["minimum_remaining"] = {"core": 100, "search": 2, "graphql": 100}

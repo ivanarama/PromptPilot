@@ -134,6 +134,17 @@ def test_a_different_denial_does_not_reuse_the_previous_scan_arithmetic(gate):
     assert result["wip_diagnostics"]["refresh_budget"] is None
 
 
+@pytest.mark.parametrize("retry", [
+    "0001-01-01T00:00:00+01:00", "9999-12-31T23:59:59-01:00",
+])
+def test_timezone_overflow_does_not_interrupt_public_defer(gate, retry):
+    task, data, _ = gate
+    data["cache"]["refresh_deferred_until"] = retry
+    result = pi.dispatch_gate(task)
+    assert result["action"] == "defer"
+    assert result["wip_diagnostics"]["snapshot"]["retry_at"] is None
+
+
 def test_fresh_wip_limit_remains_separate_from_snapshot_refusal(gate, isolated_db):
     task, data, calls = gate
     data["cache"] = {"complete": True, "stale": False}
