@@ -88,11 +88,33 @@ def test_cancelled_or_unknown_started_attempt_still_costs_its_slot():
         reduce(records + [barrier, assigned])
 
 
-@pytest.mark.parametrize("index", [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+@pytest.mark.parametrize("index", [0, 1, 2, 3, 4, 5, 7, 8, 9, 10])
 def test_missing_server_history_is_never_permission_to_skip_a_phase(index):
     records = history()
     with pytest.raises(PipelineError):
         reduce(records[:index] + records[index+1:])
+
+
+def test_author_completion_needs_handoff_but_no_fictitious_pipeline_start():
+    records=history()[:8]
+    assert records[3].payload['executor']['kind']=='author'
+    without_started=records[:6]+records[7:]
+    ledger=reduce(without_started)
+    assert ledger.budget_used==1
+    assert set(ledger.attempt_phases(ledger.attempts[0]))=={'assigned','handoff-done','fix-done'}
+    with pytest.raises(PipelineError,match='prerequisite'):
+        reduce(records[:5]+records[7:])
+
+
+def test_pipeline_completion_still_requires_its_canonical_started_phase():
+    records=history()[:8]
+    records[3]=changed(records[3],executor={'kind':'pipeline','login':'owner'})
+    bound=wire.context(records[3].payload)
+    for index in range(4,len(records)):
+        records[index]=changed(records[index],context_sha256=bound)
+    assert reduce(records).budget_used==1
+    with pytest.raises(PipelineError,match='prerequisite'):
+        reduce(records[:6]+records[7:])
 
 
 def test_head_or_blocker_rename_cannot_reset_previous_or_counter():

@@ -191,6 +191,12 @@ spawn-retry. Только прямой отказ guard до factory может 
 контролируемого повтора того же неизменного scope. Пауза выдачи не отменяет уже
 claimed задачу. Этот компонент пока не подключён к настоящему запуску FIX и не
 доказывает signed FIX-start, server started, author handoff или post-push.
+Для авторского исправления reducer допускает fix-done после handoff-done без
+фиктивного pipeline started/task_id. Для pipeline started по-прежнему обязателен.
+Сам reducer проверяет только историю: настоящий coordinator ещё обязан доказать
+реальное назначение, новый HEAD, transition и source trailer. Прежние предлагаемые
+wire-векторы с optional авторским started сохраняются как структурная история,
+но авторский coordinator не должен выдумывать такой запуск.
 
 До будущей записи/dispatch обязательны полные public gates: совместимость всех
 читателей, trusted actor/immutability, coherent identity/epoch/lifecycle/labels,

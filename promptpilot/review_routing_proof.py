@@ -182,6 +182,8 @@ def _phases(records, attempts):
             continue
         done = {item.payload["phase"] for item in result if item.payload["attempt_id"] == root.id}
         required = {"handoff-done": "assigned", "started": "handoff-done", "fix-done": "started"}
+        if root.payload['executor']['kind']=='author':
+            required['fix-done']='handoff-done'
         if data["phase"] in required and required[data["phase"]] not in done:
             raise PipelineError("routing phase prerequisite is missing")
         if "barrier" in done:
