@@ -1114,8 +1114,10 @@ def test_list_series_preserves_occurrence_and_health_semantics(isolated_db):
     assert series["broken"] is False
 
 
+@pytest.mark.parametrize('legacy_index',[False,True])
+@pytest.mark.parametrize('targeted',[False,True])
 def test_list_series_uses_constant_lightweight_queries(
-        isolated_db, monkeypatch):
+        isolated_db, monkeypatch,legacy_index,targeted):
     large_result = "x" * (1024 * 1024)
     expected_ids = []
     for index in range(6):
@@ -1128,6 +1130,13 @@ def test_list_series_uses_constant_lightweight_queries(
             series_id=historical.series_id,
         ))
         expected_ids.append(active.series_id)
+
+    # An older auxiliary client can import its own schema after our startup
+    # migration and recreate this narrower index. The read must remain light
+    # until the next migration, for both dashboard and one-series controls.
+    if legacy_index:
+        with isolated_db._connect() as conn:
+            conn.execute('CREATE INDEX idx_tasks_series ON tasks(series_id,id)')
 
     statements = []
     prohibited_reads = []
@@ -1149,11 +1158,12 @@ def test_list_series_uses_constant_lightweight_queries(
 
     monkeypatch.setattr(isolated_db, "_connect", traced_connect)
 
-    listed = isolated_db.list_series()
+    listed = ([isolated_db.get_series(expected_ids[0])] if targeted
+              else isolated_db.list_series())
 
     selects = [statement for statement in statements
                if statement.lstrip().upper().startswith(("SELECT", "WITH"))]
-    assert {item["id"] for item in listed} == set(expected_ids)
+    assert {item["id"] for item in listed} == set(expected_ids[:1] if targeted else expected_ids)
     assert len(selects) == 3
     assert sum("pipeline_repeat_blocker_pause:v1:" in statement
                for statement in selects) == 1
@@ -1166,7 +1176,8 @@ def test_list_series_uses_constant_lightweight_queries(
             "EXPLAIN QUERY PLAN " + selects[1])]
         picked_plan = [row[3] for row in conn.execute(
             "EXPLAIN QUERY PLAN " + selects[2])]
-    assert any("COVERING INDEX" in step and "SCAN t " in step
+    operation='SEARCH t ' if targeted else 'SCAN t '
+    assert any("COVERING INDEX" in step and operation in step
                for step in history_plan), history_plan
     assert any("COVERING INDEX" in step and "tasks" in step
                for step in picked_plan), picked_plan
