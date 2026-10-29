@@ -1747,6 +1747,8 @@ def next_review(gh: GitHub, config: dict, *, config_path: str | None = None) -> 
 
 
 def format_review(lease: dict, report: dict) -> tuple[str, str]:
+    if isinstance(report, dict) and "routing_version" in report:
+        raise PipelineError("versioned routing reports require a future compatible completion protocol")
     for key in ("change", "checks", "blocking", "tail"):
         if key not in report:
             raise PipelineError(f"report missing {key}")
@@ -2382,6 +2384,9 @@ def run(argv=None) -> int:
     parser.add_argument("--config", default="pipelinectl.json")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("capabilities")
+    routing_parser = sub.add_parser("validate-routing-report")
+    routing_parser.add_argument("--report", required=True)
+    routing_parser.add_argument("--head", required=True)
     inventory_parser = sub.add_parser("inventory")
     inventory_parser.add_argument("--health-file", help="read an existing health JSON snapshot")
     next_parser = sub.add_parser("next")
@@ -2412,8 +2417,12 @@ def run(argv=None) -> int:
             args.lease = path.read_text(encoding="ascii").strip()
             if not args.lease:
                 raise PipelineError("lease file is empty")
-        config = load_config(args.config)
-        if args.command == "capabilities":
+        config = None if args.command == "validate-routing-report" else load_config(args.config)
+        if args.command == "validate-routing-report":
+            from .review_routing import inspect_file
+
+            value = inspect_file(args.report, args.head)
+        elif args.command == "capabilities":
             value = capabilities(config)
         else:
             gh = GitHub()
