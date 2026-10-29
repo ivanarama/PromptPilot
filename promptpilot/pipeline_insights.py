@@ -3265,6 +3265,14 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
             "profile_id": profile_id, "queue_id": queue.get("id"),
         }
 
+    typed_queue = execution.get("review_routing_protocol") == "review-routing-v1"
+    if execution.get("review_routing_protocol") is not None and not typed_queue:
+        return {"action": "block", "mode": "tool", "reason": "unsupported REVIEW routing transport version"}
+    owned_preflight = replicated or typed_queue
+    if typed_queue and (getattr(task, "machine", None) or getattr(task, "detached", False)
+                        or getattr(task, "herdr_target", None)):
+        return {"action": "block", "mode": "tool",
+                "reason": "typed REVIEW requires a local scheduler-owned task process"}
     mode = str(execution.get("mode", "auto")).lower()
     if mode not in {"auto", "tool", "skill"}:
         return {
@@ -3273,7 +3281,7 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
             "profile_id": profile_id, "queue_id": queue.get("id"),
         }
     if mode == "skill":
-        if replicated:
+        if owned_preflight:
             return {
                 "action": "block", "mode": "skill",
                 "reason": "replicas > 1 несовместимы с execution.mode=skill",
@@ -3299,6 +3307,8 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
 
     stage = str(execution.get("stage") or queue.get("id") or "").lower()
     command = _tool_command(execution, stage)
+    if typed_queue and (stage != "review" or not command or command[-2:] != ["next", "review"]):
+        return {"action": "block", "mode": "tool", "reason": "typed REVIEW requires its exact next review command"}
     with _github_scan_admission(
             profile, f"pipeline preflight {profile_id}/{stage}",
             profile_id=profile_id, budget_route="tool_preflight",
@@ -3320,7 +3330,7 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                 profile_id,
                 profile, queue)
         if not available:
-            if mode == "auto" and not replicated:
+            if mode == "auto" and not owned_preflight:
                 admission = _reserve_execution_admission(
                     task, profile_id, profile, queue, admission, "skill",
                     retain_budget=retain_budget)
@@ -3337,7 +3347,7 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                 "profile_id": profile_id, "queue_id": queue.get("id"),
             }
         try:
-            if replicated:
+            if owned_preflight:
                 # Both worktrees must reserve in the scheduler's actual DB.
                 # Do not let a project-local .env silently select one DB per
                 # checkout and destroy cross-replica atomicity.
@@ -3359,9 +3369,7 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                 provider_ownership_kind = (
                     "herdr" if provider_cfg.get("executor") == "herdr"
                     else "headless")
-                preflight = _tool_preflight(
-                    execution, command, working_dir,
-                    env_extra={
+                attempt_env = {
                         "PP_TASK_ID": str(task.id),
                         "PP_TASK_STARTED_AT": scheduler_task_started_at,
                         "PP_PIPELINE_REPLICAS": str(replica_count),
@@ -3369,8 +3377,8 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                         "PP_DATA_DIR": scheduler_data_dir,
                         "PP_PIPELINE_LEASE_KEY_FILE": scheduler_lease_key,
                         **({"PP_PIPELINE_EXCLUDED_NUMBERS": json.dumps(exclusions)} if exclusions else {}),
-                    },
-                )
+                    }
+                preflight = _tool_preflight(execution, command, working_dir, env_extra=attempt_env)
             else:
                 preflight = (_tool_preflight(execution, command, working_dir,
                     env_extra={"PP_PIPELINE_EXCLUDED_NUMBERS": json.dumps(exclusions)})
@@ -3383,7 +3391,7 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                 profile, queue)
         except RuntimeError as exc:
             reason = str(exc)
-            if mode == "auto" and not replicated:
+            if mode == "auto" and not owned_preflight:
                 admission = _reserve_execution_admission(
                     task, profile_id, profile, queue, admission, "skill",
                     retain_budget=retain_budget)
@@ -3401,14 +3409,23 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
             }
 
         preflight_action = preflight["action"].lower()
+        typed_response = preflight.get("protocol") == "review-routing-v1"
+        if typed_response and not typed_queue:
+            return {"action": "block", "mode": "tool",
+                    "reason": "typed REVIEW requires the scheduler's explicit versioned transport"}
         target_reservation = None
         validated_target_stage = None
         fallback_lease = None
-        if replicated and preflight_action in {"audit", "fallback"}:
+        if owned_preflight and preflight_action in {"audit", "fallback", "recover"}:
             try:
                 from . import project_pipeline
 
-                if preflight_action == "audit":
+                if typed_response:
+                    from .review_routing_request import decode as decode_routing_request
+                    lease = decode_routing_request(str(preflight.get("lease") or ""))
+                    if (preflight_action == "recover") != (lease["recovery"] is not None):
+                        raise project_pipeline.PipelineError("typed REVIEW action contradicts signed request purpose")
+                elif preflight_action == "audit":
                     lease = project_pipeline.decode_signed_lease(
                         str(preflight.get("lease") or ""))
                 else:
@@ -3490,7 +3507,7 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
         if preflight_action == "fallback" and mode == "auto":
             provider_route = ("fallback_targeted" if "handoff" in preflight
                               else "skill")
-        elif preflight_action in {"audit", "merge", "cleanup"}:
+        elif preflight_action in {"audit", "merge", "cleanup", "recover"}:
             provider_route = "tool"
         elif preflight_action not in {"empty", "wait", "error"} and mode == "auto":
             provider_route = "skill"
@@ -3552,6 +3569,22 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
         # content audit left for a model. The same adapter owns every fresh
         # authorization/CI/CAS/recovery gate; never use this for REVIEW or a
         # fallback. Keep completion inside the admitted GitHub scan scope.
+        if preflight_action == "recover":
+            if not (typed_queue and typed_response and target_reservation is not None):
+                return {"action": "block", "mode": "tool", "reason": "unsigned or unreserved REVIEW recovery"}
+            complete_command = [*command[:-2], "complete", "review",
+                                *_lease_argument(task, preflight["lease"], "recover")]
+            try:
+                completion = _tool_preflight(execution, complete_command, working_dir, env_extra=attempt_env)
+            except RuntimeError as exc:
+                return {"action": "defer", "mode": "tool", "defer_for": "10m", "reason": str(exc)}
+            if completion.get("action") != "completed":
+                return {"action": "defer", "mode": "tool", "defer_for": "10m",
+                        "reason": "typed REVIEW recovery deferred", "completion": completion}
+            return {"action": "complete_empty", "mode": "tool", "verdict": "ГОТОВО",
+                    "reason": "typed REVIEW publication recovered without a provider",
+                    "profile_id": profile_id, "queue_id": queue.get("id"),
+                    "preflight": preflight, "completion": completion}
         if (stage == "merge" and execution.get("direct_complete") is True
                 and preflight_action in {"merge", "cleanup"}
                 and command[-2:] == ["next", stage]):
@@ -3706,18 +3739,19 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                     "gate_command": gate_command, "target": preflight["target"],
                     "fallback_reason": preflight_reason, "profile_id": profile_id,
                     "queue_id": queue.get("id"), "preflight": preflight,
-                    **({"pipeline_replicas": replica_count} if replicated else {}),
-                    **({"pipeline_data_dir": scheduler_data_dir} if replicated else {}),
+                    **({"review_routing_protocol": "review-routing-v1"} if typed_queue else {}),
+                    **({"pipeline_replicas": replica_count} if owned_preflight else {}),
+                    **({"pipeline_data_dir": scheduler_data_dir} if owned_preflight else {}),
                     **({"pipeline_lease_key_file": scheduler_lease_key}
-                       if replicated else {}),
+                       if owned_preflight else {}),
                     **({"pipeline_target_reservation": target_reservation}
-                       if replicated else {}),
+                       if owned_preflight else {}),
                     **({"pipeline_task_started_at": scheduler_task_started_at}
-                       if replicated else {}),
+                       if owned_preflight else {}),
                     **({"pipeline_provider_ownership_kind": provider_ownership_kind}
-                       if replicated else {}),
+                       if owned_preflight else {}),
                 }
-        if mode == "auto" and not replicated:
+        if mode == "auto" and not owned_preflight:
             return {
                 "action": "prompt", "mode": "skill", "prompt": fallback_prompt,
                 "fallback_reason": preflight_reason, "profile_id": profile_id,
@@ -3730,7 +3764,7 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
         }
     if preflight_action not in {"audit", "merge", "cleanup"}:
         reason = f"pipeline preflight вернул неподдерживаемое action={preflight_action}"
-        if mode == "auto" and not replicated:
+        if mode == "auto" and not owned_preflight:
             return {
                 "action": "prompt", "mode": "skill", "prompt": fallback_prompt,
                 "fallback_reason": reason, "profile_id": profile_id,
@@ -3775,16 +3809,17 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
         "action": "prompt", "mode": "tool", "prompt": prompt,
         "command": command, "preflight": preflight,
         "profile_id": profile_id, "queue_id": queue.get("id"),
-        **({"pipeline_replicas": replica_count} if replicated else {}),
-        **({"pipeline_data_dir": scheduler_data_dir} if replicated else {}),
+        **({"review_routing_protocol": "review-routing-v1"} if typed_queue else {}),
+        **({"pipeline_replicas": replica_count} if owned_preflight else {}),
+        **({"pipeline_data_dir": scheduler_data_dir} if owned_preflight else {}),
         **({"pipeline_lease_key_file": scheduler_lease_key}
-           if replicated else {}),
+           if owned_preflight else {}),
         **({"pipeline_target_reservation": target_reservation}
-           if replicated else {}),
+           if owned_preflight else {}),
         **({"pipeline_task_started_at": scheduler_task_started_at}
-           if replicated else {}),
+           if owned_preflight else {}),
         **({"pipeline_provider_ownership_kind": provider_ownership_kind}
-           if replicated else {}),
+           if owned_preflight else {}),
     }
 
 

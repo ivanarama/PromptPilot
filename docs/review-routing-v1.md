@@ -11,8 +11,9 @@ publication/claim/completion, выбирает canonical owner, renewal/takeover
 уже начатая resuming publication не может заново потребить тот же grant в другой
 эпохе. Known exact receipt восстанавливается чтением без повторного POST. Он требует
 внешний полный stage guard, сам не аутентифицирует signed request и не меняет
-метки; публичных writer,
-handoff/dispatch, нового CLI или включённого capability нет. Срез не завершает A
+метки. Draft-адаптер подключает его к существующим `next review` и `complete review`
+за явным opt-in и полным контрактом четырёх читателей. Мост FIX ещё не завершён,
+возможность выключена и не совместима с принятой парой OneBase. Срез не завершает A
 плана OneBase195, не снимает hold #1908 и не даёт полномочий на FIX или MERGE.
 
 `tests/fixtures/review-routing-wire-v1.json` фиксирует предлагаемые полные
@@ -49,7 +50,7 @@ immutable trusted publication/claim/completion/renewal этого полного
 Произвольные pp-маркеры, комментарии, labels/lifecycle events и другой context
 не выбрасываются ради совпадения hash. Canonical reducer, actor/identity/epoch,
 current policy, returned-owner и последний TTL-check после медленной работы
-ещё должны выполняться публичным guard. Набор canonical bytes baseline
+выполняются отдельным StageGuard. Набор canonical bytes baseline
 ограничен 8 MiB; размер считается при потоковом hash, без полного JSON-буфера.
 Это обновление предложенного v1 и goldens внутри Draft, не обещание совместимости
 со старым проектом контракта или установленным OneBase.
@@ -94,7 +95,7 @@ pending при миграции v1 сохраняют барьер. Отсутс
 Наблюдавшийся returned ID сохраняется отдельно от подтверждения: последующий
 GET не может забыть противоречивый ID. Внутренний Transport делает один POST
 либо восстанавливает receipt чтением; он требует внешнего полного stage guard,
-сам его не реализует и пока не подключён к командам next/complete.
+сам его не реализует; подключение к next/complete выполняет отдельный адаптер.
 Guard получает явный write-флаг: подтверждение уже существующего immutable
 receipt может быть чтением после истечения write lease; новый POST всегда
 повторяет актуальные права/TTL после write-ahead commit. Потеря локального
@@ -123,8 +124,8 @@ GitHub, два полных согласованных чтения PR, author/i
 После journal/reducer/exact matching Transport вызывает отдельный one-use
 `final_before_post`: ещё раз читает локальную конфигурацию и четыре дерева
 обработчиков, затем проверяет request/task/server lease по последним часам.
-Known receipt после expiry остаётся read-only recovery. Это внутренний компонент,
-а не подключённый публичный `next/complete`, election или исполнитель FIX.
+Known receipt после expiry остаётся read-only recovery. Этот компонент используется
+Draft-адаптером next/complete, но сам не выбирает цель и не назначает FIX.
 При последующем изменении HEAD, hold или закрытии PR guard может подтвердить
 только уже видимое точное тело receipt в проверенной полной истории. Для этого
 сохраняются конфигурация/совместимость, текущий GitHub actor, author и вся
@@ -153,8 +154,24 @@ checker-контракта; только marker в одном SKILL недост
 UTF-8 `pp-review-routing-consumer-tree-v1` + LF, затем для каждого файла в порядке
 UTF-8 path: relative path + NUL + lowercase SHA-256 содержимого + LF. Генерируемые
 __pycache__/.pyc/.pyo не входят; symlinks и control characters запрещены.
-Эта negotiation также ещё не подключена к публичным командам и требует
-соответствующего Go-контракта/общих fixtures до включения.
+Эта negotiation подключена к Draft-командам; принятый Go-контракт не поддерживает
+её и запрещает включение до завершения всей цепочки и парной приёмки.
+
+При ON адаптер считает реальные legacy/typed proof до прежнего барьера третьего
+круга. Первые два обычных круга сохраняют старый формат; третий выдаёт новый audit
+request. Незавершённый current root выдаёт `action=recover` с новым UUID и прежним
+report/audit/budget; report при recovery не принимается. Незавершённая старая
+публикация и невидимый результат POST блокируют новый audit. Same-HEAD completion
+возвращает wait. Эти проверки не заменяют ещё не завершённый мост к FIX.
+
+Очередь исполнителя дополнительно объявляет transport-версию
+`execution.review_routing_protocol=review-routing-v1`: даже одна реплика получает
+точный scheduler task/attempt и SQLite target reservation. Исполнитель проверяет
+подписанный request и его совпадение с этой задачей. `recover` выполняет
+`complete review --lease-file ...` непосредственно в допущенной области GitHub,
+без provider/model и без нового report. Отсутствие версии, чужая reservation или
+неизвестный результат не переводятся в свободный skill fallback. Эта версия
+очереди ещё не включена в рабочей конфигурации.
 
 До будущей записи/dispatch обязательны полные public gates: совместимость всех
 читателей, trusted actor/immutability, coherent identity/epoch/lifecycle/labels,

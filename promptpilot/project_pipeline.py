@@ -1525,7 +1525,9 @@ def _elect_review_candidate(config: dict, health: dict,
                             candidates: list[dict]) -> tuple[dict | None, dict | None, dict]:
     """Reserve the first free candidate and preserve queue order atomically."""
     replicas = _configured_replica_count()
-    if replicas == 1:
+    typed_owned_task = (config.get('technical_handoff', {}).get('enabled') is True
+                        and _pipeline_task_id(required=False) is not None)
+    if replicas == 1 and not typed_owned_task:
         return candidates[0], None, health
     if (config.get("review_completion_gate") != "target-v1"
             or config.get("fallback_handoff") != "target-v1"):
@@ -1661,6 +1663,8 @@ def parallel_content_candidates(config: dict, health: dict) -> list[dict]:
 
 def next_review(gh: GitHub, config: dict, *, config_path: str | None = None) -> dict:
     health = run_health(config, config_path=config_path)
+    from .review_routing_policy import preflight as routing_preflight
+    routing_policy = routing_preflight(config, health)
     if config.get("fallback_handoff") == "target-v1":
         from .fallback_handoff import validate_health
 
@@ -1723,6 +1727,12 @@ def next_review(gh: GitHub, config: dict, *, config_path: str | None = None) -> 
             config, election_health, "review", item, reason,
             reservation=reservation,
         )
+    if routing_policy['enabled']:
+        from .review_routing_adapter import next_review as next_typed_review
+        typed = next_typed_review(gh, config, config_path=config_path, item=item,
+                                  reservation=reservation, health=election_health)
+        if typed is not None:
+            return typed
     completion_gate = config.get("review_completion_gate", "health")
     if completion_gate == "target-v1" and not content_review_elected(
             election_health, item):
@@ -1855,11 +1865,16 @@ def content_review_elected(health: dict, selected: dict) -> bool:
     )
 
 
-def complete_review(gh: GitHub, config: dict, lease_value: str, report_path: str,
+def complete_review(gh: GitHub, config: dict, lease_value: str, report_path: str | None,
                     *, config_path: str | None = None) -> dict:
     expected_gate = config.get("review_completion_gate", "health")
     lease = (decode_signed_lease(lease_value) if expected_gate == "target-v1"
              else decode_lease(lease_value))
+    if lease.get('protocol') == 'review-routing-v1':
+        from .review_routing_adapter import complete_review as complete_typed_review
+        return complete_typed_review(gh, config, lease_value, report_path, config_path=config_path)
+    if report_path is None:
+        raise PipelineError("complete review requires --report")
     validate_review_lease(lease, config)
     report = json.loads(Path(report_path).read_text(encoding="utf-8-sig"))
     body, outcome = format_review(lease, report)
@@ -2641,8 +2656,6 @@ def run(argv=None) -> int:
                     value = gate(gh, config, args.stage, args.lease,
                                  config_path=args.config)
             elif args.stage == "review":
-                if not args.report:
-                    raise PipelineError("complete review requires --report")
                 value = complete_review(
                     gh, config, args.lease, args.report, config_path=args.config,
                 )
