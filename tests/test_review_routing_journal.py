@@ -194,13 +194,15 @@ def test_unknown_schema_is_refused_without_false_version_upgrade(tmp_path,versio
         assert [row[1] for row in connection.execute('PRAGMA table_info(requests)')]==['owner','unexpected_data']
 
 
-@pytest.mark.parametrize('variant',['history','literal','index'])
+@pytest.mark.parametrize('variant',['history','literal','keyword-literal','index'])
 def test_unversioned_database_is_not_inferred_empty_or_known_from_column_names(tmp_path,variant):
     import hashlib
     import sqlite3
     database=tmp_path/'review-routing-journal.sqlite3'
     with closing(sqlite3.connect(database)) as connection:
         schema=LEGACY_SCHEMA.replace("'done'","'d one'") if variant=='literal' else LEGACY_SCHEMA
+        if variant=='keyword-literal':
+            schema=schema.replace("'pending'","'pendingIFNOTEXISTS'")
         connection.execute(schema)
         if variant=='history':
             connection.execute('INSERT INTO requests VALUES (?,?,?,?,?,?,?,?,?,?)',

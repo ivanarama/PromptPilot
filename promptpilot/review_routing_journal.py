@@ -39,9 +39,10 @@ SCHEMA=LEGACY_SCHEMA.replace("('pending','ambiguous','done')",
 
 def _schema_signature(value):
     # SQLite removes IF NOT EXISTS when storing the original CREATE TABLE.
+    value=re.sub(r'\ACREATE\s+TABLE\s+IF\s+NOT\s+EXISTS(?=\s)','CREATE TABLE',value,count=1)
     # Ignore layout only outside quoted SQL literals; 'd one' is not 'done'.
     tokens=re.findall(r"'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"|[^\s'\"]+",value)
-    return ''.join(tokens).replace('IFNOTEXISTS','')
+    return ''.join(tokens)
 
 
 class Journal:
