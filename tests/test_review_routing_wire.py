@@ -27,6 +27,8 @@ def publication(*, case=0, depth=2, budget=0):
             "pr": wire.pr_key(IDENTITY), "owner": OWNER, "identity": IDENTITY.to_dict(),
             "author": {"id": "U_AUTHOR", "login": "contributor"}, "epoch": "e" * 64,
             "anchor": "COMMIT_NODE", "depth": depth, "budget_used": budget,
+            "audit":{'snapshot_sha256':'a'*64,'last_edge_cursor':'C_HEAD',
+                     'last_edge_node_id':'COMMIT_NODE','base_ref_oid':'b'*40},
             "max_attempts": 2, "report": report, "resume_id": None,
             "report_sha256": inspect_report(report, IDENTITY.head_sha)["report_sha256"],
             "outcome": wire.outcome(report, depth=depth, budget_used=budget)}

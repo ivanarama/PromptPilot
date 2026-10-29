@@ -28,13 +28,31 @@ SHA-256 marker коммитит все JSON bytes, включая заверша
 
 | Kind | Связь |
 |---|---|
-| publication | Полный report, PRIdentityV1, author identity, HEAD/epoch/anchor, depth, исторический бюджет/лимит, outcome, необязательный resume_id |
+| publication | Полный report, PRIdentityV1, author identity, HEAD/epoch/anchor, audit baseline, depth, исторический бюджет/лимит, outcome, необязательный resume_id |
 | lease | Root, active previous, UUID, context и отдельный purpose review-publication или technical-attempt |
 | claim | Returned publication/active lease IDs и полный context hash |
 | completion | Returned publication/canonical earliest claim/active lease IDs; завершённый REVIEW, а не разрешение на merge |
 | attempt | Полный source tuple, series/previous/ordinal, один executor и UUID; canonical reservation расходует slot до dispatch |
 | phase | Attempt/active lease/context и assigned, handoff-done, started, fix-done либо ambiguity barrier |
 | resume | Точная canonical engineering parking completion, текущий HEAD, previous attempt или null при нулевом бюджете, причина |
+
+В предлагаемый publication добавлен обязательный `audit`: snapshot_sha256,
+last_edge_cursor, last_edge_node_id и base_ref_oid. Hash коммитит полный typed
+header и точный prefix timeline, кроме отдельно проверяемого обычного продвижения
+baseRefOid и служебного updatedAt. Cursor и node ID границы сохраняются вместе;
+для пустого prefix оба явно null. Public gate всё равно обязан доказать HEAD
+anchor, подпись исходного request и текущую пригодность цели: пустой prefix или
+один совпавший hash не выдают полномочий.
+
+Внутренний baseline reader сохраняет весь prefix и допускает в suffix только
+immutable trusted publication/claim/completion/renewal этого полного context.
+Произвольные pp-маркеры, комментарии, labels/lifecycle events и другой context
+не выбрасываются ради совпадения hash. Canonical reducer, actor/identity/epoch,
+current policy, returned-owner и последний TTL-check после медленной работы
+ещё должны выполняться публичным guard. Набор canonical bytes baseline
+ограничен 8 MiB; размер считается при потоковом hash, без полного JSON-буфера.
+Это обновление предложенного v1 и goldens внутри Draft, не обещание совместимости
+со старым проектом контракта или установленным OneBase.
 
 Context roots исключает только UUID владельца; разные report/source/executor
 не считаются эквивалентными конкурентами. Выигрывает earliest(created_at,

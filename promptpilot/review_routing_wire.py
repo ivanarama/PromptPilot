@@ -81,6 +81,17 @@ def _integer(value, low, high):
         raise PipelineError("invalid routing integer")
 
 
+def audit_binding(value):
+    _fields(value,'snapshot_sha256 last_edge_cursor last_edge_node_id base_ref_oid')
+    hash64(value['snapshot_sha256']);head40(value['base_ref_oid'])
+    cursor,ident=value['last_edge_cursor'],value['last_edge_node_id']
+    if (cursor is None)!=(ident is None):
+        raise PipelineError('routing audit boundary requires both cursor and node ID')
+    if cursor is not None:
+        _text(cursor);_text(ident)
+    return value
+
+
 def outcome(report, *, depth, budget_used, max_attempts=2):
     """Classify explicit independently reviewed input; never infer evidence."""
     _integer(depth, 0, 2147483647)
@@ -117,7 +128,7 @@ def validate(payload):
         raise PipelineError("unsupported routing wire kind")
     common = "protocol kind pr "
     fields = {
-        "publication": "owner identity author epoch anchor depth budget_used max_attempts report report_sha256 outcome resume_id",
+        "publication": "owner identity author epoch anchor audit depth budget_used max_attempts report report_sha256 outcome resume_id",
         "lease": "owner context_sha256 purpose root previous",
         "claim": "owner context_sha256 publication_id lease_id",
         "completion": "owner context_sha256 publication_id claim_id lease_id",
@@ -147,6 +158,7 @@ def validate(payload):
             raise PipelineError("invalid routing PR author login")
         hash64(payload["epoch"])
         _text(payload["anchor"])
+        audit_binding(payload['audit'])
         inspected = inspect_report(payload["report"], identity.head_sha)
         if payload["report_sha256"] != inspected["report_sha256"]:
             raise PipelineError("routing report hash differs")
