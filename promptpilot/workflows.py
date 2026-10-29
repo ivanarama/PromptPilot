@@ -3146,6 +3146,7 @@ def _run_gate_commands(workflow: WorkflowInDB) -> WorkflowGateDecision:
                 "— либо явно выключите gate.enabled, если проверки не нужны",
             ],
         )
+    failures = 0
     for index, command in enumerate(commands, start=1):
         argv = (
             ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command]
@@ -3167,6 +3168,8 @@ def _run_gate_commands(workflow: WorkflowInDB) -> WorkflowGateDecision:
             evidence.append(
                 f"[{index}] exit={completed.returncode}: {command}\n{output}".rstrip()
             )
+            if completed.returncode:
+                failures += 1
             if completed.returncode and gate.stop_on_failure:
                 return WorkflowGateDecision(
                     expected_version=workflow.state_version,
@@ -3195,6 +3198,14 @@ def _run_gate_commands(workflow: WorkflowInDB) -> WorkflowGateDecision:
                 summary="Не удалось запустить deterministic gate",
                 evidence=evidence,
             )
+    if failures:
+        return WorkflowGateDecision(
+            expected_version=workflow.state_version,
+            verdict=GateVerdict.FAIL,
+            gate_id="automatic-gate",
+            summary=f"Команд gate с ошибкой: {failures} из {len(commands)}",
+            evidence=evidence,
+        )
     return WorkflowGateDecision(
         expected_version=workflow.state_version,
         verdict=GateVerdict.PASS,
