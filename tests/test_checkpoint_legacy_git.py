@@ -190,8 +190,9 @@ def test_legacy_prepared_update_and_verify_fence_real_refs(
     assert _types(isolated_db, wf).count("stage.checkpoint") == 1
 
 
+@pytest.mark.parametrize("stderr", [b"HEAD permission denied", b"", b" \n"])
 def test_capture_error_survives_resume_without_fabricating_evidence(
-        isolated_db, tmp_path, monkeypatch):
+        isolated_db, tmp_path, monkeypatch, stderr):
     repo = _git_repo(tmp_path)
     wf = _wf(isolated_db, repo, "failed-evidence")
     _start(isolated_db, wf)
@@ -201,7 +202,7 @@ def test_capture_error_survives_resume_without_fabricating_evidence(
 
     def unavailable(args, *rest, **kwargs):
         if list(args)[-3:] == ["symbolic-ref", "--no-recurse", "HEAD"]:
-            return subprocess.CompletedProcess(args, 128, b"", b"HEAD permission denied")
+            return subprocess.CompletedProcess(args, 128, b"", stderr)
         return real_run(args, *rest, **kwargs)
 
     with monkeypatch.context() as patch:
@@ -210,7 +211,8 @@ def test_capture_error_survives_resume_without_fabricating_evidence(
     assert _resume(wf).status.value == "awaiting_human"
     events = isolated_db.list_workflow_events(wf.id, limit=200)
     failed = [e for e in events if e.event_type == "stage.checkpoint_failed"]
-    assert failed and all("HEAD permission denied" in e.payload["reason"] for e in failed)
+    expected = "HEAD permission denied" if stderr.strip() else "symbolic-ref --no-recurse HEAD failed (exit 128)"
+    assert failed and all(expected in e.payload["reason"] for e in failed)
     assert all("legacy" not in e.payload["reason"] for e in failed)
     assert _git(repo, "rev-parse", "HEAD") == head
     assert "stage.advanced" not in _types(isolated_db, wf)

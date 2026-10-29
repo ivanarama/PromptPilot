@@ -30,7 +30,11 @@ class _GitError(CheckpointError):
     def __init__(self, result):
         self.returncode = result.returncode
         self.stderr = result.stderr
-        super().__init__(result.stderr.decode("utf-8", "replace")[:400])
+        message = result.stderr.decode("utf-8", "replace").strip()
+        if not message:
+            command = " ".join(str(arg) for arg in result.args[3:])[:120]
+            message = f"Git {command} failed (exit {result.returncode})"
+        super().__init__(message[:400])
 
 
 def _digest(data):
@@ -81,6 +85,8 @@ def _direct_head(repo):
         if not stat.S_ISREG(before.st_mode) or before.st_size > 4096:
             raise CheckpointError("checkpoint HEAD must be a bounded regular file")
         data = os.read(descriptor, 4097)
+        if len(data) != before.st_size:
+            raise CheckpointError("short read of checkpoint HEAD")
         after = os.fstat(descriptor)
         current = path.stat(follow_symlinks=False)
         def identity(s):
