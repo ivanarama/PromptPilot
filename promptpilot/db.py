@@ -1116,6 +1116,62 @@ def _create_series(conn: sqlite3.Connection, task: TaskCreate) -> int:
     return cur.lastrowid
 
 
+def workorder_origins(conn: sqlite3.Connection, *, task_id=None, series_id=None) -> tuple[set[int], set[int]]:
+    """Immutable guarded roots, including unsupported legacy series aliases."""
+    query = (
+        "SELECT r.task_id, t.series_id, e.payload_json, w.config_json "
+        "FROM workflow_runs r LEFT JOIN tasks t ON t.id=r.task_id "
+        "JOIN workflows w ON w.id=r.workflow_id LEFT JOIN workflow_events e "
+        "ON e.idempotency_key='workflow.created:' || w.id"
+    )
+    params = ()
+    if task_id is not None:
+        query += " WHERE r.task_id=?"
+        params = (task_id,)
+    elif series_id is not None:
+        query += " WHERE r.task_id IN (SELECT id FROM tasks WHERE series_id=?)"
+        params = (series_id,)
+    rows = conn.execute(query, params).fetchall()
+    tasks, series = set(), set()
+    fences = ()
+    if series_id is not None:
+        fences = conn.execute("SELECT value FROM settings WHERE key=?",
+                              (f"workorder_no_recurrence:v1:{series_id}",))
+    elif task_id is None:
+        fences = conn.execute("SELECT value FROM settings WHERE key GLOB 'workorder_no_recurrence:v1:*'")
+    for row in fences:
+        series.add(int(row["value"]))
+    for row in rows:
+        try:
+            original = _json_load(row["payload_json"]) if row["payload_json"] else {}
+            current = _json_load(row["config_json"])
+            guarded = ((original.get("config") or {}).get("workorder_guard") is not None
+                       or current.get("workorder_guard") is not None)
+        except (ValueError, TypeError, AttributeError):
+            guarded = True
+        if guarded:
+            tasks.add(row["task_id"])
+            if row["series_id"] is not None:
+                series.add(row["series_id"])
+    return tasks, series
+
+
+def _retain_workorder_series_fences(conn):
+    """Keep unsupported legacy lineage refused after root task retention cleanup."""
+    _, series = workorder_origins(conn)
+    conn.executemany("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
+                     [(f"workorder_no_recurrence:v1:{value}", str(value)) for value in series])
+
+
+def workorder_recurrence_forbidden(task_id: int, *, conn=None) -> bool:
+    with (nullcontext(conn) if conn is not None else _connect()) as connection:
+        if task_id in workorder_origins(connection, task_id=task_id)[0]:
+            return True
+        row = connection.execute("SELECT series_id FROM tasks WHERE id=?", (task_id,)).fetchone()
+        return bool(row and row["series_id"] is not None
+                    and row["series_id"] in workorder_origins(connection, series_id=row["series_id"])[1])
+
+
 def _backfill_task_series(conn: sqlite3.Connection):
     """Give legacy recurrence chains a stable identity without changing runs."""
     rows = conn.execute(
@@ -1123,8 +1179,13 @@ def _backfill_task_series(conn: sqlite3.Connection):
            WHERE recurrence IS NOT NULL AND recurrence != '' AND series_id IS NULL
            ORDER BY id"""
     ).fetchall()
+    if not rows:
+        return
+    guarded_tasks, _ = workorder_origins(conn)
     groups = {}
     for row in rows:
+        if row["id"] in guarded_tasks:
+            continue
         groups.setdefault((row["prompt"], row["working_dir"] or ""), []).append(row)
     for chain in groups.values():
         head = next((r for r in reversed(chain)
@@ -1193,6 +1254,8 @@ def create_series_occurrence_if_idle(task: TaskCreate) -> Optional[TaskInDB]:
     if not task.series_id:
         raise ValueError("series occurrence requires series_id")
     with _connect(immediate=True) as conn:
+        if task.series_id in workorder_origins(conn, series_id=task.series_id)[1]:
+            return None
         series = conn.execute(
             "SELECT ended_at FROM task_series WHERE id = ?",
             (task.series_id,),
@@ -2452,6 +2515,8 @@ def pause_pipeline_series_on_repeated_blocker(
 
 def _recreate_series_occurrence(conn, series_id: int, series,
                                 scheduled_at: datetime) -> bool:
+    if series_id in workorder_origins(conn, series_id=series_id)[1]:
+        return False
     latest_row = conn.execute(
         "SELECT * FROM tasks WHERE series_id = ? ORDER BY id DESC LIMIT 1",
         (series_id,),
@@ -2576,8 +2641,11 @@ def repair_active_series_occurrences(
             """SELECT * FROM task_series
                WHERE paused = 0 AND ended_at IS NULL ORDER BY id"""
         ).fetchall()
+        _, forbidden_series = workorder_origins(conn)
         for series in series_rows:
             series_id = int(series["id"])
+            if series_id in forbidden_series:
+                continue
             if conn.execute(
                     """SELECT 1 FROM tasks WHERE series_id = ?
                        AND status IN ('pending', 'running', 'rate_limited')
@@ -3108,6 +3176,8 @@ def update_task_fields(task_id: int, fields: dict) -> bool:
             "WHEN budget_wait_scope IS NOT NULL THEN ? ELSE NULL END")
         values.append(_now())
     with _connect() as conn:
+        if fields.get("recurrence") and workorder_recurrence_forbidden(task_id, conn=conn):
+            return False
         cur = conn.execute(
             f"UPDATE tasks SET {', '.join(sets)} "
             "WHERE id = ? AND status IN ('pending', 'rate_limited')",
@@ -3118,6 +3188,7 @@ def update_task_fields(task_id: int, fields: dict) -> bool:
 
 def delete_task(task_id: int) -> bool:
     with _connect() as conn:
+        _retain_workorder_series_fences(conn)
         # A running provider may still own a checkout and an exact pipeline
         # target. Deletion must follow cancel + confirmed terminal cleanup;
         # otherwise removing the row would also free the reservation while the
@@ -4993,6 +5064,7 @@ def task_has_live_pipeline_target_reservation(task_id: int) -> bool:
 
 def purge_old(before_days: int = 7) -> int:
     with _connect() as conn:
+        _retain_workorder_series_fences(conn)
         cutoff = datetime.now(timezone.utc)
         from datetime import timedelta
         cutoff = (cutoff - timedelta(days=before_days)).isoformat()
@@ -5370,6 +5442,22 @@ def update_workflow(workflow_id: str, update: WorkflowUpdate) -> WorkflowInDB:
                 f"workflow version is {current['state_version']}, "
                 f"expected {update.expected_version}"
             )
+
+        if "config_json" in changes or "repository_path" in changes:
+            origin = conn.execute(
+                "SELECT payload_json FROM workflow_events WHERE idempotency_key=?",
+                ("workflow.created:" + workflow_id,),
+            ).fetchone()
+            original = _json_load(origin["payload_json"]) if origin else {}
+            original_guard = (original.get("config") or {}).get("workorder_guard")
+            next_config = _json_load(changes.get("config_json", current["config_json"]))
+            if original_guard != next_config.get("workorder_guard"):
+                raise WorkflowConflictError("workorder guard must match its immutable creation origin")
+            if original_guard is not None and "repository_path" in changes:
+                import os
+                if os.path.realpath(changes["repository_path"]) != original.get("repository_path"):
+                    raise WorkflowConflictError("workorder repository is immutable")
+                changes["repository_path"] = original["repository_path"]
 
         new_version = current["state_version"] + 1
         assignments = [f"{field} = ?" for field in changes]
