@@ -43,6 +43,14 @@ def test_third_round_and_lifetime_budget_have_explicit_outcomes(depth, budget, e
     assert wire.parse(wire.render(record)) == record
 
 
+def test_reducing_current_limit_preserves_spent_slots_and_parks_instead_of_resetting():
+    record=publication(depth=4,budget=2)
+    record['max_attempts']=1
+    record['outcome']=wire.outcome(record['report'],depth=4,budget_used=2,max_attempts=1)
+    assert record['outcome']=='engineering-handoff'
+    assert wire.parse(wire.render(record))['budget_used']==2
+
+
 def test_whole_report_not_only_categories_is_bound_in_wire_and_context():
     record = publication()
     before = wire.context(record)

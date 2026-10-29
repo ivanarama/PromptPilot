@@ -288,3 +288,18 @@ def test_reserved_source_cannot_be_readmitted_while_its_slot_is_in_flight():
     result=state.next_attempt_admission(state.proofs[-1].source,max_attempts=2)
     assert result['eligible'] is False and result['budget_used']==1
     assert result['reason']=='same source already reserved its lifetime slot'
+
+
+def test_lower_limit_engineering_completion_keeps_the_full_lifetime_ledger():
+    records=history()
+    data=copy.deepcopy(records[16].payload)
+    data['max_attempts']=1
+    records[16]=wire.Record(records[16].id,records[16].created_at,data)
+    context_hash=wire.context(data)
+    records[17]=changed(records[17],context_sha256=context_hash)
+    records[18]=changed(records[18],context_sha256=context_hash)
+    # Historical validation is separate from the current admission limit.
+    state=reduce(records,max_attempts=16)
+    assert state.budget_used==2 and state.proofs[-1].outcome=='engineering-handoff'
+    assert state.parking_id==records[18].id
+    assert state.next_attempt_admission(state.proofs[-1].source,max_attempts=1)['eligible'] is False

@@ -85,7 +85,8 @@ def outcome(report, *, depth, budget_used, max_attempts=2):
     """Classify explicit independently reviewed input; never infer evidence."""
     _integer(depth, 0, 2147483647)
     _integer(max_attempts, 1, 16)
-    _integer(budget_used, 0, max_attempts)
+    # A smaller current limit cannot erase already spent lifetime slots.
+    _integer(budget_used, 0, 16)
     inspect_report(report, report.get("head"))
     kinds = {item["kind"] for item in report["blocking"]}
     if not kinds:
