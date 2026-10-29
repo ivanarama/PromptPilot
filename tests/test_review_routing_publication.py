@@ -259,6 +259,10 @@ def test_final_completion_snapshot_rebinds_the_earliest_claim_before_post(tmp_pa
     with pytest.raises(PipelineError,match='canonical.*claim'):
         writer.run()
     assert server.posts==[]
+    writer.guard=original
+    recovered=writer.run()
+    assert recovered['source']['claim_id']=='1400'
+    assert server.posts==['completion']
 
 
 @pytest.mark.parametrize('phase',['claim','completion','lease'])

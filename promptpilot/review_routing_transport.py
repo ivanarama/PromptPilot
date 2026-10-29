@@ -46,15 +46,15 @@ class Transport:
     def publish(self,payload,*,owner,phase):
         """One network attempt, or read-only recovery of its exact receipt.
 
-        A failed gate after durable preparation can leave an unresolved local
-        intent. That conservative barrier is deliberate: another process must
-        not infer from absent visibility that a POST was never accepted.
+        Only the live prepare winner can record its final guard's definite
+        pre-POST refusal. A crash or any failure after the network boundary
+        stays unresolved; absent visibility never proves that it was not sent.
         """
         body=render(payload)  # Size/full encoding validated before I/O.
         target=payload['pr']['pr_number']
         snapshot=self._snapshot(payload)
         existing=self.journal.get(owner=owner,phase=phase)
-        if existing is not None:
+        if existing is not None and existing['state']!='not-sent':
             if (existing['repository'],existing['pr_number'],existing['body'])!=(self.repository,target,body):
                 raise PipelineError('routing recovery differs from its prepared request')
             expected_id=existing['returned_id']
@@ -71,14 +71,22 @@ class Transport:
             record=self._exact(self._snapshot(payload),payload,body,returned_id=record.id)
             self.journal.confirm(owner=owner,phase=phase,returned_id=record.id,body=body)
             return record
-        if not self.journal.prepare(owner=owner,phase=phase,repository=self.repository,number=target,body=body):
+        generation=self.journal.prepare(owner=owner,phase=phase,repository=self.repository,
+                                        number=target,body=body,with_generation=True)
+        if not generation:
             # Another process could have completed between get and prepare.
             # Repeat only the guarded READ path, never a network POST.
             return self.publish(payload,owner=owner,phase=phase)
-        # SQLite lock waits/encoding/identity reads may have crossed expiry or
-        # a hold. The final stage guard runs after write-ahead commit.
-        snapshot=self._snapshot(payload,write=True)
-        if self._matches(snapshot,payload,body):
+        self.journal.arm(owner=owner,phase=phase,generation=generation,body=body)
+        # All SQLite I/O, including the sending fence, precedes the final
+        # guard. Only THIS controlled branch is known never to have sent.
+        try:
+            snapshot=self._snapshot(payload,write=True)
+            matches=self._matches(snapshot,payload,body)
+        except Exception:
+            self.journal.refuse_before_post(owner=owner,phase=phase,generation=generation,body=body)
+            raise
+        if matches:
             # A delayed receipt can become visible during the write-ahead
             # transaction. The last fresh snapshot must suppress another POST.
             record=self._exact(snapshot,payload,body)

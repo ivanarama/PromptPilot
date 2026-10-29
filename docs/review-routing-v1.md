@@ -5,7 +5,9 @@ Python parser/reducer, согласованное чтение timeline и ло�
 write-ahead receipts. Внутренний coordinator публикации восстанавливает
 publication/claim/completion, выбирает canonical owner, renewal/takeover и
 проверяет lifetime/resume/post-push ограничения до нового root. Он требует
-повторной semantic admission по последнему WRITE snapshot после journal commit;
+повторной semantic admission по последнему WRITE snapshot после journal commit
+для каждой фазы: свежие root, canonical earliest claim и active lease/owner
+должны по-прежнему совпадать перед POST;
 уже начатая resuming publication не может заново потребить тот же grant в другой
 эпохе. Known exact receipt восстанавливается чтением без повторного POST. Он требует
 внешний полный stage guard, сам не аутентифицирует signed request и не меняет
@@ -63,6 +65,14 @@ Resume незапаркованной цели, старой parking или др
 
 Локальный журнал связывает owner/phase с точными body и PR. Pending/ambiguous
 запрос блокирует новый owner/phase того же lifetime PR до точного read-back.
+В journal v2 победитель prepare получает отдельный generation-token, которого
+нет в get/recovery inventory. До последнего guard он фиксирует attempting.
+Только прямая ветка этого вызова, которая получила отказ guard **до первого
+POST**, может CAS-переходом записать not-sent. Новое поколение после такого
+отказа снова проходит все серверные dedup/semantic/auth gates. Crash после
+attempting, неизвестный commit, любая ошибка POST/response/receipt и старые
+pending при миграции v1 сохраняют барьер. Отсутствие видимого комментария
+никогда само не означает not-sent; потраченные budget slots не освобождаются.
 Наблюдавшийся returned ID сохраняется отдельно от подтверждения: последующий
 GET не может забыть противоречивый ID. Внутренний Transport делает один POST
 либо восстанавливает receipt чтением; он требует внешнего полного stage guard,

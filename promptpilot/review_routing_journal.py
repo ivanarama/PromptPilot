@@ -11,6 +11,7 @@ import hashlib
 import os
 from pathlib import Path
 import re
+import secrets
 import sqlite3
 import time
 
@@ -33,10 +34,13 @@ class Journal:
         else:
             os.close(descriptor)
         with closing(self._connect()) as connection:
+            connection.execute('BEGIN IMMEDIATE')
             with connection:
                 version=connection.execute('PRAGMA user_version').fetchone()[0]
-                if version not in (0,1):
+                if version not in (0,1,2):
                     raise PipelineError('unsupported routing journal version')
+                if version==1:
+                    connection.execute('ALTER TABLE requests RENAME TO requests_v1')
                 connection.execute('''CREATE TABLE IF NOT EXISTS requests (
                     owner TEXT NOT NULL,
                     phase TEXT NOT NULL,
@@ -44,12 +48,18 @@ class Journal:
                     pr_number INTEGER NOT NULL,
                     body TEXT NOT NULL,
                     body_sha256 TEXT NOT NULL,
-                    state TEXT NOT NULL CHECK(state IN ('pending','ambiguous','done')),
+                    state TEXT NOT NULL CHECK(state IN ('pending','attempting','ambiguous','done','not-sent')),
                     returned_id TEXT,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL,
+                    generation TEXT,
                     PRIMARY KEY(owner,phase))''')
-                connection.execute('PRAGMA user_version=1')
+                if version==1:
+                    # A legacy pending operation may already have sent a POST.
+                    # NULL generation can never acquire pre-network refusal rights.
+                    connection.execute('INSERT INTO requests SELECT *,NULL FROM requests_v1')
+                    connection.execute('DROP TABLE requests_v1')
+                connection.execute('PRAGMA user_version=2')
 
     def _connect(self):
         connection=sqlite3.connect(self.path,timeout=10)
@@ -67,7 +77,7 @@ class Journal:
         if not isinstance(phase,str) or not re.fullmatch(r'[a-z][a-z0-9:-]{0,255}',phase):
             raise PipelineError('invalid routing journal phase key')
 
-    def prepare(self,*,owner,phase,repository,number,body):
+    def prepare(self,*,owner,phase,repository,number,body,with_generation=False):
         """Commit pending intent BEFORE the one permitted network attempt.
 
         Returns False for an already completed identical request. Any previous
@@ -93,18 +103,24 @@ class Journal:
                     if previous['state']=='done':
                         connection.commit()
                         return False
-                    raise PipelineError('routing POST result is ambiguous; exact read-back required before recovery')
+                    if previous['state']!='not-sent':
+                        raise PipelineError('routing POST result is ambiguous; exact read-back required before recovery')
                 # A fresh owner UUID/phase/repository spelling cannot erase
                 # uncertainty about an earlier request for the same lifetime
                 # PR. Only authenticated confirmation resolves that barrier.
-                unresolved=connection.execute("SELECT body FROM requests WHERE state IN ('pending','ambiguous')").fetchall()
+                unresolved=connection.execute("SELECT body FROM requests WHERE state IN ('pending','attempting','ambiguous')").fetchall()
                 if any(parse(row['body'])['pr']==payload['pr'] for row in unresolved):
                     raise PipelineError('routing target has an unresolved POST; exact read-back required before a new owner/phase')
                 now=time.time()
-                connection.execute('INSERT INTO requests VALUES (?,?,?,?,?,?,?,NULL,?,?)',
-                                   (owner,phase,repository,number,body,body_sha,'pending',now,now))
+                generation=secrets.token_hex(16)
+                if previous:
+                    connection.execute("UPDATE requests SET state='pending',returned_id=NULL,updated_at=?,generation=? WHERE owner=? AND phase=?",
+                                       (now,generation,owner,phase))
+                else:
+                    connection.execute('INSERT INTO requests VALUES (?,?,?,?,?,?,?,NULL,?,?,?)',
+                                       (owner,phase,repository,number,body,body_sha,'pending',now,now,generation))
                 connection.commit()
-                return True
+                return generation if with_generation else True
             except BaseException:
                 connection.rollback()
                 raise
@@ -113,22 +129,65 @@ class Journal:
         self._key(owner,phase)
         with closing(self._connect()) as connection:
             row=connection.execute('SELECT * FROM requests WHERE owner=? AND phase=?',(owner,phase)).fetchone()
-            return dict(row) if row else None
+            if row is None:
+                return None
+            result=dict(row)
+            # The cancellation capability belongs only to the call that won
+            # prepare. A recovery reader must never acquire it from inventory.
+            result.pop('generation')
+            return result
 
     def pending_for(self,pr):
         """Recovery inventory only; no pending operation is permission to POST."""
         with closing(self._connect()) as connection:
-            rows=connection.execute("SELECT * FROM requests WHERE state IN ('pending','ambiguous') ORDER BY created_at,owner,phase").fetchall()
-            return [dict(row) for row in rows if parse(row['body'])['pr']==pr]
+            rows=connection.execute("SELECT * FROM requests WHERE state IN ('pending','attempting','ambiguous') ORDER BY created_at,owner,phase").fetchall()
+            result=[]
+            for row in rows:
+                if parse(row['body'])['pr']==pr:
+                    item=dict(row);item.pop('generation');result.append(item)
+            return result
 
     def ambiguous(self,*,owner,phase):
         self._key(owner,phase)
         with closing(self._connect()) as connection:
             with connection:
-                cursor=connection.execute("UPDATE requests SET state='ambiguous',updated_at=? WHERE owner=? AND phase=? AND state IN ('pending','ambiguous')",
+                cursor=connection.execute("UPDATE requests SET state='ambiguous',updated_at=? WHERE owner=? AND phase=? AND state IN ('pending','attempting','ambiguous')",
                                           (time.time(),owner,phase))
                 if cursor.rowcount!=1:
                     raise PipelineError('routing journal pending request is missing or already completed')
+
+    def _pre_network_transition(self,*,owner,phase,generation,body,source,target):
+        self._key(owner,phase)
+        if not isinstance(generation,str) or not re.fullmatch('[0-9a-f]{32}',generation):
+            raise PipelineError('routing pre-network transition requires its fresh prepare generation')
+        with closing(self._connect()) as connection:
+            with connection:
+                cursor=connection.execute('''UPDATE requests SET state=?,updated_at=?
+                    WHERE owner=? AND phase=? AND generation=? AND state=?
+                    AND returned_id IS NULL AND body=? AND body_sha256=?''',
+                    (target,time.time(),owner,phase,generation,source,body,
+                     hashlib.sha256(body.encode('utf-8')).hexdigest()))
+                if cursor.rowcount!=1:
+                    raise PipelineError('routing pre-network generation/state CAS failed; keep recovery barrier')
+
+    def arm(self,*,owner,phase,generation,body):
+        """The prepare winner records possible sending before its final guard.
+
+        A crash from here leaves uncertainty. Recovery never infers not-sent
+        from this state or from absence of a server comment.
+        """
+        self._pre_network_transition(owner=owner,phase=phase,generation=generation,body=body,
+                                     source='pending',target='attempting')
+
+    def refuse_before_post(self,*,owner,phase,generation,body):
+        """Only the live prepare winner's controlled PRE-POST failure path.
+
+        This is not a recovery API. The caller must still be before its first
+        gh.json POST. Any POST/response/receipt error must retain uncertainty.
+        A later generation still needs fresh server dedup and all stage gates.
+        """
+        self._pre_network_transition(owner=owner,phase=phase,generation=generation,body=body,
+                                     source='attempting',target='not-sent')
 
     def confirm(self,*,owner,phase,returned_id,body):
         """Store a receipt AFTER independent authenticated server verification.

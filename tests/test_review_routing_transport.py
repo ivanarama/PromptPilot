@@ -1,7 +1,9 @@
 """Transport uncertainty is recovered by exact reads, never a second POST."""
 import copy
+from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
+import threading
 
 import pytest
 
@@ -114,12 +116,65 @@ def test_gate_failure_before_post_never_sends_the_prepared_body(tmp_path,hold_at
     assert server.posts==0
 
 
+def test_confirmed_prepost_refusal_can_continue_after_hold_without_repeating_a_post(tmp_path):
+    server=Server(hold_at_guard=2)
+    with pytest.raises(PipelineError,match='late hold'):
+        invoke(server,tmp_path)
+    assert server.posts==0
+    server.hold_at_guard=None
+    assert invoke(server,tmp_path).id=='1000'
+    assert server.posts==1
+
+
+def test_crash_after_sending_fence_never_becomes_not_sent_during_recovery(tmp_path):
+    server=Server()
+    original=server.guard
+    def crash(payload,*,write=False):
+        if write:raise SystemExit('simulated process crash')
+        return original(payload,write=write)
+    server.guard=crash
+    with pytest.raises(SystemExit):invoke(server,tmp_path)
+    assert Journal(tmp_path).get(owner=OWNER,phase='publication')['state']=='attempting'
+    server.guard=original
+    with pytest.raises(PipelineError,match='unique authenticated'):
+        invoke(server,tmp_path)
+    assert server.posts==0
+
+
+def test_other_process_cannot_send_while_prepare_winner_is_in_final_guard(tmp_path):
+    server=Server()
+    original=server.guard
+    entered=threading.Event();release=threading.Event()
+    def pause_then_refuse(payload,*,write=False):
+        if write:
+            entered.set()
+            assert release.wait(10)
+            raise PipelineError('controlled pre-POST refusal')
+        return original(payload,write=write)
+    server.guard=pause_then_refuse
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        first=pool.submit(invoke,server,tmp_path)
+        try:
+            assert entered.wait(10)
+            with pytest.raises(PipelineError,match='unique authenticated'):
+                invoke(server,tmp_path)
+            assert server.posts==0
+        finally:release.set()
+        with pytest.raises(PipelineError,match='controlled pre-POST'):
+            first.result(timeout=10)
+    server.guard=original
+    assert invoke(server,tmp_path).id=='1000'
+    assert server.posts==1
+    assert invoke(server,tmp_path).id=='1000'
+    assert server.posts==1
+
+
 def test_late_hold_after_post_stops_following_phases_and_does_not_erase_intent(tmp_path):
     server=Server(hold_at_guard=3)
     with pytest.raises(PipelineError,match='late hold'):
         invoke(server,tmp_path)
     assert server.posts==1
-    assert Journal(tmp_path).get(owner=OWNER,phase='publication')['state']=='pending'
+    assert Journal(tmp_path).get(owner=OWNER,phase='publication')['state']=='attempting'
 
 
 @pytest.mark.parametrize('actor,edited', [('contributor',None),('owner','2026-10-29T00:01:00Z')])
@@ -128,7 +183,7 @@ def test_untrusted_or_edited_server_record_cannot_complete_local_request(tmp_pat
     with pytest.raises(PipelineError):
         invoke(server,tmp_path)
     assert server.posts==1
-    assert Journal(tmp_path).get(owner=OWNER,phase='publication')['state']=='pending'
+    assert Journal(tmp_path).get(owner=OWNER,phase='publication')['state']=='attempting'
 
 
 def test_contradicting_returned_id_cannot_be_forgotten_on_a_later_recovery(tmp_path):
@@ -138,7 +193,7 @@ def test_contradicting_returned_id_cannot_be_forgotten_on_a_later_recovery(tmp_p
             invoke(server,tmp_path)
     assert server.posts==1
     saved=Journal(tmp_path).get(owner=OWNER,phase='publication')
-    assert saved['state']=='pending' and saved['returned_id']=='1001'
+    assert saved['state']=='attempting' and saved['returned_id']=='1001'
 
 
 def test_missing_stage_guard_or_wrong_pr_identity_cannot_publish(tmp_path):

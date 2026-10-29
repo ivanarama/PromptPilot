@@ -79,7 +79,7 @@ def test_unsupported_local_journal_version_fails_before_any_request(tmp_path):
     journal=Journal(tmp_path)
     import sqlite3
     with closing(sqlite3.connect(journal.path)) as connection:
-        connection.execute('PRAGMA user_version=2')
+        connection.execute('PRAGMA user_version=3')
     with pytest.raises(PipelineError,match='unsupported routing journal'):
         Journal(tmp_path)
 
@@ -101,3 +101,58 @@ def test_new_owner_or_phase_cannot_bypass_an_unresolved_post_for_same_lifetime_p
     # it does not itself grant server lease ownership or budget authority.
     journal.confirm(owner=OWNER,phase='publication',returned_id='10',body=BODY)
     assert journal.prepare(**dict(REQUEST,phase='another-phase')) is True
+
+
+def test_pre_network_refusal_is_generation_cas_and_never_releases_a_spent_request(tmp_path):
+    journal=Journal(tmp_path)
+    first=journal.prepare(**REQUEST,with_generation=True)
+    assert 'generation' not in journal.get(owner=OWNER,phase='publication')
+    assert all('generation' not in item for item in journal.pending_for(PAYLOAD['pr']))
+    journal.arm(owner=OWNER,phase='publication',generation=first,body=BODY)
+    for wrong in ['f'*32,None]:
+        with pytest.raises(PipelineError,match='CAS failed|fresh prepare'):
+            journal.refuse_before_post(owner=OWNER,phase='publication',generation=wrong,body=BODY)
+    journal.refuse_before_post(owner=OWNER,phase='publication',generation=first,body=BODY)
+    assert journal.pending_for(PAYLOAD['pr'])==[]
+    second=journal.prepare(**REQUEST,with_generation=True)
+    assert second!=first
+    journal.arm(owner=OWNER,phase='publication',generation=second,body=BODY)
+    with pytest.raises(PipelineError,match='CAS failed'):
+        journal.refuse_before_post(owner=OWNER,phase='publication',generation=first,body=BODY)
+    journal.observe_returned_id(owner=OWNER,phase='publication',returned_id='10')
+    with pytest.raises(PipelineError,match='CAS failed'):
+        journal.refuse_before_post(owner=OWNER,phase='publication',generation=second,body=BODY)
+    journal.ambiguous(owner=OWNER,phase='publication')
+    with pytest.raises(PipelineError,match='CAS failed'):
+        journal.refuse_before_post(owner=OWNER,phase='publication',generation=second,body=BODY)
+    with pytest.raises(PipelineError,match='ambiguous'):
+        journal.prepare(**REQUEST,with_generation=True)
+
+
+def test_legacy_pending_and_known_receipts_migrate_without_pre_network_rights(tmp_path):
+    import hashlib
+    import sqlite3
+    tmp_path.mkdir(exist_ok=True)
+    database=tmp_path/'review-routing-journal.sqlite3'
+    with closing(sqlite3.connect(database)) as connection:
+        connection.execute('''CREATE TABLE requests(owner TEXT,phase TEXT,repository TEXT,
+            pr_number INTEGER,body TEXT,body_sha256 TEXT,state TEXT,returned_id TEXT,
+            created_at REAL,updated_at REAL,PRIMARY KEY(owner,phase))''')
+        connection.execute('INSERT INTO requests VALUES (?,?,?,?,?,?,?,?,?,?)',
+            (OWNER,'publication','owner/repo',42,BODY,hashlib.sha256(BODY.encode()).hexdigest(),
+             'pending',None,1.0,1.0))
+        connection.execute('INSERT INTO requests VALUES (?,?,?,?,?,?,?,?,?,?)',
+            (OWNER,'done','owner/repo',42,BODY,hashlib.sha256(BODY.encode()).hexdigest(),
+             'done','123',1.0,2.0))
+        connection.execute('PRAGMA user_version=1')
+        connection.commit()
+    journal=Journal(tmp_path)
+    assert journal.get(owner=OWNER,phase='done')['returned_id']=='123'
+    pending=journal.get(owner=OWNER,phase='publication')
+    assert 'generation' not in pending and pending['state']=='pending'
+    with pytest.raises(PipelineError,match='fresh prepare'):
+        journal.refuse_before_post(owner=OWNER,phase='publication',generation=None,body=BODY)
+    with pytest.raises(PipelineError,match='ambiguous'):
+        journal.prepare(**REQUEST,with_generation=True)
+    journal.confirm(owner=OWNER,phase='publication',returned_id='124',body=BODY)
+    assert Journal(tmp_path).get(owner=OWNER,phase='publication')['returned_id']=='124'
