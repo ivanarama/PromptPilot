@@ -46,13 +46,20 @@ def test_last_findings_block_wins_too():
     "AUDIT_FINDINGS_JSON: {}\nAUDIT_VERDICT: PASS",
     "AUDIT_VERDICT: PASS\nAUDIT_FINDINGS_JSON: []",
     "AUDIT_VERDICT: PASS",  # do not pair this with a quoted older findings block
+    "Current audit has no structured decision.\nИТОГ: ГОТОВО",
+    "ELICIT: need a decision\nИТОГ: ГОТОВО",
+    "```\nИТОГ: ГОТОВО",  # closing a quoted old contract cannot make it current
 ])
 def test_invalid_final_contract_never_revives_quoted_pass(tail):
     report = "AUDIT_FINDINGS_JSON: []\nAUDIT_VERDICT: PASS\n\nNew audit:\n" + tail
     assert W.parse_reviewer_report(report) is None
 
 
-def test_invalid_final_contract_stops_real_workflow_transition(isolated_db, tmp_path):
+@pytest.mark.parametrize("tail", [
+    "AUDIT_FINDINGS_JSON: not-json\nAUDIT_VERDICT: PASS\nИТОГ: ГОТОВО",
+    "The current audit is incomplete; the pair above is historical.\nИТОГ: ГОТОВО",
+])
+def test_invalid_final_contract_stops_real_workflow_transition(isolated_db, tmp_path, tail):
     from promptpilot.models import WorkflowCreate, WorkflowStartRequest
     workflow = isolated_db.create_workflow(WorkflowCreate(
         slug="invalid-final-contract", objective="x", repository_path=str(tmp_path),
@@ -68,6 +75,26 @@ def test_invalid_final_contract_stops_real_workflow_transition(isolated_db, tmp_
         W.sync_task(task.id)
         W.advance_linked_task(task.id)
     finish("executor complete")
-    finish("AUDIT_FINDINGS_JSON: []\nAUDIT_VERDICT: PASS\n\nNew audit:\nAUDIT_FINDINGS_JSON: not-json\nAUDIT_VERDICT: PASS\nИТОГ: ГОТОВО")
+    finish("AUDIT_FINDINGS_JSON: []\nAUDIT_VERDICT: PASS\n\nNew audit:\n" + tail)
     assert isolated_db.get_workflow(workflow.id).status.value == "awaiting_human"
     assert not any(e.event_type == "review.passed" for e in isolated_db.list_workflow_events(workflow.id))
+
+
+@pytest.mark.parametrize("footer", ["", "\nИТОГ: ГОТОВО", "\n\nИТОГ: УЖЕ СДЕЛАНО — аудит завершён\n"])
+def test_terminal_audit_pair_allows_only_its_optional_workflow_footer(footer):
+    decision = W.parse_reviewer_report("AUDIT_FINDINGS_JSON: []\nAUDIT_VERDICT: PASS" + footer)
+    assert decision is not None and decision.verdict.value == "PASS"
+
+
+@pytest.mark.parametrize("opening,closing", [("```text", "```"), ("````text", "````"), ("~~~text", "~~~")])
+def test_unclosed_fenced_example_cannot_supply_the_final_audit_contract(opening, closing):
+    report = "Historical example:\n" + opening + "\nAUDIT_FINDINGS_JSON: []\nAUDIT_VERDICT: PASS\nИТОГ: ГОТОВО"
+    assert W.parse_reviewer_report(report) is None
+
+
+@pytest.mark.parametrize("opening,closing", [("```text", "```"), ("````text", "````"), ("~~~text", "~~~")])
+def test_real_terminal_contract_after_closed_example_still_parses(opening, closing):
+    report = (opening + "\nAUDIT_FINDINGS_JSON: []\nAUDIT_VERDICT: PASS\n" + closing
+              + "\nCurrent decision:\nAUDIT_FINDINGS_JSON: []\nAUDIT_VERDICT: HUMAN_REQUIRED\nИТОГ: ГОТОВО")
+    decision = W.parse_reviewer_report(report)
+    assert decision is not None and decision.verdict.value == "HUMAN_REQUIRED"
