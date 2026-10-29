@@ -100,6 +100,20 @@ receipt может быть чтением после истечения write l
 повторяет актуальные права/TTL после write-ahead commit. Потеря локального
 журнала не дублирует surviving exact own server phase.
 
+Внутренний request serializer отдельно фиксирует HMAC-purpose audit либо
+publication-recovery, полный PR/author/epoch/audit scope, текущие policy/reader
+hashes, конечный budget/limit, срок, UUID/nonce и task reservation. UUID/nonce
+создаёт сервис; report и публичный owner UUID их не выбирают. Другой task/retry
+не может использовать reservation, а pipeline task не может взять unreserved
+manual request. Recovery получает новый UUID и сохраняет canonical audit binding;
+сам serializer не доказывает, что переданный ему root канонический.
+
+`require_current` проверяет локальные scope/config/replica/attempt ограничения
+и читает часы после сериализации/digest-проверок. Это не GitHub proof, не
+обновление DB reservation и не полный публичный stage guard. Подпись не заменяет
+свежие внешние гейты; parser/validator не создают ключ или DB. Ни нового CLI,
+ни реального public writer, ни включённого capability этим модулем не добавлено.
+
 Внутренний preflight сохраняет проектируемые три параметра technical_handoff:
 enabled, protocol и max_extra_attempts. Он не добавляет defaults в legacy config,
 не меняя digest существующих leases. Для совместимости он сравнивает полный
