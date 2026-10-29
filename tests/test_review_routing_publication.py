@@ -9,7 +9,7 @@ import pytest
 from promptpilot.pipeline_errors import PipelineError
 from promptpilot.review_routing_journal import Journal
 from promptpilot.review_routing_publication import Publication
-from promptpilot.review_routing_wire import parse, render
+from promptpilot.review_routing_wire import context, parse, render
 
 
 HISTORY=json.loads((Path(__file__).parent/'fixtures/review-routing-wire-v1.json').read_text(encoding='utf-8'))['records']
@@ -234,3 +234,83 @@ def test_final_snapshot_canonical_root_prevents_another_root_before_post(tmp_pat
     with pytest.raises(PipelineError,match='root appeared'):
         writer.run()
     assert server.posts==[]
+
+
+def test_final_completion_snapshot_rebinds_the_earliest_claim_before_post(tmp_path):
+    server=Server()
+    server.now+=timedelta(minutes=1)
+    for item in HISTORY[:2]:
+        node={'__typename':'IssueComment','fullDatabaseId':item['id'],
+              'createdAt':item['created_at'],'lastEditedAt':None,'author':{'login':'owner'},
+              'body':render(item['payload'])}
+        if item['payload']['kind']=='claim':
+            node['fullDatabaseId']='1500'
+        server.comments.append({'cursor':'C'+node['fullDatabaseId'],'node':node})
+    original=server.guard
+
+    def earlier_claim(payload,*,write=False):
+        if write and payload['kind']=='completion':
+            earlier=copy.deepcopy(server.comments[1])
+            earlier['node']['fullDatabaseId']='1400';earlier['cursor']='C1400'
+            server.comments.append(earlier)
+        return original(payload,write=write)
+
+    writer=Publication(server,CONFIG,Journal(tmp_path),earlier_claim,PAYLOAD,clock=lambda:server.now)
+    with pytest.raises(PipelineError,match='canonical.*claim'):
+        writer.run()
+    assert server.posts==[]
+
+
+@pytest.mark.parametrize('phase',['claim','completion','lease'])
+def test_final_snapshot_rejects_phase_when_a_renewal_changes_its_parent(tmp_path,phase):
+    server=history_server(2 if phase=='completion' else 1)
+    server.now=datetime(2026,10,29,0,30 if phase=='lease' else 26,tzinfo=timezone.utc)
+    # Claim/completion were prepared while renewal was not yet due. A second
+    # writer renews before their final POST guard; their old lease is stale.
+    if phase!='lease':
+        server.now-=timedelta(minutes=2)
+    original=server.guard
+
+    def renewed(payload,*,write=False):
+        if write and payload['kind']==phase:
+            server.now=datetime(2026,10,29,0,30 if phase=='lease' else 26,tzinfo=timezone.utc)
+            renewal={'protocol':PAYLOAD['protocol'],'pr':PAYLOAD['pr'],
+                     'owner':'00000000-0000-4000-8000-000000000003' if phase=='lease' else PAYLOAD['owner'],
+                     'kind':'lease','purpose':'review-publication','root':'1000','previous':'1000',
+                     'context_sha256':context(PAYLOAD)}
+            server.comments.append({'cursor':'C1400','node':{'__typename':'IssueComment',
+                 'fullDatabaseId':'1400','createdAt':server.now.isoformat().replace('+00:00','Z'),'lastEditedAt':None,
+                 'author':{'login':'owner'},'body':render(renewal)}})
+        return original(payload,write=write)
+
+    seed=copy.deepcopy(PAYLOAD)
+    if phase=='lease':
+        seed['owner']=OWNER2
+    writer=Publication(server,CONFIG,Journal(tmp_path),renewed,seed,clock=lambda:server.now)
+    with pytest.raises(PipelineError,match='returned ID|parent changed'):
+        writer.run()
+    assert server.posts==[]
+
+
+@pytest.mark.parametrize('phase,count,late_index',[
+    ('claim',1,1),
+    ('completion',2,2),
+])
+def test_final_snapshot_recognizes_a_phase_completed_by_another_writer(tmp_path,phase,count,late_index):
+    server=history_server(count)
+    original=server.guard
+
+    def completed_elsewhere(payload,*,write=False):
+        if write and payload['kind']==phase:
+            item=HISTORY[late_index]
+            server.comments.append({'cursor':'C'+item['id'],'node':{'__typename':'IssueComment',
+                 'fullDatabaseId':item['id'],'createdAt':item['created_at'],'lastEditedAt':None,
+                 'author':{'login':'owner'},'body':render(item['payload'])}})
+        return original(payload,write=write)
+
+    writer=Publication(server,CONFIG,Journal(tmp_path),completed_elsewhere,PAYLOAD,clock=lambda:server.now)
+    # Identical payloads should recover the exact existing receipt, with no
+    # duplicate POST; semantically different payloads must stop before POST.
+    result=writer.run()
+    assert result['action']=='completed'
+    assert server.posts==(['completion'] if phase=='claim' else [])

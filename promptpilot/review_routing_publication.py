@@ -47,19 +47,54 @@ class Publication:
         snapshot=self.guard(payload,write=write)
         if not isinstance(snapshot,dict) or snapshot.get('pr_key')!=payload['pr']:
             raise PipelineError('routing stage guard returned another PR identity')
-        if write and payload['kind']=='publication':
+        if write:
             history,ledger=self._decode_state(snapshot)
             body=render(payload)
             if not any(render(item.payload)==body for item in history):
                 # A known exact receipt is recovered by Transport, not posted.
                 # Every genuinely new root must pass semantic admission on the
                 # *last* coherent snapshot, after durable journal preparation.
-                if any(item.payload['kind']=='publication'
+                roots=[item for item in history if item.payload['kind']=='publication'
                        and (item.payload['identity']['head_sha'],item.payload['epoch'])==
-                           (self.seed['identity']['head_sha'],self.seed['epoch']) for item in history):
-                    raise PipelineError('canonical publication root appeared before POST; recover its owner')
-                self._admit(ledger)
+                           (self.seed['identity']['head_sha'],self.seed['epoch'])]
+                if payload['kind']=='publication':
+                    if roots:
+                        raise PipelineError('canonical publication root appeared before POST; recover its owner')
+                    self._admit(ledger)
+                else:
+                    self._phase_admit(payload,history,ledger,roots)
         return snapshot
+
+    def _phase_admit(self,payload,history,ledger,roots):
+        if not roots:
+            raise PipelineError('publication phase has no canonical root')
+        root=min(roots,key=lambda item:item.order)
+        if (context(root.payload)!=self.context or payload['context_sha256']!=self.context
+                or payload['owner']!=self.owner):
+            raise PipelineError('publication phase differs from its canonical context/owner')
+        if any(proof.publication.id==root.id for proof in ledger.proofs):
+            raise PipelineError('canonical publication already completed; do not POST another phase')
+        view=resolve(_lease_nodes(history,root,purpose='review-publication'),
+                     context_sha256=self.context,purpose='review-publication',now=self.clock())
+        if payload['kind']=='lease':
+            if payload['purpose']!='review-publication' or payload['root']!=root.id or payload['previous']!=view.active.id:
+                raise PipelineError('publication renewal/takeover parent changed')
+            now=self.clock()
+            eligible=(self.owner==view.active.owner and now<view.expires_at
+                      and view.expires_at-now<RENEW_WINDOW
+                      or self.owner!=view.active.owner and now>=view.expires_at)
+            if not eligible:
+                raise PipelineError('publication renewal/takeover is no longer eligible')
+            return
+        if payload['kind'] not in {'claim','completion'} or payload['publication_id']!=root.id:
+            raise PipelineError('unsupported publication phase or canonical root binding')
+        claims=[item for item in history if item.payload['kind']=='claim'
+                and item.payload['publication_id']==root.id and item.id not in ledger.ignored_ids]
+        if payload['kind']=='claim' and claims:
+            raise PipelineError('canonical claim appeared before POST; recover it')
+        if payload['kind']=='completion' and (not claims or payload['claim_id']!=min(claims,key=lambda item:item.order).id):
+            raise PipelineError('completion does not bind the fresh canonical earliest claim')
+        view.require_owner(returned_id=payload['lease_id'],owner=self.owner,now=self.clock())
 
     def _publish(self,payload):
         return self.transport.publish(payload,owner=payload['owner'],
