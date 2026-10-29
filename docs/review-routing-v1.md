@@ -181,6 +181,17 @@ HEAD, `next` подтверждает только точное тело и из
 журнале по полной доверенной истории. Невидимая запись, конфликт ID или другой
 GitHub actor сохраняют барьер и не запускают новый audit.
 
+Внутренний `OneUseStart` подготавливает последнюю границу будущего pipeline FIX.
+Он создаёт отдельную operational-таблицу только при явном использовании, в том же
+SQLite, где атомарно проверяет running task, started_at, cancel и точную живую
+reservation. До финального read-only guard и одного factory-call durable
+фиксируется spawn-attempting. Неизвестный результат, crash или новая попытка
+задачи не дают второго запуска; даже FileNotFoundError не включает старый
+spawn-retry. Только прямой отказ guard до factory может дать not-started для
+контролируемого повтора того же неизменного scope. Пауза выдачи не отменяет уже
+claimed задачу. Этот компонент пока не подключён к настоящему запуску FIX и не
+доказывает signed FIX-start, server started, author handoff или post-push.
+
 До будущей записи/dispatch обязательны полные public gates: совместимость всех
 читателей, trusted actor/immutability, coherent identity/epoch/lifecycle/labels,
 текущее владение returned ID/UUID, effective config и конечный budget. Неопределённый
