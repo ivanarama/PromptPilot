@@ -49,22 +49,30 @@ class Publication:
         if not isinstance(snapshot,dict) or snapshot.get('pr_key')!=payload['pr']:
             raise PipelineError('routing stage guard returned another PR identity')
         if write:
-            history,ledger=self._decode_state(snapshot)
-            body=render(payload)
-            if not any(render(item.payload)==body for item in history):
-                # A known exact receipt is recovered by Transport, not posted.
-                # Every genuinely new root must pass semantic admission on the
-                # *last* coherent snapshot, after durable journal preparation.
-                roots=[item for item in history if item.payload['kind']=='publication'
-                       and (item.payload['identity']['head_sha'],item.payload['epoch'])==
-                           (self.seed['identity']['head_sha'],self.seed['epoch'])]
-                if payload['kind']=='publication':
-                    if roots:
-                        raise PipelineError('canonical publication root appeared before POST; recover its owner')
-                    self._admit(ledger)
-                else:
-                    self._phase_admit(payload,history,ledger,roots)
+            self.require_admission(payload,snapshot)
         return snapshot
+
+    def require_admission(self,payload,snapshot,*,require_new=False):
+        """Pure semantic checks, also reusable after the final DB wait.
+
+        This method performs no journal/network I/O. A validation-only instance
+        may have journal=None; it must never call run/publish/recovery.
+        """
+        history,ledger=self._decode_state(snapshot)
+        body=render(payload)
+        if any(render(item.payload)==body for item in history):
+            if require_new:
+                raise PipelineError('exact publication receipt appeared before POST; recover it read-only')
+            return
+        roots=[item for item in history if item.payload['kind']=='publication'
+               and (item.payload['identity']['head_sha'],item.payload['epoch'])==
+                   (self.seed['identity']['head_sha'],self.seed['epoch'])]
+        if payload['kind']=='publication':
+            if roots:
+                raise PipelineError('canonical publication root appeared before POST; recover its owner')
+            self._admit(ledger)
+        else:
+            self._phase_admit(payload,history,ledger,roots)
 
     def _phase_admit(self,payload,history,ledger,roots):
         if not roots:

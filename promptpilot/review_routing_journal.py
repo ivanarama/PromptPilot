@@ -46,6 +46,29 @@ def _schema_signature(value):
 
 
 class Journal:
+    @staticmethod
+    def has_existing_history(directory,repository,number):
+        """Observe an existing receipt store without creation or migration."""
+        path=Path(directory)/'review-routing-journal.sqlite3'
+        if path.is_symlink():
+            raise PipelineError('routing journal cannot be a symbolic link')
+        if not path.exists():
+            return False
+        if not path.is_file():
+            raise PipelineError('existing routing journal is not a regular file')
+        try:
+            with closing(sqlite3.connect(path.resolve().as_uri()+'?mode=ro',uri=True,timeout=10)) as connection:
+                version=connection.execute('PRAGMA user_version').fetchone()[0]
+                row=connection.execute("SELECT type,sql FROM sqlite_master WHERE name='requests'").fetchone()
+                expected=SCHEMA if version==2 else LEGACY_SCHEMA
+                if (version not in (1,2) or row is None or row[0]!='table'
+                        or _schema_signature(row[1] or '')!=_schema_signature(expected)):
+                    raise PipelineError('unknown existing routing journal; preserve engineering fence')
+                return connection.execute('SELECT 1 FROM requests WHERE repository=? AND pr_number=? LIMIT 1',
+                                          (repository,number)).fetchone() is not None
+        except sqlite3.Error as exc:
+            raise PipelineError('existing routing journal is unavailable; preserve engineering fence') from exc
+
     def __init__(self, directory):
         directory=Path(directory)
         directory.mkdir(parents=True,exist_ok=True)

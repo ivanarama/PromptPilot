@@ -6,7 +6,7 @@ and expiry after all slow work. No public route or capability is enabled here.
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime,timezone
 import json
 import re
 import secrets
@@ -122,6 +122,34 @@ def require_current(request,config,*,now=None,write=True):
     if type(current) is not int:raise PipelineError('typed REVIEW clock must be integral UTC seconds')
     if request['issued_at']>current+60 or (write and request['expires_at']<=current):
         raise PipelineError('typed REVIEW request expired or is not yet valid')
+
+
+def verify_local(request):
+    """Atomically read the claimed occurrence, cancellation and reservation.
+
+    A pending cancel keeps the task running until owned cleanup finishes. It
+    must still prevent new mutations; exact read-only receipt recovery remains
+    separate and does not call this write gate.
+    """
+    from . import db
+    expected=request['target_reservation']
+    if expected is None:
+        return
+    with db._connect() as connection:
+        row=connection.execute('''SELECT r.* FROM pipeline_target_reservations r
+            JOIN tasks t ON t.id=r.task_id
+            WHERE r.repository=? AND r.number=? AND t.status='running' AND t.started_at=r.task_started_at
+              AND COALESCE(t.machine,'')='' AND COALESCE(t.detached,0)=0
+              AND COALESCE(t.worktree,0)=0 AND COALESCE(t.herdr_target,'')=''
+              AND NOT EXISTS (SELECT 1 FROM settings WHERE key=? AND value='1')''',
+            (expected['repository'],expected['number'],'cancel_task:'+str(expected['task_id']))).fetchone()
+        if row is None or any(row[name]!=expected[name] for name in RESERVATION_FIELDS.split() if name!='expires_at'):
+            raise PipelineError('typed REVIEW final task/cancel/reservation snapshot changed')
+        try:expiry=datetime.fromisoformat(row['expires_at'])
+        except (TypeError,ValueError) as exc:
+            raise PipelineError('typed REVIEW final reservation expiry is invalid') from exc
+        if expiry.tzinfo is None or expiry.utcoffset() is None or datetime.now(timezone.utc)>=expiry:
+            raise PipelineError('typed REVIEW final reservation expired')
 
 
 def encode(request):

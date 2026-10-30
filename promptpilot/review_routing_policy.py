@@ -16,19 +16,26 @@ ROLES={'review':'review-queue','fix':'fix-approved','merge':'merge-shepherd','ta
 def off_fence(gh, config, number):
     """OFF never erases an existing trusted v1 lifetime transaction.
 
-    No readers, journal or wire writes are opened here. A malformed/edited
-    trusted marker is also a fence, rather than permission to downgrade it.
-    Ordinary no-v1 legacy bytes remain unchanged.
+    No readers, journal creation/migration or wire writes occur here. Edited
+    trusted comments, deletions and existing local transactions retain the
+    fence even when their old marker text is no longer visible. Unaltered
+    ordinary no-v1 legacy bytes remain unchanged.
     """
     from . import project_pipeline as pp
+    from .review_routing_adapter import journal_directory
+    from .review_routing_journal import Journal
     snapshot = pp.stable_timeline(gh, config, number)
+    fenced=Journal.has_existing_history(journal_directory(config),config['repository'],number)
     for edge in snapshot['edges']:
         node = edge.get('node') or {}
-        if (node.get('__typename') == 'IssueComment'
+        if (node.get('__typename')=='CommentDeletedEvent'
+                or node.get('__typename') == 'IssueComment'
                 and (node.get('author') or {}).get('login') == config['trusted_account']
-                and '<!-- pp:review-routing-' in (node.get('body') or '')):
-            return {'action': 'wait', 'verdict': 'ПУСТО', 'number': number,
-                    'reason': 'routing is OFF with existing trusted v1 state; read-only engineering fence'}
+                and ('<!-- pp:review-routing-' in (node.get('body') or '') or node.get('lastEditedAt') is not None)):
+            fenced=True
+    if fenced:
+        return {'action': 'wait', 'verdict': 'ПУСТО', 'number': number,
+                'reason': 'routing is OFF with existing or uncertain trusted history; read-only engineering fence'}
     return None
 
 

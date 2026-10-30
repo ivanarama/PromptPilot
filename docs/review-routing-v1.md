@@ -122,8 +122,10 @@ GitHub, два полных согласованных чтения PR, author/i
 подписанного SHA; другой base не маскируется исключением поля из hash.
 Обновление локальной task reservation предшествует финальной проверке срока.
 После journal/reducer/exact matching Transport вызывает отдельный one-use
-`final_before_post`: ещё раз читает локальную конфигурацию и четыре дерева
-обработчиков, затем проверяет request/task/server lease по последним часам.
+`final_before_post`: после ожидания renewal заново читает actor/checker и полную
+серверную историю, повторяет semantic admission фазы. Затем одним локальным
+снимком проверяет текущую running-попытку, cancel и точную живую reservation;
+проверяет конфигурацию/четыре дерева обработчиков и сроки request/server lease.
 Known receipt после expiry остаётся read-only recovery. Этот компонент используется
 Draft-адаптером next/complete, но сам не выбирает цель и не назначает FIX.
 При последующем изменении HEAD, hold или закрытии PR guard может подтвердить
@@ -262,10 +264,18 @@ same-HEAD rebaseline, неверный parking/previous и повторное п
 wire vectors и expected legacy bytes не переписаны.
 
 При OFF, включая удаление technical_handoff из config, legacy next REVIEW/FIX
-перед handoff читает историю выбранной PR. Наличие trusted routing marker сохраняет
-read-only fence, даже после смены HEAD/labels или редактирования marker. Отсутствие
-v1 state сохраняет старые результаты и сериализацию; OFF не открывает reader trees
-или v1 journal. Это добавляет read-only timeline preflight перед legacy fallback.
+перед handoff читает историю выбранной PR. Trusted routing marker, редактирование
+доверенного комментария, удаление либо запись уже существующего локального
+v1-журнала сохраняют read-only fence, даже если тело marker исчезло. Изменённая
+история не доказывает отсутствия v1. Для неизменённой полной истории без v1 и
+локальных транзакций сохраняются прежние результаты и сериализация. OFF не
+открывает reader trees, не создаёт и не мигрирует journal; проверка существующего
+journal идёт только на чтение. Неопределённая история требует инженерной сверки.
+
+Типизированные tokenless `wait`/`empty`/`error` — ответы без права на mutation.
+Worker сохраняет для них обычный маршрут ожидания/ошибки без декодирования
+несуществующего audit-token. Подмена outer action у подписанного lease по-прежнему
+отказывает; read-only ответ не разрешает запуск модели или публикацию.
 
 Оставшаяся граница A151 существенна: нет operational progress/start issuer,
 policy-bound pipeline coordinator и canonical started; OneUseStart всё ещё не

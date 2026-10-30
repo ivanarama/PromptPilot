@@ -93,6 +93,9 @@ class StageGuard:
             raise PipelineError('typed REVIEW historical read requires a unique exact existing receipt')
 
     def __call__(self,payload,*,write=False):
+        return self._check(payload,write=write)
+
+    def _check(self,payload,*,write=False,_after_waits=False):
         self._ticket=None
         value=self._phase(payload,write=write)
         # Reauthenticate the original signed scope and reload the effective
@@ -143,7 +146,7 @@ class StageGuard:
             view=resolve(_lease_nodes(history,root,purpose='review-publication'),
                          context_sha256=self.context,purpose='review-publication',now=self.clock())
         pp.ensure_identity(self.gh,config)
-        renewed=pp.renew_lease_target_reservation(request,config) if write else None
+        renewed=pp.renew_lease_target_reservation(request,config) if write and not _after_waits else None
         requests.require_current(request,config,write=write)
         if write:
             self._ticket={'snapshot':snapshot,'snapshot_sha256':sha(snapshot),'body':render(value),
@@ -159,6 +162,17 @@ class StageGuard:
         if (ticket is None or snapshot is not ticket['snapshot']
                 or sha(snapshot)!=ticket['snapshot_sha256'] or render(payload)!=ticket['body']):
             raise PipelineError('typed REVIEW final guard has no matching fresh write snapshot')
+        # Publication's journal may have waited after the initial guard. Renew
+        # first, then obtain another authenticated actor/checker/history/lease
+        # view without moving that write wait behind the refreshed snapshot.
+        renewed=pp.renew_lease_target_reservation(self.request,pp.load_config(self.config_path))
+        fresh=self._check(payload,write=True,_after_waits=True)
+        ticket=self._ticket;self._ticket=None
+        ticket['reservation']=renewed
+        from .review_routing_publication import Publication
+        Publication(self.gh,pp.load_config(self.config_path),None,self,self.seed,
+                    clock=self.clock).require_admission(payload,fresh,require_new=True)
+        requests.verify_local(self.request)
         # Actor reads, reservation renewal and semantic/exact matching may
         # have taken arbitrarily long. Re-read the LOCAL effective config and
         # all four actual consumer trees after them. The previously complete

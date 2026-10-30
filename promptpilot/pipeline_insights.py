@@ -3421,6 +3421,8 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
         typed_response = preflight.get("protocol") == "review-routing-v1"
         routing_request = None
         token = preflight.get("lease")
+        passive_typed = (typed_queue and typed_response and stage in {"review", "fix"}
+                         and preflight_action in {"empty", "wait", "error"} and token is None)
         signed_routing_claim = False
         advertised_purpose = None
         if isinstance(token, str) and "." in token:
@@ -3437,7 +3439,7 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
         if (typed_queue and stage == "fix" and not fix_claim and not typed_response
                 and preflight_action not in {"empty", "wait", "error"}):
             return {"action": "block", "mode": "tool", "reason": "claimed FIX requires a signed exact author handoff; no generic fallback"}
-        if fix_claim or typed_response and stage == "fix":
+        if fix_claim or typed_response and stage == "fix" and not passive_typed:
             try:
                 request = fix_requests.decode(str(token or ""))
                 reservation = request["target_reservation"]
@@ -3466,7 +3468,7 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                     "reason": "author assignment verified; awaiting post-push FIX proof",
                     "profile_id": profile_id, "queue_id": queue.get("id"),
                     "preflight": preflight, "completion": completion}
-        if typed_response or signed_routing_claim:
+        if typed_response and not passive_typed or signed_routing_claim:
             from . import project_pipeline
             try:
                 from .review_routing_request import decode as decode_routing_request
