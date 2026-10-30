@@ -1090,6 +1090,9 @@ def _input_sha(dispatch: WorkflowTaskDispatch, working_dir: str) -> str:
     payload = dispatch.model_dump(mode="json")
     payload["working_dir"] = working_dir
     payload["output_contract"] = "w1-verdict-v1"
+    if dispatch.execution_mode is not WorkflowExecutionMode.EXTERNAL:
+        from .workflow_permissions import VERSION
+        payload["rights_policy"] = VERSION
     return hashlib.sha256(db._json_dump(payload).encode("utf-8")).hexdigest()
 
 
