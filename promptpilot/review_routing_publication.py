@@ -124,8 +124,9 @@ class Publication:
             previous=ledger.attempts[-1]
             done=ledger.attempt_phases(previous).get('fix-done')
             if done is None:
-                raise PipelineError('routing publication must wait for completed post-push provenance')
-            if done.payload['details']['new_head']!=self.seed['identity']['head_sha'] and resume is None:
+                if ledger.attempt_settlement(previous) is None or resume is None:
+                    raise PipelineError('routing publication must wait for completed post-push provenance')
+            elif done.payload['details']['new_head']!=self.seed['identity']['head_sha'] and resume is None:
                 raise PipelineError('routing publication HEAD differs from completed FIX')
 
     def run(self,*,max_steps=12):

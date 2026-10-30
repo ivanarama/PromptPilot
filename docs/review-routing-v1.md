@@ -193,10 +193,88 @@ claimed задачу. Этот компонент пока не подключё
 доказывает signed FIX-start, server started, author handoff или post-push.
 Для авторского исправления reducer допускает fix-done после handoff-done без
 фиктивного pipeline started/task_id. Для pipeline started по-прежнему обязателен.
-Сам reducer проверяет только историю: настоящий coordinator ещё обязан доказать
-реальное назначение, новый HEAD, transition и source trailer. Прежние предлагаемые
+Сам reducer проверяет только историю: author coordinator ниже доказывает
+назначение; новый HEAD, transition и source trailer пока не подключены. Прежние предлагаемые
 wire-векторы с optional авторским started сохраняются как структурная история,
 но авторский coordinator не должен выдумывать такой запуск.
+
+В частичном claimed FIX bridge `next fix` при явном ON выбирает отдельный
+source-bound путь до legacy parallel FIX. Он использует уже running task,
+started_at и точную headless reservation, без enqueue и изменения timeout.
+Первые два legacy REVIEW и старые signed leases сохраняют свои bytes. Запрет
+legacy parallel FIX при replicas<2 остаётся прежним; single-lane относится только
+к новому явно versioned пути. Перед выдачей admission проверяются полный typed
+stable history, последний canonical exclusively technical source, author/fork/
+branch/HEAD/epoch, lifetime slot и текущий конечный лимит. Source сам по себе не
+означает eligibility.
+
+Для этого частичного пути checker дополнительно обязан вернуть точный
+`fix_bridge_contract={"protocol":"claimed-fix-v1","snapshot":"complete",
+"purposes":["author-handoff"]}` и полный `technical_fix_candidates`. Каждая цель
+содержит ровно stage=fix-pr, number, head и полный canonical source tuple.
+Это контракт тестового совместимого peer, не утверждение поддержки OneBase29a.
+Все четыре reader tree hash по-прежнему обязательны. Наличие
+`technical_fix_execution` явно отклоняется: pipeline policy и transport ещё не
+реализованы и не могут стать неявным author→pipeline fallback.
+
+Signed `review-routing-v1-fix-admission` связывает весь immutable attempt root,
+source, executor, полный PRIdentity/author, config/readers/current budget,
+task_id+started_at, reservation/token/ownership kind, nonce и ограниченный TTL.
+Его отдельный FixGuard не ослабляет REVIEW StageGuard. `complete fix` публикует
+canonical attempt через прежний exact-body/returned-ID journal. Затем он один
+раз добавляет связанного автора через assignee API и проверяет authenticated
+GET `/pulls/{number}`: полный REST PRIdentity и `assignees[].node_id` должны
+совпасть с подписанным PR и author node ID. Ответ POST сам не считается доставкой.
+Другие assignees не снимаются. После проверенного readback появляются assigned
+и handoff-done, без started и fix-done.
+
+Отдельная strict-schema таблица `technical_fix_assignments_v1` в actual scheduler
+DB фиксирует immutable intent до assignment API. Только непосредственно создавший
+root вызов может начать новое назначение. Recovery восстанавливает видимое
+назначение чтением; отсутствие/неопределённость/ручной unassign/потеря локальной
+записи не разрешают новый POST. Поздний hold/actor/identity/reader/config/cancel,
+смена task occurrence или reservation отказывают до следующей записи. Renewal
+проверяет точную живую reservation и running task внутри BEGIN IMMEDIATE с часами
+после DB wait, не возрождая истёкшую запись. Последний one-use write ticket повторяет
+task/reservation, config/readers и TTL после journal/SQLite waits.
+
+Worker распознаёт signed FIX purpose до generic dispatch независимо от внешнего
+action/protocol. Только явный versioned local headless transport может завершить
+administrative author handoff; remote/detached/worktree/herdr отказывают. При
+успехе сохраняется отдельный verdict «ПЕРЕДАНО АВТОРУ», не «ГОТОВО». Провайдер не
+загружается и не запускается; wake_after_success и новый substantive REVIEW не
+выдаются. Admission нельзя заменить progress/start-purpose, legacy lease или
+invalid HMAC. Progress schema зарезервирована, но operational progress writer
+не подключён; start purpose явно отклоняется. Токены не расширяют полномочий.
+
+Reader/reducer теперь понимают отдельный trusted `settlement`: exact attempt/
+context/source, ожидаемые barrier/started IDs, observed HEAD, reason, явный
+executor_outcome и evidence hash. Author-unassigned, pipeline-stopped и not-started
+не взаимозаменяемы. Settlement после успеха, с чужим receipt/owner или с последующей
+старой phase отказывает. Это только историческое чтение доверенного issuer:
+публичный writer, который независимо доказывает остановку/отмену, пока отсутствует.
+Expiry, отсутствие PID, exit code и текст агента не создают settlement автоматически.
+Slot остаётся потраченным, fix-done не появляется. Точный settlement становится
+engineering parking ID. Один explicit resume на новый HEAD допускает один REVIEW;
+same-HEAD rebaseline, неверный parking/previous и повторное потребление отказывают.
+После завершения resumed REVIEW parking закрывается, lifetime budget сохраняется.
+Новые vectors находятся отдельно в review-routing-settlement-v1.json; прежние
+wire vectors и expected legacy bytes не переписаны.
+
+При OFF, включая удаление technical_handoff из config, legacy next REVIEW/FIX
+перед handoff читает историю выбранной PR. Наличие trusted routing marker сохраняет
+read-only fence, даже после смены HEAD/labels или редактирования marker. Отсутствие
+v1 state сохраняет старые результаты и сериализацию; OFF не открывает reader trees
+или v1 journal. Это добавляет read-only timeline preflight перед legacy fallback.
+
+Оставшаяся граница A151 существенна: нет operational progress/start issuer,
+policy-bound pipeline coordinator и canonical started; OneUseStart всё ещё не
+подключён к настоящей worker factory, server heartbeat и post-push completion.
+Нет публичного verified settlement/resume writer и проверки author push/source
+trailer. Полный положительный pipeline путь, его factory/crash/retry matrix и
+actual accepted OneBase/четыре peer readers требуют отдельной парной приёмки.
+Author CLI/worker и settlement reader tests не закрывают эти пункты. Флаги остаются
+OFF; этот partial slice не является завершением или приёмкой всего A151.
 
 До будущей записи/dispatch обязательны полные public gates: совместимость всех
 читателей, trusted actor/immutability, coherent identity/epoch/lifecycle/labels,

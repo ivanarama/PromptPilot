@@ -54,6 +54,8 @@ def test_codex_skip_permissions_uses_codex_autonomous_flag():
 
 
 def test_provider_env_exposes_configured_pipeline_tools_on_path(monkeypatch, tmp_path):
+    monkeypatch.delenv('GH_EXE', raising=False)
+    monkeypatch.delenv('GO_EXE', raising=False)
     gh = tmp_path / "github" / "gh.exe"
     go = tmp_path / "golang" / "go.exe"
     gh.parent.mkdir()

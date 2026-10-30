@@ -13,6 +13,25 @@ from .review_routing import VERSION
 ROLES={'review':'review-queue','fix':'fix-approved','merge':'merge-shepherd','tail':'tail-issues'}
 
 
+def off_fence(gh, config, number):
+    """OFF never erases an existing trusted v1 lifetime transaction.
+
+    No readers, journal or wire writes are opened here. A malformed/edited
+    trusted marker is also a fence, rather than permission to downgrade it.
+    Ordinary no-v1 legacy bytes remain unchanged.
+    """
+    from . import project_pipeline as pp
+    snapshot = pp.stable_timeline(gh, config, number)
+    for edge in snapshot['edges']:
+        node = edge.get('node') or {}
+        if (node.get('__typename') == 'IssueComment'
+                and (node.get('author') or {}).get('login') == config['trusted_account']
+                and '<!-- pp:review-routing-' in (node.get('body') or '')):
+            return {'action': 'wait', 'verdict': 'ПУСТО', 'number': number,
+                    'reason': 'routing is OFF with existing trusted v1 state; read-only engineering fence'}
+    return None
+
+
 def _file_bytes(path):
     """Bound before reading; never block opening a FIFO or follow a link."""
     try:

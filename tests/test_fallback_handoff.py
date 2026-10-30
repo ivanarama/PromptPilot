@@ -103,6 +103,16 @@ def invoke(argv):
 
 
 class ReadOnlyGitHub:
+    def graphql_page(self, owner, name, number, cursor):
+        # Legacy OFF admission now checks that the selected PR has no trusted
+        # v1 history before handing it to a full skill. This peer has none.
+        assert (owner, name, number, cursor) == ('ivanarama', 'onebase', 42, None)
+        return {'data': {'repository': {'pullRequest': {
+            'headRefOid': HEAD, 'baseRefOid': 'c'*40, 'baseRefName': 'main', 'state': 'OPEN', 'isDraft': False,
+            'labels': {'nodes': [], 'pageInfo': {'hasNextPage': False}},
+            'timelineItems': {'edges': [], 'pageInfo': {'hasNextPage': False}},
+        }}}}
+
     def json(self, *args, **kwargs):
         assert args == ("api", "user"), f"unexpected GitHub operation: {args}"
         assert not kwargs, "no GitHub write input is permitted"
@@ -438,9 +448,10 @@ def test_next_review_forces_targeted_full_skill_for_pre_review(config, monkeypat
     source = health(handoff.PRE_REVIEW_VALIDATION_STAGE)
     monkeypatch.setattr(pp, "run_health", lambda *_, **__: source)
     monkeypatch.setattr(
-        pp, "stable_timeline",
+        pp, "content_review_target_gate",
         lambda *_: pytest.fail("pre-review validation must not enter fast audit"),
     )
+    monkeypatch.setattr(pp, 'stable_timeline', lambda *_: {'edges': []})
 
     result = pp.next_review(object(), config)
 
@@ -450,6 +461,7 @@ def test_next_review_forces_targeted_full_skill_for_pre_review(config, monkeypat
 
 
 def test_next_review_pre_review_fails_closed_without_target_protocol(monkeypatch):
+    monkeypatch.setattr(pp, 'stable_timeline', lambda *_: {'edges': []})
     source = health(handoff.PRE_REVIEW_VALIDATION_STAGE)
     monkeypatch.setattr(pp, "run_health", lambda *_, **__: source)
     with pytest.raises(pp.PipelineError, match="exact-target"):
@@ -457,6 +469,7 @@ def test_next_review_pre_review_fails_closed_without_target_protocol(monkeypatch
 
 
 def test_legacy_config_does_not_silently_opt_in(monkeypatch):
+    monkeypatch.setattr(pp, 'stable_timeline', lambda *_: {'edges': []})
     monkeypatch.setattr(pp, "run_health", lambda *_, **__: health())
     assert pp.next_review(object(), {}) == {
         "action": "fallback", "reason": "integration/base-sync state requires the full skill",

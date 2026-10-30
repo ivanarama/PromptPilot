@@ -19,7 +19,7 @@ from .review_routing_lease import decimal_id, owner_id, timestamp
 
 MAX_BODY_BYTES = 60000
 MARKER = re.compile(r"<!-- pp:review-routing-v1 kind=([a-z-]+) sha256=([0-9a-f]{64}) -->\n")
-KINDS = {"publication", "lease", "claim", "completion", "attempt", "phase", "resume"}
+KINDS = {"publication", "lease", "claim", "completion", "attempt", "phase", "resume", "settlement"}
 OUTCOMES = {"reviewed", "changes-requested", "needs-decision",
             "technical-handoff", "engineering-handoff"}
 
@@ -135,6 +135,7 @@ def validate(payload):
         "attempt": "owner context_sha256 source series previous attempt executor",
         "phase": "owner context_sha256 attempt_id lease_id phase details",
         "resume": "head parking_id previous reason",
+        "settlement": "owner context_sha256 attempt_id lease_id source barrier_id started_id observed_head reason executor_outcome evidence_sha256",
     }
     _fields(payload, common + fields[kind])
     _pr(payload["pr"])
@@ -188,6 +189,19 @@ def validate(payload):
         login = payload["executor"]["login"]
         if not isinstance(login, str) or not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})", login):
             raise PipelineError("invalid routing executor login")
+    elif kind == 'settlement':
+        decimal_id(payload['attempt_id'])
+        decimal_id(payload['lease_id'])
+        _source(payload['source'])
+        for name in ['barrier_id', 'started_id']:
+            if payload[name] is not None:
+                decimal_id(payload[name])
+        head40(payload['observed_head'])
+        _text(payload['reason'])
+        hash64(payload['evidence_sha256'])
+        if (not isinstance(payload['executor_outcome'], str)
+                or payload['executor_outcome'] not in {'not-started', 'pipeline-stopped', 'author-unassigned'}):
+            raise PipelineError('settlement requires an explicit verified executor outcome')
     elif kind == "phase":
         decimal_id(payload["attempt_id"])
         decimal_id(payload["lease_id"])

@@ -784,6 +784,7 @@ def test_project_health_check_is_immediate_and_accepts_red_json(monkeypatch):
 
 
 def test_profile_health_exposes_configured_gh_to_nested_checker(monkeypatch):
+    monkeypatch.delenv('GH_EXE', raising=False)
     calls = []
     gh = os.path.join("tools", "github", "gh.exe")
     monkeypatch.setenv("PP_GH_EXE", gh)

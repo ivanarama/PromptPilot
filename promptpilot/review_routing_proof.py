@@ -65,6 +65,7 @@ class Ledger:
     parking_id: str | None = None
     resume_id: str | None = None
     resuming_publication_id: str | None = None
+    settlements: tuple[Record, ...] = ()
 
     @property
     def budget_used(self):
@@ -76,6 +77,9 @@ class Ledger:
     def attempt_phases(self, attempt):
         return {record.payload["phase"]: record for record in self.phases
                 if record.payload["attempt_id"] == attempt.id}
+
+    def attempt_settlement(self, attempt):
+        return next((record for record in self.settlements if record.payload['attempt_id'] == attempt.id), None)
 
     def next_attempt_admission(self, source, *, max_attempts):
         """Current read-only eligibility, separate from a historical outcome.
@@ -102,7 +106,7 @@ class Ledger:
                 'mutation_authorized':False}
 
     def to_dict(self):
-        return {"budget_used": self.budget_used,
+        result = {"budget_used": self.budget_used,
                 "series": self.attempts[0].payload["series"] if self.attempts else None,
                 "attempt_ids": [item.id for item in self.attempts],
                 "proofs": [{"source": proof.source, "outcome": proof.outcome} for proof in self.proofs],
@@ -111,6 +115,9 @@ class Ledger:
                 "active_parking_id": self.parking_id, "active_resume_id": self.resume_id,
                 "resuming_publication_id": self.resuming_publication_id,
                 "ignored_ids": list(self.ignored_ids), "mutation_authorized": False}
+        if self.settlements:
+            result['settlements'] = [{'id': record.id, **record.payload} for record in self.settlements]
+        return result
 
 
 def _proofs(records):
@@ -198,6 +205,42 @@ def _phases(records, attempts):
     return tuple(result)
 
 
+def _settlements(records, attempts, phases):
+    """History only: the trusted issuer must prove the executor really ended.
+
+    Neither an expired lease nor an absent PID/exit code is such evidence.
+    A settlement parks a spent slot; it never fabricates a successful FIX.
+    """
+    roots = {root.id: root for root in attempts}
+    settled = {}
+    for record in records:
+        data = record.payload
+        if data['kind'] != 'settlement':
+            continue
+        root = roots.get(data['attempt_id'])
+        if (root is None or record.order <= root.order or data['source'] != root.payload['source']
+                or data['context_sha256'] != context(root.payload)):
+            raise PipelineError('settlement lacks its exact canonical attempt/context/source')
+        previous = settled.get(root.id)
+        if previous is not None:
+            if sha(previous.payload) != sha(data):
+                raise PipelineError('conflicting attempt settlements')
+            continue
+        state = {item.payload['phase']: item for item in phases if item.payload['attempt_id'] == root.id}
+        if 'fix-done' in state or any(item.order >= record.order for item in state.values()):
+            raise PipelineError('settlement cannot replace success or precede a later attempt phase')
+        for phase, name in [('barrier', 'barrier_id'), ('started', 'started_id')]:
+            if data[name] != (state[phase].id if phase in state else None):
+                raise PipelineError('settlement expected barrier/started receipt differs')
+        kind = root.payload['executor']['kind']
+        expected = 'author-unassigned' if kind == 'author' else 'pipeline-stopped' if 'started' in state else 'not-started'
+        if data['executor_outcome'] != expected:
+            raise PipelineError('settlement outcome does not confirm this exact old executor')
+        owner_at(records, root, record, purpose='technical-attempt')
+        settled[root.id] = record
+    return tuple(settled.values())
+
+
 def reduce(records, *, deleted_at=(), max_attempts=2):
     """Rebuild lifetime counters from immutable history, never a local cache.
 
@@ -264,11 +307,16 @@ def reduce(records, *, deleted_at=(), max_attempts=2):
         resolve(_lease_nodes(ordered, root, purpose=purpose), context_sha256=context(root.payload),
                 purpose=purpose, now=datetime.max.replace(tzinfo=timezone.utc))
     phases = _phases([item for item in ordered if item.id not in ignored], attempts)
+    settlements = _settlements([item for item in ordered if item.id not in ignored], attempts, phases)
+    settled = {item.payload['attempt_id']: item for item in settlements}
     for previous, current in zip(attempts, attempts[1:]):
         completed = next((phase for phase in phases if phase.payload["attempt_id"] == previous.id
                           and phase.payload["phase"] == "fix-done"), None)
         proof = proof_map[current.payload["source"]["completion_id"]]
-        if (completed is None or completed.order >= proof.publication.order
+        settlement = settled.get(previous.id)
+        resumed_failure = (settlement is not None and settlement.order < proof.publication.order
+                           and proof.publication.payload['resume_id'] is not None)
+        if not resumed_failure and (completed is None or completed.order >= proof.publication.order
                 or (completed.payload["details"]["new_head"] != current.payload["source"]["head"]
                     and proof.publication.payload['resume_id'] is None)):
             raise PipelineError("next technical attempt lacks completed post-push provenance")
@@ -282,7 +330,10 @@ def reduce(records, *, deleted_at=(), max_attempts=2):
         previous=preceding[-1]
         completed=next((phase for phase in phases if phase.payload['attempt_id']==previous.id
                         and phase.payload['phase']=='fix-done'),None)
-        if (completed is None or completed.order >= publication.order
+        settlement = settled.get(previous.id)
+        resumed_failure = (settlement is not None and settlement.order < publication.order
+                           and publication.payload['resume_id'] is not None)
+        if not resumed_failure and (completed is None or completed.order >= publication.order
                 or (completed.payload['details']['new_head']!=publication.payload['identity']['head_sha']
                     and publication.payload['resume_id'] is None)):
             raise PipelineError("new routing REVIEW lacks completed post-push provenance")
@@ -304,12 +355,20 @@ def reduce(records, *, deleted_at=(), max_attempts=2):
         if data['kind']=='resume':
             preceding=[root for root in attempts if root.order<item.order]
             previous=preceding[-1].id if preceding else None
-            if (active_park is None or data['parking_id']!=active_park.completion.id
+            if (active_park is None or data['parking_id']!=active_park
                     or data['previous']!=previous or resuming_publication is not None):
                 raise PipelineError('engineering resume lacks current parking/lifetime state')
+            settlement = next((entry for entry in settlements if entry.id == active_park), None)
+            if settlement is not None and data['head'] == settlement.payload['source']['head']:
+                raise PipelineError('settled attempt resume requires a new HEAD; same-HEAD rebaseline is unsupported')
             # Before consumption, a later explicit trusted action can change
             # the chosen exact HEAD. It does not mint another resume slot.
             active_resume=item
+        elif data['kind']=='settlement' and item in settlements:
+            if active_park is not None or resuming_publication is not None:
+                raise PipelineError('settlement cannot replace an existing engineering parking')
+            active_park = item.id
+            active_resume = None
         elif data['kind']=='publication' and item.id in publication_ids:
             if active_park is None:
                 if data['resume_id'] is not None:
@@ -331,7 +390,6 @@ def reduce(records, *, deleted_at=(), max_attempts=2):
             elif proof.publication.payload['resume_id'] is not None:
                 raise PipelineError('engineering resume was already consumed by another REVIEW')
             if proof.outcome=='engineering-handoff':
-                active_park=proof
+                active_park=proof.completion.id
     return Ledger(proofs, tuple(attempts), phases, resumes, tuple(sorted(ignored)),
-                  active_park.completion.id if active_park else None,
-                  active_resume.id if active_resume else None,resuming_publication)
+                  active_park, active_resume.id if active_resume else None,resuming_publication,settlements)

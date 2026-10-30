@@ -1060,6 +1060,7 @@ def test_execution_route_passes_replica_identity_to_preflight(
 @pytest.mark.parametrize("fault", [None, "unsigned", "wrong-kind", "unavailable", "skill"])
 def test_two_fix_routes_have_distinct_signed_targets_and_no_unqualified_fallback(
         isolated_db, monkeypatch, tmp_path, fault):
+    monkeypatch.setattr(pipelinectl, 'stable_timeline', lambda *_args: {'edges': []})
     from promptpilot import fix_handoff
 
     directories = [tmp_path / f"fix-{index}" for index in (1, 2)]

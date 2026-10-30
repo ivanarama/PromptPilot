@@ -111,6 +111,8 @@ def _health(*candidates):
 
 
 def _setup_handoff(isolated_db, monkeypatch, tmp_path, candidates):
+    # These election-only fakes have no prior routing server history.
+    monkeypatch.setattr(pipelinectl, 'stable_timeline', lambda *_args: {'edges': []})
     monkeypatch.setenv("PP_DATA_DIR", str(tmp_path))
     monkeypatch.setenv("PP_PIPELINE_REPLICAS", "2")
     monkeypatch.chdir(tmp_path)

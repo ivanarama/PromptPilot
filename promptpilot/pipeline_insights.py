@@ -3276,6 +3276,7 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
         return {"action": "block", "mode": "tool", "reason": "unsupported REVIEW routing transport version"}
     owned_preflight = replicated or typed_queue
     if typed_queue and (getattr(task, "machine", None) or getattr(task, "detached", False)
+                        or getattr(task, "worktree", False)
                         or getattr(task, "herdr_target", None)):
         return {"action": "block", "mode": "tool",
                 "reason": "typed REVIEW requires a local scheduler-owned task process"}
@@ -3313,8 +3314,8 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
 
     stage = str(execution.get("stage") or queue.get("id") or "").lower()
     command = _tool_command(execution, stage)
-    if typed_queue and (stage != "review" or not command or command[-2:] != ["next", "review"]):
-        return {"action": "block", "mode": "tool", "reason": "typed REVIEW requires its exact next review command"}
+    if typed_queue and (stage not in {"review", "fix"} or not command or command[-2:] != ["next", stage]):
+        return {"action": "block", "mode": "tool", "reason": "typed routing requires its exact next stage command"}
     with _github_scan_admission(
             profile, f"pipeline preflight {profile_id}/{stage}",
             profile_id=profile_id, budget_route="tool_preflight",
@@ -3375,6 +3376,8 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                 provider_ownership_kind = (
                     "herdr" if provider_cfg.get("executor") == "herdr"
                     else "headless")
+                if typed_queue and stage == "fix" and provider_ownership_kind != "headless":
+                    raise RuntimeError("claimed FIX does not support the herdr transport")
                 attempt_env = {
                         "PP_TASK_ID": str(task.id),
                         "PP_TASK_STARTED_AT": scheduler_task_started_at,
@@ -3419,13 +3422,50 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
         routing_request = None
         token = preflight.get("lease")
         signed_routing_claim = False
+        advertised_purpose = None
         if isinstance(token, str) and "." in token:
             from . import project_pipeline
             try:
-                advertised = project_pipeline.decode_lease(token.split(".", 1)[0]).get("protocol")
+                advertised_request = project_pipeline.decode_lease(token.split(".", 1)[0])
+                advertised = advertised_request.get("protocol")
+                advertised_purpose = advertised_request.get("purpose")
             except project_pipeline.PipelineError:
                 advertised = None
             signed_routing_claim = isinstance(advertised, str) and advertised.startswith("review-routing-")
+        from . import review_routing_fix_request as fix_requests
+        fix_claim = isinstance(advertised_purpose, str) and advertised_purpose.startswith("review-routing-v1-fix-")
+        if (typed_queue and stage == "fix" and not fix_claim and not typed_response
+                and preflight_action not in {"empty", "wait", "error"}):
+            return {"action": "block", "mode": "tool", "reason": "claimed FIX requires a signed exact author handoff; no generic fallback"}
+        if fix_claim or typed_response and stage == "fix":
+            try:
+                request = fix_requests.decode(str(token or ""))
+                reservation = request["target_reservation"]
+                if (not typed_queue or not typed_response or stage != "fix" or preflight_action != "author-handoff"
+                        or request["purpose"] != fix_requests.ADMISSION
+                        or request["repository"] != str(profile.get("repository") or "").lower()
+                        or reservation["task_id"] != task.id
+                        or reservation["task_started_at"] != scheduler_task_started_at
+                        or reservation["ownership_kind"] != provider_ownership_kind
+                        or request["pipeline_replicas"] != replica_count
+                        or preflight.get("target") != {"stage": "fix-pr", "number": request["number"],
+                            "head": request["head"], "source": request["attempt"]["source"]}):
+                    raise fix_requests.PipelineError("claimed FIX signed purpose contradicts its outer envelope, task or transport")
+                complete_command = [*command[:-2], "complete", "fix",
+                                    *_lease_argument(task, token, "author-handoff")]
+                completion = _tool_preflight(execution, complete_command, working_dir, env_extra=attempt_env)
+                if (completion.get("action") != "handed-off" or completion.get("provider_started") is not False
+                        or completion.get("source") != request["attempt"]["source"]
+                        or completion.get("executor") != request["attempt"]["executor"]):
+                    raise fix_requests.PipelineError("author FIX delivery was not verified; no provider fallback")
+            except (fix_requests.PipelineError, RuntimeError, TypeError, ValueError) as exc:
+                return {"action": "block", "mode": "tool", "reason": str(exc)}
+            # This administrative completion is not a successful FIX and must
+            # not trigger wake_after_success or a new substantive REVIEW.
+            return {"action": "complete_empty", "mode": "tool", "verdict": "ПЕРЕДАНО АВТОРУ",
+                    "reason": "author assignment verified; awaiting post-push FIX proof",
+                    "profile_id": profile_id, "queue_id": queue.get("id"),
+                    "preflight": preflight, "completion": completion}
         if typed_response or signed_routing_claim:
             from . import project_pipeline
             try:

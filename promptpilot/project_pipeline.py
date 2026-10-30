@@ -245,6 +245,7 @@ class GitHub:
             result = subprocess.run(
                 [self.executable, *args], input=data, capture_output=True, text=True,
                 encoding="utf-8", errors="strict", timeout=timeout,
+                **({"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == 'nt' else {}),
             )
         except subprocess.TimeoutExpired as exc:
             operation = args[0] if args else "command"
@@ -463,6 +464,7 @@ def run_health(config: dict, *, config_path: str | None = None,
         result = subprocess.run(
             command, capture_output=True, text=True, encoding="utf-8",
             errors="strict", env=env, timeout=timeout,
+            **({"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == 'nt' else {}),
             **({"cwd": working_dir} if working_dir is not None else {}),
         )
     except subprocess.TimeoutExpired as exc:
@@ -1501,6 +1503,12 @@ def _elect_fix_candidate(config: dict, candidates: list[dict]) -> tuple[dict | N
 
 def next_fix(gh: GitHub, config: dict, *, config_path: str | None = None) -> dict:
     """Select one exact FIX target; never expose an untargeted skill fallback."""
+    from .review_routing_policy import settings as routing_settings
+    routing = routing_settings(config)
+    if routing is not None and routing['enabled']:
+        from .review_routing_fix import next_fix as next_claimed_fix
+        health = run_health(config, config_path=config_path)
+        return next_claimed_fix(gh, config, config_path=config_path, health=health)
     if config.get("parallel_fix_enabled") is not True:
         raise PipelineError("parallel FIX route is disabled")
     if _configured_replica_count() < 2:
@@ -1518,6 +1526,11 @@ def next_fix(gh: GitHub, config: dict, *, config_path: str | None = None) -> dic
     if candidate is None:
         return {"action": "wait", "stage": "fix", "verdict": "ПУСТО",
                 "reason": "all current FIX targets are reserved by other replicas"}
+    if _fix_candidate_key(candidate)[0] == 'fix-pr':
+        from .review_routing_policy import off_fence
+        fenced = off_fence(gh, config, candidate['number'])
+        if fenced is not None:
+            return fenced
     return fix_handoff.create(config, health, candidate, reservation)
 
 
@@ -1700,6 +1713,11 @@ def next_review(gh: GitHub, config: dict, *, config_path: str | None = None) -> 
             "action": "wait", "verdict": "ПУСТО",
             "reason": "all current REVIEW targets are reserved by other replicas",
         }
+    if not routing_policy['enabled']:
+        from .review_routing_policy import off_fence
+        fenced = off_fence(gh, config, item['number'])
+        if fenced is not None:
+            return fenced
     replica_count = _configured_replica_count()
     if replica_count > 1 and reservation is None:
         raise PipelineError("replicated REVIEW election did not reserve its target")
@@ -2600,7 +2618,7 @@ def run(argv=None) -> int:
     owner_lease.add_argument("--lease")
     owner_lease.add_argument("--lease-file")
     complete_parser = sub.add_parser("complete")
-    complete_parser.add_argument("stage", choices=("review", "merge", "merge-cleanup"))
+    complete_parser.add_argument("stage", choices=("review", "merge", "merge-cleanup", "fix"))
     complete_lease = complete_parser.add_mutually_exclusive_group(required=True)
     complete_lease.add_argument("--lease")
     complete_lease.add_argument("--lease-file")
@@ -2655,6 +2673,11 @@ def run(argv=None) -> int:
                     from .fallback_handoff import gate
                     value = gate(gh, config, args.stage, args.lease,
                                  config_path=args.config)
+            elif args.stage == "fix":
+                from .review_routing_fix import complete_fix
+                if args.report is not None:
+                    raise PipelineError('author handoff cannot substitute a report for post-push proof')
+                value = complete_fix(gh, config, args.lease, config_path=args.config)
             elif args.stage == "review":
                 value = complete_review(
                     gh, config, args.lease, args.report, config_path=args.config,

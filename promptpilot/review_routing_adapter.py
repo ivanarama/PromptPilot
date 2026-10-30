@@ -80,7 +80,9 @@ def _admit_audit(ledger,head):
     if ledger.attempts:
         previous=ledger.attempts[-1]
         done=ledger.attempt_phases(previous).get('fix-done')
-        if done is None or done.payload['details']['new_head']!=head and resume is None:
+        settled = ledger.attempt_settlement(previous)
+        if (done is None and (settled is None or resume is None)
+                or done is not None and done.payload['details']['new_head']!=head and resume is None):
             raise PipelineError('new REVIEW must wait for completed post-push provenance')
     if ledger.proofs:
         last=ledger.proofs[-1]

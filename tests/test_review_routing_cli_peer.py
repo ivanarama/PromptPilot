@@ -27,6 +27,16 @@ if args==['api','user']:result={'login':'owner'}
 elif args==['api','repos/owner/repo']:result={'full_name':'owner/repo','node_id':'R_BASE'}
 elif args[:2]==['api','graphql']:
  result=copy.deepcopy(state['page']);result['data']['repository']['pullRequest']['timelineItems']['edges']+=state['comments']
+elif args==['api','repos/owner/repo/pulls/42']:
+ pr=state['page']['data']['repository']['pullRequest']
+ result={'node_id':pr['id'],'number':42,
+   'base':{'ref':pr['baseRefName'],'repo':{'node_id':pr['baseRepository']['id'],'full_name':pr['baseRepository']['nameWithOwner']}},
+   'head':{'ref':pr['headRefName'],'sha':pr['headRefOid'],'repo':{'node_id':pr['headRepository']['id'],'full_name':pr['headRepository']['nameWithOwner']}},
+   'assignees':state.get('assignees',[])}
+elif args==['api','repos/owner/repo/issues/42/assignees','--method','POST','--input','-']:
+ assignment=json.load(sys.stdin);state.setdefault('assignments',[]).append(assignment)
+ author=state['page']['data']['repository']['pullRequest']['author']
+ state['assignees']=[{'node_id':author['id'],'login':author['login']}];result={'assignees':state['assignees']}
 elif args==['api','repos/owner/repo/issues/42/comments','--method','POST','--input','-']:
  body=json.load(sys.stdin)['body'];ident=str(1000+len(state['comments']))
  state['comments'].append({'cursor':'C'+ident,'node':{'__typename':'IssueComment','id':'IC_'+ident,'fullDatabaseId':ident,
@@ -45,14 +55,24 @@ print(json.dumps(result))
 
 @pytest.fixture
 def cli_peer(tmp_path):
-    if os.name=='nt':pytest.skip('executable shebang peer runs on POSIX; in-process CLI/worker tests cover Windows')
     root,config,health=peers(tmp_path)
     response=page();response['data']['repository']['pullRequest']['timelineItems']['edges']=history()['edges']
     candidate={'number':42,'head':'a'*40,'stage':'review','review_depth':2}
     health.update(review_candidates=[candidate],content_review_candidates=[candidate],merge_executable=[],integration_owner=None)
     state=tmp_path/'peer.json'
     state.write_text(json.dumps({'page':response,'health':health,'comments':[],'posts':[],'calls':[]}),encoding='utf-8')
-    executable=tmp_path/'gh';executable.write_text('#!'+sys.executable+'\n'+PEER,encoding='utf-8');executable.chmod(0o700)
+    script=tmp_path/'fake_gh.py';script.write_text(PEER,encoding='utf-8')
+    if os.name=='nt':
+        compiler=Path(os.environ.get('SystemRoot', r'C:\Windows'))/'Microsoft.NET/Framework64/v4.0.30319/csc.exe'
+        if not compiler.is_file():
+            pytest.skip('Windows executable peer requires the .NET Framework C# compiler')
+        executable=tmp_path/'gh.exe'
+        built=subprocess.run([str(compiler),'/nologo','/target:exe','/out:'+str(executable),
+            str(Path(__file__).with_name('fake_gh_launcher.cs'))],capture_output=True,text=True,
+            timeout=30,creationflags=subprocess.CREATE_NO_WINDOW)
+        assert built.returncode==0,built.stdout+built.stderr
+    else:
+        executable=tmp_path/'gh';executable.write_text('#!'+sys.executable+'\n'+PEER,encoding='utf-8');executable.chmod(0o700)
     checker=tmp_path/'checker.py'
     checker.write_text("import json,os\nfrom pathlib import Path\nprint(json.dumps(json.loads(Path(os.environ['ROUTING_FAKE_PEER']).read_text())['health']))\n",encoding='utf-8')
     config.update(repository='owner/repo',trusted_account='owner',
@@ -63,11 +83,14 @@ def cli_peer(tmp_path):
     for name in list(environment):
         if name.startswith('PP_') or name in {'GH_TOKEN','GITHUB_TOKEN','GH_EXE'}:environment.pop(name,None)
     environment.update(PP_DATA_DIR=str(tmp_path/'d'),PP_PIPELINE_STATE_DIR=str(tmp_path/'s'),
-                       GH_EXE=str(executable),ROUTING_FAKE_PEER=str(state),PYTHONDONTWRITEBYTECODE='1')
+                       GH_EXE=str(executable),ROUTING_FAKE_PEER=str(state),PYTHONDONTWRITEBYTECODE='1',
+                       ROUTING_FAKE_PYTHON=sys.executable,ROUTING_FAKE_SCRIPT=str(script))
     def run(*args):
         result=subprocess.run([sys.executable,'-X','utf8','-m','promptpilot.project_pipeline','--config',str(path),*args],
-            cwd=Path(__file__).resolve().parents[1],env=environment,capture_output=True,text=True,encoding='utf-8',timeout=90)
+            cwd=Path(__file__).resolve().parents[1],env=environment,capture_output=True,text=True,encoding='utf-8',timeout=90,
+            **({'creationflags':subprocess.CREATE_NO_WINDOW} if os.name=='nt' else {}))
         return result.returncode,json.loads(result.stdout)
+    run.environment=environment
     return state,report,run
 
 
@@ -93,3 +116,32 @@ def test_real_subprocess_lost_response_after_head_change_is_not_reposted(cli_pee
         code,refused=run('complete','review','--lease',selected['lease'],'--report',str(report))
         assert code==2 and refused['action']=='error',refused
     assert len(json.loads(state.read_text(encoding='utf-8'))['posts'])==1
+
+
+def test_real_subprocess_claimed_author_handoff_uses_executable_peer_and_no_process_start(cli_peer, isolated_db, tmp_path):
+    from datetime import timezone
+    from promptpilot.models import TaskCreate
+    from promptpilot.review_routing_fix_request import BRIDGE
+    from promptpilot.review_routing_wire import parse
+    state,report,run=cli_peer
+    code,selected=run('next','review');assert code==0,selected
+    code,completed=run('complete','review','--lease',selected['lease'],'--report',str(report))
+    assert code==0,completed
+    value=json.loads(state.read_text(encoding='utf-8'))
+    value['health']['fix_bridge_contract']=BRIDGE
+    value['health']['technical_fix_candidates']=[{'stage':'fix-pr','number':42,'head':'a'*40,'source':completed['source']}]
+    state.write_text(json.dumps(value),encoding='utf-8')
+    isolated_db.create_task(TaskCreate(prompt='Project - FIX',working_dir=str(tmp_path)))
+    task=isolated_db.get_next_runnable();assert task is not None
+    run.environment.update(PP_DATA_DIR=str(isolated_db.DB_PATH.parent),PP_TASK_ID=str(task.id),
+        PP_TASK_STARTED_AT=task.started_at.astimezone(timezone.utc).isoformat(),
+        PP_PIPELINE_REPLICAS='1',PP_PROVIDER_OWNERSHIP_KIND='headless')
+    code,selected=run('next','fix');assert code==0 and selected['action']=='author-handoff',selected
+    for _ in range(2):
+        code,result=run('complete','fix','--lease',selected['lease'])
+        assert code==0 and result['action']=='handed-off' and result['provider_started'] is False,result
+    value=json.loads(state.read_text(encoding='utf-8'))
+    assert len(value['assignments'])==1
+    records=[parse(body) for body in value['posts']]
+    assert [entry['kind'] for entry in records]==['publication','claim','completion','attempt','phase','phase']
+    assert [entry['phase'] for entry in records if entry['kind']=='phase']==['assigned','handoff-done']
