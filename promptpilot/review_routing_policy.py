@@ -24,6 +24,9 @@ def off_fence(gh, config, number):
     from . import project_pipeline as pp
     from .review_routing_adapter import journal_directory
     from .review_routing_journal import Journal
+    if (not isinstance(config.get('repository'),str) or not config['repository']
+            or not isinstance(config.get('trusted_account'),str) or not config['trusted_account']):
+        raise PipelineError('OFF history fence requires repository and trusted account configuration')
     snapshot = pp.stable_timeline(gh, config, number)
     fenced=Journal.has_existing_history(journal_directory(config),config['repository'],number)
     for edge in snapshot['edges']:

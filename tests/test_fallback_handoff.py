@@ -465,13 +465,13 @@ def test_next_review_pre_review_fails_closed_without_target_protocol(monkeypatch
     source = health(handoff.PRE_REVIEW_VALIDATION_STAGE)
     monkeypatch.setattr(pp, "run_health", lambda *_, **__: source)
     with pytest.raises(pp.PipelineError, match="exact-target"):
-        pp.next_review(object(), {})
+        pp.next_review(object(), {'repository':'ivanarama/onebase','trusted_account':'ivanarama'})
 
 
 def test_legacy_config_does_not_silently_opt_in(monkeypatch):
     monkeypatch.setattr(pp, 'stable_timeline', lambda *_: {'edges': []})
     monkeypatch.setattr(pp, "run_health", lambda *_, **__: health())
-    assert pp.next_review(object(), {}) == {
+    assert pp.next_review(object(), {'repository':'ivanarama/onebase','trusted_account':'ivanarama'}) == {
         "action": "fallback", "reason": "integration/base-sync state requires the full skill",
     }
 

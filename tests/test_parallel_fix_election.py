@@ -17,6 +17,7 @@ HEAD_B = "b" * 40
 DIGEST = "c" * 40
 CONFIG = {
     "repository": "owner/repo", "parallel_fix_enabled": True,
+    "trusted_account": "owner",
     "target_reservation_ttl_seconds": 300,
 }
 

@@ -679,8 +679,15 @@ def test_unproven_condition_means_no_carry_and_nothing_published(pipelinectl, wo
     assert code == 0 and merge["action"] == "wait", merge
     assert "waiting for integration REVIEW" in merge["reason"]
     assert merge["carry"].startswith("refused: ") and reason in merge["carry"], merge["carry"]
-    assert code_review == 0 and review["action"] == "fallback"  # the ordinary REVIEW route
-    assert "carry refused" in review["reason"] and reason in review["reason"]
+    assert code_review == 0
+    if breaks is edited_review:
+        # A trusted edit cannot prove that its old body was never typed v1.
+        # Keep the stronger engineering fence instead of a full-skill bypass.
+        assert review["action"] == "wait"
+        assert "uncertain trusted history" in review["reason"]
+    else:
+        assert review["action"] == "fallback"  # unaltered ordinary legacy REVIEW
+        assert "carry refused" in review["reason"] and reason in review["reason"]
     assert github.mutations == []
 
 

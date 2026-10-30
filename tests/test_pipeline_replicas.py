@@ -1077,7 +1077,7 @@ def test_two_fix_routes_have_distinct_signed_targets_and_no_unqualified_fallback
         "execution": {"mode": "skill" if fault == "skill" else "auto",
                       "command": ["pipelinectl", "next", "fix"]},
     }
-    config = {"repository": "owner/repo", "parallel_fix_enabled": True}
+    config = {"repository": "owner/repo", "trusted_account": "owner", "parallel_fix_enabled": True}
     monkeypatch.setattr(pipeline_insights, "_matching_queue", lambda _t: (
         "p", {"repository": "owner/repo"}, queue))
     monkeypatch.setattr(pipeline_insights, "_tool_available", lambda *_a: (
