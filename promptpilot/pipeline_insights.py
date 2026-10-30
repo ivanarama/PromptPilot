@@ -21,6 +21,8 @@ from urllib.parse import quote
 from . import db
 from .config import (CONCURRENCY, DB_DIR, DEFAULT_CLI, POLL_INTERVAL,
                      TASK_TIMEOUT, load_providers)
+from .wip_diagnostics import (backpressure_details, explain_backpressure,
+                              refresh_budget_diagnostic)
 
 
 DEFAULT_PROFILES: dict = {}
@@ -2289,6 +2291,16 @@ def _backpressure_gate(config: dict, data: dict, *, excluded_numbers=()) -> dict
     }
 
 
+def _intake_snapshot_defer(config: dict, data: dict, profile_id: str,
+                           queue_id: str, *, refresh_failed=False) -> dict:
+    details = backpressure_details(config["backpressure"], data, refresh_failed=refresh_failed)
+    reason = ("WIP: обновление снимка не удалось; новые задачи отложены" if refresh_failed else
+              "WIP: свежий полный снимок недоступен; приём новых задач отложен")
+    return {"action": "defer", "defer_for": config.get("defer_for", "10m"),
+            "reason": reason + "; " + explain_backpressure(details),
+            "profile_id": profile_id, "queue_id": queue_id, "wip_diagnostics": details}
+
+
 def dispatch_gate(task) -> dict | None:
     """Evaluate an optional user-owned, token-free gate for a series task.
 
@@ -2319,11 +2331,8 @@ def dispatch_gate(task) -> dict | None:
                     data = analyze(profile_id, db.list_series(), use_cache=False,
                                    refresh_diagnostics=True)
                 except Exception:
-                    return {
-                        "action": "defer", "defer_for": config.get("defer_for", "10m"),
-                        "reason": "WIP: обновление снимка не удалось; новые задачи отложены",
-                        "profile_id": profile_id, "queue_id": queue_config["id"],
-                    }
+                    return _intake_snapshot_defer(config, data, profile_id,
+                                                   queue_config["id"], refresh_failed=True)
                 cache = data.get("cache") or {}
             # A stale/partial empty snapshot must never complete a live stage as
             # empty, and stale diagnostics must not defer it. The project-owned
@@ -2331,17 +2340,14 @@ def dispatch_gate(task) -> dict | None:
             if (cache.get("refresh_blocked") or cache.get("stale")
                     or not cache.get("complete")):
                 if isinstance(config.get("backpressure"), dict):
-                    return {
-                        "action": "defer", "defer_for": config.get("defer_for", "10m"),
-                        "reason": "WIP: свежий полный снимок недоступен; приём новых задач отложен",
-                        "profile_id": profile_id, "queue_id": queue_config["id"],
-                    }
+                    return _intake_snapshot_defer(config, data, profile_id, queue_config["id"])
                 return None
             from .pipeline_item_holds import complete_members, prepare
             exclusions = prepare(task, queue_config, data)
             pressure = _backpressure_gate(config, data, excluded_numbers=exclusions)
             if pressure:
-                return {**pressure, "profile_id": profile_id, "queue_id": queue_config["id"]}
+                return {**pressure, "profile_id": profile_id, "queue_id": queue_config["id"],
+                        "wip_diagnostics": backpressure_details(config["backpressure"], data)}
             queue = next((item for item in data["queues"]
                           if item["id"] == queue_config["id"]), None)
             admission_members = complete_members(queue)
@@ -4564,6 +4570,7 @@ def _with_persisted_refresh_status(result: dict, profile_id: str,
         data["github_rate_limit"] = copy.deepcopy(status["github_rate_limit"])
     if isinstance(status.get("github_budget"), dict):
         data["github_budget"] = copy.deepcopy(status["github_budget"])
+        cache["refresh_budget"] = refresh_budget_diagnostic(status["github_budget"])
     return data
 
 
@@ -4764,6 +4771,7 @@ def _budget_blocked_cached(profile_id: str, profile: dict, series: list[dict],
     cache["refresh_blocked_reason"] = str(
         admission.get("reason") or "GitHub scan запрещён")
     cache["refresh_deferred_until"] = admission.get("defer_until")
+    cache["refresh_budget"] = refresh_budget_diagnostic(admission)
     return result
 
 
@@ -5074,6 +5082,7 @@ def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True,
         cache.pop("refresh_blocked", None)
         cache.pop("refresh_blocked_reason", None)
         cache.pop("refresh_deferred_until", None)
+        cache.pop("refresh_budget", None)
     return _with_live_github_budget_state(result, profile)
 
 

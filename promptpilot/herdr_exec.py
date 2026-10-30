@@ -1092,6 +1092,7 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
                 keep_pane=False,
             )
         outcome["verdict"] = closing_verdict
+        outcome["report_text"] = cleaned
 
         # task checkbox decides; provider flag / env force keep-open regardless
         where = f", машина {as_remote(host).host}" if host else ""
@@ -1131,6 +1132,7 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
 
         success_intent = {
             "ok": True, "error": "",
+            "report_text": cleaned,
             "output": (f"{cleaned}\n\n--- Meta ---\n"
                        f"Executor: herdr (pane {pane_id}{where}){wt_meta}"),
         }

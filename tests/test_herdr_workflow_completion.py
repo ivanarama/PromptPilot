@@ -287,6 +287,8 @@ def test_run_in_herdr_requires_pipeline_verdict_end_to_end(monkeypatch):
     assert outcome["ok"] is True
     assert outcome["verdict"] == "ГОТОВО"
     assert outcome["output"].startswith("Проверки завершены.")
+    assert outcome["report_text"] == "Проверки завершены.\nИТОГ: ГОТОВО (reviewed #1414)"
+    assert "--- Meta ---" in outcome["output"]
     assert read_count == 5
     assert get_count == 3
 

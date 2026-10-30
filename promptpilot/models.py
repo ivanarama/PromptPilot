@@ -2,7 +2,10 @@
 
 from datetime import datetime
 from enum import Enum
+import ipaddress
+import os
 from typing import Any, Literal, Optional
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -371,6 +374,42 @@ class WorkflowPlanningConfig(BaseModel):
     allow_editing_approved_plan: bool = False
 
 
+class WorkorderGuardConfig(BaseModel):
+    """A fixed website authorization endpoint and one opaque run identity."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+    site_url: str = Field(min_length=1, max_length=2048)
+    run_id: str = Field(min_length=1, max_length=100, pattern=r"^[A-Za-z0-9_-]+$")
+    worker_key: str = Field(min_length=1, max_length=200)
+    lease_token: str = Field(min_length=1, max_length=4096)
+
+    @field_validator("worker_key", "lease_token")
+    @classmethod
+    def printable_header(cls, value):
+        if any(ord(char) < 33 or ord(char) > 126 for char in value):
+            raise ValueError("workorder headers must be printable ASCII without whitespace")
+        return value
+
+    @field_validator("site_url")
+    @classmethod
+    def fixed_http_origin(cls, value):
+        parsed = urlsplit(value)
+        host = parsed.hostname
+        _ = parsed.port
+        loopback = host == "localhost"
+        if host and not loopback:
+            try:
+                loopback = ipaddress.ip_address(host).is_loopback
+            except ValueError:
+                pass
+        if (not host or parsed.username is not None or parsed.password is not None
+                or parsed.query or parsed.fragment or any(char.isspace() for char in value)
+                or any(ord(char) < 32 or ord(char) == 127 for char in value)
+                or not (parsed.scheme == "https" or parsed.scheme == "http" and loopback)):
+            raise ValueError("workorder site must use HTTPS or loopback HTTP without credentials/query/fragment")
+        return value.rstrip("/")
+
+
 class WorkflowConfig(BaseModel):
     """Versioned workflow configuration with legacy-friendly defaults."""
 
@@ -385,6 +424,7 @@ class WorkflowConfig(BaseModel):
     planning: WorkflowPlanningConfig = Field(default_factory=WorkflowPlanningConfig)
     limits: WorkflowLimitsConfig = Field(default_factory=WorkflowLimitsConfig)
     stage: dict[str, Any] = Field(default_factory=dict)
+    workorder_guard: Optional[WorkorderGuardConfig] = None
 
 
 class WorkflowSetupValidationRequest(BaseModel):
@@ -412,6 +452,8 @@ def normalize_workflow_config(value: Any = None) -> dict[str, Any]:
 
     validated = WorkflowConfig.model_validate(value or {})
     result = validated.model_dump(mode="json")
+    if validated.workorder_guard is None:
+        result.pop("workorder_guard", None)
     # Keep absence durable: the model default must not become an owner override
     # when a configuration is normalized, persisted, returned, or reloaded.
     if "max_revisions_per_stage" not in validated.planning.model_fields_set:
@@ -440,6 +482,10 @@ class WorkflowCreate(BaseModel):
 
     @model_validator(mode="after")
     def plan_within_configured_limit(self):
+        if self.config.get("workorder_guard") is not None:
+            if self.plan is not None:
+                raise ValueError("workorders use their separately approved website plan")
+            self.repository_path = os.path.realpath(self.repository_path)
         if self.plan is not None and len(self.plan) > self.config["planning"]["max_stages"]:
             raise ValueError("plan exceeds planning.max_stages")
         return self
@@ -800,6 +846,18 @@ class WorkflowReviewDecision(BaseModel):
     # исполнителя (доказанно пустой diff). Неизвестное происхождение этот
     # флаг не подтверждает; автоприменение вердикта его не ставит.
     allow_no_diff: bool = False
+
+
+class WorkflowGateRecovery(BaseModel):
+    """One-use engineering acknowledgement, never machine cleanup evidence."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    expected_version: int = Field(ge=0, strict=True)
+    execution_id: str = Field(min_length=1)
+    recovery_nonce: str = Field(min_length=1)
+    reason: str = Field(min_length=1, max_length=20000)
+    acknowledge_gate_effects_reviewed: bool = Field(default=False, strict=True)
 
 
 class WorkflowHumanInput(BaseModel):

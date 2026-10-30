@@ -647,6 +647,44 @@ def pickable_providers() -> dict:
     }
 
 
+def herdr_launch_kind(name: str, info: dict) -> str:
+    """Interactive kind for a provider that can open a new Herdr pane."""
+    if info.get("session_target"):
+        return ""
+    if info.get("executor"):
+        return (info.get("kind") or "claude") if info["executor"] == "herdr" else ""
+    kind = info.get("kind") or {"claude": "claude", "claude-z": "claude",
+                               "codex": "codex", "opencode": "opencode"}.get(name)
+    return kind if kind in {"claude", "codex", "opencode"} else ""
+
+
+@_provider_write
+def ensure_herdr_launch_provider(source: str) -> str:
+    """Register a hidden interactive route, also visible to an existing worker.
+
+    Headless command templates/arguments cannot be reused by an interactive
+    agent. Keep only its environment, models and capability settings.
+    """
+    info = load_providers().get(source, {})
+    kind = herdr_launch_kind(source, info)
+    if not kind:
+        raise ValueError("Этот агент не поддерживает новое окно Herdr")
+    if info.get("executor") == "herdr":
+        return source
+    name = f"__herdr_window_{source}"
+    custom = _load_custom_providers()
+    if name in custom and custom[name].get("herdr_source") != source:
+        raise ValueError("Имя запуска Herdr уже занято другим провайдером")
+    entry = {k: info[k] for k in ("env", "models", "effort", "supports_skills",
+                                  "supports_effort") if k in info}
+    entry.update(executor="herdr", kind=kind, hidden=True, herdr_source=source,
+                 description=f"{source} — новое окно Herdr")
+    if custom.get(name) != entry:
+        custom[name] = entry
+        _write_custom_providers(custom)
+    return name
+
+
 @_provider_write
 def remove_provider(name: str) -> bool:
     """Remove a custom provider from providers.json."""
@@ -810,7 +848,7 @@ def rights_supported(cfg: dict, rights: str) -> bool:
 
 def build_cmd(provider: str, prompt: str, skip_permissions: bool = False, session_id: str = None,
               model: str = None, guard: bool = True, effort: str = None,
-              rights: str = None):
+              rights: str = None, *, provider_snapshot: dict = None):
     """Build the full command list for a provider + prompt.
 
     guard=False for a run that happens on another machine: the settings file
@@ -819,7 +857,7 @@ def build_cmd(provider: str, prompt: str, skip_permissions: bool = False, sessio
     rights (models.TaskRights) wins over skip_permissions; RightsUnsupported
     when the provider cannot honour it.
     """
-    providers = load_providers()
+    providers = load_providers() if provider_snapshot is None else {provider: provider_snapshot}
     cfg = providers.get(provider, {})
     if provider in providers:
         template = cfg["cmd"]
@@ -926,7 +964,7 @@ def mask_secret_value(name: str, value: str) -> str:
     return "***"
 
 
-def get_provider_env(provider: str) -> dict:
+def get_provider_env(provider: str, *, provider_snapshot: dict = None) -> dict:
     """Environment for a provider's subprocess: current env minus PromptPilot's
     own secrets, plus the provider's declared env on top.
 
@@ -935,7 +973,7 @@ def get_provider_env(provider: str) -> dict:
     by name, so expose configured executables and well-known installations in
     PATH instead of making every agent rediscover them heuristically.
     """
-    providers = load_providers()
+    providers = load_providers() if provider_snapshot is None else {provider: provider_snapshot}
     extra = providers.get(provider, {}).get("env", {})
     env = os.environ.copy()
     for k in _SECRET_ENV:

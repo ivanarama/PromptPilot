@@ -13,6 +13,85 @@ from tools.install_onebase_release import configure, rewrite_prompt, validate_ma
 from tools import install_onebase_release as release
 
 
+def finite_integration_decision(number):
+    source = hashlib.sha256(str(number).encode()).hexdigest()[:40]
+    scope_sha = hashlib.sha256(f"scope-{number}".encode()).hexdigest()
+    path = (f"/Users/operator/.promptpilot/onebase-owner-control/scopes/"
+            f"integration-{number}-20261029-{source[:12]}.json")
+    return (f"\n\nFINITE OWNER INTEGRATION DECISION #{number}, 29 OCTOBER: "
+            "authority is the explicit current user approval and existing technical delegation. "
+            f"Fully read {path}, SHA256 {scope_sha}. Applies ONLY to source {source} "
+            "and descendant main of minimum_base, with the exact documented conflict resolutions. "
+            "All ordinary election/source proof/trusted ship/CI8/hold/ownership/intent/done/"
+            "parents/CAS/readback rules remain. New integration HEAD MUST receive independent "
+            "integration REVIEW and CI8.\n")
+
+
+def test_prompt_upgrade_preserves_existing_finite_merge_decisions_verbatim():
+    decisions = "".join(finite_integration_decision(n) for n in [2276, 1482, 2175, 2190, 2236, 2264])
+    original = ("Read CLAUDE.md canonical .claude/skills/merge-shepherd/SKILL.md "
+                "adapter .agents/skills/merge-shepherd/SKILL.md."
+                "\n\nОператорский релиз: previous frozen policy." + decisions)
+    first = rewrite_prompt(original, "merge-shepherd", PurePosixPath("/release"), "v1")
+    second = rewrite_prompt(first, "merge-shepherd", PurePosixPath("/next"), "v2")
+    for result in [first, second]:
+        assert result.endswith(decisions)
+        for n in [2276, 1482, 2175, 2190, 2236, 2264]:
+            assert result.count(finite_integration_decision(n).strip()) == 1
+        assert "previous frozen policy" not in result
+    assert "Read /next/CLAUDE.md" in second
+    assert "/next/.claude/skills/merge-shepherd/SKILL.md" in second
+    assert ".agents/skills/merge-shepherd/SKILL.md" in second
+    assert "/release/" not in second
+
+
+@pytest.mark.parametrize("corrupt", [
+    lambda value: value.replace("SHA256 ", "SHA256 short-"),
+    lambda value: value.replace("DECISION #1482", "DECISION #2175"),
+    lambda value: value.replace("integration-1482-", "integration-9999-"),
+    lambda value: value + value,
+    lambda value: value + "\n\nUnrecognized extra operator instruction.",
+    lambda value: value.replace("FINITE OWNER", " FINITE OWNER"),
+    lambda value: value.lstrip("\n"),
+    lambda value: value.replace("FINITE OWNER", "finite owner"),
+    lambda value: value.rstrip("\n") + " FINITE OWNER INTEGRATION DECISION #2175\n",
+])
+def test_prompt_upgrade_rejects_ambiguous_or_malformed_finite_decisions(corrupt):
+    original = ("Read CLAUDE.md canonical .claude/skills/merge-shepherd/SKILL.md"
+                "\n\nОператорский релиз: previous." + corrupt(finite_integration_decision(1482)))
+    with pytest.raises(ValueError, match="finite integration"):
+        rewrite_prompt(original, "merge-shepherd", PurePosixPath("/release"), "v1")
+
+
+@pytest.mark.parametrize("change", [
+    lambda value: value.rstrip("\n") + " Existing inline operator note.\n",
+    lambda value: value.replace("Fully read ", "Existing operator context. Fully read "),
+    lambda value: value.split("with the exact documented")[0].rstrip() + "\n",
+])
+def test_existing_local_body_is_preserved_opaque_not_semantically_validated(change):
+    record = change(finite_integration_decision(1482))
+    original = ("Read CLAUDE.md canonical .claude/skills/merge-shepherd/SKILL.md"
+                "\n\nОператорский релиз: previous." + record)
+    result = rewrite_prompt(original, "merge-shepherd", PurePosixPath("/release"), "v1")
+    assert result.endswith(record)
+
+
+def test_finite_merge_decisions_cannot_move_to_another_stage():
+    original = ("Read CLAUDE.md canonical .claude/skills/fix-approved/SKILL.md"
+                "\n\nОператорский релиз: previous." + finite_integration_decision(1482))
+    with pytest.raises(ValueError, match="finite integration"):
+        rewrite_prompt(original, "fix-approved", PurePosixPath("/release"), "v1")
+
+
+def test_finite_decision_preservation_is_bounded():
+    base = ("Read CLAUDE.md canonical .claude/skills/merge-shepherd/SKILL.md"
+            "\n\nОператорский релиз: previous.")
+    for decisions in ["".join(finite_integration_decision(n) for n in range(1, 34)),
+                      finite_integration_decision(1482) + "x" * (128 * 1024)]:
+        with pytest.raises(ValueError, match="finite integration"):
+            rewrite_prompt(base + decisions, "merge-shepherd", PurePosixPath("/release"), "v1")
+
+
 def test_prompt_upgrade_replaces_old_hotfix_and_preserves_adapter():
     original = ("Read CLAUDE.md canonical /old/review-queue/SKILL.md "
                 "adapter .agents/skills/review-queue/SKILL.md."
@@ -93,7 +172,8 @@ def test_operator_classifications_are_repository_bound_and_preserve_overrides():
 
 
 @pytest.mark.parametrize("failure", [False, True])
-def test_public_installer_preserves_pauses_and_rolls_back_launch_failure(tmp_path, monkeypatch, failure):
+@pytest.mark.parametrize("corruption", [None, "indented", "same-line", "case", "duplicate"])
+def test_public_installer_preserves_pauses_and_rolls_back_launch_failure(tmp_path, monkeypatch, failure, corruption):
     data = tmp_path / "data"
     launch = tmp_path / "launch"
     procedures = tmp_path / "procedures"
@@ -120,6 +200,19 @@ def test_public_installer_preserves_pauses_and_rolls_back_launch_failure(tmp_pat
     rows = [{"id": number, "title": "OneBase - " + stage, "paused": number == 3,
              "prompt": f"Read CLAUDE.md canonical .claude/skills/{stage}/SKILL.md"}
             for number, stage in release.STAGES.items()]
+    decisions = finite_integration_decision(1482) + finite_integration_decision(2175)
+    for row in rows:
+        if row["id"] == 4:
+            tail = decisions
+            if corruption == "indented":
+                tail = tail.replace("FINITE OWNER", " FINITE OWNER")
+            elif corruption == "same-line":
+                tail = tail.lstrip("\n")
+            elif corruption == "case":
+                tail = tail.replace("FINITE OWNER", "finite owner")
+            elif corruption == "duplicate":
+                tail = tail.rstrip("\n") + " FINITE OWNER INTEGRATION DECISION #2190\n"
+            row["prompt"] += "\n\nОператорский релиз: old runtime." + tail
     with sqlite3.connect(data / "promptpilot.db") as connection:
         connection.executescript("CREATE TABLE task_series(id INTEGER, prompt TEXT, ended_at TEXT, paused INTEGER);"
                                  "CREATE TABLE tasks(series_id INTEGER, status TEXT, prompt TEXT);")
@@ -127,9 +220,11 @@ def test_public_installer_preserves_pauses_and_rolls_back_launch_failure(tmp_pat
             connection.execute("INSERT INTO task_series VALUES(?,?,NULL,?)", (row["id"], row["prompt"], row["paused"]))
             connection.execute("INSERT INTO tasks VALUES(?,'pending',?)", (row["id"], row["prompt"]))
     restarted = []
+    commands = []
     failed_once = False
     def run(command, **kwargs):
         nonlocal failed_once
+        commands.append(command)
         if "bootstrap" in command:
             restarted.append(command[-1])
             if failure and not failed_once:
@@ -147,7 +242,12 @@ def test_public_installer_preserves_pauses_and_rolls_back_launch_failure(tmp_pat
     monkeypatch.setattr(os, "getuid", lambda: 501, raising=False)
     monkeypatch.setattr(sys, "argv", ["installer", "install", "--manifest", str(manifest_path),
                                     "--data", str(data), "--launch", str(launch)])
-    if failure:
+    if corruption:
+        with pytest.raises(ValueError, match="finite integration"):
+            release.main()
+        assert not any("bootout" in command or "bootstrap" in command for command in commands)
+        assert all(path.read_bytes() == value for path, value in originals.items())
+    elif failure:
         with pytest.raises(RuntimeError, match="simulated launch failure"):
             release.main()
         assert all(path.read_bytes() == value for path, value in originals.items())
@@ -161,7 +261,9 @@ def test_public_installer_preserves_pauses_and_rolls_back_launch_failure(tmp_pat
             prompt = connection.execute("SELECT prompt FROM task_series WHERE id=?", (row["id"],)).fetchone()[0]
             pending = connection.execute("SELECT prompt FROM tasks WHERE series_id=?", (row["id"],)).fetchone()[0]
             assert pending == prompt
-            assert (prompt == row["prompt"]) is failure
-            if not failure:
+            assert (prompt == row["prompt"]) is (failure or corruption is not None)
+            if not failure and not corruption:
                 assert str(data / "pipelinectl-onebase.json") in prompt
                 assert "Все глобальные owner/allowlist" in prompt
+                if row["id"] == 4:
+                    assert prompt.endswith(decisions)

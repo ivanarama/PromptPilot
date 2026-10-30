@@ -51,6 +51,7 @@ from .models import (
     WorkflowPlanReplace,
     WorkflowDispatchResult,
     WorkflowGateDecision,
+    WorkflowGateRecovery,
     WorkflowHistoryImport,
     WorkflowHumanInput,
     WorkflowReviewDecision,
@@ -67,6 +68,7 @@ from .models import (
     WorkflowVersionRequest,
 )
 from .version import check_for_update
+from .workorder_api import router as workorder_router
 
 
 def _sample_pipeline_profiles():
@@ -108,6 +110,8 @@ async def _lifespan(application: FastAPI):
 
 
 app = FastAPI(title="PromptPilot", version="0.1.0", lifespan=_lifespan)
+
+app.include_router(workorder_router)
 
 
 _SAFE_METHODS = ("GET", "HEAD", "OPTIONS")
@@ -404,6 +408,8 @@ def api_update_task(task_id: int, update: TaskUpdate):
         recurrence = update.recurrence.strip()
         if recurrence and db.parse_recurrence(recurrence) is None:
             raise HTTPException(400, "Повтор не разобран: «6h», «90m», «daily@09:00»")
+        if recurrence and db.workorder_recurrence_forbidden(task_id):
+            raise HTTPException(409, "Workorder tasks cannot acquire a recurring schedule")
         fields["recurrence"] = recurrence or None
     if update.scheduled_at is not None:
         fields["scheduled_at"] = update.scheduled_at
@@ -1126,6 +1132,13 @@ def api_record_workflow_gate(
     workflow_id: str, decision: WorkflowGateDecision
 ):
     return _workflow_action(workflows.record_gate, workflow_id, decision)
+
+
+@app.post("/api/workflows/{workflow_id}/gate/recover", response_model=WorkflowInDB)
+def api_recover_workflow_gate(workflow_id: str, request: WorkflowGateRecovery):
+    from .gate_execution import recover_unknown_gate
+
+    return _workflow_action(recover_unknown_gate, workflow_id, request)
 
 
 @app.post(

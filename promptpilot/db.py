@@ -90,6 +90,23 @@ CREATE TABLE IF NOT EXISTS task_token_usage (
     cost_attributable INTEGER NOT NULL DEFAULT 1
 );
 
+-- Original provider text for workflow decisions; display metadata stays in tasks.result.
+CREATE TABLE IF NOT EXISTS task_reports (
+    task_id INTEGER PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+    task_started_at TEXT,
+    result_sha256 TEXT NOT NULL,
+    report_text TEXT NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS task_reports_invalidate
+AFTER UPDATE OF status, started_at, result ON tasks
+WHEN NEW.status != 'completed'
+  OR NEW.started_at IS NOT OLD.started_at
+  OR NEW.result IS NOT OLD.result
+BEGIN
+    DELETE FROM task_reports WHERE task_id = NEW.id;
+END;
+
 CREATE TABLE IF NOT EXISTS task_series (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     title TEXT NOT NULL,
@@ -213,6 +230,42 @@ CREATE TABLE IF NOT EXISTS workflow_plans (
     updated_at TEXT NOT NULL,
     approved_at TEXT
 );
+
+CREATE TABLE IF NOT EXISTS workflow_gate_executions (
+    execution_id TEXT PRIMARY KEY,
+    workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE RESTRICT,
+    token TEXT NOT NULL UNIQUE,
+    observed_version INTEGER NOT NULL CHECK(observed_version >= 0),
+    admitted_version INTEGER NOT NULL CHECK(admitted_version >= observed_version),
+    round_id TEXT NOT NULL REFERENCES workflow_rounds(id) ON DELETE RESTRICT,
+    stage_id TEXT,
+    scope_sha256 TEXT NOT NULL,
+    scope_json TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN
+        ('STARTED', 'SETTLED', 'APPLIED', 'NOT_STARTED', 'UNKNOWN', 'RESOLVED')),
+    decision_json TEXT,
+    decision_sha256 TEXT,
+    cleanup_json TEXT,
+    created_at TEXT NOT NULL,
+    settled_at TEXT,
+    projected_version INTEGER,
+    recovery_nonce TEXT UNIQUE,
+    resolution_json TEXT,
+    CHECK(state NOT IN ('SETTLED', 'APPLIED') OR
+        (decision_json IS NOT NULL AND decision_sha256 IS NOT NULL
+         AND cleanup_json IS NOT NULL AND settled_at IS NOT NULL)),
+    CHECK(state != 'APPLIED' OR projected_version IS NOT NULL),
+    CHECK(state NOT IN ('UNKNOWN', 'RESOLVED') OR recovery_nonce IS NOT NULL),
+    CHECK(state != 'RESOLVED' OR resolution_json IS NOT NULL)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_gate_execution_active
+    ON workflow_gate_executions(workflow_id)
+    WHERE state IN ('STARTED', 'SETTLED', 'UNKNOWN');
+CREATE TRIGGER IF NOT EXISTS gate_executions_no_delete
+BEFORE DELETE ON workflow_gate_executions
+BEGIN
+    SELECT RAISE(ABORT, 'gate execution history is retained');
+END;
 
 CREATE TABLE IF NOT EXISTS workflow_stages (
     id TEXT PRIMARY KEY,
@@ -508,6 +561,7 @@ MIGRATIONS = [
 
 WORKFLOW_SCHEMA_VERSION = "workflow_orchestrator_w0_v1"
 WORKFLOW_STAGE_SCHEMA_VERSION = "workflow_stage_planner_w3_v1"
+WORKFLOW_GATE_SERIAL_SCHEMA_VERSION = "workflow_gate_serial_v1"
 PIPELINE_TARGET_RESERVATION_SCHEMA_VERSION = "pipeline_target_reservations_v1"
 PIPELINE_TARGET_ATTEMPT_SCHEMA_VERSION = "pipeline_target_reservations_attempt_v2"
 PIPELINE_TARGET_OWNERSHIP_SCHEMA_VERSION = "pipeline_target_reservations_ownership_v3"
@@ -606,6 +660,11 @@ def _init_db_once():
             """INSERT OR IGNORE INTO schema_migrations (version, applied_at)
                VALUES (?, ?)""",
             (WORKFLOW_STAGE_SCHEMA_VERSION, _now()),
+        )
+        conn.execute(
+            """INSERT OR IGNORE INTO schema_migrations (version, applied_at)
+               VALUES (?, ?)""",
+            (WORKFLOW_GATE_SERIAL_SCHEMA_VERSION, _now()),
         )
         conn.execute(
             """INSERT OR IGNORE INTO schema_migrations (version, applied_at)
@@ -1099,6 +1158,62 @@ def _create_series(conn: sqlite3.Connection, task: TaskCreate) -> int:
     return cur.lastrowid
 
 
+def workorder_origins(conn: sqlite3.Connection, *, task_id=None, series_id=None) -> tuple[set[int], set[int]]:
+    """Immutable guarded roots, including unsupported legacy series aliases."""
+    query = (
+        "SELECT r.task_id, t.series_id, e.payload_json, w.config_json "
+        "FROM workflow_runs r LEFT JOIN tasks t ON t.id=r.task_id "
+        "JOIN workflows w ON w.id=r.workflow_id LEFT JOIN workflow_events e "
+        "ON e.idempotency_key='workflow.created:' || w.id"
+    )
+    params = ()
+    if task_id is not None:
+        query += " WHERE r.task_id=?"
+        params = (task_id,)
+    elif series_id is not None:
+        query += " WHERE r.task_id IN (SELECT id FROM tasks WHERE series_id=?)"
+        params = (series_id,)
+    rows = conn.execute(query, params).fetchall()
+    tasks, series = set(), set()
+    fences = ()
+    if series_id is not None:
+        fences = conn.execute("SELECT value FROM settings WHERE key=?",
+                              (f"workorder_no_recurrence:v1:{series_id}",))
+    elif task_id is None:
+        fences = conn.execute("SELECT value FROM settings WHERE key GLOB 'workorder_no_recurrence:v1:*'")
+    for row in fences:
+        series.add(int(row["value"]))
+    for row in rows:
+        try:
+            original = _json_load(row["payload_json"]) if row["payload_json"] else {}
+            current = _json_load(row["config_json"])
+            guarded = ((original.get("config") or {}).get("workorder_guard") is not None
+                       or current.get("workorder_guard") is not None)
+        except (ValueError, TypeError, AttributeError):
+            guarded = True
+        if guarded:
+            tasks.add(row["task_id"])
+            if row["series_id"] is not None:
+                series.add(row["series_id"])
+    return tasks, series
+
+
+def _retain_workorder_series_fences(conn):
+    """Keep unsupported legacy lineage refused after root task retention cleanup."""
+    _, series = workorder_origins(conn)
+    conn.executemany("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
+                     [(f"workorder_no_recurrence:v1:{value}", str(value)) for value in series])
+
+
+def workorder_recurrence_forbidden(task_id: int, *, conn=None) -> bool:
+    with (nullcontext(conn) if conn is not None else _connect()) as connection:
+        if task_id in workorder_origins(connection, task_id=task_id)[0]:
+            return True
+        row = connection.execute("SELECT series_id FROM tasks WHERE id=?", (task_id,)).fetchone()
+        return bool(row and row["series_id"] is not None
+                    and row["series_id"] in workorder_origins(connection, series_id=row["series_id"])[1])
+
+
 def _backfill_task_series(conn: sqlite3.Connection):
     """Give legacy recurrence chains a stable identity without changing runs."""
     rows = conn.execute(
@@ -1106,8 +1221,13 @@ def _backfill_task_series(conn: sqlite3.Connection):
            WHERE recurrence IS NOT NULL AND recurrence != '' AND series_id IS NULL
            ORDER BY id"""
     ).fetchall()
+    if not rows:
+        return
+    guarded_tasks, _ = workorder_origins(conn)
     groups = {}
     for row in rows:
+        if row["id"] in guarded_tasks:
+            continue
         groups.setdefault((row["prompt"], row["working_dir"] or ""), []).append(row)
     for chain in groups.values():
         head = next((r for r in reversed(chain)
@@ -1176,6 +1296,8 @@ def create_series_occurrence_if_idle(task: TaskCreate) -> Optional[TaskInDB]:
     if not task.series_id:
         raise ValueError("series occurrence requires series_id")
     with _connect(immediate=True) as conn:
+        if task.series_id in workorder_origins(conn, series_id=task.series_id)[1]:
+            return None
         series = conn.execute(
             "SELECT ended_at FROM task_series WHERE id = ?",
             (task.series_id,),
@@ -1437,8 +1559,11 @@ def _release_task_pipeline_targets(conn, task_id: int, started_at=None):
 
 def mark_completed(task_id: int, result: str, exit_code: int = 0,
                    model_used: str = None, session_id: str = None,
-                   verdict: str = None, *, expected_started_at=None, usage=None) -> bool:
+                   verdict: str = None, *, expected_started_at=None, usage=None,
+                   report_text: str = None) -> bool:
     """Finalize a task, optionally committing its verdict atomically."""
+    if report_text is not None and not isinstance(report_text, str):
+        raise ValueError('report_text must be a string or None')
     with _connect() as conn:
         attempt = _attempt_iso(expected_started_at)
         where = "id = ?"
@@ -1458,6 +1583,22 @@ def mark_completed(task_id: int, result: str, exit_code: int = 0,
         if cur.rowcount:
             _drop_cancel_flag(conn, task_id)
             _release_task_pipeline_targets(conn, task_id, attempt)
+            # The raw/model boundary is recorded by the producer, never inferred
+            # by stripping renderer-looking text supplied by the model. Keep it
+            # out of ordinary task list projections and bind it to this result.
+            conn.execute("DELETE FROM task_reports WHERE task_id = ?", (task_id,))
+            if report_text is not None:
+                linked = conn.execute(
+                    "SELECT started_at FROM tasks WHERE id=? AND EXISTS "
+                    "(SELECT 1 FROM workflow_runs WHERE task_id=tasks.id)", (task_id,),
+                ).fetchone()
+                if linked:
+                    conn.execute(
+                        "INSERT INTO task_reports (task_id,task_started_at,result_sha256,report_text) "
+                        "VALUES (?, ?, ?, ?)",
+                        (task_id, linked['started_at'], hashlib.sha256(result.encode('utf-8')).hexdigest(),
+                         report_text),
+                    )
             # Usage belongs to this successful attempt, never to assistant text.
             conn.execute("DELETE FROM task_token_usage WHERE task_id = ?", (task_id,))
             if isinstance(usage, dict):
@@ -2416,6 +2557,8 @@ def pause_pipeline_series_on_repeated_blocker(
 
 def _recreate_series_occurrence(conn, series_id: int, series,
                                 scheduled_at: datetime) -> bool:
+    if series_id in workorder_origins(conn, series_id=series_id)[1]:
+        return False
     latest_row = conn.execute(
         "SELECT * FROM tasks WHERE series_id = ? ORDER BY id DESC LIMIT 1",
         (series_id,),
@@ -2540,8 +2683,11 @@ def repair_active_series_occurrences(
             """SELECT * FROM task_series
                WHERE paused = 0 AND ended_at IS NULL ORDER BY id"""
         ).fetchall()
+        _, forbidden_series = workorder_origins(conn)
         for series in series_rows:
             series_id = int(series["id"])
+            if series_id in forbidden_series:
+                continue
             if conn.execute(
                     """SELECT 1 FROM tasks WHERE series_id = ?
                        AND status IN ('pending', 'running', 'rate_limited')
@@ -3072,6 +3218,8 @@ def update_task_fields(task_id: int, fields: dict) -> bool:
             "WHEN budget_wait_scope IS NOT NULL THEN ? ELSE NULL END")
         values.append(_now())
     with _connect() as conn:
+        if fields.get("recurrence") and workorder_recurrence_forbidden(task_id, conn=conn):
+            return False
         cur = conn.execute(
             f"UPDATE tasks SET {', '.join(sets)} "
             "WHERE id = ? AND status IN ('pending', 'rate_limited')",
@@ -3082,6 +3230,7 @@ def update_task_fields(task_id: int, fields: dict) -> bool:
 
 def delete_task(task_id: int) -> bool:
     with _connect() as conn:
+        _retain_workorder_series_fences(conn)
         # A running provider may still own a checkout and an exact pipeline
         # target. Deletion must follow cancel + confirmed terminal cleanup;
         # otherwise removing the row would also free the reservation while the
@@ -4957,6 +5106,7 @@ def task_has_live_pipeline_target_reservation(task_id: int) -> bool:
 
 def purge_old(before_days: int = 7) -> int:
     with _connect() as conn:
+        _retain_workorder_series_fences(conn)
         cutoff = datetime.now(timezone.utc)
         from datetime import timedelta
         cutoff = (cutoff - timedelta(days=before_days)).isoformat()
@@ -5172,6 +5322,7 @@ def abort_draft_workflow(workflow_id: str) -> bool:
         ).fetchone()
         if not row or row["status"] != "draft":
             return False
+        require_gate_idle(conn, workflow_id)
         conn.execute(
             "DELETE FROM workflow_stages WHERE workflow_id = ?", (workflow_id,))
         conn.execute(
@@ -5297,6 +5448,21 @@ def _replace_workflow_stages(conn: sqlite3.Connection, workflow_id: str,
     return [_row_to_workflow_stage(row) for row in rows]
 
 
+def active_gate_execution(conn, workflow_id: str):
+    return conn.execute(
+        "SELECT * FROM workflow_gate_executions WHERE workflow_id=? "
+        "AND state IN ('STARTED','SETTLED','UNKNOWN')", (workflow_id,),
+    ).fetchone()
+
+
+def require_gate_idle(conn, workflow_id: str):
+    execution = active_gate_execution(conn, workflow_id)
+    if execution:
+        raise WorkflowConflictError(
+            f"unresolved gate execution {execution['execution_id']} "
+            f"({execution['state']}); explicit engineering recovery may be required")
+
+
 def update_workflow(workflow_id: str, update: WorkflowUpdate) -> WorkflowInDB:
     changes = update.model_dump(
         exclude={"expected_version", "allow_terminal_config"}, exclude_none=True)
@@ -5315,6 +5481,7 @@ def update_workflow(workflow_id: str, update: WorkflowUpdate) -> WorkflowInDB:
         ).fetchone()
         if not current:
             raise WorkflowNotFoundError(workflow_id)
+        require_gate_idle(conn, workflow_id)
         metadata_changes = set(changes) - {"config_json"}
         if current["status"] != "draft" and metadata_changes:
             raise WorkflowConflictError(
@@ -5334,6 +5501,22 @@ def update_workflow(workflow_id: str, update: WorkflowUpdate) -> WorkflowInDB:
                 f"workflow version is {current['state_version']}, "
                 f"expected {update.expected_version}"
             )
+
+        if "config_json" in changes or "repository_path" in changes:
+            origin = conn.execute(
+                "SELECT payload_json FROM workflow_events WHERE idempotency_key=?",
+                ("workflow.created:" + workflow_id,),
+            ).fetchone()
+            original = _json_load(origin["payload_json"]) if origin else {}
+            original_guard = (original.get("config") or {}).get("workorder_guard")
+            next_config = _json_load(changes.get("config_json", current["config_json"]))
+            if original_guard != next_config.get("workorder_guard"):
+                raise WorkflowConflictError("workorder guard must match its immutable creation origin")
+            if original_guard is not None and "repository_path" in changes:
+                import os
+                if os.path.realpath(changes["repository_path"]) != original.get("repository_path"):
+                    raise WorkflowConflictError("workorder repository is immutable")
+                changes["repository_path"] = original["repository_path"]
 
         new_version = current["state_version"] + 1
         assignments = [f"{field} = ?" for field in changes]
@@ -5367,6 +5550,7 @@ def create_workflow_round(data: WorkflowRoundCreate,
                           round_id: str = None) -> WorkflowRoundInDB:
     round_id = round_id or _new_id("round")
     with _connect(immediate=True) as conn:
+        require_gate_idle(conn, data.workflow_id)
         workflow = conn.execute(
             "SELECT * FROM workflows WHERE id = ?", (data.workflow_id,)
         ).fetchone()
@@ -5425,6 +5609,7 @@ def create_workflow_run(data: WorkflowRunCreate,
                         run_id: str = None) -> WorkflowRunInDB:
     run_id = run_id or _new_id("run")
     with _connect(immediate=True) as conn:
+        require_gate_idle(conn, data.workflow_id)
         round_row = conn.execute(
             """SELECT workflow_id FROM workflow_rounds
                WHERE id = ?""",
