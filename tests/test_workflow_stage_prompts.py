@@ -276,22 +276,28 @@ def render(template, **values):
     return template.strip() + workflows.WORKFLOW_VERDICT_INSTRUCTION
 
 
-def test_stage_without_own_prompts_keeps_the_builtin_text(isolated_db):
+def test_stage_without_own_prompts_keeps_builtin_text_before_rights_policy(isolated_db):
     workflow = planned(isolated_db, [stage()])
     common = dict(objective="Сделать функцию", stage_code="FINAL", stage_title="Проверка",
                   stage_goal="Проверить функцию", repository_path=str(isolated_db.DB_DIR),
                   candidate_branch="feature/prompts", round_no="1")
 
     executor = finish_task(isolated_db, "EXEC-REPORT")
-    assert executor.prompt == render(
+    expected_executor = render(
         LEGACY_EXECUTOR, **common, allowed_paths="src/feature.py",
         deliverables="отчёт о проверке", previous_review="(нет: это первый раунд)",
         gate_evidence="(gate ещё не выполнялся)")
+    assert executor.prompt.startswith(expected_executor.removesuffix(workflows.WORKFLOW_VERDICT_INSTRUCTION)
+                                      + '\n\n<promptpilot-rights')
+    assert executor.prompt.endswith(workflows.WORKFLOW_VERDICT_INSTRUCTION)
 
     reviewer = pending(isolated_db)
-    assert reviewer.prompt == render(
+    expected_reviewer = render(
         LEGACY_REVIEWER, **common, executor_report="EXEC-REPORT",
         gate_evidence="Gate отключён настройками", open_findings="[]")
+    assert reviewer.prompt.startswith(expected_reviewer.removesuffix(workflows.WORKFLOW_VERDICT_INSTRUCTION)
+                                      + '\n\n<promptpilot-rights')
+    assert reviewer.prompt.endswith(workflows.WORKFLOW_VERDICT_INSTRUCTION)
     assert isolated_db.get_workflow(workflow.id).status.value == "reviewing"
 
 

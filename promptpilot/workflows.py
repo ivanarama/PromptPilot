@@ -588,6 +588,8 @@ def dispatch_planner(workflow_id: str,
         if provider == "herdr-session" and not herdr_target:
             raise db.WorkflowConflictError("planner using herdr-session needs herdr_target")
         prompt = _render_planner_prompt(workflow, dispatch.prompt)
+        from .workflow_permissions import attach
+        prompt = attach(prompt, role="planner", rights=role.rights)
         task = db._insert_task(conn, TaskCreate(
             prompt=prompt.rstrip() + WORKFLOW_VERDICT_INSTRUCTION,
             working_dir=workflow.repository_path,
@@ -1130,8 +1132,12 @@ def dispatch_task(workflow_id: str,
         working_dir = dispatch.working_dir or workflow["repository_path"]
         if external:
             return _open_external_run(conn, workflow, round_row, dispatch, working_dir)
+        from .workflow_permissions import attach
+        prompt = attach(dispatch.prompt, role=dispatch.role.value,
+                        rights=dispatch.rights,
+                        skip_permissions=dispatch.skip_permissions)
         task = db._insert_task(conn, TaskCreate(
-            prompt=dispatch.prompt.rstrip() + WORKFLOW_VERDICT_INSTRUCTION,
+            prompt=prompt + WORKFLOW_VERDICT_INSTRUCTION,
             working_dir=working_dir,
             provider=dispatch.provider,
             priority=dispatch.priority,
