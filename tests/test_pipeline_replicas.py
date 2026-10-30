@@ -612,14 +612,27 @@ def test_fallback_gate_requires_live_exact_task_reservation(
     monkeypatch.setattr(pipelinectl, "run_health", lambda *_args, **_kwargs: health)
     monkeypatch.setattr(pipelinectl, "ensure_identity", lambda *_args: None)
 
+    reads=[]
+    def ordinary_history(repo_owner,repo_name,number,cursor):
+        assert (repo_owner,repo_name,number,cursor)==('owner','repo',10,None)
+        reads.append(number)
+        return {'data':{'repository':{'pullRequest':{
+            'headRefOid':HEAD_A,'baseRefOid':'c'*40,'baseRefName':'main',
+            'state':'OPEN','isDraft':False,
+            'labels':{'nodes':[],'pageInfo':{'hasNextPage':False}},
+            'timelineItems':{'edges':[],'pageInfo':{'hasNextPage':False}},
+        }}}}
+    peer=SimpleNamespace(graphql_page=ordinary_history)
     validated = fallback_handoff.gate(
-        object(), config, "review", envelope["handoff"]["lease"])
+        peer, config, "review", envelope["handoff"]["lease"])
     assert validated["action"] == "validated"
+    assert reads==[10,10]
 
     isolated_db.release_pipeline_target_reservations(owner.id)
     with pytest.raises(pipelinectl.PipelineError, match="expired or was released"):
         fallback_handoff.gate(
-            object(), config, "review", envelope["handoff"]["lease"])
+            peer, config, "review", envelope["handoff"]["lease"])
+    assert reads==[10,10]
 
 
 def test_replica_working_dirs_are_required_existing_and_distinct(tmp_path):
