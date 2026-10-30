@@ -1380,6 +1380,9 @@ def _validate_lease_reservation(lease: dict, config: dict) -> dict | None:
 
 def renew_lease_target_reservation(lease: dict, config: dict) -> dict | None:
     """Fence the first mutation with the still-live exact target lease."""
+    if lease.get('protocol')=='review-routing-v1' and lease.get('stage')=='review':
+        from .review_routing_request import renew_local
+        return renew_local(lease,config)
     reservation = _validate_lease_reservation(lease, config)
     if reservation is None:
         return None
@@ -1713,7 +1716,7 @@ def next_review(gh: GitHub, config: dict, *, config_path: str | None = None) -> 
             "action": "wait", "verdict": "ПУСТО",
             "reason": "all current REVIEW targets are reserved by other replicas",
         }
-    if not routing_policy['enabled']:
+    if not routing_policy['enabled'] or item.get('stage')!='review':
         from .review_routing_policy import off_fence
         fenced = off_fence(gh, config, item['number'])
         if fenced is not None:
@@ -1928,6 +1931,9 @@ def complete_review(gh: GitHub, config: dict, lease_value: str, report_path: str
     # comment/label mutation, preventing an expired replica from publishing a
     # second review after another task took over the same HEAD.
     renew_lease_target_reservation(lease, config)
+    from .review_routing_policy import require_legacy
+    require_legacy(gh,config,int(lease['number']))
+    validate_review_lease(lease,config)
     review = post_comment(gh, config, lease["number"], body)
 
     snapshot = stable_timeline(gh, config, lease["number"])
@@ -1938,6 +1944,8 @@ def complete_review(gh: GitHub, config: dict, lease_value: str, report_path: str
     review_id = int(review["id"])
     claim_body = (f"{CLAIM_MESSAGE}\n<!-- pp:review-claim {lease['head']} "
                   f"review-comment={review_id} epoch-sha256={lease['epoch']} -->")
+    require_legacy(gh,config,int(lease['number']),snapshot=snapshot)
+    validate_review_lease(lease,config)
     claim = post_comment(gh, config, lease["number"], claim_body)
 
     snapshot = stable_timeline(gh, config, lease["number"])
@@ -1950,6 +1958,8 @@ def complete_review(gh: GitHub, config: dict, lease_value: str, report_path: str
     winner = min(claims, key=lambda item: (item[0], item[1] or 0)) if claims else None
     if not winner or winner[1] != int(claim["id"]) or winner[2] != review_id:
         raise PipelineError("another review claim won; diagnostic comment was left without labels")
+    require_legacy(gh,config,int(lease['number']),snapshot=snapshot)
+    validate_review_lease(lease,config)
     add_label(gh, config, lease["number"], outcome)
 
     snapshot = stable_timeline(gh, config, lease["number"])
@@ -1957,6 +1967,8 @@ def complete_review(gh: GitHub, config: dict, lease_value: str, report_path: str
     completion_body = (f"{COMPLETE_MESSAGE}\n"
                        f"<!-- pp:head-reviewed {lease['head']} review-comment={review_id} "
                        f"claim={int(claim['id'])} epoch-sha256={lease['epoch']} -->")
+    require_legacy(gh,config,int(lease['number']),snapshot=snapshot)
+    validate_review_lease(lease,config)
     completion = post_comment(gh, config, lease["number"], completion_body)
     final = stable_timeline(gh, config, lease["number"])
     final_info = epoch(final, config["trusted_account"])

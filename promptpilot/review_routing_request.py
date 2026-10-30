@@ -6,7 +6,7 @@ and expiry after all slow work. No public route or capability is enabled here.
 """
 from __future__ import annotations
 
-from datetime import datetime,timezone
+from datetime import datetime,timedelta,timezone
 import json
 import re
 import secrets
@@ -136,20 +136,46 @@ def verify_local(request):
     if expected is None:
         return
     with db._connect() as connection:
-        row=connection.execute('''SELECT r.* FROM pipeline_target_reservations r
+        _local_reservation(connection,expected)
+
+
+def _local_reservation(connection,expected):
+    row=connection.execute('''SELECT r.* FROM pipeline_target_reservations r
             JOIN tasks t ON t.id=r.task_id
             WHERE r.repository=? AND r.number=? AND t.status='running' AND t.started_at=r.task_started_at
               AND COALESCE(t.machine,'')='' AND COALESCE(t.detached,0)=0
               AND COALESCE(t.worktree,0)=0 AND COALESCE(t.herdr_target,'')=''
               AND NOT EXISTS (SELECT 1 FROM settings WHERE key=? AND value='1')''',
-            (expected['repository'],expected['number'],'cancel_task:'+str(expected['task_id']))).fetchone()
-        if row is None or any(row[name]!=expected[name] for name in RESERVATION_FIELDS.split() if name!='expires_at'):
-            raise PipelineError('typed REVIEW final task/cancel/reservation snapshot changed')
-        try:expiry=datetime.fromisoformat(row['expires_at'])
-        except (TypeError,ValueError) as exc:
-            raise PipelineError('typed REVIEW final reservation expiry is invalid') from exc
-        if expiry.tzinfo is None or expiry.utcoffset() is None or datetime.now(timezone.utc)>=expiry:
-            raise PipelineError('typed REVIEW final reservation expired')
+        (expected['repository'],expected['number'],'cancel_task:'+str(expected['task_id']))).fetchone()
+    if row is None or any(row[name]!=expected[name] for name in RESERVATION_FIELDS.split() if name!='expires_at'):
+        raise PipelineError('typed REVIEW final task/cancel/reservation snapshot changed')
+    try:expiry=datetime.fromisoformat(row['expires_at'])
+    except (TypeError,ValueError) as exc:
+        raise PipelineError('typed REVIEW final reservation expiry is invalid') from exc
+    if expiry.tzinfo is None or expiry.utcoffset() is None or datetime.now(timezone.utc)>=expiry:
+        raise PipelineError('typed REVIEW final reservation expired')
+    return row,expiry
+
+
+def renew_local(request,config):
+    """Typed renewal cannot revive an expired/cancelled running occurrence."""
+    from . import db
+    require_current(request,config,write=True)
+    expected=request['target_reservation']
+    if expected is None:
+        return None
+    ttl=config.get('target_reservation_ttl_seconds',config.get('review_lease_seconds',7200))
+    if type(ttl) is not int or not 1<=ttl<=86400:
+        raise PipelineError('typed REVIEW reservation renewal lifetime is invalid')
+    with db._connect(immediate=True) as connection:
+        row,expiry=_local_reservation(connection,expected)
+        now=datetime.now(timezone.utc)
+        if now.timestamp()>=request['expires_at']:
+            raise PipelineError('typed REVIEW request expired during reservation renewal')
+        expiry=max(expiry,now+timedelta(seconds=ttl))
+        connection.execute('UPDATE pipeline_target_reservations SET expires_at=? WHERE repository=? AND number=?',
+                           (expiry.isoformat(),expected['repository'],expected['number']))
+        return dict(row,expires_at=expiry.isoformat())
 
 
 def encode(request):

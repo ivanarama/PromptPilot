@@ -13,8 +13,8 @@ from .review_routing import VERSION
 ROLES={'review':'review-queue','fix':'fix-approved','merge':'merge-shepherd','tail':'tail-issues'}
 
 
-def off_fence(gh, config, number):
-    """OFF never erases an existing trusted v1 lifetime transaction.
+def legacy_fence(gh, config, number, *, snapshot=None):
+    """Legacy dispatch never erases a trusted v1 lifetime transaction.
 
     No readers, journal creation/migration or wire writes occur here. Edited
     trusted comments, deletions and existing local transactions retain the
@@ -26,8 +26,8 @@ def off_fence(gh, config, number):
     from .review_routing_journal import Journal
     if (not isinstance(config.get('repository'),str) or not config['repository']
             or not isinstance(config.get('trusted_account'),str) or not config['trusted_account']):
-        raise PipelineError('OFF history fence requires repository and trusted account configuration')
-    snapshot = pp.stable_timeline(gh, config, number)
+        raise PipelineError('legacy history fence requires repository and trusted account configuration')
+    snapshot = pp.stable_timeline(gh, config, number) if snapshot is None else snapshot
     fenced=Journal.has_existing_history(journal_directory(config),config['repository'],number)
     for edge in snapshot['edges']:
         node = edge.get('node') or {}
@@ -38,8 +38,18 @@ def off_fence(gh, config, number):
             fenced=True
     if fenced:
         return {'action': 'wait', 'verdict': 'ПУСТО', 'number': number,
-                'reason': 'routing is OFF with existing or uncertain trusted history; read-only engineering fence'}
+                'reason': 'legacy route has existing or uncertain trusted history; read-only engineering fence'}
     return None
+
+
+def off_fence(gh,config,number):
+    return legacy_fence(gh,config,number)
+
+
+def require_legacy(gh,config,number,*,snapshot=None):
+    fenced=legacy_fence(gh,config,number,snapshot=snapshot)
+    if fenced is not None:
+        raise PipelineError(fenced['reason'])
 
 
 def _file_bytes(path):

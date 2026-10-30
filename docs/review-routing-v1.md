@@ -277,6 +277,14 @@ Worker сохраняет для них обычный маршрут ожида
 несуществующего audit-token. Подмена outer action у подписанного lease по-прежнему
 отказывает; read-only ответ не разрешает запуск модели или публикацию.
 
+Этот же read-only fence проверяется перед legacy integration/pre-review handoff
+при включённом протоколе, при свежей проверке уже выданных fallback/FIX owner
+tokens и перед каждой записью обычного REVIEW. Старое разрешение, смена стадии
+checker или переключение OFF не дают обхода незавершённой v1-транзакции.
+Типизированный REVIEW продлевает только ещё живую точную reservation: статус
+running сам по себе не воскрешает истёкшую или отменённую попытку. Прежнее
+правило renewal обычного legacy-маршрута этим не изменяется.
+
 Оставшаяся граница A151 существенна: нет operational progress/start issuer,
 policy-bound pipeline coordinator и canonical started; OneUseStart всё ещё не
 подключён к настоящей worker factory, server heartbeat и post-push completion.
