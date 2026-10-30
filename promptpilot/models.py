@@ -848,6 +848,18 @@ class WorkflowReviewDecision(BaseModel):
     allow_no_diff: bool = False
 
 
+class WorkflowGateRecovery(BaseModel):
+    """One-use engineering acknowledgement, never machine cleanup evidence."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    expected_version: int = Field(ge=0, strict=True)
+    execution_id: str = Field(min_length=1)
+    recovery_nonce: str = Field(min_length=1)
+    reason: str = Field(min_length=1, max_length=20000)
+    acknowledge_gate_effects_reviewed: bool = Field(default=False, strict=True)
+
+
 class WorkflowHumanInput(BaseModel):
     text: str = Field(min_length=1)
     expected_version: int = Field(ge=0)

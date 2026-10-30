@@ -18,7 +18,7 @@ from contextlib import contextmanager
 from datetime import datetime
 from typing import Optional
 
-from . import db, stage_checkpoint
+from . import db, stage_checkpoint, gate_execution
 from .process_tree import run_owned
 from .models import (
     FindingStatus,
@@ -118,6 +118,7 @@ ALLOWED_TRANSITIONS = {
         WorkflowStatus.CANCELLED,
     },
     WorkflowStatus.AWAITING_HUMAN: {
+        WorkflowStatus.GATING,
         WorkflowStatus.PLANNING,
         WorkflowStatus.QUEUED,
         WorkflowStatus.REVIEWING,
@@ -345,7 +346,10 @@ def _current_round_row(conn: sqlite3.Connection,
     return row
 
 
-def _require_version(workflow: sqlite3.Row, expected_version: int):
+def _require_version(conn: sqlite3.Connection, workflow: sqlite3.Row,
+                     expected_version: int, *, allow_gate_execution=False):
+    if not allow_gate_execution:
+        db.require_gate_idle(conn, workflow["id"])
     if workflow["state_version"] != expected_version:
         raise db.WorkflowConflictError(
             f"workflow version is {workflow['state_version']}, "
@@ -359,7 +363,7 @@ def _event_key(prefix: str, workflow_id: str, version: int) -> str:
 
 def _transition(conn: sqlite3.Connection, workflow: sqlite3.Row,
                 target: WorkflowStatus, event_type: str, payload: dict,
-                round_id: str = None) -> sqlite3.Row:
+                round_id: str = None, idempotency_key: str = None) -> sqlite3.Row:
     current = WorkflowStatus(workflow["status"])
     if target not in ALLOWED_TRANSITIONS[current]:
         raise db.WorkflowConflictError(
@@ -381,7 +385,7 @@ def _transition(conn: sqlite3.Connection, workflow: sqlite3.Row,
         workflow_id=workflow["id"],
         round_id=round_id,
         event_type=event_type,
-        idempotency_key=_event_key(event_type, workflow["id"], version),
+        idempotency_key=idempotency_key or _event_key(event_type, workflow["id"], version),
         payload={
             "from": current.value,
             "to": target.value,
@@ -394,7 +398,7 @@ def _transition(conn: sqlite3.Connection, workflow: sqlite3.Row,
 
 def _touch(conn: sqlite3.Connection, workflow: sqlite3.Row,
            event_type: str, payload: dict, round_id: str = None,
-           run_id: str = None) -> sqlite3.Row:
+           run_id: str = None, idempotency_key: str = None) -> sqlite3.Row:
     """Record an aggregate-changing action without changing lifecycle state."""
     version = workflow["state_version"] + 1
     cur = conn.execute(
@@ -409,7 +413,7 @@ def _touch(conn: sqlite3.Connection, workflow: sqlite3.Row,
         round_id=round_id,
         run_id=run_id,
         event_type=event_type,
-        idempotency_key=_event_key(event_type, workflow["id"], version),
+        idempotency_key=idempotency_key or _event_key(event_type, workflow["id"], version),
         payload={"version": version, **payload},
     ))
     return _workflow_row(conn, workflow["id"])
@@ -562,7 +566,7 @@ def dispatch_planner(workflow_id: str,
                      dispatch: WorkflowPlanDispatch) -> WorkflowPlanInDB:
     with db._connect(immediate=True) as conn:
         workflow_row = _workflow_row(conn, workflow_id)
-        _require_version(workflow_row, dispatch.expected_version)
+        _require_version(conn, workflow_row, dispatch.expected_version)
         state = WorkflowStatus(workflow_row["status"])
         if state not in {
             WorkflowStatus.DRAFT,
@@ -641,6 +645,8 @@ def sync_planner_task(task_id: int) -> Optional[WorkflowPlanInDB]:
         if not task:
             raise db.WorkflowConflictError(f"planner task {task_id} is missing")
         workflow = _workflow_row(conn, plan["workflow_id"])
+        if db.active_gate_execution(conn, workflow["id"]):
+            return db._row_to_workflow_plan(plan)
         if task["status"] in {"pending", "rate_limited", "running"}:
             return db._row_to_workflow_plan(plan)
         output = {
@@ -720,7 +726,7 @@ def provide_plan(workflow_id: str,
     """
     with (nullcontext(conn) if conn is not None else db._connect(immediate=True)) as conn:
         workflow = _workflow_row(conn, workflow_id)
-        _require_version(workflow, replacement.expected_version)
+        _require_version(conn, workflow, replacement.expected_version)
         if WorkflowStatus(workflow["status"]) is not WorkflowStatus.DRAFT:
             raise db.WorkflowConflictError(
                 "plan can only be provided for a draft workflow"
@@ -753,7 +759,7 @@ def replace_plan(workflow_id: str,
                  replacement: WorkflowPlanReplace) -> list[WorkflowStageInDB]:
     with db._connect(immediate=True) as conn:
         workflow = _workflow_row(conn, workflow_id)
-        _require_version(workflow, replacement.expected_version)
+        _require_version(conn, workflow, replacement.expected_version)
         state = WorkflowStatus(workflow["status"])
         if state not in {
             WorkflowStatus.AWAITING_PLAN_APPROVAL,
@@ -836,7 +842,7 @@ def amend_plan(workflow_id: str,
         raise db.WorkflowConflictError(str(exc)) from exc
     with db._connect(immediate=True) as conn:
         workflow = _workflow_row(conn, workflow_id)
-        _require_version(workflow, amendment.expected_version)
+        _require_version(conn, workflow, amendment.expected_version)
         status = WorkflowStatus(workflow["status"])
         live = status in {
             WorkflowStatus.QUEUED, WorkflowStatus.EXECUTING,
@@ -967,7 +973,7 @@ def approve_plan(workflow_id: str,
                  approval: WorkflowPlanApproval) -> WorkflowInDB:
     with db._connect(immediate=True) as conn:
         workflow = _workflow_row(conn, workflow_id)
-        _require_version(workflow, approval.expected_version)
+        _require_version(conn, workflow, approval.expected_version)
         if WorkflowStatus(workflow["status"]) is not WorkflowStatus.AWAITING_PLAN_APPROVAL:
             raise db.WorkflowConflictError("workflow plan is not awaiting approval")
         stages = conn.execute(
@@ -1042,13 +1048,13 @@ def start_workflow(workflow_id: str,
     with db._connect() as conn:
         workflow_row = _workflow_row(conn, workflow_id)
         planning_cfg = _config_for(workflow_row).planning
+        if planning_cfg.enabled and WorkflowStatus(workflow_row["status"]) is not WorkflowStatus.DRAFT:
+            _require_version(conn, workflow_row, request.expected_version)
+            return db._row_to_workflow(workflow_row)
     if planning_cfg.enabled:
         # Старт миссии с включённым планированием — это запуск
         # планировщика, а не исполнителя: исполнитель не должен получить
         # путь в gating/review мимо утверждения плана.
-        if WorkflowStatus(workflow_row["status"]) is not WorkflowStatus.DRAFT:
-            _require_version(workflow_row, request.expected_version)
-            return db._row_to_workflow(workflow_row)
         dispatch_planner(
             workflow_id,
             WorkflowPlanDispatch(expected_version=request.expected_version),
@@ -1056,7 +1062,7 @@ def start_workflow(workflow_id: str,
         return db.get_workflow(workflow_id)
     with db._connect(immediate=True) as conn:
         workflow = _workflow_row(conn, workflow_id)
-        _require_version(workflow, request.expected_version)
+        _require_version(conn, workflow, request.expected_version)
         if WorkflowStatus(workflow["status"]) is not WorkflowStatus.DRAFT:
             raise db.WorkflowConflictError("only a draft workflow can be started")
         round_no = workflow["current_round"] + 1
@@ -1104,7 +1110,7 @@ def dispatch_task(workflow_id: str,
 
     with db._connect(immediate=True) as conn:
         workflow = _workflow_row(conn, workflow_id)
-        _require_version(workflow, dispatch.expected_version)
+        _require_version(conn, workflow, dispatch.expected_version)
         from .workorder_guard import prepare_dispatch, WorkorderAuthorizationError
         try:
             dispatch, workorder_binding = prepare_dispatch(conn, workflow, dispatch)
@@ -1318,7 +1324,7 @@ def submit_external_result(workflow_id: str,
     """
     with db._connect(immediate=True) as conn:
         workflow = _workflow_row(conn, workflow_id)
-        _require_version(workflow, submission.expected_version)
+        _require_version(conn, workflow, submission.expected_version)
         if WorkflowStatus(workflow["status"]) is not WorkflowStatus.AWAITING_EXTERNAL:
             raise db.WorkflowConflictError(
                 "workflow is not waiting for an external result"
@@ -1368,39 +1374,60 @@ def submit_external_result(workflow_id: str,
 
 def record_gate(workflow_id: str,
                 decision: WorkflowGateDecision) -> WorkflowInDB:
-    with db._connect(immediate=True) as conn:
-        workflow = _workflow_row(conn, workflow_id)
-        _require_version(workflow, decision.expected_version)
-        if WorkflowStatus(workflow["status"]) is not WorkflowStatus.GATING:
-            raise db.WorkflowConflictError("workflow is not waiting for gates")
-        round_row = _current_round_row(conn, workflow)
-        common = {
-            "gate_id": decision.gate_id,
-            "summary": decision.summary,
-            "evidence": decision.evidence,
-            "verdict": decision.verdict.value,
-        }
-        if decision.verdict is GateVerdict.PASS:
-            round_status = WorkflowRoundStatus.REVIEWING
-            target = WorkflowStatus.REVIEWING
-            event_type = "gate.passed"
-        elif decision.verdict is GateVerdict.FAIL:
-            round_status = WorkflowRoundStatus.REVISION_REQUIRED
-            target = WorkflowStatus.REVISION_REQUIRED
-            event_type = "gate.failed"
-        else:
-            round_status = WorkflowRoundStatus.FAILED
-            target = WorkflowStatus.AWAITING_HUMAN
-            event_type = "gate.human_required"
-        conn.execute(
-            "UPDATE workflow_rounds SET status = ? WHERE id = ?",
-            (round_status.value, round_row["id"]),
-        )
-        workflow = _transition(
-            conn, workflow, target, event_type, common,
-            round_id=round_row["id"],
-        )
-        return db._row_to_workflow(workflow)
+    # Manual decisions never act as cleanup proof for an automatic execution.
+    with gate_execution.execution_lock(workflow_id) as acquired:
+        if not acquired:
+            raise db.WorkflowConflictError("gate execution is busy")
+        with db._connect(immediate=True) as conn:
+            db.require_gate_idle(conn, workflow_id)
+            return _record_gate(conn, workflow_id, decision)
+
+
+def _record_gate(conn: sqlite3.Connection, workflow_id: str,
+                 decision: WorkflowGateDecision, *, execution_id=None, token=None) -> WorkflowInDB:
+    if execution_id is None:
+        db.require_gate_idle(conn, workflow_id)
+    else:
+        execution = db.active_gate_execution(conn, workflow_id)
+        if (execution is None or execution["state"] != "SETTLED"
+                or execution["execution_id"] != execution_id or execution["token"] != token
+                or execution["admitted_version"] != decision.expected_version):
+            raise db.WorkflowConflictError("automatic gate requires its SETTLED ownership token")
+    workflow = _workflow_row(conn, workflow_id)
+    _require_version(conn, workflow, decision.expected_version,
+                     allow_gate_execution=True)
+    if WorkflowStatus(workflow["status"]) is not WorkflowStatus.GATING:
+        raise db.WorkflowConflictError("workflow is not waiting for gates")
+    round_row = _current_round_row(conn, workflow)
+    common = {
+        "gate_id": decision.gate_id,
+        "summary": decision.summary,
+        "evidence": decision.evidence,
+        "verdict": decision.verdict.value,
+    }
+    if execution_id is not None:
+        common.update(execution_id=execution_id, scope_sha256=execution["scope_sha256"])
+    if decision.verdict is GateVerdict.PASS:
+        round_status = WorkflowRoundStatus.REVIEWING
+        target = WorkflowStatus.REVIEWING
+        event_type = "gate.passed"
+    elif decision.verdict is GateVerdict.FAIL:
+        round_status = WorkflowRoundStatus.REVISION_REQUIRED
+        target = WorkflowStatus.REVISION_REQUIRED
+        event_type = "gate.failed"
+    else:
+        round_status = WorkflowRoundStatus.FAILED
+        target = WorkflowStatus.AWAITING_HUMAN
+        event_type = "gate.human_required"
+    conn.execute(
+        "UPDATE workflow_rounds SET status = ? WHERE id = ?",
+        (round_status.value, round_row["id"]),
+    )
+    workflow = _transition(
+        conn, workflow, target, event_type, common,
+        round_id=round_row["id"],
+    )
+    return db._row_to_workflow(workflow)
 
 
 def _upsert_review_finding(conn: sqlite3.Connection, workflow_id: str,
@@ -1542,7 +1569,7 @@ def record_review(workflow_id: str,
     checkpoint_deferred = None
     with db._connect(immediate=True) as conn:
         workflow = _workflow_row(conn, workflow_id)
-        _require_version(workflow, decision.expected_version)
+        _require_version(conn, workflow, decision.expected_version)
         if WorkflowStatus(workflow["status"]) is not WorkflowStatus.AWAITING_HUMAN:
             raise db.WorkflowConflictError(
                 "workflow is not waiting for a manual review verdict"
@@ -1797,6 +1824,8 @@ def human_input(workflow_id: str,
                 action: WorkflowHumanInput) -> WorkflowInDB:
     # The note is recorded next to the decision text and later rendered into
     # the next executor/reviewer prompt (see _operator_notes).
+    with db._connect() as conn:
+        db.require_gate_idle(conn, workflow_id)
     said = {"text": action.text}
     if action.note.strip():
         said["note"] = action.note.strip()
@@ -1818,7 +1847,7 @@ def human_input(workflow_id: str,
             raise db.WorkflowConflictError("workflow has no pending checkpoint")
     with db._connect(immediate=True) as conn:
         workflow = _workflow_row(conn, workflow_id)
-        _require_version(workflow, action.expected_version)
+        _require_version(conn, workflow, action.expected_version)
         state = WorkflowStatus(workflow["status"])
         if state not in {
             WorkflowStatus.AWAITING_HUMAN,
@@ -1947,7 +1976,7 @@ def _restart_pending_checkpoint(workflow_id, action, said, pending):
 
     def validate(conn):
         workflow = _workflow_row(conn, workflow_id)
-        _require_version(workflow, action.expected_version)
+        _require_version(conn, workflow, action.expected_version)
         if (WorkflowStatus(workflow["status"]) is not WorkflowStatus.AWAITING_HUMAN
                 or _pending_stage_checkpoint(conn, workflow_id) != pending):
             raise db.WorkflowConflictError("checkpoint restart state/identity changed")
@@ -2011,7 +2040,7 @@ def _complete_pending_checkpoint(workflow_id, expected_version, pending, said, *
 
     def validate(conn, version):
         workflow = _workflow_row(conn, workflow_id)
-        _require_version(workflow, version)
+        _require_version(conn, workflow, version)
         if WorkflowStatus(workflow["status"]) is not WorkflowStatus.AWAITING_HUMAN:
             raise db.WorkflowConflictError("workflow is not waiting for checkpoint")
         if not pending or _pending_stage_checkpoint(conn, workflow_id) != pending:
@@ -2103,7 +2132,7 @@ def cancel_workflow(workflow_id: str,
                     expected_version: int) -> WorkflowInDB:
     with db._connect(immediate=True) as conn:
         workflow = _workflow_row(conn, workflow_id)
-        _require_version(workflow, expected_version)
+        _require_version(conn, workflow, expected_version, allow_gate_execution=True)
         state = WorkflowStatus(workflow["status"])
         if state in TERMINAL_STATES:
             raise db.WorkflowConflictError(
@@ -2194,7 +2223,7 @@ def import_history(workflow_id: str,
                     "history idempotency key was reused with different content"
                 )
             return db._row_to_workflow(workflow)
-        _require_version(workflow, history.expected_version)
+        _require_version(conn, workflow, history.expected_version)
         if WorkflowStatus(workflow["status"]) is not WorkflowStatus.DRAFT:
             raise db.WorkflowConflictError(
                 "history can only be imported into a draft workflow"
@@ -3091,18 +3120,13 @@ def _dispatch_configured_role(workflow: WorkflowInDB,
     ))
 
 
-def _run_gate_commands(workflow: WorkflowInDB) -> WorkflowGateDecision:
-    gate = _config_for(workflow).gate
-    stage = (
-        db.get_workflow_stage(workflow.current_stage_id)
-        if workflow.current_stage_id else None
-    )
-    commands = list(gate.commands)
-    if stage:
-        commands.extend(
-            command for command in stage.acceptance_gates
-            if command not in commands
-        )
+def _run_gate_commands(workflow: WorkflowInDB, *, snapshot=None) -> WorkflowGateDecision:
+    owned_snapshot = snapshot is not None
+    if snapshot is None:
+        with db._connect() as conn:
+            snapshot = gate_execution.snapshot(conn, workflow)
+    gate = WorkflowConfig.model_validate({"gate": snapshot["gate"]}).gate
+    commands = snapshot["commands"]
     evidence: list[str] = []
     if not gate.enabled:
         return WorkflowGateDecision(
@@ -3127,19 +3151,34 @@ def _run_gate_commands(workflow: WorkflowInDB) -> WorkflowGateDecision:
                 "— либо явно выключите gate.enabled, если проверки не нужны",
             ],
         )
-    failures = 0
-    for index, command in enumerate(commands, start=1):
-        argv = (
-            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command]
-            if os.name == "nt" else ["/bin/sh", "-lc", command]
+    if not os.path.isdir(snapshot["cwd"]):
+        return WorkflowGateDecision(
+            expected_version=workflow.state_version, verdict=GateVerdict.HUMAN_REQUIRED,
+            gate_id="automatic-gate", summary="Gate working directory does not exist",
+            evidence=["Validation failed before entering any process factory"],
         )
+    failures = 0
+    for index, (command, argv) in enumerate(zip(commands, snapshot["argv"]), start=1):
+        if owned_snapshot and index > 1:
+            with db._connect() as conn:
+                current = db.get_workflow(workflow.id, conn=conn)
+                unchanged = (current is not None and current.status is WorkflowStatus.GATING
+                             and current.state_version == workflow.state_version
+                             and gate_execution.snapshot(conn, current) == snapshot)
+            if not unchanged:
+                return WorkflowGateDecision(
+                    expected_version=workflow.state_version, verdict=GateVerdict.HUMAN_REQUIRED,
+                    gate_id="automatic-gate", summary="Gate context changed; remaining commands stopped",
+                    evidence=evidence,
+                )
         try:
             # The shell can exit while descendants retain captured pipes or
             # keep editing the checkout. Retain its private lifetime boundary
             # through output collection and clean it on success and timeout.
             completed = run_owned(
                 argv,
-                cwd=workflow.repository_path,
+                cwd=snapshot["cwd"],
+                **({"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}),
                 capture_output=True,
                 text=True,
                 timeout=gate.timeout_seconds,
@@ -3170,15 +3209,8 @@ def _run_gate_commands(workflow: WorkflowInDB) -> WorkflowGateDecision:
                 summary=f"Команда gate #{index} превысила timeout",
                 evidence=evidence,
             )
-        except OSError as exc:
-            evidence.append(f"[{index}] environment error: {exc}")
-            return WorkflowGateDecision(
-                expected_version=workflow.state_version,
-                verdict=GateVerdict.HUMAN_REQUIRED,
-                gate_id="automatic-gate",
-                summary="Не удалось запустить deterministic gate",
-                evidence=evidence,
-            )
+        # Any other exception after entering run_owned can mean a child was
+        # created or close failed. The journal owner conservatively marks UNKNOWN.
     if failures:
         return WorkflowGateDecision(
             expected_version=workflow.state_version,
@@ -3281,6 +3313,8 @@ def _pause_automation(workflow_id: str, reason: str,
                       *, expected_version: int) -> WorkflowInDB:
     with db._connect(immediate=True) as conn:
         workflow = _workflow_row(conn, workflow_id)
+        if db.active_gate_execution(conn, workflow_id):
+            return db._row_to_workflow(workflow)
         # A failed observation does not own a later operator action or run.
         # Return that newer state instead of retrying the stale stop against it.
         if workflow["state_version"] != expected_version:
@@ -3321,6 +3355,9 @@ def advance_workflow(workflow_id: str, max_actions: int = 12) -> WorkflowInDB:
         workflow = db.get_workflow(workflow_id)
         if not workflow:
             raise db.WorkflowNotFoundError(workflow_id)
+        blocked = gate_execution.reconcile_unresolved(workflow.id)
+        if blocked is not None:
+            return blocked
         config = _config_for(workflow)
         if not config.automation.enabled or workflow.status in TERMINAL_STATES:
             return workflow
@@ -3376,9 +3413,10 @@ def advance_workflow(workflow_id: str, max_actions: int = 12) -> WorkflowInDB:
             if workflow.status is WorkflowStatus.GATING:
                 if not config.automation.auto_gate:
                     return workflow
-                decision = _run_gate_commands(workflow)
-                workflow = record_gate(workflow.id, decision)
-                if decision.verdict is GateVerdict.HUMAN_REQUIRED:
+                previous_version = workflow.state_version
+                workflow = gate_execution.execute_automatic_gate(
+                    workflow.id, previous_version)
+                if workflow.status in {WorkflowStatus.GATING, WorkflowStatus.AWAITING_HUMAN}:
                     return workflow
                 continue
 
@@ -3548,6 +3586,8 @@ def sync_task(task_id: int) -> Optional[WorkflowRunInDB]:
                 f"workflow run {run['id']} references missing task {task_id}"
             )
         workflow = _workflow_row(conn, run["workflow_id"])
+        if db.active_gate_execution(conn, workflow["id"]):
+            return db._row_to_workflow_run(run)
         task_status = task_row["status"]
 
         if task_status in {"pending", "rate_limited"}:

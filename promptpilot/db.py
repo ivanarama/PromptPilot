@@ -231,6 +231,42 @@ CREATE TABLE IF NOT EXISTS workflow_plans (
     approved_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS workflow_gate_executions (
+    execution_id TEXT PRIMARY KEY,
+    workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE RESTRICT,
+    token TEXT NOT NULL UNIQUE,
+    observed_version INTEGER NOT NULL CHECK(observed_version >= 0),
+    admitted_version INTEGER NOT NULL CHECK(admitted_version >= observed_version),
+    round_id TEXT NOT NULL REFERENCES workflow_rounds(id) ON DELETE RESTRICT,
+    stage_id TEXT,
+    scope_sha256 TEXT NOT NULL,
+    scope_json TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN
+        ('STARTED', 'SETTLED', 'APPLIED', 'NOT_STARTED', 'UNKNOWN', 'RESOLVED')),
+    decision_json TEXT,
+    decision_sha256 TEXT,
+    cleanup_json TEXT,
+    created_at TEXT NOT NULL,
+    settled_at TEXT,
+    projected_version INTEGER,
+    recovery_nonce TEXT UNIQUE,
+    resolution_json TEXT,
+    CHECK(state NOT IN ('SETTLED', 'APPLIED') OR
+        (decision_json IS NOT NULL AND decision_sha256 IS NOT NULL
+         AND cleanup_json IS NOT NULL AND settled_at IS NOT NULL)),
+    CHECK(state != 'APPLIED' OR projected_version IS NOT NULL),
+    CHECK(state NOT IN ('UNKNOWN', 'RESOLVED') OR recovery_nonce IS NOT NULL),
+    CHECK(state != 'RESOLVED' OR resolution_json IS NOT NULL)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_gate_execution_active
+    ON workflow_gate_executions(workflow_id)
+    WHERE state IN ('STARTED', 'SETTLED', 'UNKNOWN');
+CREATE TRIGGER IF NOT EXISTS gate_executions_no_delete
+BEFORE DELETE ON workflow_gate_executions
+BEGIN
+    SELECT RAISE(ABORT, 'gate execution history is retained');
+END;
+
 CREATE TABLE IF NOT EXISTS workflow_stages (
     id TEXT PRIMARY KEY,
     workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE RESTRICT,
@@ -525,6 +561,7 @@ MIGRATIONS = [
 
 WORKFLOW_SCHEMA_VERSION = "workflow_orchestrator_w0_v1"
 WORKFLOW_STAGE_SCHEMA_VERSION = "workflow_stage_planner_w3_v1"
+WORKFLOW_GATE_SERIAL_SCHEMA_VERSION = "workflow_gate_serial_v1"
 PIPELINE_TARGET_RESERVATION_SCHEMA_VERSION = "pipeline_target_reservations_v1"
 PIPELINE_TARGET_ATTEMPT_SCHEMA_VERSION = "pipeline_target_reservations_attempt_v2"
 PIPELINE_TARGET_OWNERSHIP_SCHEMA_VERSION = "pipeline_target_reservations_ownership_v3"
@@ -623,6 +660,11 @@ def _init_db_once():
             """INSERT OR IGNORE INTO schema_migrations (version, applied_at)
                VALUES (?, ?)""",
             (WORKFLOW_STAGE_SCHEMA_VERSION, _now()),
+        )
+        conn.execute(
+            """INSERT OR IGNORE INTO schema_migrations (version, applied_at)
+               VALUES (?, ?)""",
+            (WORKFLOW_GATE_SERIAL_SCHEMA_VERSION, _now()),
         )
         conn.execute(
             """INSERT OR IGNORE INTO schema_migrations (version, applied_at)
@@ -5280,6 +5322,7 @@ def abort_draft_workflow(workflow_id: str) -> bool:
         ).fetchone()
         if not row or row["status"] != "draft":
             return False
+        require_gate_idle(conn, workflow_id)
         conn.execute(
             "DELETE FROM workflow_stages WHERE workflow_id = ?", (workflow_id,))
         conn.execute(
@@ -5405,6 +5448,21 @@ def _replace_workflow_stages(conn: sqlite3.Connection, workflow_id: str,
     return [_row_to_workflow_stage(row) for row in rows]
 
 
+def active_gate_execution(conn, workflow_id: str):
+    return conn.execute(
+        "SELECT * FROM workflow_gate_executions WHERE workflow_id=? "
+        "AND state IN ('STARTED','SETTLED','UNKNOWN')", (workflow_id,),
+    ).fetchone()
+
+
+def require_gate_idle(conn, workflow_id: str):
+    execution = active_gate_execution(conn, workflow_id)
+    if execution:
+        raise WorkflowConflictError(
+            f"unresolved gate execution {execution['execution_id']} "
+            f"({execution['state']}); explicit engineering recovery may be required")
+
+
 def update_workflow(workflow_id: str, update: WorkflowUpdate) -> WorkflowInDB:
     changes = update.model_dump(
         exclude={"expected_version", "allow_terminal_config"}, exclude_none=True)
@@ -5423,6 +5481,7 @@ def update_workflow(workflow_id: str, update: WorkflowUpdate) -> WorkflowInDB:
         ).fetchone()
         if not current:
             raise WorkflowNotFoundError(workflow_id)
+        require_gate_idle(conn, workflow_id)
         metadata_changes = set(changes) - {"config_json"}
         if current["status"] != "draft" and metadata_changes:
             raise WorkflowConflictError(
@@ -5491,6 +5550,7 @@ def create_workflow_round(data: WorkflowRoundCreate,
                           round_id: str = None) -> WorkflowRoundInDB:
     round_id = round_id or _new_id("round")
     with _connect(immediate=True) as conn:
+        require_gate_idle(conn, data.workflow_id)
         workflow = conn.execute(
             "SELECT * FROM workflows WHERE id = ?", (data.workflow_id,)
         ).fetchone()
@@ -5549,6 +5609,7 @@ def create_workflow_run(data: WorkflowRunCreate,
                         run_id: str = None) -> WorkflowRunInDB:
     run_id = run_id or _new_id("run")
     with _connect(immediate=True) as conn:
+        require_gate_idle(conn, data.workflow_id)
         round_row = conn.execute(
             """SELECT workflow_id FROM workflow_rounds
                WHERE id = ?""",
