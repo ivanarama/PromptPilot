@@ -1582,6 +1582,7 @@ def _elect_review_candidate(config: dict, health: dict,
             )),
             task_started_at=task_started_at,
             ownership_kind=ownership_kind,
+            **({'strict_lifetime': True} if typed_owned_task else {}),
         )
         if reservation is not None:
             return selected, reservation, _review_health_without_targets(
@@ -1601,6 +1602,7 @@ def _elect_review_candidate(config: dict, health: dict,
             )),
             task_started_at=task_started_at,
             ownership_kind=ownership_kind,
+            **({'strict_lifetime': True} if typed_owned_task else {}),
         )
         if reservation is not None:
             selected = candidate

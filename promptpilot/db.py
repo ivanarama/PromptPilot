@@ -186,6 +186,7 @@ CREATE TABLE IF NOT EXISTS pipeline_target_reservations (
     token TEXT NOT NULL,
     reserved_at TEXT NOT NULL,
     expires_at TEXT NOT NULL,
+    strict_lifetime INTEGER NOT NULL DEFAULT 0 CHECK(strict_lifetime IN (0, 1)),
     PRIMARY KEY (repository, stage, number, head)
 );
 
@@ -529,6 +530,7 @@ MIGRATIONS = [
     "ALTER TABLE pipeline_target_reservations ADD COLUMN herdr_pane_id TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE pipeline_target_reservations ADD COLUMN herdr_tab_id TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE pipeline_target_reservations ADD COLUMN herdr_workspace_id TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE pipeline_target_reservations ADD COLUMN strict_lifetime INTEGER NOT NULL DEFAULT 0 CHECK(strict_lifetime IN (0, 1))",
     "ALTER TABLE tasks ADD COLUMN budget_wait_scope TEXT",
     "CREATE INDEX IF NOT EXISTS idx_tasks_budget_wait ON tasks(budget_wait_scope, status, priority)",
     "ALTER TABLE tasks ADD COLUMN pipeline_priority_restore INTEGER",
@@ -770,6 +772,7 @@ def reserve_pipeline_target(repository: str, stage: str, number: int,
                             head: str, task_id: int, ttl_seconds: int,
                             *, task_started_at: str | None = None,
                             ownership_kind: str | None = None,
+                            strict_lifetime: bool = False,
                             now: Optional[datetime] = None) -> Optional[dict]:
     """Atomically reserve one exact project-pipeline target for a task.
 
@@ -780,14 +783,19 @@ def reserve_pipeline_target(repository: str, stage: str, number: int,
     repository, stage, number, head, task_id = _pipeline_target_identity(
         repository, stage, number, head, task_id)
     ttl_seconds = _pipeline_reservation_ttl(ttl_seconds)
-    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
-    now_value = current.isoformat()
-    expires_at = (current + timedelta(seconds=ttl_seconds)).isoformat()
+    if type(strict_lifetime) is not bool:
+        raise ValueError('strict pipeline lifetime must be boolean')
     ownership_kind = str(ownership_kind or "").strip().lower()
     if ownership_kind not in {"", "headless", "herdr"}:
         raise ValueError("invalid pipeline provider ownership kind")
     with _connect(immediate=True) as conn:
+        # A writer wait consumes lease lifetime. Read time only after it.
+        current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        now_value = current.isoformat()
+        expires_at = (current + timedelta(seconds=ttl_seconds)).isoformat()
         attempt = ""
+        if strict_lifetime and task_started_at is None:
+            return None
         if task_started_at is not None:
             attempt = str(task_started_at).strip()
             try:
@@ -802,6 +810,9 @@ def reserve_pipeline_target(repository: str, stage: str, number: int,
             ).fetchone()
             if (task_row is None or task_row["status"] != "running"
                     or task_row["started_at"] != attempt):
+                return None
+            if strict_lifetime and conn.execute(
+                    "SELECT 1 FROM settings WHERE key=? AND value='1'",('cancel_task:'+str(task_id),)).fetchone():
                 return None
         conn.execute(
             """DELETE FROM pipeline_target_reservations
@@ -829,11 +840,14 @@ def reserve_pipeline_target(repository: str, stage: str, number: int,
                     or (attempt and existing["task_started_at"] != attempt)
                     or (ownership_kind and existing["ownership_kind"] != ownership_kind)):
                 return None
+            strict_lifetime = strict_lifetime or bool(existing['strict_lifetime'])
+            if strict_lifetime and not _strict_pipeline_target_live(conn,existing,current):
+                return None
             conn.execute(
-                """UPDATE pipeline_target_reservations SET expires_at = ?
+                """UPDATE pipeline_target_reservations SET expires_at = ?, strict_lifetime = ?
                    WHERE repository = ? AND stage = ? AND number = ? AND head = ?
                      AND task_id = ? AND token = ?""",
-                (expires_at, repository, stage, number, head, task_id,
+                (expires_at, int(strict_lifetime), repository, stage, number, head, task_id,
                  existing["token"]),
             )
             existing = conn.execute(
@@ -857,11 +871,11 @@ def reserve_pipeline_target(repository: str, stage: str, number: int,
         conn.execute(
             """INSERT INTO pipeline_target_reservations
                (repository, stage, number, head, task_id, task_started_at,
-                ownership_kind, herdr_session_state, token, reserved_at, expires_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ownership_kind, herdr_session_state, token, reserved_at, expires_at, strict_lifetime)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (repository, stage, number, head, task_id, attempt, ownership_kind,
              "reserved" if ownership_kind == "herdr" else "", token,
-             now_value, expires_at),
+             now_value, expires_at, int(strict_lifetime)),
         )
         row = conn.execute(
             """SELECT * FROM pipeline_target_reservations
@@ -984,6 +998,22 @@ def bind_pipeline_target_herdr_session(
         return _reservation_dict(row) if row is not None else None
 
 
+def _strict_pipeline_target_live(conn,row,current):
+    """Persistent typed policy also fences callers using legacy helpers.
+
+    The marker is local storage metadata, never an extra signed wire field.
+    Expired running attempts remain ownership barriers until real cleanup.
+    """
+    try:expiry=datetime.fromisoformat(row['expires_at'])
+    except (TypeError,ValueError):return False
+    if expiry.tzinfo is None or expiry.utcoffset() is None or expiry<=current:
+        return False
+    return conn.execute("""SELECT 1 FROM tasks WHERE id=? AND status='running'
+        AND started_at=? AND started_at!=''
+        AND NOT EXISTS (SELECT 1 FROM settings WHERE key=? AND value='1')""",
+        (row['task_id'],row['task_started_at'],'cancel_task:'+str(row['task_id']))).fetchone() is not None
+
+
 def renew_pipeline_target_reservation(reservation: dict, ttl_seconds: int,
                                       *, now: Optional[datetime] = None) -> Optional[dict]:
     """Renew only the still-live exact lease represented by ``reservation``."""
@@ -1002,10 +1032,14 @@ def renew_pipeline_target_reservation(reservation: dict, ttl_seconds: int,
     if not re.fullmatch(r"[0-9a-f]{32}", token):
         raise ValueError("invalid pipeline target reservation token")
     ttl_seconds = _pipeline_reservation_ttl(ttl_seconds)
-    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
-    now_value = current.isoformat()
-    expires_at = (current + timedelta(seconds=ttl_seconds)).isoformat()
     with _connect(immediate=True) as conn:
+        current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        now_value = current.isoformat()
+        expires_at = (current + timedelta(seconds=ttl_seconds)).isoformat()
+        stored=conn.execute('SELECT * FROM pipeline_target_reservations WHERE repository=? AND number=?',
+                            (repository,number)).fetchone()
+        if stored is not None and stored['strict_lifetime'] and not _strict_pipeline_target_live(conn,stored,current):
+            return None
         updated = conn.execute(
             """UPDATE pipeline_target_reservations
                SET expires_at = CASE WHEN expires_at < ? THEN ? ELSE expires_at END
@@ -1055,17 +1089,21 @@ def renew_task_pipeline_target_reservations(
         *, now: Optional[datetime] = None) -> int:
     """Heartbeat every still-live target owned by one running task.
 
-    Expired rows are never resurrected, and a shorter heartbeat never reduces
-    an operator-configured longer TTL. This keeps a live/uncertain provider's
-    target fenced while preserving TTL recovery after a hard process crash.
+    Legacy running attempts retain their historical renewal behavior. Strict
+    typed rows cannot renew after expiry/cancellation, including through this
+    old bulk helper, and remain barriers while their owner is still running.
+    A shorter heartbeat never reduces an operator-configured longer TTL.
     """
     if isinstance(task_id, bool) or not isinstance(task_id, int) or task_id <= 0:
         return 0
     ttl_seconds = _pipeline_reservation_ttl(ttl_seconds)
-    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
-    now_value = current.isoformat()
-    heartbeat_expiry = (current + timedelta(seconds=ttl_seconds)).isoformat()
     with _connect(immediate=True) as conn:
+        current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        now_value = current.isoformat()
+        heartbeat_expiry = (current + timedelta(seconds=ttl_seconds)).isoformat()
+        stored=conn.execute('SELECT * FROM pipeline_target_reservations WHERE task_id=?',(task_id,)).fetchone()
+        if stored is not None and stored['strict_lifetime'] and not _strict_pipeline_target_live(conn,stored,current):
+            return 0
         updated = conn.execute(
             """UPDATE pipeline_target_reservations
                SET expires_at = CASE WHEN expires_at < ? THEN ? ELSE expires_at END

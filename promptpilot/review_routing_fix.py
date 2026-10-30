@@ -208,7 +208,8 @@ def next_fix(gh, config, *, config_path, health):
         pp.review_gate(snapshot, config, dict(head=item['head'], epoch=proof.source['epoch'], anchor=proof.publication.payload['anchor']))
         pp.ensure_identity(gh, config)
         reservation = db.reserve_pipeline_target(config['repository'], 'fix-pr', item['number'], item['head'],
-            task_id, config['target_reservation_ttl_seconds'], task_started_at=started, ownership_kind='headless')
+            task_id, config['target_reservation_ttl_seconds'], task_started_at=started, ownership_kind='headless',
+            strict_lifetime=True)
         if reservation is None:
             if own is not None:
                 raise PipelineError('claimed FIX exact reservation was lost; no replacement target')

@@ -140,8 +140,7 @@ def test_worker_does_not_dispatch_full_skill_around_pending_typed_root(adapter, 
             return result
     monkeypatch.setattr(insights, '_tool_preflight', actual_cli)
     route = insights.execution_route(task, 'full repository skill', str(tmp_path))
-    from pathlib import Path
-    (Path(__file__).parent/'integration-route-summary.json').write_text(json.dumps({name: route.get(name) for name in
+    (tmp_path/'integration-route-summary.json').write_text(json.dumps({name: route.get(name) for name in
         ['action', 'mode', 'reason', 'fallback_reason', 'target']}, ensure_ascii=False), encoding='utf-8')
     assert route['action'] != 'prompt', (route['action'], route.get('mode'), route.get('target'))
 

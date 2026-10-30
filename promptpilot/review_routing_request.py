@@ -139,7 +139,7 @@ def verify_local(request):
         _local_reservation(connection,expected)
 
 
-def _local_reservation(connection,expected):
+def _local_reservation(connection,expected,*,require_strict=True):
     row=connection.execute('''SELECT r.* FROM pipeline_target_reservations r
             JOIN tasks t ON t.id=r.task_id
             WHERE r.repository=? AND r.number=? AND t.status='running' AND t.started_at=r.task_started_at
@@ -147,7 +147,8 @@ def _local_reservation(connection,expected):
               AND COALESCE(t.worktree,0)=0 AND COALESCE(t.herdr_target,'')=''
               AND NOT EXISTS (SELECT 1 FROM settings WHERE key=? AND value='1')''',
         (expected['repository'],expected['number'],'cancel_task:'+str(expected['task_id']))).fetchone()
-    if row is None or any(row[name]!=expected[name] for name in RESERVATION_FIELDS.split() if name!='expires_at'):
+    if (row is None or require_strict and row['strict_lifetime']!=1
+            or any(row[name]!=expected[name] for name in RESERVATION_FIELDS.split() if name!='expires_at')):
         raise PipelineError('typed REVIEW final task/cancel/reservation snapshot changed')
     try:expiry=datetime.fromisoformat(row['expires_at'])
     except (TypeError,ValueError) as exc:
@@ -168,14 +169,14 @@ def renew_local(request,config):
     if type(ttl) is not int or not 1<=ttl<=86400:
         raise PipelineError('typed REVIEW reservation renewal lifetime is invalid')
     with db._connect(immediate=True) as connection:
-        row,expiry=_local_reservation(connection,expected)
+        row,expiry=_local_reservation(connection,expected,require_strict=False)
         now=datetime.now(timezone.utc)
         if now.timestamp()>=request['expires_at']:
             raise PipelineError('typed REVIEW request expired during reservation renewal')
         expiry=max(expiry,now+timedelta(seconds=ttl))
-        connection.execute('UPDATE pipeline_target_reservations SET expires_at=? WHERE repository=? AND number=?',
+        connection.execute('UPDATE pipeline_target_reservations SET expires_at=?,strict_lifetime=1 WHERE repository=? AND number=?',
                            (expiry.isoformat(),expected['repository'],expected['number']))
-        return dict(row,expires_at=expiry.isoformat())
+        return dict(db._reservation_dict(row),expires_at=expiry.isoformat())
 
 
 def encode(request):

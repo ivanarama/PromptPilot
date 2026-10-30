@@ -148,9 +148,9 @@ def renew(value, config):
         if now.timestamp() >= value['expires_at']:
             raise PipelineError('claimed FIX request expired during its database wait')
         expiry = max(expiry, now+timedelta(seconds=config['target_reservation_ttl_seconds']))
-        connection.execute('UPDATE pipeline_target_reservations SET expires_at=? WHERE repository=? AND number=?',
+        connection.execute('UPDATE pipeline_target_reservations SET expires_at=?,strict_lifetime=1 WHERE repository=? AND number=?',
                            (expiry.isoformat(), expected['repository'], expected['number']))
-        return dict(row, expires_at=expiry.isoformat())
+        return dict(db._reservation_dict(row), expires_at=expiry.isoformat())
 
 
 def verify_local(value):
@@ -165,7 +165,8 @@ def verify_local(value):
               AND COALESCE(t.worktree,0)=0 AND COALESCE(t.herdr_target,'')=''
               AND NOT EXISTS (SELECT 1 FROM settings WHERE key=? AND value='1')''',
             (expected['repository'], expected['number'], 'cancel_task:'+str(expected['task_id']))).fetchone()
-        if row is None or any(row[name] != expected[name] for name in RESERVATION_FIELDS.split() if name != 'expires_at'):
+        if (row is None or row['strict_lifetime']!=1
+                or any(row[name] != expected[name] for name in RESERVATION_FIELDS.split() if name != 'expires_at')):
             raise PipelineError('claimed FIX final task/cancel/reservation snapshot changed')
         expiry = datetime.fromisoformat(row['expires_at'])
         if expiry.tzinfo is None or expiry.utcoffset() is None or datetime.now(timezone.utc) >= expiry:
