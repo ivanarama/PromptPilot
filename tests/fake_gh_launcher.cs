@@ -3,6 +3,7 @@ using System;
 using System.Diagnostics;
 using System.Linq;
 using System.Text;
+using System.Threading.Tasks;
 
 class FakeGitHubLauncher {
     static string Quote(string value) {
@@ -22,7 +23,7 @@ class FakeGitHubLauncher {
     static int Main(string[] args) {
         var start = new ProcessStartInfo {
             FileName = Environment.GetEnvironmentVariable("ROUTING_FAKE_PYTHON"),
-            Arguments = Quote(Environment.GetEnvironmentVariable("ROUTING_FAKE_SCRIPT")) + " "
+            Arguments = "-X utf8 " + Quote(Environment.GetEnvironmentVariable("ROUTING_FAKE_SCRIPT")) + " "
                 + string.Join(" ", args.Select(Quote)),
             UseShellExecute = false,
             CreateNoWindow = true,
@@ -31,11 +32,15 @@ class FakeGitHubLauncher {
             RedirectStandardError = true
         };
         using (var process = Process.Start(start)) {
-            if (args.Contains("--input")) process.StandardInput.Write(Console.In.ReadToEnd());
+            // gh's pipes carry UTF-8 bytes, not console text. The .NET and
+            // Python defaults can be different Windows code pages. Decoding
+            // here corrupts canonical bodies (and their hashes) before POST.
+            var output = process.StandardOutput.BaseStream.CopyToAsync(Console.OpenStandardOutput());
+            var error = process.StandardError.BaseStream.CopyToAsync(Console.OpenStandardError());
+            if (args.Contains("--input")) Console.OpenStandardInput().CopyTo(process.StandardInput.BaseStream);
             process.StandardInput.Close();
-            Console.Out.Write(process.StandardOutput.ReadToEnd());
-            Console.Error.Write(process.StandardError.ReadToEnd());
             process.WaitForExit();
+            Task.WaitAll(output, error);
             return process.ExitCode;
         }
     }

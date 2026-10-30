@@ -1,9 +1,66 @@
-# A151 author bridge: partial maintenance result
+# A151 author bridge: partial maintenance attempt log
+
+This document records the historical author attempts and their validation
+limits. It is not the live branch acceptance status. Any later exact-commit
+manual verification, independent review and CI are recorded separately.
 
 Branch: `feature/151-review-routing-20261029`. The required base
 `1564adab99ee165a96644fe458dc146fe9ec1098` was merged locally without conflicts;
-it is an ancestor of this branch. No GitHub writes, production changes or flag
-activation were performed. This checkout does **not** complete or accept A151.
+it is an ancestor of this branch. The author attempts made no GitHub writes,
+production changes or flag activation. This slice does **not** complete or
+accept A151.
+
+## Windows CI repair follow-up
+
+Read-only inspection of run `40985371723`, on exact commit
+`13644cec40ca05980061c0584575968fb6445b74`, found two failed executable-peer
+tests on Windows/Python 3.10: REVIEW completion and claimed author handoff both
+reported `routing record is not canonical UTF-8 JSON`. Windows/Python 3.12 was
+cancelled; the two Linux test jobs and lint passed on that earlier commit.
+
+The test-only C# launcher forwarded pipes through .NET console text encodings
+and launched Python without explicit UTF-8 mode. With inherited Python UTF-8
+mode disabled, the old launcher reproducibly changed a Unicode JSON body on
+this Windows host. The repaired launcher starts its fake peer with `-X utf8`
+and forwards stdin/stdout/stderr as bytes, draining stdout and stderr together.
+The fixture also pins Python pipe encoding. Production wire validation and
+legacy/OFF formats are unchanged.
+
+A new finite executable regression checks exact Cyrillic/CJK/emoji bytes on
+both output streams, CRLF, exit status, and text JSON round-trip with inherited
+UTF-8 mode disabled. The existing public REVIEW test now also checks the full
+report and canonical bytes returned by the fake server. The original launcher
+failed the disabled-UTF-8 JSON round-trip in a separate controlled reproduction;
+the repaired launcher passed. All children use hidden windows and no shell.
+
+The four executable fake-peer CLI tests and the final encoding regression pass
+locally, as do ruff and `git diff --check`. A focused run with Python UTF-8 mode
+disabled (`python -X utf8=0 -m pytest -q -W error`, selecting CLI peer, FIX,
+settlement, execution and policy tests) passed: **135 passed, 2 skipped**.
+Its TEMP/TMP and basetemp were private directories inside the checkout.
+The first full-suite run passed: **2463 passed, 22 skipped in 818.99 seconds**.
+The final UTF-8-mode assertion was added during that run, so it is not presented
+as a full check of the final test tree. The final encoding regression then
+passed separately. A fresh full-suite follow-up with TEMP/TMP and basetemp inside
+the checkout hit its finite **1200-second timeout** and was terminated by its
+runner. It produced no final pytest summary; it is **not PASS**. Fresh complete
+verification of the final test tree remained open at the end of that attempt.
+Only Python 3.12 was installed
+here; disabling UTF-8 mode is a regression scenario, not a claim that the Python
+3.10 CI job was rerun.
+The bridge implementation and the exact remaining gaps below are unchanged
+by this test-harness repair.
+
+Automatic approval review rejected recursive cleanup of the private test
+artifacts with `blocked by policy`, including a second attempt with an exact
+verified literal path. They remain untracked under
+`tools/a151-validation-6c843596/` and `tools/a151-full-final-6c843596/` and are
+not part of the commit. Plain ruff passed before those artifacts accumulated;
+a later repeat also scanned an intentionally invalid generated `app.py` fixture
+containing only `reviewed`. Source lint passes with just these two untracked
+directories excluded:
+`python -m ruff check promptpilot tests tools main.py --extend-exclude tools/a151-full-final-6c843596,tools/a151-validation-6c843596`.
+No repository lint rule, CI file or policy was changed. `git diff --check` passes.
 
 ## Implemented
 
@@ -37,7 +94,7 @@ contract; merely setting the flag cannot activate this path against the accepted
 OneBase checker. No actual accepted OneBase checker binary was available in this
 checkout, so its public refusal test and paired acceptance have not been run.
 
-## Verification
+## Earlier author attempt verification
 
 Local environment: Windows, Python 3.12.10, pytest 9.1.1, ruff 0.16.9.
 
@@ -65,8 +122,8 @@ Local environment: Windows, Python 3.12.10, pytest 9.1.1, ruff 0.16.9.
   task limit prevents another complete run; mandatory full-suite verification
   remains open. The overlapping run is not represented as PASS either.
 
-These local checks are not independent exact-commit review or the five GitHub CI
-jobs. Neither was claimed or performed by this author task.
+These historical local checks are not independent exact-commit review or the
+five GitHub CI jobs. Neither was claimed or performed by these author attempts.
 
 ## Exact remaining gap
 

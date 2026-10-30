@@ -84,6 +84,7 @@ def cli_peer(tmp_path):
         if name.startswith('PP_') or name in {'GH_TOKEN','GITHUB_TOKEN','GH_EXE'}:environment.pop(name,None)
     environment.update(PP_DATA_DIR=str(tmp_path/'d'),PP_PIPELINE_STATE_DIR=str(tmp_path/'s'),
                        GH_EXE=str(executable),ROUTING_FAKE_PEER=str(state),PYTHONDONTWRITEBYTECODE='1',
+                       PYTHONIOENCODING='utf-8',
                        ROUTING_FAKE_PYTHON=sys.executable,ROUTING_FAKE_SCRIPT=str(script))
     def run(*args):
         result=subprocess.run([sys.executable,'-X','utf8','-m','promptpilot.project_pipeline','--config',str(path),*args],
@@ -94,12 +95,55 @@ def cli_peer(tmp_path):
     return state,report,run
 
 
+@pytest.mark.skipif(os.name != 'nt', reason='Windows executable pipe bridge')
+def test_windows_executable_peer_preserves_canonical_utf8_and_stderr(cli_peer, tmp_path):
+    from promptpilot.review_routing_wire import render
+    _state, _report, run = cli_peer
+    script = tmp_path/'echo_bytes.py'
+    script.write_text("import sys\n"
+                      "body = sys.stdin.buffer.read()\n"
+                      "sys.stdout.buffer.write(body)\n"
+                      "sys.stderr.buffer.write(body)\n"
+                      "raise SystemExit(7)\n", encoding='utf-8')
+    environment = dict(run.environment, ROUTING_FAKE_SCRIPT=str(script),
+                       PYTHONIOENCODING='ascii:surrogateescape')
+    # Includes canonical Cyrillic evidence and characters outside Windows
+    # single-byte code pages. Do not hide pipe corruption with ASCII escapes.
+    body = (render(publication()) + '\n中文 🚀 "quoted"\r\n').encode('utf-8')
+    result = subprocess.run([environment['GH_EXE'], '--input', '-'], input=body,
+                            env=environment, capture_output=True, timeout=30,
+                            creationflags=subprocess.CREATE_NO_WINDOW)
+    assert result.returncode == 7
+    assert result.stdout == body
+    assert result.stderr == body
+
+    # Reproduce CI's Python 3.10 Windows default: the peer must parse stdin as
+    # UTF-8 even when UTF-8 mode was disabled in its inherited environment.
+    # The old launcher silently changed this JSON through a legacy code page.
+    script.write_text("import json,sys\n"
+                      "print(json.dumps({'value': json.load(sys.stdin), 'utf8': sys.flags.utf8_mode}))\n",
+                      encoding='utf-8')
+    environment.pop('PYTHONIOENCODING')
+    environment['PYTHONUTF8'] = '0'
+    expected = {'body': body.decode('utf-8')}
+    result = subprocess.run([environment['GH_EXE'], '--input', '-'],
+                            input=json.dumps(expected, ensure_ascii=False).encode('utf-8'),
+                            env=environment, capture_output=True, timeout=30,
+                            creationflags=subprocess.CREATE_NO_WINDOW)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {'value': expected, 'utf8': 1}
+
+
 def test_real_subprocess_cli_third_round_and_completed_old_head_readback(cli_peer):
     state,report,run=cli_peer
     code,selected=run('next','review');assert code==0 and selected['action']=='audit',selected
     code,completed=run('complete','review','--lease',selected['lease'],'--report',str(report))
     assert code==0 and completed['action']=='completed',completed
     before=json.loads(state.read_text(encoding='utf-8'));assert len(before['posts'])==3
+    from promptpilot.review_routing_wire import parse, render
+    record = parse(before['posts'][0])
+    assert record['report'] == json.loads(report.read_text(encoding='utf-8'))
+    assert render(record).encode('utf-8') == before['posts'][0].encode('utf-8')
     before['page']['data']['repository']['pullRequest']['labels']['nodes']=[{'name':'hold'}]
     state.write_text(json.dumps(before),encoding='utf-8')
     code,recovered=run('complete','review','--lease',selected['lease'],'--report',str(report))
