@@ -7,8 +7,10 @@ from io import StringIO
 import pytest
 
 from test_review_routing_stage_guard import setup_guard  # noqa: F401
-from test_review_routing_adapter import adapter  # noqa: F401
+from test_review_routing_adapter import adapter as _adapter_fixture
 from promptpilot import project_pipeline as pp
+
+adapter=_adapter_fixture
 
 
 def test_completed_typed_review_wait_is_no_work_in_worker(adapter, isolated_db, monkeypatch, tmp_path):
