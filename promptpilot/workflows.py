@@ -347,7 +347,7 @@ def _current_round_row(conn: sqlite3.Connection,
 
 
 def _require_version(conn: sqlite3.Connection, workflow: sqlite3.Row,
-                     expected_version: int, *, allow_gate_execution=False):
+                     expected_version: int, *, allow_gate_execution=False, allow_elicitation=False):
     if not allow_gate_execution:
         db.require_gate_idle(conn, workflow["id"])
     if workflow["state_version"] != expected_version:
@@ -355,6 +355,11 @@ def _require_version(conn: sqlite3.Connection, workflow: sqlite3.Row,
             f"workflow version is {workflow['state_version']}, "
             f"expected {expected_version}"
         )
+
+    if not allow_elicitation:
+        from . import workflow_elicitation
+        if workflow_elicitation.active(conn,workflow):
+            raise db.WorkflowConflictError('answer the current bound elicitation before continuing')
 
 
 def _event_key(prefix: str, workflow_id: str, version: int) -> str:
@@ -2141,7 +2146,7 @@ def cancel_workflow(workflow_id: str,
                     expected_version: int) -> WorkflowInDB:
     with db._connect(immediate=True) as conn:
         workflow = _workflow_row(conn, workflow_id)
-        _require_version(conn, workflow, expected_version, allow_gate_execution=True)
+        _require_version(conn, workflow, expected_version, allow_gate_execution=True, allow_elicitation=True)
         state = WorkflowStatus(workflow["status"])
         if state in TERMINAL_STATES:
             raise db.WorkflowConflictError(
@@ -2420,7 +2425,7 @@ _ROLE_DISPATCH_EVENT = {
 }
 # Events that journal a human decision and may carry a note for the agents.
 _OPERATOR_NOTE_EVENTS = (
-    "human.input", "human.resumed", "limit.stage_revisions", "limit.max_rounds",
+    "human.input", "human.resumed", "limit.stage_revisions", "limit.max_rounds", "elicit.answered",
 )
 
 
@@ -3459,6 +3464,10 @@ def advance_workflow(workflow_id: str, max_actions: int = 12) -> WorkflowInDB:
                 return _dispatch_configured_role(workflow, WorkflowRole.REVIEWER).workflow
 
             if workflow.status is WorkflowStatus.AWAITING_HUMAN:
+                from . import workflow_elicitation
+                with db._connect() as conn:
+                    if workflow_elicitation.active(conn,_workflow_row(conn,workflow.id)):
+                        return db.get_workflow(workflow.id,conn=conn)
                 if not workflow.current_round:
                     return workflow
                 current_round = next(
@@ -3685,6 +3694,11 @@ def sync_task(task_id: int) -> Optional[WorkflowRunInDB]:
 
             state = WorkflowStatus(workflow["status"])
             role = WorkflowRole(run["role"])
+            if final_status == "completed":
+                from . import workflow_elicitation
+                projected=conn.execute("SELECT * FROM workflow_runs WHERE id=?",(run["id"],)).fetchone()
+                if workflow_elicitation.capture(conn,workflow,projected,task_row):
+                    return db._row_to_workflow_run(projected)
             if (
                 final_status == "completed"
                 and task_row["verdict"] not in SUCCESS_VERDICTS

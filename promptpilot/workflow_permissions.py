@@ -1,6 +1,6 @@
 """Describe actual task rights; this text grants no tools or extra privileges."""
 
-VERSION = "workflow-rights-v1"
+VERSION = "workflow-rights-v2"
 
 _RIGHTS = {
     "none": "Без инструментов: работай только с переданным текстом.",
@@ -28,6 +28,14 @@ def attach(prompt: str, *, role: str, rights: str | None,
     else:
         level = rights
         explanation = _RIGHTS[rights]
+    if role in {"executor", "reviewer"}:
+        explanation += (
+            '\nIf you need an operator answer, put one JSON object on the penultimate line: '
+            'ELICIT_JSON: {"schema_version":1,"kind":"information","question":"...","options":[]}.'
+            ' For a permission question use kind="permission" and action="exact requested action".'
+            ' End with the required human-needed closing verdict. This only asks a question; an answer '
+            'is an operator note and never changes rights, executes the action or resumes automatically.'
+        )
     # Always append a fresh server-rendered description. A model-authored
     # lookalike in the supplied prompt cannot suppress the actual policy.
     return prompt.rstrip() + (

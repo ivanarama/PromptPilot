@@ -860,6 +860,42 @@ class WorkflowGateRecovery(BaseModel):
     acknowledge_gate_effects_reviewed: bool = Field(default=False, strict=True)
 
 
+class WorkflowElicitation(BaseModel):
+    """A question, never a permission grant or an executable command."""
+
+    model_config = ConfigDict(extra="forbid")
+    schema_version: Literal[1]
+    kind: Literal["information", "permission"]
+    question: str = Field(min_length=1, max_length=5000)
+    action: Optional[str] = Field(default=None, max_length=8192)
+    options: list[str] = Field(default_factory=list, max_length=8)
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def exact_version(cls, value):
+        if type(value) is not int or value != 1:
+            raise ValueError("elicitation schema_version must be integer 1")
+        return value
+
+    @model_validator(mode="after")
+    def meaningful_question(self):
+        if not self.question.strip() or any(not value.strip() or len(value)>2000 for value in self.options):
+            raise ValueError("elicitation question/options cannot be blank or oversized")
+        if len(set(self.options)) != len(self.options):
+            raise ValueError("elicitation options must be unique")
+        if self.kind == "permission" and not (self.action or "").strip():
+            raise ValueError("permission elicitation must describe the requested action")
+        return self
+
+
+class WorkflowElicitationAnswer(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_version: int = Field(ge=0, strict=True)
+    request_id: str = Field(min_length=1, max_length=64)
+    binding_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    answer: str = Field(min_length=1, max_length=10000)
+
+
 class WorkflowHumanInput(BaseModel):
     text: str = Field(min_length=1)
     expected_version: int = Field(ge=0)
