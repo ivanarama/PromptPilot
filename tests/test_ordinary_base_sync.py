@@ -329,3 +329,28 @@ def test_off_keeps_ordinary_behind_fallback_without_receipts(ordinary, flag):
     code, result = run("next", "merge")
     assert code == 0 and result["action"] == "fallback", result
     assert not update._directory().exists() and puts(server) == []
+
+
+@pytest.mark.parametrize("mode", ["renamed", "omitted", None, "", "carry"])
+def test_recognizable_ticket_cannot_downgrade_to_clean_legacy_merge(ordinary, world, monkeypatch, mode):
+    server, run = ordinary
+    # A delayed readiness response can change without changing the actual
+    # graph, snapshot or epoch. Use a real already-current Git graph.
+    world.set_main(world.m0)
+    genuine = ticket(run)
+    value = pp.decode_signed_lease(genuine)
+    value.pop("protocol")
+    value.pop("purpose")
+    if mode == "omitted":
+        value.pop("mode")
+    else:
+        value["mode"] = mode
+    server.merge_state = "CLEAN"
+    run.config.update(base_sync_merge=False, base_sync_carry=False)
+    run.path.write_text(json.dumps(run.config), encoding="utf-8")
+    monkeypatch.setattr(update.time, "time", lambda: value["expires_at"])
+    assert run("complete", "merge", "--lease", genuine)[0] == 2
+    # Only public payload decoding/encoding, no signature or signing-key access.
+    code, result = run("complete", "merge", "--lease", pp.encode_lease(value))
+    assert code == 2 and result["action"] == "error", result
+    assert server.mutations == []

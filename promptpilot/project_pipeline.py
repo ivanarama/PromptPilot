@@ -2533,13 +2533,21 @@ def complete_merge(gh: GitHub, config: dict, lease_value: str,
         raise PipelineError("ordinary base-sync requires a signed purpose-bound ticket")
     if lease.get("stage") != "merge" or lease.get("repository") != config["repository"]:
         raise PipelineError("lease belongs to another stage or repository")
+    common_fields = {"version", "stage", "repository", "number", "head"}
     if lease.get("mode") == "update-branch":
-        if (set(lease) != {"version", "stage", "mode", "repository", "number", "head", "base_sync_owner"}
+        if (set(lease) != common_fields | {"mode", "base_sync_owner"}
                 or lease["base_sync_owner"] is not True):
             raise PipelineError("unsupported legacy base-sync owner envelope")
         return _complete_base_sync_update(gh, config, lease)
     if lease.get("mode") == "carry":
+        required = common_fields | {"mode", "snapshot", "carry"}
+        if not required <= set(lease) <= required | {"intent"}:
+            raise PipelineError("unsupported legacy carry envelope")
         return _complete_carry_merge(gh, config, lease, config_path=config_path)
+    required = common_fields | {"snapshot", "proof"}
+    allowed = required | {"intent", "base_sync_owner", "ready_owner", "owner_stage"}
+    if not required <= set(lease) <= allowed:
+        raise PipelineError("unsupported legacy ordinary merge envelope")
     identity_contract = (config["repository"], config["trusted_account"])
     ensure_identity(gh, config)
     health = run_health(config, config_path=config_path)
