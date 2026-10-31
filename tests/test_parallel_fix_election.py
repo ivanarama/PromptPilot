@@ -17,6 +17,7 @@ HEAD_B = "b" * 40
 DIGEST = "c" * 40
 CONFIG = {
     "repository": "owner/repo", "parallel_fix_enabled": True,
+    "trusted_account": "owner",
     "target_reservation_ttl_seconds": 300,
 }
 
@@ -111,6 +112,8 @@ def _health(*candidates):
 
 
 def _setup_handoff(isolated_db, monkeypatch, tmp_path, candidates):
+    # These election-only fakes have no prior routing server history.
+    monkeypatch.setattr(pipelinectl, 'stable_timeline', lambda *_args: {'edges': []})
     monkeypatch.setenv("PP_DATA_DIR", str(tmp_path))
     monkeypatch.setenv("PP_PIPELINE_REPLICAS", "2")
     monkeypatch.chdir(tmp_path)

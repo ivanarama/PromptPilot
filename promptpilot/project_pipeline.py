@@ -245,6 +245,7 @@ class GitHub:
             result = subprocess.run(
                 [self.executable, *args], input=data, capture_output=True, text=True,
                 encoding="utf-8", errors="strict", timeout=timeout,
+                **({"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == 'nt' else {}),
             )
         except subprocess.TimeoutExpired as exc:
             operation = args[0] if args else "command"
@@ -463,6 +464,7 @@ def run_health(config: dict, *, config_path: str | None = None,
         result = subprocess.run(
             command, capture_output=True, text=True, encoding="utf-8",
             errors="strict", env=env, timeout=timeout,
+            **({"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == 'nt' else {}),
             **({"cwd": working_dir} if working_dir is not None else {}),
         )
     except subprocess.TimeoutExpired as exc:
@@ -1378,6 +1380,9 @@ def _validate_lease_reservation(lease: dict, config: dict) -> dict | None:
 
 def renew_lease_target_reservation(lease: dict, config: dict) -> dict | None:
     """Fence the first mutation with the still-live exact target lease."""
+    if lease.get('protocol')=='review-routing-v1' and lease.get('stage')=='review':
+        from .review_routing_request import renew_local
+        return renew_local(lease,config)
     reservation = _validate_lease_reservation(lease, config)
     if reservation is None:
         return None
@@ -1501,6 +1506,12 @@ def _elect_fix_candidate(config: dict, candidates: list[dict]) -> tuple[dict | N
 
 def next_fix(gh: GitHub, config: dict, *, config_path: str | None = None) -> dict:
     """Select one exact FIX target; never expose an untargeted skill fallback."""
+    from .review_routing_policy import settings as routing_settings
+    routing = routing_settings(config)
+    if routing is not None and routing['enabled']:
+        from .review_routing_fix import next_fix as next_claimed_fix
+        health = run_health(config, config_path=config_path)
+        return next_claimed_fix(gh, config, config_path=config_path, health=health)
     if config.get("parallel_fix_enabled") is not True:
         raise PipelineError("parallel FIX route is disabled")
     if _configured_replica_count() < 2:
@@ -1518,6 +1529,11 @@ def next_fix(gh: GitHub, config: dict, *, config_path: str | None = None) -> dic
     if candidate is None:
         return {"action": "wait", "stage": "fix", "verdict": "ПУСТО",
                 "reason": "all current FIX targets are reserved by other replicas"}
+    if _fix_candidate_key(candidate)[0] == 'fix-pr':
+        from .review_routing_policy import off_fence
+        fenced = off_fence(gh, config, candidate['number'])
+        if fenced is not None:
+            return fenced
     return fix_handoff.create(config, health, candidate, reservation)
 
 
@@ -1525,7 +1541,9 @@ def _elect_review_candidate(config: dict, health: dict,
                             candidates: list[dict]) -> tuple[dict | None, dict | None, dict]:
     """Reserve the first free candidate and preserve queue order atomically."""
     replicas = _configured_replica_count()
-    if replicas == 1:
+    typed_owned_task = (config.get('technical_handoff', {}).get('enabled') is True
+                        and _pipeline_task_id(required=False) is not None)
+    if replicas == 1 and not typed_owned_task:
         return candidates[0], None, health
     if (config.get("review_completion_gate") != "target-v1"
             or config.get("fallback_handoff") != "target-v1"):
@@ -1564,6 +1582,7 @@ def _elect_review_candidate(config: dict, health: dict,
             )),
             task_started_at=task_started_at,
             ownership_kind=ownership_kind,
+            **({'strict_lifetime': True} if typed_owned_task else {}),
         )
         if reservation is not None:
             return selected, reservation, _review_health_without_targets(
@@ -1583,6 +1602,7 @@ def _elect_review_candidate(config: dict, health: dict,
             )),
             task_started_at=task_started_at,
             ownership_kind=ownership_kind,
+            **({'strict_lifetime': True} if typed_owned_task else {}),
         )
         if reservation is not None:
             selected = candidate
@@ -1661,6 +1681,8 @@ def parallel_content_candidates(config: dict, health: dict) -> list[dict]:
 
 def next_review(gh: GitHub, config: dict, *, config_path: str | None = None) -> dict:
     health = run_health(config, config_path=config_path)
+    from .review_routing_policy import preflight as routing_preflight
+    routing_policy = routing_preflight(config, health)
     if config.get("fallback_handoff") == "target-v1":
         from .fallback_handoff import validate_health
 
@@ -1696,6 +1718,11 @@ def next_review(gh: GitHub, config: dict, *, config_path: str | None = None) -> 
             "action": "wait", "verdict": "ПУСТО",
             "reason": "all current REVIEW targets are reserved by other replicas",
         }
+    if not routing_policy['enabled'] or item.get('stage')!='review':
+        from .review_routing_policy import off_fence
+        fenced = off_fence(gh, config, item['number'])
+        if fenced is not None:
+            return fenced
     replica_count = _configured_replica_count()
     if replica_count > 1 and reservation is None:
         raise PipelineError("replicated REVIEW election did not reserve its target")
@@ -1723,6 +1750,12 @@ def next_review(gh: GitHub, config: dict, *, config_path: str | None = None) -> 
             config, election_health, "review", item, reason,
             reservation=reservation,
         )
+    if routing_policy['enabled']:
+        from .review_routing_adapter import next_review as next_typed_review
+        typed = next_typed_review(gh, config, config_path=config_path, item=item,
+                                  reservation=reservation, health=election_health)
+        if typed is not None:
+            return typed
     completion_gate = config.get("review_completion_gate", "health")
     if completion_gate == "target-v1" and not content_review_elected(
             election_health, item):
@@ -1855,11 +1888,16 @@ def content_review_elected(health: dict, selected: dict) -> bool:
     )
 
 
-def complete_review(gh: GitHub, config: dict, lease_value: str, report_path: str,
+def complete_review(gh: GitHub, config: dict, lease_value: str, report_path: str | None,
                     *, config_path: str | None = None) -> dict:
     expected_gate = config.get("review_completion_gate", "health")
     lease = (decode_signed_lease(lease_value) if expected_gate == "target-v1"
              else decode_lease(lease_value))
+    if lease.get('protocol') == 'review-routing-v1':
+        from .review_routing_adapter import complete_review as complete_typed_review
+        return complete_typed_review(gh, config, lease_value, report_path, config_path=config_path)
+    if report_path is None:
+        raise PipelineError("complete review requires --report")
     validate_review_lease(lease, config)
     report = json.loads(Path(report_path).read_text(encoding="utf-8-sig"))
     body, outcome = format_review(lease, report)
@@ -1895,6 +1933,9 @@ def complete_review(gh: GitHub, config: dict, lease_value: str, report_path: str
     # comment/label mutation, preventing an expired replica from publishing a
     # second review after another task took over the same HEAD.
     renew_lease_target_reservation(lease, config)
+    from .review_routing_policy import require_legacy
+    require_legacy(gh,config,int(lease['number']))
+    validate_review_lease(lease,config)
     review = post_comment(gh, config, lease["number"], body)
 
     snapshot = stable_timeline(gh, config, lease["number"])
@@ -1905,6 +1946,8 @@ def complete_review(gh: GitHub, config: dict, lease_value: str, report_path: str
     review_id = int(review["id"])
     claim_body = (f"{CLAIM_MESSAGE}\n<!-- pp:review-claim {lease['head']} "
                   f"review-comment={review_id} epoch-sha256={lease['epoch']} -->")
+    require_legacy(gh,config,int(lease['number']),snapshot=snapshot)
+    validate_review_lease(lease,config)
     claim = post_comment(gh, config, lease["number"], claim_body)
 
     snapshot = stable_timeline(gh, config, lease["number"])
@@ -1917,6 +1960,8 @@ def complete_review(gh: GitHub, config: dict, lease_value: str, report_path: str
     winner = min(claims, key=lambda item: (item[0], item[1] or 0)) if claims else None
     if not winner or winner[1] != int(claim["id"]) or winner[2] != review_id:
         raise PipelineError("another review claim won; diagnostic comment was left without labels")
+    require_legacy(gh,config,int(lease['number']),snapshot=snapshot)
+    validate_review_lease(lease,config)
     add_label(gh, config, lease["number"], outcome)
 
     snapshot = stable_timeline(gh, config, lease["number"])
@@ -1924,6 +1969,8 @@ def complete_review(gh: GitHub, config: dict, lease_value: str, report_path: str
     completion_body = (f"{COMPLETE_MESSAGE}\n"
                        f"<!-- pp:head-reviewed {lease['head']} review-comment={review_id} "
                        f"claim={int(claim['id'])} epoch-sha256={lease['epoch']} -->")
+    require_legacy(gh,config,int(lease['number']),snapshot=snapshot)
+    validate_review_lease(lease,config)
     completion = post_comment(gh, config, lease["number"], completion_body)
     final = stable_timeline(gh, config, lease["number"])
     final_info = epoch(final, config["trusted_account"])
@@ -2585,7 +2632,7 @@ def run(argv=None) -> int:
     owner_lease.add_argument("--lease")
     owner_lease.add_argument("--lease-file")
     complete_parser = sub.add_parser("complete")
-    complete_parser.add_argument("stage", choices=("review", "merge", "merge-cleanup"))
+    complete_parser.add_argument("stage", choices=("review", "merge", "merge-cleanup", "fix"))
     complete_lease = complete_parser.add_mutually_exclusive_group(required=True)
     complete_lease.add_argument("--lease")
     complete_lease.add_argument("--lease-file")
@@ -2640,9 +2687,12 @@ def run(argv=None) -> int:
                     from .fallback_handoff import gate
                     value = gate(gh, config, args.stage, args.lease,
                                  config_path=args.config)
+            elif args.stage == "fix":
+                from .review_routing_fix import complete_fix
+                if args.report is not None:
+                    raise PipelineError('author handoff cannot substitute a report for post-push proof')
+                value = complete_fix(gh, config, args.lease, config_path=args.config)
             elif args.stage == "review":
-                if not args.report:
-                    raise PipelineError("complete review requires --report")
                 value = complete_review(
                     gh, config, args.lease, args.report, config_path=args.config,
                 )

@@ -270,6 +270,7 @@ def test_queue_priority_manual_auto_and_aging():
 
 
 def test_health_exposes_configured_gh_to_nested_checker(monkeypatch):
+    monkeypatch.delenv('GH_EXE', raising=False)
     captured = {}
 
     def fake_run(*args, **kwargs):
@@ -679,6 +680,7 @@ def test_one_replica_optin_keeps_ordinary_review_executable(tmp_path, monkeypatc
 @pytest.mark.parametrize("enabled", [False, True])
 def test_disabled_or_unsupported_parallel_optin_keeps_integration_owner(
         tmp_path, monkeypatch, enabled):
+    monkeypatch.setattr(pp, 'stable_timeline', lambda *_args: {'edges': []})
     config = _parallel_optin_config(tmp_path, monkeypatch, 2)
     config["parallel_content_review"] = enabled
     owner = {"number": 10, "head": "b" * 40, "stage": "integration-review"}

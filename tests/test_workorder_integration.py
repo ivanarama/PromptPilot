@@ -35,7 +35,7 @@ def guarded_task():
     workflow = db.create_workflow(WorkflowCreate(**payload))
     workflow = workflows.start_workflow(workflow.id, WorkflowStartRequest(expected_version=workflow.state_version))
     dispatch = workflows.dispatch_task(workflow.id, WorkflowTaskDispatch(expected_version=workflow.state_version,
-        role="executor", prompt="Approved", max_retries=0, task_timeout=60))
+        role="executor", prompt="Approved", provider="claude", max_retries=0, task_timeout=60))
     return dispatch.task
 
 
