@@ -2529,11 +2529,14 @@ def complete_merge(gh: GitHub, config: dict, lease_value: str,
         from .ordinary_base_sync import complete
         return complete(gh, config, lease_value, config_path=config_path)
     lease = decode_lease(lease_value)
-    if lease.get("protocol") == "ordinary-base-sync-v1" or lease.get("mode") == "ordinary-update":
+    if "protocol" in lease or "purpose" in lease or lease.get("mode") == "ordinary-update":
         raise PipelineError("ordinary base-sync requires a signed purpose-bound ticket")
     if lease.get("stage") != "merge" or lease.get("repository") != config["repository"]:
         raise PipelineError("lease belongs to another stage or repository")
     if lease.get("mode") == "update-branch":
+        if (set(lease) != {"version", "stage", "mode", "repository", "number", "head", "base_sync_owner"}
+                or lease["base_sync_owner"] is not True):
+            raise PipelineError("unsupported legacy base-sync owner envelope")
         return _complete_base_sync_update(gh, config, lease)
     if lease.get("mode") == "carry":
         return _complete_carry_merge(gh, config, lease, config_path=config_path)

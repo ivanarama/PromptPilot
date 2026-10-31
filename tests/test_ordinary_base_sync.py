@@ -24,6 +24,7 @@ class OrdinaryGitHub(FakeGitHub):
         self.lose_response = False
         self.ignore_update = False
         self.updated_head = None
+        self.accept_legacy_shape = False
 
     def pull(self):
         return dict(number=NUMBER, title="ordinary", state="open", draft=False,
@@ -47,7 +48,9 @@ class OrdinaryGitHub(FakeGitHub):
         if args == ("api", "user"):
             return {"login": self.actor}
         if len(args) > 1 and args[1].endswith("/update-branch"):
-            assert input_value == {"expected_head_sha": self.head}
+            expected = {"expected_head_sha": self.head}
+            if self.accept_legacy_shape: expected["update_method"] = "merge"
+            assert input_value == expected
             self.mutations.append(("PUT", args[1], input_value))
             if self.update_conflict:
                 raise pp.PipelineError("Merge conflict (HTTP 422)")
@@ -181,6 +184,32 @@ def test_wrong_signed_purpose_never_falls_into_legacy_merge(ordinary, fault):
         token = pp.encode_signed_lease(value)
     code, failed = run("complete", "merge", "--lease", token)
     assert code == 2 and failed["action"] == "error", failed
+    assert puts(server) == [] and server.published() == []
+
+
+@pytest.mark.parametrize("protocol", [None,"renamed", "strip-all-tags"])
+def test_unsigned_repackaging_cannot_reach_legacy_updater(ordinary, monkeypatch, protocol):
+    server, run = ordinary
+    original = ticket(run)
+    value = pp.decode_signed_lease(original)
+    value["mode"] = "update-branch"
+    if protocol is None: value.pop("protocol")
+    elif protocol == "strip-all-tags":
+        value.pop("protocol");value.pop("purpose")
+    else: value["protocol"] = "something-else"
+    # No signing call: the attacker merely repacks the readable public payload.
+    forged = pp.encode_lease(value)
+    server.accept_legacy_shape = True
+    server.actor = "wrong-actor"
+    server.checks = []
+    run.changes["state"] = "red"
+    run.config.update(base_sync_carry=False,base_sync_merge=False)
+    run.path.write_text(json.dumps(run.config),encoding="utf-8")
+    monkeypatch.setenv("PP_PIPELINE_REPLICAS","2")
+    monkeypatch.setenv("PP_PIPELINE_EXCLUDED_NUMBERS",str(NUMBER))
+    monkeypatch.setattr(update.time,"time",lambda:value["expires_at"]+1)
+    code, refused = run("complete","merge","--lease",forged)
+    assert code == 2 and refused["action"] == "error",refused
     assert puts(server) == [] and server.published() == []
 
 
