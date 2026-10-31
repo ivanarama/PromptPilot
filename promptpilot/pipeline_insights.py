@@ -4454,6 +4454,9 @@ def _refresh_local_state(result: dict, profile: dict, series: list[dict], *,
     data["cache"] = _cache_metadata(
         source, generated_at, entry_epoch, entry_revision, current_epoch,
         _profile_fingerprint(profile))
+    from . import delivery_flow
+    data["delivery_flow"] = delivery_flow.summarize(
+        data, matching_series, now, paused=db.is_paused())
     return data
 
 
