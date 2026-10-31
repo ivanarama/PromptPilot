@@ -754,7 +754,13 @@ def api_validate_workflow_setup(request: WorkflowSetupValidationRequest):
             "gate", "warning", "Gate-команды не заданы: функциональная готовность не проверяется",
         ))
     for index, command in enumerate(request.gate_commands, start=1):
-        status, detail = _validate_gate_syntax(command)
+        if isinstance(command,str):
+            status, detail = _validate_gate_syntax(command)
+        else:
+            from .declared_gates import prepare
+            prepared = prepare([command.model_dump(mode="json")],request.repository_path)
+            status = "error" if prepared["validation_errors"] else "ok"
+            detail = "; ".join(prepared["validation_errors"])
         if status == "warning":
             # A gate the operator did specify, whose syntax we could not check.
             unverified.append(f"gate#{index}")

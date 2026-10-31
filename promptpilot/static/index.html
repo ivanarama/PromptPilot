@@ -2107,7 +2107,9 @@ function wfWizardValidateStep(step) {
     }
   }
   if (step === 3) {
-    const commands = wfWizardGateCommands();
+    let commands;
+    try { commands = wfWizardGateCommands(); }
+    catch (error) { toast(error.message); return false; }
     if (commands.length > 20) { toast('Допускается не больше 20 gate-команд'); return false; }
   }
   return true;
@@ -2142,8 +2144,24 @@ function wfWizardRole(prefix) {
   };
 }
 
+function wfGateFormat(commands) {
+  return commands.map(command => typeof command === 'string' && !/[\r\n]/.test(command) && !/^[{"\[]/.test(command.trim())
+    ? command : JSON.stringify(command)).join('\n');
+}
+
+function wfGateParse(text) {
+  return text.split(/\r?\n/).map(value => value.trim()).filter(Boolean).map((line, index) => {
+    if (!/^[{"\[]/.test(line)) return line;
+    let parsed;
+    try { parsed = JSON.parse(line); }
+    catch (_) { throw new Error(`Gate #${index + 1}: некорректный JSON`); }
+    if (typeof parsed === 'string' || parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
+    throw new Error(`Gate #${index + 1}: требуется команда или объект argv/inputs/repeat`);
+  });
+}
+
 function wfWizardGateCommands() {
-  return document.getElementById('wfNewGateCommands').value.split(/\r?\n/).map(value => value.trim()).filter(Boolean);
+  return wfGateParse(document.getElementById('wfNewGateCommands').value);
 }
 
 function wfWizardBody() {
@@ -2166,7 +2184,10 @@ function wfWizardBody() {
 }
 
 function wfWizardRenderSummary() {
-  const body = wfWizardBody(); const roles = body.config.roles;
+  let body;
+  try { body = wfWizardBody(); }
+  catch (error) { workflowWizardReady = false; wfWizardUpdateFinalLabel(); toast(error.message); return; }
+  const roles = body.config.roles;
   const role = value => `${esc(value.provider || '—')} · ${esc(value.model || 'default')} · ${esc(value.effort || 'default')}`;
   document.getElementById('wfWizardSummary').innerHTML = `
     <div><b>Задача</b>${esc(body.slug)} · ${esc(body.candidate_branch)}<br>${esc(body.repository_path)}</div>
@@ -2189,8 +2210,8 @@ async function wfWizardRunPreflight() {
   workflowWizardReady = false; wfWizardUpdateFinalLabel();
   const target = document.getElementById('wfWizardPreflight');
   target.innerHTML = '<div class="wf-meta">Проверяем окружение…</div>';
-  const body = wfWizardBody();
   try {
+    const body = wfWizardBody();
     const result = await fetchJSON(`${API}/workflows/validate-setup`, {
       method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({
         repository_path:body.repository_path, candidate_branch:body.candidate_branch,
@@ -2210,7 +2231,9 @@ async function createWorkflow(event) {
   event.preventDefault();
   for (const step of [1,2,3]) if (!wfWizardValidateStep(step)) { wfWizardShowStep(step); return false; }
   if (!await wfWizardRunPreflight()) { toast('Исправьте ошибки preflight'); return false; }
-  const body = wfWizardBody();
+  let body;
+  try { body = wfWizardBody(); }
+  catch (error) { toast(error.message); return false; }
   if (body.config.roles.executor.skip_permissions && !confirm('Исполнитель получит skip permissions в отдельном worktree. Продолжить?')) return false;
   const button = document.getElementById('wfWizardCreate'); button.disabled = true;
   try {
@@ -2349,7 +2372,7 @@ function workflowSettingsHtml(wf) {
         <h4>Deterministic Gate</h4>
         <label class="check"><input id="wfCfgGateEnabled" type="checkbox"${wfChecked(gate.enabled !== false)}> gate включён</label>
         <label>Timeout одной команды, сек<input id="wfCfgGateTimeout" type="number" min="1" value="${gate.timeout_seconds || 1800}"></label>
-        <label>Команды — по одной на строке<textarea id="wfCfgGateCommands" placeholder="pytest -q&#10;git status --porcelain">${esc((gate.commands || []).join('\n'))}</textarea></label>
+        <label>Команды или JSON argv/inputs/repeat — по одной на строке<textarea id="wfCfgGateCommands" placeholder="pytest -q&#10;git status --porcelain">${esc(wfGateFormat(gate.commands || []))}</textarea></label>
         <div class="wf-meta">Команды выполняются кодом PromptPilot в каталоге репозитория. Ненулевой exit code возвращает работу исполнителю.</div>
       </div>
       <div class="wf-settings-card">
@@ -2532,7 +2555,7 @@ function workflowStageEditorCard(stage = {}, index = 0, frozen = false) {
       <input class="wide" data-field="dependencies" value="${escAttr((stage.dependencies || []).join(', '))}" placeholder="Зависимости: S1, S2">
       <textarea class="wide" data-field="allowed_paths" placeholder="Разрешённые пути — по одному на строку">${esc((stage.allowed_paths || []).join('\n'))}</textarea>
       <textarea class="wide" data-field="deliverables" placeholder="Deliverables — по одному на строку">${esc((stage.deliverables || []).join('\n'))}</textarea>
-      <textarea class="wide" data-field="acceptance_gates" placeholder="Gate-команды — по одной на строку">${esc((stage.acceptance_gates || []).join('\n'))}</textarea>
+      <textarea class="wide" data-field="acceptance_gates" placeholder="Команды или JSON argv/inputs/repeat — по одной на строке">${esc(wfGateFormat(stage.acceptance_gates || []))}</textarea>
       <input data-field="max_revision_rounds" type="number" min="1" value="${stage.max_revision_rounds || ''}" placeholder="Лимит возвратов">
       <input data-field="executor_prompt" value="${escAttr(stage.executor_prompt || '')}" placeholder="Особый prompt executor">
       <input data-field="reviewer_prompt" value="${escAttr(stage.reviewer_prompt || '')}" placeholder="Особый prompt reviewer">
@@ -2822,8 +2845,9 @@ async function wfSaveSettings() {
   const wasEnabled = !!old.automation?.enabled;
   const enabled = document.getElementById('wfCfgEnabled').checked;
   if (!wasEnabled && enabled && !confirm('Включить автономный ping-pong? После сохранения PromptPilot сразу выполнит допустимый следующий переход.')) return;
-  const commands = document.getElementById('wfCfgGateCommands').value
-    .split(/\r?\n/).map(x => x.trim()).filter(Boolean);
+  let commands;
+  try { commands = wfGateParse(document.getElementById('wfCfgGateCommands').value); }
+  catch (error) { toast(error.message); return; }
   const revisionText = document.getElementById('wfCfgStageRevisions').value.trim();
   const revisionOverride = Number(revisionText);
   if (revisionText && (!/^\d+$/.test(revisionText) || !Number.isSafeInteger(revisionOverride)
@@ -2936,7 +2960,7 @@ function wfCollectPlanStages() {
       dependencies: wfStageListValue(card, 'dependencies', true),
       allowed_paths: wfStageListValue(card, 'allowed_paths'),
       deliverables: wfStageListValue(card, 'deliverables'),
-      acceptance_gates: wfStageListValue(card, 'acceptance_gates'),
+      acceptance_gates: wfGateParse(value('acceptance_gates')),
       executor_prompt: value('executor_prompt'), reviewer_prompt: value('reviewer_prompt'),
       max_revision_rounds: revisionRaw ? parseInt(revisionRaw, 10) : null,
     };
@@ -2960,7 +2984,7 @@ function wfCollectAmendStages() {
       execution_mode: value('execution_mode') || 'automatic',
       dependencies: comma('dependencies'),
       allowed_paths: lines('allowed_paths'), deliverables: lines('deliverables'),
-      acceptance_gates: lines('acceptance_gates'),
+      acceptance_gates: wfGateParse(value('acceptance_gates')),
       executor_prompt: value('executor_prompt'), reviewer_prompt: value('reviewer_prompt'),
       max_revision_rounds: Number.isFinite(rev) && rev >= 1 ? rev : null,
     };
@@ -2971,7 +2995,9 @@ async function wfAmendPlan() {
   const workflowId = window.__wfAmendWorkflowId;
   const expectedVersion = window.__wfAmendVersion;
   if (!workflowId || workflowId !== selectedWorkflowId || expectedVersion === null) return;
-  const stages = wfCollectAmendStages();
+  let stages;
+  try { stages = wfCollectAmendStages(); }
+  catch (error) { toast(error.message); return; }
   if (!stages.length) { toast('Пустой план'); return; }
   const frozen = window.__wfAmendFrozen || 0;
   const tailCodes = stages.slice(frozen).map(s => s.code).join(', ');
@@ -2988,7 +3014,9 @@ async function wfAmendPlan() {
 }
 
 async function wfSavePlan(reload = true) {
-  const stages = wfCollectPlanStages();
+  let stages;
+  try { stages = wfCollectPlanStages(); }
+  catch (error) { toast(error.message); return false; }
   if (!stages.length || stages.some(stage => !stage.code || !stage.title || !stage.objective)) {
     toast('У каждого этапа обязательны код, название и проверяемая цель.');
     return false;
