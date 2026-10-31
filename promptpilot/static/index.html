@@ -2286,12 +2286,13 @@ async function selectWorkflow(id) {
   document.querySelectorAll('.wf-row').forEach(row => row.classList.remove('active'));
   const wf = workflowCache.find(item => item.id === id) || await fetchJSON(`${API}/workflows/${id}`);
   selectedWorkflowData = wf;
-  const [rounds, events, findings, plan, stages] = await Promise.all([
+  const [rounds, events, findings, plan, stages, elicitation] = await Promise.all([
     fetchJSON(`${API}/workflows/${id}/rounds`),
     fetchJSON(`${API}/workflows/${id}/events?limit=200&tail=true`),
     fetchJSON(`${API}/workflows/${id}/findings`),
     fetchJSON(`${API}/workflows/${id}/plan`),
     fetchJSON(`${API}/workflows/${id}/stages`),
+    fetchJSON(`${API}/workflows/${id}/elicitation`),
   ]);
   const current = rounds.find(r => r.round_no === wf.current_round);
   const runs = current ? await fetchJSON(`${API}/workflows/${id}/rounds/${current.id}/runs`) : [];
@@ -2311,7 +2312,7 @@ async function selectWorkflow(id) {
     } catch (_) {}
   }
   const openDetailKeys = captureWorkflowOpenDetails();
-  renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, plannerTask, orphanPane);
+  renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, plannerTask, orphanPane, elicitation);
   restoreWorkflowOpenDetails(openDetailKeys);
   const idx = workflowCache.findIndex(item => item.id === id);
   if (idx >= 0) workflowCache[idx] = wf;
@@ -2644,7 +2645,39 @@ function workflowExternalFormHtml(wf, runs) {
   </div>`;
 }
 
-function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, plannerTask, orphanPane = null) {
+function workflowElicitationForm(wf, pending) {
+  const q = pending.question;
+  return `<div class="wf-stage"><b>Вопрос</b><div>${esc(q.question)}</div>
+    ${q.action ? `<pre>${esc(q.action)}</pre>` : ''}
+    ${(q.options || []).length ? `<div>${q.options.map(value => esc(value)).join(' / ')}</div>` : ''}
+    <div class="wf-form" id="wfElicitationForm" data-workflow="${escAttr(wf.id)}"
+      data-version="${pending.expected_version}" data-request="${escAttr(pending.request_id)}" data-binding="${escAttr(pending.binding_sha256)}">
+      <textarea class="wide" id="wfElicitationAnswer" placeholder="Ответ"></textarea>
+      <button class="btn btn-sm btn-primary" onclick="wfAnswerElicitation()">Сохранить ответ</button>
+    </div><div class="wf-meta">Ответ сохраняется как указание. Права не меняются; продолжение запускается отдельно.</div></div>`;
+}
+
+async function wfAnswerElicitation() {
+  const form = document.getElementById('wfElicitationForm');
+  if (!form || form.dataset.workflow !== selectedWorkflowId) return;
+  const answer = document.getElementById('wfElicitationAnswer').value.trim();
+  if (!answer) { toast('Введите ответ'); return; }
+  const workflowId = form.dataset.workflow;
+  const button = form.querySelector('button'); button.disabled = true;
+  try {
+    await fetchJSON(`${API}/workflows/${workflowId}/elicitation/answer`, {
+      method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({
+        expected_version:Number(form.dataset.version), request_id:form.dataset.request,
+        binding_sha256:form.dataset.binding, answer,
+      }),
+    });
+    toast('Ответ сохранён', false);
+    if (selectedWorkflowId === workflowId) await loadWorkflows();
+  } catch (error) { toast(error.message); }
+  finally { button.disabled = false; }
+}
+
+function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, plannerTask, orphanPane = null, elicitation = null) {
   const terminal = ['completed','failed','cancelled'].includes(wf.status);
   const plannerRun = wf.status === 'planning' && plannerTask ? {role:'planner', task_id:plannerTask.id, status:plannerTask.status} : null;
   const activeRun = plannerRun || [...runs].reverse().find(r => ['pending','running'].includes(r.status));
@@ -2671,7 +2704,9 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, 
     <button class="btn btn-sm btn-primary" onclick="wfPlannerDispatch(false)">Сформировать план этапов</button>
   </div>`;
   let action = '';
-  if (wf.status === 'draft') {
+  if (wf.status === 'awaiting_human' && elicitation && !orphanPane) {
+    action = workflowElicitationForm(wf, elicitation);
+  } else if (wf.status === 'draft') {
     action = wf.config?.planning?.enabled
       ? `${plannerForm}<button class="btn btn-sm btn-ghost" onclick="wfStart()">Запустить без плана как один этап</button>`
       : `<button class="btn btn-sm btn-primary" onclick="wfStart()">Начать первый раунд</button>`;
