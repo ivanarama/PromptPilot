@@ -207,7 +207,8 @@ def _git(config: dict, *args: str, allow=(0,)) -> tuple[int, str]:
     try:
         result = subprocess.run(
             [binary, "-c", "maintenance.auto=false", *args], capture_output=True,
-            text=True, encoding="utf-8", errors="replace", timeout=timeout)
+            text=True, encoding="utf-8", errors="replace", timeout=timeout,
+            **({"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}))
     except subprocess.TimeoutExpired as exc:
         raise PipelineError(f"git {args[0]} timed out after {timeout}s") from exc
     except OSError as exc:
