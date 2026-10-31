@@ -15,7 +15,18 @@ from pathlib import Path
 PROTOCOL = "promptpilot-fix-target-v1"
 OWNER_PROTOCOL = "promptpilot-fix-owner-v1"
 TTL = 7200
+MAX_TTL = 14400
 CONSUMER_MARKER = "<!-- pp:fix-target-consumer-v1 -->"
+
+
+def lease_seconds(config: dict) -> int:
+    """Bound an explicit operator timebox; keep old configurations unchanged."""
+    from . import project_pipeline as pp
+
+    value = config.get("fix_lease_seconds", TTL)
+    if type(value) is not int or not 300 <= value <= MAX_TTL:
+        raise pp.PipelineError("fix_lease_seconds must be an integer from 300 to 14400")
+    return value
 
 
 def consumer_digest(config: dict, checkout: str) -> str:
@@ -98,6 +109,7 @@ def create(config: dict, health: dict, candidate: dict,
 
     if config.get("parallel_fix_enabled") is not True:
         raise pp.PipelineError("parallel FIX handoff is disabled")
+    lifetime = lease_seconds(config)
     target = identity(candidate)
     checkout = str(Path.cwd().resolve())
     consumer = consumer_digest(config, checkout)
@@ -118,7 +130,7 @@ def create(config: dict, health: dict, candidate: dict,
         "version": 1, "purpose": PROTOCOL, "stage": "fix",
         "repository": config["repository"], "target": target,
         "config_sha256": pp.digest(config), "issued_at": issued,
-        "expires_at": issued + TTL, "pipeline_replicas": replicas,
+        "expires_at": issued + lifetime, "pipeline_replicas": replicas,
         "target_reservation": reservation,
         "health_checkout": checkout, "consumer_sha256": consumer,
         "admission_exclusions": excluded,
@@ -161,7 +173,7 @@ def validate_lease(lease: dict, *, purpose: str = PROTOCOL) -> None:
     now = int(time.time())
     if (type(issued) is not int or type(expires) is not int
             or issued > now + 60 or expires <= now
-            or not 0 < expires - issued <= TTL):
+            or not 0 < expires - issued <= MAX_TTL):
         raise pp.PipelineError("FIX handoff lease expired or has invalid lifetime")
     replicas = lease.get("pipeline_replicas")
     if type(replicas) is not int or not 2 <= replicas <= 16:
@@ -214,6 +226,8 @@ def gate(gh, config: dict, lease_value: str, *, config_path=None,
             or config.get("repository") != lease["repository"]
             or pp.digest(config) != lease["config_sha256"]):
         raise pp.PipelineError("FIX handoff configuration changed")
+    if lease["expires_at"] - lease["issued_at"] != lease_seconds(config):
+        raise pp.PipelineError("FIX handoff lifetime contradicts configuration")
     if consumer_digest(config, lease["health_checkout"]) != lease["consumer_sha256"]:
         raise pp.PipelineError("paired FIX consumer changed")
     health = pp.run_health(config, config_path=config_path,
