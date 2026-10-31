@@ -56,6 +56,20 @@ Procedures taken from an unmerged PR are an explicitly installed operator hotfix
 references are resolved inside the paired snapshot. Its CLAUDE.md is paired too,
 so a new skill cannot silently conflict with an old project-policy clause.
 
+## FIX validation lifetime
+
+For the signed `promptpilot-fix-target-v1` pilot, `pipelinectl` optionally accepts
+`fix_lease_seconds` (300–14400, default 7200). Match this bounded lifetime to the
+future provider task timebox and measured validation/resource waits before
+enabling two FIX lanes. Serial heavy checks can exceed the original two-hour
+lifetime even when both executors retain their reservations. A four-hour pilot
+must configure its future task timebox separately; test deadlines stay unchanged.
+The configuration is signed and checked again at every mutation gate. Changing it
+does not extend an existing token. Expiry, cancelled/changed attempts, lost
+reservations and all source/identity/proof/CI8 gates still stop publication.
+Deploy one coherent binary and finish independent pair review/CI/Mac acceptance
+before enabling the production pilot.
+
 ## Intake pressure
 
 Initial intake threshold: **10 active PRs**, including review backlog, reviewed

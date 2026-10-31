@@ -333,6 +333,8 @@ def load_config(path: str) -> dict:
             not 300 <= data["target_reservation_ttl_seconds"] <= 28800):
         raise PipelineError(
             "target_reservation_ttl_seconds must be an integer from 300 to 28800")
+    from .fix_handoff import lease_seconds as fix_lease_seconds
+    fix_lease_seconds(data)
     return data
 
 
@@ -1518,6 +1520,7 @@ def next_fix(gh: GitHub, config: dict, *, config_path: str | None = None) -> dic
         raise PipelineError("parallel FIX route requires at least two replicas")
     from . import fix_handoff
 
+    fix_handoff.lease_seconds(config)
     health = run_health(config, config_path=config_path)
     fix_handoff.consumer_digest(config, str(Path.cwd().resolve()))
     ordered = fix_handoff.ordered_health_candidates(
