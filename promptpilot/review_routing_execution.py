@@ -25,6 +25,7 @@ from .review_routing_wire import _fields,_integer,_pr,_source,canonical,hash64,s
 
 
 TABLE='technical_fix_starts_v1'
+ESTABLISHED=TABLE+':established'
 SCHEMA='''CREATE TABLE IF NOT EXISTS technical_fix_starts_v1 (
     attempt_key TEXT PRIMARY KEY,
     source_key TEXT NOT NULL UNIQUE,
@@ -92,6 +93,12 @@ class OneUseStart:
 
     @staticmethod
     def _schema(connection,*,create=False):
+        for table in ['tasks','settings','pipeline_target_reservations']:
+            if not connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",(table,)).fetchone():
+                raise PipelineError('technical start requires the actual scheduler schema')
+        marker=connection.execute('SELECT value FROM settings WHERE key=?',(ESTABLISHED,)).fetchone()
+        if marker is not None and marker['value']!='1':
+            raise PipelineError('technical start established marker is invalid; preserve barriers')
         stored=connection.execute('SELECT type,name,sql FROM sqlite_master WHERE name=? COLLATE NOCASE',(TABLE,)).fetchone()
         if stored is not None:
             if (stored['type']!='table' or stored['name']!=TABLE
@@ -99,13 +106,13 @@ class OneUseStart:
                 raise PipelineError('unknown technical start schema; preserve existing barriers')
             if connection.execute("SELECT 1 FROM sqlite_master WHERE tbl_name=? COLLATE NOCASE AND type IN ('trigger','index') AND sql IS NOT NULL LIMIT 1",(TABLE,)).fetchone():
                 raise PipelineError('unknown technical start schema objects')
-        elif not create:
+            if marker is None:
+                raise PipelineError('technical start established marker disappeared; preserve existing barriers')
+        elif not create or marker is not None:
             raise PipelineError('technical start receipt table disappeared; preserve unknown outcome')
         else:
-            for table in ['tasks','settings','pipeline_target_reservations']:
-                if not connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",(table,)).fetchone():
-                    raise PipelineError('technical start requires the actual scheduler schema')
             connection.execute(SCHEMA)
+            connection.execute('INSERT INTO settings(key,value) VALUES (?,?)',(ESTABLISHED,'1'))
 
     def _connect(self):
         connection=sqlite3.connect(str(self.database),timeout=10)

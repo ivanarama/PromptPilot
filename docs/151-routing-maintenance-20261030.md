@@ -144,3 +144,20 @@ five GitHub CI jobs. Neither was claimed or performed by these author attempts.
 
 Flags must stay OFF pending that work and separate exact-commit review/all CI.
 The parent issue must not be closed on the basis of this partial slice.
+
+## Manual execution continuation, not acceptance
+
+The still-private OneUseStart component now records an established-store marker
+in the scheduler settings transaction when it creates its receipt table. A later
+table loss cannot be mistaken for first initialization by a fresh component
+instance. Missing/corrupt markers, unmarked existing tables and unknown schemas
+fail closed; no existing receipt is erased or silently migrated. Complete loss
+of trusted history still cannot establish a safe launch. The eventual public
+coordinator must independently retain its canonical started/source barriers.
+
+A finite real scheduler regression reproduced a second factory call after table
+loss on the old code. The repaired marker, concurrent consumption, ordinary
+single-launch and unknown-schema boundaries passed eight focused Windows cases.
+An earlier broad component invocation exceeded its180-second bound and is not a
+full-suite PASS. This change does not connect the provider factory, enable a
+public start/progress issuer, deploy source or accept the five remaining gaps.

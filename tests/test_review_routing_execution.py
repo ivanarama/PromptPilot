@@ -18,7 +18,7 @@ import pytest
 from promptpilot.models import TaskCreate
 from promptpilot.pipeline_errors import PipelineError
 from promptpilot.pr_identity import PRIdentityV1
-from promptpilot.review_routing_execution import OneUseStart,TABLE,SCHEMA
+from promptpilot.review_routing_execution import OneUseStart,TABLE,SCHEMA,ESTABLISHED
 from promptpilot.review_routing_wire import context
 from test_review_routing_wire import publication
 
@@ -149,6 +149,31 @@ def test_actual_child_then_lost_factory_return_cannot_launch_again(start_scope):
         assert len(children)==1 and store.status(scope)['state']=='unknown'
     finally:
         for child in children:child.wait(timeout=15)
+
+
+def test_reopening_after_receipt_table_loss_cannot_launch_again(start_scope):
+    db,scope=start_scope;store=OneUseStart(db.DB_PATH);calls=[]
+    store.invoke(scope,final_guard=lambda _scope:True,factory=lambda:calls.append('one'))
+    update(db.DB_PATH,'DROP TABLE '+TABLE)
+    with pytest.raises(PipelineError,match='disappeared'):
+        reopened=OneUseStart(db.DB_PATH)
+        reopened.invoke(scope,final_guard=lambda _scope:True,factory=lambda:calls.append('second'))
+    assert calls==['one']
+
+
+@pytest.mark.parametrize('erase', [True,False])
+def test_missing_or_corrupt_established_marker_preserves_start_barrier(start_scope,erase):
+    db,scope=start_scope;store=OneUseStart(db.DB_PATH);calls=[]
+    store.invoke(scope,final_guard=lambda _scope:True,factory=lambda:calls.append('one'))
+    if erase:
+        update(db.DB_PATH,'DELETE FROM settings WHERE key=?',(ESTABLISHED,))
+    else:
+        update(db.DB_PATH,"UPDATE settings SET value='changed' WHERE key=?",(ESTABLISHED,))
+    with pytest.raises(PipelineError,match='marker'):
+        OneUseStart(db.DB_PATH)
+    with pytest.raises(PipelineError,match='marker'):
+        store.invoke(scope,final_guard=lambda _scope:True,factory=lambda:calls.append('second'))
+    assert calls==['one']
 
 
 def test_new_attempt_or_new_running_task_never_reuses_consumed_source(start_scope):
