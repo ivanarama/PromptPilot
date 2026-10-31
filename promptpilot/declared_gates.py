@@ -39,12 +39,26 @@ def _identity(value):
     return [value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns]
 
 
-def _file(root, name, budget):
+def _input_path(root, name):
+    # Python 3.10 has no Path.is_junction(). lstat's reparse attribute also
+    # covers NTFS junctions, which are not reported by is_symlink(). Check
+    # every component again during context validation, including after hashing.
+    if root.resolve(strict=True) != root:
+        raise ValueError("declared input repository path changed")
     path = root
-    for part in name.split("/"):
-        path = path/part
-        if path.is_symlink():
-            raise ValueError("declared input cannot traverse a symlink: "+name)
+    for part in [None, *name.split("/")]:
+        if part is not None:
+            path = path/part
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+            raise ValueError("declared input cannot traverse a link or reparse point: "+name)
+    if not path.resolve(strict=True).is_relative_to(root):
+        raise ValueError("declared input is outside the repository: "+name)
+    return path
+
+
+def _file(root, name, budget):
+    path = _input_path(root, name)
     before = path.stat()
     if not stat.S_ISREG(before.st_mode):
         raise ValueError("declared input is not a regular file: "+name)
@@ -63,7 +77,8 @@ def _file(root, name, budget):
             size += len(part)
             if size>budget: raise ValueError("declared input byte budget exceeded: "+name)
             digest.update(part)
-        if _identity(os.fstat(descriptor)) != _identity(before) or path.is_symlink() or _identity(path.stat()) != _identity(before):
+        current = _input_path(root, name)
+        if _identity(os.fstat(descriptor)) != _identity(before) or _identity(current.stat()) != _identity(before):
             raise ValueError("declared input changed while hashing: "+name)
         return dict(sha256=digest.hexdigest(),identity=_identity(before)),size
     finally:

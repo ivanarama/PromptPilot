@@ -1,5 +1,6 @@
 """Declared checks through public workflow API and real gate processes."""
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -78,6 +79,55 @@ def test_modified_declared_input_does_not_apply_stale_pass(isolated_db, tmp_path
     assert response.json()['status'] != 'reviewing'
     assert journal(isolated_db, item.id)[0]['state'] == 'UNKNOWN'
     assert not any(x.event_type == 'gate.passed' for x in isolated_db.list_workflow_events(item.id, limit=100))
+
+
+@pytest.mark.skipif(os.name != 'nt', reason='Windows directory junction boundary')
+@pytest.mark.parametrize('replace_after_exit', [False, True])
+def test_junction_input_cannot_escape_or_apply_pass(isolated_db, tmp_path, monkeypatch, replace_after_exit):
+    repo, outside = tmp_path/'repo', tmp_path/'outside'
+    repo.mkdir(); outside.mkdir()
+    (outside/'check.py').write_text("from pathlib import Path; Path('outside-effect').write_text('ran')", encoding='utf-8')
+    link = repo/'linked'
+
+    def junction():
+        result = subprocess.run(['cmd.exe', '/d', '/c', 'mklink', '/J', str(link), str(outside)],
+                                capture_output=True, text=True, errors='replace', timeout=20,
+                                creationflags=subprocess.CREATE_NO_WINDOW)
+        assert result.returncode == 0, result.stdout+result.stderr
+
+    if replace_after_exit:
+        link.mkdir()
+        (link/'check.py').write_text("print('repository input')", encoding='utf-8')
+    else:
+        junction()
+    try:
+        command = dict(argv=[sys.executable, 'linked/check.py'], inputs=['linked/check.py'], repeat='per-attempt')
+        item = gating(isolated_db, repo, commands=[command])
+        original = workflows.run_owned
+
+        def execute(*args, **kwargs):
+            if not replace_after_exit:
+                pytest.fail('junction input entered the process factory')
+            result = original(*args, **kwargs)
+            # Move only the known private fixture directory before substituting
+            # a junction. The target directory is preserved by final cleanup.
+            assert link.resolve().is_relative_to(tmp_path.resolve())
+            link.rename(repo/'original-input')
+            junction()
+            return result
+
+        monkeypatch.setattr(workflows, 'run_owned', execute)
+        response = post(item)
+        assert response.status_code == 200, response.text
+        assert response.json()['status'] != 'reviewing'
+        assert not (repo/'outside-effect').exists()
+        assert not any(x.event_type == 'gate.passed' for x in isolated_db.list_workflow_events(item.id, limit=100))
+        if replace_after_exit:
+            assert journal(isolated_db, item.id)[0]['state'] == 'UNKNOWN'
+    finally:
+        # rmdir unlinks this junction itself; never recurse into its target.
+        if link.exists() and link.lstat().st_file_attributes & 0x400:
+            link.rmdir()
 
 
 def test_disabled_declared_gate_does_not_read_missing_inputs(isolated_db, tmp_path, monkeypatch):
