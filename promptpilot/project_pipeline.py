@@ -2506,6 +2506,10 @@ def next_merge(gh: GitHub, config: dict, *, config_path: str | None = None) -> d
     if checks_in_progress(config, checks):
         return {"action": "wait", "number": item["number"],
                 "reason": "required CI checks are still running"}
+    if (status.get("mergeStateStatus") == "BEHIND" and status.get("mergeable") == "MERGEABLE"
+            and config.get("base_sync_merge") is True and config.get("base_sync_carry") is True):
+        from .ordinary_base_sync import offer
+        return offer(gh, config, health, target, snapshot, established, config_path=config_path)
     if status.get("mergeStateStatus") != "CLEAN" or status.get("mergeable") != "MERGEABLE":
         return fallback_target(config, health, "merge", target,
                                f"merge state {status.get('mergeStateStatus')}/{status.get('mergeable')} requires the full skill")
@@ -2521,13 +2525,29 @@ def next_merge(gh: GitHub, config: dict, *, config_path: str | None = None) -> d
 
 def complete_merge(gh: GitHub, config: dict, lease_value: str,
                    *, config_path: str | None = None) -> dict:
+    if "." in lease_value:
+        from .ordinary_base_sync import complete
+        return complete(gh, config, lease_value, config_path=config_path)
     lease = decode_lease(lease_value)
+    if "protocol" in lease or "purpose" in lease or lease.get("mode") == "ordinary-update":
+        raise PipelineError("ordinary base-sync requires a signed purpose-bound ticket")
     if lease.get("stage") != "merge" or lease.get("repository") != config["repository"]:
         raise PipelineError("lease belongs to another stage or repository")
+    common_fields = {"version", "stage", "repository", "number", "head"}
     if lease.get("mode") == "update-branch":
+        if (set(lease) != common_fields | {"mode", "base_sync_owner"}
+                or lease["base_sync_owner"] is not True):
+            raise PipelineError("unsupported legacy base-sync owner envelope")
         return _complete_base_sync_update(gh, config, lease)
     if lease.get("mode") == "carry":
+        required = common_fields | {"mode", "snapshot", "carry"}
+        if not required <= set(lease) <= required | {"intent"}:
+            raise PipelineError("unsupported legacy carry envelope")
         return _complete_carry_merge(gh, config, lease, config_path=config_path)
+    required = common_fields | {"snapshot", "proof"}
+    allowed = required | {"intent", "base_sync_owner", "ready_owner", "owner_stage"}
+    if not required <= set(lease) <= allowed:
+        raise PipelineError("unsupported legacy ordinary merge envelope")
     identity_contract = (config["repository"], config["trusted_account"])
     ensure_identity(gh, config)
     health = run_health(config, config_path=config_path)
