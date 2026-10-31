@@ -381,6 +381,7 @@ def test_old_unversioned_event_does_not_break_legacy_wait(isolated_db, tmp_path)
             WorkflowEventCreate(
                 workflow_id=wf["id"],
                 event_type="elicit.requested",
+                idempotency_key="legacy-elicit-prototype",
                 payload={
                     "version": wf["state_version"],
                     "question": "Historical prototype",
