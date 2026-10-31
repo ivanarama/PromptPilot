@@ -170,3 +170,9 @@ or truncated graphs, copied/duplicate/nonterminal trailers including CRLF, and
 late identity drift. It observes an author's push; it does not attest CAS or
 issue completion/launch permissions. Public progress/coordinator wiring and the
 pipeline's actual expected-HEAD CAS writer are still required.
+
+The private progress-request schema binds a separate progress_version and exact
+new_head inside the existing version1 signed lease envelope. Old admission and
+reserved progress decoders reject this closed field set. Twelve focused scope
+cases verify valid HMAC round-trip, wrong-purpose/source/version refusal and
+configuration drift. This serializer is not a public issuer or mutation permit.
