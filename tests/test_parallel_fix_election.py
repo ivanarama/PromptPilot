@@ -260,8 +260,10 @@ def test_public_fix_requires_paired_consumer_before_reservation(
 
 
 @pytest.mark.parametrize("change", ["consumer", "red", "lost", "attempt", "replicas", "single"])
+@pytest.mark.parametrize("lifetime", [7200, 14400])
 def test_public_progress_gate_fails_closed_after_live_change(
-        isolated_db, monkeypatch, tmp_path, capsys, change):
+        isolated_db, monkeypatch, tmp_path, capsys, change, lifetime):
+    monkeypatch.setitem(CONFIG, 'fix_lease_seconds', lifetime)
     _setup_handoff(isolated_db, monkeypatch, tmp_path, [
         {"stage": "review", "number": 10, "head": HEAD_A}])
     _, preflight = _cli(monkeypatch, capsys, tmp_path, "next", "fix")
@@ -358,3 +360,62 @@ def test_public_gate_rechecks_expiry_after_slow_operations(
     assert code == 2 and value["action"] == "error"
     assert "expired" in value["error"]
     assert "ownership_lease" not in value
+
+
+@pytest.mark.parametrize('configured', [None, 14400])
+def test_public_long_validation_ownership_obeys_configured_deadline(
+        isolated_db, monkeypatch, tmp_path, capsys, configured):
+    if configured is not None:
+        monkeypatch.setitem(CONFIG, 'fix_lease_seconds', configured)
+    _setup_handoff(isolated_db, monkeypatch, tmp_path, [
+        {'stage': 'fix-issue', 'number': 7, 'eligibility_digest': DIGEST}])
+    code, flight = _cli(monkeypatch, capsys, tmp_path, 'next', 'fix')
+    assert code == 0
+    code, admitted = _cli(monkeypatch, capsys, tmp_path, 'gate-fallback', 'fix',
+                          '--lease', flight['handoff']['lease'])
+    assert code == 0
+    token = admitted['ownership_lease']
+    lease = pipelinectl.decode_signed_lease(token)
+    assert lease['expires_at'] - lease['issued_at'] == (configured or 7200)
+    # Model a long resource wait while the exact task/reservation stays live.
+    clock = [lease['issued_at'] + 10800]
+    monkeypatch.setattr(fix_handoff.time, 'time', lambda: clock[0])
+    code, result = _cli(monkeypatch, capsys, tmp_path, 'gate-fix-owner', '--lease', token)
+    if configured is None:
+        assert code == 2 and 'expired' in result['error']
+    else:
+        assert code == 0 and result['phase'] == 'ownership'
+        assert result['mutation_authorized'] is False
+        assert 'ownership_lease' not in result  # No renewal during the attempt.
+    clock[0] = lease['expires_at'] + 1
+    code, result = _cli(monkeypatch, capsys, tmp_path, 'gate-fix-owner', '--lease', token)
+    assert code == 2 and 'expired' in result['error']
+
+
+@pytest.mark.parametrize('value', [True, 0, 299, 14401, '14400', None])
+def test_invalid_fix_lifetime_stops_before_reservation(
+        isolated_db, monkeypatch, tmp_path, capsys, value):
+    monkeypatch.setitem(CONFIG, 'fix_lease_seconds', value)
+    _setup_handoff(isolated_db, monkeypatch, tmp_path, [
+        {'stage': 'fix-issue', 'number': 7, 'eligibility_digest': DIGEST}])
+    code, result = _cli(monkeypatch, capsys, tmp_path, 'next', 'fix')
+    assert code == 2 and 'fix_lease_seconds' in result['error']
+    assert isolated_db.list_pipeline_target_reservations(repository='owner/repo') == []
+
+
+@pytest.mark.parametrize('ownership', [False, True])
+def test_signed_lifetime_cannot_exceed_the_unchanged_configuration(
+        isolated_db, monkeypatch, tmp_path, capsys, ownership):
+    _setup_handoff(isolated_db, monkeypatch, tmp_path, [
+        {'stage': 'fix-issue', 'number': 7, 'eligibility_digest': DIGEST}])
+    _, flight = _cli(monkeypatch, capsys, tmp_path, 'next', 'fix')
+    _, admitted = _cli(monkeypatch, capsys, tmp_path, 'gate-fallback', 'fix',
+                        '--lease', flight['handoff']['lease'])
+    token = admitted['ownership_lease'] if ownership else flight['handoff']['lease']
+    lease = pipelinectl.decode_signed_lease(token)
+    lease['expires_at'] += 3600
+    forged = pipelinectl.encode_signed_lease(lease)
+    command = ['gate-fix-owner'] if ownership else ['gate-fallback', 'fix']
+    code, result = _cli(monkeypatch, capsys, tmp_path, *command, '--lease', forged)
+    assert code == 2 and 'lifetime contradicts configuration' in result['error']
+    assert 'ownership_lease' not in result
