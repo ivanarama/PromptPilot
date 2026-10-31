@@ -3722,6 +3722,19 @@ function runsLabel(count) {
   return `${n} ${word}`;
 }
 
+function pipelineDeliveryFlow(data) {
+  const flow = data.delivery_flow;
+  if (!flow) return '';
+  const duration = seconds => seconds == null ? '—' : seconds < 3600 ? `${Math.round(seconds/60)} мин` : `${(seconds/3600).toFixed(1)} ч`;
+  return `<div class="pipeline-report-section" id="pipelineDeliveryFlow">
+    <h3>Что удерживает поставку</h3>
+    <div class="prov-cmd">${esc(flow.reason)}</div>
+    ${(flow.active || []).map(task => `<div class="prov-cmd">${esc(task.title)} · #${esc(String(task.task_id))} · выполняется ${esc(duration(task.elapsed_seconds))}</div>`).join('')}
+    ${(flow.review_rounds || []).length ? `<div class="prov-cmd">Круги ревью: ${flow.review_rounds.map(item => `#${esc(String(item.number))} — ${esc(String(item.rounds))}`).join('; ')}</div>` : ''}
+    <div class="pipeline-report-meta">Текущие запуски показаны по локальной базе. Причина ожидания и круги ревью относятся к сохранённому снимку очереди.</div>
+  </div>`;
+}
+
 async function loadPipelineInsights(profile, refresh=false) {
   const box = document.getElementById('pipelineInsights');
   box.innerHTML = refresh
@@ -3740,6 +3753,7 @@ async function loadPipelineInsights(profile, refresh=false) {
     const historyNote = h5.complete ? 'за последние 5 часов' : `история ${h5.coverage_hours} из 5 ч`;
     const runs = h5.runs;
     const outcomes = data.outcomes || {safe_deferrals_now:0, stale_reselections_5h:0, safe_refusals_5h:0, real_errors_5h:0};
+    const deliveryFlowHtml = pipelineDeliveryFlow(data);
     const activeUnable = runs.unresolved_unable ?? runs.unable;
     const activeFailed = runs.unresolved_failed ?? runs.failed;
     const recoveredRuns = (runs.recovered_unable || 0) + (runs.recovered_failed || 0);
@@ -3904,6 +3918,7 @@ async function loadPipelineInsights(profile, refresh=false) {
       <div><b>${esc(data.title)}</b><span class="pipeline-health ${escAttr(data.health.state)}">${esc(healthLabel)}</span></div>
       <div class="prov-cmd">${esc(data.repository)} · ${esc(pipelineHealthReason(data))} · история хранится локально</div>
       ${cacheNotice}
+      ${deliveryFlowHtml}
       <div class="pipeline-summary">
         <div class="pipeline-metric"><div class="pipeline-metric-label">Снимок GitHub</div><div class="pipeline-metric-value" style="${cacheColor ? `color:${cacheColor}` : ''}">${esc(cacheValue)}</div><div class="pipeline-metric-note">${esc(cacheNote)}</div></div>
         <div class="pipeline-metric"><div class="pipeline-metric-label">Backlog сейчас</div><div class="pipeline-metric-value">${data.backlog_total == null ? '—' : data.backlog_total}</div><div class="pipeline-metric-note">Δ/ч: ${h5.complete?perHour(h5.backlog_delta_per_hour):'копится история'}</div></div>
