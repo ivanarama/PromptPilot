@@ -69,8 +69,11 @@ def cli_peer(tmp_path):
         executable=tmp_path/'gh.exe'
         built=subprocess.run([str(compiler),'/nologo','/target:exe','/out:'+str(executable),
             str(Path(__file__).with_name('fake_gh_launcher.cs'))],capture_output=True,text=True,
-            timeout=30,creationflags=subprocess.CREATE_NO_WINDOW)
+            # Hosted Windows cold compiler startup can exceed 30 seconds.
+            # Keep setup bounded and require an actual successful executable.
+            timeout=120,creationflags=subprocess.CREATE_NO_WINDOW)
         assert built.returncode==0,built.stdout+built.stderr
+        assert executable.is_file()
     else:
         executable=tmp_path/'gh';executable.write_text('#!'+sys.executable+'\n'+PEER,encoding='utf-8');executable.chmod(0o700)
     checker=tmp_path/'checker.py'
