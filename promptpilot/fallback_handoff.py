@@ -354,6 +354,9 @@ def gate(gh, config: dict, stage: str, lease_value: str, *, config_path=None) ->
             "target_reservation": lease["target_reservation"],
             "pipeline_replicas": lease.get("pipeline_replicas", 1),
         }, config)
+    from .review_routing_policy import require_legacy
+    require_legacy(gh,config,int(lease['target']['number']))
+    validate_lease(lease,stage)
     return {"action": "validated", "stage": stage, "repository": lease["repository"],
             "target": lease["target"], "mutation_authorized": False,
             "reason": "fresh scheduling gate passed; full repository mutation gates still required"}

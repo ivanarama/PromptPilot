@@ -1696,7 +1696,8 @@ def _execute_task_body(task, admission_complete=None, workorder_check=None):
         if prompt_constraint and prompt_constraint not in agent_prompt:
             agent_prompt += "\n\n" + prompt_constraint
         raw_replicas = route.get("pipeline_replicas")
-        if type(raw_replicas) is int and 2 <= raw_replicas <= 16:
+        minimum_replicas = 1 if route.get("review_routing_protocol") == "review-routing-v1" else 2
+        if type(raw_replicas) is int and minimum_replicas <= raw_replicas <= 16:
             pipeline_replicas = str(raw_replicas)
         raw_data_dir = route.get("pipeline_data_dir")
         if (pipeline_replicas is not None and isinstance(raw_data_dir, str)

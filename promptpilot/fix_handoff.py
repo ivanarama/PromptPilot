@@ -244,6 +244,9 @@ def gate(gh, config: dict, lease_value: str, *, config_path=None,
         "target_reservation": reservation,
         "pipeline_replicas": lease["pipeline_replicas"],
     }, config)
+    if lease['target']['stage']=='fix-pr':
+        from .review_routing_policy import require_legacy
+        require_legacy(gh,config,int(lease['target']['number']))
     result = {
         "action": "validated", "stage": "fix",
         "repository": lease["repository"], "target": lease["target"],
