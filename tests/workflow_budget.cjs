@@ -2,6 +2,7 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const assert = require('node:assert/strict');
 const html = fs.readFileSync('promptpilot/static/index.html','utf8');
+const gates = html.slice(html.indexOf('function wfGateFormat('), html.indexOf('function wfWizardBody('));
 const render = html.slice(html.indexOf('function workflowSettingsHtml('),html.indexOf('function workflowStatusInfo('));
 const start = html.indexOf('async function wfSaveSettings(');
 const save = html.slice(start,html.indexOf('function wfReindexStageCards(',start));
@@ -11,7 +12,7 @@ async function submit(wf, override) {
     wfChecked:v=>v?' checked':'',workflowProviderOptions:()=>'',wfRoleSettings:(prefix,old)=>old||{},
     document:{getElementById:id=>nodes[id]||{value:'',checked:false}},confirm:()=>true,toast:()=>{},
     fetchJSON:async(u,o)=>posts.push(JSON.parse(o.body)),loadWorkflows:async()=>{}};
-  vm.createContext(c);vm.runInContext(render+save,c);
+  vm.createContext(c);vm.runInContext(gates+render+save,c);
   const form=c.workflowSettingsHtml(wf);
   for(const m of form.matchAll(/<input\b([^>]*)>/g)) {
     const a=m[1],id=a.match(/\bid="([^"]+)"/)?.[1];

@@ -176,6 +176,9 @@ DEFAULT_PLANNER_PROMPT = """Ты — ведущий инженер-планир�
 - каждый этап даёт один проверяемый инженерный результат;
 - зависимости могут ссылаться только на предыдущие этапы;
 - укажи разрешённые пути, deliverables и deterministic acceptance gates;
+- новые gate-проверки задавай объектами {"argv":["python","tests/check.py"],"inputs":["tests/check.py"],"repeat":"per-attempt"};
+- каждый inputs-файл gate включи в deliverables этапа; подготовку окружения выполни заранее, gate — проверка результата;
+- repeat означает один запуск в текущей попытке, а не доказательство идемпотентности произвольного скрипта;
 - ограничивай scope этапа, не объединяй независимые функциональные области;
 - последним добавь integration-этап, проверяющий результат целиком;
 - не изменяй файлы репозитория: твой результат — только план.
@@ -2956,6 +2959,7 @@ def _place_audit_contract(text: str, role: WorkflowRole) -> str:
 
 def _render_role_prompt(workflow: WorkflowInDB, role: WorkflowRole,
                         template: str, *, external: bool = False) -> str:
+    from .declared_gates import display as display_gate
     round_no = workflow.current_round
     stage_row = (
         db.get_workflow_stage(workflow.current_stage_id)
@@ -2986,7 +2990,7 @@ def _render_role_prompt(workflow: WorkflowInDB, role: WorkflowRole,
         "gate_evidence": _latest_gate_evidence(
             workflow.id, before_round=round_no
         ),
-        "acceptance_gates": "\n".join(stage.get("acceptance_gates") or []) or "(нет автоматических)",
+        "acceptance_gates": "\n".join(display_gate(item) for item in (stage.get("acceptance_gates") or [])) or "(нет автоматических)",
         "previous_stages": _previous_stage_results(workflow),
         "stage_review": _stage_review_output(workflow),
         "open_findings": json.dumps([
@@ -3145,6 +3149,12 @@ def _run_gate_commands(workflow: WorkflowInDB, *, snapshot=None) -> WorkflowGate
             summary="Gate отключён настройками",
             evidence=[],
         )
+    if snapshot.get("validation_errors"):
+        return WorkflowGateDecision(
+            expected_version=workflow.state_version, verdict=GateVerdict.HUMAN_REQUIRED,
+            gate_id="automatic-gate", summary="Declared gate preflight failed before execution",
+            evidence=snapshot["validation_errors"],
+        )
     if not commands:
         # Включённый гейт без единой команды раньше «проходил» автоматически.
         # Это конфигурационная ошибка, а не успех.
@@ -3168,7 +3178,7 @@ def _run_gate_commands(workflow: WorkflowInDB, *, snapshot=None) -> WorkflowGate
         )
     failures = 0
     for index, (command, argv) in enumerate(zip(commands, snapshot["argv"]), start=1):
-        if owned_snapshot and index > 1:
+        if owned_snapshot and (index > 1 or "inputs" in snapshot):
             with db._connect() as conn:
                 current = db.get_workflow(workflow.id, conn=conn)
                 unchanged = (current is not None and current.status is WorkflowStatus.GATING

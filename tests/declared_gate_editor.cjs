@@ -1,0 +1,18 @@
+const fs = require('node:fs');
+const vm = require('node:vm');
+const assert = require('node:assert/strict');
+const html = fs.readFileSync('promptpilot/static/index.html', 'utf8');
+const start = html.indexOf('function wfGateFormat(');
+const end = html.indexOf('function wfWizardBody(', start);
+const context = {document: {getElementById: () => ({value: ''})}};
+vm.createContext(context);
+vm.runInContext(html.slice(start, end), context);
+const spec = {argv: ['python', 'tests/check.py', 'a;b', '$(literal)'], inputs: ['tests/check.py'], repeat: 'per-attempt'};
+const commands = [spec, 'pytest -q', '{ echo legacy; }', 'echo first\necho second', '"legacy quoted"'];
+assert.equal(JSON.stringify(context.wfGateParse(context.wfGateFormat(commands))), JSON.stringify(commands));
+assert.throws(() => context.wfGateParse('{"argv":'), /JSON/);
+assert.throws(() => context.wfGateParse('["python"]'), /argv/);
+assert.match(html, /acceptance_gates: wfGateParse\(value\('acceptance_gates'\)\)/);
+assert.match(html, /wfGateFormat\(gate.commands \|\| \[\]\)/);
+assert.match(html, /wfGateFormat\(stage.acceptance_gates \|\| \[\]\)/);
+console.log('Real editor preserves typed argv, legacy shell and multiline strings; malformed JSON never becomes shell.');
