@@ -259,13 +259,19 @@ class _RefTransaction:
                     self.owned.terminate()
                     self.process.wait(timeout=5)
         finally:
+            # A descendant can retain a pipe after Git itself exits. Close the
+            # owned process boundary first, then let its reader observe EOF.
+            # Closing a buffered pipe concurrently with iteration can corrupt
+            # the reader (observed on macOS) or block on its internal lock.
+            self.owned.close()
+            self.reader.join(timeout=5)
+            if self.reader.is_alive():
+                raise CheckpointError("Git ref transaction output reader did not stop")
             for stream in (self.process.stdin, self.process.stdout, self.process.stderr):
                 try:
                     stream.close()
                 except OSError:
                     pass
-            self.reader.join(timeout=5)
-            self.owned.close()
 
 
 def _fault(point):

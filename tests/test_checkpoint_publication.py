@@ -240,3 +240,58 @@ def test_restart_http_contract_rejects_stale_head_and_requires_explicit_action(i
             assert result.status_code == 200 and result.json()["status"] == "revision_required"
     asyncio.run(request())
     assert _git(repo, "rev-parse", "HEAD") == head
+
+
+def test_restart_does_not_close_a_pipe_while_its_reader_is_still_finishing(isolated_db, tmp_path, monkeypatch):
+    repo, wf = _pending(isolated_db, tmp_path, monkeypatch)
+    head = _git(repo, "rev-parse", "HEAD")
+    eof, release, reader_finished = threading.Event(), threading.Event(), threading.Event()
+    closing, premature_close = threading.Event(), threading.Event()
+    real_start = stage_checkpoint.OwnedProcess.start
+
+    class DelayedEOF:
+        def __init__(self, stream): self.stream = stream
+        def __iter__(self):
+            yield from self.stream
+            eof.set()
+            assert release.wait(15)
+            reader_finished.set()
+        def close(self):
+            if not reader_finished.is_set():
+                premature_close.set()
+            closing.set()
+            self.stream.close()
+
+    def start(*args, **kwargs):
+        tree = real_start(*args, **kwargs)
+        tree.process.stdout = DelayedEOF(tree.process.stdout)
+        real_close = tree.close
+        def close():
+            closing.set()
+            real_close()
+        tree.close = close
+        return tree
+
+    monkeypatch.setattr(stage_checkpoint.OwnedProcess, 'start', start)
+    results, errors = [], []
+    def restart():
+        try:
+            version = isolated_db.get_workflow(wf.id).state_version
+            results.append(workflows.human_input(wf.id, WorkflowHumanInput(
+                expected_version=version, text='Restart with a fresh review',
+                restart_checkpoint=True, checkpoint_head=head)))
+        except BaseException as exc:
+            errors.append(exc)
+    thread = threading.Thread(target=restart)
+    thread.start()
+    try:
+        assert eof.wait(15) and closing.wait(15)
+        assert not premature_close.is_set(), 'the live reader lost its pipe before finishing'
+    finally:
+        release.set()
+        thread.join(20)
+    assert not thread.is_alive() and not errors, errors
+    assert reader_finished.is_set()
+    assert len(results) == 1 and results[0].status.value == 'revision_required'
+    assert _git(repo, 'rev-parse', 'HEAD') == head
+    assert 'stage.checkpoint' not in _types(isolated_db, wf)
