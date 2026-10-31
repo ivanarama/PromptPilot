@@ -161,3 +161,12 @@ single-launch and unknown-schema boundaries passed eight focused Windows cases.
 An earlier broad component invocation exceeded its180-second bound and is not a
 full-suite PASS. This change does not connect the provider factory, enable a
 public start/progress issuer, deploy source or accept the five remaining gaps.
+
+A separate read-only post-push evidence component checks a complete bounded
+forward graph of at most100 commits from the exact source, unique terminal
+attempt/source/context trailers, and exact current PR/ref/repository/HEAD REST
+identity after network reads. Sixteen finite metadata-peer cases cover divergent
+or truncated graphs, copied/duplicate/nonterminal trailers including CRLF, and
+late identity drift. It observes an author's push; it does not attest CAS or
+issue completion/launch permissions. Public progress/coordinator wiring and the
+pipeline's actual expected-HEAD CAS writer are still required.
