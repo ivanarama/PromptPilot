@@ -111,6 +111,25 @@ def test_unknown_prompt_is_not_rewritten_broadly():
         rewrite_prompt("Do arbitrary work", "fix-approved", PurePosixPath("/release"), "v1")
 
 
+@pytest.mark.parametrize("annotation", ["Операторский релиз", "Операторский runtime hotfix"])
+@pytest.mark.parametrize("stage", ["fix-approved", "review-queue", "merge-shepherd"])
+def test_release_preserves_local_operator_paragraphs_verbatim(annotation, stage):
+    suffix = ("\n\nONEBASE MAC FULL LINT SLOT V1: read /old/pinned-tool.json."
+              "\n\nExisting local note: /old/CLAUDE.md and /old/fix-approved/SKILL.md.\n")
+    decisions = finite_integration_decision(1482) if stage == "merge-shepherd" else ""
+    original = (f"Read CLAUDE.md canonical .claude/skills/{stage}/SKILL.md."
+                f"\n\n{annotation}: previous annotation." + suffix + decisions)
+    first = rewrite_prompt(original, stage, PurePosixPath("/release"), "v1")
+    second = rewrite_prompt(first, stage, PurePosixPath("/next"), "v2")
+    for result in [first, second]:
+        assert result.endswith(suffix + decisions)
+        assert result.count("ONEBASE MAC FULL LINT SLOT V1") == 1
+        assert "previous annotation" not in result
+        assert result.count("Операторский релиз:") == 1
+    assert "Read /next/CLAUDE.md" in second
+
+
+
 def test_configuration_preserves_other_profiles_gates_and_budget():
     config = {"health_command": ["old", "-json"], "required_checks": ["build", "test-windows"],
               "trusted_account": "owner", "review_completion_gate": "target-v1"}
