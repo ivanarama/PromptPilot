@@ -142,6 +142,12 @@ def verify_transport(workspace,value):
     rewrites=workspace._git(workspace.path,'config','--get-regexp',r'^url\..*\.(insteadof|pushinsteadof)$',allow_failure=True)
     if rewrites.returncode!=1:
         raise PipelineError('technical CAS refuses ambiguous Git URL rewrite configuration')
+    destination='https://github.com/'+value['scope']['repository']+'.git'
+    # Git resolves a matching configured remote name before interpreting the
+    # argument as a URL, including remote.<literal-URL>.url/pushURL aliases.
+    # Repeat this effective-config check after the publication writer wait.
+    if destination in workspace._git(workspace.path,'remote').stdout.splitlines():
+        raise PipelineError('technical CAS refuses a configured remote alias for its literal destination')
     return ref
 
 

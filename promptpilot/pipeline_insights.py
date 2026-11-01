@@ -3556,6 +3556,8 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                             completion.get("attempt_id") != request["attempt_id"]
                             or completion.get("new_head") != request["new_head"])):
                     raise fix_requests.PipelineError("author progress completion changed its signed exact source")
+            except ProviderOwnershipError:
+                raise
             except (fix_requests.PipelineError, RuntimeError, TypeError, ValueError) as exc:
                 return {"action": "block", "mode": "tool", "reason": str(exc)}
             if is_progress:

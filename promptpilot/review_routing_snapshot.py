@@ -113,4 +113,8 @@ def stable_timeline(gh, config, number):
     second = _pass(gh, config, number, repo_id)
     if canonical(first) != canonical(second):
         raise PipelineError("typed timeline changed between complete stable reads")
+    # Validate node projections before epoch/proof readers can interpret a
+    # missing or malformed actor as unrelated history.
+    from .review_routing_baseline import _edges
+    _edges(first)
     return first

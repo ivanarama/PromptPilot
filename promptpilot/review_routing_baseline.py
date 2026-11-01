@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 
 from .pipeline_errors import PipelineError
 from .review_routing_wire import audit_binding, context, hash64, records, parse
@@ -46,6 +47,20 @@ def _edges(snapshot):
             raise PipelineError('routing audit boundary has missing/duplicate server identity')
         cursors.add(cursor);ids.add(ident)
         if node.get('__typename')=='IssueComment':
+            body=node.get('body')
+            if not isinstance(body,str):
+                raise PipelineError('routing comment body is unavailable')
+            if 'author' not in node:
+                raise PipelineError('routing comment actor projection is unavailable')
+            author=node['author']
+            if author is None:
+                if re.search(r'(^|[^A-Za-z0-9_])pp:',body):
+                    raise PipelineError('routing protocol comment actor is unresolved')
+            elif (not isinstance(author,dict) or not isinstance(author.get('login'),str)
+                  or not author['login'] or author['login']!=author['login'].strip()
+                  or any(ord(char)<32 or ord(char)==127 for char in author['login'])):
+                raise PipelineError('routing comment actor projection is malformed')
+            timestamp(node.get('createdAt'))
             if 'lastEditedAt' not in node:
                 raise PipelineError('routing comment edit status is unavailable')
             if node['lastEditedAt'] is not None:

@@ -98,6 +98,24 @@ def audit_binding(value):
         if history['protocol']!='audit-history-v1':
             raise PipelineError('unsupported retained audit history')
         _fields(history['header'],'headRefOid baseRefName state isDraft identity identity_sha256 pr_key author labels labelsComplete')
+        header=history['header']
+        try:identity=PRIdentityV1(**header['identity'])
+        except TypeError as exc:raise PipelineError('invalid retained audit identity') from exc
+        _pr(header['pr_key'])
+        if (header['headRefOid']!=identity.head_sha or header['baseRefName']!=identity.base_ref
+                or header['identity_sha256']!=identity.sha256 or header['pr_key']!=pr_key(identity)
+                or header['state']!='OPEN' or header['isDraft'] is not False
+                or header['labelsComplete'] is not True):
+            raise PipelineError('retained original audit header is inconsistent or incomplete')
+        _fields(header['author'],'id login');_text(header['author']['id'])
+        if (not isinstance(header['author']['login'],str)
+                or not re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})',header['author']['login'])):
+            raise PipelineError('invalid retained audit author')
+        labels=header['labels']
+        if not isinstance(labels,list):raise PipelineError('retained audit labels are unavailable')
+        for label in labels:_text(label)
+        if labels!=sorted(set(labels)):
+            raise PipelineError('retained audit labels are duplicate or unsorted')
         if not isinstance(history['edges'],list) or len(history['edges'])>10000:
             raise PipelineError('retained audit edge manifest is invalid or oversized')
         seen_cursors=set();seen_ids=set()

@@ -19,7 +19,7 @@ def page(*, cursor="first", more=False):
               labels={"nodes":[],"pageInfo":{"hasNextPage":False}},
               timelineItems={"updatedAt":"2026-10-29T00:00:00Z",
                              "pageInfo":{"hasNextPage":more,"endCursor":cursor},
-                             "edges":[{"cursor":cursor,"node":{"__typename":"PullRequestCommit","id":"COMMIT","commit":{"oid":BASE["headRefOid"]}}}]})
+                             "edges":[{"cursor":cursor,"node":{"__typename":"PullRequestCommit","id":"COMMIT" if cursor=="first" else "COMMIT_"+cursor,"commit":{"oid":BASE["headRefOid"]}}}]})
     return {"data":{"repository":{"id":"R_BASE","nameWithOwner":"owner/repo","pullRequest":pr}}}
 
 

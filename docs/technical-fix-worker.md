@@ -64,7 +64,8 @@ The publisher journals one expected-HEAD CAS before its final gates. It checks
 the exact source ancestry (at most100 actual commit objects before the source), terminal source/context/attempt
 trailers and clean private checkout. The push names one explicit trusted GitHub
 branch with `--force-with-lease=<ref>:<reviewed-source>`, after independently
-proving the update moves forward. Hooks, URL rewrites, implicit tags and
+proving the update moves forward. Hooks, URL rewrites, remotes named like the
+literal destination URL (including their pushURL), implicit tags and
 submodule pushes cannot widen that operation. There is no second push after an
 attempted or ambiguous send. Independent authenticated graph/commit/full-identity
 readback can confirm the result even when the push response was lost.
@@ -92,3 +93,25 @@ GitHub/checker peers. Public OneBase checker/four-reader pairing, complete nativ
 qualification, independent exact-HEAD review and five
 mandatory CI remain required before accepting the whole #151 change. Production
 configuration, installed source and paused maintenance tasks remain unchanged.
+
+The opt-in `tests/test_review_routing_actual_onebase_pair.py` suite runs actual
+Go `pipelinehealth` online against a private executable GraphQL peer. Its output
+is consumed unchanged by public PromptPilot REVIEW/FIX commands and the owned
+worker. The fixture copies the complete actual REVIEW/FIX/MERGE/TAIL procedures
+and the existing TRIAGE/PLAN encoding contracts; it does not synthesize reader
+markers or capability dictionaries. A harmless finite Python child produces the
+correction, and the exact CAS arguments target a private bare Git repository.
+
+The paired-build operator must explicitly supply all three test inputs:
+`PP_ONEBASE_PAIR_CHECKER` (absolute compiled binary path),
+`PP_ONEBASE_PAIR_CHECKER_SHA256` (the exact binary digest), and
+`PP_ONEBASE_PAIR_SKILLS` (the actual OneBase `.claude/skills` source directory).
+The suite verifies the binary and all four source tree hashes before running.
+Absent inputs produce an explicit ordinary-CI skip; partial or incorrect inputs
+fail. Run `python -m pytest -q tests/test_review_routing_actual_onebase_pair.py`
+and preserve every `actual-pair-receipt.json`. The three scenarios cover normal
+completion, a lost push response and reader drift after the publication writer
+wait. They require one provider and at most one CAS, no second technical slot,
+and either the exact fix-done/new-HEAD REVIEW or a retained failure barrier.
+This local pair qualification does not supply production metrics or activate
+the paused maintenance service. Repeat it for the exact accepted source pair.
