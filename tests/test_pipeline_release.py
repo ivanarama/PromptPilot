@@ -113,12 +113,13 @@ def test_unknown_prompt_is_not_rewritten_broadly():
 
 @pytest.mark.parametrize("annotation", ["Операторский релиз", "Операторский runtime hotfix"])
 @pytest.mark.parametrize("stage", ["fix-approved", "review-queue", "merge-shepherd"])
-def test_release_preserves_local_operator_paragraphs_verbatim(annotation, stage):
-    suffix = ("\n\nONEBASE MAC FULL LINT SLOT V1: read /old/pinned-tool.json."
+@pytest.mark.parametrize("separator", ["\n\n", "\r\n\r\n", "\n \n", "\n\t\n"])
+def test_release_preserves_local_operator_paragraphs_verbatim(annotation, stage, separator):
+    suffix = (separator + "ONEBASE MAC FULL LINT SLOT V1: read /old/pinned-tool.json."
               "\n\nExisting local note: /old/CLAUDE.md and /old/fix-approved/SKILL.md.\n")
     decisions = finite_integration_decision(1482) if stage == "merge-shepherd" else ""
     original = (f"Read CLAUDE.md canonical .claude/skills/{stage}/SKILL.md."
-                f"\n\n{annotation}: previous annotation." + suffix + decisions)
+                f"{separator}{annotation}: previous annotation." + suffix + decisions)
     first = rewrite_prompt(original, stage, PurePosixPath("/release"), "v1")
     second = rewrite_prompt(first, stage, PurePosixPath("/next"), "v2")
     for result in [first, second]:

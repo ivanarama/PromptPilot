@@ -32,14 +32,15 @@ def _payload(raw):
 
 
 def active(conn, workflow_id):
-    row=conn.execute('SELECT seq,payload_json FROM workflow_events WHERE workflow_id=? AND event_type=? ORDER BY seq DESC LIMIT 1',
+    row=conn.execute('SELECT seq,idempotency_key,payload_json FROM workflow_events WHERE workflow_id=? AND event_type=? ORDER BY seq DESC LIMIT 1',
                      (workflow_id,PENDING)).fetchone()
     if row is None:return None
     value=_payload(row['payload_json'])
-    required={'protocol','generation','pending_seq','sha','stage_id','round_no','target','memory_stage','accepted'}
+    required={'protocol','generation','pending_seq','sha','stage_id','round_no','target','memory_stage','accepted','version'}
     if (not isinstance(value,dict) or set(value)!=required or value.get('protocol')!=PROTOCOL
             or not isinstance(value.get('generation'),str) or type(value.get('pending_seq')) is not int
             or value['pending_seq']<1 or type(value.get('round_no')) is not int or value['round_no']<1
+            or type(value.get('version')) is not int or value['version']<1
             or type(value.get('accepted')) is not bool
             or not isinstance(value.get('target'),str)
             or value['target'] not in {'awaiting_human','queued','completed','revision_required'}
@@ -50,6 +51,7 @@ def active(conn, workflow_id):
                 or any(char not in '0123456789abcdef' for char in value['sha']))):
         return {'invalid':True}
     generation=value['generation']
+    if row['idempotency_key']!=PENDING+':'+generation:return {'invalid':True}
     try:
         parsed=uuid.UUID(generation)
         if parsed.version!=4 or str(parsed)!=generation:return {'invalid':True}
@@ -68,14 +70,24 @@ def active(conn, workflow_id):
             or done['terminal'] and done['status'] not in {'cancelled','completed','failed'}
             or not done['terminal'] and done['status']!=value['target']):
         return {'invalid':True}
-    release=conn.execute('SELECT event_type,payload_json FROM workflow_events WHERE workflow_id=? AND seq=?',
+    workflow=conn.execute('SELECT status,state_version FROM workflows WHERE id=?',(workflow_id,)).fetchone()
+    if (workflow is None or not value['version']<done['version']<=workflow['state_version']
+            or workflow['state_version']==done['version'] and workflow['status']!=done['status']):
+        return {'invalid':True}
+    from . import workflows
+    release=conn.execute('SELECT event_type,idempotency_key,payload_json FROM workflow_events WHERE workflow_id=? AND seq=?',
                          (workflow_id,done['release_seq'])).fetchone()
     expected=dict(version=done['version'],generation=generation,terminal=done['terminal'],target=done['status'])
     if not done['terminal'] and done['status']!='awaiting_human':
         expected.update({'from':'awaiting_human','to':done['status']})
     if (release is None or release['event_type']!='checkpoint.cleanup.released'
-            or _payload(release['payload_json'])!=expected):
+            or release['idempotency_key']!=workflows._event_key('checkpoint.cleanup.released',workflow_id,done['version'])
+            or _canonical(_payload(release['payload_json']))!=_canonical(expected)):
         return {'invalid':True}
+    suffix=f":{workflow_id}:v{done['version']}"
+    versions=conn.execute('SELECT seq FROM workflow_events WHERE workflow_id=? AND substr(idempotency_key,-length(?))=? LIMIT 2',
+                          (workflow_id,suffix,suffix)).fetchall()
+    if len(versions)!=1 or versions[0]['seq']!=done['release_seq']:return {'invalid':True}
     return None
 
 
@@ -84,22 +96,40 @@ def hold(conn, workflow, generation, pending, sha, *, target, memory_stage=None,
         raise db.WorkflowConflictError('checkpoint cleanup must retain a non-runnable workflow')
     value=dict(protocol=PROTOCOL,generation=generation,pending_seq=pending['pending_seq'],sha=sha,
                stage_id=workflow['current_stage_id'],round_no=workflow['current_round'],
-               target=target,memory_stage=memory_stage,accepted=accepted)
-    db._append_workflow_event(conn,WorkflowEventCreate(workflow_id=workflow['id'],event_type=PENDING,
+               target=target,memory_stage=memory_stage,accepted=accepted,version=workflow['state_version'])
+    event=db._append_workflow_event(conn,WorkflowEventCreate(workflow_id=workflow['id'],event_type=PENDING,
         idempotency_key=PENDING+':'+generation,payload=value))
-    return value
+    return dict(workflow_id=workflow['id'],seq=event.seq,key=event.idempotency_key,payload=_canonical(value))
 
 
 def new_generation():return str(uuid.uuid4())
 
 
-def register(generation, cleanup, ready):
+def _canonical(value):
+    return json.dumps(value,sort_keys=True,separators=(',',':'),ensure_ascii=True,allow_nan=False)
+
+
+def _require_binding(conn,workflow_id,pending,resource):
+    row=conn.execute('SELECT seq,idempotency_key,payload_json FROM workflow_events WHERE workflow_id=? AND idempotency_key=?',
+                    (workflow_id,PENDING+':'+pending['generation'])).fetchone()
+    if row is None:raise db.WorkflowConflictError('checkpoint cleanup original receipt disappeared')
+    actual=dict(workflow_id=workflow_id,seq=row['seq'],key=row['idempotency_key'],payload=_canonical(_payload(row['payload_json'])))
+    if actual!=resource['binding'] or actual['payload']!=_canonical(pending):
+        raise db.WorkflowConflictError('checkpoint cleanup original receipt context changed')
+
+
+def register(generation, cleanup, ready, *, binding):
     if not callable(cleanup) or not callable(ready):
         raise db.WorkflowConflictError('checkpoint cleanup requires retained owned callbacks')
+    if (not isinstance(binding,dict) or set(binding)!={'workflow_id','seq','key','payload'}
+            or binding['key']!=PENDING+':'+generation or type(binding['seq']) is not int
+            or binding['seq']<1 or not isinstance(binding['workflow_id'],str)
+            or not isinstance(binding['payload'],str)):
+        raise db.WorkflowConflictError('checkpoint cleanup requires its original immutable receipt')
     with _MUTEX:
         if generation in _RESOURCES:
             raise db.WorkflowConflictError('checkpoint cleanup owner already registered')
-        _RESOURCES[generation]=dict(cleanup=cleanup,ready=ready,lock=threading.Lock(),auto_tried=False)
+        _RESOURCES[generation]=dict(cleanup=cleanup,ready=ready,binding=dict(binding),lock=threading.Lock(),auto_tried=False)
 
 
 def failed(workflow_id,generation,error):
@@ -125,6 +155,9 @@ def finish(workflow_id,generation,*,expected_version=None,said=None):
         if pending is None:return db._row_to_workflow(workflow)
         if pending.get('invalid') or pending.get('generation')!=generation:
             raise db.WorkflowConflictError('checkpoint cleanup history is unknown or changed')
+        with _MUTEX:resource=_RESOURCES.get(generation)
+        if resource is None:raise db.WorkflowConflictError('checkpoint cleanup owner is unavailable')
+        _require_binding(conn,workflow_id,pending,resource)
         terminal=WorkflowStatus(workflow['status']) in workflows.TERMINAL_STATES
         if terminal:
             target=WorkflowStatus(workflow['status'])
@@ -185,6 +218,13 @@ def retry(workflow_id,expected_version,*,manual=False,said=None):
         if manual:raise db.WorkflowConflictError('checkpoint cleanup is already owned by another caller')
         return db.get_workflow(workflow_id)
     try:
+        with db._connect() as conn:
+            current=workflows._workflow_row(conn,workflow_id)
+            workflows._require_version(conn,current,expected_version,allow_checkpoint_cleanup=True)
+            current_pending=active(conn,workflow_id)
+            if not current_pending or current_pending.get('invalid'):
+                raise db.WorkflowConflictError('checkpoint cleanup original history changed')
+            _require_binding(conn,workflow_id,current_pending,resource)
         if not manual and (resource['auto_tried'] or resource['ready']() is not True):
             return db.get_workflow(workflow_id)
         if not manual:resource['auto_tried']=True

@@ -43,3 +43,15 @@ terminal outcome, lifecycle version and ordered reference to the exact release
 event. Invalid JSON, duplicate keys, mismatched fields or ordering preserve an
 engineering barrier. Unconfirmed cleanup cannot be acknowledged by metadata
 that merely resembles a completion receipt.
+
+The original PENDING receipt includes its workflow version and canonical event
+key. Retained callbacks are bound to that complete immutable payload, workflow,
+event sequence and key. Rebinding a generation to a different target, note scope
+or source receipt cannot reuse its cleanup owner. Checks run before the callback
+and again before readiness release.
+
+The release uses strict JSON types, its canonical aggregate event key and a
+unique committed workflow version after PENDING. A future version, an impossible
+current lifecycle outcome, integer-as-boolean or float-as-version is refused.
+These checks cover malformed recovery history; they do not authenticate arbitrary
+replacement of all trusted database state and process memory.

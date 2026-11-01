@@ -599,3 +599,61 @@ def test_malformed_cleanup_done_cannot_release_any_task(isolated_db,tmp_path,mon
     assert response.status_code==200 and response.json()['status']=='awaiting_human'
     assert len(db.list_tasks())==before and not calls
     with db._connect() as conn:assert checkpoint_cleanup.active(conn,wf.id).get('invalid')
+
+
+@pytest.fixture
+def unconfirmed_original_cleanup(isolated_db,tmp_path,monkeypatch):
+    from contextlib import contextmanager
+    _repo,wf=_pending(isolated_db,tmp_path,monkeypatch)
+    original=workflows._stage_checkpoint_commit
+    ready=threading.Event();calls=[]
+    @contextmanager
+    def uncertain(*args,**kwargs):
+        with original(*args,**kwargs) as sha:yield sha
+        raise stage_checkpoint.CheckpointCleanupError('unconfirmed original owner',lambda:calls.append(True),ready.is_set)
+    with monkeypatch.context() as patch:
+        patch.setattr(workflows,'_stage_checkpoint_commit',uncertain)
+        assert _resume(wf).status.value=='awaiting_human'
+    with db._connect() as conn:pending=checkpoint_cleanup.active(conn,wf.id)
+    try:yield wf,pending,calls
+    finally:ready.set()
+
+
+@pytest.mark.parametrize('fault',['float-version','integer-terminal','wrong-key','future-version','false-cancelled'])
+def test_release_receipt_requires_real_typed_lifecycle(unconfirmed_original_cleanup,fault):
+    from test_workflow_pause_race import request
+    wf,pending,calls=unconfirmed_original_cleanup
+    generation=pending['generation'];version=db.get_workflow(wf.id).state_version+1
+    terminal,target=(True,'cancelled') if fault=='false-cancelled' else (False,'queued')
+    payload=dict(version=float(version) if fault=='float-version' else version,
+        generation=generation,terminal=0 if fault=='integer-terminal' else terminal,target=target)
+    if not terminal:payload.update({'from':'awaiting_human','to':target})
+    with db._connect(immediate=True) as conn:
+        release=db._append_workflow_event(conn,WorkflowEventCreate(workflow_id=wf.id,
+            event_type='checkpoint.cleanup.released',idempotency_key='unrelated-release' if fault=='wrong-key'
+                else workflows._event_key('checkpoint.cleanup.released',wf.id,version),payload=payload))
+        db._append_workflow_event(conn,WorkflowEventCreate(workflow_id=wf.id,event_type=checkpoint_cleanup.DONE,
+            idempotency_key=checkpoint_cleanup.DONE+':'+generation,payload=dict(protocol=checkpoint_cleanup.PROTOCOL,
+                generation=generation,terminal=terminal,release_seq=release.seq,version=version,status=target)))
+        if fault not in {'future-version','false-cancelled'}:
+            conn.execute('UPDATE workflows SET status=?,state_version=? WHERE id=?',(target,version,wf.id))
+    before=len(db.list_tasks())
+    with pytest.raises(db.WorkflowConflictError):_resume(wf)
+    assert request('POST',f'/api/workflows/{wf.id}/advance').status_code==200
+    assert len(db.list_tasks())==before and not calls
+    with db._connect() as conn:assert checkpoint_cleanup.active(conn,wf.id).get('invalid')
+
+
+@pytest.mark.parametrize('field',['target','memory_stage','pending_seq'])
+def test_original_callbacks_cannot_acknowledge_rebound_pending(unconfirmed_original_cleanup,field):
+    from test_workflow_pause_race import request
+    wf,pending,calls=unconfirmed_original_cleanup
+    altered=dict(pending)
+    altered[field]='completed' if field=='target' else pending['stage_id'] if field=='memory_stage' else pending['pending_seq']+1
+    with db._connect(immediate=True) as conn:
+        db._append_workflow_event(conn,WorkflowEventCreate(workflow_id=wf.id,event_type=checkpoint_cleanup.PENDING,
+            idempotency_key='rebound-original-generation',payload=altered))
+    before=len(db.list_tasks())
+    with pytest.raises(db.WorkflowConflictError):_resume(wf)
+    assert request('POST',f'/api/workflows/{wf.id}/advance').status_code==200
+    assert len(db.list_tasks())==before and not calls

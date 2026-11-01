@@ -2051,10 +2051,10 @@ def _restart_pending_checkpoint(workflow_id, action, said, pending):
                     idempotency_key=f"human.input:checkpoint-restart:{pending['pending_seq']}",
                     payload={**said, "checkpoint_restart": True},
                 ))
-            checkpoint_cleanup.hold(conn,workflow,generation,pending,None,
+            owned['cleanup_binding']=checkpoint_cleanup.hold(conn,workflow,generation,pending,None,
                 target=WorkflowStatus.REVISION_REQUIRED.value,accepted=False)
             owned['cleanup_version']=workflow['state_version']
-        checkpoint_cleanup.register(generation,lambda:None,lambda:True)
+        checkpoint_cleanup.register(generation,lambda:None,lambda:True,binding=owned['cleanup_binding'])
         return checkpoint_cleanup.finish(workflow_id,generation,expected_version=owned['cleanup_version'])
     except stage_checkpoint.CheckpointCleanupError as exc:
         with db._connect(immediate=True) as conn:
@@ -2068,10 +2068,10 @@ def _restart_pending_checkpoint(workflow_id, action, said, pending):
                 workflow=_touch(conn,workflow,'checkpoint.restart.cleanup_failed',
                     dict(generation=generation,reason=str(exc)[:800]))
             if held is None:
-                checkpoint_cleanup.hold(conn,workflow,generation,pending,None,
+                owned['cleanup_binding']=checkpoint_cleanup.hold(conn,workflow,generation,pending,None,
                     target=WorkflowStatus.AWAITING_HUMAN.value,accepted=False)
             result=db._row_to_workflow(workflow)
-        checkpoint_cleanup.register(generation,exc.cleanup,exc.ready)
+        checkpoint_cleanup.register(generation,exc.cleanup,exc.ready,binding=owned['cleanup_binding'])
         return result
     except stage_checkpoint.CheckpointError as exc:
         raise db.WorkflowConflictError(str(exc)) from exc
@@ -2156,12 +2156,12 @@ def _complete_pending_checkpoint(workflow_id, expected_version, pending, said, *
             workflow = _advance_after_stage(
                 conn, workflow, round_row, pending.get("common") or {},
                 extra={"after_checkpoint": True, "checkpoint_resumed": resume}, cleanup=cleanup)
-            checkpoint_cleanup.hold(conn, workflow, cleanup['generation'], pending, sha,
+            owned['cleanup_binding']=checkpoint_cleanup.hold(conn, workflow, cleanup['generation'], pending, sha,
                 target=cleanup['target'], memory_stage=cleanup.get('memory_stage'))
             owned['cleanup_version'] = workflow['state_version']
         # Acceptance committed with index/ref fences held; readiness is still
         # blocked in the durable cleanup marker until every resource closes.
-        checkpoint_cleanup.register(cleanup['generation'], lambda: None, lambda: True)
+        checkpoint_cleanup.register(cleanup['generation'], lambda: None, lambda: True,binding=owned['cleanup_binding'])
         return checkpoint_cleanup.finish(workflow_id, cleanup['generation'],
                                          expected_version=owned['cleanup_version'])
     except stage_checkpoint.CheckpointBusyError as exc:
@@ -2183,11 +2183,11 @@ def _complete_pending_checkpoint(workflow_id, expected_version, pending, said, *
                     **said, 'stage_code': pending['stage_code'], 'reason': str(exc)[:800],
                 }, round_id=_current_round_row(conn, workflow)['id'])
                 if isinstance(exc, stage_checkpoint.CheckpointCleanupError):
-                    checkpoint_cleanup.hold(conn, workflow, cleanup['generation'], pending, None,
+                    owned['cleanup_binding']=checkpoint_cleanup.hold(conn, workflow, cleanup['generation'], pending, None,
                         target=WorkflowStatus.AWAITING_HUMAN.value, accepted=False)
             result = db._row_to_workflow(workflow)
         if isinstance(exc, stage_checkpoint.CheckpointCleanupError):
-            checkpoint_cleanup.register(cleanup['generation'], exc.cleanup, exc.ready)
+            checkpoint_cleanup.register(cleanup['generation'], exc.cleanup, exc.ready,binding=owned['cleanup_binding'])
         return result
 
 
