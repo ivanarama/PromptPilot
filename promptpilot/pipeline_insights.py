@@ -3481,7 +3481,7 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                         or positive_merge_request.get('protocol') != CONTRACT
                         or positive_merge_request.get('purpose') != PURPOSE
                         or positive_merge_request.get('stage') != 'merge'
-                        or positive_merge_request.get('repository') != str(profile.get('repository') or '').lower()
+                        or positive_merge_request.get('repository') != str(profile.get('repository') or '')
                         or any(target.get(name) != positive_merge_request.get(name) for name in ('number', 'head'))
                         or command[-2:] != ['next', 'merge']):
                     raise project_pipeline.PipelineError('positive typed MERGE requires its exact signed target and explicit direct completion; no model fallback')
@@ -3496,7 +3496,7 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                 target=dict(stage='fix-pr',number=identity['pr_number'],head=identity['head_sha'],
                             source=request['attempt']['source'],attempt_id=request['attempt_id'])
                 if (not typed_queue or not typed_response or stage!='fix' or preflight_action!='settlement'
-                        or request['repository']!=str(profile.get('repository') or '').lower()
+                        or request['repository']!=str(profile.get('repository') or '')
                         or reservation['task_id']!=task.id or reservation['task_started_at']!=scheduler_task_started_at
                         or provider_ownership_kind!='headless' or request['pipeline_replicas']!=replica_count
                         or preflight.get('target')!=target):
@@ -3521,7 +3521,7 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
         if preflight_action=='pipeline-fix' or advertised_purpose==fix_requests.PIPELINE_ADMISSION:
             from . import review_routing_worker as technical
             try:
-                request=technical.admission(preflight,task,repository=str(profile.get('repository') or '').lower(),
+                request=technical.admission(preflight,task,repository=str(profile.get('repository') or ''),
                     replicas=replica_count,started_at=scheduler_task_started_at,
                     ownership_kind=provider_ownership_kind,typed=typed_queue and stage=='fix')
                 priority=db.restore_running_attempt_priority(task.id,task.started_at)
@@ -3558,7 +3558,7 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                     expected_target.update(attempt_id=request["attempt_id"], new_head=request["new_head"])
                 if (not typed_queue or not typed_response or stage != "fix" or preflight_action != expected_action
                         or request["purpose"] != expected_purpose
-                        or request["repository"] != str(profile.get("repository") or "").lower()
+                        or request["repository"] != str(profile.get("repository") or "")
                         or reservation["task_id"] != task.id
                         or reservation["task_started_at"] != scheduler_task_started_at
                         or reservation["ownership_kind"] != provider_ownership_kind
