@@ -1,7 +1,7 @@
-"""Typed REVIEW entrypoint adapter; the complete FIX bridge remains separate.
+"""Typed REVIEW adapter, gated by explicit opt-in and the complete paired readers.
 
-This Draft path requires the explicit flag and complete paired reader contract.
-The accepted OneBase pair does not provide that contract and cannot enable it.
+Compatibility alone grants no execution or publication authority. FIX and the
+positive MERGE/TAIL consumers retain their separate source-bound stage gates.
 """
 from __future__ import annotations
 

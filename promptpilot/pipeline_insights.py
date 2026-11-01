@@ -3455,6 +3455,8 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                          and preflight_action in {"empty", "wait", "error"} and token is None)
         signed_routing_claim = False
         advertised_purpose = None
+        advertised = None
+        positive_merge_request = None
         if isinstance(token, str) and "." in token:
             from . import project_pipeline
             try:
@@ -3464,6 +3466,26 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
             except project_pipeline.PipelineError:
                 advertised = None
             signed_routing_claim = isinstance(advertised, str) and advertised.startswith("review-routing-")
+        positive_claim = (isinstance(advertised, str) and advertised.startswith('positive-review-')
+                          or isinstance(preflight.get('protocol'), str) and preflight['protocol'].startswith('positive-review-')
+                          or advertised_purpose == 'typed-clean-merge-v1')
+        if positive_claim:
+            from . import project_pipeline
+            from .review_routing_merge import CONTRACT, PURPOSE
+            try:
+                positive_merge_request = project_pipeline.decode_signed_lease(str(token or ''))
+                target = preflight.get('target') or {}
+                if (stage != 'merge' or execution.get('direct_complete') is not True
+                        or preflight_action != 'merge' or preflight.get('protocol') != CONTRACT
+                        or positive_merge_request.get('protocol') != CONTRACT
+                        or positive_merge_request.get('purpose') != PURPOSE
+                        or positive_merge_request.get('stage') != 'merge'
+                        or positive_merge_request.get('repository') != str(profile.get('repository') or '').lower()
+                        or any(target.get(name) != positive_merge_request.get(name) for name in ('number', 'head'))
+                        or command[-2:] != ['next', 'merge']):
+                    raise project_pipeline.PipelineError('positive typed MERGE requires its exact signed target and explicit direct completion; no model fallback')
+            except (project_pipeline.PipelineError, TypeError, ValueError) as exc:
+                return {'action': 'block', 'mode': 'tool', 'reason': str(exc)}
         from . import review_routing_fix_request as fix_requests
         from . import review_routing_settlement_request as settlement_requests
         if preflight_action=='settlement' or advertised_purpose==settlement_requests.PURPOSE:
@@ -3776,6 +3798,11 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                         "reason": "direct MERGE refused: " + str(
                             completion.get("error") or completion.get("reason")
                             or completion.get("action")), "completion": completion}
+            if positive_merge_request is not None and (
+                    completion.get('stage') != 'merge-cleanup'
+                    or any(completion.get(name) != positive_merge_request[name] for name in ('number', 'head'))):
+                return {'action': 'block', 'mode': 'tool',
+                        'reason': 'positive typed MERGE completion changed the signed target', 'completion': completion}
             return {"action": "complete_empty", "mode": "tool", "verdict": "ГОТОВО",
                     "reason": f"pipelinectl {complete_stage} completed for PR #"
                               f"{(preflight.get('target') or {}).get('number')}",
