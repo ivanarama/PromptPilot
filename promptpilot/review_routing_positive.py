@@ -132,7 +132,10 @@ def live(gh, config, number, *, purpose, health=None):
 
     if purpose not in {'merge', 'tail', 'cleanup'}:
         raise PipelineError('unknown positive typed REVIEW consumer purpose')
-    health = pp.run_health(config) if health is None else health
+    # Inspecting a proof must not fetch/fast-forward the operator checkout.
+    # Preserve the effective config for policy checks; suppress only the
+    # optional checkout synchronization of this read-only health invocation.
+    health = pp.run_health(dict(config, sync_base_before_health=False)) if health is None else health
     policy = capability(config, health)
     snapshot = stable_timeline(gh, config, number)
     merged = purpose != 'merge'

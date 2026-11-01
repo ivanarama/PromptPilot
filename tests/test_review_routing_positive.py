@@ -7,10 +7,12 @@ from pathlib import Path
 
 import pytest
 
+from promptpilot import project_pipeline as pp
 from promptpilot.review_routing_wire import sha
 from test_review_routing_adapter import adapter as adapter  # noqa: F401
 from test_review_routing_stage_guard import setup_guard as setup_guard  # noqa: F401
 
+ACTUAL_HEALTH = pp.run_health
 
 def positive_readers(health, path):
     from promptpilot.review_routing_policy import ROLES, consumer_tree
@@ -37,6 +39,24 @@ def rest_projection(peer):
                 base=dict(ref=pr['baseRefName'], repo=dict(node_id=pr['baseRepository']['id'], full_name=pr['baseRepository']['nameWithOwner'])),
                 user=dict(node_id=pr['author']['id'], login=pr['author']['login']),
                 merge_commit_sha='b' * 40, merged_at=event['createdAt'] if event else None)
+
+
+def test_public_read_only_positive_inspection_never_enables_checkout_sync(positive, monkeypatch):
+    _peer, _health, path, run, _completed = positive
+    config = json.loads(path.read_text(encoding='utf-8'))
+    config['sync_base_before_health'] = True
+    path.write_text(json.dumps(config), encoding='utf-8')
+    observed = []
+
+    def stop_before_git(effective, **kwargs):
+        observed.append(effective.get('sync_base_before_health', False))
+        raise pp.PipelineError('private regression stops before any Git operation')
+
+    monkeypatch.setattr(pp, 'run_health', ACTUAL_HEALTH)
+    monkeypatch.setattr(pp, 'sync_base_before_health', stop_before_git)
+    code, result = run('inspect-routing-positive', '--number', '42', '--stage', 'merge')
+    assert code == 2 and 'stops before any Git operation' in result['error']
+    assert observed == [False]
 
 
 @pytest.fixture
