@@ -582,14 +582,17 @@ def test_malformed_cleanup_done_cannot_release_any_task(isolated_db,tmp_path,mon
         elif fault=='generation':value['generation']=checkpoint_cleanup.new_generation()
         elif fault=='terminal':value['terminal']='false'
         elif fault=='release':value['release_seq']=2**60
-        db._append_workflow_event(conn,WorkflowEventCreate(workflow_id=wf.id,
-            event_type='unrelated' if fault=='event-type' else checkpoint_cleanup.DONE,
-            idempotency_key=checkpoint_cleanup.DONE+':'+generation,payload=value))
         if fault in {'raw-json','duplicate-key'}:
             import json
             raw='{' if fault=='raw-json' else json.dumps(value)[:-1]+',"generation":'+json.dumps(generation)+'}'
-            conn.execute('UPDATE workflow_events SET payload_json=? WHERE idempotency_key=?',
-                         (raw,checkpoint_cleanup.DONE+':'+generation))
+            # Private corrupted-history fixture: append raw bytes directly.
+            # Keep the actual append-only triggers enabled; never UPDATE it.
+            conn.execute('INSERT INTO workflow_events(workflow_id,event_type,payload_json,idempotency_key,created_at) VALUES (?,?,?,?,?)',
+                (wf.id,checkpoint_cleanup.DONE,raw,checkpoint_cleanup.DONE+':'+generation,db._now()))
+        else:
+            db._append_workflow_event(conn,WorkflowEventCreate(workflow_id=wf.id,
+                event_type='unrelated' if fault=='event-type' else checkpoint_cleanup.DONE,
+                idempotency_key=checkpoint_cleanup.DONE+':'+generation,payload=value))
     before=len(db.list_tasks())
     with pytest.raises(db.WorkflowConflictError,match='history is unknown'):_resume(wf)
     response=request('POST',f'/api/workflows/{wf.id}/advance')
