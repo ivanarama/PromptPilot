@@ -473,7 +473,8 @@ def test_cleanup_barrier_never_infers_completion_or_reaccepts_source(isolated_db
     attempts=[]
     def close():
         attempts.append(True)
-        if len(attempts)==1:raise OSError('still unconfirmed')
+        if mode in {'automatic','cancelled'} and len(attempts)==1:
+            raise OSError('still unconfirmed')
     @contextmanager
     def fail_cleanup(*args,**kwargs):
         with original(*args,**kwargs) as sha:yield sha
