@@ -2631,11 +2631,28 @@ def _complete_ordinary_merge(gh, config, lease, *, config_path=None, typed_guard
     if status.get("mergeStateStatus") != "CLEAN" or status.get("mergeable") != "MERGEABLE" or not ready:
         raise PipelineError(f"merge is no longer ready: {reason}")
     body = status.get("body") or ""
+
+    def typed_boundary(phase, payload):
+        # The durable send writer and its subsequent proof/CI reads may wait.
+        # Recheck the ordinary cleanup payload after that work as well, so a
+        # changed Fixes/Closes target cannot cross the final mutation boundary.
+        typed_guard(phase)
+        fresh_status, fresh_checks = pr_checks(gh, config, lease["number"])
+        fresh_ready, fresh_reason = checks_ready(config, fresh_checks)
+        if (fresh_status.get("mergeStateStatus") != "CLEAN"
+                or fresh_status.get("mergeable") != "MERGEABLE" or not fresh_ready):
+            raise PipelineError(f"merge is no longer ready at typed {phase} boundary: {fresh_reason}")
+        fresh_body = fresh_status.get("body") or ""
+        if (hashlib.sha256(fresh_body.encode("utf-8")).hexdigest() != payload["body_sha256"]
+                or same_repo_closing_issues(fresh_body, config["repository"]) != payload["issues"]):
+            raise PipelineError("cleanup payload changed at the final typed mutation boundary")
+
     intent = lease.get("intent")
     if intent is None:
         issues = same_repo_closing_issues(body, config["repository"])
         marker = intent_body(lease["head"], established, body, issues)
-        callback = (lambda: typed_guard('intent')) if typed_guard is not None else None
+        expected_payload = dict(body_sha256=hashlib.sha256(body.encode("utf-8")).hexdigest(), issues=issues)
+        callback = (lambda: typed_boundary('intent', expected_payload)) if typed_guard is not None else None
         intent, _ = reserve_merge_intent(
             gh, config, lease["number"], marker, **({'before_post': callback} if callback else {}))
         if intent is None:
@@ -2673,7 +2690,7 @@ def _complete_ordinary_merge(gh, config, lease, *, config_path=None, typed_guard
         raise PipelineError("cleanup payload changed after intent")
 
     if typed_guard is not None:
-        typed_guard('put')
+        typed_boundary('put', intent)
     result = gh.json("api", f"repos/{config['repository']}/pulls/{lease['number']}/merge",
                      "--method", "PUT", "--input", "-",
                      input_value={"merge_method": config["merge_method"], "sha": lease["head"]})

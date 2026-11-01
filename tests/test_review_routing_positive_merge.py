@@ -273,7 +273,7 @@ def test_owned_scheduler_dispatch_uses_actual_cli_without_a_model(
         assert peer.merge_sends == (1 if fault == 'completion-target' else 0)
 
 
-@pytest.mark.parametrize('fault', ['actor', 'hold', 'reader', 'expiry', 'flag', 'ci'])
+@pytest.mark.parametrize('fault', ['actor', 'hold', 'reader', 'expiry', 'flag', 'ci', 'body'])
 def test_public_completion_rechecks_every_gate_after_receipt_writer_admission(
         merge_case, monkeypatch, fault):
     import sqlite3
@@ -314,6 +314,8 @@ def test_public_completion_rechecks_every_gate_after_receipt_writer_admission(
                     value = json.loads(path.read_text(encoding='utf-8'))
                     value['technical_handoff']['enabled'] = False
                     path.write_text(json.dumps(value), encoding='utf-8')
+                elif fault == 'body':
+                    peer.native_body = 'Fixes #8'
                 else:
                     peer.ci_fault = 'failure'
             return result
