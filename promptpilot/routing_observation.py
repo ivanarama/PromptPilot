@@ -7,6 +7,9 @@ import copy
 import json
 import re
 
+from .pipeline_errors import PipelineError
+from .review_routing import VALIDATORS
+
 
 GROUPS = {
     "technical": "Техническая доработка",
@@ -81,16 +84,24 @@ def _displayable(item):
     if "transition_id" in item and (not isinstance(item["transition_id"], str)
                                     or not re.fullmatch(r"[1-9][0-9]{0,127}", item["transition_id"])):
         return False
+    blocker_ids = set()
     for blocker in item["blockers"]:
         if (not isinstance(blocker, dict) or not isinstance(blocker.get("summary"), str)
                 or not isinstance(blocker.get("evidence"), dict)
-                or blocker.get("kind") not in item["categories"]):
+                or set(blocker) != {"id", "kind", "summary", "evidence"}
+                or not isinstance(blocker.get("kind"), str)
+                or blocker["kind"] not in item["categories"]
+                or not blocker["summary"].strip() or "\0" in blocker["summary"]
+                or not isinstance(blocker["id"], str)
+                or not re.fullmatch(r"[a-z][a-z0-9._-]{0,63}", blocker["id"])
+                or blocker["id"] in blocker_ids):
             return False
-        evidence = blocker["evidence"]
-        if "options" in evidence and (not isinstance(evidence["options"], list)
-                                     or any(not isinstance(option, dict) for option in evidence["options"])):
-            return False
-        if "recommendation" in evidence and not isinstance(evidence["recommendation"], dict):
+        blocker_ids.add(blocker["id"])
+        try:
+            # Share the existing schema validators; display validation does
+            # not create a report, authenticity proof or execution permission.
+            VALIDATORS[blocker["kind"]](blocker["evidence"])
+        except PipelineError:
             return False
     return True
 

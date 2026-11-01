@@ -63,7 +63,7 @@ Tool_error — фактически failed execution выбранной сери
 Восемь полных health JSON в `tests/fixtures/routing-observation-v1.json`
 получены публичным Go CLI из исторических protocol fixtures с фактическими
 четырьмя каноническими consumer trees на коммите OneBase
-`b4313a4e633b382770b81cb44f3ff8ebf9e69a25`. Это исходный immutable producer,
+`f01c606310595680a0d3b314aefdc1c2b87e3b47`. Это исходный immutable producer,
 а не выдуманный SHA будущего финального коммита. Origin содержит source blobs,
 tree, команду, SHA256 данных и бинаря. Файлы закреплены как LF.
 

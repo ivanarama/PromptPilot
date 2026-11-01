@@ -39,7 +39,7 @@ def _publish_health(db, monkeypatch, health, *, stale=False):
 @pytest.mark.parametrize("case", GOLDEN["cases"], ids=lambda case: case["name"])
 def test_public_api_and_real_ui_keep_go_produced_handoff(case, isolated_db, monkeypatch):
     assert hashlib.sha256(RAW).hexdigest() == ORIGIN["sha256"]
-    assert GOLDEN["producer_head"] == ORIGIN["producer_head"] == "b4313a4e633b382770b81cb44f3ff8ebf9e69a25"
+    assert GOLDEN["producer_head"] == ORIGIN["producer_head"] == "f01c606310595680a0d3b314aefdc1c2b87e3b47"
     assert GOLDEN["producer_tree"] == ORIGIN["producer_tree"]
     assert GOLDEN["authority"] == "unverified-offline-input"
     _publish_health(isolated_db, monkeypatch, case["health"])
@@ -241,3 +241,29 @@ def test_public_report_exposes_capped_error_rows_in_json_and_markdown(isolated_d
     assert routing["complete"] is False and routing["truncated"] is True
     markdown = _request("GET", "/api/pipeline-insights/example/report?format=markdown").text
     assert "Полная свежая классификация недоступна" in markdown and "вывод сокращён" in markdown
+
+
+@pytest.mark.parametrize("case_index,evidence", [
+    (4, {"options": [{}], "recommendation": {}}),
+    (4, {"options": [{"number": 1, "behavior": {}, "consequences": "x"},
+                     {"number": 2, "behavior": "y", "consequences": "z"}],
+         "recommendation": {"number": 1, "reason": "x"}}),
+    (4, {"options": [{"number": 1, "behavior": "a", "consequences": "b"},
+                     {"number": 1, "behavior": "c", "consequences": "d"}],
+         "recommendation": {"number": 1, "reason": "x"}}),
+    (4, {"options": [{"number": 1, "behavior": "a", "consequences": "b"},
+                     {"number": 2, "behavior": "c", "consequences": "d"}],
+         "recommendation": {"number": 3, "reason": "x"}}),
+    (0, {"entrypoint": "x"}), (5, {"boundary": "x"}), (6, {"missing": "x"}),
+])
+def test_public_gets_reject_incomplete_category_specific_evidence(case_index, evidence, isolated_db, monkeypatch):
+    health = copy.deepcopy(GOLDEN["cases"][case_index]["health"])
+    health["routing_observation"]["items"][0]["blockers"][0]["evidence"] = evidence
+    _publish_health(isolated_db, monkeypatch, health)
+    state = _request("GET", "/api/pipeline-insights/example").json()["routing"]
+    report = _request("GET", "/api/pipeline-insights/example/report").json()["board"]["routing"]
+    for routing in [state, report]:
+        assert routing["complete"] is False and routing["items"] == []
+        assert all(group["count"] is None for group in routing["groups"] if group["id"] != "tool_error")
+    response = _request("GET", "/api/pipeline-insights/example/report?format=markdown")
+    assert response.status_code == 200 and "Полная свежая классификация недоступна" in response.text
