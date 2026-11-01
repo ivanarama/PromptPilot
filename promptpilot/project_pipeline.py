@@ -2660,7 +2660,7 @@ def run(argv=None) -> int:
     owner_lease = owner_parser.add_mutually_exclusive_group(required=True)
     owner_lease.add_argument("--lease")
     owner_lease.add_argument("--lease-file")
-    for name in ['prepare-fix-start','gate-fix-start']:
+    for name in ['prepare-fix-start','gate-fix-start','prepare-fix-heartbeat','renew-fix-heartbeat']:
         start_parser=sub.add_parser(name)
         start_parser.add_argument('stage',choices=('fix',))
         start_lease=start_parser.add_mutually_exclusive_group(required=True)
@@ -2716,6 +2716,12 @@ def run(argv=None) -> int:
             elif args.command == 'gate-fix-start':
                 from .review_routing_start import gate
                 value=gate(gh,args.config,args.lease)
+            elif args.command == 'prepare-fix-heartbeat':
+                from .review_routing_heartbeat import prepare
+                value=prepare(gh,args.config,args.lease)
+            elif args.command == 'renew-fix-heartbeat':
+                from .review_routing_heartbeat import renew
+                value=renew(gh,args.config,args.lease)
             elif args.command == "gate-fix-owner":
                 from .fix_handoff import gate
                 value = gate(gh, config, args.lease, config_path=args.config,

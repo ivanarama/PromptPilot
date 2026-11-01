@@ -21,10 +21,10 @@ from .review_routing_wire import _fields,canonical,context,pr_key,validate as wi
 FIELDS='version protocol purpose scope identity author attempt lease_id pipeline_replicas issued_at expires_at nonce'
 
 
-def validate(value):
+def _validate_structure(value,*,purpose=START,max_lifetime=1800):
     _fields(value,FIELDS)
     if (type(value['version']) is not int or value['version']!=1
-            or value['protocol']!='review-routing-v1' or value['purpose']!=START):
+            or value['protocol']!='review-routing-v1' or value['purpose']!=purpose):
         raise PipelineError('unsupported exact pipeline START purpose/version')
     scope=freeze_scope(value['scope'])
     attempt=wire_validate(value['attempt'])
@@ -48,12 +48,15 @@ def validate(value):
     if type(value['pipeline_replicas']) is not int or not 1<=value['pipeline_replicas']<=16:
         raise PipelineError('pipeline START replica count is invalid')
     issued,expires=value['issued_at'],value['expires_at']
-    if type(issued) is not int or type(expires) is not int or issued<0 or not 0<expires-issued<=1800:
+    if type(issued) is not int or type(expires) is not int or issued<0 or not 0<expires-issued<=max_lifetime:
         raise PipelineError('pipeline START lifetime is invalid')
     if not isinstance(value['nonce'],str) or not re.fullmatch('[0-9a-f]{32}',value['nonce']):
         raise PipelineError('pipeline START nonce is invalid')
     if len(canonical(value))>32768:raise PipelineError('pipeline START scope exceeds bounded size')
     return value
+
+
+def validate(value):return _validate_structure(value)
 
 
 def encode(value):return pp.encode_signed_lease(validate(value))
@@ -67,8 +70,8 @@ def decode(token):
     return value
 
 
-def require_current(value,config,*,write=True):
-    validate(value)
+def _require_current(value,config,*,write=True,validator=validate):
+    validator(value)
     policy.require(config,value['identity'])
     scope=value['scope']
     if (pp.digest(config)!=scope['config_sha256']
@@ -82,6 +85,10 @@ def require_current(value,config,*,write=True):
     now=int(time.time())
     if value['issued_at']>now+60 or write and now>=value['expires_at']:
         raise PipelineError('pipeline START scope expired or is not yet valid')
+
+
+def require_current(value,config,*,write=True):
+    return _require_current(value,config,write=write)
 
 
 def build(config,snapshot,paired,root,started,reservation):

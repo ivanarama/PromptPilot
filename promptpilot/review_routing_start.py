@@ -19,11 +19,14 @@ from .review_routing_wire import _fields,_source,_integer,context,head40,records
 
 
 class StartGuard:
+    decode_request=staticmethod(requests.decode)
+    require_current=staticmethod(requests.require_current)
+
     def __init__(self,gh,config_path,token,*,clock=None):
         if not isinstance(config_path,str) or not config_path:
             raise PipelineError('pipeline START requires its actual configuration path')
         self.gh,self.config_path,self.token=gh,config_path,token
-        self.request=requests.decode(token)
+        self.request=self.decode_request(token)
         self.scope=self.request['scope']
         self.clock=clock or (lambda:datetime.now(timezone.utc))
 
@@ -34,12 +37,12 @@ class StartGuard:
         return value.astimezone(timezone.utc)
 
     def state(self):
-        request=requests.decode(self.token)
+        request=self.decode_request(self.token)
         if request!=self.request:raise PipelineError('pipeline START signed binding changed')
         config=pp.load_config(self.config_path)
         health=pp.run_health(config,config_path=self.config_path)
         paired=policy.require(config,request['identity'],health=health)
-        requests.require_current(request,config)
+        self.require_current(request,config)
         if paired['consumer_sha256']!=self.scope['reader_sha256']:
             raise PipelineError('pipeline START paired readers changed')
         expected=dict(stage='fix-pr',number=self.scope['pr']['pr_number'],head=self.scope['source']['head'],
@@ -89,7 +92,7 @@ class StartGuard:
         view.require_owner(returned_id=view.active.id,owner=self.scope['owner'],now=self.now())
         pp.ensure_identity(self.gh,config)
         require_task(dict(target_reservation=self.scope['reservation']))
-        return dict(config=config,health=health,view=view)
+        return dict(config=config,health=health,view=view,snapshot=snapshot,root=root,ledger=ledger)
 
     def final(self,store,scope):
         if scope!=self.scope:raise PipelineError('pipeline START factory substituted its consumed scope')
