@@ -5,7 +5,7 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-__version__ = "0.5.1"
+__version__ = "0.6.0"
 
 _RELEASES_URL = "https://api.github.com/repos/ivanarama/PromptPilot/releases/latest"
 _CACHE_FILE = Path.home() / ".promptpilot" / "version-check.json"
@@ -30,7 +30,7 @@ _BUILD_META = _load_build_meta()
 
 
 def full_version() -> str:
-    """``0.5.1`` in dev; ``0.5.1 build 171f3e5a12 v0.5.1`` in stamped builds."""
+    """Package version in dev; version, commit and tag in stamped builds."""
     parts = [__version__]
     commit = _BUILD_META.get("commit")
     if commit:
