@@ -39,7 +39,7 @@ def _publish_health(db, monkeypatch, health, *, stale=False):
 @pytest.mark.parametrize("case", GOLDEN["cases"], ids=lambda case: case["name"])
 def test_public_api_and_real_ui_keep_go_produced_handoff(case, isolated_db, monkeypatch):
     assert hashlib.sha256(RAW).hexdigest() == ORIGIN["sha256"]
-    assert GOLDEN["producer_head"] == ORIGIN["producer_head"] == "66239703ab6368e21e0065a971b871e55b54eec5"
+    assert GOLDEN["producer_head"] == ORIGIN["producer_head"] == "b4313a4e633b382770b81cb44f3ff8ebf9e69a25"
     assert GOLDEN["producer_tree"] == ORIGIN["producer_tree"]
     assert GOLDEN["authority"] == "unverified-offline-input"
     _publish_health(isolated_db, monkeypatch, case["health"])
@@ -107,6 +107,8 @@ def test_public_report_separates_execution_error_from_model_decision(
         "task_id": failed.id, "series_id": failed.series_id,
         "category": "tool_error", "source": "task.status=failed",
         "recipient": "engineering", "summary": "runner <unavailable>",
+        "summary_truncated": False, "summary_bytes": len("runner <unavailable>".encode("utf-8")),
+        "summary_limit_bytes": 4096,
         "transition_at": isolated_db.get_task(failed.id).completed_at.isoformat(),
     }]
     assert not groups["product"]["items"]
@@ -149,13 +151,14 @@ def test_public_report_preserves_late_failure_after_newer_run_completed(isolated
     assert group["items"][0]["task_id"] == old.id
 
 
-@pytest.mark.parametrize("broken", [None, {"route": []}, {"evidence_status": []},
+@pytest.mark.parametrize("broken", [None, {}, {"route": []}, {"evidence_status": []},
                                     {"categories": None}, {"blockers": {"injected": "value"}},
+                                    {"source": None}, {"source": {}}, {"budget_used": True},
                                     {"blockers": [{"summary": "x", "evidence": {"options": "invalid"}}]}])
 def test_public_report_rejects_malformed_rows_without_claiming_zero(broken, isolated_db, monkeypatch):
     health = copy.deepcopy(GOLDEN["cases"][0]["health"])
     original = health["routing_observation"]["items"][0]
-    health["routing_observation"]["items"] = [None if broken is None else {**original, **broken}]
+    health["routing_observation"]["items"] = [None if broken is None else ({} if broken == {} else {**original, **broken})]
     _publish_health(isolated_db, monkeypatch, health)
     response = _request("GET", "/api/pipeline-insights/example/report")
     assert response.status_code == 200
@@ -163,3 +166,78 @@ def test_public_report_rejects_malformed_rows_without_claiming_zero(broken, isol
     assert routing["complete"] is False
     assert routing["items"] == []
     assert all(group["count"] is None for group in routing["groups"] if group["id"] != "tool_error")
+
+
+def test_public_report_honors_durable_epoch_invalidation(isolated_db, monkeypatch):
+    _publish_health(isolated_db, monkeypatch, GOLDEN["cases"][0]["health"])
+    pipeline_insights._discard_cache()
+    state = _request("GET", "/api/pipeline-insights/example").json()
+    report = _request("GET", "/api/pipeline-insights/example/report").json()
+    assert report["cache"]["stale"] is True and report["cache"]["invalidated"] is True
+    for routing in [state["routing"], report["board"]["routing"]]:
+        assert routing["available"] is False and routing["complete"] is False
+        assert routing["items"] == []
+        assert all(group["count"] is None for group in routing["groups"] if group["id"] != "tool_error")
+
+
+def test_public_markdown_neutralizes_html_and_markdown_from_failures_and_proofs(isolated_db, monkeypatch):
+    health = copy.deepcopy(GOLDEN["cases"][4]["health"])
+    payload = '<img src=x onerror=bad()> `code` **strong** [link](javascript:bad)'
+    health["routing_observation"]["items"][0]["blockers"][0]["summary"] = payload
+    _publish_health(isolated_db, monkeypatch, health)
+    task = isolated_db.create_task(TaskCreate(prompt="Example - Review", recurrence="1h"))
+    isolated_db.mark_failed(task.id, payload)
+    response = _request("GET", "/api/pipeline-insights/example/report?format=markdown")
+    assert response.status_code == 200
+    assert "<img" not in response.text and "&lt;img" in response.text
+    assert "`code`" not in response.text and "**strong**" not in response.text
+    assert "\\`code\\`" in response.text and "\\*\\*strong\\*\\*" in response.text
+
+
+def test_public_report_retains_ambiguous_equal_timestamp_failure(isolated_db, monkeypatch):
+    _publish_health(isolated_db, monkeypatch, GOLDEN["cases"][0]["health"])
+    old = isolated_db.create_task(TaskCreate(prompt="Example - Review", recurrence="1h"))
+    newer = isolated_db.create_task(TaskCreate(prompt="Example - Review", recurrence="1h", series_id=old.series_id))
+    instant = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    monkeypatch.setattr(isolated_db, "_now", lambda: instant)
+    isolated_db.mark_completed(newer.id, "finished first", verdict="ПУСТО")
+    isolated_db.mark_failed(old.id, "failed later at the same clock instant")
+    # Freeze both calls to exactly the same timestamp, even at a second boundary.
+    assert isolated_db.get_task(old.id).completed_at == isolated_db.get_task(newer.id).completed_at
+    report = _request("GET", "/api/pipeline-insights/example/report").json()
+    errors = next(group for group in report["board"]["routing"]["groups"] if group["id"] == "tool_error")
+    assert errors["items"][0]["task_id"] == old.id and errors["count"] == 1
+
+
+def test_public_report_bounds_error_bytes_and_exposes_all_truncation(isolated_db, monkeypatch):
+    _publish_health(isolated_db, monkeypatch, GOLDEN["cases"][0]["health"])
+    task = isolated_db.create_task(TaskCreate(prompt="Example - Review", recurrence="1h"))
+    error = "А🙂" * 200000
+    isolated_db.mark_failed(task.id, error)
+    report = _request("GET", "/api/pipeline-insights/example/report").json()
+    routing = report["board"]["routing"]
+    group = next(group for group in routing["groups"] if group["id"] == "tool_error")
+    item = group["items"][0]
+    assert len(item["summary"].encode("utf-8")) <= 4096
+    assert item["summary_bytes"] == len(error.encode("utf-8")) and item["summary_truncated"] is True
+    assert group["truncated"] is True and routing["truncated"] is True and routing["complete"] is False
+    assert isolated_db.get_task(task.id).error == error
+    markdown = _request("GET", "/api/pipeline-insights/example/report?format=markdown").text
+    assert len(markdown) < 20000 and "вывод сокращён" in markdown
+
+
+def test_public_report_exposes_capped_error_rows_in_json_and_markdown(isolated_db, monkeypatch):
+    _publish_health(isolated_db, monkeypatch, GOLDEN["cases"][0]["health"])
+    series_id = None
+    for index in range(51):
+        task = isolated_db.create_task(TaskCreate(prompt="Example - Review", recurrence="1h", series_id=series_id))
+        series_id = task.series_id
+        isolated_db.mark_failed(task.id, f"failure {index}")
+    report = _request("GET", "/api/pipeline-insights/example/report").json()
+    routing = report["board"]["routing"]
+    group = next(group for group in routing["groups"] if group["id"] == "tool_error")
+    assert len(group["items"]) == 50 and group["count"] is None
+    assert group["complete"] is False and group["truncated"] is True
+    assert routing["complete"] is False and routing["truncated"] is True
+    markdown = _request("GET", "/api/pipeline-insights/example/report?format=markdown").text
+    assert "Полная свежая классификация недоступна" in markdown and "вывод сокращён" in markdown

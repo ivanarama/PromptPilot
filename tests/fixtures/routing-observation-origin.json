@@ -1,16 +1,16 @@
 {
   "schema": "routing-observation-public-origin-v1",
-  "producer_head": "66239703ab6368e21e0065a971b871e55b54eec5",
-  "producer_tree": "e5cefe78b905c40abc6f78f1a714e6c7676d7a4f",
-  "binary_sha256": "d9a18b21c0aadd49d35a5f1330053f79ea11f85f9f95396105c61ba6f8e754f7",
+  "producer_head": "b4313a4e633b382770b81cb44f3ff8ebf9e69a25",
+  "producer_tree": "acbbddb4b11b7922fc9b8e399f55a7b1d1985ea6",
+  "binary_sha256": "a6950aa2dcf9286708ad6bdaa5a663029546e287eac2fd5b72e1dbb5a9485b7e",
   "file": "routing-observation-v1.json",
-  "sha256": "7253a845f9f27354c3fa3f20130c067f4654676c60941698edfac3f44aa767f1",
-  "case_count": 8,
+  "sha256": "140edfacaa20e88a124d882edf0e7f3e58c2ea1b851c295af989c49cbf24d587",
+  "case_count": 9,
   "producer_blobs": {
-    "tools/pipelinehealth/main.go": "3ccc1eae471e93196c4a09a5db90cdfeb1089827",
-    "tools/pipelinehealth/routing_report.go": "44f6d7f7431580e553ffc398bcad98387c7b15b1",
-    "tools/pipelinehealth/routing_observation.go": "4c2889fac7d3f8d0b669d5080c609ebf4794ef27",
-    "tools/pipelinehealth/routing_observation_test.go": "fd3e0c4234cecd121596ff93907c5bc9fe180212"
+    "tools/pipelinehealth/main.go": "c70afeb76b7d778bcba60eb32b7b4fecaec1d482",
+    "tools/pipelinehealth/routing_report.go": "727773f34325a1a2039bc5a1af5d862e0813fb34",
+    "tools/pipelinehealth/routing_observation.go": "4c748cf5e386a792d34913622c34b027b8e4f6e0",
+    "tools/pipelinehealth/routing_observation_test.go": "f27b614d27e22ab46446c32ef0c02ea188494915"
   },
   "command": "pipelinehealth -json -repo owner/repo -owner owner -prs <case-prs.json> -issues <empty-issues.json> -contract <actual REVIEW tree>/SKILL.md -technical-handoff",
   "notes": "Measured public CLI over genuine retained protocol snapshots and all four actual canonical readers. Offline synthetic repository; no execution or production authority."

@@ -2,6 +2,7 @@
 
 import copy
 import hashlib
+import html
 import json
 import math
 import os
@@ -5779,6 +5780,7 @@ def build_period_report(profile_id: str, series: list[dict], *, hours: int = 24,
     board = build_board(
         delivery, diagnostics, current_tasks,
         available=(fresh and cache.get("complete") is True
+                   and cache.get("stale") is False
                    and bool(diagnostics) and not diagnostics.get("checker_failed")),
         classifications=profile.get("delivery_classifications"),
         tool_errors=db.pipeline_operational_errors(series_ids, start))
@@ -5959,9 +5961,18 @@ def render_period_report_markdown(report: dict) -> str:
             identity = (f"PR #{item['number']} HEAD {item.get('head', 'неизвестен')}"
                         if item.get("number") else f"Task #{item.get('task_id')}")
             detail = json.dumps(item, ensure_ascii=False, sort_keys=True)
-            lines.append(f"- {_markdown_escape(group['title'])}: "
-                         f"{_markdown_escape(identity)} — {_markdown_escape(detail)}")
+            lines.append(f"- {_routing_markdown_text(group['title'])}: "
+                         f"{_routing_markdown_text(identity)} — {_routing_markdown_text(detail)}")
+        if group.get("truncated"):
+            lines.append(f"- {_routing_markdown_text(group['title'])}: вывод сокращён; "
+                         "полные подробности доступны в исходных задачах/REVIEW.")
     return "\n".join(lines) + "\n"
+
+
+def _routing_markdown_text(value):
+    """Literal untrusted details: neutralize HTML and Markdown operators."""
+    text = html.escape(str(value), quote=False).replace("\r", " ").replace("\n", " ")
+    return re.sub(r"([\\`*_{}\[\]()#+\-.!|>~])", r"\\\1", text)
 
 
 def sample_active_profiles(series: list[dict]) -> dict[str, str]:
