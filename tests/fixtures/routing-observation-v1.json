@@ -526,7 +526,7 @@
         },
         "reviewed_waiting_ship": [],
         "routing_observation": {
-          "complete": true,
+          "complete": false,
           "items": [
             {
               "blockers": [],
@@ -1079,7 +1079,7 @@
         },
         "reviewed_waiting_ship": [],
         "routing_observation": {
-          "complete": true,
+          "complete": false,
           "items": [
             {
               "blockers": [],
@@ -1116,7 +1116,7 @@
       "name": "missing-claim"
     }
   ],
-  "producer_head": "38f96937fa7afc416c087fb64c76f542a5e441f1",
-  "producer_tree": "7513a4496e171e9e120b2dbae4cbc86917f517db",
+  "producer_head": "66239703ab6368e21e0065a971b871e55b54eec5",
+  "producer_tree": "e5cefe78b905c40abc6f78f1a714e6c7676d7a4f",
   "schema": "routing-observation-public-health-v1"
 }

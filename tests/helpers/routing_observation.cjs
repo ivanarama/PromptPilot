@@ -1,4 +1,4 @@
-// Feed the actual public API response to the shipped report renderer.
+// API-response harness; invoked with stdin by test_routing_observation.py.
 const fs = require('node:fs');
 const vm = require('node:vm');
 const assert = require('node:assert/strict');

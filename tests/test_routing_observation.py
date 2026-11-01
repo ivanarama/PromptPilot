@@ -39,7 +39,7 @@ def _publish_health(db, monkeypatch, health, *, stale=False):
 @pytest.mark.parametrize("case", GOLDEN["cases"], ids=lambda case: case["name"])
 def test_public_api_and_real_ui_keep_go_produced_handoff(case, isolated_db, monkeypatch):
     assert hashlib.sha256(RAW).hexdigest() == ORIGIN["sha256"]
-    assert GOLDEN["producer_head"] == ORIGIN["producer_head"] == "38f96937fa7afc416c087fb64c76f542a5e441f1"
+    assert GOLDEN["producer_head"] == ORIGIN["producer_head"] == "66239703ab6368e21e0065a971b871e55b54eec5"
     assert GOLDEN["producer_tree"] == ORIGIN["producer_tree"]
     assert GOLDEN["authority"] == "unverified-offline-input"
     _publish_health(isolated_db, monkeypatch, case["health"])
@@ -56,13 +56,18 @@ def test_public_api_and_real_ui_keep_go_produced_handoff(case, isolated_db, monk
     assert routing["available"] is True, (report["cache"], report["coverage"])
     assert routing["mutation_authorized"] is False
     assert routing["items"] == case["health"]["routing_observation"]["items"]
+    if case["name"] in {"missing-claim", "changed-head-with-unsettled-pipeline"}:
+        assert routing["complete"] is False
+        assert all(group["count"] is None for group in routing["groups"]
+                   if group["id"] != "tool_error")
+        assert next(group for group in routing["groups"] if group["id"] == "unknown")["items"]
     state = _request("GET", "/api/pipeline-insights/example").json()
     assert state["routing"]["items"] == routing["items"]
     markdown = _request("GET", "/api/pipeline-insights/example/report?format=markdown")
     assert markdown.status_code == 200 and "Причины остановок" in markdown.text
     node = shutil.which("node")
     if node:
-        result = subprocess.run([node, "tests/routing_observation.cjs"],
+        result = subprocess.run([node, "tests/helpers/routing_observation.cjs"],
                                 input=json.dumps(report, ensure_ascii=False),
                                 text=True, encoding="utf-8", capture_output=True, check=False)
         assert result.returncode == 0, result.stderr
@@ -142,3 +147,19 @@ def test_public_report_preserves_late_failure_after_newer_run_completed(isolated
     group = next(item for item in response.json()["board"]["routing"]["groups"]
                  if item["id"] == "tool_error")
     assert group["items"][0]["task_id"] == old.id
+
+
+@pytest.mark.parametrize("broken", [None, {"route": []}, {"evidence_status": []},
+                                    {"categories": None}, {"blockers": {"injected": "value"}},
+                                    {"blockers": [{"summary": "x", "evidence": {"options": "invalid"}}]}])
+def test_public_report_rejects_malformed_rows_without_claiming_zero(broken, isolated_db, monkeypatch):
+    health = copy.deepcopy(GOLDEN["cases"][0]["health"])
+    original = health["routing_observation"]["items"][0]
+    health["routing_observation"]["items"] = [None if broken is None else {**original, **broken}]
+    _publish_health(isolated_db, monkeypatch, health)
+    response = _request("GET", "/api/pipeline-insights/example/report")
+    assert response.status_code == 200
+    routing = response.json()["board"]["routing"]
+    assert routing["complete"] is False
+    assert routing["items"] == []
+    assert all(group["count"] is None for group in routing["groups"] if group["id"] != "tool_error")
