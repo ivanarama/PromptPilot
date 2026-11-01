@@ -201,3 +201,18 @@ not attest the author's CAS push, implement the pipeline execution factory,
 heartbeat, trusted settlement writers or actual accepted OneBase pairing.
 All five original acceptance gaps still require their remaining work; production
 flags and Windows scheduled maintenance stay OFF.
+
+
+The private pipeline START schema now binds a distinct signed purpose to the
+canonical attempt and started IDs, source, full same-repository PR identity,
+trusted executor, task occurrence, attempt UUID, reservation, four reader hashes,
+configuration digest, replica count and finite expiry. Its explicit executor
+policy refuses fork execution. Sixteen focused serialization/policy cases pass,
+including signed purpose/source/owner/identity changes, replica drift and OFF.
+
+This is serialization and policy scaffolding only. It neither verifies server
+canonicality by itself nor connects a provider. The future public coordinator
+must freshly verify actual started history, ownership, source and checker after
+all waits and use OneUseStart at the actual factory. The complete execution peer
+contract is deliberately unavailable from all current public routes. No pipeline
+execution, heartbeat, CAS writer or settlement completion is claimed here.
