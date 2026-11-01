@@ -514,3 +514,85 @@ def test_cleanup_barrier_never_infers_completion_or_reaccepts_source(isolated_db
         assert not attempts
     assert _types(db,wf).count('stage.checkpoint')==_types(db,wf).count('stage.advanced')==1
     assert not db.list_tasks(status=TaskStatus.PENDING)
+
+
+@pytest.mark.parametrize('fault',['reader','owned-boundary'])
+def test_restart_cleanup_failure_stays_nonrunnable_and_recovers_original_owner(isolated_db,tmp_path,monkeypatch,fault):
+    from test_workflow_pause_race import request
+    repo,wf=_pending(isolated_db,tmp_path,monkeypatch)
+    head=_git(repo,'rev-parse','HEAD')
+    release=threading.Event()
+    transactions=[]
+    original_read=stage_checkpoint._RefTransaction._read
+    original_close=stage_checkpoint._RefTransaction.close
+    def read(tx):
+        transactions.append(tx)
+        original_read(tx)
+        assert release.wait(40)
+    def close(tx):
+        original_close(tx)
+        if not release.is_set():raise OSError('original owned cleanup unconfirmed')
+    try:
+        with monkeypatch.context() as patch:
+            if fault=='reader':patch.setattr(stage_checkpoint._RefTransaction,'_read',read)
+            else:patch.setattr(stage_checkpoint._RefTransaction,'close',close)
+            response=request('POST',f'/api/workflows/{wf.id}/human-input',json={
+                'expected_version':db.get_workflow(wf.id).state_version,'text':'Review source again',
+                'restart_checkpoint':True,'checkpoint_head':head})
+        before=len(db.list_tasks())
+        request('POST',f'/api/workflows/{wf.id}/advance')
+        assert len(db.list_tasks())==before,'restart escaped its original resource cleanup barrier'
+        assert response.status_code==200 and response.json()['status']=='awaiting_human',response.text
+        with db._connect() as conn:assert checkpoint_cleanup.active(conn,wf.id)
+        assert _git(repo,'rev-parse','HEAD')==head
+        assert _types(db,wf).count('stage.checkpoint_invalidated')==1
+        assert 'stage.checkpoint' not in _types(db,wf)
+    finally:
+        release.set()
+        for tx in transactions:
+            tx.reader.join(10)
+            tx.close()
+    assert _resume(wf).status.value=='revision_required'
+    assert _types(db,wf).count('stage.checkpoint_invalidated')==1
+    with db._connect() as conn:assert checkpoint_cleanup.active(conn,wf.id) is None
+    workflows.advance_workflow(wf.id)
+    assert len(db.list_tasks())==before+1
+
+
+@pytest.mark.parametrize('fault',['protocol','generation','event-type','terminal','release','raw-json','duplicate-key'])
+def test_malformed_cleanup_done_cannot_release_any_task(isolated_db,tmp_path,monkeypatch,fault):
+    from contextlib import contextmanager
+    from test_workflow_pause_race import request
+    _repo,wf=_pending(isolated_db,tmp_path,monkeypatch)
+    original=workflows._stage_checkpoint_commit
+    calls=[]
+    @contextmanager
+    def uncertain(*args,**kwargs):
+        with original(*args,**kwargs) as sha:yield sha
+        raise stage_checkpoint.CheckpointCleanupError('unknown original cleanup',lambda:calls.append(True),lambda:True)
+    with monkeypatch.context() as patch:
+        patch.setattr(workflows,'_stage_checkpoint_commit',uncertain)
+        assert _resume(wf).status.value=='awaiting_human'
+    with db._connect(immediate=True) as conn:
+        pending=checkpoint_cleanup.active(conn,wf.id)
+        generation=pending['generation']
+        value=dict(protocol=checkpoint_cleanup.PROTOCOL,generation=generation,terminal=False,
+            release_seq=1,version=1,status='queued')
+        if fault=='protocol':value['protocol']='unknown'
+        elif fault=='generation':value['generation']=checkpoint_cleanup.new_generation()
+        elif fault=='terminal':value['terminal']='false'
+        elif fault=='release':value['release_seq']=2**60
+        db._append_workflow_event(conn,WorkflowEventCreate(workflow_id=wf.id,
+            event_type='unrelated' if fault=='event-type' else checkpoint_cleanup.DONE,
+            idempotency_key=checkpoint_cleanup.DONE+':'+generation,payload=value))
+        if fault in {'raw-json','duplicate-key'}:
+            import json
+            raw='{' if fault=='raw-json' else json.dumps(value)[:-1]+',"generation":'+json.dumps(generation)+'}'
+            conn.execute('UPDATE workflow_events SET payload_json=? WHERE idempotency_key=?',
+                         (raw,checkpoint_cleanup.DONE+':'+generation))
+    before=len(db.list_tasks())
+    with pytest.raises(db.WorkflowConflictError,match='history is unknown'):_resume(wf)
+    response=request('POST',f'/api/workflows/{wf.id}/advance')
+    assert response.status_code==200 and response.json()['status']=='awaiting_human'
+    assert len(db.list_tasks())==before and not calls
+    with db._connect() as conn:assert checkpoint_cleanup.active(conn,wf.id).get('invalid')

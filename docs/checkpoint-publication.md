@@ -29,3 +29,17 @@ verification. PID absence, elapsed time, an agent report or a newly launched
 process never supplies a cleanup acknowledgement. No scheduler, migration or
 provider is started by cleanup recovery. This is not OS sandboxing or a guarantee
 that arbitrary scripts are idempotent.
+
+
+Restarting a pending checkpoint uses the same readiness barrier. Revoking the
+old PASS and invalidating its checkpoint may commit under the existing Git
+fences, but the workflow stays awaiting until those original resources close.
+Only then does it become revision_required. Restart cleanup failure retains the
+same handles and returns the blocked state, with no new configured executor.
+
+A matching DONE idempotency key is not an acknowledgement by itself. Completion
+must have the exact event type, closed JSON schema, protocol, generation, typed
+terminal outcome, lifecycle version and ordered reference to the exact release
+event. Invalid JSON, duplicate keys, mismatched fields or ordering preserve an
+engineering barrier. Unconfirmed cleanup cannot be acknowledged by metadata
+that merely resembles a completion receipt.

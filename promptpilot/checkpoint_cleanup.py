@@ -4,6 +4,7 @@ The source checkpoint is accepted with its index/ref fence still held. Workflow
 readiness is released separately after cleanup, never from PID absence, timeout,
 agent text or a newly started process. Lost ownership remains an explicit barrier.
 """
+import json
 import threading
 import uuid
 
@@ -17,20 +18,33 @@ _RESOURCES={}
 _MUTEX=threading.Lock()
 
 
+def _payload(raw):
+    def unique(pairs):
+        result={}
+        for key,value in pairs:
+            if key in result:raise ValueError('duplicate cleanup metadata key')
+            result[key]=value
+        return result
+    def reject_constant(_value):raise ValueError('non-JSON cleanup metadata')
+    if not isinstance(raw,str) or len(raw)>65536:return None
+    try:return json.loads(raw,object_pairs_hook=unique,parse_constant=reject_constant)
+    except (ValueError,TypeError,RecursionError):return None
+
+
 def active(conn, workflow_id):
-    row=conn.execute('SELECT payload_json FROM workflow_events WHERE workflow_id=? AND event_type=? ORDER BY seq DESC LIMIT 1',
+    row=conn.execute('SELECT seq,payload_json FROM workflow_events WHERE workflow_id=? AND event_type=? ORDER BY seq DESC LIMIT 1',
                      (workflow_id,PENDING)).fetchone()
     if row is None:return None
-    value=db._json_load(row['payload_json'],{})
+    value=_payload(row['payload_json'])
     required={'protocol','generation','pending_seq','sha','stage_id','round_no','target','memory_stage','accepted'}
     if (not isinstance(value,dict) or set(value)!=required or value.get('protocol')!=PROTOCOL
             or not isinstance(value.get('generation'),str) or type(value.get('pending_seq')) is not int
             or value['pending_seq']<1 or type(value.get('round_no')) is not int or value['round_no']<1
             or type(value.get('accepted')) is not bool
             or not isinstance(value.get('target'),str)
-            or value['target'] not in {'awaiting_human','queued','completed'}
-            or value['accepted'] and value['target']=='awaiting_human'
-            or not value['accepted'] and value['target']!='awaiting_human'
+            or value['target'] not in {'awaiting_human','queued','completed','revision_required'}
+            or value['accepted'] and value['target'] not in {'queued','completed'}
+            or not value['accepted'] and value['target'] not in {'awaiting_human','revision_required'}
             or any(value[name] is not None and not isinstance(value[name],str) for name in ['stage_id','memory_stage'])
             or value['sha'] is not None and (not isinstance(value['sha'],str) or len(value['sha'])!=40
                 or any(char not in '0123456789abcdef' for char in value['sha']))):
@@ -40,9 +54,29 @@ def active(conn, workflow_id):
         parsed=uuid.UUID(generation)
         if parsed.version!=4 or str(parsed)!=generation:return {'invalid':True}
     except ValueError:return {'invalid':True}
-    if conn.execute('SELECT 1 FROM workflow_events WHERE workflow_id=? AND idempotency_key=?',
-                    (workflow_id,DONE+':'+generation)).fetchone():return None
-    return value
+    receipt=conn.execute('SELECT seq,event_type,payload_json FROM workflow_events WHERE workflow_id=? AND idempotency_key=?',
+                         (workflow_id,DONE+':'+generation)).fetchone()
+    if receipt is None:return value
+    done=_payload(receipt['payload_json'])
+    required={'protocol','generation','terminal','release_seq','version','status'}
+    if (receipt['event_type']!=DONE or receipt['seq']<=row['seq']
+            or not isinstance(done,dict) or set(done)!=required or done['protocol']!=PROTOCOL
+            or done['generation']!=generation or type(done['terminal']) is not bool
+            or type(done['release_seq']) is not int or not row['seq']<done['release_seq']<receipt['seq']
+            or type(done['version']) is not int or done['version']<1
+            or not isinstance(done['status'],str)
+            or done['terminal'] and done['status'] not in {'cancelled','completed','failed'}
+            or not done['terminal'] and done['status']!=value['target']):
+        return {'invalid':True}
+    release=conn.execute('SELECT event_type,payload_json FROM workflow_events WHERE workflow_id=? AND seq=?',
+                         (workflow_id,done['release_seq'])).fetchone()
+    expected=dict(version=done['version'],generation=generation,terminal=done['terminal'],target=done['status'])
+    if not done['terminal'] and done['status']!='awaiting_human':
+        expected.update({'from':'awaiting_human','to':done['status']})
+    if (release is None or release['event_type']!='checkpoint.cleanup.released'
+            or _payload(release['payload_json'])!=expected):
+        return {'invalid':True}
+    return None
 
 
 def hold(conn, workflow, generation, pending, sha, *, target, memory_stage=None, accepted=True):
@@ -92,7 +126,9 @@ def finish(workflow_id,generation,*,expected_version=None,said=None):
         if pending.get('invalid') or pending.get('generation')!=generation:
             raise db.WorkflowConflictError('checkpoint cleanup history is unknown or changed')
         terminal=WorkflowStatus(workflow['status']) in workflows.TERMINAL_STATES
-        if not terminal:
+        if terminal:
+            target=WorkflowStatus(workflow['status'])
+        else:
             if expected_version is not None:
                 workflows._require_version(conn,workflow,expected_version,allow_checkpoint_cleanup=True)
             if (workflow['status']!='awaiting_human' or pending['stage_id']!=workflow['current_stage_id']
@@ -113,13 +149,18 @@ def finish(workflow_id,generation,*,expected_version=None,said=None):
                 conn.execute('DELETE FROM workflow_memory WHERE workflow_id=? AND scope_stage=?',
                              (workflow_id,pending['memory_stage']))
             target=WorkflowStatus(pending['target'])
-            if target is WorkflowStatus.AWAITING_HUMAN:
-                workflow=workflows._touch(conn,workflow,'checkpoint.cleanup.released',dict(generation=generation))
-            elif target in {WorkflowStatus.QUEUED,WorkflowStatus.COMPLETED}:
-                workflow=workflows._transition(conn,workflow,target,'checkpoint.cleanup.released',dict(generation=generation))
-            else:raise db.WorkflowConflictError('checkpoint cleanup cannot release an unsupported lifecycle')
+        payload=dict(generation=generation,terminal=terminal,target=target.value)
+        if terminal or target is WorkflowStatus.AWAITING_HUMAN:
+            workflow=workflows._touch(conn,workflow,'checkpoint.cleanup.released',payload)
+        elif target in {WorkflowStatus.QUEUED,WorkflowStatus.COMPLETED,WorkflowStatus.REVISION_REQUIRED}:
+            workflow=workflows._transition(conn,workflow,target,'checkpoint.cleanup.released',payload)
+        else:raise db.WorkflowConflictError('checkpoint cleanup cannot release an unsupported lifecycle')
+        release=conn.execute('SELECT seq FROM workflow_events WHERE workflow_id=? AND idempotency_key=?',
+            (workflow_id,workflows._event_key('checkpoint.cleanup.released',workflow_id,workflow['state_version']))).fetchone()
+        if release is None:raise db.WorkflowConflictError('checkpoint cleanup release receipt disappeared')
         db._append_workflow_event(conn,WorkflowEventCreate(workflow_id=workflow_id,event_type=DONE,
-            idempotency_key=DONE+':'+generation,payload=dict(protocol=PROTOCOL,generation=generation,terminal=terminal)))
+            idempotency_key=DONE+':'+generation,payload=dict(protocol=PROTOCOL,generation=generation,
+                terminal=terminal,release_seq=release['seq'],version=workflow['state_version'],status=workflow['status'])))
         result=db._row_to_workflow(workflow)
     with _MUTEX:_RESOURCES.pop(generation,None)
     return result

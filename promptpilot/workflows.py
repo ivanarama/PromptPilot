@@ -2012,6 +2012,7 @@ def _restart_pending_checkpoint(workflow_id, action, said, pending):
     if not action.checkpoint_head or not action.text.strip():
         raise db.WorkflowConflictError("checkpoint restart requires observed HEAD and reason")
     owned = {}
+    generation = checkpoint_cleanup.new_generation()
 
     def validate(conn):
         workflow = _workflow_row(conn, workflow_id)
@@ -2039,8 +2040,7 @@ def _restart_pending_checkpoint(workflow_id, action, said, pending):
             conn.execute("""UPDATE workflow_stages SET status='executing',
                             completed_at=NULL, summary_json=NULL WHERE id=?""",
                          (pending["stage_id"],))
-            workflow = _transition(conn, workflow, WorkflowStatus.REVISION_REQUIRED,
-                "stage.checkpoint_invalidated", {
+            workflow = _touch(conn, workflow, "stage.checkpoint_invalidated", {
                     **said, **proof, "pending_seq": pending["pending_seq"],
                     "stage_code": pending["stage_code"], "old_pass_revoked": True,
                 }, round_id=round_row["id"])
@@ -2051,7 +2051,27 @@ def _restart_pending_checkpoint(workflow_id, action, said, pending):
                     idempotency_key=f"human.input:checkpoint-restart:{pending['pending_seq']}",
                     payload={**said, "checkpoint_restart": True},
                 ))
-            result = db._row_to_workflow(workflow)
+            checkpoint_cleanup.hold(conn,workflow,generation,pending,None,
+                target=WorkflowStatus.REVISION_REQUIRED.value,accepted=False)
+            owned['cleanup_version']=workflow['state_version']
+        checkpoint_cleanup.register(generation,lambda:None,lambda:True)
+        return checkpoint_cleanup.finish(workflow_id,generation,expected_version=owned['cleanup_version'])
+    except stage_checkpoint.CheckpointCleanupError as exc:
+        with db._connect(immediate=True) as conn:
+            workflow=_workflow_row(conn,workflow_id)
+            held=checkpoint_cleanup.active(conn,workflow_id)
+            if held is not None and held.get('generation')!=generation:
+                raise db.WorkflowConflictError('checkpoint restart cleanup ownership changed') from exc
+            if held is None:
+                workflow=validate(conn)
+            if WorkflowStatus(workflow['status']) not in TERMINAL_STATES:
+                workflow=_touch(conn,workflow,'checkpoint.restart.cleanup_failed',
+                    dict(generation=generation,reason=str(exc)[:800]))
+            if held is None:
+                checkpoint_cleanup.hold(conn,workflow,generation,pending,None,
+                    target=WorkflowStatus.AWAITING_HUMAN.value,accepted=False)
+            result=db._row_to_workflow(workflow)
+        checkpoint_cleanup.register(generation,exc.cleanup,exc.ready)
         return result
     except stage_checkpoint.CheckpointError as exc:
         raise db.WorkflowConflictError(str(exc)) from exc
