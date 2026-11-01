@@ -17,8 +17,9 @@ def legacy_fence(gh, config, number, *, snapshot=None):
     """Legacy dispatch never erases a trusted v1 lifetime transaction.
 
     No readers, journal creation/migration or wire writes occur here. Edited
-    trusted comments, deletions and existing local transactions retain the
-    fence even when their old marker text is no longer visible. Unaltered
+    trusted comments, unavailable actors on typed protocol comments, deletions
+    and existing local transactions retain the fence even when their old
+    marker text is no longer visible. Unaltered
     ordinary no-v1 legacy bytes remain unchanged.
     """
     from . import project_pipeline as pp
@@ -31,10 +32,14 @@ def legacy_fence(gh, config, number, *, snapshot=None):
     fenced=Journal.has_existing_history(journal_directory(config),config['repository'],number)
     for edge in snapshot['edges']:
         node = edge.get('node') or {}
+        author = node.get('author')
+        login = author.get('login') if isinstance(author, dict) else None
+        known_actor = isinstance(login, str) and bool(login.strip())
         if (node.get('__typename')=='CommentDeletedEvent'
                 or node.get('__typename') == 'IssueComment'
-                and (node.get('author') or {}).get('login') == config['trusted_account']
-                and ('<!-- pp:review-routing-' in (node.get('body') or '') or node.get('lastEditedAt') is not None)):
+                and (('<!-- pp:review-routing-' in (node.get('body') or '')
+                      and (not known_actor or login == config['trusted_account']))
+                     or login == config['trusted_account'] and node.get('lastEditedAt') is not None)):
             fenced=True
     if fenced:
         return {'action': 'wait', 'verdict': 'ПУСТО', 'number': number,

@@ -27,6 +27,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 from .pipeline_errors import PipelineError
+from .pipeline_markers import has_review_again
 
 REVIEW = re.compile(r"(?m)^Reviewed-SHA: ([0-9a-f]{40})$.*^Outcome-Label: (reviewed|changes-requested|needs-decision)$.*^<!-- pp:review pp:tail=([0-9]+) -->$", re.S)
 CLAIM_MESSAGE = "PromptPilot service marker: REVIEW result publication claimed."
@@ -554,7 +555,7 @@ def epoch(snapshot: dict, trusted: str) -> dict:
         node = edge.get("node") or {}
         if (node.get("__typename") == "IssueComment" and
                 (node.get("author") or {}).get("login") == trusted and
-                node.get("lastEditedAt") is None and OVERRIDE.search(node.get("body") or "")):
+                node.get("lastEditedAt") is None and has_review_again(node.get("body") or "")):
             anchor_index, anchor = index, edge
     node = anchor["node"]
     anchor_id = node.get("id")
@@ -1513,7 +1514,18 @@ def next_fix(gh: GitHub, config: dict, *, config_path: str | None = None) -> dic
     if routing is not None and routing['enabled']:
         from .review_routing_fix import next_fix as next_claimed_fix
         health = run_health(config, config_path=config_path)
-        return next_claimed_fix(gh, config, config_path=config_path, health=health)
+        from .review_routing_settlement import select as select_settlement
+        settlement=select_settlement(gh,config,config_path=config_path,health=health)
+        if settlement is not None and settlement['action']=='settlement':return settlement
+        from .review_routing_pipeline_policy import settings as execution_settings
+        execution=execution_settings(config)
+        if execution is not None and execution['enabled']:
+            from .review_routing_pipeline_fix import select as select_pipeline_fix
+            selected=select_pipeline_fix(gh,config,config_path=config_path,health=health)
+            if selected is not None:return selected
+        selected=next_claimed_fix(gh, config, config_path=config_path, health=health)
+        if settlement is not None and selected.get('action') in {'empty','wait'}:return settlement
+        return selected
     if config.get("parallel_fix_enabled") is not True:
         raise PipelineError("parallel FIX route is disabled")
     if _configured_replica_count() < 2:
@@ -2654,6 +2666,13 @@ def run(argv=None) -> int:
     owner_lease = owner_parser.add_mutually_exclusive_group(required=True)
     owner_lease.add_argument("--lease")
     owner_lease.add_argument("--lease-file")
+    for name in ['prepare-fix-start','gate-fix-start','prepare-fix-heartbeat','renew-fix-heartbeat',
+                 'prepare-fix-publication','publish-fix','complete-fix-settlement']:
+        start_parser=sub.add_parser(name)
+        start_parser.add_argument('stage',choices=('fix',))
+        start_lease=start_parser.add_mutually_exclusive_group(required=True)
+        start_lease.add_argument('--lease')
+        start_lease.add_argument('--lease-file')
     complete_parser = sub.add_parser("complete")
     complete_parser.add_argument("stage", choices=("review", "merge", "merge-cleanup", "fix"))
     complete_lease = complete_parser.add_mutually_exclusive_group(required=True)
@@ -2698,6 +2717,27 @@ def run(argv=None) -> int:
                     value = next_merge(gh, config, config_path=args.config)
                 else:
                     value = next_fix(gh, config, config_path=args.config)
+            elif args.command == 'prepare-fix-start':
+                from .review_routing_pipeline_fix import issue
+                value=issue(gh,config,args.lease,config_path=args.config)
+            elif args.command == 'gate-fix-start':
+                from .review_routing_start import gate
+                value=gate(gh,args.config,args.lease)
+            elif args.command == 'prepare-fix-heartbeat':
+                from .review_routing_heartbeat import prepare
+                value=prepare(gh,args.config,args.lease)
+            elif args.command == 'renew-fix-heartbeat':
+                from .review_routing_heartbeat import renew
+                value=renew(gh,args.config,args.lease)
+            elif args.command == 'prepare-fix-publication':
+                from .review_routing_publish import prepare
+                value=prepare(gh,args.config,args.lease)
+            elif args.command == 'publish-fix':
+                from .review_routing_publish import publish
+                value=publish(gh,args.config,args.lease)
+            elif args.command == 'complete-fix-settlement':
+                from .review_routing_settlement import complete
+                value=complete(gh,args.config,args.lease)
             elif args.command == "gate-fix-owner":
                 from .fix_handoff import gate
                 value = gate(gh, config, args.lease, config_path=args.config,

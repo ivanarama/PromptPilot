@@ -2952,10 +2952,18 @@ def _tool_available(execution: dict, command: list[str], working_dir: str | None
             return False, "probe_command должен быть непустым массивом строк"
         try:
             _ensure_github_scan_lease(renew=True)
-            result = subprocess.run(
+            runner=subprocess.run
+            probe_kwargs={}
+            if execution.get('_owned_control') is True:
+                from .review_routing_control import run as run_control
+                runner=run_control
+                probe_kwargs['env']=_tool_environment(execution.get('_owned_control_env'))
+            result = runner(
                 probe_command, cwd=str(root), capture_output=True, text=True,
                 timeout=max(1, min(int(execution.get("probe_timeout_seconds", 30)), 120)),
                 encoding="utf-8", errors="replace",
+                **({"creationflags":subprocess.CREATE_NO_WINDOW} if os.name=="nt" else {}),
+                **probe_kwargs,
             )
             _ensure_github_scan_lease()
         except (OSError, subprocess.TimeoutExpired) as exc:
@@ -2985,9 +2993,7 @@ def _lease_argument(task, token: str, purpose: str) -> list[str]:
     return ["--lease-file", str(path)]
 
 
-def _tool_preflight(execution: dict, command: list[str], working_dir: str | None,
-                    *, env_extra: dict[str, str] | None = None) -> dict:
-    root = Path(working_dir or os.getcwd())
+def _tool_environment(env_extra=None):
     environment = os.environ.copy()
     # Replica identity is per claimed task, never process-global operator
     # configuration. A stale shell variable must not opt a legacy queue into
@@ -2998,14 +3004,27 @@ def _tool_preflight(execution: dict, command: list[str], working_dir: str | None
     environment.pop("PP_PROVIDER_OWNERSHIP_KIND", None)
     environment.pop("PP_PIPELINE_TARGET_TOKEN", None)
     environment.pop("PP_PIPELINE_EXCLUDED_NUMBERS", None)
+    environment.pop("PP_TECHNICAL_EXECUTION_NONCE",None)
     if env_extra:
         environment.update(env_extra)
+    return environment
+
+
+def _tool_preflight(execution: dict, command: list[str], working_dir: str | None,
+                    *, env_extra: dict[str, str] | None = None) -> dict:
+    root = Path(working_dir or os.getcwd())
+    environment=_tool_environment(env_extra)
     try:
         _ensure_github_scan_lease(renew=True)
-        result = subprocess.run(
+        runner=subprocess.run
+        if execution.get('_owned_control') is True:
+            from .review_routing_control import run as run_control
+            runner=run_control
+        result = runner(
             command, cwd=str(root), capture_output=True, text=True,
             timeout=max(1, min(int(execution.get("timeout_seconds", 180)), 900)),
             encoding="utf-8", errors="replace", env=environment,
+            **({"creationflags":subprocess.CREATE_NO_WINDOW} if os.name=="nt" else {}),
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise RuntimeError(f"pipeline preflight не выполнен: {exc}") from exc
@@ -3180,6 +3199,7 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
     renders a compact executor-neutral prompt; all repository semantics stay in
     the project tool and its fallback skill.
     """
+    from .worker import ProviderOwnershipError
     matched = _matching_queue(task)
     if matched is None:
         # A profile/series marker may have been renamed while this exact
@@ -3313,6 +3333,14 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
         }
 
     stage = str(execution.get("stage") or queue.get("id") or "").lower()
+    if typed_queue and stage=='fix':
+        started=getattr(task,'started_at',None)
+        if not isinstance(started,datetime):
+            return {'action':'block','mode':'tool','reason':'typed FIX probe requires its claimed task occurrence'}
+        if started.tzinfo is None:started=started.astimezone()
+        execution=dict(execution,_owned_control=True,_owned_control_env={
+            'PP_TASK_ID':str(task.id),'PP_TASK_STARTED_AT':started.astimezone(timezone.utc).isoformat(),
+            'PP_PROVIDER_OWNERSHIP_KIND':'headless','PP_DATA_DIR':str(Path(db.DB_PATH).resolve().parent)})
     command = _tool_command(execution, stage)
     if typed_queue and (stage not in {"review", "fix"} or not command or command[-2:] != ["next", stage]):
         return {"action": "block", "mode": "tool", "reason": "typed routing requires its exact next stage command"}
@@ -3398,6 +3426,8 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                     admission, profile, exc),
                 profile_id,
                 profile, queue)
+        except ProviderOwnershipError:
+            raise
         except RuntimeError as exc:
             reason = str(exc)
             if mode == "auto" and not owned_preflight:
@@ -3435,36 +3465,111 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                 advertised = None
             signed_routing_claim = isinstance(advertised, str) and advertised.startswith("review-routing-")
         from . import review_routing_fix_request as fix_requests
+        from . import review_routing_settlement_request as settlement_requests
+        if preflight_action=='settlement' or advertised_purpose==settlement_requests.PURPOSE:
+            try:
+                request=settlement_requests.decode(str(token or ''))
+                identity=request['identity'];reservation=request['target_reservation']
+                target=dict(stage='fix-pr',number=identity['pr_number'],head=identity['head_sha'],
+                            source=request['attempt']['source'],attempt_id=request['attempt_id'])
+                if (not typed_queue or not typed_response or stage!='fix' or preflight_action!='settlement'
+                        or request['repository']!=str(profile.get('repository') or '').lower()
+                        or reservation['task_id']!=task.id or reservation['task_started_at']!=scheduler_task_started_at
+                        or provider_ownership_kind!='headless' or request['pipeline_replicas']!=replica_count
+                        or preflight.get('target')!=target):
+                    raise settlement_requests.PipelineError('administrative settlement changed its signed task, target or transport')
+                completion=_tool_preflight(dict(execution,_owned_control=True),[*command[:-2],'complete-fix-settlement','fix',
+                    *_lease_argument(task,token,'settlement')],working_dir,env_extra=attempt_env)
+                if (completion.get('action') not in {'resumed','wait'} or completion.get('provider_started') is not False
+                        or completion.get('stage')!='fix' or completion.get('protocol')!='review-routing-v1'):
+                    raise settlement_requests.PipelineError('administrative settlement was not independently confirmed')
+                done=completion['action']=='resumed'
+                if done and (completion.get('source')!=request['attempt']['source']
+                        or completion.get('executor')!=request['attempt']['executor']
+                        or completion.get('attempt_id')!=request['attempt_id'] or completion.get('new_head')!=identity['head_sha']):
+                    raise settlement_requests.PipelineError('settlement completion substituted its old executor or current HEAD')
+                return dict(action='complete_empty',mode='tool',profile_id=profile_id,queue_id=queue.get('id'),
+                    verdict='\u0413\u041e\u0422\u041e\u0412\u041e' if done else '\u041f\u0423\u0421\u0422\u041e',
+                    reason='old executor settled; independent exact-current-HEAD REVIEW resumed' if done else completion.get('reason','settlement waits'),
+                    preflight=preflight,completion=completion)
+            except ProviderOwnershipError:raise
+            except (settlement_requests.PipelineError,RuntimeError,TypeError,ValueError) as exc:
+                return dict(action='block',mode='tool',reason=str(exc),profile_id=profile_id,queue_id=queue.get('id'))
+        if preflight_action=='pipeline-fix' or advertised_purpose==fix_requests.PIPELINE_ADMISSION:
+            from . import review_routing_worker as technical
+            try:
+                request=technical.admission(preflight,task,repository=str(profile.get('repository') or '').lower(),
+                    replicas=replica_count,started_at=scheduler_task_started_at,
+                    ownership_kind=provider_ownership_kind,typed=typed_queue and stage=='fix')
+                priority=db.restore_running_attempt_priority(task.id,task.started_at)
+                if priority is None:raise RuntimeError('technical FIX task changed before provider admission')
+                admission=_reserve_execution_admission(task,profile_id,profile,queue,admission,'tool',
+                    retain_budget=retain_budget,admission_priority=priority)
+                if not admission.get('allowed'):
+                    return _budget_defer_route(admission,profile_id,profile,queue,mode='tool',
+                        phase='post_preflight',preflight=preflight)
+                return technical.prepare_route(task,request,preflight,execution=execution,command=command,
+                    working_dir=working_dir,attempt_env=attempt_env,profile_id=profile_id,
+                    queue_id=queue.get('id'),fallback_prompt=fallback_prompt)
+            except ProviderOwnershipError:raise
+            except (fix_requests.PipelineError,RuntimeError,TypeError,ValueError,sqlite3.Error) as exc:
+                return dict(action='block',mode='tool',reason=str(exc),profile_id=profile_id,queue_id=queue.get('id'))
         fix_claim = isinstance(advertised_purpose, str) and advertised_purpose.startswith("review-routing-v1-fix-")
         if (typed_queue and stage == "fix" and not fix_claim and not typed_response
                 and preflight_action not in {"empty", "wait", "error"}):
             return {"action": "block", "mode": "tool", "reason": "claimed FIX requires a signed exact author handoff; no generic fallback"}
         if fix_claim or typed_response and stage == "fix" and not passive_typed:
+            is_progress = preflight_action == "author-progress"
             try:
-                request = fix_requests.decode(str(token or ""))
+                if is_progress:
+                    from . import review_routing_progress_request as progress_requests
+                    request = progress_requests.decode(str(token or ""))
+                else:
+                    request = fix_requests.decode(str(token or ""))
                 reservation = request["target_reservation"]
-                if (not typed_queue or not typed_response or stage != "fix" or preflight_action != "author-handoff"
-                        or request["purpose"] != fix_requests.ADMISSION
+                expected_action = "author-progress" if is_progress else "author-handoff"
+                expected_purpose = fix_requests.PROGRESS if is_progress else fix_requests.ADMISSION
+                expected_target = {"stage": "fix-pr", "number": request["number"],
+                    "head": request["head"], "source": request["attempt"]["source"]}
+                if is_progress:
+                    expected_target.update(attempt_id=request["attempt_id"], new_head=request["new_head"])
+                if (not typed_queue or not typed_response or stage != "fix" or preflight_action != expected_action
+                        or request["purpose"] != expected_purpose
                         or request["repository"] != str(profile.get("repository") or "").lower()
                         or reservation["task_id"] != task.id
                         or reservation["task_started_at"] != scheduler_task_started_at
                         or reservation["ownership_kind"] != provider_ownership_kind
                         or request["pipeline_replicas"] != replica_count
-                        or preflight.get("target") != {"stage": "fix-pr", "number": request["number"],
-                            "head": request["head"], "source": request["attempt"]["source"]}):
+                        or preflight.get("target") != expected_target):
                     raise fix_requests.PipelineError("claimed FIX signed purpose contradicts its outer envelope, task or transport")
                 complete_command = [*command[:-2], "complete", "fix",
-                                    *_lease_argument(task, token, "author-handoff")]
+                                    *_lease_argument(task, token, expected_action)]
                 completion = _tool_preflight(execution, complete_command, working_dir, env_extra=attempt_env)
-                if (completion.get("action") != "handed-off" or completion.get("provider_started") is not False
+                allowed = {"fixed", "wait"} if is_progress else {"handed-off"}
+                if (completion.get("action") not in allowed or completion.get("provider_started") is not False
                         or completion.get("source") != request["attempt"]["source"]
                         or completion.get("executor") != request["attempt"]["executor"]):
-                    raise fix_requests.PipelineError("author FIX delivery was not verified; no provider fallback")
+                    raise fix_requests.PipelineError("author FIX delivery/progress was not verified; no provider fallback")
+                if is_progress and (completion.get("stage") != "fix"
+                        or completion.get("protocol") != "review-routing-v1"
+                        or completion["action"] == "fixed" and (
+                            completion.get("attempt_id") != request["attempt_id"]
+                            or completion.get("new_head") != request["new_head"])):
+                    raise fix_requests.PipelineError("author progress completion changed its signed exact source")
+            except ProviderOwnershipError:
+                raise
             except (fix_requests.PipelineError, RuntimeError, TypeError, ValueError) as exc:
                 return {"action": "block", "mode": "tool", "reason": str(exc)}
-            # This administrative completion is not a successful FIX and must
-            # not trigger wake_after_success or a new substantive REVIEW.
-            return {"action": "complete_empty", "mode": "tool", "verdict": "ПЕРЕДАНО АВТОРУ",
+            if is_progress:
+                done = completion["action"] == "fixed"
+                return {"action": "complete_empty", "mode": "tool",
+                        "verdict": "\u0413\u041e\u0422\u041e\u0412\u041e" if done else "\u041f\u0423\u0421\u0422\u041e",
+                        "reason": ("author post-push source verified; independent REVIEW may inspect the new HEAD"
+                                   if done else "author progress waits for its canonical owner lease"),
+                        "profile_id": profile_id, "queue_id": queue.get("id"),
+                        "preflight": preflight, "completion": completion}
+            # Assignment alone is not successful FIX and must not wake REVIEW.
+            return {"action": "complete_empty", "mode": "tool", "verdict": "\u041f\u0415\u0420\u0415\u0414\u0410\u041d\u041e \u0410\u0412\u0422\u041e\u0420\u0423",
                     "reason": "author assignment verified; awaiting post-push FIX proof",
                     "profile_id": profile_id, "queue_id": queue.get("id"),
                     "preflight": preflight, "completion": completion}

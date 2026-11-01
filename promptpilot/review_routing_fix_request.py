@@ -23,6 +23,7 @@ from .review_routing_wire import _fields, _integer, _text, canonical, context, h
 ADMISSION = 'review-routing-v1-fix-admission'
 PROGRESS = 'review-routing-v1-fix-progress'
 START = 'review-routing-v1-fix-start'
+PIPELINE_ADMISSION = 'review-routing-v1-pipeline-admission'
 PURPOSES = {ADMISSION, PROGRESS, START}
 FIELDS = ('version protocol purpose stage target_stage repository number head identity author '
           'attempt attempt_id config_sha256 reader_sha256 current_limit pipeline_replicas '
@@ -34,18 +35,26 @@ def capability(config, health):
     policy = preflight(config, health)
     if policy.get('enabled') is not True:
         raise PipelineError('claimed FIX bridge is disabled')
-    if health.get('fix_bridge_contract') != BRIDGE:
+    from .review_routing_progress import BRIDGE as PROGRESS_BRIDGE
+    if health.get('fix_bridge_contract') not in (BRIDGE, PROGRESS_BRIDGE):
         raise PipelineError('checker lacks the complete claimed FIX author-handoff capability')
     if config.get('technical_fix_execution') is not None:
-        raise PipelineError('pipeline FIX execution is not supported by this bridge slice')
+        from . import review_routing_pipeline_policy as pipeline
+        explicit=pipeline.settings(config)
+        if explicit['enabled'] and health.get('fix_execution_contract')!=pipeline.CONTRACT:
+            raise PipelineError('pipeline FIX execution requires its complete paired capability')
     return policy
 
 
 def validate(value):
+    return _validate_structure(value)
+
+
+def _validate_structure(value, *, pipeline=False):
     _fields(value, FIELDS)
     if (type(value['version']) is not int or value['version'] != 1
             or value['protocol'] != VERSION or not isinstance(value['purpose'], str)
-            or value['purpose'] not in {ADMISSION, PROGRESS}
+            or value['purpose'] not in ({PIPELINE_ADMISSION} if pipeline else {ADMISSION, PROGRESS})
             or value['stage'] != 'fix' or value['target_stage'] != 'fix-pr'):
         raise PipelineError('unsupported claimed FIX purpose or transport')
     try:
@@ -63,8 +72,11 @@ def validate(value):
     _fields(value['author'], 'id login')
     _text(value['author']['id'])
     if (not isinstance(value['author']['id'], str) or not value['author']['id']
-            or attempt['executor'] != {'kind': 'author', 'login': value['author']['login']}):
-        raise PipelineError('claimed FIX request must address its bound author')
+            or not pipeline and attempt['executor'] != {'kind': 'author', 'login': value['author']['login']}
+            or pipeline and (attempt['executor']['kind']!='pipeline' or identity.cross_repository
+                             or value['attempt_id'] is not None)):
+        raise PipelineError('claimed FIX request must address its exact permitted executor')
+    _text(value['author']['login'])
     from .review_routing_lease import decimal_id
     if value['attempt_id'] is not None:
         decimal_id(value['attempt_id'])
@@ -112,6 +124,10 @@ def decode(token):
 
 def require_current(value, config, *, write=True):
     validate(value)
+    return _require_current(value,config,write=write)
+
+
+def _require_current(value,config,*,write=True):
     if (pp.digest(config) != value['config_sha256'] or config.get('repository') != value['repository']
             or pp._configured_replica_count() != value['pipeline_replicas']):
         raise PipelineError('claimed FIX effective configuration changed')
@@ -123,13 +139,17 @@ def require_current(value, config, *, write=True):
 
 
 def renew(value, config):
+    return _renew(value,config,require_current)
+
+
+def _renew(value,config,current):
     """Renew only a live exact reservation, reading time after SQLite waits.
 
     Unlike the legacy administrative renewal, an expired row is not revived
     just because a task with that integer ID is still marked running.
     """
     from . import db
-    require_current(value, config)
+    current(value, config)
     expected = value['target_reservation']
     with db._connect(immediate=True) as connection:
         task = connection.execute('SELECT * FROM tasks WHERE id=?', (expected['task_id'],)).fetchone()

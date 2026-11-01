@@ -100,6 +100,9 @@ class Assignment:
             connection.execute('BEGIN IMMEDIATE')
             try:
                 self._schema(connection)
+                if connection.execute('SELECT 1 FROM settings WHERE key IN (?,?)',
+                    (TABLE+':revoking:'+key,TABLE+':revoked:'+key)).fetchone():
+                    raise PipelineError('author delivery was permanently revoked; no new delivery or handoff')
                 row = connection.execute('SELECT * FROM '+TABLE+' WHERE attempt_key=?', (key,)).fetchone()
                 if row is not None and row['scope_json'] != body:
                     raise PipelineError('author assignment immutable scope changed')

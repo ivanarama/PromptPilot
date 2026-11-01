@@ -1019,11 +1019,13 @@ def _forget_provider_tree(task_id: int, tree: OwnedProcess) -> None:
 
 def _close_registered_provider_tree(task_id: int) -> bool:
     """Stop a child before any caller can release its exact target lease."""
+    from .review_routing_control import close_controls
+    control_error=close_controls(task_id)
     key = _provider_tree_key(task_id)
     with _active_provider_trees_lock:
         tree = _active_provider_trees.get(key)
     if tree is None:
-        return True
+        return not control_error
     try:
         _stop_owned_process(tree)
     except Exception as exc:
@@ -1033,7 +1035,7 @@ def _close_registered_provider_tree(task_id: int) -> bool:
         )
         return False
     _forget_provider_tree(task_id, tree)
-    return True
+    return not control_error
 
 
 SPAWN_RETRY_DELAY_S = 20.0
@@ -1625,6 +1627,8 @@ def _execute_task_body(task, admission_complete=None, workorder_check=None):
             route = pipeline_insights.execution_route(
                 task, agent_prompt, getattr(task, "working_dir", None),
                 retain_budget=True)
+        except ProviderOwnershipError:
+            raise
         except Exception as exc:
             route = {
                 "action": "defer", "mode": "skill", "defer_for": "5m",
@@ -1692,6 +1696,11 @@ def _execute_task_body(task, admission_complete=None, workorder_check=None):
             )
             print(f"  -> Pipeline preflight completed without agent: {reason}")
             return
+        if route.get('technical_fix') is not None:
+            if workorder_check is not None:
+                raise RuntimeError('technical FIX cannot substitute a workorder execution factory')
+            from .review_routing_worker import execute as execute_technical_fix
+            return execute_technical_fix(task,route)
         agent_prompt = route["prompt"]
         if prompt_constraint and prompt_constraint not in agent_prompt:
             agent_prompt += "\n\n" + prompt_constraint

@@ -18,7 +18,7 @@ import pytest
 from promptpilot.models import TaskCreate
 from promptpilot.pipeline_errors import PipelineError
 from promptpilot.pr_identity import PRIdentityV1
-from promptpilot.review_routing_execution import OneUseStart,TABLE,SCHEMA
+from promptpilot.review_routing_execution import OneUseStart,TABLE,SCHEMA,ESTABLISHED
 from promptpilot.review_routing_wire import context
 from test_review_routing_wire import publication
 
@@ -151,6 +151,31 @@ def test_actual_child_then_lost_factory_return_cannot_launch_again(start_scope):
         for child in children:child.wait(timeout=15)
 
 
+def test_reopening_after_receipt_table_loss_cannot_launch_again(start_scope):
+    db,scope=start_scope;store=OneUseStart(db.DB_PATH);calls=[]
+    store.invoke(scope,final_guard=lambda _scope:True,factory=lambda:calls.append('one'))
+    update(db.DB_PATH,'DROP TABLE '+TABLE)
+    with pytest.raises(PipelineError,match='disappeared'):
+        reopened=OneUseStart(db.DB_PATH)
+        reopened.invoke(scope,final_guard=lambda _scope:True,factory=lambda:calls.append('second'))
+    assert calls==['one']
+
+
+@pytest.mark.parametrize('erase', [True,False])
+def test_missing_or_corrupt_established_marker_preserves_start_barrier(start_scope,erase):
+    db,scope=start_scope;store=OneUseStart(db.DB_PATH);calls=[]
+    store.invoke(scope,final_guard=lambda _scope:True,factory=lambda:calls.append('one'))
+    if erase:
+        update(db.DB_PATH,'DELETE FROM settings WHERE key=?',(ESTABLISHED,))
+    else:
+        update(db.DB_PATH,"UPDATE settings SET value='changed' WHERE key=?",(ESTABLISHED,))
+    with pytest.raises(PipelineError,match='marker'):
+        OneUseStart(db.DB_PATH)
+    with pytest.raises(PipelineError,match='marker'):
+        store.invoke(scope,final_guard=lambda _scope:True,factory=lambda:calls.append('second'))
+    assert calls==['one']
+
+
 def test_new_attempt_or_new_running_task_never_reuses_consumed_source(start_scope):
     db,scope=start_scope;store=OneUseStart(db.DB_PATH);calls=[]
     store.invoke(scope,final_guard=lambda _scope:True,factory=lambda:calls.append('one'))
@@ -212,3 +237,89 @@ def test_child_observation_cannot_reset_or_rebind_a_consumed_start(start_scope):
     with pytest.raises(PipelineError):store.observe_started(scope,124)
     with pytest.raises(PipelineError):store.invoke(scope,final_guard=lambda _scope:True,factory=lambda:None)
     assert store.status(scope)['pid']==123
+
+
+
+def test_stopped_receipt_requires_original_kernel_boundary_and_keeps_start_spent(start_scope):
+    from promptpilot.process_tree import OwnedProcess
+    db,scope=start_scope;store=OneUseStart(db.DB_PATH)
+    tree=store.invoke(scope,final_guard=lambda _scope:True,
+        factory=lambda:OwnedProcess.start([sys.executable,'-c','import time; time.sleep(60)'],
+                                          stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL))
+    try:
+        store.retain_owned(scope,tree);store.observe_started(scope,tree.process.pid)
+        store.confirm_stopped(scope,tree)
+        assert tree.process.poll() is not None and store.status(scope)['state']=='stopped'
+        with pytest.raises(PipelineError):store.invoke(scope,final_guard=lambda _scope:True,factory=lambda:pytest.fail('second factory'))
+    finally:tree.close()
+
+
+def test_other_process_handle_never_settles_the_original_started_task(start_scope):
+    from promptpilot.process_tree import OwnedProcess
+    db,scope=start_scope;store=OneUseStart(db.DB_PATH)
+    def child():return OwnedProcess.start([sys.executable,'-c','import time; time.sleep(60)'],
+        stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    tree=store.invoke(scope,final_guard=lambda _scope:True,factory=child)
+    other=child()
+    try:
+        store.retain_owned(scope,tree);store.observe_started(scope,tree.process.pid)
+        impostor=OwnedProcess(tree.process)
+        with pytest.raises(PipelineError):store.retain_owned(scope,impostor)
+        with pytest.raises(PipelineError):store.confirm_stopped(scope,impostor)
+        with pytest.raises(PipelineError,match='original owned lifetime'):store.confirm_stopped(scope,other)
+        assert tree.process.poll() is None and store.status(scope)['state']=='launched'
+        store.confirm_stopped(scope,tree)
+        assert other.process.poll() is None
+    finally:
+        tree.close();other.close()
+        tree.process.wait(timeout=10);other.process.wait(timeout=10)
+
+
+def test_original_owned_cleanup_failure_retains_unknown_until_same_handle_succeeds(start_scope):
+    from promptpilot.process_tree import OwnedProcess
+    db,scope=start_scope;store=OneUseStart(db.DB_PATH)
+    tree=store.invoke(scope,final_guard=lambda _scope:True,
+        factory=lambda:OwnedProcess.start([sys.executable,'-c','import time; time.sleep(60)'],
+                                          stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL))
+    original=tree.close;attempts=[]
+    def uncertain():
+        if not attempts:attempts.append(True);raise OSError('original kernel boundary not confirmed')
+        original()
+    try:
+        store.retain_owned(scope,tree);store.observe_started(scope,tree.process.pid)
+        tree.close=uncertain
+        with pytest.raises(OSError):store.confirm_stopped(scope,tree)
+        assert store.status(scope)['state']=='launched' and tree.process.poll() is None
+        store.confirm_stopped(scope,tree)
+        assert store.status(scope)['state']=='stopped'
+    finally:
+        original();tree.process.wait(timeout=10)
+
+
+
+@pytest.mark.parametrize('fault',[None,'wrong-nonce','cancel','expired'])
+def test_heartbeat_memory_proof_is_factory_bound_and_cannot_authorize_relaunch(start_scope,fault):
+    from promptpilot.process_tree import OwnedProcess
+    db,scope=start_scope;store=OneUseStart(db.DB_PATH)
+    update(db.DB_PATH,'UPDATE pipeline_target_reservations SET strict_lifetime=1')
+    nonce='1'*64
+    tree=store.invoke(scope,final_guard=lambda _scope:True,
+        factory=lambda:OwnedProcess.start([sys.executable,'-c','import time; time.sleep(60)'],
+            stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL))
+    try:
+        store.observe_started(scope,tree.process.pid,live_nonce=nonce)
+        store.observe_started(scope,tree.process.pid,live_nonce=nonce)
+        if fault=='wrong-nonce':
+            with pytest.raises(PipelineError):store.verify_live(scope,'2'*64)
+        elif fault=='cancel':
+            db.request_cancel(scope['task_id'])
+            with pytest.raises(PipelineError):store.verify_live(scope,nonce)
+        elif fault=='expired':
+            update(db.DB_PATH,"UPDATE pipeline_target_reservations SET expires_at='2000-01-01T00:00:00+00:00'")
+            with pytest.raises(PipelineError):store.verify_live(scope,nonce)
+        else:
+            assert store.verify_live(scope,nonce) is True
+            with pytest.raises(PipelineError):store.invoke(scope,final_guard=lambda _scope:True,factory=lambda:pytest.fail('second factory'))
+        store.confirm_stopped(scope,tree)
+        with pytest.raises(PipelineError):store.verify_live(scope,nonce)
+    finally:tree.close();tree.process.wait(timeout=10)

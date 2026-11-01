@@ -3,10 +3,10 @@ from __future__ import annotations
 
 from . import project_pipeline as pp
 from .pipeline_errors import PipelineError
-from .review_routing_baseline import _edges
+from .review_routing_baseline import _edges, historical
 from .review_routing_lease import decimal_id
 from .review_routing_proof import reduce
-from .review_routing_wire import records
+from .review_routing_wire import records, context
 
 
 def verified_depth(snapshot,*,trusted):
@@ -38,12 +38,19 @@ def verified_depth(snapshot,*,trusted):
         decimal_id(review_id);decimal_id(claim_id)
         if review_id not in by_id or claim_id not in by_id:
             raise PipelineError('routing legacy completion references missing proof history')
-        # Reconstruct the exact server prefix at this completion. Reusing the
-        # current HEAD/epoch for older rounds would silently discard proofs.
+        # This is scheduling history, not a current mutation proof. GitHub can
+        # insert a later-pushed commit before old comments by its commit date.
+        # Verify the immutable triple in its override interval; never infer an
+        # old server epoch from a prefix of today's merged timeline.
         index=positions[ident]
-        prefix=dict(snapshot,headRefOid=head,edges=edges[:index+1])
-        info=pp.epoch(prefix,trusted)
-        pp.validate_epoch_safety(info,trusted)
+        start=0
+        for offset,edge in enumerate(edges[:index+1]):
+            event=edge['node']
+            if (event['__typename']=='IssueComment'
+                    and (event.get('author') or {}).get('login')==trusted
+                    and pp.has_review_again(event.get('body') or '')):
+                start=offset+1
+        info={'hash':epoch,'edges':edges[start:index+1]}
         established=pp.proof(info,head,trusted)
         if (info['hash']!=epoch or established is None
                 or str(established['review_id'])!=review_id
@@ -60,14 +67,25 @@ def verified_depth(snapshot,*,trusted):
     boundaries+=[(proof.publication,proof.completion.id) for proof in ledger.proofs]
     for publication,boundary in boundaries:
         payload=publication.payload
+        identity=dict(snapshot['identity'],head_sha=payload['identity']['head_sha'])
+        if identity!=payload['identity'] or snapshot['author']!=payload['author']:
+            raise PipelineError('routing historical publication identity or author differs from PR')
+        original=historical(snapshot,payload['audit'],identity=identity,author=payload['author'],
+                            publication_index=positions[publication.id],
+                            publication_context=context(payload),trusted=trusted)
         # Even an unfinished root needs a real historical server anchor.
         # Completed proofs must retain that epoch through their completion.
-        prefix=dict(snapshot,headRefOid=payload['identity']['head_sha'],
-                    edges=edges[:positions[boundary]+1])
-        info=pp.epoch(prefix,trusted)
+        info=pp.epoch(original,trusted)
         pp.validate_epoch_safety(info,trusted)
         if (info['hash'],info['anchor_id'])!=(payload['epoch'],payload['anchor']):
             raise PipelineError('routing typed proof has no matching historical server epoch/anchor')
+        suffix=[edge for edge in edges[positions[publication.id]:positions[boundary]+1]
+                if edge['node']['__typename']!='PullRequestCommit']
+        pp.validate_epoch_safety({'edges':suffix},trusted)
+        if any(edge['node']['__typename']=='IssueComment'
+               and (edge['node'].get('author') or {}).get('login')==trusted
+               and pp.has_review_again(edge['node'].get('body') or '') for edge in suffix):
+            raise PipelineError('routing typed publication crossed a review override')
     typed=[{'kind':'typed','completion_id':proof.completion.id,'publication_id':proof.publication.id,
             'head':proof.source['head'],'epoch':proof.source['epoch'],'outcome':proof.outcome,
             'index':positions[proof.completion.id]} for proof in ledger.proofs]
@@ -80,8 +98,10 @@ def verified_depth(snapshot,*,trusted):
         epochs.add(key)
     # A typed root's declared depth is immutable reviewed context, and must
     # agree with independently verified transactions preceding that root.
-    for proof in ledger.proofs:
-        prior=sum(item['index']<positions[proof.publication.id] for item in completed)
-        if proof.publication.payload['depth']!=prior:
+    for publication in history:
+        if publication.payload['kind']!='publication' or publication.id in ledger.ignored_ids:
+            continue
+        prior=sum(item['index']<positions[publication.id] for item in completed)
+        if publication.payload['depth']!=prior:
             raise PipelineError('routing typed publication depth contradicts verified history')
     return {'depth':len(completed),'completed':completed,'ledger':ledger,'mutation_authorized':False}

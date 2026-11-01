@@ -19,7 +19,7 @@ def page(*, cursor="first", more=False):
               labels={"nodes":[],"pageInfo":{"hasNextPage":False}},
               timelineItems={"updatedAt":"2026-10-29T00:00:00Z",
                              "pageInfo":{"hasNextPage":more,"endCursor":cursor},
-                             "edges":[{"cursor":cursor,"node":{"__typename":"PullRequestCommit","id":"COMMIT","commit":{"oid":BASE["headRefOid"]}}}]})
+                             "edges":[{"cursor":cursor,"node":{"__typename":"PullRequestCommit","id":"COMMIT" if cursor=="first" else "COMMIT_"+cursor,"commit":{"oid":BASE["headRefOid"]}}}]})
     return {"data":{"repository":{"id":"R_BASE","nameWithOwner":"owner/repo","pullRequest":pr}}}
 
 
@@ -34,7 +34,7 @@ class Reader:
         if args == ("api", "repos/owner/repo"):
             return {"full_name":"owner/repo","node_id":"R_BASE"}
         assert args[1] == "graphql"
-        assert "author{id login}" in args[3]
+        assert "author{login ... on Node{id}}" in args[3]
         return next(self.pages)
 
 
@@ -82,3 +82,10 @@ def test_same_head_different_identity_between_complete_passes_is_not_a_stable_pr
     second["data"]["repository"]["pullRequest"]["headRefName"]="other"
     with pytest.raises(PipelineError,match="stable reads"):
         snapshots.stable_timeline(Reader([page(),second]), CONFIG, 42)
+
+
+def test_nonfinal_page_watermark_cannot_change_during_a_complete_pass():
+    first=page(more=True);last=page(cursor='second')
+    last['data']['repository']['pullRequest']['timelineItems']['updatedAt']='2026-10-29T00:01:00Z'
+    with pytest.raises(PipelineError,match='watermark changed'):
+        snapshots.stable_timeline(Reader([first,last]),CONFIG,42)

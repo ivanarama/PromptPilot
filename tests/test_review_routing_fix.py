@@ -23,6 +23,34 @@ from test_review_routing_stage_guard import setup_guard as setup_guard  # noqa: 
 @pytest.fixture
 def author_bridge(adapter, isolated_db, monkeypatch, tmp_path, request):
     peer, health, path, report, run = adapter
+    source_dir=tmp_path
+    if getattr(request,'param',None)=='real-source':
+        from promptpilot.process_tree import run_owned
+        repo=tmp_path/'source';repo.mkdir()
+        def git(*args):
+            result=run_owned(['git','-c','maintenance.auto=false','-c','gc.auto=0','-C',str(repo),*args],
+                capture_output=True,text=True,encoding='utf-8',timeout=60)
+            assert result.returncode==0,result.stderr
+            return result.stdout.strip()
+        git('init','-q');git('config','user.name','Pipeline fixture')
+        git('config','user.email','pipeline@example.invalid')
+        git('remote','add','origin','https://github.com/owner/repo.git')
+        (repo/'app.py').write_text('reviewed source',encoding='utf-8')
+        git('add','app.py');git('commit','-qm','reviewed source')
+        head=git('rev-parse','HEAD')
+        pr=peer.current['data']['repository']['pullRequest']
+        git('branch','-M',pr['headRefName'])
+        pr['headRefOid']=head
+        for edge in pr['timelineItems']['edges']:
+            node=edge.get('node') or {}
+            if node.get('__typename')=='PullRequestCommit' and (node.get('commit') or {}).get('oid')=='a'*40:
+                node['commit']['oid']=head
+        for field in ['review_candidates','content_review_candidates','parallel_review_candidates']:
+            for item in health.get(field,[]):
+                if item.get('number')==42:item['head']=head
+        value=json.loads(report.read_text(encoding='utf-8'));value['head']=head
+        report.write_text(json.dumps(value),encoding='utf-8')
+        source_dir=repo
     if getattr(request, 'param', None) == 'fork':
         pr = peer.current['data']['repository']['pullRequest']
         pr['headRepository'] = {'id': 'R_FORK', 'nameWithOwner': 'contributor/repo'}
@@ -32,8 +60,8 @@ def author_bridge(adapter, isolated_db, monkeypatch, tmp_path, request):
     code, completed = run('complete', 'review', '--lease', selected['lease'], '--report', str(report))
     assert code == 0, completed
     health['fix_bridge_contract'] = copy.deepcopy(requests.BRIDGE)
-    health['technical_fix_candidates'] = [{'stage': 'fix-pr', 'number': 42, 'head': 'a'*40, 'source': completed['source']}]
-    task = isolated_db.create_task(TaskCreate(prompt='Project - FIX', working_dir=str(tmp_path)))
+    health['technical_fix_candidates'] = [{'stage': 'fix-pr', 'number': 42, 'head': completed['source']['head'], 'source': completed['source']}]
+    task = isolated_db.create_task(TaskCreate(prompt='Project - FIX', working_dir=str(source_dir)))
     task = isolated_db.get_next_runnable()
     assert task is not None
     monkeypatch.setenv('PP_TASK_ID', str(task.id))

@@ -239,8 +239,12 @@ def test_uncertain_owned_boundaries_never_project_or_retry(isolated_db, tmp_path
     class FixtureInterruption(BaseException):
         pass
 
-    item = gating(isolated_db, tmp_path, timeout_seconds=1,
-                  commands=[command("import time; time.sleep(2)" if boundary == "timeout_cleanup" else "print('ok')")])
+    # Factory/interruption probes deliberately lose the adapter return value.
+    # Keep their finite private child alive until this fixture's retained owner
+    # closes it, rather than racing an already exited process group on macOS.
+    source = ("import time; time.sleep(30)" if boundary in {"factory", "base_exception"}
+              else "import time; time.sleep(2)" if boundary == "timeout_cleanup" else "print('ok')")
+    item = gating(isolated_db, tmp_path, timeout_seconds=1, commands=[command(source)])
     factories, owned = [], []
     original_start = process_tree.OwnedProcess.start
     original_close = process_tree.OwnedProcess.close
