@@ -11,6 +11,7 @@ import json
 
 from .pipeline_errors import PipelineError
 from .review_routing_wire import audit_binding, context, hash64, records
+from .review_routing_lease import timestamp
 
 
 MAX_BYTES=8388608
@@ -44,6 +45,11 @@ def _edges(snapshot):
                 or not isinstance(ident,str) or not ident or ident in ids):
             raise PipelineError('routing audit boundary has missing/duplicate server identity')
         cursors.add(cursor);ids.add(ident)
+        if node.get('__typename')=='IssueComment':
+            if 'lastEditedAt' not in node:
+                raise PipelineError('routing comment edit status is unavailable')
+            if node['lastEditedAt'] is not None:
+                timestamp(node['lastEditedAt'])
     return snapshot['edges']
 
 

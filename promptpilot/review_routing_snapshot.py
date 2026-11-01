@@ -39,6 +39,7 @@ def _pass(gh, config, number, repo_id):
     owner, name = config["repository"].split("/")
     edges, seen_cursors, seen_edges = [], set(), set()
     cursor, header = None, None
+    watermark = None
     for _page in range(1000):
         args = ["api", "graphql", "-f", f"query={_query()}", "-F", f"owner={owner}",
                 "-F", f"name={name}", "-F", f"number={number}"]
@@ -77,8 +78,11 @@ def _pass(gh, config, number, repo_id):
                            labelsComplete=not labels["pageInfo"]["hasNextPage"])
             if header is not None and current != header:
                 raise PipelineError("typed PR identity/state changed during pagination")
-            header = current
             connection = pr["timelineItems"]
+            page_watermark = connection["updatedAt"]
+            if header is not None and page_watermark != watermark:
+                raise PipelineError("typed timeline watermark changed during pagination")
+            header, watermark = current, page_watermark
             page_info = connection["pageInfo"]
             if type(page_info["hasNextPage"]) is not bool or not isinstance(connection["edges"], list):
                 raise PipelineError("typed timeline pagination is incomplete")

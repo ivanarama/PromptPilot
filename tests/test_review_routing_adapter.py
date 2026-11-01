@@ -88,6 +88,19 @@ def test_actual_first_round_remains_legacy_when_opted_in(adapter):
     assert 'protocol' not in pp.decode_signed_lease(selected['lease']) and peer.posts==[]
 
 
+def test_backdated_later_commit_does_not_erase_completed_legacy_rounds(adapter):
+    peer,_health,_path,report,run=adapter
+    edges=peer.current['data']['repository']['pullRequest']['timelineItems']['edges']
+    edges.insert(2,{'cursor':'LATE_OLD_DATE','node':{'__typename':'PullRequestCommit',
+        'id':'LATE_OLD_DATE','commit':{'oid':'9'*40}}})
+    code,selected=run('next','review')
+    assert code==0 and selected['action']=='audit',selected
+    assert selected['review_depth']==2
+    code,completed=run('complete','review','--lease',selected['lease'],'--report',str(report))
+    assert code==0 and completed['outcome']=='technical-handoff',completed
+    assert peer.posts==['publication','claim','completion']
+
+
 @pytest.mark.parametrize('change',['missing-contract','red','reader','closed'])
 def test_actual_entrypoints_fail_closed_without_a_compatible_current_peer(adapter,change):
     peer,health,path,_report,run=adapter

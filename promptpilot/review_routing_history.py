@@ -3,10 +3,11 @@ from __future__ import annotations
 
 from . import project_pipeline as pp
 from .pipeline_errors import PipelineError
-from .review_routing_baseline import _edges
+from .review_routing_baseline import _edges, capture
 from .review_routing_lease import decimal_id
 from .review_routing_proof import reduce
 from .review_routing_wire import records
+from .pr_identity import PRIdentityV1
 
 
 def verified_depth(snapshot,*,trusted):
@@ -38,12 +39,19 @@ def verified_depth(snapshot,*,trusted):
         decimal_id(review_id);decimal_id(claim_id)
         if review_id not in by_id or claim_id not in by_id:
             raise PipelineError('routing legacy completion references missing proof history')
-        # Reconstruct the exact server prefix at this completion. Reusing the
-        # current HEAD/epoch for older rounds would silently discard proofs.
+        # This is scheduling history, not a current mutation proof. GitHub can
+        # insert a later-pushed commit before old comments by its commit date.
+        # Verify the immutable triple in its override interval; never infer an
+        # old server epoch from a prefix of today's merged timeline.
         index=positions[ident]
-        prefix=dict(snapshot,headRefOid=head,edges=edges[:index+1])
-        info=pp.epoch(prefix,trusted)
-        pp.validate_epoch_safety(info,trusted)
+        start=0
+        for offset,edge in enumerate(edges[:index+1]):
+            event=edge['node']
+            if (event['__typename']=='IssueComment'
+                    and (event.get('author') or {}).get('login')==trusted
+                    and pp.OVERRIDE.search(event.get('body') or '')):
+                start=offset+1
+        info={'hash':epoch,'edges':edges[start:index+1]}
         established=pp.proof(info,head,trusted)
         if (info['hash']!=epoch or established is None
                 or str(established['review_id'])!=review_id
@@ -60,6 +68,17 @@ def verified_depth(snapshot,*,trusted):
     boundaries+=[(proof.publication,proof.completion.id) for proof in ledger.proofs]
     for publication,boundary in boundaries:
         payload=publication.payload
+        identity=dict(snapshot['identity'],head_sha=payload['identity']['head_sha'])
+        if identity!=payload['identity'] or snapshot['author']!=payload['author']:
+            raise PipelineError('routing historical publication identity or author differs from PR')
+        if boundary==publication.id:
+            prefix=dict(snapshot,identity=identity,headRefOid=identity['head_sha'],
+                        identity_sha256=PRIdentityV1(**identity).sha256,
+                        edges=edges[:positions[publication.id]])
+            observed=capture(prefix)
+            if any(observed[key]!=payload['audit'][key] for key in
+                   ('snapshot_sha256','last_edge_cursor','last_edge_node_id')):
+                raise PipelineError('routing historical publication audit prefix is unavailable or changed')
         # Even an unfinished root needs a real historical server anchor.
         # Completed proofs must retain that epoch through their completion.
         prefix=dict(snapshot,headRefOid=payload['identity']['head_sha'],

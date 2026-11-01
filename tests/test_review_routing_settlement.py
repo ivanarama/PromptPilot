@@ -34,6 +34,14 @@ def settlement(records, **changes):
     return wire.Record('1080', '2026-10-29T00:00:50Z', data)
 
 
+def test_duplicate_settlement_still_requires_its_actual_lease_owner():
+    records=history()[:6]
+    receipt=settlement(records)
+    expired=wire.Record('1090','2026-10-29T01:00:00Z',receipt.payload)
+    with pytest.raises(PipelineError):
+        reduce(records+[receipt,expired])
+
+
 def test_explicit_settlement_parks_the_spent_slot_and_requires_exact_new_head_resume():
     records = history()[:6]
     root = records[3]

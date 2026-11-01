@@ -27,6 +27,14 @@ def changed(record, **values):
     return wire.Record(record.id, record.created_at, data)
 
 
+def test_author_cannot_start_after_its_terminal_fix_done():
+    records=history()[:8]
+    late=records[6]
+    records[6]=wire.Record(late.id,'2026-10-29T00:00:08Z',late.payload)
+    with pytest.raises(PipelineError,match='terminal fix-done'):
+        reduce(records)
+
+
 def test_shared_vectors_bind_every_record_and_finite_lifetime_ledger():
     records = history()
     assert reduce(records).to_dict() == GOLDEN["expected_ledger"]

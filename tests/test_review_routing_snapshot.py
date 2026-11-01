@@ -82,3 +82,10 @@ def test_same_head_different_identity_between_complete_passes_is_not_a_stable_pr
     second["data"]["repository"]["pullRequest"]["headRefName"]="other"
     with pytest.raises(PipelineError,match="stable reads"):
         snapshots.stable_timeline(Reader([page(),second]), CONFIG, 42)
+
+
+def test_nonfinal_page_watermark_cannot_change_during_a_complete_pass():
+    first=page(more=True);last=page(cursor='second')
+    last['data']['repository']['pullRequest']['timelineItems']['updatedAt']='2026-10-29T00:01:00Z'
+    with pytest.raises(PipelineError,match='watermark changed'):
+        snapshots.stable_timeline(Reader([first,last]),CONFIG,42)

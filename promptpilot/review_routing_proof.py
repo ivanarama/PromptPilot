@@ -195,6 +195,8 @@ def _phases(records, attempts):
             raise PipelineError("routing phase prerequisite is missing")
         if "barrier" in done:
             raise PipelineError("routing attempt is parked behind an ambiguity barrier")
+        if "fix-done" in done:
+            raise PipelineError("routing attempt already has terminal fix-done")
         if data["phase"] == "fix-done":
             if data["details"]["source_trailer"] != sha(root.payload["source"]):
                 raise PipelineError("routing FIX source trailer differs")
@@ -221,6 +223,7 @@ def _settlements(records, attempts, phases):
         if (root is None or record.order <= root.order or data['source'] != root.payload['source']
                 or data['context_sha256'] != context(root.payload)):
             raise PipelineError('settlement lacks its exact canonical attempt/context/source')
+        owner_at(records, root, record, purpose='technical-attempt')
         previous = settled.get(root.id)
         if previous is not None:
             if sha(previous.payload) != sha(data):
@@ -236,7 +239,6 @@ def _settlements(records, attempts, phases):
         expected = 'author-unassigned' if kind == 'author' else 'pipeline-stopped' if 'started' in state else 'not-started'
         if data['executor_outcome'] != expected:
             raise PipelineError('settlement outcome does not confirm this exact old executor')
-        owner_at(records, root, record, purpose='technical-attempt')
         settled[root.id] = record
     return tuple(settled.values())
 

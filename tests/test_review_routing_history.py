@@ -7,7 +7,7 @@ from promptpilot import project_pipeline as pp
 from promptpilot.pipeline_errors import PipelineError
 from promptpilot.review_routing_baseline import capture
 from promptpilot.review_routing_history import verified_depth
-from promptpilot.review_routing_wire import context,outcome
+from promptpilot.review_routing_wire import context,outcome,parse,render
 from test_review_routing_baseline import snapshot,append,root
 
 
@@ -59,6 +59,29 @@ def test_two_verified_legacy_rounds_then_typed_completion_have_depth_three():
     assert result['ledger'].budget_used==0 and result['mutation_authorized'] is False
     anchor(state,'c'*40,'AFTER_FIX')
     assert verified_depth(state,trusted='owner')['depth']==3
+
+
+@pytest.mark.parametrize('change',['audit','author','identity','edit-status'])
+def test_historical_publication_cannot_borrow_missing_or_different_context(change):
+    state=history();add_typed(state)
+    old_context=new_context=None
+    for edge in state['edges']:
+        node=edge['node']
+        if change=='edit-status' and node['__typename']=='IssueComment':
+            del node['lastEditedAt']
+        if 'pp:review-routing-v1 ' not in node.get('body',''):continue
+        payload=parse(node['body'])
+        if payload['kind']=='publication':
+            old_context=context(payload)
+            if change=='audit':payload['audit']['snapshot_sha256']='f'*64
+            elif change=='author':payload['author']={'id':'OTHER','login':'other'}
+            elif change=='identity':
+                payload['identity'].update(base_repository='other/repo',head_repository='other/repo')
+            new_context=context(payload)
+        elif payload.get('context_sha256')==old_context:
+            payload['context_sha256']=new_context
+        node['body']=render(payload)
+    with pytest.raises(PipelineError):verified_depth(state,trusted='owner')
 
 
 @pytest.mark.parametrize('change',['missing-review','missing-claim','foreign-review','wrong-epoch','edited','duplicate-id','deletion'])
