@@ -92,7 +92,9 @@ def test_private_new_issuer_to_actual_owned_factory_has_one_canonical_attempt(pi
         assert peer.posts==before
         assert len(ledger(peer,path).attempts)==ledger(peer,path).budget_used==1
         assert not peer.assignment_posts
-    finally:tree.close()
+    finally:
+        OneUseStart(database.DB_PATH).confirm_stopped(request['scope'],tree)
+        tree.close()
 
 
 def test_existing_start_does_not_reconstruct_lost_local_issuance(pipeline_case):

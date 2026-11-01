@@ -84,7 +84,9 @@ def test_canonical_start_seam_launches_one_actual_owned_child_and_never_relaunch
         assert store.status(value['scope'])['state']=='launched'
         with pytest.raises(PipelineError):metadata_launch(peer,str(path),token,factory=factory)
         assert len(calls)==1
-    finally:tree.close()
+    finally:
+        OneUseStart(database.DB_PATH).confirm_stopped(value['scope'],tree)
+        tree.close()
 
 
 @pytest.mark.parametrize('fault',['cancel','actor','reader','strict-lifetime','checker-started','checker-task'])

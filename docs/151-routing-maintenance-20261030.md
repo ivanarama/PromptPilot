@@ -302,3 +302,18 @@ bytes/receipt before any factory; three cases passed57.20s. The initial combined
 source/default-author check had two cases passed28.96s. Metadata-only launch
 composition now lives solely in test helpers; its positive case passed21.47s.
 Installed worker wiring, heartbeat/CAS/settlement and real pairing remain open.
+
+
+The private one-use store now automatically retains an actual OwnedProcess
+returned by its sole factory, before any later audit I/O. A caller cannot attach
+an arbitrary process or same-PID wrapper as the original lifetime. A trusted
+observer must close that exact retained kernel boundary and wait for its process
+before recording stopped; failed close retains ownership for a same-handle retry.
+Missing ownership never produces this receipt from PID absence, expiry or exit
+text. Stopped remains a spent start and does not authorize relaunch or publication.
+The private schema adds stopped explicitly and still refuses unknown old schemas;
+no live data migration was performed. Four focused real-owned process cases
+passed17.08s; an additional same-PID impostor boundary passed4.94s. An earlier
+three-case run had a test teardown ResourceWarning because the unrelated child
+was closed without waiting; tests now wait for both owned children, and that
+failed run is not reported as PASS. Public worker and settlement wiring are pending.

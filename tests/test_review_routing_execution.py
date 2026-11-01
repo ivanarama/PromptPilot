@@ -237,3 +237,60 @@ def test_child_observation_cannot_reset_or_rebind_a_consumed_start(start_scope):
     with pytest.raises(PipelineError):store.observe_started(scope,124)
     with pytest.raises(PipelineError):store.invoke(scope,final_guard=lambda _scope:True,factory=lambda:None)
     assert store.status(scope)['pid']==123
+
+
+
+def test_stopped_receipt_requires_original_kernel_boundary_and_keeps_start_spent(start_scope):
+    from promptpilot.process_tree import OwnedProcess
+    db,scope=start_scope;store=OneUseStart(db.DB_PATH)
+    tree=store.invoke(scope,final_guard=lambda _scope:True,
+        factory=lambda:OwnedProcess.start([sys.executable,'-c','import time; time.sleep(60)'],
+                                          stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL))
+    try:
+        store.retain_owned(scope,tree);store.observe_started(scope,tree.process.pid)
+        store.confirm_stopped(scope,tree)
+        assert tree.process.poll() is not None and store.status(scope)['state']=='stopped'
+        with pytest.raises(PipelineError):store.invoke(scope,final_guard=lambda _scope:True,factory=lambda:pytest.fail('second factory'))
+    finally:tree.close()
+
+
+def test_other_process_handle_never_settles_the_original_started_task(start_scope):
+    from promptpilot.process_tree import OwnedProcess
+    db,scope=start_scope;store=OneUseStart(db.DB_PATH)
+    def child():return OwnedProcess.start([sys.executable,'-c','import time; time.sleep(60)'],
+        stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    tree=store.invoke(scope,final_guard=lambda _scope:True,factory=child)
+    other=child()
+    try:
+        store.retain_owned(scope,tree);store.observe_started(scope,tree.process.pid)
+        impostor=OwnedProcess(tree.process)
+        with pytest.raises(PipelineError):store.retain_owned(scope,impostor)
+        with pytest.raises(PipelineError):store.confirm_stopped(scope,impostor)
+        with pytest.raises(PipelineError,match='original owned lifetime'):store.confirm_stopped(scope,other)
+        assert tree.process.poll() is None and store.status(scope)['state']=='launched'
+        store.confirm_stopped(scope,tree)
+        assert other.process.poll() is None
+    finally:
+        tree.close();other.close()
+        tree.process.wait(timeout=10);other.process.wait(timeout=10)
+
+
+def test_original_owned_cleanup_failure_retains_unknown_until_same_handle_succeeds(start_scope):
+    from promptpilot.process_tree import OwnedProcess
+    db,scope=start_scope;store=OneUseStart(db.DB_PATH)
+    tree=store.invoke(scope,final_guard=lambda _scope:True,
+        factory=lambda:OwnedProcess.start([sys.executable,'-c','import time; time.sleep(60)'],
+                                          stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL))
+    original=tree.close;attempts=[]
+    def uncertain():
+        if not attempts:attempts.append(True);raise OSError('original kernel boundary not confirmed')
+        original()
+    try:
+        store.retain_owned(scope,tree);store.observe_started(scope,tree.process.pid)
+        tree.close=uncertain
+        with pytest.raises(OSError):store.confirm_stopped(scope,tree)
+        assert store.status(scope)['state']=='launched' and tree.process.poll() is None
+        store.confirm_stopped(scope,tree)
+        assert store.status(scope)['state']=='stopped'
+    finally:
+        original();tree.process.wait(timeout=10)

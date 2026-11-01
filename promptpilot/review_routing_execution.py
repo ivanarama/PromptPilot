@@ -14,9 +14,11 @@ from pathlib import Path
 import re
 import secrets
 import sqlite3
+import threading
 
 from . import project_pipeline as pp
 from .pipeline_errors import PipelineError
+from .process_tree import OwnedProcess
 from .review_routing_journal import _schema_signature
 from .review_routing_lease import decimal_id,owner_id
 from .review_routing_policy import ROLES
@@ -26,13 +28,15 @@ from .review_routing_wire import _fields,_integer,_pr,_source,canonical,hash64,s
 
 TABLE='technical_fix_starts_v1'
 ESTABLISHED=TABLE+':established'
+_OWNED_HANDLES={}
+_OWNED_MUTEX=threading.Lock()
 SCHEMA='''CREATE TABLE IF NOT EXISTS technical_fix_starts_v1 (
     attempt_key TEXT PRIMARY KEY,
     source_key TEXT NOT NULL UNIQUE,
     scope_json TEXT NOT NULL,
     scope_sha256 TEXT NOT NULL,
     generation TEXT NOT NULL,
-    state TEXT NOT NULL CHECK(state IN ('spawn-attempting','not-started','unknown','launched')),
+    state TEXT NOT NULL CHECK(state IN ('spawn-attempting','not-started','unknown','launched','stopped')),
     pid INTEGER,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL)'''
@@ -155,6 +159,9 @@ class OneUseStart:
 
     def _consume(self,scope,*,prepare=False):
         attempt_key,source_key=self._keys(scope);body=canonical(scope).decode('utf-8');digest=sha(scope)
+        with _OWNED_MUTEX:
+            if (str(self.database.resolve()),attempt_key) in _OWNED_HANDLES:
+                raise PipelineError('technical start still retains an original owned boundary; no second factory')
         generation=secrets.token_hex(32)
         with closing(self._connect()) as connection:
             connection.execute('BEGIN IMMEDIATE')
@@ -219,10 +226,24 @@ class OneUseStart:
         # No journal/SQLite/network call follows the final guard before launch.
         # All factory exceptions, including FileNotFoundError, are conservative
         # unknown outcomes. This path never invokes legacy spawn-retry logic.
-        try:return factory()
+        try:child=factory()
         except Exception:
             self._record(scope,generation,'unknown')
             raise
+        if isinstance(child,OwnedProcess):
+            attempt_key,_source=self._keys(scope)
+            key=(str(self.database.resolve()),attempt_key)
+            with _OWNED_MUTEX:
+                previous=_OWNED_HANDLES.get(key)
+                if previous is None:
+                    _OWNED_HANDLES[key]=dict(tree=child,generation=generation,scope_sha256=sha(scope),
+                                             lock=threading.Lock())
+                else:
+                    # Preserve both actual handles if trusted local state was
+                    # replaced concurrently; never overwrite an unknown owner.
+                    previous.setdefault('extra_owned',[]).append(child)
+                    previous['ambiguous']=True
+        return child
 
     def status(self,scope):
         scope=freeze_scope(scope);attempt_key,_source=self._keys(scope)
@@ -276,3 +297,60 @@ class OneUseStart:
                 connection.commit()
             except BaseException:
                 connection.rollback();raise
+
+    def retain_owned(self,scope,tree):
+        """Bind the actual returned kernel boundary, never a PID lookup."""
+        scope=freeze_scope(scope)
+        if not isinstance(tree,OwnedProcess):
+            raise PipelineError('technical stop proof requires the actual owned process boundary')
+        attempt_key,_source=self._keys(scope)
+        with closing(self._connect()) as connection:
+            self._schema(connection)
+            row=connection.execute('SELECT generation,scope_sha256,state,pid FROM '+TABLE+' WHERE attempt_key=?',
+                                   (attempt_key,)).fetchone()
+            if (row is None or row['scope_sha256']!=sha(scope)
+                    or row['state'] not in {'spawn-attempting','launched','unknown'}
+                    or row['pid'] is not None and row['pid']!=tree.process.pid):
+                raise PipelineError('technical owned boundary has no matching consumed start')
+        key=(str(self.database.resolve()),attempt_key)
+        with _OWNED_MUTEX:
+            previous=_OWNED_HANDLES.get(key)
+            if (previous is None or previous.get('ambiguous') or previous['tree'] is not tree
+                    or previous['generation']!=row['generation'] or previous['scope_sha256']!=sha(scope)):
+                raise PipelineError('technical stop requires the original factory-returned boundary')
+
+    def confirm_stopped(self,scope,tree):
+        """Trusted observer closes its ORIGINAL boundary before durable audit.
+
+        Exit status, expiry, absent PID and a replacement process cannot produce
+        this receipt. Missing ownership remains unknown after a process restart.
+        The eventual publisher must separately validate complete provider output.
+        """
+        scope=freeze_scope(scope);attempt_key,_source=self._keys(scope)
+        key=(str(self.database.resolve()),attempt_key)
+        with _OWNED_MUTEX:owner=_OWNED_HANDLES.get(key)
+        if owner is None or owner.get('ambiguous') or owner['tree'] is not tree or owner['scope_sha256']!=sha(scope):
+            raise PipelineError('technical stop requires the retained original owned lifetime')
+        if not owner['lock'].acquire(blocking=False):
+            raise PipelineError('technical owned stop is already being verified')
+        try:
+            tree.close()
+            tree.process.wait(timeout=10)
+            with closing(self._connect()) as connection:
+                connection.execute('BEGIN IMMEDIATE')
+                try:
+                    self._schema(connection)
+                    row=connection.execute('SELECT generation,scope_sha256,state,pid FROM '+TABLE+' WHERE attempt_key=?',
+                                           (attempt_key,)).fetchone()
+                    if (row is None or row['generation']!=owner['generation'] or row['scope_sha256']!=sha(scope)
+                            or row['state'] not in {'spawn-attempting','launched','unknown'}
+                            or row['pid'] is not None and row['pid']!=tree.process.pid):
+                        raise PipelineError('technical stop context changed; preserve its unknown outcome')
+                    connection.execute('UPDATE '+TABLE+" SET state='stopped',pid=?,updated_at=? WHERE attempt_key=?",
+                                       (tree.process.pid,self._now().isoformat(),attempt_key))
+                    connection.commit()
+                except BaseException:
+                    connection.rollback();raise
+            with _OWNED_MUTEX:
+                if _OWNED_HANDLES.get(key) is owner:_OWNED_HANDLES.pop(key)
+        finally:owner['lock'].release()
