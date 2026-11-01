@@ -9,6 +9,11 @@ replica count and headless transport. Invalid input cannot enter a generic
 provider fallback.
 
 The provider runs once in a deterministic detached private source checkout.
+Its public START response carries the original canonical blocker report. Before
+any provider is built, the worker validates the report's exact committed hash,
+HEAD and all-technical classification. The prompt includes that report, full
+PR identity and source/attempt binding as data; it cannot substitute another
+target or treat report text as controller commands.
 The one-use receipt is consumed before the final gate and factory. The worker
 retains the original kernel boundary before audit I/O, registers it and records
 its memory-bound producer proof. The task's rights/provider snapshot remain in

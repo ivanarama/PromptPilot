@@ -212,4 +212,5 @@ def issue(gh,config,token,*,config_path):
     return dict(action='pipeline-start',stage='fix',protocol='review-routing-v1',lease=starts.encode(value),
         target=dict(stage='fix-pr',number=guard.request['number'],head=guard.request['head'],
                     attempt_id=root.id,started_id=started.id,**guard.occurrence),
+        source_report=state['ledger'].source_proof(guard.seed['source']).publication.payload['report'],
         provider_started=False,mutation_authorized=False)

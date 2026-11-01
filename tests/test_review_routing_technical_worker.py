@@ -93,12 +93,18 @@ def technical_worker(pipeline_case,monkeypatch,tmp_path):
                 if mode['fault']=='missing-protocol':value.pop('protocol',None)
                 elif mode['fault']=='wrong-head':value['target']['head']='e'*40
                 elif mode['fault']=='action-downgrade':value['action']='author-handoff'
+            if 'prepare-fix-start' in command:
+                if mode['fault']=='missing-report':value.pop('source_report',None)
+                elif mode['fault']=='changed-report':value['source_report']['change']='different unsigned task'
             assert code==0 or value['action']=='error',value
             return value
     monkeypatch.setattr(insights,'_tool_preflight',cli)
     def build(_provider,prompt,**kwargs):
         state=ledger(peer,path);attempt=state.attempts[0]
         assert NONCE_ENV not in prompt and 'pipeline-start' not in prompt
+        assert '"operation": "owned-pipeline-fix"' in prompt and '"pr_number": 42' in prompt
+        assert attempt.payload['source']['report_sha256'] in prompt
+        assert state.proofs[-1].publication.payload['report']['blocking'][0]['summary'] in prompt
         message='Actual worker correction\n\n'+'\n'.join(k+': '+v for k,v in trailers(attempt.payload,attempt.id).items())
         if mode['fault']=='rate-limit':code="import sys; print('rate limit',file=sys.stderr); sys.exit(1)"
         else:
@@ -136,7 +142,7 @@ def test_public_worker_one_owned_launch_one_cas_and_one_machine_fix_done(technic
 
 
 @pytest.mark.parametrize('author_bridge',['real-source'],indirect=True)
-@pytest.mark.parametrize('fault',['missing-protocol','wrong-head','action-downgrade','rate-limit','ambiguous-spawn'])
+@pytest.mark.parametrize('fault',['missing-protocol','wrong-head','action-downgrade','missing-report','changed-report','rate-limit','ambiguous-spawn'])
 def test_public_worker_never_falls_back_or_relaunches_a_consumed_technical_start(technical_worker,fault):
     peer,path,task,database,_calls,factories,pushes,_remote,_ref,mode=technical_worker
     mode['fault']=fault
@@ -154,6 +160,8 @@ def test_public_worker_never_falls_back_or_relaunches_a_consumed_technical_start
             OneUseStart(database.DB_PATH,create=False,allow_new=False).invoke(scope,
                 final_guard=lambda _scope:True,factory=lambda:pytest.fail('second provider'))
         assert 'fix-done' not in state.attempt_phases(state.attempts[0])
+    elif fault in {'missing-report','changed-report'}:
+        assert not factories and state.budget_used==1 and 'fix-done' not in state.attempt_phases(state.attempts[0])
     else:assert not factories and state.budget_used==0
 
 
