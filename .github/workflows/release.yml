@@ -4,13 +4,62 @@ on:
   push:
     tags:
       - "v*.*.*"
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - "pyproject.toml"
+      - "promptpilot/version.py"
+      - "docs/releases/**"
 
 # Least privilege by default; only the release job needs write (set below).
 permissions:
   contents: read
 
 jobs:
+  verify-release:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Verify tag, package version and release notes
+        id: meta
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_EVENT: ${{ github.event_name }}
+        run: |
+          python - <<'PY'
+          import ast
+          import os
+          from pathlib import Path
+          import re
+          import tomllib
+
+          package = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
+          tag = f"v{package}" if os.environ.get("RELEASE_EVENT") == "pull_request" else os.environ["RELEASE_TAG"]
+          if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", tag):
+              raise SystemExit("Stable releases require a vMAJOR.MINOR.PATCH tag")
+          tree = ast.parse(Path("promptpilot/version.py").read_text(encoding="utf-8"))
+          versions = [ast.literal_eval(node.value) for node in tree.body
+                      if isinstance(node, ast.Assign)
+                      and any(isinstance(target, ast.Name) and target.id == "__version__"
+                              for target in node.targets)]
+          if versions != [tag[1:]] or package != tag[1:]:
+              raise SystemExit(f"Version mismatch: tag={tag}, package={package}, runtime={versions}")
+          notes = Path("docs/releases") / f"{tag}.md"
+          if not notes.is_file() or not notes.read_text(encoding="utf-8").strip():
+              raise SystemExit(f"Release notes are missing or empty: {notes}")
+          if output := os.environ.get("GITHUB_OUTPUT"):
+              with open(output, "a", encoding="utf-8") as stream:
+                  stream.write(f"tag={tag}\n")
+          print(f"Verified {tag}: package/runtime versions and release notes agree")
+          PY
+
   build-exe:
+    needs: [verify-release]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -39,17 +88,20 @@ jobs:
         run: python -m PyInstaller pp.spec --clean
 
       - name: Create Windows archive
+        env:
+          RELEASE_TAG: ${{ needs.verify-release.outputs.tag }}
         run: |
           Copy-Item .env.example dist\.env
           Compress-Archive -Path dist\pp.exe, dist\.env, start.ps1, stop.ps1 `
-            -DestinationPath "PromptPilot-${{ github.ref_name }}-windows.zip"
+            -DestinationPath "PromptPilot-${env:RELEASE_TAG}-windows.zip"
 
       - uses: actions/upload-artifact@v4
         with:
           name: windows-zip
-          path: "PromptPilot-${{ github.ref_name }}-windows.zip"
+          path: "PromptPilot-${{ needs.verify-release.outputs.tag }}-windows.zip"
 
   build-exe-linux:
+    needs: [verify-release]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -75,9 +127,20 @@ jobs:
       - name: Build binary
         run: python -m PyInstaller pp.spec --clean
 
+      - name: Verify packaged Linux version
+        env:
+          RELEASE_TAG: ${{ needs.verify-release.outputs.tag }}
+          RELEASE_COMMIT: ${{ github.sha }}
+          RELEASE_LABEL: ${{ github.ref_name }}
+        run: |
+          actual="$(./dist/pp --version)"
+          expected="pp ${RELEASE_TAG#v} build ${RELEASE_COMMIT:0:10} ${RELEASE_LABEL}"
+          printf '%s\n' "$actual"
+          test "$actual" = "$expected"
+
       - name: Create Linux archive
         env:
-          REF_NAME: ${{ github.ref_name }}
+          REF_NAME: ${{ needs.verify-release.outputs.tag }}
         run: |
           cp .env.example dist/.env
           tar -czf "PromptPilot-${REF_NAME}-linux.tar.gz" -C dist pp .env
@@ -85,9 +148,10 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: linux-tar
-          path: "PromptPilot-${{ github.ref_name }}-linux.tar.gz"
+          path: "PromptPilot-${{ needs.verify-release.outputs.tag }}-linux.tar.gz"
 
   build-wheel:
+    needs: [verify-release]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -123,7 +187,7 @@ jobs:
   # the served UI must contain the Workflows panel and /api/workflows must
   # answer, and --version must name the commit the exe was built from.
   smoke-exe:
-    needs: [build-exe]
+    needs: [verify-release, build-exe]
     runs-on: windows-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -134,18 +198,25 @@ jobs:
         shell: pwsh
         run: Expand-Archive -Path "PromptPilot-*-windows.zip" -DestinationPath pp-smoke
 
-      - name: --version carries the build identity
+      - name: --version matches the release and build identity
         shell: pwsh
+        env:
+          RELEASE_TAG: ${{ needs.verify-release.outputs.tag }}
+          RELEASE_COMMIT: ${{ github.sha }}
+          RELEASE_LABEL: ${{ github.ref_name }}
         run: |
           $v = & .\pp-smoke\pp.exe --version
           Write-Host "pp --version → $v"
-          if ($v -notlike "*build*") { throw "--version has no build stamp (issue #79)" }
+          $expected = "pp $($env:RELEASE_TAG.Substring(1)) build $($env:RELEASE_COMMIT.Substring(0, 10)) $env:RELEASE_LABEL"
+          if ($LASTEXITCODE -ne 0 -or $v.Trim() -ne $expected) {
+            throw "Packaged version mismatch: expected '$expected', got '$v'"
+          }
 
       - name: Serve the exe and check Workflows UI + API
         shell: pwsh
         run: |
           $proc = Start-Process -FilePath ".\pp-smoke\pp.exe" `
-            -ArgumentList "server", "--port", "8599" -PassThru
+            -ArgumentList "server", "--port", "8599" -WindowStyle Hidden -PassThru
           try {
             $apiOk = $false
             foreach ($i in 1..45) {
@@ -166,10 +237,13 @@ jobs:
 
   release:
     needs: [build-exe, build-exe-linux, build-wheel, smoke-exe]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           name: windows-zip
@@ -183,48 +257,26 @@ jobs:
           name: python-dist
           path: python-dist/
 
-      # Supply-chain: this third-party action runs with contents:write and the
-      # release token. Pin it (and the actions/* above) to a full commit SHA
-      # rather than a moving tag, and enable Dependabot to bump the SHAs.
+      - name: Generate artifact checksums
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          sha256sum "PromptPilot-${RELEASE_TAG}-windows.zip" "PromptPilot-${RELEASE_TAG}-linux.tar.gz" > SHA256SUMS
+          (cd python-dist && sha256sum -- *.whl *.tar.gz) >> SHA256SUMS
+
+      # The publisher has contents:write. Pin maintained v3 (Node 24) to
+      # an exact upstream commit, rather than a mutable major-version tag.
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           name: "PromptPilot ${{ github.ref_name }}"
-          body: |
-            ## Установка
-
-            ### Windows (exe)
-            1. Скачай `PromptPilot-${{ github.ref_name }}-windows.zip`
-            2. Распакуй в любую папку
-            3. Заполни `.env` (шаблон уже внутри архива)
-            4. Запусти `start.ps1` или `pp.exe server`
-
-            ### Linux (standalone binary)
-            ```bash
-            tar -xzf PromptPilot-${{ github.ref_name }}-linux.tar.gz
-            # заполни .env при необходимости (LiteLLM / токены)
-            ./pp server
-            ```
-
-            ### Docker
-            ```bash
-            docker compose up -d --build
-            # Web UI: http://localhost:8420
-            ```
-
-            ### Linux / Mac / Python
-            ```bash
-            pip install promptpilot-*.whl
-            pp server
-            ```
-            Или из исходников:
-            ```bash
-            pip install git+https://github.com/${{ github.repository }}.git@${{ github.ref_name }}
-            ```
+          body_path: docs/releases/${{ github.ref_name }}.md
+          fail_on_unmatched_files: true
           files: |
             PromptPilot-${{ github.ref_name }}-windows.zip
             PromptPilot-${{ github.ref_name }}-linux.tar.gz
             python-dist/*.whl
             python-dist/*.tar.gz
+            SHA256SUMS
           draft: false
           prerelease: false
