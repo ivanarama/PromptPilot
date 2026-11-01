@@ -35,6 +35,7 @@ def admission(preflight,task,*,repository,replicas,started_at,ownership_kind,typ
 def prepare_route(task,request,preflight,*,execution,command,working_dir,attempt_env,profile_id,queue_id,fallback_prompt):
     from .pipeline_insights import _lease_argument,_tool_preflight
     if command[-2:]!=['next','fix']:raise PipelineError('technical FIX command must select its exact stage')
+    execution=dict(execution,_owned_control=True)
     prepared=_tool_preflight(execution,[*command[:-2],'prepare-fix-start','fix',
         *_lease_argument(task,preflight['lease'],'pipeline-admission')],working_dir,env_extra=attempt_env)
     start=starts.decode(str(prepared.get('lease') or ''));scope=start['scope']
@@ -108,7 +109,9 @@ class Execution:
         from .review_routing_policy import ROLES,consumer_tree
         policy.require(config,self.request['identity'])
         contract=config['health_command']
-        root=Path(contract[contract.index('-contract')+1]).parent.parent
+        entry=Path(contract[contract.index('-contract')+1])
+        if not entry.is_absolute():entry=Path(self.control['working_dir'] or os.getcwd())/entry
+        root=entry.parent.parent
         if ({role:consumer_tree(root,role) for role in ROLES}!=scope['reader_sha256']
                 or pp.digest(config)!=scope['config_sha256'] or pp.load_config(self.control['config_path'])!=config):
             raise PipelineError('technical factory local config/readers changed after metadata gate')
@@ -125,8 +128,12 @@ class Execution:
             raise PipelineError('technical heartbeat has no retained original producer')
         if time.monotonic()<self.next_heartbeat:return
         prepared=self.call('prepare-fix-heartbeat',self.token)
+        from .review_routing_heartbeat import decode as decode_heartbeat
+        bound=decode_heartbeat(str(prepared.get('lease') or ''))
         if prepared.get('action')!='heartbeat-prepared' or prepared.get('scope_sha256')!=sha(self.scope):
             raise PipelineError('technical heartbeat changed its producer scope')
+        if bound['scope']!=self.scope or bound['attempt']!=self.request['attempt'] or bound['identity']!=self.request['identity']:
+            raise PipelineError('technical heartbeat signed purpose changed its original source')
         result=self.call('renew-fix-heartbeat',prepared['lease'])
         if result.get('action') not in {'heartbeat-renewed','heartbeat-unchanged'} or result.get('scope_sha256')!=sha(self.scope):
             raise PipelineError('technical heartbeat did not retain its exact canonical owner')
@@ -211,8 +218,15 @@ def execute(task,route):
         if verdict!='\u0413\u041e\u0422\u041e\u0412\u041e':
             raise PipelineError('technical provider did not report a completed correction; no repair model is authorized')
         prepared=execution.call('prepare-fix-publication',execution.token)
+        from .review_routing_publish import decode as decode_publication
+        bound=decode_publication(str(prepared.get('lease') or ''))
+        output_head=execution.workspace.output(execution.request['attempt'])
         if prepared.get('action')!='publication-prepared' or prepared.get('scope_sha256')!=sha(scope):
             raise PipelineError('technical output did not acquire its exact publication binding')
+        if (bound['scope']!=scope or bound['attempt']!=execution.request['attempt']
+                or bound['identity']!=execution.request['identity'] or bound['author']!=execution.request['author']
+                or {key:bound[key] for key in ['new_head','tree']}!=output_head or prepared.get('new_head')!=output_head['new_head']):
+            raise PipelineError('technical publication signed purpose changed its original output/source')
         completed=execution.call('publish-fix',prepared['lease'])
         if (completed.get('action')!='fixed' or completed.get('protocol')!='review-routing-v1'
                 or completed.get('source')!=scope['source'] or completed.get('executor')!=scope['executor']
@@ -230,6 +244,10 @@ def execute(task,route):
         except Exception as cleanup:
             raise worker.ProviderOwnershipError('technical FIX retains its original cleanup barrier',
                 execution.cleanup,heartbeat=target,on_cleaned=fail) from cleanup
+        if isinstance(exc,worker.ProviderOwnershipError):
+            exc.on_cleaned=fail
+            exc.heartbeat=target
+            raise
         if isinstance(exc,Exception):worker._commit_terminal_or_defer(task,'technical FIX failure',fail)
         else:raise
     finally:

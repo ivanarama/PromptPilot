@@ -8,6 +8,7 @@ from . import review_routing_start_request as starts
 from . import review_routing_pipeline_policy as policy
 from .pipeline_errors import PipelineError
 from .review_routing_execution import OneUseStart
+from .review_routing_lease import RENEW_WINDOW
 from .review_routing_heartbeat import deadline
 from .review_routing_post_push import verify
 from .review_routing_progress import _source_gate,candidates as progress_candidates
@@ -132,15 +133,27 @@ class PublicationGuard(StartGuard):
     def _check(self,payload,*,write=False):
         self._ticket=None
         value=parse(render(payload));seed=self.request['attempt']
-        if (value['kind']!='phase' or value['phase']!='fix-done' or value['pr']!=self.scope['pr']
+        if (value['pr']!=self.scope['pr']
                 or value['owner']!=self.scope['owner'] or value['context_sha256']!=context(seed)
-                or value['attempt_id']!=self.scope['attempt_id']):
-            raise PipelineError('technical publication may only publish its exact fix-done')
-        self.push.require_confirmed()
+                or value['kind'] not in {'phase','lease'}):
+            raise PipelineError('technical publication changes its exact source owner or purpose')
         state=self.state()
-        if state['details'] is None or value['details']!=state['details']:
-            raise PipelineError('technical FIX lacks independently verified new HEAD/source trailers')
-        state['view'].require_owner(returned_id=value['lease_id'],owner=value['owner'],now=self.now())
+        if value['kind']=='lease':
+            if value['purpose']!='technical-attempt' or value['root']!=self.scope['attempt_id']:
+                raise PipelineError('technical publisher may only finish its same existing owner lease')
+            if write:
+                if 'fix-done' in state['ledger'].attempt_phases(state['root']):
+                    raise PipelineError('technical publisher cannot renew a completed attempt')
+                view=state['view'];now=self.now()
+                view.require_owner(returned_id=value['previous'],owner=value['owner'],now=now)
+                if view.expires_at-now>=RENEW_WINDOW:raise PipelineError('technical publisher renewal is outside its window')
+        else:
+            if value['phase']!='fix-done' or value['attempt_id']!=self.scope['attempt_id']:
+                raise PipelineError('technical publication may only publish its exact fix-done')
+            self.push.require_confirmed()
+            if state['details'] is None or value['details']!=state['details']:
+                raise PipelineError('technical FIX lacks independently verified new HEAD/source trailers')
+            state['view'].require_owner(returned_id=value['lease_id'],owner=value['owner'],now=self.now())
         if write:self._ticket=dict(snapshot=state['snapshot'],snapshot_sha256=sha(state['snapshot']),body=render(value))
         return state['snapshot']
 
@@ -153,9 +166,13 @@ class PublicationGuard(StartGuard):
         self._check(payload,write=True)
         self._ticket=None
         state=self.state()
-        self.push.require_confirmed()
+        if payload['kind']=='phase':self.push.require_confirmed()
         self.finish_local(state)
-        state['view'].require_owner(returned_id=payload['lease_id'],owner=payload['owner'],now=self.now())
+        view=state['view'];now=self.now()
+        view.require_owner(returned_id=payload['lease_id'] if payload['kind']=='phase' else payload['previous'],
+                           owner=payload['owner'],now=now)
+        if payload['kind']=='lease' and view.expires_at-now>=RENEW_WINDOW:
+            raise PipelineError('technical publisher lease changed before POST')
 
 
 def prepare(gh,config_path,start_token):
@@ -184,13 +201,40 @@ def publish(gh,config_path,token):
     history,_deleted=records(state['snapshot'],trusted=config['trusted_account'],expected_pr=guard.scope['pr'])
     if _recover_visible_pending(gh,config,state['snapshot'],history,journal,journal.pending_for(guard.scope['pr'])):
         raise PipelineError('technical publication preserves an unresolved POST barrier')
+    def completed(state):
+        existing=state['ledger'].attempt_phases(state['root']).get('fix-done')
+        if existing is None:return None
+        guard.push.require_confirmed()
+        if existing.payload['details']!=state['details']:
+            raise PipelineError('technical FIX existing completion differs from independently verified output')
+        guard.finish_local(state)
+        return _result(guard,existing)
+    existing=completed(state)
+    if existing is not None:return existing
+    transport=Transport(gh,config,journal,guard)
+    def renew_owner(state):
+        view=state['view']
+        if view.expires_at-guard.now()<RENEW_WINDOW:
+            payload=dict(protocol='review-routing-v1',kind='lease',pr=guard.scope['pr'],owner=guard.scope['owner'],
+                context_sha256=guard.scope['context_sha256'],purpose='technical-attempt',root=guard.scope['attempt_id'],
+                previous=view.active.id)
+            transport.publish(payload,owner=guard.scope['owner'],phase='pipeline-publish-lease:'+sha(payload))
+    renew_owner(state)
     send=prepare_expected(guard.workspace,guard.push.value)
     guard.push.publish(final_guard=guard.final_push,push=send,readback=guard.readback)
+    state=guard.state()
+    existing=completed(state)
+    if existing is not None:return existing
+    renew_owner(state)
     state=guard.state()
     payload=dict(protocol='review-routing-v1',kind='phase',phase='fix-done',pr=guard.scope['pr'],
         owner=guard.scope['owner'],context_sha256=guard.scope['context_sha256'],attempt_id=guard.scope['attempt_id'],
         lease_id=state['view'].active.id,details=state['details'])
-    receipt=Transport(gh,config,journal,guard).publish(payload,owner=guard.scope['owner'],phase='pipeline-fix-done:'+sha(payload))
+    receipt=transport.publish(payload,owner=guard.scope['owner'],phase='pipeline-fix-done:'+sha(payload))
+    return _result(guard,receipt)
+
+
+def _result(guard,receipt):
     return dict(action='fixed',stage='fix',protocol='review-routing-v1',attempt_id=guard.scope['attempt_id'],
                 source=guard.scope['source'],executor=guard.scope['executor'],new_head=guard.request['new_head'],
                 fix_done_id=receipt.id,provider_started=False,mutation_authorized=False)

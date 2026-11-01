@@ -172,6 +172,30 @@ def test_public_worker_rechecks_authority_after_cas_journal_wait_and_before_fix_
     assert state.budget_used==1 and 'fix-done' not in state.attempt_phases(state.attempts[0])
 
 
+@pytest.mark.parametrize('author_bridge',['real-source'],indirect=True)
+def test_stopped_publisher_can_finish_same_owner_lease_without_renewing_execution_or_pushing_again(technical_worker,monkeypatch):
+    from datetime import timedelta
+    from promptpilot.review_routing_publish import PublicationGuard
+    from promptpilot.review_routing_worker import Execution
+    peer,path,task,database,_calls,factories,pushes,_remote,_ref,_mode=technical_worker
+    cleanup=Execution.cleanup;advanced={'value':False}
+    def stop(execution):
+        value=cleanup(execution)
+        if execution.stopped and not advanced['value']:
+            peer.now+=timedelta(minutes=26);advanced['value']=True
+        return value
+    monkeypatch.setattr(Execution,'cleanup',stop)
+    init=PublicationGuard.__init__
+    def publisher(self,*args,**kwargs):return init(self,*args,**dict(kwargs,clock=lambda:peer.now))
+    monkeypatch.setattr(PublicationGuard,'__init__',publisher)
+    worker._execute_task_body(task)
+    saved=database.get_task(task.id)
+    assert saved.status.value=='completed' and saved.verdict=='\u0413\u041e\u0422\u041e\u0412\u041e',saved.error or saved.result
+    assert len(factories)==len(pushes)==1 and peer.posts.count('lease')==1
+    state=ledger(peer,path);root=state.attempts[0]
+    assert state.budget_used==1 and state.attempt_phases(root)['fix-done'].payload['lease_id']!=root.id
+
+
 def _rows(path):
     from contextlib import closing
     import sqlite3

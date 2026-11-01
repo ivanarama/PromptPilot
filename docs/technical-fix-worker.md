@@ -52,11 +52,12 @@ coordinator and known publication outcome. It cannot settle from task status,
 lease expiry, process absence or agent text. An unknown push first needs exact
 readback. A permanent local retirement seal prevents a stale worker from starting
 or publishing again, including a concurrent publisher waiting for its DB writer.
-This local observer is not itself the public settlement/resume writer.
+The public administrative continuation is documented in
+[technical-fix-settlement.md](technical-fix-settlement.md).
 
 Focused Windows evidence includes real owned subprocesses, real private Git
 checkouts and actual CAS against a local bare remote, with authenticated synthetic
-GitHub/checker peers. Public OneBase checker/four-reader pairing, settlement/resume
-writers, complete native qualification, independent exact-HEAD review and five
+GitHub/checker peers. Public OneBase checker/four-reader pairing, complete native
+qualification, independent exact-HEAD review and five
 mandatory CI remain required before accepting the whole #151 change. Production
 configuration, installed source and paused maintenance tasks remain unchanged.

@@ -3004,7 +3004,11 @@ def _tool_preflight(execution: dict, command: list[str], working_dir: str | None
         environment.update(env_extra)
     try:
         _ensure_github_scan_lease(renew=True)
-        result = subprocess.run(
+        runner=subprocess.run
+        if execution.get('_owned_control') is True:
+            from .review_routing_control import run as run_control
+            runner=run_control
+        result = runner(
             command, cwd=str(root), capture_output=True, text=True,
             timeout=max(1, min(int(execution.get("timeout_seconds", 180)), 900)),
             encoding="utf-8", errors="replace", env=environment,
@@ -3183,6 +3187,7 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
     renders a compact executor-neutral prompt; all repository semantics stay in
     the project tool and its fallback skill.
     """
+    from .worker import ProviderOwnershipError
     matched = _matching_queue(task)
     if matched is None:
         # A profile/series marker may have been renamed while this exact
@@ -3438,6 +3443,36 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                 advertised = None
             signed_routing_claim = isinstance(advertised, str) and advertised.startswith("review-routing-")
         from . import review_routing_fix_request as fix_requests
+        from . import review_routing_settlement_request as settlement_requests
+        if preflight_action=='settlement' or advertised_purpose==settlement_requests.PURPOSE:
+            try:
+                request=settlement_requests.decode(str(token or ''))
+                identity=request['identity'];reservation=request['target_reservation']
+                target=dict(stage='fix-pr',number=identity['pr_number'],head=identity['head_sha'],
+                            source=request['attempt']['source'],attempt_id=request['attempt_id'])
+                if (not typed_queue or not typed_response or stage!='fix' or preflight_action!='settlement'
+                        or request['repository']!=str(profile.get('repository') or '').lower()
+                        or reservation['task_id']!=task.id or reservation['task_started_at']!=scheduler_task_started_at
+                        or provider_ownership_kind!='headless' or request['pipeline_replicas']!=replica_count
+                        or preflight.get('target')!=target):
+                    raise settlement_requests.PipelineError('administrative settlement changed its signed task, target or transport')
+                completion=_tool_preflight(dict(execution,_owned_control=True),[*command[:-2],'complete-fix-settlement','fix',
+                    *_lease_argument(task,token,'settlement')],working_dir,env_extra=attempt_env)
+                if (completion.get('action') not in {'resumed','wait'} or completion.get('provider_started') is not False
+                        or completion.get('stage')!='fix' or completion.get('protocol')!='review-routing-v1'):
+                    raise settlement_requests.PipelineError('administrative settlement was not independently confirmed')
+                done=completion['action']=='resumed'
+                if done and (completion.get('source')!=request['attempt']['source']
+                        or completion.get('executor')!=request['attempt']['executor']
+                        or completion.get('attempt_id')!=request['attempt_id'] or completion.get('new_head')!=identity['head_sha']):
+                    raise settlement_requests.PipelineError('settlement completion substituted its old executor or current HEAD')
+                return dict(action='complete_empty',mode='tool',profile_id=profile_id,queue_id=queue.get('id'),
+                    verdict='\u0413\u041e\u0422\u041e\u0412\u041e' if done else '\u041f\u0423\u0421\u0422\u041e',
+                    reason='old executor settled; independent exact-current-HEAD REVIEW resumed' if done else completion.get('reason','settlement waits'),
+                    preflight=preflight,completion=completion)
+            except ProviderOwnershipError:raise
+            except (settlement_requests.PipelineError,RuntimeError,TypeError,ValueError) as exc:
+                return dict(action='block',mode='tool',reason=str(exc),profile_id=profile_id,queue_id=queue.get('id'))
         if preflight_action=='pipeline-fix' or advertised_purpose==fix_requests.PIPELINE_ADMISSION:
             from . import review_routing_worker as technical
             try:
@@ -3454,6 +3489,7 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                 return technical.prepare_route(task,request,preflight,execution=execution,command=command,
                     working_dir=working_dir,attempt_env=attempt_env,profile_id=profile_id,
                     queue_id=queue.get('id'),fallback_prompt=fallback_prompt)
+            except ProviderOwnershipError:raise
             except (fix_requests.PipelineError,RuntimeError,TypeError,ValueError,sqlite3.Error) as exc:
                 return dict(action='block',mode='tool',reason=str(exc),profile_id=profile_id,queue_id=queue.get('id'))
         fix_claim = isinstance(advertised_purpose, str) and advertised_purpose.startswith("review-routing-v1-fix-")

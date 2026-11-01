@@ -23,5 +23,6 @@ Publication uses the existing write-ahead transport and one-use final guard
 after journal writer waits. An uncertain POST requires authenticated exact
 readback; absence of a visible comment cannot authorize a repeated POST.
 
-This source component remains unpublished and production execution remains OFF
-until the complete worker, CAS, settlement and paired OneBase acceptance pass.
+The development worker, CAS and administrative continuation are described in
+[technical-fix-worker.md](technical-fix-worker.md). Production execution remains
+OFF until the complete paired qualification, review and mandatory CI pass.
