@@ -9,6 +9,7 @@ from __future__ import annotations
 from contextlib import closing
 import copy
 from datetime import datetime,timezone
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -154,7 +155,7 @@ class OneUseStart:
             raise PipelineError('technical start reservation changed')
         try:expiry=datetime.fromisoformat(actual['expires_at'])
         except (TypeError,ValueError) as exc:raise PipelineError('technical start reservation expiry is invalid') from exc
-        if expiry.tzinfo is None or expiry.utcoffset() is None or expiry<=now:
+        if expiry.tzinfo is None or expiry.utcoffset() is None or expiry<=max(now,self._now()):
             raise PipelineError('technical start reservation expired')
 
     def _consume(self,scope,*,prepare=False):
@@ -259,7 +260,6 @@ class OneUseStart:
         with closing(self._connect()) as connection:
             connection.execute('BEGIN')
             self._schema(connection)
-            self._current_task(connection,scope,self._now())
             reservation=scope['reservation']
             current=connection.execute('SELECT strict_lifetime FROM pipeline_target_reservations WHERE repository=? AND number=?',
                                        (reservation['repository'],reservation['number'])).fetchone()
@@ -271,9 +271,23 @@ class OneUseStart:
                     or row['scope_json']!=canonical(scope).decode('utf-8')
                     or row['state']!='spawn-attempting'):
                 raise PipelineError('technical factory has no exact consumed unresolved start')
+            self._current_task(connection,scope,self._now())
         return True
 
-    def observe_started(self,scope,pid):
+    @staticmethod
+    def _live_receipt(scope,generation,pid,nonce):
+        if not isinstance(nonce,str) or not re.fullmatch('[0-9a-f]{64}',nonce):
+            raise PipelineError('technical live producer requires its private memory nonce')
+        body=dict(protocol='technical-fix-live-v1',scope_sha256=sha(scope),generation=generation,pid=pid,
+                  nonce_sha256=hashlib.sha256(nonce.encode('ascii')).hexdigest())
+        return canonical(body).decode('utf-8')
+
+    @staticmethod
+    def _live_row(connection,attempt_key):
+        return connection.execute('SELECT CASE WHEN length(value)<4096 THEN value ELSE NULL END AS value FROM settings WHERE key=?',
+                                  (TABLE+':live:'+attempt_key,)).fetchone()
+
+    def observe_started(self,scope,pid,*,live_nonce=None):
         """Audit only, after the worker already owns/registers its child handle.
 
         A caller retains that handle even if this write fails. This receipt
@@ -285,18 +299,63 @@ class OneUseStart:
             connection.execute('BEGIN IMMEDIATE')
             try:
                 self._schema(connection)
-                row=connection.execute('SELECT state,scope_sha256,pid FROM '+TABLE+' WHERE attempt_key=?',(attempt_key,)).fetchone()
+                row=connection.execute('SELECT generation,state,scope_sha256,pid FROM '+TABLE+' WHERE attempt_key=?',(attempt_key,)).fetchone()
                 if row is None or row['scope_sha256']!=sha(scope):
                     raise PipelineError('technical start observation has no matching consumed scope')
+                live=self._live_row(connection,attempt_key)
+                expected=None
+                if live_nonce is not None:
+                    with _OWNED_MUTEX:owner=_OWNED_HANDLES.get((str(self.database.resolve()),attempt_key))
+                    if (owner is None or owner.get('ambiguous') or owner['generation']!=row['generation']
+                            or owner['scope_sha256']!=sha(scope) or owner['tree'].process.pid!=pid):
+                        raise PipelineError('technical live producer has no original factory-owned lifetime')
+                    expected=self._live_receipt(scope,row['generation'],pid,live_nonce)
                 if row['state']=='launched' and row['pid']==pid:
+                    if (expected is None and live is not None or expected is not None and (
+                            live is None or not isinstance(live['value'],str)
+                            or not secrets.compare_digest(live['value'].encode('utf-8'),expected.encode('utf-8')))):
+                        raise PipelineError('technical live producer receipt changed or disappeared')
                     connection.commit();return
                 if row['state']!='spawn-attempting':
                     raise PipelineError('technical start observation conflicts with its existing barrier')
+                if live is not None:
+                    raise PipelineError('technical live producer has unknown existing metadata')
+                if expected is not None:
+                    connection.execute('INSERT INTO settings(key,value) VALUES (?,?)',(TABLE+':live:'+attempt_key,expected))
                 connection.execute('UPDATE '+TABLE+" SET state='launched',pid=?,updated_at=? WHERE attempt_key=?",
                                    (pid,self._now().isoformat(),attempt_key))
                 connection.commit()
             except BaseException:
                 connection.rollback();raise
+
+    def verify_live(self,scope,nonce):
+        """Producer-only heartbeat proof; the nonce is never stored in plaintext.
+
+        The controller delegates it only while its original handle is alive.
+        A new process/token/PID cannot mint it after worker ownership is lost.
+        This grants no launch, stop, push, settlement or budget-refund right.
+        """
+        scope=freeze_scope(scope);attempt_key,_source=self._keys(scope)
+        with closing(self._connect()) as connection:
+            connection.execute('BEGIN')
+            self._schema(connection)
+            row=connection.execute('SELECT generation,state,scope_sha256,pid FROM '+TABLE+' WHERE attempt_key=?',
+                                   (attempt_key,)).fetchone()
+            if (row is None or row['state']!='launched' or row['scope_sha256']!=sha(scope)
+                    or type(row['pid']) is not int or row['pid']<1):
+                raise PipelineError('technical heartbeat lacks its exact launched producer')
+            expected=self._live_receipt(scope,row['generation'],row['pid'],nonce)
+            live=self._live_row(connection,attempt_key)
+            if (live is None or not isinstance(live['value'],str)
+                    or not secrets.compare_digest(live['value'].encode('utf-8'),expected.encode('utf-8'))):
+                raise PipelineError('technical heartbeat lost its original memory producer proof')
+            reservation=scope['reservation']
+            current=connection.execute('SELECT strict_lifetime FROM pipeline_target_reservations WHERE repository=? AND number=?',
+                                       (reservation['repository'],reservation['number'])).fetchone()
+            if current is None or current['strict_lifetime']!=1:
+                raise PipelineError('technical heartbeat requires strict lifetime ownership')
+            self._current_task(connection,scope,self._now())
+        return True
 
     def retain_owned(self,scope,tree):
         """Bind the actual returned kernel boundary, never a PID lookup."""

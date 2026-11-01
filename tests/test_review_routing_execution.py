@@ -294,3 +294,32 @@ def test_original_owned_cleanup_failure_retains_unknown_until_same_handle_succee
         assert store.status(scope)['state']=='stopped'
     finally:
         original();tree.process.wait(timeout=10)
+
+
+
+@pytest.mark.parametrize('fault',[None,'wrong-nonce','cancel','expired'])
+def test_heartbeat_memory_proof_is_factory_bound_and_cannot_authorize_relaunch(start_scope,fault):
+    from promptpilot.process_tree import OwnedProcess
+    db,scope=start_scope;store=OneUseStart(db.DB_PATH)
+    update(db.DB_PATH,'UPDATE pipeline_target_reservations SET strict_lifetime=1')
+    nonce='1'*64
+    tree=store.invoke(scope,final_guard=lambda _scope:True,
+        factory=lambda:OwnedProcess.start([sys.executable,'-c','import time; time.sleep(60)'],
+            stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL))
+    try:
+        store.observe_started(scope,tree.process.pid,live_nonce=nonce)
+        store.observe_started(scope,tree.process.pid,live_nonce=nonce)
+        if fault=='wrong-nonce':
+            with pytest.raises(PipelineError):store.verify_live(scope,'2'*64)
+        elif fault=='cancel':
+            db.request_cancel(scope['task_id'])
+            with pytest.raises(PipelineError):store.verify_live(scope,nonce)
+        elif fault=='expired':
+            update(db.DB_PATH,"UPDATE pipeline_target_reservations SET expires_at='2000-01-01T00:00:00+00:00'")
+            with pytest.raises(PipelineError):store.verify_live(scope,nonce)
+        else:
+            assert store.verify_live(scope,nonce) is True
+            with pytest.raises(PipelineError):store.invoke(scope,final_guard=lambda _scope:True,factory=lambda:pytest.fail('second factory'))
+        store.confirm_stopped(scope,tree)
+        with pytest.raises(PipelineError):store.verify_live(scope,nonce)
+    finally:tree.close();tree.process.wait(timeout=10)
