@@ -78,7 +78,8 @@ class OneUseStart:
     absence never resets it. Only this direct controlled pre-factory refusal
     may record not-started, and only the same immutable scope may retry it.
     """
-    def __init__(self,database,*,clock=None):
+    def __init__(self,database,*,clock=None,create=True,allow_new=True):
+        self.allow_new=allow_new
         self.database=Path(database)
         if not self.database.is_file() or self.database.is_symlink():
             raise PipelineError('technical start requires the existing scheduler database')
@@ -86,7 +87,7 @@ class OneUseStart:
         with closing(self._connect()) as connection:
             connection.execute('BEGIN IMMEDIATE')
             try:
-                self._schema(connection,create=True)
+                self._schema(connection,create=create)
                 connection.commit()
             except BaseException:
                 connection.rollback();raise
@@ -152,7 +153,7 @@ class OneUseStart:
         if expiry.tzinfo is None or expiry.utcoffset() is None or expiry<=now:
             raise PipelineError('technical start reservation expired')
 
-    def _consume(self,scope):
+    def _consume(self,scope,*,prepare=False):
         attempt_key,source_key=self._keys(scope);body=canonical(scope).decode('utf-8');digest=sha(scope)
         generation=secrets.token_hex(32)
         with closing(self._connect()) as connection:
@@ -170,15 +171,27 @@ class OneUseStart:
                         raise PipelineError('technical start immutable scope changed; preserve prior barrier')
                     if row['state']!='not-started':
                         raise PipelineError('technical start was already attempted or remains unknown; no second factory')
+                    if prepare:
+                        connection.commit();return row['generation']
                     connection.execute('UPDATE '+TABLE+" SET generation=?,state='spawn-attempting',updated_at=? WHERE attempt_key=?",
                                        (generation,now.isoformat(),attempt_key))
                 else:
+                    if not prepare and not self.allow_new:
+                        raise PipelineError('technical START has no prepared local issuance; preserve unknown outcome')
                     connection.execute('INSERT INTO '+TABLE+' VALUES (?,?,?,?,?,?,?,?,?)',
-                        (attempt_key,source_key,body,digest,generation,'spawn-attempting',None,now.isoformat(),now.isoformat()))
+                        (attempt_key,source_key,body,digest,generation,'not-started' if prepare else 'spawn-attempting',None,now.isoformat(),now.isoformat()))
                 connection.commit()
                 return generation
             except BaseException:
                 connection.rollback();raise
+
+    def prepare(self,scope):
+        """Trusted NEW started issuer only; never reconstruct from an old token.
+
+        A public token consumer uses create=False,allow_new=False. Missing
+        issuance/table/history cannot become a new launch right on readback.
+        """
+        return self._consume(freeze_scope(scope),prepare=True)
 
     def _record(self,scope,generation,state):
         attempt_key,_source=self._keys(scope)
@@ -218,6 +231,26 @@ class OneUseStart:
             self._schema(connection)
             row=connection.execute('SELECT state,scope_sha256,pid FROM '+TABLE+' WHERE attempt_key=?',(attempt_key,)).fetchone()
             return dict(row) if row is not None else None
+
+    def verify_consumed(self,scope):
+        """Fresh local read for the exact already-consumed final factory gate."""
+        scope=freeze_scope(scope);attempt_key,source_key=self._keys(scope)
+        with closing(self._connect()) as connection:
+            connection.execute('BEGIN')
+            self._schema(connection)
+            self._current_task(connection,scope,self._now())
+            reservation=scope['reservation']
+            current=connection.execute('SELECT strict_lifetime FROM pipeline_target_reservations WHERE repository=? AND number=?',
+                                       (reservation['repository'],reservation['number'])).fetchone()
+            if current is None or current['strict_lifetime']!=1:
+                raise PipelineError('technical factory requires a strict-lifetime owned reservation')
+            row=connection.execute('SELECT * FROM '+TABLE+' WHERE attempt_key=? AND source_key=?',
+                                   (attempt_key,source_key)).fetchone()
+            if (row is None or row['scope_sha256']!=sha(scope)
+                    or row['scope_json']!=canonical(scope).decode('utf-8')
+                    or row['state']!='spawn-attempting'):
+                raise PipelineError('technical factory has no exact consumed unresolved start')
+        return True
 
     def observe_started(self,scope,pid):
         """Audit only, after the worker already owns/registers its child handle.

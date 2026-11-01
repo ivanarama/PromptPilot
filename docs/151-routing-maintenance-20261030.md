@@ -216,3 +216,22 @@ must freshly verify actual started history, ownership, source and checker after
 all waits and use OneUseStart at the actual factory. The complete execution peer
 contract is deliberately unavailable from all current public routes. No pipeline
 execution, heartbeat, CAS writer or settlement completion is claimed here.
+
+
+A private canonical START guard now composes the real history reducer, exact
+started/task/UUID binding, complete checker allowlist, actual four reader hashes,
+explicit same-repository executor policy, current actor/source/author and live
+canonical lease. A final local consumed-scope read checks cancellation, task
+occurrence, exact reservation and strict lifetime immediately before one factory.
+The token consumer cannot create a missing receipt table or reconstruct lost
+local issuance from an existing server START. The future trusted issuer must
+persist its own new issuance and prepare the exact scope; an old token cannot.
+
+Eight focused scheduler/peer/owned-process and base one-use cases passed43.46s.
+Two further strict-lifetime/positive cases passed11.85s; two fresh changed-checker
+started/task cases passed11.34s. The positive seam launches an actual harmless
+owned Python child once; ambiguous factory failure stays unknown without retry.
+These are private integration seams with fixture-produced trusted records.
+The actual public pipeline admission/START issuer, worker wiring, technical lease
+heartbeat, CAS writer, settlement/resume writers and real paired acceptance are
+still required. This does not enable a production capability or close #151.
