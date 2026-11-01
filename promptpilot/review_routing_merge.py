@@ -117,8 +117,9 @@ def _candidate(health, ordinary, context):
 
 def issue(gh, config, health, ordinary, *, config_path):
     pp = _pp()
-    if not isinstance(config_path, str) or not Path(config_path).is_absolute():
-        raise PipelineError('positive typed MERGE requires an absolute effective configuration path')
+    if not isinstance(config_path, str) or not config_path:
+        raise PipelineError('positive typed MERGE requires its effective configuration path')
+    config_path = str(Path(config_path).resolve())
     context = live(gh, config, ordinary['number'], purpose='merge', health=health)
     _candidate(health, ordinary, context)
     if context['source'] != ordinary['proof']:
@@ -191,8 +192,9 @@ def complete(gh, config, token, *, config_path):
     if pp.encode_lease(value) != token.split('.', 1)[0]:
         raise PipelineError('positive typed MERGE request is not canonical signed JSON')
     _wire(value, config)
-    if not isinstance(config_path, str) or not Path(config_path).is_absolute():
+    if not isinstance(config_path, str) or not config_path:
         raise PipelineError('positive typed MERGE requires its effective configuration path')
+    config_path = str(Path(config_path).resolve())
 
     def fresh():
         effective = pp.load_config(config_path)

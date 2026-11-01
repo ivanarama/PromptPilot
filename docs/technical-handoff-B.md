@@ -7,14 +7,14 @@ PromptPilot main `fcbb725bbdcc93a828b932f400a43873014c3d9e`, OneBase main
 Кодовый срез требует совместной приёмки точных версий и не является разрешением
 обновить установку или включить рабочий флаг.
 
-- Использовать принятые parser, конечный lifetime budget, единственный FIX,
+- Используются принятые parser, конечный lifetime budget, единственный FIX,
   post-push recovery, settlement и механизм парковки цели #144.
-- Добавить положительные потребители typed REVIEW в MERGE/TAIL без создания
+- Добавлены положительные потребители typed REVIEW в MERGE/TAIL без создания
   синтетического legacy-заключения. Technical/engineering handoff не является
   разрешением на merge или создание хвоста.
-- Сохранить полный proof, identity, trusted ship, CI точного HEAD, свежий main,
+- Сохраняются полный proof, identity, trusted ship, CI точного HEAD, свежий main,
   HMAC/expiry, compare-and-merge, single-flight и обработку неизвестного исхода.
-- Проверить публичные transport/CLI: повтор next, два новых HEAD, переименование
+- Приёмка проверяет публичные transport/CLI: повтор next, два новых HEAD, переименование
   blocker, исчерпание бюджета, другой eligible PR, ABA, edit/delete и старый
   third-round human handoff.
 - Общая приёмка требует точной пары исходников, настоящего Go checker,
@@ -34,6 +34,9 @@ publication ID/time и SHA-256 канонического JSON/LF каждого
 
 При совместимом `positive_review_contract` обычные `next/complete merge`
 поддерживают только точный положительный typed proof и `CLEAN` ветку. Новый
+contract требует отдельного `pp:positive-review-v1-consumer` marker каждого из
+четырёх фактических entries; совпадения старых A tree hashes недостаточно.
+Новый
 purpose `typed-clean-merge-v1` подписан HMAC, ограничен 30 минутами и связан с
 source/config/base/четырьмя reader trees. Проверяются trusted ship, первая
 исполняемая цель, single-flight, current main в HEAD и успешные обязательные

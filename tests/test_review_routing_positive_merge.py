@@ -138,6 +138,15 @@ def test_public_positive_merge_keeps_typed_proof_and_finishes_native_cleanup(mer
     assert code == 0 and empty['action'] == 'empty' and peer.merge_sends == 1, empty
 
 
+def test_public_positive_merge_resolves_the_standard_relative_config_path(merge_case, monkeypatch):
+    peer, _health, path, run = merge_case
+    monkeypatch.chdir(path.parent)
+    code, selected = run('--config', 'pipelinectl.json', 'next', 'merge')
+    assert code == 0 and selected['action'] == 'merge', selected
+    code, completed = run('--config', 'pipelinectl.json', 'complete', 'merge', '--lease', selected['lease'])
+    assert code == 0 and completed['number'] == 42 and peer.merge_sends == 1, completed
+
+
 @pytest.mark.parametrize('fault', ['signature', 'unsigned', 'expired', 'flag-off', 'config', 'reader',
                                    'hold', 'ship', 'actor', 'owner', 'ci-failure', 'ci-head', 'ci-foreign-app'])
 def test_public_positive_completion_refuses_late_gate_changes_without_mutations(merge_case, fault):

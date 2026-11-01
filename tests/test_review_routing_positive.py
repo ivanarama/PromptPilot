@@ -12,6 +12,20 @@ from test_review_routing_adapter import adapter as adapter  # noqa: F401
 from test_review_routing_stage_guard import setup_guard as setup_guard  # noqa: F401
 
 
+def positive_readers(health, path):
+    from promptpilot.review_routing_policy import ROLES, consumer_tree
+
+    root = path.parent / '.claude/skills'
+    for role, stage in ROLES.items():
+        entry = root / stage / 'SKILL.md'
+        text = entry.read_text(encoding='utf-8')
+        marker = f'<!-- pp:positive-review-v1-consumer stage={role} -->'
+        assert text.splitlines().count(marker) in {0, 1}
+        if marker not in text.splitlines():
+            entry.write_text(text + '\n' + marker + '\n', encoding='utf-8')
+    health['review_routing_contract']['reader_sha256'] = {role: consumer_tree(root, role) for role in ROLES}
+
+
 def rest_projection(peer):
     pr = peer.current['data']['repository']['pullRequest']
     event = next((edge['node'] for edge in [*pr['timelineItems']['edges'], *peer.comments]
@@ -28,6 +42,7 @@ def rest_projection(peer):
 @pytest.fixture
 def positive(adapter):
     peer, health, path, report, run = adapter
+    positive_readers(health, path)
     value = json.loads(report.read_text(encoding='utf-8'))
     value['blocking'] = []
     value['tail'] = [dict(kind='issue', title='Follow-up invariant', text='Preserve the source on restart'),
@@ -267,6 +282,7 @@ def test_shared_technical_source_never_becomes_positive(adapter):
     from promptpilot.review_routing_snapshot import stable_timeline
 
     peer, health, path, report, run = adapter
+    positive_readers(health, path)
     code, selected = run('next', 'review')
     assert code == 0 and selected['action'] == 'audit'
     code, result = run('complete', 'review', '--lease', selected['lease'], '--report', str(report))
@@ -281,6 +297,7 @@ def test_shared_technical_source_never_becomes_positive(adapter):
 
 def test_retained_positive_vectors_replay_through_public_transport(adapter):
     peer, health, _path, _report, run = adapter
+    positive_readers(health, _path)
     directory = Path(__file__).parent / 'fixtures'
     raw = (directory / 'positive-review-v1.json').read_bytes()
     vectors = json.loads(raw)
@@ -315,3 +332,20 @@ def test_retained_positive_vectors_replay_through_public_transport(adapter):
         if fixture['accepted']:
             assert result['source'] == fixture['source'] and result['merge_sha'] == fixture['merge_sha']
     assert peer.posts == []
+
+
+@pytest.mark.parametrize('role', ['review', 'fix', 'merge', 'tail'])
+def test_public_positive_refuses_old_reader_even_when_all_reported_hashes_match(positive, role):
+    from promptpilot.review_routing_policy import ROLES, consumer_tree
+
+    peer, health, path, run, _completed = positive
+    root = path.parent / '.claude/skills'
+    entry = root / ROLES[role] / 'SKILL.md'
+    text = entry.read_text(encoding='utf-8')
+    entry.write_text(text.replace(f'<!-- pp:positive-review-v1-consumer stage={role} -->\n', ''), encoding='utf-8')
+    # A matching A tree hash is insufficient even if an incompatible checker
+    # advertises the new contract. The local B marker must exist independently.
+    health['review_routing_contract']['reader_sha256'] = {name: consumer_tree(root, name) for name in ROLES}
+    code, result = inspect(run)
+    assert code == 2 and 'positive REVIEW consumer version marker' in result['error'], result
+    assert peer.posts == ['publication', 'claim', 'completion']

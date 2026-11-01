@@ -100,7 +100,7 @@ def settings(config):
     return dict(value)
 
 
-def consumer_tree(root,role):
+def consumer_tree(root,role,*,positive=False):
     if role not in ROLES:
         raise PipelineError('unsupported routing consumer role')
     directory=Path(root)/ROLES[role]
@@ -117,6 +117,8 @@ def consumer_tree(root,role):
     marker=f'<!-- pp:review-routing-v1-consumer stage={role} -->'
     if text.splitlines().count(marker)!=1:
         raise PipelineError('paired routing consumer version marker is missing or ambiguous')
+    if positive and text.splitlines().count(f'<!-- pp:positive-review-v1-consumer stage={role} -->')!=1:
+        raise PipelineError('positive REVIEW consumer version marker is missing or ambiguous for '+role)
     files=[]
     for path in directory.rglob('*'):
         relative=path.relative_to(directory)

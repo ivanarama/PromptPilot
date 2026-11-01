@@ -45,7 +45,7 @@ if 'PipelineHealthSnapshot' in query:
   headRefOid=pr['headRefOid'],baseRefName=pr['baseRefName'],
   labels=connection(pr['labels']['nodes']),comments=connection(comments),
   commits=dict(nodes=[dict(commit=dict(id='COMMIT_'+pr['headRefOid'],oid=pr['headRefOid']))]))
- result=dict(data=dict(repository=dict(pullRequests=connection([pull]),issues=connection([]))))
+ result=dict(data=dict(repository=dict(pullRequests=connection([pull] if pr['state']=='OPEN' else []),issues=connection([]))))
  name='queue'
 elif 'PipelineRoutingRepository' in query:
  result=dict(data=dict(repository=dict(id='R_BASE',nameWithOwner='owner/repo')));name='repository'

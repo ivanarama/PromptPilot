@@ -6,6 +6,8 @@ identity, ship, CI, single-flight and mutation ownership at each write boundary.
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 from .pipeline_errors import PipelineError
 from .review_routing import VERSION
 from .review_routing_baseline import _edges
@@ -20,13 +22,18 @@ LIFECYCLE = {'PullRequestCommit', 'HeadRefForcePushedEvent',
 
 
 def capability(config, health):
-    from .review_routing_policy import preflight
+    from .review_routing_policy import preflight, consumer_tree, ROLES
 
     policy = preflight(config, health)
     expected = {'protocol': CONTRACT, 'snapshot': 'complete',
                 'purposes': ['merge', 'tail']}
     if not policy['enabled'] or health.get('positive_review_contract') != expected:
         raise PipelineError('positive typed REVIEW requires its accepted paired consumer contract')
+    command = config['health_command']
+    root = Path(command[command.index('-contract') + 1]).parent.parent
+    readers = {role: consumer_tree(root, role, positive=True) for role in ROLES}
+    if readers != policy['consumer_sha256']:
+        raise PipelineError('positive REVIEW consumer trees changed during compatibility reads')
     return policy
 
 
