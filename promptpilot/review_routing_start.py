@@ -80,6 +80,7 @@ class StartGuard:
         root=next((row for row in ledger.attempts if row.id==self.scope['attempt_id']),None)
         proof=ledger.source_proof(self.scope['source'])
         if (root is None or root.payload!=request['attempt'] or proof is None or proof is not ledger.proofs[-1]
+                or proof.publication.payload['author']!=request['author']
                 or proof.outcome!='technical-handoff' or ledger.parking_id is not None
                 or ledger.attempt_settlement(root) is not None
                 or root.payload['attempt']>paired['current_limit']):

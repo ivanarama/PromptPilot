@@ -48,6 +48,7 @@ class AdmissionGuard:
         ledger=verified_depth(snapshot,trusted=config['trusted_account'])['ledger']
         proof=ledger.source_proof(self.seed['source'])
         if (proof is None or proof is not ledger.proofs[-1] or proof.outcome!='technical-handoff'
+                or proof.publication.payload['author']!=snapshot['author']
                 or context(proof.publication.payload)!=self.seed['context_sha256']
                 or ledger.parking_id is not None or self.seed['attempt']>paired['current_limit']):
             raise PipelineError('pipeline admission lacks its current eligible canonical technical source')

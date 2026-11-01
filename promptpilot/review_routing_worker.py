@@ -251,13 +251,14 @@ def execute(task,route):
         def fail(message=message):
             if db.is_cancel_requested(task.id):return worker._mark_cancelled(task,message)
             return worker._mark_failed(task,message,exit_code=-1)
+        terminal=(exc.on_cleaned if isinstance(exc,worker.ProviderOwnershipError) and callable(exc.on_cleaned) else fail)
         try:execution.cleanup()
         except Exception as cleanup:
             raise worker.ProviderOwnershipError('technical FIX retains its original cleanup barrier',
-                execution.cleanup,heartbeat=target,on_cleaned=fail) from cleanup
+                execution.cleanup,heartbeat=target,on_cleaned=terminal) from cleanup
         if isinstance(exc,worker.ProviderOwnershipError):
-            exc.on_cleaned=fail
-            exc.heartbeat=target
+            if not callable(exc.on_cleaned):exc.on_cleaned=fail
+            if not callable(exc.heartbeat):exc.heartbeat=target
             raise
         if isinstance(exc,Exception):worker._commit_terminal_or_defer(task,'technical FIX failure',fail)
         else:raise

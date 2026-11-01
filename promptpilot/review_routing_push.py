@@ -133,8 +133,8 @@ class Push:
         return self.value
 
 
-def prepare_expected(workspace,value):
-    """Only an independently proven forward output, one explicit branch ref."""
+def verify_transport(workspace,value):
+    """Repeat effective local Git transport policy after publication writer waits."""
     value=binding(value['scope'],value['identity'],dict(new_head=value['new_head'],tree=value['tree']))
     if workspace.scope!=value['scope']:raise PipelineError('technical CAS substituted its source checkout')
     ref='refs/heads/'+value['identity']['head_ref']
@@ -142,6 +142,13 @@ def prepare_expected(workspace,value):
     rewrites=workspace._git(workspace.path,'config','--get-regexp',r'^url\..*\.(insteadof|pushinsteadof)$',allow_failure=True)
     if rewrites.returncode!=1:
         raise PipelineError('technical CAS refuses ambiguous Git URL rewrite configuration')
+    return ref
+
+
+def prepare_expected(workspace,value):
+    """Only an independently proven forward output, one explicit branch ref."""
+    value=binding(value['scope'],value['identity'],dict(new_head=value['new_head'],tree=value['tree']))
+    ref=verify_transport(workspace,value)
     argv=('push','--porcelain','--atomic','--no-verify','--no-follow-tags',
           '--recurse-submodules=no','--force-with-lease='+ref+':'+value['scope']['source']['head'],
           'https://github.com/'+value['scope']['repository']+'.git',value['new_head']+':'+ref)

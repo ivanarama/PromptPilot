@@ -3321,6 +3321,7 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
         }
 
     stage = str(execution.get("stage") or queue.get("id") or "").lower()
+    if typed_queue and stage=='fix':execution=dict(execution,_owned_control=True)
     command = _tool_command(execution, stage)
     if typed_queue and (stage not in {"review", "fix"} or not command or command[-2:] != ["next", stage]):
         return {"action": "block", "mode": "tool", "reason": "typed routing requires its exact next stage command"}
@@ -3406,6 +3407,8 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                     admission, profile, exc),
                 profile_id,
                 profile, queue)
+        except ProviderOwnershipError:
+            raise
         except RuntimeError as exc:
             reason = str(exc)
             if mode == "auto" and not owned_preflight:

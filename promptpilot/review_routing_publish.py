@@ -12,7 +12,7 @@ from .review_routing_lease import RENEW_WINDOW
 from .review_routing_heartbeat import deadline
 from .review_routing_post_push import verify
 from .review_routing_progress import _source_gate,candidates as progress_candidates
-from .review_routing_push import Push,binding,prepare_expected
+from .review_routing_push import Push,binding,prepare_expected,verify_transport
 from .review_routing_start import StartGuard
 from .review_routing_wire import _fields,context,head40,parse,render,sha
 from .review_routing_workspace import Workspace
@@ -103,9 +103,10 @@ class PublicationGuard(StartGuard):
                                     self.scope['attempt_id'],self.request['new_head'])
         return state
 
-    def finish_local(self,state):
+    def finish_local(self,state,*,push=False):
         # Complete all SQLite waits before the last config/readers/clock fence.
         self.store.verify_stopped(self.scope)
+        if push:verify_transport(self.workspace,self.push.value)
         config=pp.load_config(self.config_path)
         paired=policy.require(config,self.request['identity'],health=state['health'])
         if paired['consumer_sha256']!=self.scope['reader_sha256'] or pp.load_config(self.config_path)!=config:
@@ -121,7 +122,7 @@ class PublicationGuard(StartGuard):
         state=self.state()
         if state['snapshot']['headRefOid']!=self.scope['source']['head']:
             raise PipelineError('technical CAS expected source has already changed')
-        self.finish_local(state)
+        self.finish_local(state,push=True)
         return True
 
     def readback(self):

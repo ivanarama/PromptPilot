@@ -114,6 +114,12 @@ class Workspace:
             raise PipelineError('FIX workspace HEAD differs from the bound reviewed source')
         branch=self._git(self.path,'symbolic-ref','-q','HEAD',allow_failure=True)
         if branch.returncode!=1:raise PipelineError('FIX workspace must remain a detached private checkout')
+        entries=self._git(self.path,'ls-files','-v','-z').stdout.split('\0')
+        if any(len(entry)<3 or entry[:2]!='H ' for entry in entries if entry):
+            raise PipelineError('FIX workspace index conceals tracked source or has unresolved/sparse state')
+        sparse=self._git(self.path,'config','--type=bool','--get','core.sparseCheckout',allow_failure=True)
+        if sparse.returncode not in {0,1} or sparse.stdout.strip() not in {'','false'}:
+            raise PipelineError('FIX workspace cannot use sparse checkout to conceal source')
         if self._git(self.path,'status','--porcelain=v1','--untracked-files=normal').stdout:
             raise PipelineError('FIX workspace changed before its one owned factory')
         return self.path
