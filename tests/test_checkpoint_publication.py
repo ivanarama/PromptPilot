@@ -4,11 +4,22 @@ import threading
 
 import pytest
 
-from promptpilot import db, stage_checkpoint, workflows
-from promptpilot.models import WorkflowHumanInput
+from promptpilot import db, stage_checkpoint, workflows, checkpoint_cleanup
+from promptpilot.models import WorkflowHumanInput, TaskStatus, WorkflowEventCreate
 from test_checkpoint_hardening import (
     _git_repo, _wf, _start, _claim_and_finish, _types, REVIEWER_PASS,
 )
+
+
+@pytest.fixture(autouse=True)
+def retire_private_checkpoint_cleanup_resources():
+    saved=set(checkpoint_cleanup._RESOURCES)
+    yield
+    for generation in set(checkpoint_cleanup._RESOURCES)-saved:
+        resource=checkpoint_cleanup._RESOURCES[generation]
+        assert resource['ready'](), 'private checkpoint resource did not stop'
+        resource['cleanup']()
+        checkpoint_cleanup._RESOURCES.pop(generation,None)
 
 
 def _git(repo, *args):
@@ -341,8 +352,11 @@ def test_final_ref_cleanup_failure_keeps_checkpoint_pending_and_recovers_once(is
                 'expected_version': version, 'text': 'Retry reviewed checkpoint', 'resume': True})
         assert response.status_code == 200, response.text
         assert isolated_db.get_workflow(wf.id).status.value == 'awaiting_human'
-        assert 'stage.checkpoint' not in _types(isolated_db, wf)
-        assert 'stage.advanced' not in _types(isolated_db, wf)
+        assert _types(isolated_db, wf).count('stage.checkpoint') == 1
+        assert _types(isolated_db, wf).count('stage.advanced') == 1
+        with isolated_db._connect() as conn:
+            assert checkpoint_cleanup.active(conn,wf.id)
+        assert not isolated_db.list_tasks(status=TaskStatus.PENDING)
         assert _git(repo, 'show', 'HEAD:app.py') == _git(repo, 'show', ':app.py') == 'reviewed'
         assert int(_git(repo, 'rev-list', '--count', 'HEAD')) == before + 1
     finally:
@@ -383,8 +397,10 @@ def test_checkpoint_receipt_rechecks_context_after_cleanup(isolated_db, tmp_path
 
     monkeypatch.setattr(stage_checkpoint, 'confirm', changed)
     assert _resume(wf).status.value == 'awaiting_human'
-    assert 'stage.checkpoint' not in _types(isolated_db, wf)
-    assert 'stage.advanced' not in _types(isolated_db, wf)
+    assert _types(isolated_db, wf).count('stage.checkpoint') == 1
+    assert _types(isolated_db, wf).count('stage.advanced') == 1
+    with isolated_db._connect() as conn:
+        assert checkpoint_cleanup.active(conn,wf.id)
     if drift == 'bytes': assert (repo/'app.py').read_text() == 'post-cleanup edit'
     if drift == 'index': assert _git(repo, 'show', ':app.py') == 'different staged bytes'
 
@@ -402,8 +418,98 @@ def test_cancellation_between_cleaned_receipt_and_projection_wins(isolated_db, t
         workflows.cancel_workflow(wf.id, current.state_version)
 
     monkeypatch.setattr(workflows, '_stage_checkpoint_commit', cancel_after_cleanup)
-    with pytest.raises(db.WorkflowConflictError): _resume(wf)
+    assert _resume(wf).status.value == 'cancelled'
     assert isolated_db.get_workflow(wf.id).status.value == 'cancelled'
     assert _git(repo, 'show', 'HEAD:app.py') == 'reviewed'
-    assert 'stage.checkpoint' not in _types(isolated_db, wf)
-    assert 'stage.advanced' not in _types(isolated_db, wf)
+    assert _types(isolated_db, wf).count('stage.checkpoint') == 1
+    assert _types(isolated_db, wf).count('stage.advanced') == 1
+    with isolated_db._connect() as conn:
+        assert checkpoint_cleanup.active(conn,wf.id) is None
+
+
+def test_source_acceptance_retains_real_git_index_and_ref_fences(isolated_db, tmp_path, monkeypatch):
+    from test_workflow_pause_race import request
+    repo, wf = _pending(isolated_db, tmp_path, monkeypatch)
+    original = db._append_workflow_event
+    projecting, release = threading.Event(), threading.Event()
+    results, errors = [], []
+    def event(conn, value):
+        if value.workflow_id == wf.id and value.event_type == 'stage.checkpoint':
+            projecting.set()
+            assert release.wait(30)
+        return original(conn, value)
+    monkeypatch.setattr(db, '_append_workflow_event', event)
+    version = db.get_workflow(wf.id).state_version
+    def resume():
+        try:
+            results.append(request('POST', f'/api/workflows/{wf.id}/human-input', json={
+                'expected_version': version, 'text': 'Accept fenced checkpoint', 'resume': True}))
+        except BaseException as exc: errors.append(exc)
+    thread = threading.Thread(target=resume)
+    thread.start()
+    try:
+        assert projecting.wait(30)
+        head = _git(repo, 'rev-parse', 'HEAD')
+        foreign = _git(repo, 'commit-tree', head+'^{tree}', '-p', head, '-m', 'foreign writer')
+        ref = subprocess.run(['git','-C',str(repo),'update-ref','HEAD',foreign,head],capture_output=True,timeout=15)
+        index = subprocess.run(['git','-C',str(repo),'add','--','app.py'],capture_output=True,timeout=15)
+        assert ref.returncode != 0 and b'lock' in ref.stderr.lower(), ref.stderr
+        assert index.returncode != 0 and b'index.lock' in index.stderr.lower(), index.stderr
+        assert _git(repo,'rev-parse','HEAD') == head
+    finally:
+        release.set()
+        thread.join(30)
+    assert not thread.is_alive() and not errors, errors
+    assert len(results)==1 and results[0].status_code==200, results
+    assert db.get_workflow(wf.id).status.value == 'queued'
+    assert _types(db,wf).count('stage.checkpoint') == _types(db,wf).count('stage.advanced') == 1
+
+
+@pytest.mark.parametrize('mode', ['lost-owner','automatic','cancelled','malformed'])
+def test_cleanup_barrier_never_infers_completion_or_reaccepts_source(isolated_db,tmp_path,monkeypatch,mode):
+    from contextlib import contextmanager
+    repo,wf = _pending(isolated_db,tmp_path,monkeypatch)
+    original = workflows._stage_checkpoint_commit
+    attempts=[]
+    def close():
+        attempts.append(True)
+        if len(attempts)==1:raise OSError('still unconfirmed')
+    @contextmanager
+    def fail_cleanup(*args,**kwargs):
+        with original(*args,**kwargs) as sha:yield sha
+        raise stage_checkpoint.CheckpointCleanupError('retain original owner',close,lambda:True)
+    with monkeypatch.context() as patch:
+        patch.setattr(workflows,'_stage_checkpoint_commit',fail_cleanup)
+        assert _resume(wf).status.value=='awaiting_human'
+    with db._connect() as conn:pending=checkpoint_cleanup.active(conn,wf.id)
+    generation=pending['generation']
+    assert _types(db,wf).count('stage.checkpoint')==1
+    if mode=='lost-owner':
+        resource=checkpoint_cleanup._RESOURCES.pop(generation)
+        try:
+            assert workflows.advance_workflow(wf.id).status.value=='awaiting_human'
+            with pytest.raises(db.WorkflowConflictError,match='owner is unavailable'):_resume(wf)
+            assert not attempts
+        finally:checkpoint_cleanup._RESOURCES[generation]=resource
+    elif mode=='automatic':
+        assert workflows.advance_workflow(wf.id).status.value=='awaiting_human'
+        assert workflows.advance_workflow(wf.id).status.value=='awaiting_human'
+        assert len(attempts)==1
+        assert _resume(wf).status.value=='queued'
+        assert len(attempts)==2
+    elif mode=='cancelled':
+        current=db.get_workflow(wf.id)
+        workflows.cancel_workflow(wf.id,current.state_version)
+        checkpoint_cleanup.retry(wf.id,db.get_workflow(wf.id).state_version,manual=True)
+        checkpoint_cleanup.retry(wf.id,db.get_workflow(wf.id).state_version,manual=True)
+        assert db.get_workflow(wf.id).status.value=='cancelled'
+    else:
+        with db._connect(immediate=True) as conn:
+            db._append_workflow_event(conn,WorkflowEventCreate(
+                workflow_id=wf.id,event_type=checkpoint_cleanup.PENDING,idempotency_key='corrupt-test',
+                payload=dict(pending,target=[])))
+        assert workflows.advance_workflow(wf.id).status.value=='awaiting_human'
+        with pytest.raises(db.WorkflowConflictError,match='history is unknown'):_resume(wf)
+        assert not attempts
+    assert _types(db,wf).count('stage.checkpoint')==_types(db,wf).count('stage.advanced')==1
+    assert not db.list_tasks(status=TaskStatus.PENDING)

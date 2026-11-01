@@ -22,6 +22,12 @@ class CheckpointError(RuntimeError):
     pass
 
 
+class CheckpointCleanupError(CheckpointError):
+    def __init__(self, message, cleanup, ready):
+        super().__init__(message)
+        self.cleanup, self.ready = cleanup, ready
+
+
 class CheckpointBusyError(CheckpointError):
     pass
 
@@ -239,7 +245,7 @@ class _RefTransaction:
         self.process.stdin.flush()
         self._expect(b"commit: ok")
 
-    def __exit__(self, *exc):
+    def close(self):
         if self.process is None:
             return
         try:
@@ -247,7 +253,7 @@ class _RefTransaction:
                 try:
                     self.process.stdin.write(b"abort\n")
                     self.process.stdin.flush()
-                except (BrokenPipeError, OSError):
+                except (BrokenPipeError, OSError, ValueError):
                     pass
                 try:
                     self.process.stdin.close()
@@ -273,16 +279,23 @@ class _RefTransaction:
                 except OSError:
                     pass
 
+    def __exit__(self, *exc):
+        try:
+            self.close()
+        except Exception as error:
+            raise CheckpointCleanupError(str(error), self.close,
+                lambda: self.process.poll() is not None and not self.reader.is_alive()) from error
+
 
 def _fault(point):
     """Injection seam for process-crash recovery tests; production is a no-op."""
 
 
 def confirm(pending, commit, signature):
-    """Freshly confirm a cleaned-up publication receipt before projecting it.
+    """Confirm a fenced, accepted receipt before releasing workflow readiness.
 
     The immutable commit/index intent was created under the original admission.
-    This read-only check follows the caller's new SQLite writer/version gate;
+    This read-only check follows the caller's cleanup and SQLite writer gate;
     it grants no new ref write or permission to accept changed working bytes.
     """
     repo = Path(pending["check_dir"]).resolve()
@@ -559,9 +572,9 @@ def publish(pending, signature, claim, admit):
                     _fault("after_ref_before_database")
                 elif head != intent["commit"] or digest != intent["after"]:
                     raise CheckpointError("unknown checkpoint ref/index state; operator inspection required")
-                # Capture the receipt under both ref and SQLite admission. The
-                # caller applies it only after this fence's cleanup succeeds,
-                # under a new version gate and fresh confirm() readback.
+                # Keep this ref fence and index ownership through SQLite
+                # source acceptance. Workflow readiness stays blocked until
+                # the retained owned resource cleanup confirms completion.
                 fences.enter_context(_RefTransaction(
                     repo, intent["branch"], intent["commit"], None, hooks))
                 yield intent["commit"]
