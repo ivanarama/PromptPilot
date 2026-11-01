@@ -4,6 +4,7 @@ from datetime import datetime
 from enum import Enum
 import ipaddress
 import os
+from pathlib import PurePosixPath
 from typing import Any, Literal, Optional
 from urllib.parse import urlsplit
 
@@ -317,21 +318,53 @@ class WorkflowRolesConfig(BaseModel):
         return self
 
 
+class WorkflowGateCommand(BaseModel):
+    """An explicitly approved argv check with declared repository inputs."""
+
+    model_config = ConfigDict(extra="forbid")
+    argv: list[str] = Field(min_length=1, max_length=128)
+    inputs: list[str] = Field(min_length=1, max_length=100)
+    repeat: Literal["per-attempt"]
+
+    @field_validator("argv")
+    @classmethod
+    def finite_argv(cls, value):
+        if (not value[0].strip() or any("\0" in part or len(part)>8192 for part in value)
+                or sum(len(part) for part in value)>32768):
+            raise ValueError("gate argv must be a finite argument vector without NUL")
+        return value
+
+    @field_validator("inputs")
+    @classmethod
+    def relative_inputs(cls, value):
+        for name in value:
+            path = PurePosixPath(name)
+            if (not name or len(name)>1024 or "\0" in name or "\\" in name or ":" in name
+                    or path.is_absolute() or any(part in {"", ".", ".."} for part in name.split("/"))):
+                raise ValueError("gate inputs must be exact repository-relative POSIX file paths")
+        if len(set(value)) != len(value):
+            raise ValueError("gate inputs must be unique")
+        return value
+
+
+GateCommand = str | WorkflowGateCommand
+
+
 class WorkflowGateConfig(BaseModel):
     """Deterministic checks executed after a successful executor run."""
 
     model_config = ConfigDict(extra="forbid")
 
     enabled: bool = True
-    commands: list[str] = Field(default_factory=list, max_length=20)
+    commands: list[GateCommand] = Field(default_factory=list, max_length=20)
     timeout_seconds: int = Field(default=1800, ge=1, le=86400)
     stop_on_failure: bool = True
 
     @field_validator("commands")
     @classmethod
-    def commands_are_not_blank(cls, value: list[str]) -> list[str]:
-        cleaned = [item.strip() for item in value]
-        if any(not item for item in cleaned):
+    def commands_are_not_blank(cls, value):
+        cleaned = [item.strip() if isinstance(item, str) else item for item in value]
+        if any(isinstance(item, str) and not item for item in cleaned):
             raise ValueError("gate commands cannot be blank")
         return cleaned
 
@@ -433,7 +466,7 @@ class WorkflowSetupValidationRequest(BaseModel):
     repository_path: str = Field(min_length=1)
     candidate_branch: str = Field(min_length=1)
     providers: list[str] = Field(default_factory=list, max_length=3)
-    gate_commands: list[str] = Field(default_factory=list, max_length=20)
+    gate_commands: list[GateCommand] = Field(default_factory=list, max_length=20)
 
 
 class WorkflowSetupCheck(BaseModel):
@@ -591,11 +624,20 @@ class WorkflowStageSpec(BaseModel):
     dependencies: list[str] = Field(default_factory=list, max_length=20)
     allowed_paths: list[str] = Field(default_factory=list, max_length=100)
     deliverables: list[str] = Field(default_factory=list, max_length=100)
-    acceptance_gates: list[str] = Field(default_factory=list, max_length=20)
+    acceptance_gates: list[GateCommand] = Field(default_factory=list, max_length=20)
     executor_prompt: str = ""
     reviewer_prompt: str = ""
     max_revision_rounds: Optional[int] = Field(default=None, ge=1, le=20)
     execution_mode: WorkflowExecutionMode = WorkflowExecutionMode.AUTOMATIC
+
+    @model_validator(mode="after")
+    def declared_gate_inputs_are_deliverables(self):
+        for command in self.acceptance_gates:
+            if isinstance(command, WorkflowGateCommand):
+                missing = set(command.inputs)-set(self.deliverables)
+                if missing:
+                    raise ValueError("gate inputs must be listed in stage deliverables: "+", ".join(sorted(missing)))
+        return self
 
 
 class WorkflowPlanReplace(BaseModel):
@@ -858,6 +900,42 @@ class WorkflowGateRecovery(BaseModel):
     recovery_nonce: str = Field(min_length=1)
     reason: str = Field(min_length=1, max_length=20000)
     acknowledge_gate_effects_reviewed: bool = Field(default=False, strict=True)
+
+
+class WorkflowElicitation(BaseModel):
+    """A question, never a permission grant or an executable command."""
+
+    model_config = ConfigDict(extra="forbid")
+    schema_version: Literal[1]
+    kind: Literal["information", "permission"]
+    question: str = Field(min_length=1, max_length=5000)
+    action: Optional[str] = Field(default=None, max_length=8192)
+    options: list[str] = Field(default_factory=list, max_length=8)
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def exact_version(cls, value):
+        if type(value) is not int or value != 1:
+            raise ValueError("elicitation schema_version must be integer 1")
+        return value
+
+    @model_validator(mode="after")
+    def meaningful_question(self):
+        if not self.question.strip() or any(not value.strip() or len(value)>2000 for value in self.options):
+            raise ValueError("elicitation question/options cannot be blank or oversized")
+        if len(set(self.options)) != len(self.options):
+            raise ValueError("elicitation options must be unique")
+        if self.kind == "permission" and not (self.action or "").strip():
+            raise ValueError("permission elicitation must describe the requested action")
+        return self
+
+
+class WorkflowElicitationAnswer(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_version: int = Field(ge=0, strict=True)
+    request_id: str = Field(min_length=1, max_length=64)
+    binding_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    answer: str = Field(min_length=1, max_length=10000)
 
 
 class WorkflowHumanInput(BaseModel):

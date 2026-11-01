@@ -77,10 +77,11 @@ def snapshot(conn, workflow):
     gate = config.gate.model_dump(mode="json")
     stage = conn.execute("SELECT spec_json FROM workflow_stages WHERE id=?",
                          (workflow.current_stage_id,)).fetchone()
-    commands = list(dict.fromkeys([
+    from . import declared_gates
+    commands = declared_gates.unique([
         *gate["commands"],
         *((db._json_load(stage["spec_json"]).get("acceptance_gates") or []) if stage else []),
-    ]))
+    ])
     round_row = conn.execute(
         "SELECT id FROM workflow_rounds WHERE workflow_id=? AND round_no=?",
         (workflow.id, workflow.current_round),
@@ -90,7 +91,7 @@ def snapshot(conn, workflow):
         "FROM workflow_runs WHERE round_id=? AND role='executor' AND status='completed' "
         "ORDER BY attempt_no DESC LIMIT 1", (round_row["id"] if round_row else None,),
     ).fetchone()
-    return {
+    result = {
         "workflow_id": workflow.id,
         "round_id": round_row["id"] if round_row else None,
         "stage_id": workflow.current_stage_id,
@@ -100,8 +101,14 @@ def snapshot(conn, workflow):
         "gate": gate,
         "commands": commands,
         "argv": [(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command]
-                  if os.name == "nt" else ["/bin/sh", "-lc", command]) for command in commands],
+                  if os.name == "nt" else ["/bin/sh", "-lc", command])
+                 if isinstance(command,str) else [] for command in commands],
     }
+    if gate["enabled"] and any(not isinstance(command,str) for command in commands):
+        from pathlib import Path
+        result["cwd"] = str(Path(workflow.repository_path).resolve())
+        result.update(declared_gates.prepare(commands,result["cwd"]))
+    return result
 
 
 def _unknown(execution_id, reason):

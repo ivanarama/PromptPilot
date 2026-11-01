@@ -54,6 +54,7 @@ from .models import (
     WorkflowGateRecovery,
     WorkflowHistoryImport,
     WorkflowHumanInput,
+    WorkflowElicitationAnswer,
     WorkflowReviewDecision,
     WorkflowRoundInDB,
     WorkflowRunInDB,
@@ -754,7 +755,13 @@ def api_validate_workflow_setup(request: WorkflowSetupValidationRequest):
             "gate", "warning", "Gate-команды не заданы: функциональная готовность не проверяется",
         ))
     for index, command in enumerate(request.gate_commands, start=1):
-        status, detail = _validate_gate_syntax(command)
+        if isinstance(command,str):
+            status, detail = _validate_gate_syntax(command)
+        else:
+            from .declared_gates import prepare
+            prepared = prepare([command.model_dump(mode="json")],request.repository_path)
+            status = "error" if prepared["validation_errors"] else "ok"
+            detail = "; ".join(prepared["validation_errors"])
         if status == "warning":
             # A gate the operator did specify, whose syntax we could not check.
             unverified.append(f"gate#{index}")
@@ -1182,6 +1189,18 @@ def api_workflow_external_request(workflow_id: str, request: WorkflowExternalReq
 def api_workflow_external_result(workflow_id: str, submission: WorkflowExternalResult):
     submitted = _workflow_action(workflows.submit_external_result, workflow_id, submission)
     return workflows.advance_workflow(submitted.id)
+
+
+@app.get("/api/workflows/{workflow_id}/elicitation")
+def api_workflow_elicitation(workflow_id: str):
+    from . import workflow_elicitation
+    return _workflow_action(workflow_elicitation.get, workflow_id)
+
+
+@app.post("/api/workflows/{workflow_id}/elicitation/answer", response_model=WorkflowInDB)
+def api_workflow_elicitation_answer(workflow_id: str, action: WorkflowElicitationAnswer):
+    from . import workflow_elicitation
+    return _workflow_action(workflow_elicitation.answer, workflow_id, action)
 
 
 @app.post(

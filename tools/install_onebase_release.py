@@ -86,10 +86,18 @@ def split_finite_integration_decisions(prompt, stage):
 
 def rewrite_prompt(prompt, stage, procedures, release_id, health_config=None):
     prompt, decisions = split_finite_integration_decisions(prompt, stage)
-    # Replace the canonical occurrence only, not the Codex adapter path. Old
-    # operator hotfix annotations are ours, bounded by their exact prefix.
-    prompt = prompt.split("\n\nОператорский runtime hotfix:", 1)[0]
-    prompt = prompt.split("\n\nОператорский релиз:", 1)[0]
+    # Only the annotation paragraph belongs to the installer. Later trusted
+    # local operator paragraphs must survive verbatim (including pinned tool
+    # paths); preservation grants no new authority. Keep finite MERGE framing
+    # validation above, before handling these opaque local paragraphs.
+    suffix = ""
+    paragraph = r"\r?\n[ \t]*\r?\n"
+    annotation = re.search(paragraph + r"Операторский (?:runtime hotfix|релиз):", prompt)
+    if annotation is not None:
+        end = re.search(paragraph, prompt[annotation.end():])
+        if end is not None:
+            suffix = prompt[annotation.end() + end.start():]
+        prompt = prompt[:annotation.start()]
     pattern = rf"(?<!\S)(?:\.claude/skills/{stage}/SKILL\.md|/[^\s]+/{stage}/SKILL\.md)"
     path = str(procedures / ".claude" / "skills" / stage / "SKILL.md")
     prompt, count = re.subn(pattern, lambda _match: path, prompt)
@@ -115,7 +123,7 @@ def rewrite_prompt(prompt, stage, procedures, release_id, health_config=None):
             "это закреплённый checker данного релиза с его -contract/transport/cache "
             "параметрами. Не подменяй его устаревшей сборкой из рабочего checkout. "
             "Все глобальные owner/allowlist и локальные mutation-гейты обязательны.")
-    return result + decisions
+    return result + suffix + decisions
 
 
 def configure(profiles, config, binary, health, procedures, release_id):
