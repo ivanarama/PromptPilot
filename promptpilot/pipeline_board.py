@@ -15,7 +15,8 @@ CATEGORIES = {
 }
 
 
-def build_board(delivery, diagnostics, tasks, *, available, classifications=None):
+def build_board(delivery, diagnostics, tasks, *, available, classifications=None,
+                tool_errors=None):
     groups = {key: [] for key in CATEGORIES}
     configured = classifications if isinstance(classifications, dict) else {}
     for original in delivery.get("merged_prs") or []:
@@ -50,7 +51,10 @@ def build_board(delivery, diagnostics, tasks, *, available, classifications=None
                 waiting.append(target)
             else:
                 blocked.append(target)
+    from .routing_observation import build_routing_observation
     return {
+        "routing": build_routing_observation(
+            diagnostics, available=available, tool_errors=tool_errors),
         "available": bool(available),
         "delivery_exact": delivery.get("exact") is True,
         "delivery_groups": [{"id": key, "title": title, "items": groups[key],

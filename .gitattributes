@@ -1,2 +1,4 @@
 /tests/fixtures/positive-review-v1.json text eol=lf
 /tests/fixtures/positive-review-origin.json text eol=lf
+/tests/fixtures/routing-observation-v1.json text eol=lf
+/tests/fixtures/routing-observation-origin.json text eol=lf
