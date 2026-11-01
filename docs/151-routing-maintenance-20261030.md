@@ -235,3 +235,12 @@ These are private integration seams with fixture-produced trusted records.
 The actual public pipeline admission/START issuer, worker wiring, technical lease
 heartbeat, CAS writer, settlement/resume writers and real paired acceptance are
 still required. This does not enable a production capability or close #151.
+
+
+The private pipeline-admission purpose is separate from author admission and
+START. Both codecs share closed structural/local configuration and live strict
+reservation checks; the public author decoder still rejects the pipeline
+purpose, and pipeline admission rejects author execution and fork identities.
+Forty combined pure scope and actual public author/fork progress cases passed
+35.79s after that extraction, with Ruff. No public pipeline issuer or capability
+was added by this serialization/refactoring slice.
