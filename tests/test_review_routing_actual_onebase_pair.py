@@ -121,7 +121,10 @@ def adapter(synthetic_adapter,monkeypatch,tmp_path):  # noqa: F811
         current['timelineItems']['edges']+=copy.deepcopy(peer.comments)
         state_path.write_text(json.dumps(dict(pr=current,queries=queries)),encoding='utf-8')
         result=ACTUAL_HEALTH(config,**kwargs)
-        evidence.append(result)
+        # Later synthetic composition fixtures may augment the returned dict.
+        # Retain the checker bytes independently so they cannot manufacture
+        # evidence that the real Go implementation emitted a START allowlist.
+        evidence.append(copy.deepcopy(result))
         return result
     monkeypatch.setattr(pp,'run_health',health)
     peer.actual_pair=dict(binary_sha256=digest,source_reader_sha256=initial,
@@ -153,6 +156,12 @@ def test_actual_go_and_all_four_canonical_readers_through_public_worker(technica
         assert not health['technical_fix_candidates'] and not health['merge_executable']
     assert any('gate-fix-start' in command for command in calls)
     data=peer.actual_pair
+    started=history.attempt_phases(attempt)['started']
+    expected_start=dict(stage='fix-pr',number=42,head=attempt.payload['source']['head'],
+        source=attempt.payload['source'],attempt_id=attempt.id,started_id=started.id,
+        **started.payload['details'])
+    assert any(expected_start in value.get('technical_fix_start_candidates',[])
+               for value in data['evidence']), 'actual checker did not emit the exact canonical START target'
     assert any(value.get('fix_execution_contract',{}).get('protocol')=='claimed-pipeline-fix-v1'
                for value in data['evidence'])
     queries=json.loads(data['state_path'].read_text(encoding='utf-8'))['queries']
@@ -160,5 +169,6 @@ def test_actual_go_and_all_four_canonical_readers_through_public_worker(technica
     receipt=dict(binary_sha256=data['binary_sha256'],reader_sha256=data['source_reader_sha256'],
                  fault=fault,factories=len(factories),cas_sends=len(pushes),budget_used=history.budget_used,
                  task_status=saved.status.value,verdict=saved.verdict,query_count=len(queries),
-                 github_transport='private synthetic peer',production_activation=False)
+                 github_transport='private synthetic peer',production_activation=False,
+                 actual_start_allowlist=True,canonical_start_target=expected_start)
     (data['fixture_root']/'actual-pair-receipt.json').write_text(json.dumps(receipt,ensure_ascii=False,indent=2),encoding='utf-8')
