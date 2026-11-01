@@ -78,7 +78,7 @@ def _source_gate(snapshot, config, proof, request):
             raise PipelineError('author progress source crossed an unsafe lifecycle/ref event')
         if (node.get('__typename') == 'IssueComment'
                 and (node.get('author') or {}).get('login') == config['trusted_account']
-                and (node.get('lastEditedAt') is not None or pp.OVERRIDE.search(node.get('body') or ''))):
+                and (node.get('lastEditedAt') is not None or pp.has_review_again(node.get('body') or ''))):
             raise PipelineError('author progress source crossed a trusted edit or override')
     before, after = proof.publication.payload['audit']['base_ref_oid'], snapshot['baseRefOid']
     return before, after

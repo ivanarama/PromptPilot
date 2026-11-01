@@ -339,9 +339,9 @@ def reduce(records, *, deleted_at=(), max_attempts=2):
                 or (completed.payload['details']['new_head']!=publication.payload['identity']['head_sha']
                     and publication.payload['resume_id'] is None)):
             raise PipelineError("new routing REVIEW lacks completed post-push provenance")
-    for proof in proofs:
-        historical = sum(item.order < proof.publication.order for item in attempts)
-        if proof.publication.payload["budget_used"] != historical:
+    for publication in publications:
+        historical = sum(item.order < publication.order for item in attempts)
+        if publication.payload["budget_used"] != historical:
             raise PipelineError("routing publication budget differs from lifetime reservations")
     resumes = tuple(item for item in ordered if item.payload["kind"] == "resume")
     # Parking is a chronological state, not max(all historical parking). A

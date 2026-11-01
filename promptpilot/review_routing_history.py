@@ -48,7 +48,7 @@ def verified_depth(snapshot,*,trusted):
             event=edge['node']
             if (event['__typename']=='IssueComment'
                     and (event.get('author') or {}).get('login')==trusted
-                    and pp.OVERRIDE.search(event.get('body') or '')):
+                    and pp.has_review_again(event.get('body') or '')):
                 start=offset+1
         info={'hash':epoch,'edges':edges[start:index+1]}
         established=pp.proof(info,head,trusted)
@@ -84,7 +84,7 @@ def verified_depth(snapshot,*,trusted):
         pp.validate_epoch_safety({'edges':suffix},trusted)
         if any(edge['node']['__typename']=='IssueComment'
                and (edge['node'].get('author') or {}).get('login')==trusted
-               and pp.OVERRIDE.search(edge['node'].get('body') or '') for edge in suffix):
+               and pp.has_review_again(edge['node'].get('body') or '') for edge in suffix):
             raise PipelineError('routing typed publication crossed a review override')
     typed=[{'kind':'typed','completion_id':proof.completion.id,'publication_id':proof.publication.id,
             'head':proof.source['head'],'epoch':proof.source['epoch'],'outcome':proof.outcome,
@@ -98,8 +98,10 @@ def verified_depth(snapshot,*,trusted):
         epochs.add(key)
     # A typed root's declared depth is immutable reviewed context, and must
     # agree with independently verified transactions preceding that root.
-    for proof in ledger.proofs:
-        prior=sum(item['index']<positions[proof.publication.id] for item in completed)
-        if proof.publication.payload['depth']!=prior:
+    for publication in history:
+        if publication.payload['kind']!='publication' or publication.id in ledger.ignored_ids:
+            continue
+        prior=sum(item['index']<positions[publication.id] for item in completed)
+        if publication.payload['depth']!=prior:
             raise PipelineError('routing typed publication depth contradicts verified history')
     return {'depth':len(completed),'completed':completed,'ledger':ledger,'mutation_authorized':False}

@@ -27,6 +27,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 from .pipeline_errors import PipelineError
+from .pipeline_markers import has_review_again
 
 REVIEW = re.compile(r"(?m)^Reviewed-SHA: ([0-9a-f]{40})$.*^Outcome-Label: (reviewed|changes-requested|needs-decision)$.*^<!-- pp:review pp:tail=([0-9]+) -->$", re.S)
 CLAIM_MESSAGE = "PromptPilot service marker: REVIEW result publication claimed."
@@ -554,7 +555,7 @@ def epoch(snapshot: dict, trusted: str) -> dict:
         node = edge.get("node") or {}
         if (node.get("__typename") == "IssueComment" and
                 (node.get("author") or {}).get("login") == trusted and
-                node.get("lastEditedAt") is None and OVERRIDE.search(node.get("body") or "")):
+                node.get("lastEditedAt") is None and has_review_again(node.get("body") or "")):
             anchor_index, anchor = index, edge
     node = anchor["node"]
     anchor_id = node.get("id")
