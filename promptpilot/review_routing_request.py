@@ -222,7 +222,7 @@ def build(config,snapshot,policy,*,depth,budget_used,resume_id=None,reservation=
         'pr_key':pr_key(identity),'identity':identity.to_dict(),'identity_sha256':identity.sha256,
         'author':snapshot['author'],'head':identity.head_sha,'epoch':pp.epoch(snapshot,config['trusted_account'])['hash'],
         'anchor':pp.epoch(snapshot,config['trusted_account'])['anchor_id'],
-        'audit':recovery['audit'] if recovery is not None else capture(snapshot),
+        'audit':recovery['audit'] if recovery is not None else capture(snapshot,retain_history=True),
         'config_sha256':pp.digest(config),'reader_sha256':policy['consumer_sha256'],
         'depth':depth,'budget_used':budget_used,'current_limit':policy['current_limit'],'resume_id':resume_id,
         'owner_uuid':str(uuid4()),'issued_at':issued,'expires_at':issued+ttl,'nonce':secrets.token_hex(16),

@@ -3,11 +3,10 @@ from __future__ import annotations
 
 from . import project_pipeline as pp
 from .pipeline_errors import PipelineError
-from .review_routing_baseline import _edges, capture
+from .review_routing_baseline import _edges, historical
 from .review_routing_lease import decimal_id
 from .review_routing_proof import reduce
-from .review_routing_wire import records
-from .pr_identity import PRIdentityV1
+from .review_routing_wire import records, context
 
 
 def verified_depth(snapshot,*,trusted):
@@ -71,22 +70,22 @@ def verified_depth(snapshot,*,trusted):
         identity=dict(snapshot['identity'],head_sha=payload['identity']['head_sha'])
         if identity!=payload['identity'] or snapshot['author']!=payload['author']:
             raise PipelineError('routing historical publication identity or author differs from PR')
-        if boundary==publication.id:
-            prefix=dict(snapshot,identity=identity,headRefOid=identity['head_sha'],
-                        identity_sha256=PRIdentityV1(**identity).sha256,
-                        edges=edges[:positions[publication.id]])
-            observed=capture(prefix)
-            if any(observed[key]!=payload['audit'][key] for key in
-                   ('snapshot_sha256','last_edge_cursor','last_edge_node_id')):
-                raise PipelineError('routing historical publication audit prefix is unavailable or changed')
+        original=historical(snapshot,payload['audit'],identity=identity,author=payload['author'],
+                            publication_index=positions[publication.id],
+                            publication_context=context(payload),trusted=trusted)
         # Even an unfinished root needs a real historical server anchor.
         # Completed proofs must retain that epoch through their completion.
-        prefix=dict(snapshot,headRefOid=payload['identity']['head_sha'],
-                    edges=edges[:positions[boundary]+1])
-        info=pp.epoch(prefix,trusted)
+        info=pp.epoch(original,trusted)
         pp.validate_epoch_safety(info,trusted)
         if (info['hash'],info['anchor_id'])!=(payload['epoch'],payload['anchor']):
             raise PipelineError('routing typed proof has no matching historical server epoch/anchor')
+        suffix=[edge for edge in edges[positions[publication.id]:positions[boundary]+1]
+                if edge['node']['__typename']!='PullRequestCommit']
+        pp.validate_epoch_safety({'edges':suffix},trusted)
+        if any(edge['node']['__typename']=='IssueComment'
+               and (edge['node'].get('author') or {}).get('login')==trusted
+               and pp.OVERRIDE.search(edge['node'].get('body') or '') for edge in suffix):
+            raise PipelineError('routing typed publication crossed a review override')
     typed=[{'kind':'typed','completion_id':proof.completion.id,'publication_id':proof.publication.id,
             'head':proof.source['head'],'epoch':proof.source['epoch'],'outcome':proof.outcome,
             'index':positions[proof.completion.id]} for proof in ledger.proofs]

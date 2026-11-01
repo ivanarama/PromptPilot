@@ -40,9 +40,10 @@ def history():
     return state
 
 
-def add_typed(state,*,depth=2,epoch=None,anchor_id=None):
+def add_typed(state,*,depth=2,epoch=None,anchor_id=None,retain_history=False):
     data=root(state);info=pp.epoch(state,'owner')
-    data.update(depth=depth,epoch=epoch or info['hash'],anchor=anchor_id or info['anchor_id'],audit=capture(state))
+    data.update(depth=depth,epoch=epoch or info['hash'],anchor=anchor_id or info['anchor_id'],
+                audit=capture(state,retain_history=retain_history))
     data['outcome']=outcome(data['report'],depth=data['depth'],budget_used=data['budget_used'],max_attempts=data['max_attempts'])
     common={'protocol':data['protocol'],'pr':data['pr'],'owner':data['owner'],
             'context_sha256':context(data),'publication_id':'3000','lease_id':'3000'}

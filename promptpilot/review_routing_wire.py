@@ -82,13 +82,33 @@ def _integer(value, low, high):
 
 
 def audit_binding(value):
-    _fields(value,'snapshot_sha256 last_edge_cursor last_edge_node_id base_ref_oid')
+    if not isinstance(value,dict):
+        raise PipelineError('invalid routing audit binding')
+    _fields({key:item for key,item in value.items() if key!='history'},
+            'snapshot_sha256 last_edge_cursor last_edge_node_id base_ref_oid')
     hash64(value['snapshot_sha256']);head40(value['base_ref_oid'])
     cursor,ident=value['last_edge_cursor'],value['last_edge_node_id']
     if (cursor is None)!=(ident is None):
         raise PipelineError('routing audit boundary requires both cursor and node ID')
     if cursor is not None:
         _text(cursor);_text(ident)
+    if 'history' in value:
+        history=value['history']
+        _fields(history,'protocol header edges')
+        if history['protocol']!='audit-history-v1':
+            raise PipelineError('unsupported retained audit history')
+        _fields(history['header'],'headRefOid baseRefName state isDraft identity identity_sha256 pr_key author labels labelsComplete')
+        if not isinstance(history['edges'],list) or len(history['edges'])>10000:
+            raise PipelineError('retained audit edge manifest is invalid or oversized')
+        seen_cursors=set();seen_ids=set()
+        for edge in history['edges']:
+            _fields(edge,'cursor node_id');_text(edge['cursor']);_text(edge['node_id'])
+            if edge['cursor'] in seen_cursors or edge['node_id'] in seen_ids:
+                raise PipelineError('retained audit manifest has duplicate server identities')
+            seen_cursors.add(edge['cursor']);seen_ids.add(edge['node_id'])
+        last=history['edges'][-1] if history['edges'] else {'cursor':None,'node_id':None}
+        if (last['cursor'],last['node_id'])!=(cursor,ident):
+            raise PipelineError('retained audit manifest differs from its boundary')
     return value
 
 

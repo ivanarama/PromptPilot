@@ -14,6 +14,18 @@ any provider is built, the worker validates the report's exact committed hash,
 HEAD and all-technical classification. The prompt includes that report, full
 PR identity and source/attempt binding as data; it cannot substitute another
 target or treat report text as controller commands.
+New audit bindings optionally retain `audit-history-v1`: the exact original
+header and an ordered cursor/node-ID manifest, bound by the existing complete
+snapshot hash and publication context. Runtime REVIEW retains this material.
+Historical verification uses the retained header and the unchanged original
+nodes, so later labels, lifecycle state and backdated commit insertions cannot
+erase a completed receipt. It rejects missing, reordered or changed original
+nodes and unexplained independent events. This is historical evidence only;
+live writes still require the strict full-prefix, current HEAD and owner gate.
+Older development records without retained material require an available exact
+original projection. The existing 60,000-byte complete-comment bound remains:
+oversized history is an explicit engineering refusal, never truncated evidence.
+
 The one-use receipt is consumed before the final gate and factory. The worker
 atomically keeps separate permanent attempt/source issuance tombstones. Losing
 the mutable START row cannot authorize an overlapping issuer to recreate it.
