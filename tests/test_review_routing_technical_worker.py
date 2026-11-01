@@ -108,10 +108,13 @@ def technical_worker(pipeline_case,monkeypatch,tmp_path):
         message='Actual worker correction\n\n'+'\n'.join(k+': '+v for k,v in trailers(attempt.payload,attempt.id).items())
         if mode['fault']=='rate-limit':code="import sys; print('rate limit',file=sys.stderr); sys.exit(1)"
         else:
+            closing='ИТОГ: ГОТОВО'
+            if mode['fault']=='closing-contract' and '\n'+closing+'\n' not in prompt:
+                closing='Verdict: PASS'
             code=("import pathlib,subprocess; pathlib.Path('app.py').write_text('corrected by owned worker',encoding='utf-8'); "
                 "subprocess.run(['git','-c','maintenance.auto=false','-c','gc.auto=0','add','--','app.py'],check=True); "
                 "subprocess.run(['git','-c','maintenance.auto=false','-c','gc.auto=0','commit','-qm',"+repr(message)+"],check=True); "
-                "print("+repr('\u0418\u0422\u041e\u0413: \u0413\u041e\u0422\u041e\u0412\u041e')+")")
+                "print("+repr(closing)+")")
         return [sys.executable,'-X','utf8','-c',code]
     monkeypatch.setattr(worker,'build_cmd',build)
     original_start=worker.OwnedProcess.start
@@ -139,6 +142,19 @@ def test_public_worker_one_owned_launch_one_cas_and_one_machine_fix_done(technic
     done=state.attempt_phases(root)['fix-done']
     assert done.payload['details']['new_head']==git(task.working_dir,'--git-dir='+str(remote),'rev-parse',ref)
     assert any('gate-fix-start' in command for command in calls)
+
+
+@pytest.mark.parametrize('author_bridge',['real-source'],indirect=True)
+def test_public_worker_supplies_the_closing_format_its_provider_must_follow(technical_worker):
+    peer,path,task,database,_calls,factories,pushes,_remote,_ref,mode=technical_worker
+    mode['fault']='closing-contract'
+    worker._execute_task_body(task)
+    saved=database.get_task(task.id)
+    assert saved.status.value=='completed' and saved.verdict=='ГОТОВО',saved.error or saved.result
+    assert len(factories)==len(pushes)==1
+    state=ledger(peer,path)
+    assert state.budget_used==len(state.attempts)==1
+    assert 'fix-done' in state.attempt_phases(state.attempts[0])
 
 
 @pytest.mark.parametrize('author_bridge',['real-source'],indirect=True)
