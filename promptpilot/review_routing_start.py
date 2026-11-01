@@ -110,19 +110,24 @@ class StartGuard:
         return True
 
 
-def launch(gh,config_path,token,*,factory):
-    """Private integration seam. Caller must retain/close its owned child handle."""
-    guard=StartGuard(gh,config_path,token)
-    guard.state()
-    store=OneUseStart(db.DB_PATH,create=False,allow_new=False)
-    return store.invoke(guard.scope,final_guard=lambda scope:guard.final(store,scope),factory=factory)
-
-
 def gate(gh,config_path,token):
     """Public read-only factory gate; requires the worker's consumed local scope."""
+    from .review_routing_workspace import Workspace
+    import hashlib
     guard=StartGuard(gh,config_path,token)
     store=OneUseStart(db.DB_PATH,create=False,allow_new=False)
+    task=db.get_task(guard.scope['task_id'])
+    if task is None or not task.working_dir:
+        raise PipelineError('pipeline START source checkout is unavailable')
+    workspace=Workspace(db.DB_PATH,guard.scope,task.working_dir)
+    workspace.verify()
     guard.final(store,guard.scope)
+    path=workspace.verify()
+    store.verify_consumed(guard.scope)
+    requests.require_current(guard.request,pp.load_config(config_path))
+    if guard._validated_expiry<=guard.now():
+        raise PipelineError('pipeline START lease expired during checkout verification')
     return dict(action='start-allowed',stage='fix',protocol='review-routing-v1',
         scope_sha256=sha(guard.scope),owner=guard.scope['owner'],
+        workspace=str(path),workspace_receipt_sha256=hashlib.sha256(workspace.receipt.read_bytes()).hexdigest(),
         lease_expires_at=guard._validated_expiry.isoformat())

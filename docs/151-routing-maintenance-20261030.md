@@ -290,3 +290,15 @@ Seven actual zero-network Git cases passed57.08s with Ruff: clean/idempotent sou
 base dirty files/index retained, bytes/HEAD/scope/remote drift refused, missing
 receipt preserved and a real base post-checkout hook not executed. This remains
 a private component, not worker wiring, OS sandboxing or paired acceptance.
+
+
+The unpublished public START gate now derives the exact workspace from the
+scope UUID and actual scheduler source directory, verifies its receipt/common
+repository/clean source before and after fresh remote gates, then repeats the
+strict consumed local task fence and lease clock. It returns the exact path and
+receipt digest to the trusted coordinator. Real Git source fixtures exercise
+unconsumed-token refusal after preparing a valid checkout and reject modified
+bytes/receipt before any factory; three cases passed57.20s. The initial combined
+source/default-author check had two cases passed28.96s. Metadata-only launch
+composition now lives solely in test helpers; its positive case passed21.47s.
+Installed worker wiring, heartbeat/CAS/settlement and real pairing remain open.

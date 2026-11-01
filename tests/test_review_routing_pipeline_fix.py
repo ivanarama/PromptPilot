@@ -12,7 +12,6 @@ import pytest
 from promptpilot import project_pipeline as pp
 from promptpilot import review_routing_pipeline_fix as pipeline
 from promptpilot import review_routing_pipeline_policy as policy
-from promptpilot import review_routing_start as start
 from promptpilot import review_routing_start_request as requests
 from promptpilot.pipeline_errors import PipelineError
 from promptpilot.process_tree import OwnedProcess
@@ -21,6 +20,7 @@ from promptpilot.review_routing_wire import parse
 from test_review_routing_adapter import adapter as adapter  # noqa: F401
 from test_review_routing_stage_guard import setup_guard as setup_guard  # noqa: F401
 from test_review_routing_fix import author_bridge as author_bridge,ledger  # noqa: F401
+from test_review_routing_start import metadata_launch
 
 
 @pytest.fixture
@@ -83,7 +83,7 @@ def test_private_new_issuer_to_actual_owned_factory_has_one_canonical_attempt(pi
         calls.append(True)
         return OwnedProcess.start([sys.executable,'-c','print("one-factory")'],
             stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
-    tree=start.launch(peer,str(path),issued['lease'],factory=factory)
+    tree=metadata_launch(peer,str(path),issued['lease'],factory=factory)
     try:
         OneUseStart(database.DB_PATH).observe_started(request['scope'],tree.process.pid)
         output,_error=tree.process.communicate(timeout=10)
@@ -136,6 +136,7 @@ def test_late_pre_admission_change_spends_no_attempt_and_starts_nothing(pipeline
 
 
 
+@pytest.mark.parametrize('author_bridge',['real-source'],indirect=True)
 def test_public_cli_admission_prepare_and_consumed_start_gate(pipeline_case):
     from contextlib import redirect_stdout
     from io import StringIO
@@ -149,9 +150,12 @@ def test_public_cli_admission_prepare_and_consumed_start_gate(pipeline_case):
     assert code==0 and selection['action']=='pipeline-fix',selection
     code,prepared=cli('prepare-fix-start','fix','--lease',selection['lease'])
     assert code==0 and prepared['action']=='pipeline-start',prepared
+    value=requests.decode(prepared['lease']);calls=[]
+    from promptpilot.review_routing_workspace import Workspace
+    Workspace(database.DB_PATH,value['scope'],database.get_task(value['scope']['task_id']).working_dir).prepare()
     code,refused=cli('gate-fix-start','fix','--lease',prepared['lease'])
     assert code==2 and refused['action']=='error','unconsumed token acquired factory permission'
-    value=requests.decode(prepared['lease']);calls=[]
+    assert 'consumed' in refused['error']
     def final(scope):
         code,result=cli('gate-fix-start','fix','--lease',prepared['lease'])
         assert code==0 and result['action']=='start-allowed',result
@@ -175,3 +179,32 @@ def test_public_pipeline_policy_keeps_fork_execution_with_the_author(pipeline_ca
     assert code==0 and value['action']=='author-handoff',value
     assert value['mutation_authorized'] is False
     assert ledger(peer,path).budget_used==0
+
+
+
+@pytest.mark.parametrize('author_bridge',['real-source'],indirect=True)
+@pytest.mark.parametrize('fault',['bytes','receipt'])
+def test_public_factory_gate_refuses_changed_deterministic_checkout(pipeline_case,fault):
+    from contextlib import redirect_stdout
+    from io import StringIO
+    from promptpilot.review_routing_workspace import Workspace
+    peer,_health,path,task,database,_config=pipeline_case
+    selection=selected(pipeline_case);prepared=issue(pipeline_case,selection)
+    value=requests.decode(prepared['lease'])
+    workspace=Workspace(database.DB_PATH,value['scope'],task.working_dir)
+    workspace.prepare()
+    if fault=='bytes':(workspace.path/'app.py').write_text('unexpected checkout change',encoding='utf-8')
+    else:
+        record=json.loads(workspace.receipt.read_bytes());record['scope_sha256']='f'*64
+        workspace.receipt.write_text(json.dumps(record),encoding='utf-8')
+    calls=[]
+    def final(_scope):
+        stream=StringIO()
+        with redirect_stdout(stream):code=pp.run(['--config',str(path),'gate-fix-start','fix','--lease',prepared['lease']])
+        result=json.loads(stream.getvalue())
+        assert code==2 and result['action']=='error',result
+        raise PipelineError('checkout gate refused before actual factory')
+    store=OneUseStart(database.DB_PATH,create=False,allow_new=False)
+    with pytest.raises(PipelineError):store.invoke(value['scope'],final_guard=final,factory=lambda:calls.append(True))
+    assert not calls and store.status(value['scope'])['state']=='not-started'
+    assert workspace.path.exists() and ledger(peer,path).budget_used==1

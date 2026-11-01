@@ -11,6 +11,7 @@ from uuid import uuid4
 import pytest
 
 from promptpilot import project_pipeline as pp
+from promptpilot import db
 from promptpilot import review_routing_pipeline_policy as policy
 from promptpilot import review_routing_start_request as requests
 from promptpilot import review_routing_start as start
@@ -23,6 +24,14 @@ from promptpilot.review_routing_wire import context,render
 from test_review_routing_adapter import adapter as adapter  # noqa: F401
 from test_review_routing_stage_guard import setup_guard as setup_guard  # noqa: F401
 from test_review_routing_fix import author_bridge as author_bridge,ledger  # noqa: F401
+
+
+def metadata_launch(gh,config_path,token,*,factory):
+    """Test-only composition probe; the real worker must use the workspace gate."""
+    guard=start.StartGuard(gh,config_path,token)
+    guard.state()
+    store=OneUseStart(db.DB_PATH,create=False,allow_new=False)
+    return store.invoke(guard.scope,final_guard=lambda scope:guard.final(store,scope),factory=factory)
 
 
 @pytest.fixture
@@ -66,14 +75,14 @@ def test_canonical_start_seam_launches_one_actual_owned_child_and_never_relaunch
         calls.append(True)
         return OwnedProcess.start([sys.executable,'-c','print("owned-start")'],
             stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
-    tree=start.launch(peer,str(path),token,factory=factory)
+    tree=metadata_launch(peer,str(path),token,factory=factory)
     try:
         store=OneUseStart(database.DB_PATH)
         store.observe_started(value['scope'],tree.process.pid)
         output,_error=tree.process.communicate(timeout=10)
         assert b'owned-start' in output
         assert store.status(value['scope'])['state']=='launched'
-        with pytest.raises(PipelineError):start.launch(peer,str(path),token,factory=factory)
+        with pytest.raises(PipelineError):metadata_launch(peer,str(path),token,factory=factory)
         assert len(calls)==1
     finally:tree.close()
 
@@ -97,7 +106,7 @@ def test_late_change_after_consumption_stops_before_any_factory(pipeline_start,m
         return generation
     monkeypatch.setattr(OneUseStart,'_consume',changed)
     calls=[]
-    with pytest.raises(PipelineError):start.launch(peer,str(path),token,factory=lambda:calls.append(True))
+    with pytest.raises(PipelineError):metadata_launch(peer,str(path),token,factory=lambda:calls.append(True))
     assert not calls
     assert OneUseStart(database.DB_PATH).status(value['scope'])['state']=='not-started'
 
@@ -106,9 +115,9 @@ def test_ambiguous_factory_failure_remains_unknown_without_spawn_retry(pipeline_
     peer,_health,path,_task,database,value,token=pipeline_start
     calls=[]
     def failed():calls.append(True);raise OSError('unknown factory outcome')
-    with pytest.raises(OSError):start.launch(peer,str(path),token,factory=failed)
+    with pytest.raises(OSError):metadata_launch(peer,str(path),token,factory=failed)
     assert OneUseStart(database.DB_PATH).status(value['scope'])['state']=='unknown'
-    with pytest.raises(PipelineError):start.launch(peer,str(path),token,factory=failed)
+    with pytest.raises(PipelineError):metadata_launch(peer,str(path),token,factory=failed)
     assert len(calls)==1
 
 
@@ -121,5 +130,5 @@ def test_existing_server_started_cannot_reconstruct_lost_local_issuance(pipeline
         with connection:connection.execute('DELETE FROM '+TABLE)
     calls=[]
     with pytest.raises(PipelineError,match='no prepared local issuance'):
-        start.launch(peer,str(path),token,factory=lambda:calls.append(True))
+        metadata_launch(peer,str(path),token,factory=lambda:calls.append(True))
     assert not calls
