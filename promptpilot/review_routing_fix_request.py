@@ -39,7 +39,10 @@ def capability(config, health):
     if health.get('fix_bridge_contract') not in (BRIDGE, PROGRESS_BRIDGE):
         raise PipelineError('checker lacks the complete claimed FIX author-handoff capability')
     if config.get('technical_fix_execution') is not None:
-        raise PipelineError('pipeline FIX execution is not supported by this bridge slice')
+        from . import review_routing_pipeline_policy as pipeline
+        explicit=pipeline.settings(config)
+        if explicit['enabled'] and health.get('fix_execution_contract')!=pipeline.CONTRACT:
+            raise PipelineError('pipeline FIX execution requires its complete paired capability')
     return policy
 
 

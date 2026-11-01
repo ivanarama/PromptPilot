@@ -1,4 +1,4 @@
-"""Private closed pipeline admission schema; not a public issuer/capability."""
+"""Closed pipeline admission schema; serialization is not factory permission."""
 import json
 import re
 import secrets

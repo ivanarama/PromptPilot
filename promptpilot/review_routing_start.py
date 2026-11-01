@@ -1,4 +1,4 @@
-"""Private canonical pipeline start guard; public issuer/worker not connected.
+"""Canonical pipeline START gate; installed worker factory not connected.
 
 Only a fresh complete peer and actual trusted source/started history can reach
 OneUseStart. This module never interprets process exit or expiry as settlement.
@@ -15,7 +15,7 @@ from .review_routing_history import verified_depth
 from .review_routing_lease import resolve,decimal_id,owner_id
 from .review_routing_proof import _lease_nodes
 from .review_routing_snapshot import stable_timeline
-from .review_routing_wire import _fields,_source,_integer,context,head40,records
+from .review_routing_wire import _fields,_source,_integer,context,head40,records,sha
 
 
 class StartGuard:
@@ -106,6 +106,7 @@ class StartGuard:
         store.verify_consumed(scope)
         state['view'].require_owner(returned_id=state['view'].active.id,owner=scope['owner'],now=self.now())
         requests.require_current(self.request,config)
+        self._validated_expiry=state['view'].expires_at
         return True
 
 
@@ -115,3 +116,13 @@ def launch(gh,config_path,token,*,factory):
     guard.state()
     store=OneUseStart(db.DB_PATH,create=False,allow_new=False)
     return store.invoke(guard.scope,final_guard=lambda scope:guard.final(store,scope),factory=factory)
+
+
+def gate(gh,config_path,token):
+    """Public read-only factory gate; requires the worker's consumed local scope."""
+    guard=StartGuard(gh,config_path,token)
+    store=OneUseStart(db.DB_PATH,create=False,allow_new=False)
+    guard.final(store,guard.scope)
+    return dict(action='start-allowed',stage='fix',protocol='review-routing-v1',
+        scope_sha256=sha(guard.scope),owner=guard.scope['owner'],
+        lease_expires_at=guard._validated_expiry.isoformat())

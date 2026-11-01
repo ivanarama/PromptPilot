@@ -1,7 +1,7 @@
 """Explicit same-repository pipeline executor policy; not launch authority.
 
-The future public coordinator must repeat this preflight at every write and
-factory boundary. No current route advertises this incomplete capability.
+The coordinator repeats this preflight at writes and the factory gate.
+The full worker execution capability remains unqualified and disabled.
 """
 import re
 

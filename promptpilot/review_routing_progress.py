@@ -34,7 +34,10 @@ def capability(config, health):
     if result.get('enabled') is not True or health.get('fix_bridge_contract') != BRIDGE:
         raise PipelineError('author progress requires its complete paired bridge capability')
     if config.get('technical_fix_execution') is not None:
-        raise PipelineError('author progress cannot enable pipeline execution')
+        from . import review_routing_pipeline_policy as pipeline
+        explicit=pipeline.settings(config)
+        if explicit['enabled'] and health.get('fix_execution_contract')!=pipeline.CONTRACT:
+            raise PipelineError('author progress requires the complete configured paired capability')
     return result
 
 

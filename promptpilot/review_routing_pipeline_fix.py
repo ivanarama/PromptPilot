@@ -1,4 +1,4 @@
-"""Private pipeline admission/START issuer; not advertised by public routes yet.
+"""Pipeline admission and prepared START metadata issuer; worker not connected.
 
 Canonical metadata does not prove a process launch or grant a second factory.
 The worker must consume the separately prepared START with its final gate.
@@ -132,10 +132,11 @@ class AdmissionGuard:
 
 
 def select(gh,config,*,config_path,health):
+    ordered=candidates(health)
+    if not ordered:return None
     task=pp._pipeline_task_id(required=True)
     own=next((row for row in db.list_pipeline_target_reservations(repository=config['repository'])
               if row['task_id']==task),None)
-    ordered=candidates(health)
     if own is not None:
         ordered=[item for item in ordered if (own['stage'],own['number'],own['head'])==pp._fix_candidate_key(item)]
         if not ordered:raise PipelineError('pipeline admission reservation target changed; no retargeting')

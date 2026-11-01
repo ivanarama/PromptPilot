@@ -133,3 +133,45 @@ def test_late_pre_admission_change_spends_no_attempt_and_starts_nothing(pipeline
     else:database.request_cancel(task.id)
     with pytest.raises(PipelineError):issue(pipeline_case,selection)
     assert peer.posts==before and ledger(peer,path).budget_used==0
+
+
+
+def test_public_cli_admission_prepare_and_consumed_start_gate(pipeline_case):
+    from contextlib import redirect_stdout
+    from io import StringIO
+    from promptpilot.review_routing_wire import sha
+    peer,_health,path,_task,database,_config=pipeline_case
+    def cli(*args):
+        stream=StringIO()
+        with redirect_stdout(stream):code=pp.run(['--config',str(path),*args])
+        return code,json.loads(stream.getvalue())
+    code,selection=cli('next','fix')
+    assert code==0 and selection['action']=='pipeline-fix',selection
+    code,prepared=cli('prepare-fix-start','fix','--lease',selection['lease'])
+    assert code==0 and prepared['action']=='pipeline-start',prepared
+    code,refused=cli('gate-fix-start','fix','--lease',prepared['lease'])
+    assert code==2 and refused['action']=='error','unconsumed token acquired factory permission'
+    value=requests.decode(prepared['lease']);calls=[]
+    def final(scope):
+        code,result=cli('gate-fix-start','fix','--lease',prepared['lease'])
+        assert code==0 and result['action']=='start-allowed',result
+        assert result['scope_sha256']==sha(scope) and result['owner']==scope['owner']
+        return True
+    OneUseStart(database.DB_PATH,create=False,allow_new=False).invoke(value['scope'],
+        final_guard=final,factory=lambda:calls.append(True))
+    assert calls==[True] and ledger(peer,path).budget_used==1
+    with pytest.raises(PipelineError):issue(pipeline_case,selection)
+
+
+
+@pytest.mark.parametrize('author_bridge',['fork'],indirect=True)
+def test_public_pipeline_policy_keeps_fork_execution_with_the_author(pipeline_case):
+    from contextlib import redirect_stdout
+    from io import StringIO
+    peer,_health,path,_task,_database,_config=pipeline_case
+    stream=StringIO()
+    with redirect_stdout(stream):code=pp.run(['--config',str(path),'next','fix'])
+    value=json.loads(stream.getvalue())
+    assert code==0 and value['action']=='author-handoff',value
+    assert value['mutation_authorized'] is False
+    assert ledger(peer,path).budget_used==0

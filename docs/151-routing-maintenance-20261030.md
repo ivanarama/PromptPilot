@@ -261,3 +261,20 @@ readback, lost local issuance, unknown absent POST, late actor/cancellation and
 zero author assignment operations. This is a private issuer integration API;
 actual pipelinectl dispatch and installed worker, technical heartbeat, CAS push,
 settlement/resume writers and accepted OneBase pairing remain unconnected.
+
+
+## Unpublished public START metadata CLI
+
+The development source now exposes source-bound `next fix` pipeline admission,
+`prepare-fix-start fix` and read-only `gate-fix-start fix` under the explicit
+complete paired policy. The gate requires an already consumed matching local
+START row; possession of a token alone is refused. Three actual CLI/legacy gate
+cases passed24.95s. Three additional public fork/default-author and existing
+same-repository/fork author-progress cases passed37.45s: switching on a configured
+pipeline executor never rewrites an existing canonical author attempt.
+
+This is an unpublished CLI metadata slice. The installed worker still refuses
+these new pipeline purposes before any generic provider fallback. Its actual
+factory/workspace wiring, technical heartbeat, CAS push, trusted settlement/resume
+writers and accepted checker/four readers/paired qualification remain required.
+No production configuration, installed source or scheduler flag changed.

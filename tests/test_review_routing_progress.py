@@ -138,3 +138,20 @@ def test_public_progress_rechecks_late_source_and_authority_before_any_write(pro
     code,result=run('complete','fix','--lease',selected['lease'])
     assert code==2,result
     assert peer.posts==before and len(peer.assignment_posts)==1
+
+
+
+@pytest.mark.parametrize('author_bridge',[None,'fork'],indirect=True)
+def test_configured_pipeline_executor_never_retargets_an_existing_author_progress(progress_case):
+    import json
+    from promptpilot.review_routing_pipeline_policy import CONTRACT
+    peer,health,path,_task,run,_database,root,_config,_graph=progress_case
+    raw=json.loads(path.read_text(encoding='utf-8'))
+    raw['technical_fix_execution']=dict(enabled=True,protocol='review-routing-v1',executor=dict(kind='pipeline',login='owner'))
+    path.write_text(json.dumps(raw),encoding='utf-8')
+    health['fix_execution_contract']=copy.deepcopy(CONTRACT)
+    code,selected=run('next','fix')
+    assert code==0 and selected['action']=='author-progress',selected
+    code,result=run('complete','fix','--lease',selected['lease'])
+    assert code==0 and result['executor']==root.payload['executor'] and result['provider_started'] is False,result
+    assert ledger(peer,path).budget_used==1 and len(peer.assignment_posts)==1

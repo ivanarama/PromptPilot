@@ -2,7 +2,7 @@
 
 The coordinator must independently verify canonical attempt/started/lease and
 source history, actor, current checker/readers and task after all waits. This
-private schema alone does not connect the factory or enable a public capability.
+schema alone does not connect the worker factory or enable production execution.
 """
 import json
 import re
