@@ -244,3 +244,20 @@ purpose, and pipeline admission rejects author execution and fork identities.
 Forty combined pure scope and actual public author/fork progress cases passed
 35.79s after that extraction, with Ruff. No public pipeline issuer or capability
 was added by this serialization/refactoring slice.
+
+
+The private pipeline issuer now composes source-bound admission, canonical
+attempt/assigned/handoff/started receipts and prepared local one-use scope. Its
+final write ticket repeats source/actor/checker/lease after SQLite renewal waits,
+then checks the actual local task/cancel/reservation and readers/config/clock.
+It preserves one spent lifetime slot, derives one task UUID from the immutable
+admission nonce and refuses retargeting a claimed task. An existing server START
+cannot rebuild a missing local issuance. An ambiguous absent POST stays a barrier;
+an authenticated exact readback of a newly sent START can recover response loss.
+
+Six private scheduler/authenticated-peer/actual owned-child tests passed56.53s
+with Ruff. They include positive one-launch, response loss, repeated pre-factory
+readback, lost local issuance, unknown absent POST, late actor/cancellation and
+zero author assignment operations. This is a private issuer integration API;
+actual pipelinectl dispatch and installed worker, technical heartbeat, CAS push,
+settlement/resume writers and accepted OneBase pairing remain unconnected.
