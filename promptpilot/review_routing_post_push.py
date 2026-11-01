@@ -67,15 +67,7 @@ def verify(gh, config, snapshot, attempt, attempt_id, new_head):
     message = content.get('message') if isinstance(content, dict) else None
     if not isinstance(message, str) or len(message.encode('utf-8')) > 65536:
         raise PipelineError('post-push commit message is missing or oversized')
-    lines = message.splitlines()
-    while lines and not lines[-1].strip():
-        lines.pop()
-    last_break = max((index for index, line in enumerate(lines) if not line.strip()), default=-1)
-    block = lines[last_break+1:]
-    for key, value in expected.items():
-        matches = [line for line in lines if line.startswith(key + ':')]
-        if matches != [key + ': ' + value] or matches[0] not in block:
-            raise PipelineError('post-push requires unique terminal source/attempt trailers')
+    verify_message(message,expected)
     # A metadata read after graph/commit I/O detects ordinary concurrent pushes
     # and ref/repository swaps. The eventual mutation guard must repeat its own
     # complete stable timeline and clock checks after every intervening wait.
@@ -85,3 +77,17 @@ def verify(gh, config, snapshot, attempt, attempt_id, new_head):
         raise PipelineError('post-push PR identity changed during graph verification')
     return dict(new_head=new_head, transition=expected['PP-Fix-Transition'],
                 source_trailer=expected['PP-Technical-Fix-Source'])
+
+
+def verify_message(message,expected):
+    if not isinstance(message,str) or len(message.encode('utf-8'))>65536:
+        raise PipelineError('post-push commit message is missing or oversized')
+    lines = message.splitlines()
+    while lines and not lines[-1].strip():
+        lines.pop()
+    last_break = max((index for index, line in enumerate(lines) if not line.strip()), default=-1)
+    block = lines[last_break+1:]
+    for key, value in expected.items():
+        matches = [line for line in lines if line.startswith(key + ':')]
+        if matches != [key + ': ' + value] or matches[0] not in block:
+            raise PipelineError('post-push requires unique terminal source/attempt trailers')

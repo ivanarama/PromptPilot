@@ -21,6 +21,7 @@ from .review_routing_wire import _fields,_source,_integer,context,head40,records
 class StartGuard:
     decode_request=staticmethod(requests.decode)
     require_current=staticmethod(requests.require_current)
+    forbidden_phases={'fix-done','barrier'}
 
     def __init__(self,gh,config_path,token,*,clock=None):
         if not isinstance(config_path,str) or not config_path:
@@ -36,15 +37,7 @@ class StartGuard:
             raise PipelineError('pipeline START clock must be timezone aware')
         return value.astimezone(timezone.utc)
 
-    def state(self):
-        request=self.decode_request(self.token)
-        if request!=self.request:raise PipelineError('pipeline START signed binding changed')
-        config=pp.load_config(self.config_path)
-        health=pp.run_health(config,config_path=self.config_path)
-        paired=policy.require(config,request['identity'],health=health)
-        self.require_current(request,config)
-        if paired['consumer_sha256']!=self.scope['reader_sha256']:
-            raise PipelineError('pipeline START paired readers changed')
+    def checker_gate(self,health):
         expected=dict(stage='fix-pr',number=self.scope['pr']['pr_number'],head=self.scope['source']['head'],
             source=self.scope['source'],attempt_id=self.scope['attempt_id'],started_id=self.scope['started_id'],
             task_id=self.scope['task_id'],attempt_uuid=self.scope['attempt_uuid'])
@@ -62,9 +55,27 @@ class StartGuard:
                 raise PipelineError('pipeline START checker target is invalid or duplicated')
             seen.add(item['number'])
         if expected not in candidates:raise PipelineError('pipeline START left its exact checker allowlist')
-        snapshot=stable_timeline(self.gh,config,expected['number'])
-        if snapshot['identity']!=request['identity'] or snapshot['author']!=request['author']:
+
+    def identity_gate(self,snapshot):
+        if snapshot['identity']!=self.request['identity'] or snapshot['author']!=self.request['author']:
             raise PipelineError('pipeline START full source identity or author changed')
+
+    def source_gate(self,snapshot,config,proof):
+        source=proof.publication.payload
+        pp.review_gate(snapshot,config,dict(head=self.scope['source']['head'],epoch=source['epoch'],anchor=source['anchor']))
+
+    def state(self):
+        request=self.decode_request(self.token)
+        if request!=self.request:raise PipelineError('pipeline START signed binding changed')
+        config=pp.load_config(self.config_path)
+        health=pp.run_health(config,config_path=self.config_path)
+        paired=policy.require(config,request['identity'],health=health)
+        self.require_current(request,config)
+        if paired['consumer_sha256']!=self.scope['reader_sha256']:
+            raise PipelineError('pipeline START paired readers changed')
+        self.checker_gate(health)
+        snapshot=stable_timeline(self.gh,config,self.scope['pr']['pr_number'])
+        self.identity_gate(snapshot)
         ledger=verified_depth(snapshot,trusted=config['trusted_account'])['ledger']
         root=next((row for row in ledger.attempts if row.id==self.scope['attempt_id']),None)
         proof=ledger.source_proof(self.scope['source'])
@@ -80,10 +91,9 @@ class StartGuard:
                 or started.payload['lease_id']!=request['lease_id']
                 or started.payload['details']!={'task_id':self.scope['task_id'],'attempt_uuid':self.scope['attempt_uuid']}
                 or not {'assigned','handoff-done'} <= set(phases)
-                or {'fix-done','barrier'} & set(phases)):
+                or self.forbidden_phases & set(phases)):
             raise PipelineError('pipeline START canonical started/executor context changed or is ended')
-        source=proof.publication.payload
-        pp.review_gate(snapshot,config,dict(head=self.scope['source']['head'],epoch=source['epoch'],anchor=source['anchor']))
+        self.source_gate(snapshot,config,proof)
         if set(snapshot['labels']) & {'hold','ship','needs-decision','manual'}:
             raise PipelineError('pipeline START stopped by current routing labels')
         history,_deleted=records(snapshot,trusted=config['trusted_account'],expected_pr=self.scope['pr'])

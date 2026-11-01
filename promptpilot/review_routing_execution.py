@@ -137,6 +137,11 @@ class OneUseStart:
     def _keys(scope):
         return sha({'pr':scope['pr'],'attempt_id':scope['attempt_id']}),sha({'pr':scope['pr'],'source':scope['source']})
 
+    @staticmethod
+    def _not_retired(connection,attempt_key):
+        if connection.execute('SELECT 1 FROM settings WHERE key=?',(TABLE+':retired:'+attempt_key,)).fetchone():
+            raise PipelineError('technical executor/publication was permanently retired; no restart or push')
+
     def _current_task(self,connection,scope,now):
         task=connection.execute('SELECT status,started_at,machine,detached,herdr_target,worktree FROM tasks WHERE id=?',
                                 (scope['task_id'],)).fetchone()
@@ -168,6 +173,7 @@ class OneUseStart:
             connection.execute('BEGIN IMMEDIATE')
             try:
                 self._schema(connection)
+                self._not_retired(connection,attempt_key)
                 now=self._now();self._current_task(connection,scope,now)
                 previous=connection.execute('SELECT * FROM '+TABLE+' WHERE attempt_key=? OR source_key=?',
                                             (attempt_key,source_key)).fetchall()
@@ -260,6 +266,7 @@ class OneUseStart:
         with closing(self._connect()) as connection:
             connection.execute('BEGIN')
             self._schema(connection)
+            self._not_retired(connection,attempt_key)
             reservation=scope['reservation']
             current=connection.execute('SELECT strict_lifetime FROM pipeline_target_reservations WHERE repository=? AND number=?',
                                        (reservation['repository'],reservation['number'])).fetchone()
@@ -339,6 +346,7 @@ class OneUseStart:
         with closing(self._connect()) as connection:
             connection.execute('BEGIN')
             self._schema(connection)
+            self._not_retired(connection,attempt_key)
             row=connection.execute('SELECT generation,state,scope_sha256,pid FROM '+TABLE+' WHERE attempt_key=?',
                                    (attempt_key,)).fetchone()
             if (row is None or row['state']!='launched' or row['scope_sha256']!=sha(scope)
@@ -354,6 +362,27 @@ class OneUseStart:
                                        (reservation['repository'],reservation['number'])).fetchone()
             if current is None or current['strict_lifetime']!=1:
                 raise PipelineError('technical heartbeat requires strict lifetime ownership')
+            self._current_task(connection,scope,self._now())
+        return True
+
+    def verify_stopped(self,scope):
+        """Trusted owned cleanup receipt, never exit/TTL/PID-absence inference."""
+        scope=freeze_scope(scope);attempt_key,source_key=self._keys(scope)
+        with closing(self._connect()) as connection:
+            connection.execute('BEGIN')
+            self._schema(connection)
+            self._not_retired(connection,attempt_key)
+            row=connection.execute('SELECT * FROM '+TABLE+' WHERE attempt_key=? AND source_key=?',
+                                   (attempt_key,source_key)).fetchone()
+            if (row is None or row['state']!='stopped' or row['scope_sha256']!=sha(scope)
+                    or row['scope_json']!=canonical(scope).decode('utf-8')
+                    or type(row['pid']) is not int or row['pid']<1):
+                raise PipelineError('technical publication requires confirmed original owned cleanup')
+            reservation=scope['reservation']
+            current=connection.execute('SELECT strict_lifetime FROM pipeline_target_reservations WHERE repository=? AND number=?',
+                                       (reservation['repository'],reservation['number'])).fetchone()
+            if current is None or current['strict_lifetime']!=1:
+                raise PipelineError('technical publication lost its strict target ownership')
             self._current_task(connection,scope,self._now())
         return True
 

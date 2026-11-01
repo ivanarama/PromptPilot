@@ -1692,6 +1692,11 @@ def _execute_task_body(task, admission_complete=None, workorder_check=None):
             )
             print(f"  -> Pipeline preflight completed without agent: {reason}")
             return
+        if route.get('technical_fix') is not None:
+            if workorder_check is not None:
+                raise RuntimeError('technical FIX cannot substitute a workorder execution factory')
+            from .review_routing_worker import execute as execute_technical_fix
+            return execute_technical_fix(task,route)
         agent_prompt = route["prompt"]
         if prompt_constraint and prompt_constraint not in agent_prompt:
             agent_prompt += "\n\n" + prompt_constraint

@@ -2956,6 +2956,7 @@ def _tool_available(execution: dict, command: list[str], working_dir: str | None
                 probe_command, cwd=str(root), capture_output=True, text=True,
                 timeout=max(1, min(int(execution.get("probe_timeout_seconds", 30)), 120)),
                 encoding="utf-8", errors="replace",
+                **({"creationflags":subprocess.CREATE_NO_WINDOW} if os.name=="nt" else {}),
             )
             _ensure_github_scan_lease()
         except (OSError, subprocess.TimeoutExpired) as exc:
@@ -2998,6 +2999,7 @@ def _tool_preflight(execution: dict, command: list[str], working_dir: str | None
     environment.pop("PP_PROVIDER_OWNERSHIP_KIND", None)
     environment.pop("PP_PIPELINE_TARGET_TOKEN", None)
     environment.pop("PP_PIPELINE_EXCLUDED_NUMBERS", None)
+    environment.pop("PP_TECHNICAL_EXECUTION_NONCE",None)
     if env_extra:
         environment.update(env_extra)
     try:
@@ -3006,6 +3008,7 @@ def _tool_preflight(execution: dict, command: list[str], working_dir: str | None
             command, cwd=str(root), capture_output=True, text=True,
             timeout=max(1, min(int(execution.get("timeout_seconds", 180)), 900)),
             encoding="utf-8", errors="replace", env=environment,
+            **({"creationflags":subprocess.CREATE_NO_WINDOW} if os.name=="nt" else {}),
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise RuntimeError(f"pipeline preflight не выполнен: {exc}") from exc
@@ -3435,6 +3438,24 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                 advertised = None
             signed_routing_claim = isinstance(advertised, str) and advertised.startswith("review-routing-")
         from . import review_routing_fix_request as fix_requests
+        if preflight_action=='pipeline-fix' or advertised_purpose==fix_requests.PIPELINE_ADMISSION:
+            from . import review_routing_worker as technical
+            try:
+                request=technical.admission(preflight,task,repository=str(profile.get('repository') or '').lower(),
+                    replicas=replica_count,started_at=scheduler_task_started_at,
+                    ownership_kind=provider_ownership_kind,typed=typed_queue and stage=='fix')
+                priority=db.restore_running_attempt_priority(task.id,task.started_at)
+                if priority is None:raise RuntimeError('technical FIX task changed before provider admission')
+                admission=_reserve_execution_admission(task,profile_id,profile,queue,admission,'tool',
+                    retain_budget=retain_budget,admission_priority=priority)
+                if not admission.get('allowed'):
+                    return _budget_defer_route(admission,profile_id,profile,queue,mode='tool',
+                        phase='post_preflight',preflight=preflight)
+                return technical.prepare_route(task,request,preflight,execution=execution,command=command,
+                    working_dir=working_dir,attempt_env=attempt_env,profile_id=profile_id,
+                    queue_id=queue.get('id'),fallback_prompt=fallback_prompt)
+            except (fix_requests.PipelineError,RuntimeError,TypeError,ValueError,sqlite3.Error) as exc:
+                return dict(action='block',mode='tool',reason=str(exc),profile_id=profile_id,queue_id=queue.get('id'))
         fix_claim = isinstance(advertised_purpose, str) and advertised_purpose.startswith("review-routing-v1-fix-")
         if (typed_queue and stage == "fix" and not fix_claim and not typed_response
                 and preflight_action not in {"empty", "wait", "error"}):

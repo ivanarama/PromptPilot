@@ -99,7 +99,7 @@ class Workspace:
             stream.write(canonical(value));stream.flush();os.fsync(stream.fileno())
         return self.verify()
 
-    def verify(self):
+    def _verify(self,*,head):
         self._directories()
         _plain(self.path,directory=True);_plain(self.receipt)
         if self.receipt.stat().st_size>65536:raise PipelineError('FIX workspace receipt is oversized')
@@ -110,10 +110,33 @@ class Workspace:
         if (top!=self.source or actual!=self.path.resolve() or workspace_common!=common
                 or value!=self._expected(common)):
             raise PipelineError('FIX workspace receipt, root or shared repository changed')
-        if self._git(self.path,'rev-parse','HEAD').stdout.strip()!=self.scope['source']['head']:
+        if head is not None and self._git(self.path,'rev-parse','HEAD').stdout.strip()!=head:
             raise PipelineError('FIX workspace HEAD differs from the bound reviewed source')
         branch=self._git(self.path,'symbolic-ref','-q','HEAD',allow_failure=True)
         if branch.returncode!=1:raise PipelineError('FIX workspace must remain a detached private checkout')
         if self._git(self.path,'status','--porcelain=v1','--untracked-files=normal').stdout:
             raise PipelineError('FIX workspace changed before its one owned factory')
         return self.path
+
+    def verify(self):return self._verify(head=self.scope['source']['head'])
+
+    def output(self,attempt):
+        """A clean, finite forward commit with exact source trailers, never a push."""
+        from .review_routing_post_push import trailers,verify_message
+        from .review_routing_wire import context,head40
+        if (attempt['source']!=self.scope['source'] or attempt['pr']!=self.scope['pr']
+                or attempt['owner']!=self.scope['owner'] or context(attempt)!=self.scope['context_sha256']):
+            raise PipelineError('FIX output differs from its immutable technical attempt')
+        self._verify(head=None)
+        head=head40(self._git(self.path,'rev-parse','HEAD').stdout.strip())
+        old=self.scope['source']['head']
+        if head==old or self._git(self.path,'merge-base','--is-ancestor',old,head,allow_failure=True).returncode:
+            raise PipelineError('FIX output must move forward from its exact reviewed source')
+        count=self._git(self.path,'rev-list','--count',old+'..'+head).stdout.strip()
+        if not count.isdecimal() or not 1<=int(count)<=100:
+            raise PipelineError('FIX output exceeds its finite forward graph')
+        verify_message(self._git(self.path,'show','-s','--format=%B',head).stdout,
+                       trailers(attempt,self.scope['attempt_id']))
+        tree=head40(self._git(self.path,'rev-parse',head+'^{tree}').stdout.strip())
+        self._verify(head=head)
+        return dict(new_head=head,tree=tree)
