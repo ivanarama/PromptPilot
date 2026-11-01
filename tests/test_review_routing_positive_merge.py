@@ -6,7 +6,7 @@ import pytest
 
 from promptpilot import project_pipeline as pp
 from test_review_routing_adapter import adapter as adapter  # noqa: F401
-from test_review_routing_positive import positive as positive, merged  # noqa: F401
+from test_review_routing_positive import positive as positive, merged, rest_projection  # noqa: F401
 from test_review_routing_stage_guard import setup_guard as setup_guard  # noqa: F401
 
 
@@ -43,9 +43,7 @@ def merge_case(positive):
                 if edge['node']['__typename'] == 'IssueComment']
 
     def rest_pr():
-        return dict(number=42, title='positive typed fixture', state='closed' if pr['state'] == 'MERGED' else 'open',
-                    merged=pr['state'] == 'MERGED', merge_commit_sha='b' * 40,
-                    head={'sha': pr['headRefOid']}, base={'ref': pr['baseRefName']},
+        return dict(rest_projection(peer), title='positive typed fixture',
                     labels=copy.deepcopy(pr['labels']['nodes']), body=peer.native_body)
 
     def transport(*args, input_value=None):

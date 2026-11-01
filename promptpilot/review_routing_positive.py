@@ -84,6 +84,8 @@ def inspect(snapshot, *, trusted, merged=False):
             raise PipelineError('positive typed REVIEW was superseded by a later override')
     merge_sha = None
     if merged:
+        from .review_routing_lease import timestamp
+        timestamp(edges[cut]['node'].get('createdAt'))
         merge_sha = (edges[cut]['node'].get('commit') or {}).get('oid')
         from .pr_identity import SHA
         if not isinstance(merge_sha, str) or not SHA.fullmatch(merge_sha):
@@ -138,11 +140,28 @@ def live(gh, config, number, *, purpose, health=None):
             raise PipelineError('positive typed MERGE requires trusted current-epoch ship')
     else:
         pr = gh.json('api', f"repos/{config['repository']}/pulls/{number}")
+        if not isinstance(pr, dict):
+            raise PipelineError('positive typed REVIEW merged PR response is incomplete')
+        obj = lambda value: value if isinstance(value, dict) else {}
+        head, base, author = obj(pr.get('head')), obj(pr.get('base')), obj(pr.get('user'))
+        head_repo, base_repo = obj(head.get('repo')), obj(base.get('repo'))
+        identity = dict(base_repository_id=base_repo.get('node_id'), base_repository=base_repo.get('full_name'),
+                        base_ref=base.get('ref'), pr_id=pr.get('node_id'), pr_number=pr.get('number'),
+                        head_repository_id=head_repo.get('node_id'), head_repository=head_repo.get('full_name'),
+                        head_ref=head.get('ref'), head_sha=head.get('sha'),
+                        cross_repository=base_repo.get('node_id') != head_repo.get('node_id'))
         if (pr.get('merged') is not True or pr.get('state') != 'closed'
+                or type(pr.get('number')) is not int or pr['number'] != number
+                or identity != snapshot['identity']
+                or dict(id=author.get('node_id'), login=author.get('login')) != snapshot['author']
                 or (pr.get('head') or {}).get('sha') != snapshot['headRefOid']
                 or (pr.get('base') or {}).get('ref') != config['base_branch']
                 or pr.get('merge_commit_sha') != result['merge_sha']):
             raise PipelineError('positive typed REVIEW REST and observed merge disagree')
+        from .review_routing_lease import timestamp
+        merge_node = next(edge['node'] for edge in snapshot['edges'] if edge['node']['id'] == result['merge_event'])
+        if timestamp(pr.get('merged_at')) != timestamp(merge_node.get('createdAt')):
+            raise PipelineError('positive typed REVIEW REST and observed merge time disagree')
     if purpose == 'tail' and 'no-tail' in labels:
         raise PipelineError('positive typed TAIL was declined by the owner')
     proof = result['proof']

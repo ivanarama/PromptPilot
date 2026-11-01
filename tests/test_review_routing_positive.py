@@ -1,5 +1,6 @@
 """Positive consumers through the real CLI and complete typed transport."""
 import copy
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -9,6 +10,19 @@ import pytest
 from promptpilot.review_routing_wire import sha
 from test_review_routing_adapter import adapter as adapter  # noqa: F401
 from test_review_routing_stage_guard import setup_guard as setup_guard  # noqa: F401
+
+
+def rest_projection(peer):
+    pr = peer.current['data']['repository']['pullRequest']
+    event = next((edge['node'] for edge in [*pr['timelineItems']['edges'], *peer.comments]
+                  if edge['node']['__typename'] == 'MergedEvent'), None)
+    return dict(number=pr['number'], node_id=pr['id'], merged=pr['state'] == 'MERGED',
+                state='closed' if pr['state'] == 'MERGED' else 'open',
+                head=dict(sha=pr['headRefOid'], ref=pr['headRefName'],
+                          repo=dict(node_id=pr['headRepository']['id'], full_name=pr['headRepository']['nameWithOwner'])),
+                base=dict(ref=pr['baseRefName'], repo=dict(node_id=pr['baseRepository']['id'], full_name=pr['baseRepository']['nameWithOwner'])),
+                user=dict(node_id=pr['author']['id'], login=pr['author']['login']),
+                merge_commit_sha='b' * 40, merged_at=event['createdAt'] if event else None)
 
 
 @pytest.fixture
@@ -33,8 +47,7 @@ def positive(adapter):
 
     def transport(*args, **kwargs):
         if args == ('api', 'repos/owner/repo/pulls/42'):
-            return dict(merged=pr['state'] == 'MERGED', state='closed' if pr['state'] == 'MERGED' else 'open',
-                        head={'sha': pr['headRefOid']}, base={'ref': pr['baseRefName']}, merge_commit_sha='b' * 40)
+            return rest_projection(peer)
         return original(*args, **kwargs)
 
     peer.json = transport
@@ -148,6 +161,34 @@ def test_public_tail_allows_one_terminal_branch_delete(positive):
     assert code == 0 and result['merge_sha'] == 'b' * 40, result
 
 
+@pytest.mark.parametrize('fault', ['number', 'node-id', 'author', 'repository', 'missing-merged-at', 'merge-time'])
+def test_public_tail_refuses_partial_or_conflicting_rest_merge_identity(positive, fault):
+    peer, _health, _path, run, _completed = positive
+    merged(peer)
+    original = peer.json
+
+    def transport(*args, **kwargs):
+        result = original(*args, **kwargs)
+        if args == ('api', 'repos/owner/repo/pulls/42'):
+            if fault == 'number':
+                result['number'] = 99
+            elif fault == 'node-id':
+                result['node_id'] = 'OTHER_PR'
+            elif fault == 'author':
+                result['user']['node_id'] = 'OTHER_AUTHOR'
+            elif fault == 'repository':
+                result['head']['repo']['node_id'] = 'OTHER_REPOSITORY'
+            elif fault == 'missing-merged-at':
+                result.pop('merged_at')
+            else:
+                result['merged_at'] = '2026-01-01T00:00:00Z'
+        return result
+
+    peer.json = transport
+    code, result = inspect(run, 'tail')
+    assert code == 2 and result['action'] == 'error', result
+
+
 def export_vector(name, value):
     directory = os.environ.get('PP_POSITIVE_GOLDEN_DIR')
     if directory is None:
@@ -165,6 +206,9 @@ def export_vector(name, value):
     ('author-changed', 'merge', False), ('fork-changed', 'merge', False),
     ('edited-publication', 'merge', False), ('deleted-history', 'merge', False),
     ('override', 'merge', False), ('post-merge-override', 'tail', False),
+    ('missing-merge-time', 'tail', False), ('missing-merge-commit', 'tail', False),
+    ('positive-after-merge', 'tail', False), ('two-terminal-deletes', 'tail', False),
+    ('fenced-override', 'merge', True), ('post-merge-fenced-override', 'tail', True),
 ])
 def test_shared_positive_vectors_are_measured_through_public_cli(positive, name, stage, accepted):
     from promptpilot import project_pipeline as pp
@@ -180,6 +224,16 @@ def test_shared_positive_vectors_are_measured_through_public_cli(positive, name,
         peer.comments.append(dict(cursor='LIFECYCLE', node=dict(__typename=kind, id='LIFECYCLE', createdAt=at)))
     elif name == 'second-merge':
         peer.comments.append(dict(cursor='SECOND_MERGE', node=dict(__typename='MergedEvent', id='SECOND_MERGE', createdAt=at, commit={'oid': 'b' * 40})))
+    elif name == 'missing-merge-time':
+        peer.comments[-1]['node'].pop('createdAt')
+    elif name == 'missing-merge-commit':
+        peer.comments[-1]['node'].pop('commit')
+    elif name == 'positive-after-merge':
+        event = peer.comments.pop()
+        peer.comments.insert(0, event)
+    elif name == 'two-terminal-deletes':
+        for index in range(2):
+            peer.comments.append(dict(cursor=f'DELETE{index}', node=dict(__typename='HeadRefDeletedEvent', id=f'DELETE{index}', createdAt=at)))
     elif name == 'head-ABA':
         for index, head in enumerate(['c' * 40, 'a' * 40]):
             peer.comments.append(dict(cursor=f'ABA{index}', node=dict(__typename='HeadRefForcePushedEvent', id=f'ABA{index}', createdAt=at, afterCommit={'oid': head})))
@@ -195,9 +249,10 @@ def test_shared_positive_vectors_are_measured_through_public_cli(positive, name,
         peer.comments[0]['node']['lastEditedAt'] = at
     elif name == 'deleted-history':
         peer.comments.append(dict(cursor='DELETED', node=dict(__typename='CommentDeletedEvent', id='DELETED', createdAt=at)))
-    elif name in {'override', 'post-merge-override'}:
+    elif name in {'override', 'post-merge-override', 'fenced-override', 'post-merge-fenced-override'}:
+        body = '```text\npp:review-again\n```' if 'fenced' in name else 'pp:review-again'
         peer.comments.append(dict(cursor='OVERRIDE', node=dict(__typename='IssueComment', id='IC_9000', fullDatabaseId='9000',
-            createdAt=at, lastEditedAt=None, author={'login': 'owner'}, body='pp:review-again')))
+            createdAt=at, lastEditedAt=None, author={'login': 'owner'}, body=body)))
     snapshot = stable_timeline(peer, pp.load_config(str(path)), 42)
     code, result = inspect(run, stage)
     assert (code == 0) is accepted, result
@@ -222,3 +277,41 @@ def test_shared_technical_source_never_becomes_positive(adapter):
     assert code == 2 and result['action'] == 'error'
     export_vector('technical-is-not-positive', dict(name='technical-is-not-positive', stage='merge', accepted=False,
                   snapshot=snapshot, source=None, merge_sha=None))
+
+
+def test_retained_positive_vectors_replay_through_public_transport(adapter):
+    peer, health, _path, _report, run = adapter
+    directory = Path(__file__).parent / 'fixtures'
+    raw = (directory / 'positive-review-v1.json').read_bytes()
+    vectors = json.loads(raw)
+    origin = json.loads((directory / 'positive-review-origin.json').read_text(encoding='utf-8'))
+    assert hashlib.sha256(raw).hexdigest() == origin['sha256']
+    assert vectors['source_head'] == origin['source_head'] and len(vectors['cases']) == origin['case_count'] == 21
+    assert vectors['authority'] == 'unverified-offline-input'
+    health['positive_review_contract'] = dict(protocol='positive-review-v1', snapshot='complete', purposes=['merge', 'tail'])
+    original = peer.json
+
+    def transport(*args, **kwargs):
+        if args == ('api', 'repos/owner/repo/pulls/42'):
+            return rest_projection(peer)
+        return original(*args, **kwargs)
+
+    peer.json = transport
+    pr = peer.current['data']['repository']['pullRequest']
+    for fixture in vectors['cases']:
+        state = fixture['snapshot']
+        identity = state['identity']
+        pr.update(id=identity['pr_id'], number=identity['pr_number'],
+                  headRefOid=state['headRefOid'], baseRefOid=state['baseRefOid'], baseRefName=state['baseRefName'],
+                  headRefName=identity['head_ref'], isCrossRepository=identity['cross_repository'],
+                  headRepository=dict(id=identity['head_repository_id'], nameWithOwner=identity['head_repository']),
+                  baseRepository=dict(id=identity['base_repository_id'], nameWithOwner=identity['base_repository']),
+                  author=copy.deepcopy(state['author']), state=state['state'], isDraft=state['isDraft'],
+                  labels=dict(nodes=[dict(name=name) for name in state['labels']], pageInfo=dict(hasNextPage=False)))
+        pr['timelineItems'].update(updatedAt=state['updatedAt'], edges=copy.deepcopy(state['edges']))
+        peer.comments.clear()
+        code, result = inspect(run, fixture['stage'])
+        assert (code == 0) is fixture['accepted'], (fixture['name'], result)
+        if fixture['accepted']:
+            assert result['source'] == fixture['source'] and result['merge_sha'] == fixture['merge_sha']
+    assert peer.posts == []
