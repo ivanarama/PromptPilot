@@ -2952,11 +2952,18 @@ def _tool_available(execution: dict, command: list[str], working_dir: str | None
             return False, "probe_command должен быть непустым массивом строк"
         try:
             _ensure_github_scan_lease(renew=True)
-            result = subprocess.run(
+            runner=subprocess.run
+            probe_kwargs={}
+            if execution.get('_owned_control') is True:
+                from .review_routing_control import run as run_control
+                runner=run_control
+                probe_kwargs['env']=_tool_environment(execution.get('_owned_control_env'))
+            result = runner(
                 probe_command, cwd=str(root), capture_output=True, text=True,
                 timeout=max(1, min(int(execution.get("probe_timeout_seconds", 30)), 120)),
                 encoding="utf-8", errors="replace",
                 **({"creationflags":subprocess.CREATE_NO_WINDOW} if os.name=="nt" else {}),
+                **probe_kwargs,
             )
             _ensure_github_scan_lease()
         except (OSError, subprocess.TimeoutExpired) as exc:
@@ -2986,9 +2993,7 @@ def _lease_argument(task, token: str, purpose: str) -> list[str]:
     return ["--lease-file", str(path)]
 
 
-def _tool_preflight(execution: dict, command: list[str], working_dir: str | None,
-                    *, env_extra: dict[str, str] | None = None) -> dict:
-    root = Path(working_dir or os.getcwd())
+def _tool_environment(env_extra=None):
     environment = os.environ.copy()
     # Replica identity is per claimed task, never process-global operator
     # configuration. A stale shell variable must not opt a legacy queue into
@@ -3002,6 +3007,13 @@ def _tool_preflight(execution: dict, command: list[str], working_dir: str | None
     environment.pop("PP_TECHNICAL_EXECUTION_NONCE",None)
     if env_extra:
         environment.update(env_extra)
+    return environment
+
+
+def _tool_preflight(execution: dict, command: list[str], working_dir: str | None,
+                    *, env_extra: dict[str, str] | None = None) -> dict:
+    root = Path(working_dir or os.getcwd())
+    environment=_tool_environment(env_extra)
     try:
         _ensure_github_scan_lease(renew=True)
         runner=subprocess.run
@@ -3321,7 +3333,14 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
         }
 
     stage = str(execution.get("stage") or queue.get("id") or "").lower()
-    if typed_queue and stage=='fix':execution=dict(execution,_owned_control=True)
+    if typed_queue and stage=='fix':
+        started=getattr(task,'started_at',None)
+        if not isinstance(started,datetime):
+            return {'action':'block','mode':'tool','reason':'typed FIX probe requires its claimed task occurrence'}
+        if started.tzinfo is None:started=started.astimezone()
+        execution=dict(execution,_owned_control=True,_owned_control_env={
+            'PP_TASK_ID':str(task.id),'PP_TASK_STARTED_AT':started.astimezone(timezone.utc).isoformat(),
+            'PP_PROVIDER_OWNERSHIP_KIND':'headless','PP_DATA_DIR':str(Path(db.DB_PATH).resolve().parent)})
     command = _tool_command(execution, stage)
     if typed_queue and (stage not in {"review", "fix"} or not command or command[-2:] != ["next", stage]):
         return {"action": "block", "mode": "tool", "reason": "typed routing requires its exact next stage command"}

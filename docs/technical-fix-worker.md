@@ -15,6 +15,16 @@ HEAD and all-technical classification. The prompt includes that report, full
 PR identity and source/attempt binding as data; it cannot substitute another
 target or treat report text as controller commands.
 The one-use receipt is consumed before the final gate and factory. The worker
+atomically keeps separate permanent attempt/source issuance tombstones. Losing
+the mutable START row cannot authorize an overlapping issuer to recreate it.
+The checkout verifier hashes regular working files as raw Git blobs, independently
+of status, index concealment and clean/smudge transformations. Private checkout
+uses LF with automatic line conversion disabled; files whose working bytes still
+differ from their tree, linked files and submodules require engineering handling.
+The finite raw check permits at most128 MiB per file and512 MiB for the tree.
+Both initial metadata selection and configured availability probes use retained
+owned process boundaries, including cleanup quarantine after an OS error.
+The worker
 retains the original kernel boundary before audit I/O, registers it and records
 its memory-bound producer proof. The task's rights/provider snapshot remain in
 force. START, heartbeat and publication tokens and the producer nonce are kept

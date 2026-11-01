@@ -3,6 +3,7 @@
 This is not a sandbox. The eventual worker must retain the workspace on unknown
 process outcomes and must use the actual owned factory and CAS coordinator.
 """
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -24,6 +25,7 @@ def _plain(path,*,directory=False):
             or directory and not stat.S_ISDIR(info.st_mode)
             or not directory and not stat.S_ISREG(info.st_mode)):
         raise PipelineError('FIX workspace path is linked or has an unexpected type')
+    return info
 
 
 def _remote(url,repository):
@@ -59,6 +61,7 @@ class Workspace:
     def _git(self,root,*args,allow_failure=False):
         env=dict(os.environ,GIT_NO_REPLACE_OBJECTS='1',GIT_TERMINAL_PROMPT='0')
         result=run_owned(['git','-c','maintenance.auto=false','-c','gc.auto=0',
+            '-c','core.autocrlf=false','-c','core.eol=lf',
             '-c','core.fsmonitor=false','-c','core.hooksPath='+str(self.hooks),'-C',str(root),*args],
             capture_output=True,text=True,encoding='utf-8',errors='strict',env=env,timeout=120)
         if result.returncode and not allow_failure:
@@ -66,6 +69,51 @@ class Workspace:
         if len(result.stdout)>1048576 or len(result.stderr)>1048576:
             raise PipelineError('FIX workspace Git metadata exceeds its finite bound')
         return result
+
+    def _raw_tree(self):
+        # Git status/hash-object with filters can normalize unreviewed bytes
+        # back to the committed blob. Hash regular working files directly,
+        # independently of the index, attributes and clean/smudge drivers.
+        records=self._git(self.path,'ls-tree','-r','-z','HEAD').stdout.split('\0')
+        total=0
+        for record in records:
+            if not record:continue
+            try:
+                metadata,name=record.split('\t',1)
+                mode,kind,oid=metadata.split(' ')
+            except ValueError as exc:raise PipelineError('FIX tracked tree metadata is malformed') from exc
+            relative=Path(name)
+            if (mode not in {'100644','100755'} or kind!='blob' or len(oid)!=40
+                    or any(char not in '0123456789abcdef' for char in oid)
+                    or relative.is_absolute() or any(part in {'.','..','.git'} for part in relative.parts)):
+                raise PipelineError('FIX raw source requires regular tracked files in its bound tree')
+            parent=self.path
+            for part in relative.parts[:-1]:
+                parent=parent/part;_plain(parent,directory=True)
+            path=self.path/relative;before=_plain(path)
+            if before.st_size>134217728:raise PipelineError('FIX tracked source file exceeds its finite raw-byte bound')
+            total+=before.st_size
+            if total>536870912:raise PipelineError('FIX tracked source tree exceeds its finite raw-byte bound')
+            flags=os.O_RDONLY|getattr(os,'O_BINARY',0)|getattr(os,'O_NOFOLLOW',0)|getattr(os,'O_NONBLOCK',0)
+            descriptor=os.open(path,flags)
+            with os.fdopen(descriptor,'rb') as stream:
+                opened=os.fstat(stream.fileno())
+                if (not stat.S_ISREG(opened.st_mode) or (before.st_dev,before.st_ino)!=(opened.st_dev,opened.st_ino)
+                        or opened.st_size!=before.st_size
+                        or os.name!='nt' and (mode=='100755')!=bool(opened.st_mode&0o111)):
+                    raise PipelineError('FIX tracked source changed while opening')
+                digest=hashlib.sha1(usedforsecurity=False)
+                digest.update(('blob '+str(opened.st_size)+'\0').encode('ascii'));read=0
+                while True:
+                    block=stream.read(min(1048576,opened.st_size-read+1))
+                    if not block:break
+                    read+=len(block)
+                    if read>opened.st_size:raise PipelineError('FIX tracked source grew during raw verification')
+                    digest.update(block)
+                after=os.fstat(stream.fileno())
+                if (read!=opened.st_size or digest.hexdigest()!=oid
+                        or (opened.st_size,opened.st_mtime_ns,opened.st_ctime_ns)!=(after.st_size,after.st_mtime_ns,after.st_ctime_ns)):
+                    raise PipelineError('FIX working bytes differ from its bound Git tree; filtered status is not source proof')
 
     def _repository(self,root):
         top=Path(self._git(root,'rev-parse','--show-toplevel').stdout.strip()).resolve()
@@ -120,6 +168,7 @@ class Workspace:
         sparse=self._git(self.path,'config','--type=bool','--get','core.sparseCheckout',allow_failure=True)
         if sparse.returncode not in {0,1} or sparse.stdout.strip() not in {'','false'}:
             raise PipelineError('FIX workspace cannot use sparse checkout to conceal source')
+        self._raw_tree()
         if self._git(self.path,'status','--porcelain=v1','--untracked-files=normal').stdout:
             raise PipelineError('FIX workspace changed before its one owned factory')
         return self.path

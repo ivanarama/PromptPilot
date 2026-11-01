@@ -142,6 +142,20 @@ class OneUseStart:
         if connection.execute('SELECT 1 FROM settings WHERE key=?',(TABLE+':retired:'+attempt_key,)).fetchone():
             raise PipelineError('technical executor/publication was permanently retired; no restart or push')
 
+    @staticmethod
+    def _issuance(connection,attempt_key,source_key,digest,*,new=False):
+        # Independent permanent tombstones survive loss of the mutable start
+        # row. Check and create them under the SAME scheduler writer lock:
+        # a pre-POST can_prepare observation cannot authorize reconstruction.
+        keys=[TABLE+':issued-attempt:'+attempt_key,TABLE+':issued-source:'+source_key]
+        rows=[connection.execute('SELECT value FROM settings WHERE key=?',(key,)).fetchone() for key in keys]
+        if new:
+            if any(row is not None for row in rows):
+                raise PipelineError('technical issuance was already reserved; missing local row remains a barrier')
+            for key in keys:connection.execute('INSERT INTO settings(key,value) VALUES (?,?)',(key,digest))
+        elif any(row is None or row['value']!=digest for row in rows):
+            raise PipelineError('technical issuance tombstone changed or disappeared; preserve unknown outcome')
+
     def _current_task(self,connection,scope,now):
         task=connection.execute('SELECT status,started_at,machine,detached,herdr_target,worktree FROM tasks WHERE id=?',
                                 (scope['task_id'],)).fetchone()
@@ -183,6 +197,7 @@ class OneUseStart:
                     row=previous[0]
                     if row['scope_sha256']!=digest or row['scope_json']!=body:
                         raise PipelineError('technical start immutable scope changed; preserve prior barrier')
+                    self._issuance(connection,attempt_key,source_key,digest)
                     if row['state']!='not-started':
                         raise PipelineError('technical start was already attempted or remains unknown; no second factory')
                     if prepare:
@@ -192,6 +207,7 @@ class OneUseStart:
                 else:
                     if not prepare and not self.allow_new:
                         raise PipelineError('technical START has no prepared local issuance; preserve unknown outcome')
+                    self._issuance(connection,attempt_key,source_key,digest,new=True)
                     connection.execute('INSERT INTO '+TABLE+' VALUES (?,?,?,?,?,?,?,?,?)',
                         (attempt_key,source_key,body,digest,generation,'not-started' if prepare else 'spawn-attempting',None,now.isoformat(),now.isoformat()))
                 connection.commit()
@@ -213,6 +229,7 @@ class OneUseStart:
             connection.execute('BEGIN IMMEDIATE')
             try:
                 self._schema(connection)
+                self._issuance(connection,*self._keys(scope),sha(scope))
                 connection.execute('UPDATE '+TABLE+" SET state=?,updated_at=? WHERE attempt_key=? AND generation=? AND scope_sha256=? AND state='spawn-attempting'",
                                    (state,self._now().isoformat(),attempt_key,generation,sha(scope)))
                 connection.commit()
@@ -258,6 +275,7 @@ class OneUseStart:
             connection.execute('BEGIN')
             self._schema(connection)
             row=connection.execute('SELECT state,scope_sha256,pid FROM '+TABLE+' WHERE attempt_key=?',(attempt_key,)).fetchone()
+            if row is not None:self._issuance(connection,*self._keys(scope),sha(scope))
             return dict(row) if row is not None else None
 
     def verify_consumed(self,scope):
@@ -268,6 +286,7 @@ class OneUseStart:
             self._schema(connection)
             self._not_retired(connection,attempt_key)
             reservation=scope['reservation']
+            self._issuance(connection,attempt_key,source_key,sha(scope))
             current=connection.execute('SELECT strict_lifetime FROM pipeline_target_reservations WHERE repository=? AND number=?',
                                        (reservation['repository'],reservation['number'])).fetchone()
             if current is None or current['strict_lifetime']!=1:
@@ -306,6 +325,7 @@ class OneUseStart:
             connection.execute('BEGIN IMMEDIATE')
             try:
                 self._schema(connection)
+                self._issuance(connection,*self._keys(scope),sha(scope))
                 row=connection.execute('SELECT generation,state,scope_sha256,pid FROM '+TABLE+' WHERE attempt_key=?',(attempt_key,)).fetchone()
                 if row is None or row['scope_sha256']!=sha(scope):
                     raise PipelineError('technical start observation has no matching consumed scope')
@@ -347,6 +367,7 @@ class OneUseStart:
             connection.execute('BEGIN')
             self._schema(connection)
             self._not_retired(connection,attempt_key)
+            self._issuance(connection,*self._keys(scope),sha(scope))
             row=connection.execute('SELECT generation,state,scope_sha256,pid FROM '+TABLE+' WHERE attempt_key=?',
                                    (attempt_key,)).fetchone()
             if (row is None or row['state']!='launched' or row['scope_sha256']!=sha(scope)
@@ -372,6 +393,7 @@ class OneUseStart:
             connection.execute('BEGIN')
             self._schema(connection)
             self._not_retired(connection,attempt_key)
+            self._issuance(connection,*self._keys(scope),sha(scope))
             row=connection.execute('SELECT * FROM '+TABLE+' WHERE attempt_key=? AND source_key=?',
                                    (attempt_key,source_key)).fetchone()
             if (row is None or row['state']!='stopped' or row['scope_sha256']!=sha(scope)
@@ -394,6 +416,7 @@ class OneUseStart:
         attempt_key,_source=self._keys(scope)
         with closing(self._connect()) as connection:
             self._schema(connection)
+            self._issuance(connection,*self._keys(scope),sha(scope))
             row=connection.execute('SELECT generation,scope_sha256,state,pid FROM '+TABLE+' WHERE attempt_key=?',
                                    (attempt_key,)).fetchone()
             if (row is None or row['scope_sha256']!=sha(scope)
@@ -428,6 +451,7 @@ class OneUseStart:
                 connection.execute('BEGIN IMMEDIATE')
                 try:
                     self._schema(connection)
+                    self._issuance(connection,*self._keys(scope),sha(scope))
                     row=connection.execute('SELECT generation,scope_sha256,state,pid FROM '+TABLE+' WHERE attempt_key=?',
                                            (attempt_key,)).fetchone()
                     if (row is None or row['generation']!=owner['generation'] or row['scope_sha256']!=sha(scope)
