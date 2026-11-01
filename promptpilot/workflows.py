@@ -2096,12 +2096,22 @@ def _complete_pending_checkpoint(workflow_id, expected_version, pending, said, *
         if context is False:
             raise stage_checkpoint.CheckpointError("checkpoint preparation failed")
         with context as sha:
-            conn, workflow, round_row = owned["conn"], owned["workflow"], owned["round"]
+            # Capture the source-bound receipt while Git and SQLite admission
+            # are held. All ref-process/reader cleanup must finish before any
+            # lifecycle acceptance can commit. Durable Git intent already
+            # supports recovery if publication succeeded but cleanup did not.
+            verified_sha = sha
+        with db._connect(immediate=True) as conn:
+            workflow = validate(conn, owned["version"])
+            round_row = _current_round_row(conn, workflow)
+            # A writer wait or cancellation may have intervened after receipt
+            # cleanup. Recheck the exact repository/ref/index/reviewed bytes.
+            stage_checkpoint.confirm(pending, verified_sha, _file_sig)
             db._append_workflow_event(conn, WorkflowEventCreate(
                 workflow_id=workflow_id, round_id=round_row["id"],
                 event_type="stage.checkpoint",
                 idempotency_key=f"stage.checkpoint:{pending['pending_seq']}",
-                payload={"stage_code": pending["stage_code"], "sha": sha,
+                payload={"stage_code": pending["stage_code"], "sha": verified_sha,
                          "pending_seq": pending["pending_seq"],
                          "files": pending.get("checkpoint_paths", [])},
             ))
