@@ -1039,7 +1039,7 @@ def pending_merge_intents(gh: GitHub, config: dict) -> list[dict]:
 
 
 def reserve_merge_intent(gh: GitHub, config: dict, number: int,
-                         marker: str) -> tuple[dict | None, list[dict]]:
+                         marker: str, *, before_post=None) -> tuple[dict | None, list[dict]]:
     """Publish one intent under the same lock as the canonical delta scan.
 
     Returning ``None`` means an earlier intent already owns the integration
@@ -1054,6 +1054,8 @@ def reserve_merge_intent(gh: GitHub, config: dict, number: int,
             _write_merge_comment_index(path, state)
             return None, pending
 
+        if before_post is not None:
+            before_post()
         posted = post_comment(gh, config, number, marker)
         intent = parse_merge_intent(posted, config)
         if intent is None or intent["number"] != number:
@@ -1193,8 +1195,7 @@ def validate_merged_intent(gh: GitHub, config: dict, intent: dict) -> tuple[dict
 
     proof_snapshot = dict(snapshot)
     proof_snapshot["headRefOid"] = intent["head"]
-    established = proof(epoch(proof_snapshot, config["trusted_account"]),
-                        intent["head"], config["trusted_account"])
+    established = merge_review_proof(gh, config, intent['number'], proof_snapshot, merged=True)
     if ((not established or digest(established) != intent["proof_sha256"])
             and not _carry_intent_matches(gh, config, snapshot, intent, intent_index)):
         raise PipelineError("review proof no longer matches merge cleanup intent")
@@ -2062,6 +2063,19 @@ def intent_body(head: str, established: dict, body: str, issues: list[int]) -> s
             f"issues={issues_value} -->")
 
 
+def merge_review_proof(gh, config, number, snapshot, *, health=None, merged=False):
+    """Keep typed source identity explicit in the shared merge transaction."""
+    from .review_routing_positive import has_history, live
+    if has_history(snapshot, config['trusted_account']):
+        context = live(gh, config, number, purpose='cleanup' if merged else 'merge', health=health)
+        typed = context['snapshot']
+        if (typed['edges'] != snapshot['edges'] or any(typed[name] != snapshot[name]
+                for name in ('headRefOid', 'baseRefOid', 'baseRefName', 'state', 'isDraft', 'labels', 'labelsComplete'))):
+            raise PipelineError('typed/ordinary merge snapshots changed between independent reads')
+        return context['source']
+    return proof(epoch(snapshot, config['trusted_account']), snapshot['headRefOid'], config['trusted_account'])
+
+
 def pending_merge_action(gh: GitHub, config: dict, intent: dict) -> dict:
     pr = gh.json("api", f"repos/{config['repository']}/pulls/{intent['number']}")
     if pr.get("merged") is True:
@@ -2082,12 +2096,15 @@ def pending_merge_action(gh: GitHub, config: dict, intent: dict) -> dict:
         return {"action": "fallback", "reason": str(exc)}
     info = epoch(snapshot, config["trusted_account"])
     validate_epoch_safety(info, config["trusted_account"])
-    established = proof(info, intent["head"], config["trusted_account"])
+    established = merge_review_proof(gh, config, intent['number'], snapshot)
     if not established or digest(established) != intent["proof_sha256"]:
         carried = _pending_carry_action(gh, config, intent, snapshot)
         if carried is not None:
             return carried
         return {"action": "fallback", "reason": "merge cleanup intent review proof is stale"}
+    if established.get('protocol') == 'review-routing-v1':
+        return {'action': 'wait', 'stage': 'merge', 'number': intent['number'],
+                'reason': 'typed merge intent has an unresolved send; observe the original outcome, never resend'}
     if not trusted_ship_authorized(info, config["trusted_account"]):
         return {"action": "fallback", "reason": "merge cleanup intent lost trusted ship"}
     status, checks = pr_checks(gh, config, intent["number"])
@@ -2511,7 +2528,7 @@ def next_merge(gh: GitHub, config: dict, *, config_path: str | None = None) -> d
     validate_epoch_safety(info, config["trusted_account"])
     if any(BASE_SYNC.search(node.get("body") or "") for _index, _edge, node in comments(info, config["trusted_account"])):
         return fallback_target(config, health, "merge", target, "base-sync lineage requires the full skill")
-    established = proof(info, snapshot["headRefOid"], config["trusted_account"])
+    established = merge_review_proof(gh, config, item['number'], snapshot, health=health)
     if not established:
         return fallback_target(config, health, "merge", target, "ordinary canonical review proof not found")
     if not trusted_ship_authorized(info, config["trusted_account"]):
@@ -2521,6 +2538,10 @@ def next_merge(gh: GitHub, config: dict, *, config_path: str | None = None) -> d
     if checks_in_progress(config, checks):
         return {"action": "wait", "number": item["number"],
                 "reason": "required CI checks are still running"}
+    typed_positive = established.get('protocol') == 'review-routing-v1'
+    if typed_positive and status.get('mergeStateStatus') != 'CLEAN':
+        return {'action': 'wait', 'stage': 'merge', 'number': item['number'],
+                'reason': 'typed positive source requires a fresh-main content review; legacy base-sync cannot carry it'}
     if (status.get("mergeStateStatus") == "BEHIND" and status.get("mergeable") == "MERGEABLE"
             and config.get("base_sync_merge") is True and config.get("base_sync_carry") is True):
         from .ordinary_base_sync import offer
@@ -2534,6 +2555,12 @@ def next_merge(gh: GitHub, config: dict, *, config_path: str | None = None) -> d
     lease = {"version": 1, "stage": "merge", "repository": config["repository"],
              "number": item["number"], "head": snapshot["headRefOid"],
              "snapshot": digest(snapshot), "proof": established}
+    if typed_positive:
+        from .review_routing_merge import issue
+        token = issue(gh, config, health, lease, config_path=config_path)
+        return {'action': 'merge', 'protocol': 'positive-review-v1',
+                'target': {'number': item['number'], 'title': item['title'], 'head': snapshot['headRefOid']},
+                'lease': token, 'complete': 'complete merge with this unchanged signed lease'}
     return {"action": "merge", "target": {"number": item["number"], "title": item["title"], "head": snapshot["headRefOid"]},
             "lease": encode_lease(lease), "complete": "run the same command with: complete merge --lease <lease>"}
 
@@ -2541,11 +2568,21 @@ def next_merge(gh: GitHub, config: dict, *, config_path: str | None = None) -> d
 def complete_merge(gh: GitHub, config: dict, lease_value: str,
                    *, config_path: str | None = None) -> dict:
     if "." in lease_value:
+        signed = decode_signed_lease(lease_value)
+        if signed.get('protocol') == 'positive-review-v1':
+            from .review_routing_merge import complete
+            return complete(gh, config, lease_value, config_path=config_path)
         from .ordinary_base_sync import complete
         return complete(gh, config, lease_value, config_path=config_path)
     lease = decode_lease(lease_value)
     if "protocol" in lease or "purpose" in lease or lease.get("mode") == "ordinary-update":
         raise PipelineError("ordinary base-sync requires a signed purpose-bound ticket")
+    if isinstance(lease.get('proof'), dict) and lease['proof'].get('protocol') == 'review-routing-v1':
+        raise PipelineError('positive typed MERGE requires its signed purpose-bound request')
+    return _complete_ordinary_merge(gh, config, lease, config_path=config_path)
+
+
+def _complete_ordinary_merge(gh, config, lease, *, config_path=None, typed_guard=None):
     if lease.get("stage") != "merge" or lease.get("repository") != config["repository"]:
         raise PipelineError("lease belongs to another stage or repository")
     common_fields = {"version", "stage", "repository", "number", "head"}
@@ -2586,7 +2623,7 @@ def complete_merge(gh: GitHub, config: dict, lease_value: str,
         raise PipelineError("merge label gate closed")
     info = epoch(snapshot, config["trusted_account"])
     validate_epoch_safety(info, config["trusted_account"])
-    established = proof(info, lease["head"], config["trusted_account"])
+    established = merge_review_proof(gh, config, lease['number'], snapshot, health=health)
     if not established or established != lease["proof"]:
         raise PipelineError("review proof changed")
     status, checks = pr_checks(gh, config, lease["number"])
@@ -2598,8 +2635,9 @@ def complete_merge(gh: GitHub, config: dict, lease_value: str,
     if intent is None:
         issues = same_repo_closing_issues(body, config["repository"])
         marker = intent_body(lease["head"], established, body, issues)
+        callback = (lambda: typed_guard('intent')) if typed_guard is not None else None
         intent, _ = reserve_merge_intent(
-            gh, config, lease["number"], marker)
+            gh, config, lease["number"], marker, **({'before_post': callback} if callback else {}))
         if intent is None:
             return {"action": "wait", "stage": "merge", "number": lease["number"],
                     "reason": "another merge cleanup intent won"}
@@ -2614,7 +2652,7 @@ def complete_merge(gh: GitHub, config: dict, lease_value: str,
         raise PipelineError("merge label gate closed after cleanup intent")
     info = epoch(snapshot, config["trusted_account"])
     validate_epoch_safety(info, config["trusted_account"])
-    current_proof = proof(info, lease["head"], config["trusted_account"])
+    current_proof = merge_review_proof(gh, config, lease['number'], snapshot)
     if not current_proof or current_proof != lease["proof"] or digest(current_proof) != intent["proof_sha256"]:
         raise PipelineError("review proof changed after cleanup intent")
     if not trusted_ship_authorized(info, config["trusted_account"]):
@@ -2634,6 +2672,8 @@ def complete_merge(gh: GitHub, config: dict, lease_value: str,
             same_repo_closing_issues(current_body, config["repository"]) != intent["issues"]):
         raise PipelineError("cleanup payload changed after intent")
 
+    if typed_guard is not None:
+        typed_guard('put')
     result = gh.json("api", f"repos/{config['repository']}/pulls/{lease['number']}/merge",
                      "--method", "PUT", "--input", "-",
                      input_value={"merge_method": config["merge_method"], "sha": lease["head"]})
@@ -2653,6 +2693,9 @@ def run(argv=None) -> int:
     routing_parser = sub.add_parser("validate-routing-report")
     routing_parser.add_argument("--report", required=True)
     routing_parser.add_argument("--head", required=True)
+    positive_parser = sub.add_parser("inspect-routing-positive")
+    positive_parser.add_argument("--number", required=True, type=int)
+    positive_parser.add_argument("--stage", required=True, choices=("merge", "tail"))
     inventory_parser = sub.add_parser("inventory")
     inventory_parser.add_argument("--health-file", help="read an existing health JSON snapshot")
     next_parser = sub.add_parser("next")
@@ -2710,6 +2753,9 @@ def run(argv=None) -> int:
                     # Slice A is read-only: no base checkout fast-forward or config rewrite.
                     health = run_health(dict(config, sync_base_before_health=False))
                 value = inventory(gh, config, health)
+            elif args.command == "inspect-routing-positive":
+                from .review_routing_positive import live
+                value = live(gh, config, args.number, purpose=args.stage)
             elif args.command == "next":
                 if args.stage == "review":
                     value = next_review(gh, config, config_path=args.config)
