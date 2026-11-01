@@ -15,7 +15,7 @@ def _query():
     replacement = """repository(owner:$owner,name:$name){id nameWithOwner
  pullRequest(number:$number){id number
   baseRepository{id nameWithOwner} headRepository{id nameWithOwner}
-  headRefName isCrossRepository author{id login}"""
+  headRefName isCrossRepository author{login ... on Node{id}}"""
     if TIMELINE_QUERY.count(needle) != 1:
         raise PipelineError("typed timeline query adapter no longer matches legacy query")
     return TIMELINE_QUERY.replace(needle, replacement)

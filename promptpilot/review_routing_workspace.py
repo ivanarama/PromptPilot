@@ -58,12 +58,13 @@ class Workspace:
         if self.path.resolve().parent!=self.folder.resolve():
             raise PipelineError('FIX workspace escaped its deterministic owned directory')
 
-    def _git(self,root,*args,allow_failure=False):
-        env=dict(os.environ,GIT_NO_REPLACE_OBJECTS='1',GIT_TERMINAL_PROMPT='0')
+    def _git(self,root,*args,allow_failure=False,binary=False):
+        env=dict(os.environ,GIT_NO_REPLACE_OBJECTS='1',GIT_GRAFT_FILE=os.devnull,GIT_TERMINAL_PROMPT='0')
         result=run_owned(['git','-c','maintenance.auto=false','-c','gc.auto=0',
             '-c','core.autocrlf=false','-c','core.eol=lf',
             '-c','core.fsmonitor=false','-c','core.hooksPath='+str(self.hooks),'-C',str(root),*args],
-            capture_output=True,text=True,encoding='utf-8',errors='strict',env=env,timeout=120)
+            capture_output=True,env=env,timeout=120,
+            **({} if binary else dict(text=True,encoding='utf-8',errors='strict')))
         if result.returncode and not allow_failure:
             raise PipelineError('FIX workspace Git operation failed; preserve its artifacts')
         if len(result.stdout)>1048576 or len(result.stderr)>1048576:
@@ -75,7 +76,7 @@ class Workspace:
         # back to the committed blob. Hash regular working files directly,
         # independently of the index, attributes and clean/smudge drivers.
         records=self._git(self.path,'ls-tree','-r','-z','HEAD').stdout.split('\0')
-        total=0
+        total=0;tracked=set()
         for record in records:
             if not record:continue
             try:
@@ -87,6 +88,7 @@ class Workspace:
                     or any(char not in '0123456789abcdef' for char in oid)
                     or relative.is_absolute() or any(part in {'.','..','.git'} for part in relative.parts)):
                 raise PipelineError('FIX raw source requires regular tracked files in its bound tree')
+            tracked.add(relative.as_posix())
             parent=self.path
             for part in relative.parts[:-1]:
                 parent=parent/part;_plain(parent,directory=True)
@@ -114,6 +116,53 @@ class Workspace:
                 if (read!=opened.st_size or digest.hexdigest()!=oid
                         or (opened.st_size,opened.st_mtime_ns,opened.st_ctime_ns)!=(after.st_size,after.st_mtime_ns,after.st_ctime_ns)):
                     raise PipelineError('FIX working bytes differ from its bound Git tree; filtered status is not source proof')
+        return tracked
+
+    def _pristine_tree(self,tracked):
+        # Enumerate the physical checkout, independently of Git excludes.
+        # In particular an ignored AGENTS.md/.env cannot influence a provider
+        # whose source commit does not contain that file. Preserve artifacts.
+        expected=set(tracked)|{'.git'}
+        directories={parent.as_posix() for name in tracked for parent in Path(name).parents if parent!=Path('.')}
+        pending=[self.path];seen=set()
+        while pending:
+            directory=pending.pop()
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    path=Path(entry.path);relative=path.relative_to(self.path).as_posix()
+                    if relative in directories:
+                        _plain(path,directory=True);pending.append(path)
+                    elif relative in expected:
+                        _plain(path);seen.add(relative)
+                    else:
+                        raise PipelineError('FIX checkout has unexpected uncommitted/ignored artifacts; preserve them outside its bound source')
+        if seen!=expected:raise PipelineError('FIX physical checkout is missing a bound source file')
+
+    def _forward(self,head,old):
+        # Read and hash actual commit objects: rev-list/merge-base can honor
+        # grafts or other local reachability metadata. A non-forward CAS is
+        # forbidden BEFORE the only push, not diagnosed by later readback.
+        from .review_routing_wire import head40
+        pending=[head];seen=set();found=False
+        while pending:
+            oid=pending.pop()
+            if oid in seen:continue
+            if len(seen)>=101:raise PipelineError('FIX output exceeds its finite actual-parent graph')
+            raw=self._git(self.path,'cat-file','commit',head40(oid),binary=True).stdout
+            digest=hashlib.sha1(b'commit '+str(len(raw)).encode('ascii')+b'\0'+raw,usedforsecurity=False).hexdigest()
+            if digest!=oid:raise PipelineError('FIX commit object differs from its bound Git identity')
+            seen.add(oid)
+            if oid==old:found=True;continue
+            parents=[]
+            for line in raw.split(b'\n\n',1)[0].split(b'\n'):
+                if line.startswith(b'parent '):
+                    try:parent=head40(line[7:].decode('ascii'))
+                    except UnicodeError as exc:raise PipelineError('FIX actual parent is malformed') from exc
+                    if parent in parents or len(parents)>=16:raise PipelineError('FIX actual parent graph is ambiguous or oversized')
+                    parents.append(parent)
+            pending.extend(parents)
+        if not found or head==old or len(seen)-1>100:
+            raise PipelineError('FIX output must move forward from its actual reviewed source objects')
 
     def _repository(self,root):
         top=Path(self._git(root,'rev-parse','--show-toplevel').stdout.strip()).resolve()
@@ -168,7 +217,7 @@ class Workspace:
         sparse=self._git(self.path,'config','--type=bool','--get','core.sparseCheckout',allow_failure=True)
         if sparse.returncode not in {0,1} or sparse.stdout.strip() not in {'','false'}:
             raise PipelineError('FIX workspace cannot use sparse checkout to conceal source')
-        self._raw_tree()
+        self._pristine_tree(self._raw_tree())
         if self._git(self.path,'status','--porcelain=v1','--untracked-files=normal').stdout:
             raise PipelineError('FIX workspace changed before its one owned factory')
         return self.path
@@ -185,11 +234,7 @@ class Workspace:
         self._verify(head=None)
         head=head40(self._git(self.path,'rev-parse','HEAD').stdout.strip())
         old=self.scope['source']['head']
-        if head==old or self._git(self.path,'merge-base','--is-ancestor',old,head,allow_failure=True).returncode:
-            raise PipelineError('FIX output must move forward from its exact reviewed source')
-        count=self._git(self.path,'rev-list','--count',old+'..'+head).stdout.strip()
-        if not count.isdecimal() or not 1<=int(count)<=100:
-            raise PipelineError('FIX output exceeds its finite forward graph')
+        self._forward(head,old)
         verify_message(self._git(self.path,'show','-s','--format=%B',head).stdout,
                        trailers(attempt,self.scope['attempt_id']))
         tree=head40(self._git(self.path,'rev-parse',head+'^{tree}').stdout.strip())

@@ -34,7 +34,7 @@ class Reader:
         if args == ("api", "repos/owner/repo"):
             return {"full_name":"owner/repo","node_id":"R_BASE"}
         assert args[1] == "graphql"
-        assert "author{id login}" in args[3]
+        assert "author{login ... on Node{id}}" in args[3]
         return next(self.pages)
 
 

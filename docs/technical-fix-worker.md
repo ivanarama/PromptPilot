@@ -22,10 +22,12 @@ of status, index concealment and clean/smudge transformations. Private checkout
 uses LF with automatic line conversion disabled; files whose working bytes still
 differ from their tree, linked files and submodules require engineering handling.
 The finite raw check permits at most128 MiB per file and512 MiB for the tree.
+The physical file/directory manifest must match the tracked tree and its local
+Git pointer; ignored uncommitted files, including instructions, are refused.
+Build/test/cache artifacts belong in the owned sibling `../artifacts` directory.
 Both initial metadata selection and configured availability probes use retained
 owned process boundaries, including cleanup quarantine after an OS error.
-The worker
-retains the original kernel boundary before audit I/O, registers it and records
+The worker retains the original kernel boundary before audit I/O, registers it and records
 its memory-bound producer proof. The task's rights/provider snapshot remain in
 force. START, heartbeat and publication tokens and the producer nonce are kept
 out of the provider prompt/environment. The agent receives only the intended
@@ -47,13 +49,15 @@ and clean forward output. It issues the separate
 `review-routing-v1-fix-publication` purpose, binding the exact new commit/tree.
 
 The publisher journals one expected-HEAD CAS before its final gates. It checks
-the exact source ancestry (1..100 commits), terminal source/context/attempt
+the exact source ancestry (at most100 actual commit objects before the source), terminal source/context/attempt
 trailers and clean private checkout. The push names one explicit trusted GitHub
 branch with `--force-with-lease=<ref>:<reviewed-source>`, after independently
 proving the update moves forward. Hooks, URL rewrites, implicit tags and
 submodule pushes cannot widen that operation. There is no second push after an
 attempted or ambiguous send. Independent authenticated graph/commit/full-identity
 readback can confirm the result even when the push response was lost.
+Ancestry is reconstructed from hashed raw commit parents with grafts and object
+replacement disabled; filtered local reachability cannot authorize a rewrite.
 
 Only the confirmed local CAS receipt plus independent new-HEAD/trailer evidence
 can publish the canonical `fix-done`. Its write-ahead transport repeats source,
