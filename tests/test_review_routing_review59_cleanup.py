@@ -43,7 +43,9 @@ def test_author_control_cleanup_preserves_running_task(author_bridge,monkeypatch
                 'while not ready.exists() and time.monotonic()<deadline: time.sleep(.05)\n'
                 'if not ready.exists(): raise RuntimeError("private descendant startup deadline expired")\n'
                 'print("harmless metadata parent established its descendant")\n')
-            return run_control([sys.executable,'-c',parent],env=env_extra,
+            # Match the real _tool_preflight environment. Windows Python3.10
+            # needs inherited SystemRoot even to initialize its hash seed.
+            return run_control([sys.executable,'-c',parent],env=insights._tool_environment(env_extra),
                 capture_output=True,text=True,timeout=35,stdin=subprocess.DEVNULL)
         code,value=run('next','fix')
         assert code==0,value
