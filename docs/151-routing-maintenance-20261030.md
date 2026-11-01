@@ -176,3 +176,28 @@ new_head inside the existing version1 signed lease envelope. Old admission and
 reserved progress decoders reject this closed field set. Twelve focused scope
 cases verify valid HMAC round-trip, wrong-purpose/source/version refusal and
 configuration drift. This serializer is not a public issuer or mutation permit.
+
+
+## Private author-progress continuation
+
+The public next/complete FIX CLI and actual worker now have a separately gated
+administrative author-progress prototype. A complete explicit peer capability
+must advertise both author-handoff and author-progress. The source, author node,
+assigned executor, canonical attempt and lifetime budget are retained. The new
+signed purpose also binds the exact new HEAD. Every write revalidates checker,
+all four reader hashes, full stable server history, local claimed task, exact
+reservation, cancellation, current canonical lease and clock after writer waits.
+A new local owner cannot take over an unexpired canonical owner lease.
+
+The observer reads the authenticated head repository for same-repository and
+fork commit graphs, then confirms the exact PR identity in the base repository.
+It publishes fix-done only for independently checked graph/trailers/current HEAD.
+The actual worker verifies the signed action/target/protocol, performs only this
+administrative completion, and loads no provider. A duplicate readback does not
+spend another attempt, assign again or publish a second fix-done.
+
+This remains unpublished development, with compatible private peers. It does
+not attest the author's CAS push, implement the pipeline execution factory,
+heartbeat, trusted settlement writers or actual accepted OneBase pairing.
+All five original acceptance gaps still require their remaining work; production
+flags and Windows scheduled maintenance stay OFF.

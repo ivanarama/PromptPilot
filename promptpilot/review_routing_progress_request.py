@@ -1,8 +1,8 @@
-"""Closed author-progress scope; no public issuer or mutation permit yet.
+"""Closed author-progress scope; evidence and administrative publication only.
 
 The extra new_head binding deliberately cannot be decoded by v1 admission or
-the reserved v1 progress shape. A future coordinator must prove the canonical
-attempt/executor/lease, current source evidence and exact live task separately.
+the reserved v1 progress shape. The public progress coordinator separately proves the canonical
+attempt/executor/lease, current source evidence and exact live task.
 """
 import copy
 import json

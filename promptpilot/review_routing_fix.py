@@ -181,8 +181,16 @@ class FixGuard:
 
 def next_fix(gh, config, *, config_path, health):
     policy = requests.capability(config, health)
+    from . import review_routing_progress as progress
+    progress_route = None
+    if health.get('fix_bridge_contract') == progress.BRIDGE:
+        progress_route = progress.select(gh, config, config_path=config_path, health=health)
+        if progress_route and progress_route['action'] == 'author-progress':
+            return progress_route
     ordered = [item for item in candidates(health) if item['number'] not in pp.admission_exclusions()]
     if not ordered:
+        if progress_route is not None:
+            return progress_route
         return {'action': 'empty', 'stage': 'fix', 'verdict': 'ПУСТО', 'reason': 'no source-bound technical FIX target'}
     # Unlike legacy parallel FIX, this explicitly versioned path admits one
     # claimed local lane. It never enqueues or changes that task's timeout.
@@ -231,6 +239,10 @@ def next_fix(gh, config, *, config_path, health):
 
 
 def complete_fix(gh, config, token, *, config_path):
+    raw = pp.decode_signed_lease(token)
+    if raw.get('purpose') == requests.PROGRESS and 'progress_version' in raw:
+        from .review_routing_progress import complete
+        return complete(gh, config, token, config_path=config_path)
     from .review_routing_adapter import _journal
     guard = FixGuard(gh, config_path, token)
     request, seed = guard.request, guard.seed

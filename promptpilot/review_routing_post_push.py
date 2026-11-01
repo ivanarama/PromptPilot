@@ -39,7 +39,8 @@ def verify(gh, config, snapshot, attempt, attempt_id, new_head):
             or PRIdentityV1(**original).sha256 != attempt['source']['identity_sha256']):
         raise PipelineError('post-push current HEAD or lifetime PR identity changed')
     repository = config['repository']
-    comparison = gh.json('api', f'repos/{repository}/compare/{old_head}...{new_head}?per_page=100')
+    head_repository = current['head_repository']
+    comparison = gh.json('api', f'repos/{head_repository}/compare/{old_head}...{new_head}?per_page=100')
     if not isinstance(comparison, dict):
         raise PipelineError('post-push graph response is incomplete')
     total = comparison.get('total_commits')
@@ -59,7 +60,7 @@ def verify(gh, config, snapshot, attempt, attempt_id, new_head):
         head40(item.get('sha'))
     if len({item['sha'] for item in commits}) != total:
         raise PipelineError('post-push graph duplicates commits')
-    commit = gh.json('api', f'repos/{repository}/commits/{new_head}')
+    commit = gh.json('api', f'repos/{head_repository}/commits/{new_head}')
     if not isinstance(commit, dict) or commit.get('sha') != new_head:
         raise PipelineError('post-push commit response belongs to another HEAD')
     content = commit.get('commit')

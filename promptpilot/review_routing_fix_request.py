@@ -34,7 +34,8 @@ def capability(config, health):
     policy = preflight(config, health)
     if policy.get('enabled') is not True:
         raise PipelineError('claimed FIX bridge is disabled')
-    if health.get('fix_bridge_contract') != BRIDGE:
+    from .review_routing_progress import BRIDGE as PROGRESS_BRIDGE
+    if health.get('fix_bridge_contract') not in (BRIDGE, PROGRESS_BRIDGE):
         raise PipelineError('checker lacks the complete claimed FIX author-handoff capability')
     if config.get('technical_fix_execution') is not None:
         raise PipelineError('pipeline FIX execution is not supported by this bridge slice')

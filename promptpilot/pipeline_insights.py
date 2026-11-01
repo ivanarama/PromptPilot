@@ -3440,31 +3440,55 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                 and preflight_action not in {"empty", "wait", "error"}):
             return {"action": "block", "mode": "tool", "reason": "claimed FIX requires a signed exact author handoff; no generic fallback"}
         if fix_claim or typed_response and stage == "fix" and not passive_typed:
+            is_progress = preflight_action == "author-progress"
             try:
-                request = fix_requests.decode(str(token or ""))
+                if is_progress:
+                    from . import review_routing_progress_request as progress_requests
+                    request = progress_requests.decode(str(token or ""))
+                else:
+                    request = fix_requests.decode(str(token or ""))
                 reservation = request["target_reservation"]
-                if (not typed_queue or not typed_response or stage != "fix" or preflight_action != "author-handoff"
-                        or request["purpose"] != fix_requests.ADMISSION
+                expected_action = "author-progress" if is_progress else "author-handoff"
+                expected_purpose = fix_requests.PROGRESS if is_progress else fix_requests.ADMISSION
+                expected_target = {"stage": "fix-pr", "number": request["number"],
+                    "head": request["head"], "source": request["attempt"]["source"]}
+                if is_progress:
+                    expected_target.update(attempt_id=request["attempt_id"], new_head=request["new_head"])
+                if (not typed_queue or not typed_response or stage != "fix" or preflight_action != expected_action
+                        or request["purpose"] != expected_purpose
                         or request["repository"] != str(profile.get("repository") or "").lower()
                         or reservation["task_id"] != task.id
                         or reservation["task_started_at"] != scheduler_task_started_at
                         or reservation["ownership_kind"] != provider_ownership_kind
                         or request["pipeline_replicas"] != replica_count
-                        or preflight.get("target") != {"stage": "fix-pr", "number": request["number"],
-                            "head": request["head"], "source": request["attempt"]["source"]}):
+                        or preflight.get("target") != expected_target):
                     raise fix_requests.PipelineError("claimed FIX signed purpose contradicts its outer envelope, task or transport")
                 complete_command = [*command[:-2], "complete", "fix",
-                                    *_lease_argument(task, token, "author-handoff")]
+                                    *_lease_argument(task, token, expected_action)]
                 completion = _tool_preflight(execution, complete_command, working_dir, env_extra=attempt_env)
-                if (completion.get("action") != "handed-off" or completion.get("provider_started") is not False
+                allowed = {"fixed", "wait"} if is_progress else {"handed-off"}
+                if (completion.get("action") not in allowed or completion.get("provider_started") is not False
                         or completion.get("source") != request["attempt"]["source"]
                         or completion.get("executor") != request["attempt"]["executor"]):
-                    raise fix_requests.PipelineError("author FIX delivery was not verified; no provider fallback")
+                    raise fix_requests.PipelineError("author FIX delivery/progress was not verified; no provider fallback")
+                if is_progress and (completion.get("stage") != "fix"
+                        or completion.get("protocol") != "review-routing-v1"
+                        or completion["action"] == "fixed" and (
+                            completion.get("attempt_id") != request["attempt_id"]
+                            or completion.get("new_head") != request["new_head"])):
+                    raise fix_requests.PipelineError("author progress completion changed its signed exact source")
             except (fix_requests.PipelineError, RuntimeError, TypeError, ValueError) as exc:
                 return {"action": "block", "mode": "tool", "reason": str(exc)}
-            # This administrative completion is not a successful FIX and must
-            # not trigger wake_after_success or a new substantive REVIEW.
-            return {"action": "complete_empty", "mode": "tool", "verdict": "ПЕРЕДАНО АВТОРУ",
+            if is_progress:
+                done = completion["action"] == "fixed"
+                return {"action": "complete_empty", "mode": "tool",
+                        "verdict": "\u0413\u041e\u0422\u041e\u0412\u041e" if done else "\u041f\u0423\u0421\u0422\u041e",
+                        "reason": ("author post-push source verified; independent REVIEW may inspect the new HEAD"
+                                   if done else "author progress waits for its canonical owner lease"),
+                        "profile_id": profile_id, "queue_id": queue.get("id"),
+                        "preflight": preflight, "completion": completion}
+            # Assignment alone is not successful FIX and must not wake REVIEW.
+            return {"action": "complete_empty", "mode": "tool", "verdict": "\u041f\u0415\u0420\u0415\u0414\u0410\u041d\u041e \u0410\u0412\u0422\u041e\u0420\u0423",
                     "reason": "author assignment verified; awaiting post-push FIX proof",
                     "profile_id": profile_id, "queue_id": queue.get("id"),
                     "preflight": preflight, "completion": completion}
