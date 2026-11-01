@@ -91,7 +91,9 @@ def _validate_structure(value, *, pipeline=False):
     reservation = value['target_reservation']
     _fields(reservation, RESERVATION_FIELDS)
     repo, stage, number, head, _task, _token = pp._reservation_identity(reservation)
-    if ((repo, stage, number, head) != (value['repository'], 'fix-pr', value['number'], value['head'])
+    # Reservations normalize repository keys; the signed canonical identity
+    # above retains GitHub's original spelling and exact repository node IDs.
+    if ((repo, stage, number, head) != (value['repository'].lower(), 'fix-pr', value['number'], value['head'])
             or reservation['ownership_kind'] != 'headless'
             or any(reservation[name] not in ('', None) for name in
                    ['herdr_session_state', 'herdr_pane_id', 'herdr_tab_id', 'herdr_workspace_id'])):
