@@ -60,7 +60,18 @@ def test_disabled_public_review_fences_unavailable_protocol_actor(adapter,fault,
   gate_code,gate=run('gate-fallback','review','--lease',result['handoff']['lease'])
  (tmp_path/'independent-disabled-actor-receipt.json').write_text(json.dumps(dict(native_command=cmd,
   native_health=actual_health,code=code,result=result,gate_code=gate_code,gate=gate,posts=peer.posts),indent=2),encoding='utf-8')
- assert code!=0 or result['action'] in {'wait','error'},result
+ allowed={'wait','error'}
+ if binary:
+  # The actual OFF checker can park this target before Python elects one.
+  # Only that explicit engineering barrier makes an empty queue acceptable.
+  assert any(item['number']==42 and item['stage']=='engineering-recovery'
+             for item in actual_health['human_waiting'])
+  assert any(item.get('pr')==42 and item['code']=='routing_disabled_history'
+             for item in actual_health['findings'])
+  for field in ['review_candidates','content_review_candidates','fix_candidates','merge_executable']:
+   assert not any(item['number']==42 for item in actual_health[field])
+  allowed.add('empty')
+ assert code!=0 or result['action'] in allowed,result
  assert peer.posts==[]
  if gate_code is not None:assert gate_code!=0,gate
 
