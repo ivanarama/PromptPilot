@@ -3550,10 +3550,11 @@ async function loadPipelineReport(profile, hours=24, refresh=false) {
       : 'не обнаружено';
     const tokenValue = tokens.known_runs ? pipelineReportNumber(tokens.total) : 'нет данных';
     const costValue = cost.known_runs ? `$${Number(cost.total_usd || 0).toFixed(4)}` : 'Стоимость не измеряется';
+    const board = data.board || {};
     const decisions = data.decisions || {};
     const decisionItems = [
       ...(decisions.waiting_ship || []).map(item => ({...item, action: 'Посмотреть ревью и разрешить слияние меткой ship'})),
-      ...(decisions.human_waiting || []).map(item => ({...item, action: 'Открыть обсуждение и выбрать решение'})),
+      ...(decisions.human_waiting || []).filter(item => !((board.routing || {}).items || []).some(row => row.number === item.number && ['technical', 'engineering'].includes(row.route) && row.evidence_status === 'verified_current')).map(item => ({...item, action: 'Проверить причину остановки и требуемое решение'})),
     ];
     const decisionRow = item => `<li>${pipelineReportItem(item)}<div class="pipeline-report-meta">${esc(item.action)}</div></li>`;
     const decisionRows = decisionItems.slice(0, 5).map(decisionRow).join('');
@@ -3572,7 +3573,6 @@ async function loadPipelineReport(profile, hours=24, refresh=false) {
     const emptyRuns = summary.empty_or_no_change_runs == null
       ? Number(verdicts.empty || 0) + Number(verdicts.no_change || 0)
       : summary.empty_or_no_change_runs;
-    const board = data.board || {};
     const categories = (board.delivery_groups || []).map(group =>
       `<div class="pipeline-metric"><div class="pipeline-metric-label">${esc(group.title)}</div><div class="pipeline-metric-value">${pipelineReportNumber(group.count)}</div></div>`).join('');
     const blockedRows = (board.blocked || []).map(item =>
@@ -3616,6 +3616,7 @@ async function loadPipelineReport(profile, hours=24, refresh=false) {
       ${ciRows ? `<ul class="pipeline-report-list">${ciRows}</ul>` : '<div>Нет подтверждённого списка ожиданий CI. Это не означает, что все проверки зелёные.</div>'}
     </div>
     <div class="pipeline-report-section"><h3>Почему задачи ждут</h3>
+      ${pipelineRoutingHtml(board.routing)}
       ${currentWaitRows ? `<ul class="pipeline-report-list">${currentWaitRows}</ul>` : '<div>У текущих запусков нет записанной причины ожидания.</div>'}
       ${board.available ? (blockedRows ? `<ul class="pipeline-report-list">${blockedRows}</ul>` : '<div>В свежей диагностике нет дополнительных предупреждений.</div>') : '<div>Свежая полная диагностика недоступна; причины ожидания пока неизвестны.</div>'}
       <div class="pipeline-report-meta">Предупреждение не означает остановку всего конвейера. Решения человека перечислены отдельно выше.</div>
@@ -3733,6 +3734,25 @@ function pipelineDeliveryFlow(data) {
     ${(flow.review_rounds || []).length ? `<div class="prov-cmd">Круги ревью: ${flow.review_rounds.map(item => `#${esc(String(item.number))} — ${esc(String(item.rounds))}`).join('; ')}</div>` : ''}
     <div class="pipeline-report-meta">Текущие запуски показаны по локальной базе. Причина ожидания и круги ревью относятся к сохранённому снимку очереди.</div>
   </div>`;
+}
+
+function pipelineRoutingHtml(routing) {
+  const view = routing || {};
+  const groups = (view.groups || []).filter(group => (group.items || []).length);
+  const row = item => {
+    const identity = item.number ? `PR #${item.number} · HEAD ${item.head || 'неизвестен'}` : `Task #${item.task_id}`;
+    const recipient = typeof item.recipient === 'object' ? JSON.stringify(item.recipient) : item.recipient || 'не назначен';
+    const budget = item.budget_used == null ? 'расход неизвестен' : `${item.budget_used} / ${item.budget_limit}`;
+    const source = item.source && typeof item.source === 'object' ? `publication ${item.source.publication_id}, completion ${item.source.completion_id}, SHA256 ${item.source.report_sha256}` : item.source || '';
+    const blockers = (item.blockers || []).map(blocker => {
+      const evidence = blocker.evidence || {};
+      const options = Array.isArray(evidence.options) ? evidence.options.map(option => `<li>Вариант ${esc(String(option.number))}: ${esc(option.behavior)} · последствия: ${esc(option.consequences)}</li>`).join('') : '';
+      const recommendation = evidence.recommendation ? `<div>Рекомендуется вариант ${esc(String(evidence.recommendation.number))}: ${esc(evidence.recommendation.reason)}</div>` : '';
+      return `<div>${esc(blocker.summary || '')}${options ? `<ul>${options}</ul>${recommendation}` : `<pre style="white-space:pre-wrap">${esc(JSON.stringify(evidence, null, 2))}</pre>`}</div>`;
+    }).join('');
+    return `<li><b>${esc(identity)}</b><div>Получатель: ${esc(recipient)} · попытки: ${esc(budget)}</div><div>${esc(item.transition_kind || (item.task_id ? 'Ошибка выполнения' : 'Событие перехода неизвестно'))} · ${esc(item.transition_at || 'время неизвестно')}</div><div class="pipeline-report-meta">${esc(item.evidence_status || '')} · ${esc(source)}</div>${item.summary ? `<div>${esc(item.summary)}</div>` : ''}${(item.reasons || []).map(reason => `<div>${esc(reason)}</div>`).join('')}${blockers}${item.blockers_omitted ? `<div>Ещё ${esc(String(item.blockers_omitted))} находок — в исходном отчёте.</div>` : ''}</li>`;
+  };
+  return `<div class="pipeline-routing"><h4>Причины остановок и получатели</h4>${view.complete ? '' : '<div>Полная свежая классификация недоступна; отсутствие строк не означает ноль.</div>'}<div class="pipeline-report-meta">Один PR может иметь несколько причин; группы не складываются как число PR.</div>${groups.map(group => `<details open><summary>${esc(group.title)} · ${group.count == null ? 'число неизвестно' : esc(String(group.count))}</summary>${group.truncated ? '<div>Вывод сокращён; полные данные доступны в исходных задачах/REVIEW.</div>' : ''}<ul class="pipeline-report-list">${group.items.map(row).join('')}</ul></details>`).join('')}${view.complete && !groups.length ? '<div>В проверенном снимке нет классифицированных остановок.</div>' : ''}</div>`;
 }
 
 async function loadPipelineInsights(profile, refresh=false) {
@@ -3950,6 +3970,7 @@ async function loadPipelineInsights(profile, refresh=false) {
         <div class="pipeline-report-meta">«Готово» здесь — итог запуска, не обязательно влитый PR. Отложенные попытки (WIP, бюджет API) не становятся «ПУСТО» и показаны отдельно выше. Данные — из локальной базы PromptPilot.</div>
       </div>
       ${diagnosticHtml}
+      ${pipelineRoutingHtml(data.routing)}
       <table class="insights-table"><colgroup><col class="insights-col-stage"><col class="insights-col-small"><col class="insights-col-small"><col class="insights-col-capacity"><col class="insights-col-capacity"><col class="insights-col-duration"><col class="insights-col-small"><col class="insights-col-oldest"><col class="insights-col-interval"><col class="insights-col-recommendation"></colgroup><thead><tr><th>Этап</th><th class="num">Очередь</th><th class="num">Δ/ч</th><th class="num">За реплику × активные</th><th class="num">Прогонов</th><th>Средний запуск</th><th>ETA</th><th>Самый старый</th><th>Интервал</th><th>Рекомендация</th></tr></thead><tbody>${rows}</tbody></table>
       ${priorityHtml}
     </div>`;

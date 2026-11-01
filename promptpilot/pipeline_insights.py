@@ -2,6 +2,7 @@
 
 import copy
 import hashlib
+import html
 import json
 import math
 import os
@@ -4577,15 +4578,23 @@ def _refresh_local_state(result: dict, profile: dict, series: list[dict], *,
         }
     data["runtime"] = runtime
     data["health"] = health
+    from .routing_observation import build_routing_observation
+    routing_cache = _cache_metadata(
+        source, generated_at, entry_epoch, entry_revision, current_epoch,
+        _profile_fingerprint(profile))
+    data["routing"] = build_routing_observation(
+        diagnostics or {}, available=(not routing_cache["stale"]
+            and routing_cache.get("complete") is True
+            and not (diagnostics or {}).get("checker_failed")),
+        tool_errors=db.pipeline_operational_errors(
+            series_ids, now - timedelta(hours=24)))
     data["target_clear_hours"] = target_hours
     data["priority_control"] = ({
         "levels": list(_PRIORITY_LEVELS),
         "aging_hours": priority_settings["aging_hours"],
         "manual_labels": priority_settings["manual_labels"],
     } if priority_settings else None)
-    data["cache"] = _cache_metadata(
-        source, generated_at, entry_epoch, entry_revision, current_epoch,
-        _profile_fingerprint(profile))
+    data["cache"] = routing_cache
     from . import delivery_flow
     data["delivery_flow"] = delivery_flow.summarize(
         data, matching_series, now, paused=db.is_paused())
@@ -5771,8 +5780,10 @@ def build_period_report(profile_id: str, series: list[dict], *, hours: int = 24,
     board = build_board(
         delivery, diagnostics, current_tasks,
         available=(fresh and cache.get("complete") is True
+                   and cache.get("stale") is False
                    and bool(diagnostics) and not diagnostics.get("checker_failed")),
-        classifications=profile.get("delivery_classifications"))
+        classifications=profile.get("delivery_classifications"),
+        tool_errors=db.pipeline_operational_errors(series_ids, start))
     report = {
         "profile_id": profile_id, "title": profile["title"],
         "repository": profile["repository"], "hours": hours,
@@ -5941,7 +5952,27 @@ def render_period_report_markdown(report: dict) -> str:
                 "- Полного снимка состава нет; среди доступных элементов "
                 "не найдено `ship`, `needs-decision` или `hold`.")
 
+    routing = (report.get("board") or {}).get("routing") or {}
+    lines.extend(["", "## Причины остановок", ""])
+    if not routing.get("complete"):
+        lines.append("- Полная свежая классификация недоступна; отсутствие строк не означает ноль.")
+    for group in routing.get("groups", []):
+        for item in group.get("items", []):
+            identity = (f"PR #{item['number']} HEAD {item.get('head', 'неизвестен')}"
+                        if item.get("number") else f"Task #{item.get('task_id')}")
+            detail = json.dumps(item, ensure_ascii=False, sort_keys=True)
+            lines.append(f"- {_routing_markdown_text(group['title'])}: "
+                         f"{_routing_markdown_text(identity)} — {_routing_markdown_text(detail)}")
+        if group.get("truncated"):
+            lines.append(f"- {_routing_markdown_text(group['title'])}: вывод сокращён; "
+                         "полные подробности доступны в исходных задачах/REVIEW.")
     return "\n".join(lines) + "\n"
+
+
+def _routing_markdown_text(value):
+    """Literal untrusted details: neutralize HTML and Markdown operators."""
+    text = html.escape(str(value), quote=False).replace("\r", " ").replace("\n", " ")
+    return re.sub(r"([\\`*_{}\[\]()#+\-.!|>~])", r"\\\1", text)
 
 
 def sample_active_profiles(series: list[dict]) -> dict[str, str]:

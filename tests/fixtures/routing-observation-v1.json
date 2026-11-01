@@ -1,0 +1,1391 @@
+{
+  "authority": "unverified-offline-input",
+  "cases": [
+    {
+      "health": {
+        "checked": 1,
+        "content_review_candidates": [],
+        "engineering_waiting": [],
+        "findings": [
+          {
+            "code": "routing_technical_wait",
+            "message": "one source-bound technical attempt; execution still requires the independent public admission/START gate",
+            "pr": 42,
+            "severity": "yellow"
+          }
+        ],
+        "fix_bridge_contract": {
+          "protocol": "claimed-fix-v1",
+          "purposes": [
+            "author-handoff",
+            "author-progress"
+          ],
+          "snapshot": "complete"
+        },
+        "fix_candidates": [],
+        "fix_execution_contract": {
+          "protocol": "claimed-pipeline-fix-v1",
+          "purposes": [
+            "admission",
+            "start",
+            "heartbeat",
+            "progress",
+            "settlement"
+          ],
+          "snapshot": "complete"
+        },
+        "human_waiting": [],
+        "issues_checked": 0,
+        "merge_candidates": [],
+        "merge_executable": [],
+        "parallel_review_candidates": [],
+        "plan_candidates": [],
+        "positive_merge_candidates": [],
+        "positive_review_contract": {
+          "protocol": "positive-review-v1",
+          "purposes": [
+            "merge",
+            "tail"
+          ],
+          "snapshot": "complete"
+        },
+        "review_backlog": [],
+        "review_candidates": [],
+        "review_dispatch_candidates": [],
+        "review_routing_contract": {
+          "protocol": "review-routing-v1",
+          "reader_sha256": {
+            "fix": "866c5a7a93b5bdb0f89bf150cf8cad3487a799e34e79a71738825d86302c0432",
+            "merge": "6ebf1409d21f71b08259c5debc7609421b8bbace6b5d2d6b101839ba08000305",
+            "review": "357882eedd1d42a27e5ca7aac0c2444d31fe19f9cb779c71e92e1e9fb0c70a52",
+            "tail": "fb9ad54553127fa331974fccf5e334fff5662da02c4d44e8ea83d9f2c630ac37"
+          },
+          "snapshot": "complete"
+        },
+        "reviewed_waiting_ship": [],
+        "routing_observation": {
+          "complete": true,
+          "items": [
+            {
+              "blockers": [
+                {
+                  "evidence": {
+                    "actual": "31.01.2026 20:59:59",
+                    "command": "onebase procrun --project probe --sqlite probe.sqlite --proc Probe",
+                    "entrypoint": "onebase procrun --proc Probe",
+                    "environment": "Windows, Europe/Moscow, SQLite",
+                    "expected": "31.01.2026 23:59:59",
+                    "invariant": "HTML и string используют согласованную локальную зону",
+                    "result": "exit 1, mismatch persisted date output"
+                  },
+                  "id": "date.html-local-zone",
+                  "kind": "technical",
+                  "summary": "HTML-шаблон показывает UTC вместо локального времени"
+                }
+              ],
+              "blockers_omitted": 0,
+              "budget_limit": 2,
+              "budget_used": 0,
+              "categories": [
+                "technical"
+              ],
+              "evidence_status": "verified_current",
+              "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "number": 42,
+              "reasons": [
+                "one source-bound technical attempt; execution still requires the independent public admission/START gate"
+              ],
+              "recipient": "technical-fix",
+              "route": "technical",
+              "source": {
+                "claim_id": "3001",
+                "completion_id": "3002",
+                "epoch": "0c002f56fdd896176fa7502ca68a9f9b9d81889f447291cab43c9815b8bd0195",
+                "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "identity_sha256": "001684e955703f1e625889ff28935e682ad8f9cb8607e49e71f101e76a228fce",
+                "publication_id": "3000",
+                "report_sha256": "8e5514230ab9cf74cb6ad6110667d1fec3c564cb02156a6286c4a733589e0061"
+              },
+              "transition_at": "2026-10-29T00:00:01Z",
+              "transition_id": "3002",
+              "transition_kind": "review-completion"
+            }
+          ],
+          "truncated": false,
+          "version": "routing-observation-v1"
+        },
+        "scheduler": "two-lane-safety-priority-aging-depth-number",
+        "scope": "complete GraphQL queue snapshot; mutation gates remain independent GraphQL proofs",
+        "state": "yellow",
+        "summary": "PR: 1; issues: 0; REVIEW исполняемо: 0 (следующие нет); всего ждут REVIEW: 0; содержательное: 0; интеграционный владелец: нет; ждут ship: 0; MERGE исполняемо: 0; всего MERGE: 0; PLAN: 0; FIX: 0; человек: 0; сигналов: 1",
+        "technical_fix_candidates": [
+          {
+            "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "number": 42,
+            "source": {
+              "claim_id": "3001",
+              "completion_id": "3002",
+              "epoch": "0c002f56fdd896176fa7502ca68a9f9b9d81889f447291cab43c9815b8bd0195",
+              "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "identity_sha256": "001684e955703f1e625889ff28935e682ad8f9cb8607e49e71f101e76a228fce",
+              "publication_id": "3000",
+              "report_sha256": "8e5514230ab9cf74cb6ad6110667d1fec3c564cb02156a6286c4a733589e0061"
+            },
+            "stage": "fix-pr"
+          }
+        ],
+        "technical_fix_progress_candidates": [],
+        "technical_fix_settlement_candidates": [],
+        "technical_waiting": [
+          {
+            "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "number": 42,
+            "priority": 2,
+            "priority_source": "auto:default",
+            "review_depth": 3,
+            "stage": "technical-fix",
+            "title": "private routing fixture",
+            "updated_at": "2026-10-29T00:01:00Z",
+            "url": "https://github.com/owner/repo/pull/42"
+          }
+        ]
+      },
+      "input": {
+        "file": "internal/reviewrouting/testdata/review-routing-operational-history-v1.json",
+        "git_blob": "2c8f031e30f3fab330ef430f5a6f0a01d6d8da96"
+      },
+      "name": "fresh-technical-source"
+    },
+    {
+      "health": {
+        "checked": 1,
+        "content_review_candidates": [],
+        "engineering_waiting": [],
+        "findings": [
+          {
+            "code": "routing_technical_wait",
+            "message": "one source-bound technical attempt; execution still requires the independent public admission/START gate",
+            "pr": 42,
+            "severity": "yellow"
+          }
+        ],
+        "fix_bridge_contract": {
+          "protocol": "claimed-fix-v1",
+          "purposes": [
+            "author-handoff",
+            "author-progress"
+          ],
+          "snapshot": "complete"
+        },
+        "fix_candidates": [],
+        "fix_execution_contract": {
+          "protocol": "claimed-pipeline-fix-v1",
+          "purposes": [
+            "admission",
+            "start",
+            "heartbeat",
+            "progress",
+            "settlement"
+          ],
+          "snapshot": "complete"
+        },
+        "human_waiting": [],
+        "issues_checked": 0,
+        "merge_candidates": [],
+        "merge_executable": [],
+        "parallel_review_candidates": [],
+        "plan_candidates": [],
+        "positive_merge_candidates": [],
+        "positive_review_contract": {
+          "protocol": "positive-review-v1",
+          "purposes": [
+            "merge",
+            "tail"
+          ],
+          "snapshot": "complete"
+        },
+        "review_backlog": [],
+        "review_candidates": [],
+        "review_dispatch_candidates": [],
+        "review_routing_contract": {
+          "protocol": "review-routing-v1",
+          "reader_sha256": {
+            "fix": "866c5a7a93b5bdb0f89bf150cf8cad3487a799e34e79a71738825d86302c0432",
+            "merge": "6ebf1409d21f71b08259c5debc7609421b8bbace6b5d2d6b101839ba08000305",
+            "review": "357882eedd1d42a27e5ca7aac0c2444d31fe19f9cb779c71e92e1e9fb0c70a52",
+            "tail": "fb9ad54553127fa331974fccf5e334fff5662da02c4d44e8ea83d9f2c630ac37"
+          },
+          "snapshot": "complete"
+        },
+        "reviewed_waiting_ship": [],
+        "routing_observation": {
+          "complete": true,
+          "items": [
+            {
+              "blockers": [
+                {
+                  "evidence": {
+                    "actual": "31.01.2026 20:59:59",
+                    "command": "onebase procrun --project probe --sqlite probe.sqlite --proc Probe",
+                    "entrypoint": "onebase procrun --proc Probe",
+                    "environment": "Windows, Europe/Moscow, SQLite",
+                    "expected": "31.01.2026 23:59:59",
+                    "invariant": "HTML и string используют согласованную локальную зону",
+                    "result": "exit 1, mismatch persisted date output"
+                  },
+                  "id": "date.html-local-zone",
+                  "kind": "technical",
+                  "summary": "HTML-шаблон показывает UTC вместо локального времени"
+                }
+              ],
+              "blockers_omitted": 0,
+              "budget_limit": 2,
+              "budget_used": 1,
+              "categories": [
+                "technical"
+              ],
+              "evidence_status": "verified_current",
+              "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "number": 42,
+              "reasons": [
+                "one source-bound technical attempt; execution still requires the independent public admission/START gate"
+              ],
+              "recipient": {
+                "kind": "pipeline",
+                "login": "owner"
+              },
+              "route": "technical",
+              "source": {
+                "claim_id": "3001",
+                "completion_id": "3002",
+                "epoch": "0c002f56fdd896176fa7502ca68a9f9b9d81889f447291cab43c9815b8bd0195",
+                "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "identity_sha256": "001684e955703f1e625889ff28935e682ad8f9cb8607e49e71f101e76a228fce",
+                "publication_id": "3000",
+                "report_sha256": "8e5514230ab9cf74cb6ad6110667d1fec3c564cb02156a6286c4a733589e0061"
+              },
+              "transition_at": "2026-10-29T00:00:01Z",
+              "transition_id": "4003",
+              "transition_kind": "started"
+            }
+          ],
+          "truncated": false,
+          "version": "routing-observation-v1"
+        },
+        "scheduler": "two-lane-safety-priority-aging-depth-number",
+        "scope": "complete GraphQL queue snapshot; mutation gates remain independent GraphQL proofs",
+        "state": "yellow",
+        "summary": "PR: 1; issues: 0; REVIEW исполняемо: 0 (следующие нет); всего ждут REVIEW: 0; содержательное: 0; интеграционный владелец: нет; ждут ship: 0; MERGE исполняемо: 0; всего MERGE: 0; PLAN: 0; FIX: 0; человек: 0; сигналов: 1",
+        "technical_fix_candidates": [
+          {
+            "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "number": 42,
+            "source": {
+              "claim_id": "3001",
+              "completion_id": "3002",
+              "epoch": "0c002f56fdd896176fa7502ca68a9f9b9d81889f447291cab43c9815b8bd0195",
+              "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "identity_sha256": "001684e955703f1e625889ff28935e682ad8f9cb8607e49e71f101e76a228fce",
+              "publication_id": "3000",
+              "report_sha256": "8e5514230ab9cf74cb6ad6110667d1fec3c564cb02156a6286c4a733589e0061"
+            },
+            "stage": "fix-pr"
+          }
+        ],
+        "technical_fix_progress_candidates": [],
+        "technical_fix_settlement_candidates": [],
+        "technical_waiting": [
+          {
+            "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "number": 42,
+            "priority": 2,
+            "priority_source": "auto:default",
+            "review_depth": 3,
+            "stage": "technical-fix",
+            "title": "private routing fixture",
+            "updated_at": "2026-10-29T00:01:00Z",
+            "url": "https://github.com/owner/repo/pull/42"
+          }
+        ]
+      },
+      "input": {
+        "file": "internal/reviewrouting/testdata/review-routing-operational-history-v1.json",
+        "git_blob": "2c8f031e30f3fab330ef430f5a6f0a01d6d8da96"
+      },
+      "name": "pipeline-start-spent-once"
+    },
+    {
+      "health": {
+        "checked": 1,
+        "content_review_candidates": [],
+        "engineering_waiting": [
+          {
+            "head": "cccccccccccccccccccccccccccccccccccccccc",
+            "number": 42,
+            "priority": 2,
+            "priority_source": "auto:default",
+            "review_depth": 5,
+            "stage": "engineering-recovery",
+            "title": "private routing fixture",
+            "updated_at": "2026-10-29T00:01:00Z",
+            "url": "https://github.com/owner/repo/pull/42"
+          }
+        ],
+        "findings": [
+          {
+            "code": "routing_engineering_wait",
+            "message": "engineering parking needs one explicit exact-current-HEAD resume",
+            "pr": 42,
+            "severity": "yellow"
+          }
+        ],
+        "fix_bridge_contract": {
+          "protocol": "claimed-fix-v1",
+          "purposes": [
+            "author-handoff",
+            "author-progress"
+          ],
+          "snapshot": "complete"
+        },
+        "fix_candidates": [],
+        "fix_execution_contract": {
+          "protocol": "claimed-pipeline-fix-v1",
+          "purposes": [
+            "admission",
+            "start",
+            "heartbeat",
+            "progress",
+            "settlement"
+          ],
+          "snapshot": "complete"
+        },
+        "human_waiting": [],
+        "issues_checked": 0,
+        "merge_candidates": [],
+        "merge_executable": [],
+        "parallel_review_candidates": [],
+        "plan_candidates": [],
+        "positive_merge_candidates": [],
+        "positive_review_contract": {
+          "protocol": "positive-review-v1",
+          "purposes": [
+            "merge",
+            "tail"
+          ],
+          "snapshot": "complete"
+        },
+        "review_backlog": [],
+        "review_candidates": [],
+        "review_dispatch_candidates": [],
+        "review_routing_contract": {
+          "protocol": "review-routing-v1",
+          "reader_sha256": {
+            "fix": "866c5a7a93b5bdb0f89bf150cf8cad3487a799e34e79a71738825d86302c0432",
+            "merge": "6ebf1409d21f71b08259c5debc7609421b8bbace6b5d2d6b101839ba08000305",
+            "review": "357882eedd1d42a27e5ca7aac0c2444d31fe19f9cb779c71e92e1e9fb0c70a52",
+            "tail": "fb9ad54553127fa331974fccf5e334fff5662da02c4d44e8ea83d9f2c630ac37"
+          },
+          "snapshot": "complete"
+        },
+        "reviewed_waiting_ship": [],
+        "routing_observation": {
+          "complete": true,
+          "items": [
+            {
+              "blockers": [
+                {
+                  "evidence": {
+                    "actual": "31.01.2026 20:59:59",
+                    "command": "onebase procrun --project probe --sqlite probe.sqlite --proc Probe",
+                    "entrypoint": "onebase procrun --proc Probe",
+                    "environment": "Windows, Europe/Moscow, SQLite",
+                    "expected": "31.01.2026 23:59:59",
+                    "invariant": "HTML и string используют согласованную локальную зону",
+                    "result": "exit 1, mismatch persisted date output"
+                  },
+                  "id": "date.html-local-zone",
+                  "kind": "technical",
+                  "summary": "HTML-шаблон показывает UTC вместо локального времени"
+                }
+              ],
+              "blockers_omitted": 0,
+              "budget_limit": 2,
+              "budget_used": 2,
+              "categories": [
+                "technical"
+              ],
+              "evidence_status": "verified_current",
+              "head": "cccccccccccccccccccccccccccccccccccccccc",
+              "number": 42,
+              "reasons": [
+                "engineering parking needs one explicit exact-current-HEAD resume"
+              ],
+              "recipient": "engineering",
+              "route": "engineering",
+              "source": {
+                "claim_id": "7001",
+                "completion_id": "7002",
+                "epoch": "ae4b971e53f2a4ddaf17b68102f64d24e0ed8e6d95e427c408b5ffe30429a5d4",
+                "head": "cccccccccccccccccccccccccccccccccccccccc",
+                "identity_sha256": "6ea428b435b535cb3df226af4082e862708dd7a6bb272b9bede8115f293c5201",
+                "publication_id": "7000",
+                "report_sha256": "21f42cc8447a16ca4e7f31ee042e1281f18fcbb32373d0aa0a19fce47f754582"
+              },
+              "transition_at": "2026-10-29T00:00:01Z",
+              "transition_id": "7002",
+              "transition_kind": "review-completion"
+            }
+          ],
+          "truncated": false,
+          "version": "routing-observation-v1"
+        },
+        "scheduler": "two-lane-safety-priority-aging-depth-number",
+        "scope": "complete GraphQL queue snapshot; mutation gates remain independent GraphQL proofs",
+        "state": "yellow",
+        "summary": "PR: 1; issues: 0; REVIEW исполняемо: 0 (следующие нет); всего ждут REVIEW: 0; содержательное: 0; интеграционный владелец: нет; ждут ship: 0; MERGE исполняемо: 0; всего MERGE: 0; PLAN: 0; FIX: 0; человек: 0; сигналов: 1",
+        "technical_fix_candidates": [],
+        "technical_fix_progress_candidates": [],
+        "technical_fix_settlement_candidates": [],
+        "technical_waiting": []
+      },
+      "input": {
+        "file": "internal/reviewrouting/testdata/review-routing-operational-history-v1.json",
+        "git_blob": "2c8f031e30f3fab330ef430f5a6f0a01d6d8da96"
+      },
+      "name": "two-attempts-engineering-parking"
+    },
+    {
+      "health": {
+        "checked": 1,
+        "content_review_candidates": [],
+        "engineering_waiting": [
+          {
+            "head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "number": 42,
+            "priority": 2,
+            "priority_source": "auto:default",
+            "review_depth": 3,
+            "stage": "engineering-recovery",
+            "title": "private routing fixture",
+            "updated_at": "2026-10-29T00:01:00Z",
+            "url": "https://github.com/owner/repo/pull/42"
+          }
+        ],
+        "findings": [
+          {
+            "code": "routing_engineering_wait",
+            "message": "changed HEAD requires proof of the exact old executor and original delivery before one REVIEW resume; spent budget is preserved",
+            "pr": 42,
+            "severity": "yellow"
+          }
+        ],
+        "fix_bridge_contract": {
+          "protocol": "claimed-fix-v1",
+          "purposes": [
+            "author-handoff",
+            "author-progress"
+          ],
+          "snapshot": "complete"
+        },
+        "fix_candidates": [],
+        "fix_execution_contract": {
+          "protocol": "claimed-pipeline-fix-v1",
+          "purposes": [
+            "admission",
+            "start",
+            "heartbeat",
+            "progress",
+            "settlement"
+          ],
+          "snapshot": "complete"
+        },
+        "human_waiting": [],
+        "issues_checked": 0,
+        "merge_candidates": [],
+        "merge_executable": [],
+        "parallel_review_candidates": [],
+        "plan_candidates": [],
+        "positive_merge_candidates": [],
+        "positive_review_contract": {
+          "protocol": "positive-review-v1",
+          "purposes": [
+            "merge",
+            "tail"
+          ],
+          "snapshot": "complete"
+        },
+        "review_backlog": [],
+        "review_candidates": [],
+        "review_dispatch_candidates": [],
+        "review_routing_contract": {
+          "protocol": "review-routing-v1",
+          "reader_sha256": {
+            "fix": "866c5a7a93b5bdb0f89bf150cf8cad3487a799e34e79a71738825d86302c0432",
+            "merge": "6ebf1409d21f71b08259c5debc7609421b8bbace6b5d2d6b101839ba08000305",
+            "review": "357882eedd1d42a27e5ca7aac0c2444d31fe19f9cb779c71e92e1e9fb0c70a52",
+            "tail": "fb9ad54553127fa331974fccf5e334fff5662da02c4d44e8ea83d9f2c630ac37"
+          },
+          "snapshot": "complete"
+        },
+        "reviewed_waiting_ship": [],
+        "routing_observation": {
+          "complete": false,
+          "items": [
+            {
+              "blockers": [],
+              "blockers_omitted": 0,
+              "budget_limit": 2,
+              "budget_used": 1,
+              "categories": [],
+              "evidence_status": "older_head_or_epoch",
+              "head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "number": 42,
+              "reasons": [
+                "changed HEAD requires proof of the exact old executor and original delivery before one REVIEW resume; spent budget is preserved"
+              ],
+              "recipient": "engineering",
+              "route": "engineering",
+              "source": {
+                "claim_id": "3001",
+                "completion_id": "3002",
+                "epoch": "0c002f56fdd896176fa7502ca68a9f9b9d81889f447291cab43c9815b8bd0195",
+                "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "identity_sha256": "001684e955703f1e625889ff28935e682ad8f9cb8607e49e71f101e76a228fce",
+                "publication_id": "3000",
+                "report_sha256": "8e5514230ab9cf74cb6ad6110667d1fec3c564cb02156a6286c4a733589e0061"
+              },
+              "transition_at": "2026-10-29T00:00:01Z",
+              "transition_id": "4003",
+              "transition_kind": "started"
+            }
+          ],
+          "truncated": false,
+          "version": "routing-observation-v1"
+        },
+        "scheduler": "two-lane-safety-priority-aging-depth-number",
+        "scope": "complete GraphQL queue snapshot; mutation gates remain independent GraphQL proofs",
+        "state": "yellow",
+        "summary": "PR: 1; issues: 0; REVIEW исполняемо: 0 (следующие нет); всего ждут REVIEW: 0; содержательное: 0; интеграционный владелец: нет; ждут ship: 0; MERGE исполняемо: 0; всего MERGE: 0; PLAN: 0; FIX: 0; человек: 0; сигналов: 1",
+        "technical_fix_candidates": [],
+        "technical_fix_progress_candidates": [
+          {
+            "attempt_id": "4000",
+            "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "new_head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "number": 42,
+            "source": {
+              "claim_id": "3001",
+              "completion_id": "3002",
+              "epoch": "0c002f56fdd896176fa7502ca68a9f9b9d81889f447291cab43c9815b8bd0195",
+              "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "identity_sha256": "001684e955703f1e625889ff28935e682ad8f9cb8607e49e71f101e76a228fce",
+              "publication_id": "3000",
+              "report_sha256": "8e5514230ab9cf74cb6ad6110667d1fec3c564cb02156a6286c4a733589e0061"
+            },
+            "stage": "fix-pr"
+          }
+        ],
+        "technical_fix_settlement_candidates": [
+          {
+            "attempt_id": "4000",
+            "head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "number": 42,
+            "source": {
+              "claim_id": "3001",
+              "completion_id": "3002",
+              "epoch": "0c002f56fdd896176fa7502ca68a9f9b9d81889f447291cab43c9815b8bd0195",
+              "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "identity_sha256": "001684e955703f1e625889ff28935e682ad8f9cb8607e49e71f101e76a228fce",
+              "publication_id": "3000",
+              "report_sha256": "8e5514230ab9cf74cb6ad6110667d1fec3c564cb02156a6286c4a733589e0061"
+            },
+            "stage": "fix-pr"
+          }
+        ],
+        "technical_waiting": []
+      },
+      "input": {
+        "file": "internal/reviewrouting/testdata/review-routing-operational-history-v1.json",
+        "git_blob": "2c8f031e30f3fab330ef430f5a6f0a01d6d8da96"
+      },
+      "name": "changed-head-with-unsettled-pipeline"
+    },
+    {
+      "health": {
+        "checked": 1,
+        "content_review_candidates": [],
+        "engineering_waiting": [],
+        "findings": [],
+        "fix_bridge_contract": {
+          "protocol": "claimed-fix-v1",
+          "purposes": [
+            "author-handoff",
+            "author-progress"
+          ],
+          "snapshot": "complete"
+        },
+        "fix_candidates": [],
+        "fix_execution_contract": {
+          "protocol": "claimed-pipeline-fix-v1",
+          "purposes": [
+            "admission",
+            "start",
+            "heartbeat",
+            "progress",
+            "settlement"
+          ],
+          "snapshot": "complete"
+        },
+        "human_waiting": [
+          {
+            "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "number": 42,
+            "priority": 2,
+            "priority_source": "auto:default",
+            "review_depth": 3,
+            "stage": "review",
+            "title": "private routing fixture",
+            "updated_at": "2026-10-29T00:01:00Z",
+            "url": "https://github.com/owner/repo/pull/42"
+          }
+        ],
+        "issues_checked": 0,
+        "merge_candidates": [],
+        "merge_executable": [],
+        "parallel_review_candidates": [],
+        "plan_candidates": [],
+        "positive_merge_candidates": [],
+        "positive_review_contract": {
+          "protocol": "positive-review-v1",
+          "purposes": [
+            "merge",
+            "tail"
+          ],
+          "snapshot": "complete"
+        },
+        "review_backlog": [],
+        "review_candidates": [],
+        "review_dispatch_candidates": [],
+        "review_routing_contract": {
+          "protocol": "review-routing-v1",
+          "reader_sha256": {
+            "fix": "866c5a7a93b5bdb0f89bf150cf8cad3487a799e34e79a71738825d86302c0432",
+            "merge": "6ebf1409d21f71b08259c5debc7609421b8bbace6b5d2d6b101839ba08000305",
+            "review": "357882eedd1d42a27e5ca7aac0c2444d31fe19f9cb779c71e92e1e9fb0c70a52",
+            "tail": "fb9ad54553127fa331974fccf5e334fff5662da02c4d44e8ea83d9f2c630ac37"
+          },
+          "snapshot": "complete"
+        },
+        "reviewed_waiting_ship": [],
+        "routing_observation": {
+          "complete": true,
+          "items": [
+            {
+              "blockers": [
+                {
+                  "evidence": {
+                    "options": [
+                      {
+                        "behavior": "Локальная зона пользователя",
+                        "consequences": "Соответствует string()",
+                        "number": 1
+                      },
+                      {
+                        "behavior": "Всегда UTC",
+                        "consequences": "Одинаково на всех серверах",
+                        "number": 2
+                      }
+                    ],
+                    "recommendation": {
+                      "number": 1,
+                      "reason": "Совместимость с текущим string()"
+                    }
+                  },
+                  "id": "date.display-policy",
+                  "kind": "product",
+                  "summary": "Выбрать политику отображения даты"
+                }
+              ],
+              "blockers_omitted": 0,
+              "budget_limit": 2,
+              "budget_used": 0,
+              "categories": [
+                "product"
+              ],
+              "evidence_status": "verified_current",
+              "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "number": 42,
+              "reasons": [],
+              "recipient": "owner",
+              "route": "decision",
+              "source": {
+                "claim_id": "3001",
+                "completion_id": "3002",
+                "epoch": "0c002f56fdd896176fa7502ca68a9f9b9d81889f447291cab43c9815b8bd0195",
+                "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "identity_sha256": "001684e955703f1e625889ff28935e682ad8f9cb8607e49e71f101e76a228fce",
+                "publication_id": "3000",
+                "report_sha256": "deae5c329e13919834b64bde2266c4464f6ef21f5f76d8e25b4f6031306b1383"
+              },
+              "transition_at": "2026-10-29T00:00:01Z",
+              "transition_id": "3002",
+              "transition_kind": "review-completion"
+            }
+          ],
+          "truncated": false,
+          "version": "routing-observation-v1"
+        },
+        "scheduler": "two-lane-safety-priority-aging-depth-number",
+        "scope": "complete GraphQL queue snapshot; mutation gates remain independent GraphQL proofs",
+        "state": "yellow",
+        "summary": "PR: 1; issues: 0; REVIEW исполняемо: 0 (следующие нет); всего ждут REVIEW: 0; содержательное: 0; интеграционный владелец: нет; ждут ship: 0; MERGE исполняемо: 0; всего MERGE: 0; PLAN: 0; FIX: 0; человек: 1; сигналов: 0",
+        "technical_fix_candidates": [],
+        "technical_fix_progress_candidates": [],
+        "technical_fix_settlement_candidates": [],
+        "technical_waiting": []
+      },
+      "input": {
+        "file": "internal/reviewrouting/testdata/review-routing-operational-history-v1.json",
+        "git_blob": "2c8f031e30f3fab330ef430f5a6f0a01d6d8da96"
+      },
+      "name": "explicit-report-case-1"
+    },
+    {
+      "health": {
+        "checked": 1,
+        "content_review_candidates": [],
+        "engineering_waiting": [],
+        "findings": [],
+        "fix_bridge_contract": {
+          "protocol": "claimed-fix-v1",
+          "purposes": [
+            "author-handoff",
+            "author-progress"
+          ],
+          "snapshot": "complete"
+        },
+        "fix_candidates": [],
+        "fix_execution_contract": {
+          "protocol": "claimed-pipeline-fix-v1",
+          "purposes": [
+            "admission",
+            "start",
+            "heartbeat",
+            "progress",
+            "settlement"
+          ],
+          "snapshot": "complete"
+        },
+        "human_waiting": [
+          {
+            "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "number": 42,
+            "priority": 2,
+            "priority_source": "auto:default",
+            "review_depth": 3,
+            "stage": "review",
+            "title": "private routing fixture",
+            "updated_at": "2026-10-29T00:01:00Z",
+            "url": "https://github.com/owner/repo/pull/42"
+          }
+        ],
+        "issues_checked": 0,
+        "merge_candidates": [],
+        "merge_executable": [],
+        "parallel_review_candidates": [],
+        "plan_candidates": [],
+        "positive_merge_candidates": [],
+        "positive_review_contract": {
+          "protocol": "positive-review-v1",
+          "purposes": [
+            "merge",
+            "tail"
+          ],
+          "snapshot": "complete"
+        },
+        "review_backlog": [],
+        "review_candidates": [],
+        "review_dispatch_candidates": [],
+        "review_routing_contract": {
+          "protocol": "review-routing-v1",
+          "reader_sha256": {
+            "fix": "866c5a7a93b5bdb0f89bf150cf8cad3487a799e34e79a71738825d86302c0432",
+            "merge": "6ebf1409d21f71b08259c5debc7609421b8bbace6b5d2d6b101839ba08000305",
+            "review": "357882eedd1d42a27e5ca7aac0c2444d31fe19f9cb779c71e92e1e9fb0c70a52",
+            "tail": "fb9ad54553127fa331974fccf5e334fff5662da02c4d44e8ea83d9f2c630ac37"
+          },
+          "snapshot": "complete"
+        },
+        "reviewed_waiting_ship": [],
+        "routing_observation": {
+          "complete": true,
+          "items": [
+            {
+              "blockers": [
+                {
+                  "evidence": {
+                    "boundary": "Код внешнего fork на машине с credentials",
+                    "requested_exception": "Не выполнять до отдельной политики изолированного runner"
+                  },
+                  "id": "fork.execution-policy",
+                  "kind": "safety_exception",
+                  "summary": "Нужно решение о границе исполнения"
+                }
+              ],
+              "blockers_omitted": 0,
+              "budget_limit": 2,
+              "budget_used": 0,
+              "categories": [
+                "safety_exception"
+              ],
+              "evidence_status": "verified_current",
+              "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "number": 42,
+              "reasons": [],
+              "recipient": "owner",
+              "route": "decision",
+              "source": {
+                "claim_id": "3001",
+                "completion_id": "3002",
+                "epoch": "0c002f56fdd896176fa7502ca68a9f9b9d81889f447291cab43c9815b8bd0195",
+                "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "identity_sha256": "001684e955703f1e625889ff28935e682ad8f9cb8607e49e71f101e76a228fce",
+                "publication_id": "3000",
+                "report_sha256": "252bfff71dd630c67deef322556dcacfe89967ec8952ff017d135e6b3b43be47"
+              },
+              "transition_at": "2026-10-29T00:00:01Z",
+              "transition_id": "3002",
+              "transition_kind": "review-completion"
+            }
+          ],
+          "truncated": false,
+          "version": "routing-observation-v1"
+        },
+        "scheduler": "two-lane-safety-priority-aging-depth-number",
+        "scope": "complete GraphQL queue snapshot; mutation gates remain independent GraphQL proofs",
+        "state": "yellow",
+        "summary": "PR: 1; issues: 0; REVIEW исполняемо: 0 (следующие нет); всего ждут REVIEW: 0; содержательное: 0; интеграционный владелец: нет; ждут ship: 0; MERGE исполняемо: 0; всего MERGE: 0; PLAN: 0; FIX: 0; человек: 1; сигналов: 0",
+        "technical_fix_candidates": [],
+        "technical_fix_progress_candidates": [],
+        "technical_fix_settlement_candidates": [],
+        "technical_waiting": []
+      },
+      "input": {
+        "file": "internal/reviewrouting/testdata/review-routing-operational-history-v1.json",
+        "git_blob": "2c8f031e30f3fab330ef430f5a6f0a01d6d8da96"
+      },
+      "name": "explicit-report-case-2"
+    },
+    {
+      "health": {
+        "checked": 1,
+        "content_review_candidates": [],
+        "engineering_waiting": [
+          {
+            "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "number": 42,
+            "priority": 2,
+            "priority_source": "auto:default",
+            "review_depth": 3,
+            "stage": "engineering-recovery",
+            "title": "private routing fixture",
+            "updated_at": "2026-10-29T00:01:00Z",
+            "url": "https://github.com/owner/repo/pull/42"
+          }
+        ],
+        "findings": [
+          {
+            "code": "routing_engineering_wait",
+            "message": "engineering parking needs one explicit exact-current-HEAD resume",
+            "pr": 42,
+            "severity": "yellow"
+          }
+        ],
+        "fix_bridge_contract": {
+          "protocol": "claimed-fix-v1",
+          "purposes": [
+            "author-handoff",
+            "author-progress"
+          ],
+          "snapshot": "complete"
+        },
+        "fix_candidates": [],
+        "fix_execution_contract": {
+          "protocol": "claimed-pipeline-fix-v1",
+          "purposes": [
+            "admission",
+            "start",
+            "heartbeat",
+            "progress",
+            "settlement"
+          ],
+          "snapshot": "complete"
+        },
+        "human_waiting": [],
+        "issues_checked": 0,
+        "merge_candidates": [],
+        "merge_executable": [],
+        "parallel_review_candidates": [],
+        "plan_candidates": [],
+        "positive_merge_candidates": [],
+        "positive_review_contract": {
+          "protocol": "positive-review-v1",
+          "purposes": [
+            "merge",
+            "tail"
+          ],
+          "snapshot": "complete"
+        },
+        "review_backlog": [],
+        "review_candidates": [],
+        "review_dispatch_candidates": [],
+        "review_routing_contract": {
+          "protocol": "review-routing-v1",
+          "reader_sha256": {
+            "fix": "866c5a7a93b5bdb0f89bf150cf8cad3487a799e34e79a71738825d86302c0432",
+            "merge": "6ebf1409d21f71b08259c5debc7609421b8bbace6b5d2d6b101839ba08000305",
+            "review": "357882eedd1d42a27e5ca7aac0c2444d31fe19f9cb779c71e92e1e9fb0c70a52",
+            "tail": "fb9ad54553127fa331974fccf5e334fff5662da02c4d44e8ea83d9f2c630ac37"
+          },
+          "snapshot": "complete"
+        },
+        "reviewed_waiting_ship": [],
+        "routing_observation": {
+          "complete": true,
+          "items": [
+            {
+              "blockers": [
+                {
+                  "evidence": {
+                    "missing": "Нет PostgreSQL/UTC результата",
+                    "verification": "Запустить публичный CLI на точном HEAD в UTC с PostgreSQL"
+                  },
+                  "id": "date.missing-reproduction",
+                  "kind": "insufficient_data",
+                  "summary": "Нет воспроизведения на целевом HEAD"
+                }
+              ],
+              "blockers_omitted": 0,
+              "budget_limit": 2,
+              "budget_used": 0,
+              "categories": [
+                "insufficient_data"
+              ],
+              "evidence_status": "verified_current",
+              "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "number": 42,
+              "reasons": [
+                "engineering parking needs one explicit exact-current-HEAD resume"
+              ],
+              "recipient": "engineering",
+              "route": "engineering",
+              "source": {
+                "claim_id": "3001",
+                "completion_id": "3002",
+                "epoch": "0c002f56fdd896176fa7502ca68a9f9b9d81889f447291cab43c9815b8bd0195",
+                "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "identity_sha256": "001684e955703f1e625889ff28935e682ad8f9cb8607e49e71f101e76a228fce",
+                "publication_id": "3000",
+                "report_sha256": "d752f7d768b227f3d620cbe4612620d77c9f0211586903e61adbce7f926ab12c"
+              },
+              "transition_at": "2026-10-29T00:00:01Z",
+              "transition_id": "3002",
+              "transition_kind": "review-completion"
+            }
+          ],
+          "truncated": false,
+          "version": "routing-observation-v1"
+        },
+        "scheduler": "two-lane-safety-priority-aging-depth-number",
+        "scope": "complete GraphQL queue snapshot; mutation gates remain independent GraphQL proofs",
+        "state": "yellow",
+        "summary": "PR: 1; issues: 0; REVIEW исполняемо: 0 (следующие нет); всего ждут REVIEW: 0; содержательное: 0; интеграционный владелец: нет; ждут ship: 0; MERGE исполняемо: 0; всего MERGE: 0; PLAN: 0; FIX: 0; человек: 0; сигналов: 1",
+        "technical_fix_candidates": [],
+        "technical_fix_progress_candidates": [],
+        "technical_fix_settlement_candidates": [],
+        "technical_waiting": []
+      },
+      "input": {
+        "file": "internal/reviewrouting/testdata/review-routing-operational-history-v1.json",
+        "git_blob": "2c8f031e30f3fab330ef430f5a6f0a01d6d8da96"
+      },
+      "name": "explicit-report-case-3"
+    },
+    {
+      "health": {
+        "checked": 1,
+        "content_review_candidates": [],
+        "engineering_waiting": [
+          {
+            "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "number": 42,
+            "priority": 2,
+            "priority_source": "auto:default",
+            "review_depth": 2,
+            "stage": "engineering-recovery",
+            "title": "private routing fixture",
+            "updated_at": "2026-10-29T00:01:00Z",
+            "url": "https://github.com/owner/repo/pull/42"
+          }
+        ],
+        "findings": [
+          {
+            "code": "routing_engineering_wait",
+            "message": "legacy completion references missing claim",
+            "pr": 42,
+            "severity": "yellow"
+          }
+        ],
+        "fix_bridge_contract": {
+          "protocol": "claimed-fix-v1",
+          "purposes": [
+            "author-handoff",
+            "author-progress"
+          ],
+          "snapshot": "complete"
+        },
+        "fix_candidates": [],
+        "fix_execution_contract": {
+          "protocol": "claimed-pipeline-fix-v1",
+          "purposes": [
+            "admission",
+            "start",
+            "heartbeat",
+            "progress",
+            "settlement"
+          ],
+          "snapshot": "complete"
+        },
+        "human_waiting": [],
+        "issues_checked": 0,
+        "merge_candidates": [],
+        "merge_executable": [],
+        "parallel_review_candidates": [],
+        "plan_candidates": [],
+        "positive_merge_candidates": [],
+        "positive_review_contract": {
+          "protocol": "positive-review-v1",
+          "purposes": [
+            "merge",
+            "tail"
+          ],
+          "snapshot": "complete"
+        },
+        "review_backlog": [],
+        "review_candidates": [],
+        "review_dispatch_candidates": [],
+        "review_routing_contract": {
+          "protocol": "review-routing-v1",
+          "reader_sha256": {
+            "fix": "866c5a7a93b5bdb0f89bf150cf8cad3487a799e34e79a71738825d86302c0432",
+            "merge": "6ebf1409d21f71b08259c5debc7609421b8bbace6b5d2d6b101839ba08000305",
+            "review": "357882eedd1d42a27e5ca7aac0c2444d31fe19f9cb779c71e92e1e9fb0c70a52",
+            "tail": "fb9ad54553127fa331974fccf5e334fff5662da02c4d44e8ea83d9f2c630ac37"
+          },
+          "snapshot": "complete"
+        },
+        "reviewed_waiting_ship": [],
+        "routing_observation": {
+          "complete": false,
+          "items": [
+            {
+              "blockers": [],
+              "blockers_omitted": 0,
+              "budget_limit": 2,
+              "budget_used": null,
+              "categories": [],
+              "evidence_status": "unknown",
+              "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "number": 42,
+              "reasons": [
+                "legacy completion references missing claim"
+              ],
+              "recipient": "engineering",
+              "route": "engineering"
+            }
+          ],
+          "truncated": false,
+          "version": "routing-observation-v1"
+        },
+        "scheduler": "two-lane-safety-priority-aging-depth-number",
+        "scope": "complete GraphQL queue snapshot; mutation gates remain independent GraphQL proofs",
+        "state": "yellow",
+        "summary": "PR: 1; issues: 0; REVIEW исполняемо: 0 (следующие нет); всего ждут REVIEW: 0; содержательное: 0; интеграционный владелец: нет; ждут ship: 0; MERGE исполняемо: 0; всего MERGE: 0; PLAN: 0; FIX: 0; человек: 0; сигналов: 1",
+        "technical_fix_candidates": [],
+        "technical_fix_progress_candidates": [],
+        "technical_fix_settlement_candidates": [],
+        "technical_waiting": []
+      },
+      "input": {
+        "file": "internal/reviewrouting/testdata/review-routing-history-v1.json",
+        "git_blob": "81bbf541bb613397193d062570e52b630cabc3b3"
+      },
+      "name": "missing-claim"
+    },
+    {
+      "health": {
+        "checked": 1,
+        "content_review_candidates": [],
+        "engineering_waiting": [],
+        "findings": [],
+        "fix_bridge_contract": {
+          "protocol": "claimed-fix-v1",
+          "purposes": [
+            "author-handoff",
+            "author-progress"
+          ],
+          "snapshot": "complete"
+        },
+        "fix_candidates": [],
+        "fix_execution_contract": {
+          "protocol": "claimed-pipeline-fix-v1",
+          "purposes": [
+            "admission",
+            "start",
+            "heartbeat",
+            "progress",
+            "settlement"
+          ],
+          "snapshot": "complete"
+        },
+        "human_waiting": [
+          {
+            "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "number": 42,
+            "priority": 2,
+            "priority_source": "auto:default",
+            "review_depth": 2,
+            "stage": "review",
+            "title": "private routing fixture",
+            "updated_at": "2026-10-29T00:01:00Z",
+            "url": "https://github.com/owner/repo/pull/42"
+          }
+        ],
+        "issues_checked": 0,
+        "merge_candidates": [],
+        "merge_executable": [],
+        "parallel_review_candidates": [],
+        "plan_candidates": [],
+        "positive_merge_candidates": [],
+        "positive_review_contract": {
+          "protocol": "positive-review-v1",
+          "purposes": [
+            "merge",
+            "tail"
+          ],
+          "snapshot": "complete"
+        },
+        "review_backlog": [],
+        "review_candidates": [],
+        "review_dispatch_candidates": [],
+        "review_routing_contract": {
+          "protocol": "review-routing-v1",
+          "reader_sha256": {
+            "fix": "866c5a7a93b5bdb0f89bf150cf8cad3487a799e34e79a71738825d86302c0432",
+            "merge": "6ebf1409d21f71b08259c5debc7609421b8bbace6b5d2d6b101839ba08000305",
+            "review": "357882eedd1d42a27e5ca7aac0c2444d31fe19f9cb779c71e92e1e9fb0c70a52",
+            "tail": "fb9ad54553127fa331974fccf5e334fff5662da02c4d44e8ea83d9f2c630ac37"
+          },
+          "snapshot": "complete"
+        },
+        "reviewed_waiting_ship": [],
+        "routing_observation": {
+          "complete": false,
+          "items": [
+            {
+              "blockers": [],
+              "blockers_omitted": 0,
+              "budget_limit": 2,
+              "budget_used": null,
+              "categories": [],
+              "evidence_status": "unknown",
+              "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "number": 42,
+              "reasons": [],
+              "recipient": "owner",
+              "route": "decision"
+            }
+          ],
+          "truncated": false,
+          "version": "routing-observation-v1"
+        },
+        "scheduler": "two-lane-safety-priority-aging-depth-number",
+        "scope": "complete GraphQL queue snapshot; mutation gates remain independent GraphQL proofs",
+        "state": "yellow",
+        "summary": "PR: 1; issues: 0; REVIEW исполняемо: 0 (следующие нет); всего ждут REVIEW: 0; содержательное: 0; интеграционный владелец: нет; ждут ship: 0; MERGE исполняемо: 0; всего MERGE: 0; PLAN: 0; FIX: 0; человек: 1; сигналов: 0",
+        "technical_fix_candidates": [],
+        "technical_fix_progress_candidates": [],
+        "technical_fix_settlement_candidates": [],
+        "technical_waiting": []
+      },
+      "input": {
+        "derived_current_labels": [
+          "needs-decision"
+        ],
+        "file": "internal/reviewrouting/testdata/review-routing-history-v1.json",
+        "git_blob": "81bbf541bb613397193d062570e52b630cabc3b3",
+        "source_case": "two-legacy-rounds"
+      },
+      "name": "legacy-needs-decision"
+    },
+    {
+      "health": {
+        "checked": 1,
+        "content_review_candidates": [],
+        "engineering_waiting": [],
+        "findings": [
+          {
+            "code": "routing_technical_wait",
+            "message": "one source-bound technical attempt; execution still requires the independent public admission/START gate",
+            "pr": 42,
+            "severity": "yellow"
+          }
+        ],
+        "fix_bridge_contract": {
+          "protocol": "claimed-fix-v1",
+          "purposes": [
+            "author-handoff",
+            "author-progress"
+          ],
+          "snapshot": "complete"
+        },
+        "fix_candidates": [],
+        "fix_execution_contract": {
+          "protocol": "claimed-pipeline-fix-v1",
+          "purposes": [
+            "admission",
+            "start",
+            "heartbeat",
+            "progress",
+            "settlement"
+          ],
+          "snapshot": "complete"
+        },
+        "human_waiting": [],
+        "issues_checked": 0,
+        "merge_candidates": [],
+        "merge_executable": [],
+        "parallel_review_candidates": [],
+        "plan_candidates": [],
+        "positive_merge_candidates": [],
+        "positive_review_contract": {
+          "protocol": "positive-review-v1",
+          "purposes": [
+            "merge",
+            "tail"
+          ],
+          "snapshot": "complete"
+        },
+        "review_backlog": [],
+        "review_candidates": [],
+        "review_dispatch_candidates": [],
+        "review_routing_contract": {
+          "protocol": "review-routing-v1",
+          "reader_sha256": {
+            "fix": "866c5a7a93b5bdb0f89bf150cf8cad3487a799e34e79a71738825d86302c0432",
+            "merge": "6ebf1409d21f71b08259c5debc7609421b8bbace6b5d2d6b101839ba08000305",
+            "review": "357882eedd1d42a27e5ca7aac0c2444d31fe19f9cb779c71e92e1e9fb0c70a52",
+            "tail": "fb9ad54553127fa331974fccf5e334fff5662da02c4d44e8ea83d9f2c630ac37"
+          },
+          "snapshot": "complete"
+        },
+        "reviewed_waiting_ship": [],
+        "routing_observation": {
+          "complete": true,
+          "items": [
+            {
+              "blockers": [
+                {
+                  "evidence": {
+                    "actual": "31.01.2026 20:59:59",
+                    "command": "onebase procrun --project probe --sqlite probe.sqlite --proc Probe",
+                    "entrypoint": "onebase procrun --proc Probe",
+                    "environment": "Windows, Europe/Moscow, SQLite",
+                    "expected": "31.01.2026 23:59:59",
+                    "invariant": "HTML и string используют согласованную локальную зону",
+                    "result": "exit 1, mismatch persisted date output"
+                  },
+                  "id": "date.html-local-zone",
+                  "kind": "technical",
+                  "summary": "HTML-шаблон показывает UTC вместо локального времени"
+                }
+              ],
+              "blockers_omitted": 0,
+              "budget_limit": 2,
+              "budget_used": 1,
+              "categories": [
+                "technical"
+              ],
+              "evidence_status": "verified_current",
+              "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "number": 42,
+              "reasons": [
+                "one source-bound technical attempt; execution still requires the independent public admission/START gate"
+              ],
+              "recipient": "technical-fix",
+              "route": "technical",
+              "source": {
+                "claim_id": "7001",
+                "completion_id": "7002",
+                "epoch": "719e7c8e4b7bc10f3b1cb2a690bffdfa4dce887e34978f9919b59efc25baa6f3",
+                "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "identity_sha256": "001684e955703f1e625889ff28935e682ad8f9cb8607e49e71f101e76a228fce",
+                "publication_id": "7000",
+                "report_sha256": "8e5514230ab9cf74cb6ad6110667d1fec3c564cb02156a6286c4a733589e0061"
+              },
+              "transition_at": "2026-10-29T00:00:01Z",
+              "transition_id": "7002",
+              "transition_kind": "review-completion"
+            }
+          ],
+          "truncated": false,
+          "version": "routing-observation-v1"
+        },
+        "scheduler": "two-lane-safety-priority-aging-depth-number",
+        "scope": "complete GraphQL queue snapshot; mutation gates remain independent GraphQL proofs",
+        "state": "yellow",
+        "summary": "PR: 1; issues: 0; REVIEW исполняемо: 0 (следующие нет); всего ждут REVIEW: 0; содержательное: 0; интеграционный владелец: нет; ждут ship: 0; MERGE исполняемо: 0; всего MERGE: 0; PLAN: 0; FIX: 0; человек: 0; сигналов: 1",
+        "technical_fix_candidates": [
+          {
+            "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "number": 42,
+            "source": {
+              "claim_id": "7001",
+              "completion_id": "7002",
+              "epoch": "719e7c8e4b7bc10f3b1cb2a690bffdfa4dce887e34978f9919b59efc25baa6f3",
+              "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "identity_sha256": "001684e955703f1e625889ff28935e682ad8f9cb8607e49e71f101e76a228fce",
+              "publication_id": "7000",
+              "report_sha256": "8e5514230ab9cf74cb6ad6110667d1fec3c564cb02156a6286c4a733589e0061"
+            },
+            "stage": "fix-pr"
+          }
+        ],
+        "technical_fix_progress_candidates": [],
+        "technical_fix_settlement_candidates": [],
+        "technical_waiting": [
+          {
+            "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "number": 42,
+            "priority": 2,
+            "priority_source": "auto:default",
+            "review_depth": 5,
+            "stage": "technical-fix",
+            "title": "private routing fixture",
+            "updated_at": "2026-10-29T00:01:00Z",
+            "url": "https://github.com/owner/repo/pull/42"
+          }
+        ]
+      },
+      "input": {
+        "file": "tools/pipelinehealth/testdata/routing-observation-reused-head.json",
+        "git_blob": "fcb95c04b9c56148d99db24aef6a0b81ba4c7b8f",
+        "source_case": "retained independent A-B-A current recipient reproduction"
+      },
+      "name": "reused-head-fresh-source"
+    }
+  ],
+  "producer_head": "f01c606310595680a0d3b314aefdc1c2b87e3b47",
+  "producer_tree": "d33a25cf8f53d2f925c19eb827ae8ee8a8723022",
+  "schema": "routing-observation-public-health-v1"
+}

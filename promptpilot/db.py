@@ -3420,6 +3420,50 @@ def prune_pipeline_snapshots(before: datetime) -> int:
         return cur.rowcount
 
 
+def pipeline_operational_errors(series_ids: list[int], since: datetime) -> dict:
+    """Actual failed executions, separate from a model's human/unable verdict.
+
+    A later completed execution in the same series resolves an older process
+    failure. Pauses, missing PIDs and cancelled tasks are not stop evidence.
+    """
+    ids = sorted({int(value) for value in series_ids if value is not None})
+    if not ids:
+        return {"complete": True, "items": []}
+    marks = ",".join("?" for _ in ids)
+    with _connect() as conn:
+        rows = conn.execute(
+            f"""SELECT t.id, t.series_id, t.completed_at,
+                       substr(CAST(t.error AS BLOB), 1, 4097) AS error_prefix,
+                       length(CAST(t.error AS BLOB)) AS error_bytes
+                FROM tasks AS t
+                WHERE t.series_id IN ({marks}) AND t.completed_at >= ?
+                  AND t.status = 'failed'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM tasks AS newer
+                    WHERE newer.series_id = t.series_id AND newer.id > t.id
+                      AND newer.status = 'completed'
+                      AND newer.completed_at > t.completed_at)
+                ORDER BY t.id DESC LIMIT 51""",
+            (*ids, _to_utc_iso(since)),
+        ).fetchall()
+    items = []
+    for row in rows[:50]:
+        original_bytes = row["error_bytes"] or 0
+        truncated = original_bytes > 4096
+        suffix = f"… [сокращено; подробности в задаче #{row['id']}]" if truncated else ""
+        prefix = (row["error_prefix"] or b"")[:4096 - len(suffix.encode("utf-8"))]
+        summary = prefix.decode("utf-8", errors="ignore") + suffix
+        items.append({"task_id": row["id"], "series_id": row["series_id"],
+         "category": "tool_error", "source": "task.status=failed",
+         "recipient": "engineering", "transition_at": row["completed_at"],
+         "summary": summary or "Ошибка выполнения; подробности в задаче",
+         "summary_truncated": truncated, "summary_bytes": original_bytes,
+         "summary_limit_bytes": 4096})
+    return {"complete": len(rows) <= 50,
+            "truncated": len(rows) > 50 or any(item["summary_truncated"] for item in items),
+            "items": items}
+
+
 def pipeline_run_metrics(series_ids: list[int], since: datetime) -> dict:
     """Semantic outcomes of scheduled runs belonging to one pipeline profile."""
     ids = sorted({int(value) for value in series_ids if value is not None})
