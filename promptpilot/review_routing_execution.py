@@ -19,6 +19,7 @@ import threading
 
 from . import project_pipeline as pp
 from .pipeline_errors import PipelineError
+from .pr_identity import REPOSITORY
 from .process_tree import OwnedProcess
 from .review_routing_journal import _schema_signature
 from .review_routing_lease import decimal_id,owner_id
@@ -63,7 +64,8 @@ def freeze_scope(scope):
     for value in scope['reader_sha256'].values():hash64(value)
     reservation=scope['reservation'];_fields(reservation,RESERVATION_FIELDS)
     repository,stage,number,head,task,_token=pp._reservation_identity(reservation)
-    if (scope['repository']!=repository or stage!='fix-pr' or number!=scope['pr']['pr_number']
+    if (not isinstance(scope['repository'],str) or not REPOSITORY.fullmatch(scope['repository'])
+            or scope['repository'].lower()!=repository or stage!='fix-pr' or number!=scope['pr']['pr_number']
             or head!=scope['source']['head'] or task!=scope['task_id']
             or reservation['task_started_at']!=scope['task_started_at']
             or reservation['ownership_kind']!='headless'

@@ -38,7 +38,7 @@ def validate(value):
     if type(replicas) is not int or not 1<=replicas<=16:raise PipelineError('settlement replicas are invalid')
     reservation=value['target_reservation'];_fields(reservation,RESERVATION_FIELDS)
     repository,stage,number,head,_task,_token=pp._reservation_identity(reservation)
-    if ((repository,stage,number,head)!=(identity.base_repository,'fix-pr',identity.pr_number,identity.head_sha)
+    if ((repository,stage,number,head)!=(identity.base_repository.lower(),'fix-pr',identity.pr_number,identity.head_sha)
             or reservation['ownership_kind']!='headless'
             or any(reservation[name] not in ('',None) for name in ['herdr_session_state','herdr_pane_id','herdr_tab_id','herdr_workspace_id'])):
         raise PipelineError('settlement changes its exact new-head headless target')
