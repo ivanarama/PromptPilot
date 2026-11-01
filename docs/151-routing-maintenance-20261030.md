@@ -278,3 +278,15 @@ these new pipeline purposes before any generic provider fallback. Its actual
 factory/workspace wiring, technical heartbeat, CAS push, trusted settlement/resume
 writers and accepted checker/four readers/paired qualification remain required.
 No production configuration, installed source or scheduler flag changed.
+
+
+The private workspace component creates a deterministic detached worktree for the
+bound source commit and writes its exact scope/common-repository receipt outside
+the checkout. It requires a single credential-free origin URL for the expected
+GitHub repository, disables hooks/fsmonitor/replacement objects for its Git
+operations and never checks out/resets the base directory. Existing partial
+creation or drift is preserved for engineering inspection; no automatic deletion.
+Seven actual zero-network Git cases passed57.08s with Ruff: clean/idempotent source,
+base dirty files/index retained, bytes/HEAD/scope/remote drift refused, missing
+receipt preserved and a real base post-checkout hook not executed. This remains
+a private component, not worker wiring, OS sandboxing or paired acceptance.
