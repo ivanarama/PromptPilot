@@ -91,11 +91,12 @@ def rewrite_prompt(prompt, stage, procedures, release_id, health_config=None):
     # paths); preservation grants no new authority. Keep finite MERGE framing
     # validation above, before handling these opaque local paragraphs.
     suffix = ""
-    annotation = re.search(r"\n\nОператорский (?:runtime hotfix|релиз):", prompt)
+    paragraph = r"\r?\n[ \t]*\r?\n"
+    annotation = re.search(paragraph + r"Операторский (?:runtime hotfix|релиз):", prompt)
     if annotation is not None:
-        end = prompt.find("\n\n", annotation.end())
-        if end != -1:
-            suffix = prompt[end:]
+        end = re.search(paragraph, prompt[annotation.end():])
+        if end is not None:
+            suffix = prompt[annotation.end() + end.start():]
         prompt = prompt[:annotation.start()]
     pattern = rf"(?<!\S)(?:\.claude/skills/{stage}/SKILL\.md|/[^\s]+/{stage}/SKILL\.md)"
     path = str(procedures / ".claude" / "skills" / stage / "SKILL.md")

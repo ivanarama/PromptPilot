@@ -22,6 +22,12 @@ class CheckpointError(RuntimeError):
     pass
 
 
+class CheckpointCleanupError(CheckpointError):
+    def __init__(self, message, cleanup, ready):
+        super().__init__(message)
+        self.cleanup, self.ready = cleanup, ready
+
+
 class CheckpointBusyError(CheckpointError):
     pass
 
@@ -239,7 +245,7 @@ class _RefTransaction:
         self.process.stdin.flush()
         self._expect(b"commit: ok")
 
-    def __exit__(self, *exc):
+    def close(self):
         if self.process is None:
             return
         try:
@@ -247,7 +253,7 @@ class _RefTransaction:
                 try:
                     self.process.stdin.write(b"abort\n")
                     self.process.stdin.flush()
-                except (BrokenPipeError, OSError):
+                except (BrokenPipeError, OSError, ValueError):
                     pass
                 try:
                     self.process.stdin.close()
@@ -273,9 +279,76 @@ class _RefTransaction:
                 except OSError:
                     pass
 
+    def __exit__(self, *exc):
+        try:
+            self.close()
+        except Exception as error:
+            raise CheckpointCleanupError(str(error), self.close,
+                lambda: self.process.poll() is not None and not self.reader.is_alive()) from error
+
 
 def _fault(point):
     """Injection seam for process-crash recovery tests; production is a no-op."""
+
+
+def confirm(pending, commit, signature):
+    """Confirm a fenced, accepted receipt before releasing workflow readiness.
+
+    The immutable commit/index intent was created under the original admission.
+    This read-only check follows the caller's cleanup and SQLite writer gate;
+    it grants no new ref write or permission to accept changed working bytes.
+    """
+    repo = Path(pending["check_dir"]).resolve()
+    evidence = pending.get("reviewed")
+    if not evidence or evidence["repo"] != str(repo):
+        raise CheckpointError("checkpoint receipt lost its reviewed repository evidence")
+    if commit is not None and (not isinstance(commit, str) or len(commit) != 40
+                               or any(char not in "0123456789abcdef" for char in commit)):
+        raise CheckpointError("checkpoint receipt commit is not an exact Git object ID")
+    expected_head = commit or evidence["head"]
+
+    def identity():
+        if (_direct_head(repo) != evidence["branch"]
+                or _text(repo, "rev-parse", "HEAD") != expected_head
+                or _text(repo, "for-each-ref", "--format=%(symref)", evidence["branch"])):
+            raise CheckpointError("checkpoint receipt HEAD or branch changed before acceptance")
+
+    identity()
+    if not pending.get("checkpoint_paths"):
+        return
+    gitdir = Path(_text(repo, "rev-parse", "--absolute-git-dir"))
+    index = Path(_text(repo, "rev-parse", "--path-format=absolute", "--git-path", "index"))
+    operation = _digest((pending["workflow_id"] + ":" + pending["stage_id"]
+                         + ":" + pending["run_id"]).encode())
+    folder = gitdir / "promptpilot-checkpoints" / operation
+    if commit:
+        try:
+            intent = json.loads((folder / "intent.json").read_text())
+        except (ValueError, UnicodeError) as exc:
+            raise CheckpointError("checkpoint receipt intent is unreadable") from exc
+        if (not isinstance(intent, dict) or set(intent) != {
+                "evidence", "index", "head", "branch", "tree", "commit", "before", "after"}):
+            raise CheckpointError("checkpoint receipt intent shape changed")
+        if (intent["commit"] != commit or intent["head"] != evidence["head"]
+                or intent["evidence"] != evidence or intent["branch"] != evidence["branch"]
+                or intent["index"] != str(index)):
+            raise CheckpointError("checkpoint receipt intent identity changed")
+        expected_index = intent["after"]
+        if (_text(repo, "rev-parse", commit + "^{tree}") != intent["tree"]
+                or _text(repo, "rev-parse", commit + "^") != intent["head"]):
+            raise CheckpointError("checkpoint receipt commit tree or parent changed")
+    else:
+        expected_index = _digest((folder / "index.before").read_bytes())
+    for name in pending.get("checkpoint_paths", []):
+        path = repo / name
+        actual = signature(str(path)) if path.exists() or path.is_symlink() else "D"
+        if actual != evidence["signatures"][name]:
+            raise CheckpointError("checkpoint receipt reviewed bytes changed before acceptance")
+        if evidence["filemode"] and _mode(path, None, True) != evidence["modes"][name]:
+            raise CheckpointError("checkpoint receipt reviewed mode changed before acceptance")
+    if _digest(index.read_bytes()) != expected_index:
+        raise CheckpointError("checkpoint receipt index changed before acceptance")
+    identity()
 
 
 @contextmanager
@@ -499,7 +572,9 @@ def publish(pending, signature, claim, admit):
                     _fault("after_ref_before_database")
                 elif head != intent["commit"] or digest != intent["after"]:
                     raise CheckpointError("unknown checkpoint ref/index state; operator inspection required")
-                # Fence against subsequent ref changes while the caller commits SQLite.
+                # Keep this ref fence and index ownership through SQLite
+                # source acceptance. Workflow readiness stays blocked until
+                # the retained owned resource cleanup confirms completion.
                 fences.enter_context(_RefTransaction(
                     repo, intent["branch"], intent["commit"], None, hooks))
                 yield intent["commit"]

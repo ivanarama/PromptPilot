@@ -18,7 +18,7 @@ from contextlib import contextmanager
 from datetime import datetime
 from typing import Optional
 
-from . import db, stage_checkpoint, gate_execution
+from . import db, stage_checkpoint, gate_execution, checkpoint_cleanup
 from .process_tree import run_owned
 from .models import (
     FindingStatus,
@@ -350,7 +350,7 @@ def _current_round_row(conn: sqlite3.Connection,
 
 
 def _require_version(conn: sqlite3.Connection, workflow: sqlite3.Row,
-                     expected_version: int, *, allow_gate_execution=False, allow_elicitation=False):
+                     expected_version: int, *, allow_gate_execution=False, allow_elicitation=False, allow_checkpoint_cleanup=False):
     if not allow_gate_execution:
         db.require_gate_idle(conn, workflow["id"])
     if workflow["state_version"] != expected_version:
@@ -358,6 +358,9 @@ def _require_version(conn: sqlite3.Connection, workflow: sqlite3.Row,
             f"workflow version is {workflow['state_version']}, "
             f"expected {expected_version}"
         )
+
+    if not allow_checkpoint_cleanup and checkpoint_cleanup.active(conn,workflow['id']):
+        raise db.WorkflowConflictError('checkpoint cleanup must be confirmed before another workflow action')
 
     if not allow_elicitation:
         from . import workflow_elicitation
@@ -1509,7 +1512,7 @@ def _upsert_review_finding(conn: sqlite3.Connection, workflow_id: str,
 
 
 def _advance_after_stage(conn, workflow, round_row, common,
-                         extra: dict = None):
+                         extra: dict = None, cleanup: dict = None):
     """Перевод завершённой стадии дальше: следующая — в executing с новым
     раундом (миссия queued), иначе миссия завершается.
 
@@ -1521,6 +1524,13 @@ def _advance_after_stage(conn, workflow, round_row, common,
     if WorkflowStatus(workflow["status"]) is not WorkflowStatus.AWAITING_HUMAN:
         return workflow  # барьер уже завершён, миссия проведена дальше
     extra = extra or {}
+    def move(target, event, payload, *, round_id):
+        if cleanup is None:
+            return _transition(conn, workflow, target, event, payload, round_id=round_id)
+        cleanup['target'] = target.value
+        cleanup['memory_stage'] = current_stage['id'] if current_stage else None
+        return _touch(conn, workflow, event,
+                      {**payload, 'checkpoint_cleanup_generation': cleanup['generation']}, round_id=round_id)
     current_stage = None
     if workflow["current_stage_id"]:
         current_stage = conn.execute(
@@ -1528,17 +1538,18 @@ def _advance_after_stage(conn, workflow, round_row, common,
             (workflow["current_stage_id"],),
         ).fetchone()
     if not current_stage:
-        return _transition(
-            conn, workflow, WorkflowStatus.COMPLETED, "review.passed",
+        return move(
+            WorkflowStatus.COMPLETED, "review.passed",
             {**common, **extra}, round_id=round_row["id"],
         )
     # Acceptance is durable only after the checkpoint barrier succeeds.
     # Keep stage notes available during failures/restarts, and delete only
     # this stage's notes in the same transaction as the successful advance.
-    conn.execute(
-        "DELETE FROM workflow_memory WHERE workflow_id=? AND scope_stage=?",
-        (workflow["id"], current_stage["id"]),
-    )
+    if cleanup is None:
+        conn.execute(
+            "DELETE FROM workflow_memory WHERE workflow_id=? AND scope_stage=?",
+            (workflow["id"], current_stage["id"]),
+        )
     next_stage = conn.execute(
         """SELECT * FROM workflow_stages
            WHERE workflow_id=? AND position>? AND status='pending'
@@ -1561,8 +1572,8 @@ def _advance_after_stage(conn, workflow, round_row, common,
             stage_id=next_stage["id"],
         )
         workflow = _workflow_row(conn, workflow["id"])
-        return _transition(
-            conn, workflow, WorkflowStatus.QUEUED,
+        return move(
+            WorkflowStatus.QUEUED,
             "stage.advanced",
             {"completed_stage_id": current_stage["id"],
              "completed_stage_code": current_stage["code"],
@@ -1570,8 +1581,8 @@ def _advance_after_stage(conn, workflow, round_row, common,
              "next_stage_code": next_stage["code"], **extra},
             round_id=new_round["id"],
         )
-    return _transition(
-        conn, workflow, WorkflowStatus.COMPLETED,
+    return move(
+        WorkflowStatus.COMPLETED,
         "review.passed",
         {**common, "final_stage_id": current_stage["id"],
          "final_stage_code": current_stage["code"], **extra},
@@ -1852,6 +1863,17 @@ def human_input(workflow_id: str,
     # незавершённого чекпоинта запрещён.
     if action.restart_checkpoint and action.resume:
         raise db.WorkflowConflictError("restart_checkpoint and resume are mutually exclusive")
+    with db._connect() as conn:
+        cleanup_probe = checkpoint_cleanup.active(conn, workflow_id)
+    if cleanup_probe:
+        if not action.resume or action.restart_checkpoint:
+            raise db.WorkflowConflictError('finish the owned checkpoint cleanup before another decision')
+        result = checkpoint_cleanup.retry(workflow_id, action.expected_version, manual=True, said=said)
+        with db._connect() as conn:
+            still_pending = checkpoint_cleanup.active(conn, workflow_id)
+        if still_pending or cleanup_probe.get('accepted') or result.status is not WorkflowStatus.AWAITING_HUMAN:
+            return result
+        action = action.model_copy(update={'expected_version': result.state_version})
     if action.resume or action.restart_checkpoint:
         with db._connect() as conn:
             probe = _pending_stage_checkpoint(conn, workflow_id)
@@ -1990,6 +2012,7 @@ def _restart_pending_checkpoint(workflow_id, action, said, pending):
     if not action.checkpoint_head or not action.text.strip():
         raise db.WorkflowConflictError("checkpoint restart requires observed HEAD and reason")
     owned = {}
+    generation = checkpoint_cleanup.new_generation()
 
     def validate(conn):
         workflow = _workflow_row(conn, workflow_id)
@@ -2017,8 +2040,7 @@ def _restart_pending_checkpoint(workflow_id, action, said, pending):
             conn.execute("""UPDATE workflow_stages SET status='executing',
                             completed_at=NULL, summary_json=NULL WHERE id=?""",
                          (pending["stage_id"],))
-            workflow = _transition(conn, workflow, WorkflowStatus.REVISION_REQUIRED,
-                "stage.checkpoint_invalidated", {
+            workflow = _touch(conn, workflow, "stage.checkpoint_invalidated", {
                     **said, **proof, "pending_seq": pending["pending_seq"],
                     "stage_code": pending["stage_code"], "old_pass_revoked": True,
                 }, round_id=round_row["id"])
@@ -2029,7 +2051,27 @@ def _restart_pending_checkpoint(workflow_id, action, said, pending):
                     idempotency_key=f"human.input:checkpoint-restart:{pending['pending_seq']}",
                     payload={**said, "checkpoint_restart": True},
                 ))
-            result = db._row_to_workflow(workflow)
+            owned['cleanup_binding']=checkpoint_cleanup.hold(conn,workflow,generation,pending,None,
+                target=WorkflowStatus.REVISION_REQUIRED.value,accepted=False)
+            owned['cleanup_version']=workflow['state_version']
+        checkpoint_cleanup.register(generation,lambda:None,lambda:True,binding=owned['cleanup_binding'])
+        return checkpoint_cleanup.finish(workflow_id,generation,expected_version=owned['cleanup_version'])
+    except stage_checkpoint.CheckpointCleanupError as exc:
+        with db._connect(immediate=True) as conn:
+            workflow=_workflow_row(conn,workflow_id)
+            held=checkpoint_cleanup.active(conn,workflow_id)
+            if held is not None and held.get('generation')!=generation:
+                raise db.WorkflowConflictError('checkpoint restart cleanup ownership changed') from exc
+            if held is None:
+                workflow=validate(conn)
+            if WorkflowStatus(workflow['status']) not in TERMINAL_STATES:
+                workflow=_touch(conn,workflow,'checkpoint.restart.cleanup_failed',
+                    dict(generation=generation,reason=str(exc)[:800]))
+            if held is None:
+                owned['cleanup_binding']=checkpoint_cleanup.hold(conn,workflow,generation,pending,None,
+                    target=WorkflowStatus.AWAITING_HUMAN.value,accepted=False)
+            result=db._row_to_workflow(workflow)
+        checkpoint_cleanup.register(generation,exc.cleanup,exc.ready,binding=owned['cleanup_binding'])
         return result
     except stage_checkpoint.CheckpointError as exc:
         raise db.WorkflowConflictError(str(exc)) from exc
@@ -2044,6 +2086,7 @@ def _resume_pending_checkpoint(workflow_id: str,
 
 def _complete_pending_checkpoint(workflow_id, expected_version, pending, said, *, resume):
     owned = {"version": expected_version}
+    cleanup = {"generation": checkpoint_cleanup.new_generation()}
 
     def record_note(conn, workflow):
         if resume and said.get("note"):
@@ -2112,19 +2155,40 @@ def _complete_pending_checkpoint(workflow_id, expected_version, pending, said, *
                 }, round_id=round_row["id"])
             workflow = _advance_after_stage(
                 conn, workflow, round_row, pending.get("common") or {},
-                extra={"after_checkpoint": True, "checkpoint_resumed": resume})
-            result = db._row_to_workflow(workflow)
-        return result
+                extra={"after_checkpoint": True, "checkpoint_resumed": resume}, cleanup=cleanup)
+            owned['cleanup_binding']=checkpoint_cleanup.hold(conn, workflow, cleanup['generation'], pending, sha,
+                target=cleanup['target'], memory_stage=cleanup.get('memory_stage'))
+            owned['cleanup_version'] = workflow['state_version']
+        # Acceptance committed with index/ref fences held; readiness is still
+        # blocked in the durable cleanup marker until every resource closes.
+        checkpoint_cleanup.register(cleanup['generation'], lambda: None, lambda: True,binding=owned['cleanup_binding'])
+        return checkpoint_cleanup.finish(workflow_id, cleanup['generation'],
+                                         expected_version=owned['cleanup_version'])
     except stage_checkpoint.CheckpointBusyError as exc:
         raise db.WorkflowConflictError(str(exc)) from exc
     except (stage_checkpoint.CheckpointError, OSError, subprocess.SubprocessError) as exc:
         with db._connect(immediate=True) as conn:
-            workflow = validate(conn, owned["version"])
-            record_note(conn, workflow)
-            workflow = _touch(conn, workflow, "stage.checkpoint_failed", {
-                **said, "stage_code": pending["stage_code"], "reason": str(exc)[:800],
-            }, round_id=_current_round_row(conn, workflow)["id"])
-            return db._row_to_workflow(workflow)
+            workflow = _workflow_row(conn, workflow_id)
+            held = checkpoint_cleanup.active(conn, workflow_id)
+            if held is not None:
+                if held.get('generation') != cleanup['generation']:
+                    raise db.WorkflowConflictError('checkpoint cleanup ownership changed') from exc
+                if WorkflowStatus(workflow['status']) not in TERMINAL_STATES:
+                    workflow = _touch(conn, workflow, 'checkpoint.cleanup.failed', {
+                        'generation': cleanup['generation'], 'reason': str(exc)[:800]})
+            else:
+                workflow = validate(conn, owned['version'])
+                record_note(conn, workflow)
+                workflow = _touch(conn, workflow, 'stage.checkpoint_failed', {
+                    **said, 'stage_code': pending['stage_code'], 'reason': str(exc)[:800],
+                }, round_id=_current_round_row(conn, workflow)['id'])
+                if isinstance(exc, stage_checkpoint.CheckpointCleanupError):
+                    owned['cleanup_binding']=checkpoint_cleanup.hold(conn, workflow, cleanup['generation'], pending, None,
+                        target=WorkflowStatus.AWAITING_HUMAN.value, accepted=False)
+            result = db._row_to_workflow(workflow)
+        if isinstance(exc, stage_checkpoint.CheckpointCleanupError):
+            checkpoint_cleanup.register(cleanup['generation'], exc.cleanup, exc.ready,binding=owned['cleanup_binding'])
+        return result
 
 
 def _keep_refused_note(conn: sqlite3.Connection, workflow: sqlite3.Row,
@@ -2149,7 +2213,7 @@ def cancel_workflow(workflow_id: str,
                     expected_version: int) -> WorkflowInDB:
     with db._connect(immediate=True) as conn:
         workflow = _workflow_row(conn, workflow_id)
-        _require_version(conn, workflow, expected_version, allow_gate_execution=True, allow_elicitation=True)
+        _require_version(conn, workflow, expected_version, allow_gate_execution=True, allow_elicitation=True, allow_checkpoint_cleanup=True)
         state = WorkflowStatus(workflow["status"])
         if state in TERMINAL_STATES:
             raise db.WorkflowConflictError(
@@ -3379,6 +3443,12 @@ def advance_workflow(workflow_id: str, max_actions: int = 12) -> WorkflowInDB:
         workflow = db.get_workflow(workflow_id)
         if not workflow:
             raise db.WorkflowNotFoundError(workflow_id)
+        with db._connect() as conn:
+            cleanup_pending = checkpoint_cleanup.active(conn, workflow.id)
+        if cleanup_pending:
+            if not _config_for(workflow).automation.enabled:
+                return workflow
+            return checkpoint_cleanup.retry(workflow.id, workflow.state_version)
         blocked = gate_execution.reconcile_unresolved(workflow.id)
         if blocked is not None:
             return blocked
