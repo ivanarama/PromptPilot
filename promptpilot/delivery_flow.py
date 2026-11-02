@@ -16,7 +16,10 @@ def summarize(data, series, now, *, paused=False):
                 started = started.replace(tzinfo=timezone.utc)
         except (KeyError, TypeError, ValueError):
             started = None
+        from .task_progress import observe
+        progress = observe(item.get('next_task_id'), started, now) if started else None
         active.append({'task_id': item.get('next_task_id'), 'series_id': item['id'],
+                       'progress': progress,
                        'stage': stages.get(item['id']), 'title': item.get('title', ''),
                        'started_at': started.isoformat() if started else None,
                        'elapsed_seconds': max(0, round((now - started).total_seconds())) if started else None})

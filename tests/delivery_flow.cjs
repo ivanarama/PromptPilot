@@ -18,4 +18,14 @@ assert.match(rendered, /#10 — 11/);
 assert.match(rendered, /&lt;script&gt;/);
 assert.doesNotMatch(rendered, /<script>/);
 assert.equal(context.pipelineDeliveryFlow({}), '');
+const progress = context.pipelineDeliveryFlow({delivery_flow: {reason: 'Working', active: [{
+  task_id: 43, title: 'FIX', elapsed_seconds: 500,
+  progress: {stage: '<race>', status: 'waiting', elapsed_seconds: 100, age_seconds: 200,
+    stale: true, wait_reason: '<database>', tests: {passed: 414, total: 469, skipped: 5, failed: 0}},
+}]}});
+assert.match(progress, /414\/469/);
+assert.match(progress, /пропущено 5/);
+assert.match(progress, /данные прогресса устарели/);
+assert.match(progress, /&lt;database&gt;/);
+assert.doesNotMatch(progress, /<race>|<database>/);
 console.log('Delivery flow: actual elapsed time, review rounds and escaping OK');

@@ -183,6 +183,31 @@ def add(prompt, file_path, priority, scheduled_at, working_dir, provider, max_re
     click.echo(click.style(f"\n{len(prompts)} task(s) added.", fg="green"))
 
 
+@cli.command("task-progress")
+@click.option('--task-id', type=int, envvar='PP_TASK_ID', required=True)
+@click.option('--started-at', envvar='PP_TASK_STARTED_AT', required=True)
+@click.option('--stage', required=True)
+@click.option('--status', type=click.Choice(['running', 'waiting', 'completed', 'failed']), default='running')
+@click.option('--passed', type=click.IntRange(min=0))
+@click.option('--failed', type=click.IntRange(min=0), default=0)
+@click.option('--skipped', type=click.IntRange(min=0), default=0)
+@click.option('--total', type=click.IntRange(min=0))
+@click.option('--wait-reason', default='')
+def task_progress_cmd(task_id, started_at, stage, status, passed, failed, skipped, total, wait_reason):
+    """Report observed progress of this running attempt to the local dashboard."""
+    from .task_progress import publish
+    if (passed is None) != (total is None):
+        raise click.ClickException('--passed and --total must be supplied together')
+    if total is None and (failed or skipped):
+        raise click.ClickException('test counters require --passed and --total')
+    tests = dict(passed=passed, failed=failed, skipped=skipped, total=total) if total is not None else None
+    try:
+        publish(task_id, started_at, stage, status, tests=tests, wait_reason=wait_reason)
+    except (OSError, ValueError, TypeError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo('Progress recorded (observation only).')
+
+
 @cli.command("list")
 @click.option("-s", "--status", type=click.Choice([s.value for s in TaskStatus]), help="Filter by status")
 @click.option("-n", "--limit", default=20, help="Number of tasks to show")
