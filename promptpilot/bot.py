@@ -3391,7 +3391,7 @@ def _question_keyboard(ref):
 
 def _question_text(raw):
     lines = [line.rstrip() for line in raw.splitlines() if not _screen_chrome(line)]
-    return _clip('\n'.join(lines).strip(), 3500) or 'Вопрос больше не отображается.'
+    return '\n'.join(lines).strip() or 'Вопрос больше не отображается.'
 
 
 async def _show_herdr_question(query, context, ref, pane, host):
@@ -3405,7 +3405,7 @@ async def _show_herdr_question(query, context, ref, pane, host):
         'digest': hashlib.sha256(_question_text(raw).encode()).hexdigest(),
         'endpoint': list(host) if host else None, 'expires_at': time.time() + 600,
     }
-    await query.message.reply_text('❓ Вопрос агента\n\n' + _question_text(raw),
+    await query.message.reply_text('❓ Вопрос агента\n\n' + _clip(_question_text(raw), 3500),
                                    reply_markup=_question_keyboard(ref))
 
 

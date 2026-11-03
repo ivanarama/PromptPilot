@@ -63,6 +63,20 @@ def test_old_question_buttons_do_not_send_keys_to_changed_screen(dialog):
     rpc.assert_not_called()
 
 
+def test_changed_question_tail_beyond_telegram_limit_invalidates_old_buttons(dialog):
+    event, context, rpc, screen = dialog
+    prefix = 'Choose a destination\n' + 'Context for this question. ' * 180
+    screen.side_effect = [PENDING, prefix + '\n› 1. Telegram\n  2. Email']
+    asyncio.run(bot.cb_herdr_question(event, context))
+    assert len(event.callback_query.message.reply_text.call_args.args[0]) < 4096
+    rpc.reset_mock()
+    screen.side_effect = None
+    screen.return_value = prefix + '\n› 1. Delete\n  2. Keep'
+    event.callback_query.data = 'hd_qkey:enter::w1:p1'
+    asyncio.run(bot.cb_herdr_question_key(event, context))
+    rpc.assert_not_called()
+
+
 def test_question_choice_is_explicit_and_cannot_be_replayed(dialog):
     event, context, rpc, screen = dialog
     asyncio.run(bot.cb_herdr_question(event, context))
