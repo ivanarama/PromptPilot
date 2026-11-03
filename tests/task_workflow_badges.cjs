@@ -3,6 +3,9 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const assert = require('node:assert/strict');
 const html = fs.readFileSync('promptpilot/static/index.html', 'utf8');
+const resultStart = html.indexOf('function visibleResult(');
+const resultEnd = html.indexOf('// --- Parse result text', resultStart);
+assert.ok(resultStart >= 0 && resultEnd > resultStart);
 const start = html.indexOf('function taskDisplayTitle(');
 const end = html.indexOf('function providerLabel(', start);
 assert.ok(start >= 0 && end > start);
@@ -11,7 +14,8 @@ const escape = value => String(value).replaceAll('&', '&amp;').replaceAll('<', '
 const base = {status:'completed', prompt:'same repository', working_dir:'/same/repo',
   retry_count:0, max_retries:5, exit_code:0, priority:5};
 const tasks = [
-  {...base, id:1, workflow_id:'wf', role:'executor', workflow_stage_code:'FIRST',
+  {...base, id:1, result:'Ready\nPP-FILE: /private/task-output/report.txt',
+    workflow_id:'wf', role:'executor', workflow_stage_code:'FIRST',
     workflow_stage_title:'<img src=x onerror=alert(1)> "old stage"', workflow_round_no:1},
   {...base, id:2, workflow_id:'wf', role:'reviewer', workflow_stage_code:'FIRST', workflow_round_no:1},
   {...base, id:3, status:'running', workflow_id:'wf', role:'executor', workflow_stage_code:'FINAL',
@@ -31,6 +35,7 @@ const context = {
   uiSnapScrolls:()=>[], uiRestoreScrolls:()=>{}, esc:escape, escAttr:escape,
 };
 vm.createContext(context);
+vm.runInContext(html.slice(resultStart,resultEnd), context);
 vm.runInContext(html.slice(start,end), context);
 (async()=>{
   await context.loadTasks();
@@ -41,6 +46,8 @@ vm.runInContext(html.slice(start,end), context);
   assert.doesNotMatch(badges[0],/FINAL|Current stage/);
   assert.match(badges[0],/&lt;img/);
   assert.doesNotMatch(list.innerHTML,/<img|<svg|undefined/);
+  assert.match(list.innerHTML,/Ready/);
+  assert.doesNotMatch(list.innerHTML,/PP-FILE:|\/private\/task-output/);
   assert.match(badges[1],/Ревью.*FIRST/);
   assert.match(badges[2],/Исполнитель.*FINAL.*раунд 2/);
   assert.equal(badges[3],'Планировщик');
