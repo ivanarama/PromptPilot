@@ -193,10 +193,11 @@ def test_herdr_reply_authorized_final_sends_once_and_clears_dialog(monkeypatch):
     context, entry, final, _, calls = _herdr_conversation(monkeypatch)
     assert asyncio.run(bot.cb_herdr_reply_start(entry, context)) == bot.ASK_HERDR_REPLY
     assert asyncio.run(bot.herdr_reply_got_text(final, context)) == bot.ConversationHandler.END
-    assert calls == [(("agent", "prompt", "w1:p1", "continue safely"), {"host": None})]
+    assert calls == [(("agent", "get", "w1:p1"), {"host": None}),
+                     (("agent", "prompt", "w1:p1", "continue safely"), {"host": None})]
     assert context.user_data == {}
     asyncio.run(bot.herdr_reply_got_text(final, context))
-    assert len(calls) == 1
+    assert len(calls) == 2
 
 
 @pytest.mark.parametrize("denial", ["revoked", "group", "no_chat", "no_user"])
