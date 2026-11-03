@@ -17,10 +17,12 @@ def records(data, context):
                     evidence='immutable actual FIX handoff', now=100) for c in data['queues'][0]['admission_items']]
 
 
-def test_finite_unchanged_wait_skips_provider_but_never_authorizes_mutation():
+def test_finite_unchanged_inbox_waits_never_block_other_owner_actions():
     data = observation(); context = dict(environment='profile/tool/resource fingerprints')
     result = select(data, records(data, context), context, now=101)
-    assert result['action'] == 'wait' and len(result['excluded']) == 2
+    assert result['action'] == 'fallback' and len(result['excluded']) == 2
+    assert result['negative_only'] is True and result['scope'] == 'owner-inbox'
+    assert 'eligible' not in result
     assert not {'ship', 'approved', 'lease', 'handoff'} & result.keys()
     assert select(data, records(data, context), context, now=701)['action'] == 'fallback'
 
@@ -28,8 +30,29 @@ def test_finite_unchanged_wait_skips_provider_but_never_authorizes_mutation():
 def test_one_wait_does_not_hide_another_candidate():
     data = observation(); context = dict(environment='one')
     result = select(data, records(data, context)[1:], context, now=101)
-    assert result['action'] == 'fallback' and result['eligible'] == [2279]
+    assert result['action'] == 'fallback' and 'eligible' not in result
     assert result['excluded'][0]['number'] == 2367
+
+
+def test_reviewed_delivery_pr_outside_inbox_is_not_excluded_by_positive_list():
+    data = observation(); context = dict(environment='one')
+    memo = records(data, context)
+    # The same complete needs-decision inbox exists both with and without a
+    # reviewed PR waiting for ship. It cannot decide the whole election domain.
+    context['heads']['2474'] = 'b' * 40
+    memo = records(data, context)
+    result = select(data, memo, context, now=101)
+    assert result['action'] == 'fallback' and 'eligible' not in result
+    assert {item['number'] for item in result['excluded']} == {2279, 2367}
+    assert 2474 not in {item['number'] for item in result['excluded']}
+
+
+def test_empty_decision_inbox_does_not_prove_delivery_is_empty():
+    data = observation()
+    data['queues'][0].update(backlog=0, admission_items=[])
+    result = select(data, [], dict(environment='one', heads={}), now=101)
+    assert result['action'] == 'fallback' and result['excluded'] == []
+    assert 'eligible' not in result
 
 
 @pytest.mark.parametrize('change', ['comment', 'label', 'new_candidate', 'environment', 'duplicate', 'future'])

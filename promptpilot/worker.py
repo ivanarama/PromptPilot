@@ -1178,11 +1178,14 @@ def _maybe_recur(task, failed: bool = False):
     if not next_dt:
         return
     from .models import TaskCreate
-    # The prompt as stored, never the one this run was handed: a one-off note
-    # must not be baked into every future occurrence.
-    stored = db.get_task(task.id)
+    # The current series template owns future instructions. A running
+    # occurrence keeps its original prompt for audit, while later occurrences
+    # must retain edits made to the template during that run. Legacy tasks
+    # without a series still use stored text rather than a one-off run note.
+    stored = db.get_task(task.id) if not series else None
     db.create_series_occurrence_if_idle(TaskCreate(
-        prompt=(stored.prompt if stored else task.prompt),
+        prompt=(series["prompt"] if series else
+                stored.prompt if stored else task.prompt),
         working_dir=task.working_dir,
         provider=series["provider"] if series else task.provider,
         priority=series["priority"] if series else task.priority,

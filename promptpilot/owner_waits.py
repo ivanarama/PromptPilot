@@ -35,8 +35,14 @@ def receipt(candidate, context, *, head, reason, evidence, now, seconds=600):
 
 
 def select(data, records, context, *, now):
-    """Only fresh complete membership may conclude that all work is waiting."""
-    fallback = dict(action='fallback', excluded=[], reason='Normal exact-target OWNER admission required')
+    """Exclude exact waits without treating one inbox as every OWNER action.
+
+    Complete membership of needs-decision is not complete membership of delivery:
+    reviewed PRs awaiting ship may be absent. This observation cannot narrow the
+    canonical delivery-first election or conclude that all OWNER work is blocked.
+    """
+    fallback = dict(action='fallback', excluded=[], negative_only=True,
+                    scope='owner-inbox', reason='Normal exact-target OWNER admission required')
     cache = data.get('cache') or {}
     queues = data.get('queues') or []
     if (cache.get('complete') is not True or cache.get('available') is not True
@@ -70,10 +76,7 @@ def select(data, records, context, *, now):
                 and isinstance(r.get('reason'), str) and r['reason']
                 and isinstance(r.get('evidence'), str) and r['evidence']):
             excluded.append(dict(number=r['number'], head=r.get('head'), reason=r['reason'], expires_at=end))
-    remaining = [c['number'] for c in candidates if c['number'] not in {r['number'] for r in excluded}]
-    if not remaining:
-        return dict(action='wait', excluded=excluded, reason='OWNER: unchanged observed waits; no provider needed')
-    return dict(fallback, excluded=excluded, eligible=remaining)
+    return dict(fallback, excluded=excluded)
 
 
 def now_timestamp():
