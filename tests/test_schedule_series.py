@@ -96,6 +96,51 @@ def test_fresh_install_has_no_project_specific_pipeline_profiles(tmp_path, monke
     assert pipeline_insights.list_profiles() == []
 
 
+def test_recurrence_keeps_new_series_prompt_without_rewriting_running_attempt(
+        isolated_db):
+    original = "ExampleProject - FIX\nOriginal instructions\r\n"
+    updated = "ExampleProject - FIX\nCurrent operator instructions\r\n"
+    created = isolated_db.create_task(TaskCreate(prompt=original, recurrence="30m"))
+    running = isolated_db.get_next_runnable()
+    assert running.id == created.id
+    with isolated_db._connect() as connection:
+        connection.execute("UPDATE task_series SET prompt=? WHERE id=?",
+                           (updated, created.series_id))
+    # The dispatched copy can also carry a transient note; neither old text
+    # nor that note should replace the current template in the successor.
+    running.prompt += "\nOne-off note for this attempt"
+    assert isolated_db.mark_completed(running.id, "Done", verdict="ГОТОВО",
+                                     expected_started_at=running.started_at)
+    worker._recur_after_run(running)
+    series = isolated_db.get_series(created.series_id)
+    successor = isolated_db.get_task(series["next_task_id"])
+    assert successor.prompt == updated
+    assert isolated_db.get_task(created.id).prompt == original
+    assert series["prompt"] == updated
+
+
+def test_failed_occurrence_also_uses_current_series_prompt(isolated_db):
+    created = isolated_db.create_task(TaskCreate(
+        prompt="ExampleProject - FIX\nOld", recurrence="30m"))
+    running = isolated_db.get_next_runnable()
+    with isolated_db._connect() as connection:
+        connection.execute("UPDATE task_series SET prompt=? WHERE id=?",
+                           ("ExampleProject - FIX\nNew", created.series_id))
+    worker._maybe_recur(running, failed=True)
+    successor = isolated_db.get_task(
+        isolated_db.get_series(created.series_id)["next_task_id"])
+    # A live occurrence still blocks duplicate scheduling. Complete it and
+    # confirm the failure path preserves the template in its one successor.
+    assert successor.id == running.id
+    assert isolated_db.mark_failed(running.id, "Failure",
+                                  expected_started_at=running.started_at)
+    worker._maybe_recur(running, failed=True)
+    successor = isolated_db.get_task(
+        isolated_db.get_series(created.series_id)["next_task_id"])
+    assert successor.id != running.id
+    assert successor.prompt == "ExampleProject - FIX\nNew"
+
+
 def test_first_valid_stale_verdict_reselects_immediately(isolated_db):
     task = isolated_db.create_task(TaskCreate(
         prompt="ExampleProject - REVIEW", recurrence="4h"))

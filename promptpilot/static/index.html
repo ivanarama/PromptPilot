@@ -3726,11 +3726,17 @@ function runsLabel(count) {
 function pipelineDeliveryFlow(data) {
   const flow = data.delivery_flow;
   if (!flow) return '';
-  const duration = seconds => seconds == null ? '—' : seconds < 3600 ? `${Math.round(seconds/60)} мин` : `${(seconds/3600).toFixed(1)} ч`;
+  const duration = seconds => seconds == null ? '—' : seconds < 60 ? `${Math.round(seconds)} с` : seconds < 3600 ? `${Math.round(seconds/60)} мин` : `${(seconds/3600).toFixed(1)} ч`;
   return `<div class="pipeline-report-section" id="pipelineDeliveryFlow">
     <h3>Что удерживает поставку</h3>
     <div class="prov-cmd">${esc(flow.reason)}</div>
-    ${(flow.active || []).map(task => `<div class="prov-cmd">${esc(task.title)} · #${esc(String(task.task_id))} · выполняется ${esc(duration(task.elapsed_seconds))}</div>`).join('')}
+    ${(flow.active || []).map(task => {
+      const p = task.progress;
+      const tests = p?.tests;
+      const counters = tests ? ` · пройдено ${tests.passed}/${tests.total} · пропущено ${tests.skipped} · ошибок ${tests.failed}` : '';
+      const status = p && ({running:'выполняется', waiting:'ожидание', completed:'завершён', failed:'ошибка'}[p.status] || p.status);
+      return `<div class="prov-cmd">${esc(task.title)} · #${esc(String(task.task_id))} · выполняется ${esc(duration(task.elapsed_seconds))}${p ? `<br>${esc(p.stage)} · ${esc(status)} · этап ${esc(duration(p.elapsed_seconds))}${esc(counters)}${p.wait_reason ? `<br>Ожидание: ${esc(p.wait_reason)}` : ''}<br>Обновлено ${esc(String(p.age_seconds))} с назад${p.stale ? ' · данные прогресса устарели' : ''}` : ''}</div>`;
+    }).join('')}
     ${(flow.review_rounds || []).length ? `<div class="prov-cmd">Круги ревью: ${flow.review_rounds.map(item => `#${esc(String(item.number))} — ${esc(String(item.rounds))}`).join('; ')}</div>` : ''}
     <div class="pipeline-report-meta">Текущие запуски показаны по локальной базе. Причина ожидания и круги ревью относятся к сохранённому снимку очереди.</div>
   </div>`;
