@@ -4937,6 +4937,25 @@ def mark_notified(task_id: int):
         )
 
 
+def mark_notified_with_files(task, files: list) -> bool:
+    """Commit this exact completion and its file outbox entries together."""
+    with _connect() as conn:
+        changed = conn.execute(
+            "UPDATE tasks SET notified_at=? WHERE id=? AND notified_at IS NULL "
+            "AND status='completed' AND started_at IS ? AND tg_chat_id IS ? AND result IS ?",
+            (_now(), task.id, _to_utc_iso(task.started_at), task.tg_chat_id, task.result),
+        ).rowcount
+        if not changed:
+            return False
+        for file in files:
+            conn.execute(
+                "INSERT INTO notifications(task_id,tg_chat_id,message,created_at,machine,kind) "
+                "VALUES(?,?,?,?,?,?)",
+                (task.id, task.tg_chat_id, file["message"], _now(), task.machine, file["kind"]),
+            )
+    return True
+
+
 # ── 1С-доработка (epf_tools): связь задачи с проектом обработки ─────────
 
 def create_epf_job(task_id: int, project_dir: str, original_name: str,
@@ -4984,6 +5003,63 @@ def update_epf_job(job_id: int, fields: dict):
             f"UPDATE epf_jobs SET {cols} WHERE id = ?",
             (*sets.values(), job_id),
         )
+
+
+def save_native_file_context(source_key: str, context: dict):
+    slot = hashlib.sha256(_json_dump([context['pane'], context['tg_chat_id']]).encode()).hexdigest()
+    set_setting('result-files.native.' + source_key + '.' + slot, _json_dump(context))
+
+
+def queue_native_file_manifests(source_key: str, agents: list[dict]) -> int:
+    """Observe only completions after the reply, on the same agent instance."""
+    prefix = 'result-files.native.' + source_key + '.'
+    current = {a.get('pane_id'): a for a in agents if isinstance(a, dict)}
+    count = 0
+    with _connect(immediate=True) as conn:
+        rows = conn.execute('SELECT key,value FROM settings WHERE substr(key,1,?)=?',
+                            (len(prefix), prefix)).fetchall()
+        for row in rows:
+            context = _json_load(row['value'], {})
+            if context.get('expires_at', 0) < time.time():
+                conn.execute('DELETE FROM settings WHERE key=?', (row['key'],))
+                continue
+            if context.get('queued'):
+                continue
+            agent = current.get(context['pane'])
+            if not agent or agent.get('agent_status') != 'done':
+                continue
+            if any(context.get(field) and agent.get(field) != context[field]
+                   for field in ('terminal_id', 'agent_session')):
+                continue
+            sequence = agent.get('completion_seq')
+            if sequence is None:
+                sequence = agent.get('state_change_seq')
+            if type(sequence) is not int or sequence <= context['baseline_seq']:
+                continue
+            conn.execute(
+                'INSERT INTO notifications(tg_chat_id,message,created_at,machine,kind) VALUES(?,?,?,?,?)',
+                (context['tg_chat_id'], _json_dump(context), _now(), context['machine'], 'result.manifest'),
+            )
+            context['queued'] = True
+            conn.execute('UPDATE settings SET value=? WHERE key=?', (_json_dump(context), row['key']))
+            count += 1
+    return count
+
+
+def expand_file_manifest(notification_id: int, files: list[dict]) -> bool:
+    """Persist fetched manifest children and acknowledge the parent atomically."""
+    with _connect(immediate=True) as conn:
+        row = conn.execute("SELECT * FROM notifications WHERE id=? AND sent_at IS NULL AND kind='result.manifest'",
+                           (notification_id,)).fetchone()
+        if not row:
+            return False
+        for payload in files:
+            conn.execute(
+                'INSERT INTO notifications(tg_chat_id,message,created_at,machine,kind) VALUES(?,?,?,?,?)',
+                (row['tg_chat_id'], _json_dump(payload), _now(), row['machine'], 'result.file'),
+            )
+        conn.execute('UPDATE notifications SET sent_at=? WHERE id=?', (_now(), notification_id))
+    return True
 
 
 def queue_herdr_completions(source_key: str, completions: list[dict], chat_ids: list[int], *, machine: str = "",

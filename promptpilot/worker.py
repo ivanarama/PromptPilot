@@ -230,7 +230,8 @@ def effective_prompt(task) -> str:
     already set, usually because the run was going the wrong way, so it has to
     outrank everything above it.
     """
-    prompt = task.prompt
+    from .result_files import prompt_instruction
+    prompt = task.prompt + prompt_instruction(task)
     note = (getattr(task, "note", None) or "").strip()
     if note:
         prompt += ("\n\n<приписка>\n"

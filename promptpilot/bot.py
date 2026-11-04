@@ -40,7 +40,7 @@ from telegram.ext import (
     filters,
 )
 
-from . import db, epf_tools, pipeline_insights
+from . import db, epf_tools, pipeline_insights, result_files
 from .config import (
     DEFAULT_CLI, HERDR_RENOTIFY_COOLDOWN, HERDR_WATCH, HERDR_WATCH_INTERVAL, LOG_PROMPTS,
     ensure_herdr_launch_provider, herdr_launch_kind,
@@ -220,7 +220,7 @@ def _task_detail_keyboard(task) -> InlineKeyboardMarkup:
         action_row.append(InlineKeyboardButton("🔁 Повторить", callback_data=f"rerun:{task.id}"))
     if action_row:
         rows.append(action_row)
-    if task.result and len(task.result) > 800:
+    if task.result and len(result_files.visible_result(task.result)) > 800:
         rows.append([InlineKeyboardButton("📄 Полный вывод", callback_data=f"full_result:{task.id}")])
     final_row = [InlineKeyboardButton("← К списку", callback_data="tasklist")]
     if status != "running":
@@ -617,7 +617,7 @@ async def cb_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text += f"\n\n*Промпт:*\n{_esc(task.prompt[:500])}"
 
     if task.result:
-        result_text = task.result.split("\n--- Meta ---")[0].strip()
+        result_text = result_files.visible_result(task.result.split("\n--- Meta ---")[0]).strip()
         if result_text:
             text += f"\n\n*Результат:*\n{_esc(result_text[:800])}"
         if "--- Meta ---" in task.result:
@@ -791,7 +791,7 @@ async def cb_full_result(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("Вывода нет.", show_alert=True)
         return
     await query.answer()
-    content = task.result or task.error
+    content = result_files.visible_result(task.result or task.error)
     buf = io.BytesIO(content.encode("utf-8"))
     buf.name = f"task_{task_id}.md"
     await query.message.reply_document(
@@ -3374,6 +3374,114 @@ def _screen_chrome(line: str) -> bool:
             or "Enter to select" in s or "Esc to cancel" in s)
 
 
+def _codex_question_pending(text: str) -> bool:
+    return bool(re.search(r'\b[1-9]\d*\s+questions?\b', text, re.I)
+                and re.search(r'shift\s*\+\s*(?:↑|up)\s+to answer', text, re.I))
+
+
+def _question_keyboard(ref):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton('↑ Предыдущий', callback_data=f'hd_qkey:up:{ref}'),
+         InlineKeyboardButton('↓ Следующий', callback_data=f'hd_qkey:down:{ref}')],
+        [InlineKeyboardButton('✓ Выбрать', callback_data=f'hd_qkey:enter:{ref}'),
+         InlineKeyboardButton('Закрыть', callback_data=f'hd_qkey:esc:{ref}')],
+        [InlineKeyboardButton('Обновить вопрос', callback_data=f'hd_qkey:refresh:{ref}')],
+    ])
+
+
+def _question_text(raw):
+    lines = [line.rstrip() for line in raw.splitlines() if not _screen_chrome(line)]
+    return '\n'.join(lines).strip() or 'Вопрос больше не отображается.'
+
+
+async def _show_herdr_question(query, context, ref, pane, host):
+    import hashlib
+    raw = await _herdr_cli('agent', 'read', pane, '--source', 'visible', '--format', 'text', host=host)
+    if raw is None:
+        await query.message.reply_text('Не удалось прочитать вопрос. Нажмите «Обновить вопрос».',
+                                       reply_markup=_question_keyboard(ref))
+        return
+    context.user_data.setdefault('herdr_question_views', {})[ref] = {
+        'digest': hashlib.sha256(_question_text(raw).encode()).hexdigest(),
+        'endpoint': list(host) if host else None, 'expires_at': time.time() + 600,
+    }
+    await query.message.reply_text('❓ Вопрос агента\n\n' + _clip(_question_text(raw), 3500),
+                                   reply_markup=_question_keyboard(ref))
+
+
+@require_auth
+async def cb_herdr_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    ref = query.data.split(':', 1)[1]
+    target = await _hd_ref_or_alert(query, ref)
+    if target is None:
+        return
+    _, pane, host = target
+    raw = await _herdr_cli('agent', 'read', pane, '--source', 'visible', '--format', 'text', host=host)
+    if not raw or not _codex_question_pending(raw):
+        await query.answer('Свёрнутого вопроса уже нет. Обновите окно.', show_alert=True)
+        return
+    if not await _check_herdr_reply_access(update):
+        return
+    result = await _herdr_json('agent', 'send-keys', pane, 'shift+up', host=host)
+    if not result or not result.get('result'):
+        await query.answer('Не удалось открыть вопрос.', show_alert=True)
+        return
+    await query.answer('Открываю вопрос')
+    await asyncio.sleep(0.25)
+    await _show_herdr_question(query, context, ref, pane, host)
+
+
+@require_auth
+async def cb_herdr_question_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    import hashlib
+    query = update.callback_query
+    _, key, ref = query.data.split(':', 2)
+    if key not in {'up', 'down', 'enter', 'esc', 'refresh'}:
+        await query.answer('Неизвестное действие.', show_alert=True)
+        return
+    target = await _hd_ref_or_alert(query, ref)
+    if target is None:
+        return
+    _, pane, host = target
+    view = context.user_data.get('herdr_question_views', {}).get(ref)
+    if (not view or time.time() > view['expires_at']
+            or view['endpoint'] != (list(host) if host else None)):
+        await query.answer('Откройте вопрос заново: эти кнопки устарели.', show_alert=True)
+        return
+    raw = await _herdr_cli('agent', 'read', pane, '--source', 'visible', '--format', 'text', host=host)
+    if raw is None:
+        await query.answer('Не удалось прочитать текущий вопрос.', show_alert=True)
+        return
+    if hashlib.sha256(_question_text(raw).encode()).hexdigest() != view['digest']:
+        await query.answer('Содержимое изменилось. Проверьте обновлённый вопрос.')
+        await _show_herdr_question(query, context, ref, pane, host)
+        return
+    if not await _check_herdr_reply_access(update):
+        return
+    if key != 'refresh':
+        result = await _herdr_json('agent', 'send-keys', pane, key, host=host)
+        if not result or not result.get('result'):
+            await query.answer('Не удалось передать выбор.', show_alert=True)
+            return
+        await asyncio.sleep(0.25)
+    await query.answer()
+    if key in {'enter', 'esc'}:
+        context.user_data['herdr_question_views'].pop(ref, None)
+        await query.message.reply_text('Выбор передан агенту.' if key == 'enter' else 'Вопрос закрыт.')
+        return
+    await _show_herdr_question(query, context, ref, pane, host)
+
+
+async def _dispatch_question_callback(update, context):
+    from telegram.ext import ApplicationHandlerStop
+    handler = cb_herdr_question if update.callback_query.data.startswith('hd_question:') else cb_herdr_question_key
+    await handler(update, context)
+    # These controls also work during a wizard; don't let a later group treat
+    # the same click as an unknown/stale callback.
+    raise ApplicationHandlerStop
+
+
 async def _herdr_screen_tail(pane_id: str, machine: str = "", lines_n: int = 10) -> str:
     """Last lines of the pane — so a blocked notification SHOWS the question
     instead of making the user tap 📺 first."""
@@ -3407,6 +3515,9 @@ async def _herdr_notify(bot, pane_id: str, status: str, agent: dict, machine: st
         buttons = _herdr_blocked_keyboard(ref)
         if tail:
             text += f"\n\n{tail}"
+        if _codex_question_pending(tail):
+            buttons = [[InlineKeyboardButton('❓ Открыть вопрос', callback_data=f'hd_question:{ref}')],
+                       [InlineKeyboardButton('📺 Экран', callback_data=f'hd_screen:{ref}')]]
     else:
         text = f"✅ herdr{where}: {label} в панели {pane_id} завершил работу"
         buttons = _herdr_done_keyboard(ref)
@@ -3428,8 +3539,9 @@ def _is_local_host(host: str) -> bool:
     """A machine whose ssh host is this very box talks to the SAME herdr
     server, so polling it duplicates every local pane — twice in the windows
     list, and two identical notifications per blocked dialog."""
+    import socket
     h = (host or "").split("@")[-1].strip().lower()
-    return h in _LOCAL_HOSTS or h == os.uname().nodename.lower()
+    return h in _LOCAL_HOSTS or h == socket.gethostname().lower()
 
 
 def _herdr_watch_targets():
@@ -3454,6 +3566,23 @@ async def _herdr_watch_loop(bot):
             await _herdr_watch_tick(bot, notified, initialized)
         except Exception as e:  # one bad poll must not stop the whole watcher
             logger.warning("herdr watch tick упал: %s", e)
+
+
+async def _native_file_watch_loop():
+    """Requested reply files still work when general agent notices are disabled."""
+    while True:
+        await asyncio.sleep(HERDR_WATCH_INTERVAL)
+        try:
+            for machine, host in _herdr_watch_targets():
+                source = _herdr_watch_source(machine, host)
+                if not db.has_setting_prefix('result-files.native.' + source + '.'):
+                    continue
+                data = await _herdr_json('agent', 'list', host=host)
+                agents = ((data or {}).get('result') or {}).get('agents')
+                if isinstance(agents, list):
+                    db.queue_native_file_manifests(source, agents)
+        except Exception as exc:
+            logger.warning('Reply-file watch failed: %s', exc)
 
 
 def _herdr_completion_sequence(agent):
@@ -3481,6 +3610,8 @@ async def _herdr_watch_tick(bot, notified, initialized):
             agents = (data.get("result") or {}).get("agents")
             if not isinstance(agents, list):
                 continue  # A failed/unknown response cannot establish a baseline.
+
+            db.queue_native_file_manifests(_herdr_watch_source(machine, host), agents)
 
             current = {}
             for a in agents:
@@ -3691,8 +3822,17 @@ async def herdr_reply_got_text(update: Update, context: ContextTypes.DEFAULT_TYP
         return ConversationHandler.END
     if not await _check_herdr_reply_access(update):
         return ConversationHandler.END
-    res = await _herdr_json("agent", "prompt", pane, update.message.text, host=host)
+    data = await _herdr_json('agent', 'get', pane, host=host)
+    result = (data or {}).get('result')
+    agent = result.get('agent') if isinstance(result, dict) else None
+    delivery = result_files.native_context(agent, machine, host, update.effective_chat.id) if isinstance(agent, dict) else None
+    if not await _check_herdr_reply_access(update):
+        return ConversationHandler.END
+    prompt = (result_files.native_instruction(delivery) if delivery else '') + update.message.text
+    res = await _herdr_json("agent", "prompt", pane, prompt, host=host)
     if res and res.get("result"):
+        if delivery:
+            db.save_native_file_context(_herdr_watch_source(machine, host), delivery)
         await update.message.reply_text("Отправлено ✓")
         if LOG_PROMPTS:
             await _log_pane_prompt(pane, machine, host, update.message.text)
@@ -3846,7 +3986,9 @@ async def _render_window_card(query, context, idx: int) -> str:
 
     ref = f"{w['machine']}:{w['pane_id']}"
     rows = [[InlineKeyboardButton(REPLY_LABEL, callback_data=f"hd_reply:{ref}")]]
-    if w["status"] == "blocked":
+    if _codex_question_pending(tail):
+        rows.insert(0, [InlineKeyboardButton('❓ Открыть вопрос', callback_data=f'hd_question:{ref}')])
+    elif w["status"] == "blocked":
         rows.append([InlineKeyboardButton("✅ Enter", callback_data=f"hd_enter:{ref}"),
                      InlineKeyboardButton("2", callback_data=f"hd_key:2:{ref}"),
                      InlineKeyboardButton("3", callback_data=f"hd_key:3:{ref}"),
@@ -3967,6 +4109,61 @@ async def cb_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
 
+def _file_remote(machine):
+    if machine and machine not in load_machines():
+        raise result_files.RejectedFile("The result-file machine is no longer registered")
+    return _machine_remote(machine) if machine else None
+
+
+def _result_file_notifications(task):
+    try:
+        specs = result_files.specs(task)
+        if not specs:
+            return []
+        remote = _file_remote(task.machine)
+        endpoint = list(remote) if remote else None
+        return [{"kind": "result.file", "message": json.dumps({
+            **spec, "endpoint": endpoint, "expires_at": time.time() + 86400,
+        }, ensure_ascii=False)} for spec in specs]
+    except result_files.RejectedFile as exc:
+        logger.warning("task %s result files rejected: %s", task.id, exc)
+        return [{"kind": "result.file.error", "message":
+                 f"⚠️ Файлы задачи #{task.id} не приложены. Попросите агента подготовить их для отправки повторно."}]
+
+
+async def _send_result_file(bot, note):
+    import hashlib
+    import io
+    payload = json.loads(note["message"])
+    if time.time() > payload["expires_at"]:
+        raise result_files.RejectedFile("Result-file delivery expired after 24 hours")
+    remote = _file_remote(note.get("machine"))
+    if payload["endpoint"] != (list(remote) if remote else None):
+        raise result_files.RejectedFile("The result-file machine endpoint has changed")
+    data = await asyncio.to_thread(result_files.read_bytes, payload, remote)
+    if payload.get('expected_sha256') and hashlib.sha256(data).hexdigest() != payload['expected_sha256']:
+        raise result_files.RejectedFile('Result file changed after completion')
+    with io.BytesIO(data) as stream:
+        await bot.send_document(
+            chat_id=note["tg_chat_id"], document=stream, filename=payload["name"],
+            caption=f"📎 Результат задачи #{note['task_id']}" if note.get('task_id') else '📎 Файл результата',
+        )
+
+
+async def _expand_result_manifest(note):
+    context = json.loads(note['message'])
+    if time.time() > context['expires_at']:
+        raise result_files.RejectedFile('Result-file delivery expired after 24 hours')
+    remote = _file_remote(note.get('machine'))
+    if context['endpoint'] != (list(remote) if remote else None):
+        raise result_files.RejectedFile('The result-file machine endpoint has changed')
+    specs = await asyncio.to_thread(result_files.manifest_specs, context, remote)
+    db.expand_file_manifest(note['id'], [
+        {**spec, 'endpoint': context['endpoint'], 'expires_at': context['expires_at']}
+        for spec in specs
+    ])
+
+
 async def _notify_loop(bot):
     """Background loop: send notifications for completed/failed tasks every 10s.
 
@@ -3988,6 +4185,18 @@ async def _notify_loop(bot):
             continue
         for note in notes:
             try:
+                if note.get("kind") in {'result.file', 'result.manifest'}:
+                    try:
+                        if note['kind'] == 'result.manifest':
+                            await _expand_result_manifest(note)
+                        else:
+                            await _send_result_file(bot, note)
+                    except result_files.RejectedFile as exc:
+                        logger.warning("task %s result file rejected: %s", note['task_id'], exc)
+                        await bot.send_message(chat_id=note["tg_chat_id"],
+                                               text="⚠️ Файл результата не приложен. Попросите агента подготовить его для отправки повторно.")
+                    db.mark_notification_sent(note["id"])
+                    continue
                 kb = None
                 if note.get("flow_ref"):
                     kb = _flow_keyboard(note["flow_ref"])
@@ -4026,7 +4235,7 @@ async def _notify_loop(bot):
                     icon, status_word = "✅", "выполнена"
                     body = ""
                     if task.result:
-                        preview = task.result.split("\n--- Meta ---")[0].strip()
+                        preview = result_files.visible_result(task.result.split("\n--- Meta ---")[0]).strip()
                         if preview:
                             body = f"\n\n{preview[:600]}"
                         meta_lines = []
@@ -4061,7 +4270,11 @@ async def _notify_loop(bot):
                 except BadRequest:
                     await bot.send_message(chat_id=task.tg_chat_id, text=text,
                                            reply_markup=note_kb)
-                db.mark_notified(task.id)
+                file_notes = _result_file_notifications(task) if task.status.value == "completed" else []
+                if file_notes:
+                    db.mark_notified_with_files(task, file_notes)
+                else:
+                    db.mark_notified(task.id)
                 if task.status.value == "completed":
                     # 1С-доработка: у задач из /epf собираем и присылаем .epf.
                     # Для обычных задач get_epf_job_by_task пуст — это no-op.
@@ -4489,6 +4702,8 @@ def run_bot():
         asyncio.create_task(_notify_loop(application.bot))
         if HERDR_WATCH:
             asyncio.create_task(_herdr_watch_loop(application.bot))
+        else:
+            asyncio.create_task(_native_file_watch_loop())
 
     # The wizard survives a bot restart: without persistence every inline
     # button of a half-finished wizard died silently after redeploy.
@@ -4715,6 +4930,8 @@ def run_bot():
     app.add_handler(CallbackQueryHandler(cb_herdr_enter, pattern=r"^hd_enter:"), group=-1)
     app.add_handler(CallbackQueryHandler(cb_herdr_screen, pattern=r"^hd_screen:"), group=-1)
     app.add_handler(CallbackQueryHandler(cb_herdr_key, pattern=r"^hd_key:"), group=-1)
+    app.add_handler(CallbackQueryHandler(_dispatch_question_callback, pattern=r'^hd_question:'), group=-1)
+    app.add_handler(CallbackQueryHandler(_dispatch_question_callback, pattern=r'^hd_qkey:'), group=-1)
 
     # windows screen buttons live in cards that outlive any active wizard
     app.add_handler(CallbackQueryHandler(cb_window, pattern=r"^win_i:\d+$"), group=-1)
@@ -4839,4 +5056,4 @@ def run_bot():
     app.add_error_handler(error_handler)
 
     logger.info("PromptPilot Telegram bot started.")
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(drop_pending_updates=False)

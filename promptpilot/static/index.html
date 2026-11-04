@@ -1151,6 +1151,15 @@ async function loadStats() {
    .join('');
 }
 
+function visibleResult(raw) {
+  let fenced = false;
+  return (raw || '').split('\n').filter(line => {
+    const s = line.trim();
+    if (s.startsWith('```') || s.startsWith('~~~')) fenced = !fenced;
+    return fenced || !s.startsWith('PP-FILE:');
+  }).join('\n');
+}
+
 // --- Parse result text (worker already formats it, but extract meta if present) ---
 function parseResult(raw) {
   if (!raw) return null;
@@ -1279,7 +1288,8 @@ async function loadTasks() {
   list.innerHTML = tasks.map(t => {
     const expanded = t.id === expandedId;
     const time = timeAgo(t.created_at);
-    const parsed = parseResult(t.result);
+    const resultText = visibleResult(t.result);
+    const parsed = parseResult(resultText);
     const taskErrorLabel = githubApiWait(t) ? 'Причина ожидания' : 'Error';
 
     // Build result section
@@ -1296,11 +1306,11 @@ async function loadTasks() {
           ${copyable ? `<button class="copy-btn" data-copy="${escAttr(copyable)}" onclick="copyText(event)">Copy</button>` : ''}
         </div>`;
       }
-    } else if (t.result) {
+    } else if (resultText) {
       resultHTML += `<div class="detail-label">Result</div>`;
       resultHTML += `<div class="result-block">
-        <pre>${esc(t.result)}</pre>
-        <button class="copy-btn" data-copy="${escAttr(t.result)}" onclick="copyText(event)">Copy</button>
+        <pre>${esc(resultText)}</pre>
+        <button class="copy-btn" data-copy="${escAttr(resultText)}" onclick="copyText(event)">Copy</button>
       </div>`;
     }
 
