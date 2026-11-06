@@ -146,7 +146,7 @@ def live(gh, config, number, *, purpose, health=None):
     if purpose == 'merge':
         pp.validate_common(snapshot, config, {'head': result['descriptor']['source']['head']})
         info = pp.epoch(snapshot, config['trusted_account'])
-        if 'ship' not in labels or not pp.trusted_ship_authorized(info, config['trusted_account']):
+        if 'ship' not in labels or not pp.current_ship_authorized(gh, config, number, snapshot, info=info):
             raise PipelineError('positive typed MERGE requires trusted current-epoch ship')
     else:
         pr = gh.json('api', f"repos/{config['repository']}/pulls/{number}")

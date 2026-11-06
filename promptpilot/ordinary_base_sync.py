@@ -159,7 +159,7 @@ def _fresh(gh, config, value, config_path):
     pp.validate_epoch_safety(info, config["trusted_account"])
     if (pp.digest(snapshot) != value["snapshot"] or snapshot["baseRefOid"] != value["base"]
             or pp.proof(info, value["head"], config["trusted_account"]) != value["proof"]
-            or not pp.trusted_ship_authorized(info, config["trusted_account"])):
+            or not pp.current_ship_authorized(gh, config, value['number'], snapshot, info=info)):
         raise PipelineError("ordinary base-sync proof/ship/epoch changed")
     if (pp.digest(config) != value["config_sha256"]
             or config_path is not None and pp.digest(pp.load_config(config_path)) != value["config_sha256"]):

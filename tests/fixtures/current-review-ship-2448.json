@@ -1,0 +1,1078 @@
+{
+  "checks": [
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-11-06T13:21:16Z",
+      "conclusion": "SUCCESS",
+      "detailsUrl": "https://github.com/ivanarama/onebase/actions/runs/42224778705/job/127915399549",
+      "name": "classify",
+      "startedAt": "2026-11-06T13:21:04Z",
+      "status": "COMPLETED",
+      "workflowName": "CI"
+    },
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-11-06T13:58:37Z",
+      "conclusion": "SUCCESS",
+      "detailsUrl": "https://github.com/ivanarama/onebase/actions/runs/42224778705/job/127915519750",
+      "name": "build",
+      "startedAt": "2026-11-06T13:21:20Z",
+      "status": "COMPLETED",
+      "workflowName": "CI"
+    },
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-11-06T13:26:10Z",
+      "conclusion": "SUCCESS",
+      "detailsUrl": "https://github.com/ivanarama/onebase/actions/runs/42224778705/job/127915519486",
+      "name": "launcher-webview-build",
+      "startedAt": "2026-11-06T13:21:19Z",
+      "status": "COMPLETED",
+      "workflowName": "CI"
+    },
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-11-06T13:22:02Z",
+      "conclusion": "SUCCESS",
+      "detailsUrl": "https://github.com/ivanarama/onebase/actions/runs/42224778705/job/127915519696",
+      "name": "Smoke ubuntu-latest / private",
+      "startedAt": "2026-11-06T13:21:20Z",
+      "status": "COMPLETED",
+      "workflowName": "CI"
+    },
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-11-06T13:22:11Z",
+      "conclusion": "SUCCESS",
+      "detailsUrl": "https://github.com/ivanarama/onebase/actions/runs/42224778705/job/127915519708",
+      "name": "Smoke ubuntu-latest / shared",
+      "startedAt": "2026-11-06T13:21:20Z",
+      "status": "COMPLETED",
+      "workflowName": "CI"
+    },
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-11-06T13:22:47Z",
+      "conclusion": "SUCCESS",
+      "detailsUrl": "https://github.com/ivanarama/onebase/actions/runs/42224778705/job/127915519628",
+      "name": "Smoke windows-latest / private",
+      "startedAt": "2026-11-06T13:21:20Z",
+      "status": "COMPLETED",
+      "workflowName": "CI"
+    },
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-11-06T13:22:53Z",
+      "conclusion": "SUCCESS",
+      "detailsUrl": "https://github.com/ivanarama/onebase/actions/runs/42224778705/job/127915519705",
+      "name": "Smoke windows-latest / shared",
+      "startedAt": "2026-11-06T13:21:19Z",
+      "status": "COMPLETED",
+      "workflowName": "CI"
+    },
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-11-06T13:26:49Z",
+      "conclusion": "SUCCESS",
+      "detailsUrl": "https://github.com/ivanarama/onebase/actions/runs/42224778705/job/127915519470",
+      "name": "e2e",
+      "startedAt": "2026-11-06T13:21:19Z",
+      "status": "COMPLETED",
+      "workflowName": "CI"
+    },
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-11-06T13:37:45Z",
+      "conclusion": "SUCCESS",
+      "detailsUrl": "https://github.com/ivanarama/onebase/actions/runs/42224778705/job/127915519467",
+      "name": "test-windows",
+      "startedAt": "2026-11-06T13:21:19Z",
+      "status": "COMPLETED",
+      "workflowName": "CI"
+    },
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-11-06T13:25:25Z",
+      "conclusion": "SUCCESS",
+      "detailsUrl": "https://github.com/ivanarama/onebase/actions/runs/42224778705/job/127915519472",
+      "name": "lint",
+      "startedAt": "2026-11-06T13:21:20Z",
+      "status": "COMPLETED",
+      "workflowName": "CI"
+    },
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-11-06T13:50:51Z",
+      "conclusion": "SUCCESS",
+      "detailsUrl": "https://github.com/ivanarama/onebase/actions/runs/42224778705/job/127915519772",
+      "name": "postgres-integration",
+      "startedAt": "2026-11-06T13:21:20Z",
+      "status": "COMPLETED",
+      "workflowName": "CI"
+    },
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-11-06T13:22:01Z",
+      "conclusion": "SUCCESS",
+      "detailsUrl": "https://github.com/ivanarama/onebase/actions/runs/42224778705/job/127915519985",
+      "name": "vuln",
+      "startedAt": "2026-11-06T13:21:19Z",
+      "status": "COMPLETED",
+      "workflowName": "CI"
+    },
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-11-06T13:25:17Z",
+      "conclusion": "SUCCESS",
+      "detailsUrl": "https://github.com/ivanarama/onebase/actions/runs/42224778705/job/127915519700",
+      "name": "bench",
+      "startedAt": "2026-11-06T13:21:20Z",
+      "status": "COMPLETED",
+      "workflowName": "CI"
+    },
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-11-06T13:23:01Z",
+      "conclusion": "SUCCESS",
+      "detailsUrl": "https://github.com/ivanarama/onebase/actions/runs/42224778705/job/127916241643",
+      "name": "smoke",
+      "startedAt": "2026-11-06T13:22:58Z",
+      "status": "COMPLETED",
+      "workflowName": "CI"
+    }
+  ],
+  "checks_ready": true,
+  "checks_reason": "checks are green",
+  "commit": {
+    "author": {
+      "date": "2026-11-06T13:20:56Z",
+      "email": "83814559+ivanarama@users.noreply.github.com",
+      "name": "ivanarama"
+    },
+    "committer": {
+      "date": "2026-11-06T13:20:56Z",
+      "email": "noreply@github.com",
+      "name": "GitHub"
+    },
+    "html_url": "https://github.com/ivanarama/onebase/commit/8f8a3c60d201be67945962fa0028058199ba30d2",
+    "message": "Merge branch 'main' into fix/new-card-tab-title",
+    "node_id": "C_kwDOSKrn-toAKDhmOGEzYzYwZDIwMWJlNjc5NDU5NjJmYTAwMjgwNTgxOTliYTMwZDI",
+    "parents": [
+      {
+        "html_url": "https://github.com/ivanarama/onebase/commit/b2fb8719bf779cfc49143128d2b595fffed8ad00",
+        "sha": "b2fb8719bf779cfc49143128d2b595fffed8ad00",
+        "url": "https://api.github.com/repos/ivanarama/onebase/git/commits/b2fb8719bf779cfc49143128d2b595fffed8ad00"
+      },
+      {
+        "html_url": "https://github.com/ivanarama/onebase/commit/2c396369f1373e5290a9670a2d9d688df0b1eb0f",
+        "sha": "2c396369f1373e5290a9670a2d9d688df0b1eb0f",
+        "url": "https://api.github.com/repos/ivanarama/onebase/git/commits/2c396369f1373e5290a9670a2d9d688df0b1eb0f"
+      }
+    ],
+    "sha": "8f8a3c60d201be67945962fa0028058199ba30d2",
+    "tree": {
+      "sha": "c1647c9a28260e5c88a845505e5e80cb3d192f70",
+      "url": "https://api.github.com/repos/ivanarama/onebase/git/trees/c1647c9a28260e5c88a845505e5e80cb3d192f70"
+    },
+    "url": "https://api.github.com/repos/ivanarama/onebase/git/commits/8f8a3c60d201be67945962fa0028058199ba30d2",
+    "verification": {
+      "payload": "tree c1647c9a28260e5c88a845505e5e80cb3d192f70\nparent b2fb8719bf779cfc49143128d2b595fffed8ad00\nparent 2c396369f1373e5290a9670a2d9d688df0b1eb0f\nauthor ivanarama <83814559+ivanarama@users.noreply.github.com> 1793971256 +0300\ncommitter GitHub <noreply@github.com> 1793971256 +0300\n\nMerge branch 'main' into fix/new-card-tab-title",
+      "reason": "valid",
+      "signature": "-----BEGIN PGP SIGNATURE-----\n\nwsFcBAABCAAQBQJq7dQ4CRC1aQ7uu5UhlAAAAToQADJ0CjF2yfxsPUS1xOTudREw\nWvgfmvYdxaQexaTuQzLZ0hD1oIE2fcxhwZg+THgP/Fa6s04ySSYyjZDASiBLJ0nw\nf+039qLY9ql/lY09ZmKXFKHVJWF+CjTOcJ+H3Vopm0Vc6ho2346RReEiu/UJzmEY\ng/RlTIJ8wU1z4ZJ+JYLdMjNSWZpsDNN47T7KtYwwi++MidwPItK3r5LDr4piRWIe\nPsODCzOAcK2ymXq69j9cR6oDOd539syTgZqtcxc3OMOCwbXc/Pya+oGLleDTeNli\n5NCjtI3uU+7zeUafF14XXHTQhKqXpo0oHJXYIbIzs1nR7NZgsneE2h3n93Ds8qam\nxWvpNNdBr+zhnSaZmC3b40+6Dhutuae/3sugo2Dt+QvyuF358Sq1sJDWLV1J8GWS\n5yJ8fnT3WBMotp0dGw44I6DaAN3ybE7HLtLpJJvLP8FMKmyTx5kTxznZ0472xgbn\nWsRQBpcz6IKom1ei0OxSLpIP/Oj7RdNKrLQNsTU+LnF8RnTYqaj/2N19LDWxjEkQ\n5YEr9p2G8Ol4H3ZvVGb4WjAzdQDbp/+VBsM513lnAmdzp2ee5UOK8mZrP8KEixd4\nOlXcBVaPjy6uJjwjRZJqGbua53QiJFtSV/AyhRlITz9Bxr4p6lSCuc7Sl1kXpjCt\nH2g8Ts6CrRkOV0zrCiw3\n=6mlK\n-----END PGP SIGNATURE-----\n",
+      "verified": true,
+      "verified_at": "2026-11-06T13:20:56Z"
+    }
+  },
+  "config_sha256": "3c9dcbf0b9f76c636f1c2df2eca9acf5b3770b6a111ecde80f3695e3b859c31c",
+  "epoch": "27f6f9fd662b362f5e121841a9f9a530c758f1cf1eab59422967cf8fd9ec2c9b",
+  "intent": {
+    "body": "PromptPilot service marker: MERGE transaction reserved.\n<!-- pp:merge-cleanup-intent head=8f8a3c60d201be67945962fa0028058199ba30d2 proof-sha256=49f6f9ca707c680679c1affc1950f96abe496c2527de709a1a856b1d7a72c73a body-sha256=6eb0adbde46f1a8f80f4a9f5413bfd4b637c0b71793006c56e7ff1ed28881b36 issues=none -->",
+    "body_sha256": "6eb0adbde46f1a8f80f4a9f5413bfd4b637c0b71793006c56e7ff1ed28881b36",
+    "head": "8f8a3c60d201be67945962fa0028058199ba30d2",
+    "id": 6686772992,
+    "issues": [],
+    "number": 2448,
+    "proof_sha256": "49f6f9ca707c680679c1affc1950f96abe496c2527de709a1a856b1d7a72c73a"
+  },
+  "no_operational_authority": true,
+  "number": 2448,
+  "observed_at": "2026-11-06T14:39:52.277260+00:00",
+  "offline_replay": {
+    "actual_GitHub_changes": 0,
+    "epoch_unchanged": true,
+    "intent_exact_original_unedited": true,
+    "intent_proof_digest": "49f6f9ca707c680679c1affc1950f96abe496c2527de709a1a856b1d7a72c73a",
+    "lease_encoder_stubbed_no_real_lease_generated": true,
+    "mode": "OFFLINE_FAKE_GH_ONLY_NO_NATIVE_LEASE",
+    "original_action": {
+      "action": "fallback",
+      "reason": "merge cleanup intent lost trusted ship"
+    },
+    "original_proof_digest": "49f6f9ca707c680679c1affc1950f96abe496c2527de709a1a856b1d7a72c73a",
+    "original_ship_current_epoch": false,
+    "projected_action": {
+      "action": "merge",
+      "complete": "run the same command with: complete merge --lease <lease>",
+      "target": {
+        "head": "8f8a3c60d201be67945962fa0028058199ba30d2",
+        "number": 2448
+      }
+    },
+    "projected_proof_digest": "49f6f9ca707c680679c1affc1950f96abe496c2527de709a1a856b1d7a72c73a",
+    "projected_ship_current_epoch": true,
+    "proof_unchanged": true
+  },
+  "pr": {
+    "_links": {
+      "comments": {
+        "href": "https://api.github.com/repos/ivanarama/onebase/issues/2448/comments"
+      },
+      "commits": {
+        "href": "https://api.github.com/repos/ivanarama/onebase/pulls/2448/commits"
+      },
+      "html": {
+        "href": "https://github.com/ivanarama/onebase/pull/2448"
+      },
+      "issue": {
+        "href": "https://api.github.com/repos/ivanarama/onebase/issues/2448"
+      },
+      "review_comment": {
+        "href": "https://api.github.com/repos/ivanarama/onebase/pulls/comments{/number}"
+      },
+      "review_comments": {
+        "href": "https://api.github.com/repos/ivanarama/onebase/pulls/2448/comments"
+      },
+      "self": {
+        "href": "https://api.github.com/repos/ivanarama/onebase/pulls/2448"
+      },
+      "statuses": {
+        "href": "https://api.github.com/repos/ivanarama/onebase/statuses/8f8a3c60d201be67945962fa0028058199ba30d2"
+      }
+    },
+    "active_lock_reason": null,
+    "additions": 119,
+    "assignee": null,
+    "assignees": [],
+    "author_association": "FIRST_TIME_CONTRIBUTOR",
+    "auto_merge": null,
+    "base": {
+      "label": "ivanarama:main",
+      "ref": "main",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/ivanarama/onebase/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/ivanarama/onebase/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/ivanarama/onebase/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/ivanarama/onebase/branches{/branch}",
+        "clone_url": "https://github.com/ivanarama/onebase.git",
+        "collaborators_url": "https://api.github.com/repos/ivanarama/onebase/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/ivanarama/onebase/comments{/number}",
+        "commits_url": "https://api.github.com/repos/ivanarama/onebase/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/ivanarama/onebase/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/ivanarama/onebase/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/ivanarama/onebase/contributors",
+        "created_at": "2026-04-23T15:35:10Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/ivanarama/onebase/deployments",
+        "description": "Открытая бизнес-платформа со знакомым DSL для учётных задач, написанная на Go — open business platform with a familiar DSL, in Go",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/ivanarama/onebase/downloads",
+        "events_url": "https://api.github.com/repos/ivanarama/onebase/events",
+        "fork": false,
+        "forks": 44,
+        "forks_count": 44,
+        "forks_url": "https://api.github.com/repos/ivanarama/onebase/forks",
+        "full_name": "ivanarama/onebase",
+        "git_commits_url": "https://api.github.com/repos/ivanarama/onebase/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/ivanarama/onebase/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/ivanarama/onebase/git/tags{/sha}",
+        "git_url": "git://github.com/ivanarama/onebase.git",
+        "has_discussions": true,
+        "has_downloads": false,
+        "has_issues": true,
+        "has_pages": false,
+        "has_projects": true,
+        "has_pull_requests": true,
+        "has_wiki": true,
+        "homepage": "https://onebase.ivantitov.tech",
+        "hooks_url": "https://api.github.com/repos/ivanarama/onebase/hooks",
+        "html_url": "https://github.com/ivanarama/onebase",
+        "id": 1219160058,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/ivanarama/onebase/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/ivanarama/onebase/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/ivanarama/onebase/issues{/number}",
+        "keys_url": "https://api.github.com/repos/ivanarama/onebase/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/ivanarama/onebase/labels{/name}",
+        "language": "Go",
+        "languages_url": "https://api.github.com/repos/ivanarama/onebase/languages",
+        "license": {
+          "key": "mit",
+          "name": "MIT License",
+          "node_id": "MDc6TGljZW5zZTEz",
+          "spdx_id": "MIT",
+          "url": "https://api.github.com/licenses/mit"
+        },
+        "merges_url": "https://api.github.com/repos/ivanarama/onebase/merges",
+        "milestones_url": "https://api.github.com/repos/ivanarama/onebase/milestones{/number}",
+        "mirror_url": null,
+        "name": "onebase",
+        "node_id": "R_kgDOSKrn-g",
+        "notifications_url": "https://api.github.com/repos/ivanarama/onebase/notifications{?since,all,participating}",
+        "open_issues": 303,
+        "open_issues_count": 303,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/83814559?v=4",
+          "events_url": "https://api.github.com/users/ivanarama/events{/privacy}",
+          "followers_url": "https://api.github.com/users/ivanarama/followers",
+          "following_url": "https://api.github.com/users/ivanarama/following{/other_user}",
+          "gists_url": "https://api.github.com/users/ivanarama/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/ivanarama",
+          "id": 83814559,
+          "login": "ivanarama",
+          "node_id": "MDQ6VXNlcjgzODE0NTU5",
+          "organizations_url": "https://api.github.com/users/ivanarama/orgs",
+          "received_events_url": "https://api.github.com/users/ivanarama/received_events",
+          "repos_url": "https://api.github.com/users/ivanarama/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/ivanarama/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/ivanarama/subscriptions",
+          "type": "User",
+          "url": "https://api.github.com/users/ivanarama",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/ivanarama/onebase/pulls{/number}",
+        "pushed_at": "2026-11-06T13:34:20Z",
+        "releases_url": "https://api.github.com/repos/ivanarama/onebase/releases{/id}",
+        "size": 70222,
+        "ssh_url": "git@github.com:ivanarama/onebase.git",
+        "stargazers_count": 140,
+        "stargazers_url": "https://api.github.com/repos/ivanarama/onebase/stargazers",
+        "statuses_url": "https://api.github.com/repos/ivanarama/onebase/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/ivanarama/onebase/subscribers",
+        "subscription_url": "https://api.github.com/repos/ivanarama/onebase/subscription",
+        "svn_url": "https://github.com/ivanarama/onebase",
+        "tags_url": "https://api.github.com/repos/ivanarama/onebase/tags",
+        "teams_url": "https://api.github.com/repos/ivanarama/onebase/teams",
+        "topics": [
+          "1c",
+          "business-platform",
+          "dsl",
+          "erp",
+          "go",
+          "low-code",
+          "postgresql",
+          "sqlite"
+        ],
+        "trees_url": "https://api.github.com/repos/ivanarama/onebase/git/trees{/sha}",
+        "updated_at": "2026-11-06T13:02:50Z",
+        "url": "https://api.github.com/repos/ivanarama/onebase",
+        "visibility": "public",
+        "watchers": 140,
+        "watchers_count": 140,
+        "web_commit_signoff_required": false
+      },
+      "sha": "2c396369f1373e5290a9670a2d9d688df0b1eb0f",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/83814559?v=4",
+        "events_url": "https://api.github.com/users/ivanarama/events{/privacy}",
+        "followers_url": "https://api.github.com/users/ivanarama/followers",
+        "following_url": "https://api.github.com/users/ivanarama/following{/other_user}",
+        "gists_url": "https://api.github.com/users/ivanarama/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/ivanarama",
+        "id": 83814559,
+        "login": "ivanarama",
+        "node_id": "MDQ6VXNlcjgzODE0NTU5",
+        "organizations_url": "https://api.github.com/users/ivanarama/orgs",
+        "received_events_url": "https://api.github.com/users/ivanarama/received_events",
+        "repos_url": "https://api.github.com/users/ivanarama/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/ivanarama/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/ivanarama/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/ivanarama",
+        "user_view_type": "public"
+      }
+    },
+    "body": "## Режим работы\r\n\r\n- [ ] Эксперимент: PR остаётся Draft, гипотеза или контракт ещё меняются\r\n- [x] Поставка: результат проверен, текущий HEAD готов к конвейеру\r\n\r\nПроверено в работе: 06.11.2026 входит в сборку колл-центра (cc2) dev-5a0b05e (1105i), выпущенную в рабочую базу оператора (выпуск-27, prod e1899f1). Полный набор сценариев конфигурации на этой сборке: 101 сценарий, 2648 проверок, 99 зелёных; не зелёные — неустойчивый в полном прогоне тест цвета строки в списке задач (по отдельности проходит) и сценарий НСИ, который не запускается из-за уже заданной константы.\r\nСвежий `main` подмешан, обязательный CI зелёный для HEAD `b2fb8719bf779cfc49143128d2b595fffed8ad00`: https://github.com/ivanarama/onebase/actions/runs/42207646799\r\n\r\n## Что было\r\n\r\nВ оболочке со вкладками новая карточка («Создать» в списке) открывалась во вкладке с заголовком **«Insert»**, хотя в шапке самой формы было правильное «Создать — <Сущность>».\r\n\r\nПричин две:\r\n- **Заголовок брался из ссылки.** Вкладку, открытую из другой вкладки, ui.js называет по `title` нажатой ссылки. У кнопки «Создать» это подсказка горячей клавиши: `title=\"Insert\" aria-keyshortcuts=\"Insert\"`.\r\n- **Новая карточка не поправляла заголовок.** Представление записи (`<meta name=\"ob-tab-title\">` → `obSetTitle`) карточка отдавала только для существующей записи, поэтому у новой заголовок оставался «Insert».\r\n\r\n## Что сделано\r\n\r\n- **Новая карточка** — и управляемая, и автоформа, общий путь `renderEntityForm` — отдаёт `ob-tab-title` «<синоним> (создание)», как в 1С («Звонок (создание)»). После записи заголовок — представление записи, как раньше.\r\n  - i18n: ключ `%s (создание)`, в `en.json` → `%s (new)`.\r\n- **Подсказка горячей клавиши** — `title`, совпадающий с `aria-keyshortcuts`, — больше не становится заголовком вкладки, вместо неё берётся текст ссылки. Функция `obLinkTabTitle` в ui.js выделена между маркерами.\r\n\r\nЕсли у сущности не задан синоним (`title`), в заголовке будет её имя — как и в шапке формы.\r\n\r\n## Проверка\r\n\r\n- `TestManagedForm_NewCardTabTitle` — через GET `/ui/catalog/<сущность>/new` (`Server.form`) проверяет `ob-tab-title` «<имя> (создание)» и, с синонимом, «Звонок (создание)».\r\n- `TestLinkTabTitleBehaviorInNode` (`static/link_tab_title_behavior_test.js`):\r\n  - подсказка «Insert» не становится заголовком;\r\n  - обычный `title` сохраняется;\r\n  - пустая ссылка даёт «Форма».\r\n- Без правок оба теста падают.\r\n- `go test ./internal/ui/ ./internal/i18n/...` — зелёные.\r\n\r\nПоставка: в dev-сборке КЦ (:8444) на проверке.\r\n\r\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\r\n",
+    "changed_files": 6,
+    "closed_at": null,
+    "comments": 9,
+    "comments_url": "https://api.github.com/repos/ivanarama/onebase/issues/2448/comments",
+    "commits": 3,
+    "commits_url": "https://api.github.com/repos/ivanarama/onebase/pulls/2448/commits",
+    "created_at": "2026-10-31T19:53:35Z",
+    "deletions": 1,
+    "diff_url": "https://github.com/ivanarama/onebase/pull/2448.diff",
+    "draft": false,
+    "head": {
+      "label": "AnnaSIceberg:fix/new-card-tab-title",
+      "ref": "fix/new-card-tab-title",
+      "repo": {
+        "allow_forking": true,
+        "archive_url": "https://api.github.com/repos/AnnaSIceberg/onebase/{archive_format}{/ref}",
+        "archived": false,
+        "assignees_url": "https://api.github.com/repos/AnnaSIceberg/onebase/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/AnnaSIceberg/onebase/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/AnnaSIceberg/onebase/branches{/branch}",
+        "clone_url": "https://github.com/AnnaSIceberg/onebase.git",
+        "collaborators_url": "https://api.github.com/repos/AnnaSIceberg/onebase/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/AnnaSIceberg/onebase/comments{/number}",
+        "commits_url": "https://api.github.com/repos/AnnaSIceberg/onebase/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/AnnaSIceberg/onebase/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/AnnaSIceberg/onebase/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/AnnaSIceberg/onebase/contributors",
+        "created_at": "2026-09-22T14:23:46Z",
+        "default_branch": "main",
+        "deployments_url": "https://api.github.com/repos/AnnaSIceberg/onebase/deployments",
+        "description": "Открытая бизнес-платформа со знакомым DSL для учётных задач, написанная на Go — open business platform with a familiar DSL, in Go",
+        "disabled": false,
+        "downloads_url": "https://api.github.com/repos/AnnaSIceberg/onebase/downloads",
+        "events_url": "https://api.github.com/repos/AnnaSIceberg/onebase/events",
+        "fork": true,
+        "forks": 0,
+        "forks_count": 0,
+        "forks_url": "https://api.github.com/repos/AnnaSIceberg/onebase/forks",
+        "full_name": "AnnaSIceberg/onebase",
+        "git_commits_url": "https://api.github.com/repos/AnnaSIceberg/onebase/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/AnnaSIceberg/onebase/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/AnnaSIceberg/onebase/git/tags{/sha}",
+        "git_url": "git://github.com/AnnaSIceberg/onebase.git",
+        "has_discussions": false,
+        "has_downloads": false,
+        "has_issues": false,
+        "has_pages": false,
+        "has_projects": true,
+        "has_pull_requests": true,
+        "has_wiki": true,
+        "homepage": "https://onebase.ivantitov.tech",
+        "hooks_url": "https://api.github.com/repos/AnnaSIceberg/onebase/hooks",
+        "html_url": "https://github.com/AnnaSIceberg/onebase",
+        "id": 1381701589,
+        "is_template": false,
+        "issue_comment_url": "https://api.github.com/repos/AnnaSIceberg/onebase/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/AnnaSIceberg/onebase/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/AnnaSIceberg/onebase/issues{/number}",
+        "keys_url": "https://api.github.com/repos/AnnaSIceberg/onebase/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/AnnaSIceberg/onebase/labels{/name}",
+        "language": "Go",
+        "languages_url": "https://api.github.com/repos/AnnaSIceberg/onebase/languages",
+        "license": {
+          "key": "mit",
+          "name": "MIT License",
+          "node_id": "MDc6TGljZW5zZTEz",
+          "spdx_id": "MIT",
+          "url": "https://api.github.com/licenses/mit"
+        },
+        "merges_url": "https://api.github.com/repos/AnnaSIceberg/onebase/merges",
+        "milestones_url": "https://api.github.com/repos/AnnaSIceberg/onebase/milestones{/number}",
+        "mirror_url": null,
+        "name": "onebase",
+        "node_id": "R_kgDOUlsX1Q",
+        "notifications_url": "https://api.github.com/repos/AnnaSIceberg/onebase/notifications{?since,all,participating}",
+        "open_issues": 0,
+        "open_issues_count": 0,
+        "owner": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/330018641?v=4",
+          "events_url": "https://api.github.com/users/AnnaSIceberg/events{/privacy}",
+          "followers_url": "https://api.github.com/users/AnnaSIceberg/followers",
+          "following_url": "https://api.github.com/users/AnnaSIceberg/following{/other_user}",
+          "gists_url": "https://api.github.com/users/AnnaSIceberg/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/AnnaSIceberg",
+          "id": 330018641,
+          "login": "AnnaSIceberg",
+          "node_id": "U_kgDOE6uvUQ",
+          "organizations_url": "https://api.github.com/users/AnnaSIceberg/orgs",
+          "received_events_url": "https://api.github.com/users/AnnaSIceberg/received_events",
+          "repos_url": "https://api.github.com/users/AnnaSIceberg/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/AnnaSIceberg/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/AnnaSIceberg/subscriptions",
+          "type": "User",
+          "url": "https://api.github.com/users/AnnaSIceberg",
+          "user_view_type": "public"
+        },
+        "private": false,
+        "pull_request_creation_policy": "all",
+        "pulls_url": "https://api.github.com/repos/AnnaSIceberg/onebase/pulls{/number}",
+        "pushed_at": "2026-11-06T13:20:56Z",
+        "releases_url": "https://api.github.com/repos/AnnaSIceberg/onebase/releases{/id}",
+        "size": 69407,
+        "ssh_url": "git@github.com:AnnaSIceberg/onebase.git",
+        "stargazers_count": 0,
+        "stargazers_url": "https://api.github.com/repos/AnnaSIceberg/onebase/stargazers",
+        "statuses_url": "https://api.github.com/repos/AnnaSIceberg/onebase/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/AnnaSIceberg/onebase/subscribers",
+        "subscription_url": "https://api.github.com/repos/AnnaSIceberg/onebase/subscription",
+        "svn_url": "https://github.com/AnnaSIceberg/onebase",
+        "tags_url": "https://api.github.com/repos/AnnaSIceberg/onebase/tags",
+        "teams_url": "https://api.github.com/repos/AnnaSIceberg/onebase/teams",
+        "topics": [],
+        "trees_url": "https://api.github.com/repos/AnnaSIceberg/onebase/git/trees{/sha}",
+        "updated_at": "2026-11-05T13:20:41Z",
+        "url": "https://api.github.com/repos/AnnaSIceberg/onebase",
+        "visibility": "public",
+        "watchers": 0,
+        "watchers_count": 0,
+        "web_commit_signoff_required": false
+      },
+      "sha": "8f8a3c60d201be67945962fa0028058199ba30d2",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/330018641?v=4",
+        "events_url": "https://api.github.com/users/AnnaSIceberg/events{/privacy}",
+        "followers_url": "https://api.github.com/users/AnnaSIceberg/followers",
+        "following_url": "https://api.github.com/users/AnnaSIceberg/following{/other_user}",
+        "gists_url": "https://api.github.com/users/AnnaSIceberg/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/AnnaSIceberg",
+        "id": 330018641,
+        "login": "AnnaSIceberg",
+        "node_id": "U_kgDOE6uvUQ",
+        "organizations_url": "https://api.github.com/users/AnnaSIceberg/orgs",
+        "received_events_url": "https://api.github.com/users/AnnaSIceberg/received_events",
+        "repos_url": "https://api.github.com/users/AnnaSIceberg/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/AnnaSIceberg/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/AnnaSIceberg/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/AnnaSIceberg",
+        "user_view_type": "public"
+      }
+    },
+    "html_url": "https://github.com/ivanarama/onebase/pull/2448",
+    "id": 5101012175,
+    "issue_url": "https://api.github.com/repos/ivanarama/onebase/issues/2448",
+    "labels": [
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "0e8a16",
+        "default": false,
+        "description": "Иван одобрил мерж: пастух может вливать",
+        "id": 11933710317,
+        "name": "ship",
+        "node_id": "LA_kwDOSKrn-s8AAAACx0337Q",
+        "url": "https://api.github.com/repos/ivanarama/onebase/labels/ship"
+      },
+      {
+        "archived_at": null,
+        "archived_by": null,
+        "color": "0052cc",
+        "default": false,
+        "description": "Ревью: блокирующего нет — ждёт ship",
+        "id": 11951320083,
+        "name": "reviewed",
+        "node_id": "LA_kwDOSKrn-s8AAAACyFqsEw",
+        "url": "https://api.github.com/repos/ivanarama/onebase/labels/reviewed"
+      }
+    ],
+    "locked": false,
+    "maintainer_can_modify": true,
+    "merge_commit_sha": "144f68deec37bda7c5495a926a5bb4a6a85e8f79",
+    "mergeable": true,
+    "mergeable_state": "clean",
+    "merged": false,
+    "merged_at": null,
+    "merged_by": null,
+    "milestone": null,
+    "node_id": "PR_kwDOSKrn-s8AAAABMAtEzw",
+    "number": 2448,
+    "patch_url": "https://github.com/ivanarama/onebase/pull/2448.patch",
+    "rebaseable": true,
+    "requested_reviewers": [],
+    "requested_teams": [],
+    "review_comment_url": "https://api.github.com/repos/ivanarama/onebase/pulls/comments{/number}",
+    "review_comments": 0,
+    "review_comments_url": "https://api.github.com/repos/ivanarama/onebase/pulls/2448/comments",
+    "state": "open",
+    "statuses_url": "https://api.github.com/repos/ivanarama/onebase/statuses/8f8a3c60d201be67945962fa0028058199ba30d2",
+    "title": "fix(ui): вкладка новой карточки — «<синоним> (создание)», а не «Insert»",
+    "updated_at": "2026-11-06T14:08:37Z",
+    "url": "https://api.github.com/repos/ivanarama/onebase/pulls/2448",
+    "user": {
+      "avatar_url": "https://avatars.githubusercontent.com/u/330018641?v=4",
+      "events_url": "https://api.github.com/users/AnnaSIceberg/events{/privacy}",
+      "followers_url": "https://api.github.com/users/AnnaSIceberg/followers",
+      "following_url": "https://api.github.com/users/AnnaSIceberg/following{/other_user}",
+      "gists_url": "https://api.github.com/users/AnnaSIceberg/gists{/gist_id}",
+      "gravatar_id": "",
+      "html_url": "https://github.com/AnnaSIceberg",
+      "id": 330018641,
+      "login": "AnnaSIceberg",
+      "node_id": "U_kgDOE6uvUQ",
+      "organizations_url": "https://api.github.com/users/AnnaSIceberg/orgs",
+      "received_events_url": "https://api.github.com/users/AnnaSIceberg/received_events",
+      "repos_url": "https://api.github.com/users/AnnaSIceberg/repos",
+      "site_admin": false,
+      "starred_url": "https://api.github.com/users/AnnaSIceberg/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/AnnaSIceberg/subscriptions",
+      "type": "User",
+      "url": "https://api.github.com/users/AnnaSIceberg",
+      "user_view_type": "public"
+    }
+  },
+  "proof": {
+    "claim_id": 6686603049,
+    "claim_node": "IC_kwDOSKrn-s8AAAABjo13KQ",
+    "completion_id": 6686610358,
+    "completion_index": 3,
+    "completion_node": "IC_kwDOSKrn-s8AAAABjo2Ttg",
+    "outcome": "reviewed",
+    "review_id": 6686599236,
+    "review_node": "IC_kwDOSKrn-s8AAAABjo1oRA"
+  },
+  "read_budget": {
+    "live_rate_resources": {
+      "actions_runner_registration": {
+        "limit": 10000,
+        "remaining": 10000,
+        "reset": 1793979588,
+        "used": 0
+      },
+      "audit_log": {
+        "limit": 1750,
+        "remaining": 1750,
+        "reset": 1793979588,
+        "used": 0
+      },
+      "audit_log_streaming": {
+        "limit": 15,
+        "remaining": 15,
+        "reset": 1793979588,
+        "used": 0
+      },
+      "code_scanning_autofix": {
+        "limit": 10,
+        "remaining": 10,
+        "reset": 1793976048,
+        "used": 0
+      },
+      "code_search": {
+        "limit": 10,
+        "remaining": 10,
+        "reset": 1793976048,
+        "used": 0
+      },
+      "copilot_usage_records": {
+        "limit": 1750,
+        "remaining": 1750,
+        "reset": 1793979588,
+        "used": 0
+      },
+      "core": {
+        "limit": 5000,
+        "remaining": 2086,
+        "reset": 1793977151,
+        "used": 2914
+      },
+      "dependency_sbom": {
+        "limit": 100,
+        "remaining": 100,
+        "reset": 1793976048,
+        "used": 0
+      },
+      "dependency_snapshots": {
+        "limit": 100,
+        "remaining": 100,
+        "reset": 1793976048,
+        "used": 0
+      },
+      "enterprise_token_inventory": {
+        "limit": 1750,
+        "remaining": 1750,
+        "reset": 1793979588,
+        "used": 0
+      },
+      "graphql": {
+        "limit": 5000,
+        "remaining": 4931,
+        "reset": 1793979111,
+        "used": 69
+      },
+      "integration_manifest": {
+        "limit": 5000,
+        "remaining": 5000,
+        "reset": 1793979588,
+        "used": 0
+      },
+      "scim": {
+        "limit": 15000,
+        "remaining": 15000,
+        "reset": 1793979588,
+        "used": 0
+      },
+      "search": {
+        "limit": 30,
+        "remaining": 22,
+        "reset": 1793976027,
+        "used": 8
+      },
+      "source_import": {
+        "limit": 100,
+        "remaining": 100,
+        "reset": 1793976048,
+        "used": 0
+      }
+    },
+    "reserved_other": {
+      "core": 200,
+      "graphql": 200,
+      "search": 0
+    }
+  },
+  "reader_sha256": "1aff686ccaf6d82f9978affd3765b427022531c372c18bf2b9f876a59ee49c57",
+  "reader_source": "/Users/ivantitov/PromptPilotBuild/c195-verdict-20261101-c719807b-ed82a0d8/source/promptpilot/project_pipeline.py",
+  "repository": "ivanarama/onebase",
+  "stable_full_snapshot": {
+    "baseRefName": "main",
+    "baseRefOid": "2c396369f1373e5290a9670a2d9d688df0b1eb0f",
+    "edges": [
+      {
+        "cursor": "Y3Vyc29yOnYyOpPPAAABoZOGD5gH2gAzNTEwMTAxMjE3NTo1MjZjM2U1OWQzNTZiMWVjMzI4NDk5NWM1YmI4ZjZkMzZlYWM2ZDIw",
+        "node": {
+          "__typename": "PullRequestCommit",
+          "commit": {
+            "oid": "526c3e59d356b1ec3284995c5bb8f6d36eac6d20"
+          },
+          "id": "PURC_lADOSKrn-s8AAAABMAtEz9oAKDUyNmMzZTU5ZDM1NmIxZWMzMjg0OTk1YzViYjhmNmQzNmVhYzZkMjA"
+        }
+      },
+      {
+        "cursor": "Y3Vyc29yOnYyOpPPAAABoa_M7_AH2gAzNTEwMTAxMjE3NTpiMmZiODcxOWJmNzc5Y2ZjNDkxNDMxMjhkMmI1OTVmZmZlZDhhZDAw",
+        "node": {
+          "__typename": "PullRequestCommit",
+          "commit": {
+            "oid": "b2fb8719bf779cfc49143128d2b595fffed8ad00"
+          },
+          "id": "PURC_lADOSKrn-s8AAAABMAtEz9oAKGIyZmI4NzE5YmY3NzljZmM0OTE0MzEyOGQyYjU5NWZmZmVkOGFkMDA"
+        }
+      },
+      {
+        "cursor": "Y3Vyc29yOnYyOpPPAAABobDpDlAAqjY2ODUyMTU4MDM=",
+        "node": {
+          "__typename": "IssueComment",
+          "author": {
+            "login": "ivanarama"
+          },
+          "body": "**Ревью.** (круг 1)\nReviewed-SHA: b2fb8719bf779cfc49143128d2b595fffed8ad00\nOutcome-Label: reviewed\nЧто меняется: Новая карточка в общей renderEntityForm получает локализованный заголовок «<синоним> (создание)» / «<title> (new)» для автоформы и управляемой формы; подсказка горячей клавиши, совпадающая с aria-keyshortcuts, больше не используется как название вкладки..\nПроверено: Полное содержательное ревью HEAD b2fb8719bf779cfc49143128d2b595fffed8ad00, diff относительно base 3ff6738cb023c6e7e3ae5c5a2532c8be0adc1c34 и потребителей: page-form, page-managed-form, obOpenInShell, obSetTitle, i18n.Resolve/Bundle.T и Entity.DisplayName. Detached checkout чистый; git diff --check — PASS. Новые тесты сохранены относительно первого родителя merge-коммита.; go build ./... — PASS (Go 1.26.10, darwin/amd64).; go test -count=1 -json ./internal/ui ./internal/i18n/... — PASS: 4227 успешных тестов/подтестов, 410 пропусков, 0 падений. Включая TestManagedForm_NewCardTabTitle, TestLinkTabTitleBehaviorInNode, TestManagedForm_TabTitleMetaFromRecord и TestTabsBehaviorInNode. Пропуски не учитывались как выполненные проверки.; go vet ./internal/ui ./internal/i18n/... — PASS.; go run ./cmd/onebase check --project examples/trade — PASS.; Независимая проверка через зарегистрированный HTTP-маршрут GET /ui/catalog/<entity>/new с внешним Go overlay — PASS для автоформы и managed-формы: имя без синонима, русский синоним, английский Titles[en] и формат (new), экранирование кавычек/амперсанда/угловых скобок. Исходники HEAD не изменялись.; Node 22.21.0: выполнен реальный embedded-блок ui.js с зарегистрированным click/DOMContentLoaded, без прямого вызова obLinkTabTitle — PASS для названия по тексту вместо Insert, обычного title, несовпадающей горячей клавиши, пустой ссылки, Ctrl-click, внешнего URL и передачи meta-заголовка оболочке.; Отрицательные контроли: с handlers_managed.go из точного base TestManagedForm_NewCardTabTitle воспроизводимо падает на обеих проверках отсутствующего meta; с ui.js из base обработчик click передаёт Insert вместо текста. Это ожидаемые контрольные падения, подтверждающие исправление.; CI8: все восемь обязательных проверок нового полного CI run 42214185656 завершились SUCCESS для точного HEAD b2fb8719bf779cfc49143128d2b595fffed8ad00: build, lint, postgres-integration, vuln, smoke, e2e, test-windows, launcher-webview-build. Проверены workflow .github/workflows/ci.yml, event=pull_request и head_sha; прогон завершён успешно. В build также прошли -race/coverage, обе зоны времени и компиляция Linux/Windows.; Отдельная задача metadata (run 42214196814) завершилась FAILURE при переходе fork-PR в Ready: журнал сообщает об отсутствии matching full CI proof для fork. Она отсутствует в required_status_checks; успешный полный CI8 проверен отдельно по новому run 42214185656..\nБлокирующее: нет.\nХвост:\n1. [заявка] В internal/ui/tabs.go обработчик obSetTitle присваивает название переменной active и не ищет вкладку по ev.source. Воспроизведено на реально отрендеренной оболочке: открыть новую карточку A, затем карточку B и до окончания загрузки A переключиться на B; поздний obSetTitle от фрейма A оставляет название A прежним и переименовывает B в «A (создание)». Ожидается обновление только A. Тот же tabs.go побайтно присутствует в base 3ff6738cb023c6e7e3ae5c5a2532c8be0adc1c34 и HEAD; проблема уже существовала для карточек сохранённых записей, поэтому это отдельная неблокирующая находка. Привязать обновление к tabByWindow(ev.source), включая неактивную вкладку, и добавить сценарий с отложенной загрузкой. → заголовок: «ui: обновлять заголовок вкладки отправителя obSetTitle вместо активной вкладки»\nВердикт: годится к мержу.\n<!-- pp:review pp:tail=1 -->",
+          "createdAt": "2026-11-06T12:50:26Z",
+          "fullDatabaseId": "6685215803",
+          "id": "IC_kwDOSKrn-s8AAAABjnhMOw",
+          "lastEditedAt": null
+        }
+      },
+      {
+        "cursor": "Y3Vyc29yOnYyOpPPAAABobDpFiAAqjY2ODUyMTY0OTA=",
+        "node": {
+          "__typename": "IssueComment",
+          "author": {
+            "login": "ivanarama"
+          },
+          "body": "PromptPilot service marker: REVIEW result publication claimed.\n<!-- pp:review-claim b2fb8719bf779cfc49143128d2b595fffed8ad00 review-comment=6685215803 epoch-sha256=aaac0dcc6623b112962e7efad9158aa6e9089a77c83e4ebb2b26ff263d0a7d96 -->",
+          "createdAt": "2026-11-06T12:50:28Z",
+          "fullDatabaseId": "6685216490",
+          "id": "IC_kwDOSKrn-s8AAAABjnhO6g",
+          "lastEditedAt": null
+        }
+      },
+      {
+        "cursor": "Y3Vyc29yOnYyOpPPAAABobDpHfABqzM1MzQ4NTE0Nzk0",
+        "node": {
+          "__typename": "LabeledEvent",
+          "actor": {
+            "login": "ivanarama"
+          },
+          "createdAt": "2026-11-06T12:50:30Z",
+          "id": "LE_lADOSKrn-s8AAAABbeuQnM8AAAAIOu-H6g",
+          "label": {
+            "name": "reviewed"
+          }
+        }
+      },
+      {
+        "cursor": "Y3Vyc29yOnYyOpPPAAABobDpKagAqjY2ODUyMTgwNDc=",
+        "node": {
+          "__typename": "IssueComment",
+          "author": {
+            "login": "ivanarama"
+          },
+          "body": "PromptPilot service marker: REVIEW result committed.\n<!-- pp:head-reviewed b2fb8719bf779cfc49143128d2b595fffed8ad00 review-comment=6685215803 claim=6685216490 epoch-sha256=aaac0dcc6623b112962e7efad9158aa6e9089a77c83e4ebb2b26ff263d0a7d96 -->",
+          "createdAt": "2026-11-06T12:50:33Z",
+          "fullDatabaseId": "6685218047",
+          "id": "IC_kwDOSKrn-s8AAAABjnhU_w",
+          "lastEditedAt": null
+        }
+      },
+      {
+        "cursor": "Y3Vyc29yOnYyOpPPAAABobDvDXgBqzM1MzQ5MDE0NzQw",
+        "node": {
+          "__typename": "LabeledEvent",
+          "actor": {
+            "login": "ivanarama"
+          },
+          "createdAt": "2026-11-06T12:56:59Z",
+          "id": "LE_lADOSKrn-s8AAAABbeuQnM8AAAAIOvco1A",
+          "label": {
+            "name": "ship"
+          }
+        }
+      },
+      {
+        "cursor": "Y3Vyc29yOnYyOpPPAAABobEEvEAAqjY2ODU4MDA5NTA=",
+        "node": {
+          "__typename": "IssueComment",
+          "author": {
+            "login": "ivanarama"
+          },
+          "body": "<!-- pp:base-sync-intent from=b2fb8719bf779cfc49143128d2b595fffed8ad00 base=2c396369f1373e5290a9670a2d9d688df0b1eb0f review-comment=6685215803 claim=6685216490 completion=6685218047 ship-event=LE_lADOSKrn-s8AAAABbeuQnM8AAAAIOvco1A previous=none -->",
+          "createdAt": "2026-11-06T13:20:40Z",
+          "fullDatabaseId": "6685800950",
+          "id": "IC_kwDOSKrn-s8AAAABjoE59g",
+          "lastEditedAt": null
+        }
+      },
+      {
+        "cursor": "Y3Vyc29yOnYyOpPPAAABobEE-sAH2gAzNTEwMTAxMjE3NTo4ZjhhM2M2MGQyMDFiZTY3OTQ1OTYyZmEwMDI4MDU4MTk5YmEzMGQy",
+        "node": {
+          "__typename": "PullRequestCommit",
+          "commit": {
+            "oid": "8f8a3c60d201be67945962fa0028058199ba30d2"
+          },
+          "id": "PURC_lADOSKrn-s8AAAABMAtEz9oAKDhmOGEzYzYwZDIwMWJlNjc5NDU5NjJmYTAwMjgwNTgxOTliYTMwZDI"
+        }
+      },
+      {
+        "cursor": "Y3Vyc29yOnYyOpPPAAABobEQeCgAqjY2ODYwNDg3NTQ=",
+        "node": {
+          "__typename": "IssueComment",
+          "author": {
+            "login": "ivanarama"
+          },
+          "body": "<!-- pp:base-sync-done intent=6685800950 from=b2fb8719bf779cfc49143128d2b595fffed8ad00 to=8f8a3c60d201be67945962fa0028058199ba30d2 base=2c396369f1373e5290a9670a2d9d688df0b1eb0f previous=none ship-event=LE_lADOSKrn-s8AAAABbeuQnM8AAAAIOvco1A -->",
+          "createdAt": "2026-11-06T13:33:29Z",
+          "fullDatabaseId": "6686048754",
+          "id": "IC_kwDOSKrn-s8AAAABjoUB8g",
+          "lastEditedAt": null
+        }
+      },
+      {
+        "cursor": "Y3Vyc29yOnYyOpPPAAABobEpiiAAqjY2ODY1OTkyMzY=",
+        "node": {
+          "__typename": "IssueComment",
+          "author": {
+            "login": "ivanarama"
+          },
+          "body": "**Ревью.** (круг 2)\nReviewed-SHA: 8f8a3c60d201be67945962fa0028058199ba30d2\nOutcome-Label: reviewed\nЧто меняется: Интеграционная проверка base-sync b2fb8719bf779cfc49143128d2b595fffed8ad00 → 8f8a3c60d201be67945962fa0028058199ba30d2 с принятым main 2c396369f1373e5290a9670a2d9d688df0b1eb0f. Подмешаны оптимизация проходов компилятора запросов и autocomplete=\"off\" у форм; собственные изменения заголовка новой карточки сохранены. Исходный содержательный аудит переиспользован по каноничной паре REVIEW/claim/completion 6685215803 / 6685216490 / 6685218047.\nПроверено:\n- Два одинаковых полных GraphQL-прохода; точный текущий server epoch, неизменённый исходный серверный снимок до base-sync, его REVIEW-proof и непрерывное разрешение ship. Intent 6685800950 и done 6686048754 совпадают с HEAD и графом; REST подтверждает родителей [b2fb8719bf779cfc49143128d2b595fffed8ad00, 2c396369f1373e5290a9670a2d9d688df0b1eb0f]. Добавлен ровно один merge-коммит, base является предком текущего main.\n- Независимая проверка всех 4265 записей дерева: результат точно объединяет непересекающиеся изменения родителей от общего предка 3ff6738cb023c6e7e3ae5c5a2532c8be0adc1c34. Посторонних правок и разрешений конфликтов нет. Изменённые итоговые тесты сравнены с обоими точными родителями, включая принятый main: все assertions и входные данные сохранены побайтно, ослабления либо скрывающей нарушение предварительной обработки нет. git diff --check — PASS.\n- go build ./... — PASS (Go 1.26.10, darwin/amd64).\n- go test -count=1 -json ./internal/query ./internal/configcheck ./internal/dsl/interpreter ./internal/access ./internal/widget ./internal/cli ./internal/api ./internal/launcher ./internal/ui ./internal/i18n/... — PASS: 12357 успешных тестов/подтестов, 635 пропусков, 0 падений; все 11 пакетов прошли. Пропуски не учитывались как выполненные проверки. Включены TestMainFormAutocompleteOff для автоформы и managed-формы, TestManagedForm_NewCardTabTitle, TestManagedForm_TabTitleMetaFromRecord, TestLinkTabTitleBehaviorInNode и TestTabsBehaviorInNode (Node 22.21.0).\n- go vet тех же затронутых пакетов и конкретных потребителей query — PASS. go run ./cmd/onebase check --project examples/trade — PASS: ошибок не найдено. Рабочая копия точного HEAD чистая.\n- CI8 точного HEAD 8f8a3c60d201be67945962fa0028058199ba30d2: build, lint, postgres-integration, vuln, smoke, e2e, test-windows и launcher-webview-build — completed/SUCCESS. Проверены identities GitHub Actions, workflow .github/workflows/ci.yml, event=pull_request, check suite и последний exact-head [run 42224778705](https://github.com/ivanarama/onebase/actions/runs/42224778705). Проверки прежнего HEAD не использовались.\nБлокирующее: нет.\nХвост:\n1. [заявка] Находка из исходного завершённого содержательного REVIEW 6685215803; internal/ui/tabs.go побайтно совпадает с обоими родителями: В internal/ui/tabs.go обработчик obSetTitle присваивает название переменной active и не ищет вкладку по ev.source. Воспроизведено на реально отрендеренной оболочке: открыть новую карточку A, затем карточку B и до окончания загрузки A переключиться на B; поздний obSetTitle от фрейма A оставляет название A прежним и переименовывает B в «A (создание)». Ожидается обновление только A. Тот же tabs.go побайтно присутствует в base 3ff6738cb023c6e7e3ae5c5a2532c8be0adc1c34 и HEAD; проблема уже существовала для карточек сохранённых записей, поэтому это отдельная неблокирующая находка. Привязать обновление к tabByWindow(ev.source), включая неактивную вкладку, и добавить сценарий с отложенной загрузкой. → заголовок: «ui: обновлять заголовок вкладки отправителя obSetTitle вместо активной вкладки»\nВердикт: годится к мержу.\n<!-- pp:review pp:tail=1 -->",
+          "createdAt": "2026-11-06T14:00:52Z",
+          "fullDatabaseId": "6686599236",
+          "id": "IC_kwDOSKrn-s8AAAABjo1oRA",
+          "lastEditedAt": null
+        }
+      },
+      {
+        "cursor": "Y3Vyc29yOnYyOpPPAAABobEpqWAAqjY2ODY2MDMwNDk=",
+        "node": {
+          "__typename": "IssueComment",
+          "author": {
+            "login": "ivanarama"
+          },
+          "body": "PromptPilot service marker: REVIEW result publication claimed.\n<!-- pp:review-claim 8f8a3c60d201be67945962fa0028058199ba30d2 review-comment=6686599236 epoch-sha256=27f6f9fd662b362f5e121841a9f9a530c758f1cf1eab59422967cf8fd9ec2c9b -->",
+          "createdAt": "2026-11-06T14:01:00Z",
+          "fullDatabaseId": "6686603049",
+          "id": "IC_kwDOSKrn-s8AAAABjo13KQ",
+          "lastEditedAt": null
+        }
+      },
+      {
+        "cursor": "Y3Vyc29yOnYyOpPPAAABobEp68gAqjY2ODY2MTAzNTg=",
+        "node": {
+          "__typename": "IssueComment",
+          "author": {
+            "login": "ivanarama"
+          },
+          "body": "PromptPilot service marker: REVIEW result committed.\n<!-- pp:head-reviewed 8f8a3c60d201be67945962fa0028058199ba30d2 review-comment=6686599236 claim=6686603049 epoch-sha256=27f6f9fd662b362f5e121841a9f9a530c758f1cf1eab59422967cf8fd9ec2c9b -->",
+          "createdAt": "2026-11-06T14:01:17Z",
+          "fullDatabaseId": "6686610358",
+          "id": "IC_kwDOSKrn-s8AAAABjo2Ttg",
+          "lastEditedAt": null
+        }
+      },
+      {
+        "cursor": "Y3Vyc29yOnYyOpPPAAABobEwoogAqjY2ODY3NzI5OTI=",
+        "node": {
+          "__typename": "IssueComment",
+          "author": {
+            "login": "ivanarama"
+          },
+          "body": "PromptPilot service marker: MERGE transaction reserved.\n<!-- pp:merge-cleanup-intent head=8f8a3c60d201be67945962fa0028058199ba30d2 proof-sha256=49f6f9ca707c680679c1affc1950f96abe496c2527de709a1a856b1d7a72c73a body-sha256=6eb0adbde46f1a8f80f4a9f5413bfd4b637c0b71793006c56e7ff1ed28881b36 issues=none -->",
+          "createdAt": "2026-11-06T14:08:37Z",
+          "fullDatabaseId": "6686772992",
+          "id": "IC_kwDOSKrn-s8AAAABjpAPAA",
+          "lastEditedAt": null
+        }
+      }
+    ],
+    "headRefOid": "8f8a3c60d201be67945962fa0028058199ba30d2",
+    "isDraft": false,
+    "labels": [
+      "reviewed",
+      "ship"
+    ],
+    "labelsComplete": true,
+    "state": "OPEN",
+    "updatedAt": "2026-11-06T14:08:37Z"
+  },
+  "status": {
+    "body": "## Режим работы\r\n\r\n- [ ] Эксперимент: PR остаётся Draft, гипотеза или контракт ещё меняются\r\n- [x] Поставка: результат проверен, текущий HEAD готов к конвейеру\r\n\r\nПроверено в работе: 06.11.2026 входит в сборку колл-центра (cc2) dev-5a0b05e (1105i), выпущенную в рабочую базу оператора (выпуск-27, prod e1899f1). Полный набор сценариев конфигурации на этой сборке: 101 сценарий, 2648 проверок, 99 зелёных; не зелёные — неустойчивый в полном прогоне тест цвета строки в списке задач (по отдельности проходит) и сценарий НСИ, который не запускается из-за уже заданной константы.\r\nСвежий `main` подмешан, обязательный CI зелёный для HEAD `b2fb8719bf779cfc49143128d2b595fffed8ad00`: https://github.com/ivanarama/onebase/actions/runs/42207646799\r\n\r\n## Что было\r\n\r\nВ оболочке со вкладками новая карточка («Создать» в списке) открывалась во вкладке с заголовком **«Insert»**, хотя в шапке самой формы было правильное «Создать — <Сущность>».\r\n\r\nПричин две:\r\n- **Заголовок брался из ссылки.** Вкладку, открытую из другой вкладки, ui.js называет по `title` нажатой ссылки. У кнопки «Создать» это подсказка горячей клавиши: `title=\"Insert\" aria-keyshortcuts=\"Insert\"`.\r\n- **Новая карточка не поправляла заголовок.** Представление записи (`<meta name=\"ob-tab-title\">` → `obSetTitle`) карточка отдавала только для существующей записи, поэтому у новой заголовок оставался «Insert».\r\n\r\n## Что сделано\r\n\r\n- **Новая карточка** — и управляемая, и автоформа, общий путь `renderEntityForm` — отдаёт `ob-tab-title` «<синоним> (создание)», как в 1С («Звонок (создание)»). После записи заголовок — представление записи, как раньше.\r\n  - i18n: ключ `%s (создание)`, в `en.json` → `%s (new)`.\r\n- **Подсказка горячей клавиши** — `title`, совпадающий с `aria-keyshortcuts`, — больше не становится заголовком вкладки, вместо неё берётся текст ссылки. Функция `obLinkTabTitle` в ui.js выделена между маркерами.\r\n\r\nЕсли у сущности не задан синоним (`title`), в заголовке будет её имя — как и в шапке формы.\r\n\r\n## Проверка\r\n\r\n- `TestManagedForm_NewCardTabTitle` — через GET `/ui/catalog/<сущность>/new` (`Server.form`) проверяет `ob-tab-title` «<имя> (создание)» и, с синонимом, «Звонок (создание)».\r\n- `TestLinkTabTitleBehaviorInNode` (`static/link_tab_title_behavior_test.js`):\r\n  - подсказка «Insert» не становится заголовком;\r\n  - обычный `title` сохраняется;\r\n  - пустая ссылка даёт «Форма».\r\n- Без правок оба теста падают.\r\n- `go test ./internal/ui/ ./internal/i18n/...` — зелёные.\r\n\r\nПоставка: в dev-сборке КЦ (:8444) на проверке.\r\n\r\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\r\n",
+    "mergeStateStatus": "CLEAN",
+    "mergeable": "MERGEABLE",
+    "statusCheckRollup": [
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-11-06T13:21:16Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/ivanarama/onebase/actions/runs/42224778705/job/127915399549",
+        "name": "classify",
+        "startedAt": "2026-11-06T13:21:04Z",
+        "status": "COMPLETED",
+        "workflowName": "CI"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-11-06T13:58:37Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/ivanarama/onebase/actions/runs/42224778705/job/127915519750",
+        "name": "build",
+        "startedAt": "2026-11-06T13:21:20Z",
+        "status": "COMPLETED",
+        "workflowName": "CI"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-11-06T13:26:10Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/ivanarama/onebase/actions/runs/42224778705/job/127915519486",
+        "name": "launcher-webview-build",
+        "startedAt": "2026-11-06T13:21:19Z",
+        "status": "COMPLETED",
+        "workflowName": "CI"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-11-06T13:22:02Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/ivanarama/onebase/actions/runs/42224778705/job/127915519696",
+        "name": "Smoke ubuntu-latest / private",
+        "startedAt": "2026-11-06T13:21:20Z",
+        "status": "COMPLETED",
+        "workflowName": "CI"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-11-06T13:22:11Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/ivanarama/onebase/actions/runs/42224778705/job/127915519708",
+        "name": "Smoke ubuntu-latest / shared",
+        "startedAt": "2026-11-06T13:21:20Z",
+        "status": "COMPLETED",
+        "workflowName": "CI"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-11-06T13:22:47Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/ivanarama/onebase/actions/runs/42224778705/job/127915519628",
+        "name": "Smoke windows-latest / private",
+        "startedAt": "2026-11-06T13:21:20Z",
+        "status": "COMPLETED",
+        "workflowName": "CI"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-11-06T13:22:53Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/ivanarama/onebase/actions/runs/42224778705/job/127915519705",
+        "name": "Smoke windows-latest / shared",
+        "startedAt": "2026-11-06T13:21:19Z",
+        "status": "COMPLETED",
+        "workflowName": "CI"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-11-06T13:26:49Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/ivanarama/onebase/actions/runs/42224778705/job/127915519470",
+        "name": "e2e",
+        "startedAt": "2026-11-06T13:21:19Z",
+        "status": "COMPLETED",
+        "workflowName": "CI"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-11-06T13:37:45Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/ivanarama/onebase/actions/runs/42224778705/job/127915519467",
+        "name": "test-windows",
+        "startedAt": "2026-11-06T13:21:19Z",
+        "status": "COMPLETED",
+        "workflowName": "CI"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-11-06T13:25:25Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/ivanarama/onebase/actions/runs/42224778705/job/127915519472",
+        "name": "lint",
+        "startedAt": "2026-11-06T13:21:20Z",
+        "status": "COMPLETED",
+        "workflowName": "CI"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-11-06T13:50:51Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/ivanarama/onebase/actions/runs/42224778705/job/127915519772",
+        "name": "postgres-integration",
+        "startedAt": "2026-11-06T13:21:20Z",
+        "status": "COMPLETED",
+        "workflowName": "CI"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-11-06T13:22:01Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/ivanarama/onebase/actions/runs/42224778705/job/127915519985",
+        "name": "vuln",
+        "startedAt": "2026-11-06T13:21:19Z",
+        "status": "COMPLETED",
+        "workflowName": "CI"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-11-06T13:25:17Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/ivanarama/onebase/actions/runs/42224778705/job/127915519700",
+        "name": "bench",
+        "startedAt": "2026-11-06T13:21:20Z",
+        "status": "COMPLETED",
+        "workflowName": "CI"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-11-06T13:23:01Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/ivanarama/onebase/actions/runs/42224778705/job/127916241643",
+        "name": "smoke",
+        "startedAt": "2026-11-06T13:22:58Z",
+        "status": "COMPLETED",
+        "workflowName": "CI"
+      }
+    ]
+  }
+}
