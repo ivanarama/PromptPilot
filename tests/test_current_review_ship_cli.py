@@ -27,6 +27,8 @@ class ActualGitHub:
         self.clock=0;self.identity='ivanarama';self.owner_head=None
         self.revoke_during_graph_read=False;self.unknown_put=False
         self.commits={self.cap['commit']['sha']:self.cap['commit']};self.comparisons={}
+        self.main_head=self.snapshot['baseRefOid']
+        self.move_main_when=None;self.graph_reads_started=False
 
     def now(self):
         self.clock+=1
@@ -41,6 +43,8 @@ class ActualGitHub:
 
     def graphql_page(self,owner,name,number,cursor):
         assert (owner,name,number,cursor)==('ivanarama','onebase',NUMBER,None)
+        if self.move_main_when=='timeline' and self.graph_reads_started:
+            self.main_head='f'*40;self.move_main_when=None
         s=self.snapshot
         pr={k:copy.deepcopy(s[k]) for k in ('headRefOid','baseRefOid','baseRefName','state','isDraft')}
         pr['labels']={'nodes':[{'name':v} for v in s['labels']], 'pageInfo':{'hasNextPage':False}}
@@ -89,6 +93,9 @@ class ActualGitHub:
         if route==f'repos/{REPO}/pulls/{NUMBER}' and method=='GET':
             return copy.deepcopy(self.cap['pr'])
         if route.startswith(f'repos/{REPO}/git/commits/'):
+            self.graph_reads_started=True
+            if self.move_main_when=='graph':
+                self.main_head='f'*40;self.move_main_when=None
             if self.revoke_during_graph_read:
                 self.revoke_during_graph_read=False
                 self.append('UnlabeledEvent',actor={'login':'ivanarama'},label={'name':'ship'},createdAt=self.now())
@@ -98,7 +105,7 @@ class ActualGitHub:
         if route.startswith(f'repos/{REPO}/compare/'):
             return copy.deepcopy(self.comparisons[route.rsplit('/',1)[1]])
         if route==f'repos/{REPO}/git/ref/heads/main':
-            return {'ref':'refs/heads/main','object':{'type':'commit','sha':self.snapshot['baseRefOid']}}
+            return {'ref':'refs/heads/main','object':{'type':'commit','sha':self.main_head}}
         if route==f'repos/{REPO}/issues/{NUMBER}' and method=='GET':
             return {'labels':copy.deepcopy(self.cap['pr']['labels'])}
         if route==f'repos/{REPO}/pulls/{NUMBER}/merge' and method=='PUT':
@@ -166,7 +173,7 @@ def test_actual_public_cli_uses_original_intent_and_exact_head_cas(cli):
     'force-push','restore','base-change','deleted-comment','source-edit','broken-done',
     'broken-source-intent','review-again-gap','current-proof','current-completion','ci',
     'body','hold','manual','missing-edit-state','different-pr',
-    'commit-identity','partial-commit','in-flight-revoke'])
+    'commit-identity','partial-commit','in-flight-revoke','historical-base-mismatch','invalid-live-main'])
 def test_real_cli_rejects_changed_source_or_current_facts_without_writes(cli,fault):
     gh,invoke=cli
     edges=gh.snapshot['edges']
@@ -202,6 +209,8 @@ def test_real_cli_rejects_changed_source_or_current_facts_without_writes(cli,fau
     elif fault=='commit-identity':gh.cap['commit']['sha']='f'*40
     elif fault=='partial-commit':del gh.cap['commit']['tree']
     elif fault=='in-flight-revoke':gh.revoke_during_graph_read=True
+    elif fault=='historical-base-mismatch':gh.snapshot['baseRefOid']='e'*40
+    elif fault=='invalid-live-main':gh.main_head='not-a-commit'
     code,result,_=invoke(fixed,'next','merge')
     assert code==2 or result['action'] in ('fallback','wait'),result
     assert not result.get('lease') and gh.mutations==[]
@@ -315,9 +324,10 @@ def unsigned_object(tmp_path,parents,tree,message):
 
 
 def advance_main(gh,tmp_path):
-    old=gh.snapshot['baseRefOid']
+    old=gh.main_head
     obj=unsigned_object(tmp_path,[old],gh.cap['commit']['tree']['sha'],'synthetic accepted main descendant')
-    gh.snapshot['baseRefOid']=obj['sha'];gh.cap['pr']['base']['sha']=obj['sha']
+    # Authentic PR shape: baseRefOid and REST base.sha can remain historical.
+    gh.main_head=obj['sha']
     gh.comparisons[old+'...'+obj['sha']]={'status':'ahead','ahead_by':1,'behind_by':0,
         'base_commit':{'sha':old},'merge_base_commit':{'sha':old},'commits':[{'sha':obj['sha']}]}
     return obj
@@ -338,7 +348,7 @@ def refresh_current_proof_and_intent(gh):
 
 
 def add_unsigned_second_hop(gh,tmp_path):
-    source=gh.snapshot['headRefOid'];oldbase=gh.snapshot['baseRefOid']
+    source=gh.snapshot['headRefOid'];oldbase=gh.main_head
     main=advance_main(gh,tmp_path)['sha']
     obj=unsigned_object(tmp_path,[source,main],gh.cap['commit']['tree']['sha'],'synthetic second base-sync')
     head=obj['sha'];ship='LE_lADOSKrn-s8AAAABbeuQnM8AAAAIOvco1A'
@@ -350,6 +360,8 @@ def add_unsigned_second_hop(gh,tmp_path):
             f'claim=6686603049 completion=6686610358 ship-event={ship} previous=6686048754 -->','2026-11-06T14:10:00Z')
     gh.append('PullRequestCommit',commit={'oid':head},createdAt='2026-11-06T14:11:00Z')
     gh.snapshot['headRefOid']=head;gh.cap['pr']['head']['sha']=head
+    # Publishing this new merge HEAD synchronizes the PR base metadata.
+    gh.snapshot['baseRefOid']=main;gh.cap['pr']['base']['sha']=main
     gh.commits[head]=obj;gh.cap['commit']=obj
     comment(7000000001,f'<!-- pp:base-sync-done intent=7000000000 from={source} to={head} base={main} '
             f'previous=6686048754 ship-event={ship} -->','2026-11-06T14:12:00Z')
@@ -394,14 +406,31 @@ def test_signature_metadata_is_not_an_extra_authorization_gate(cli):
     assert fixed.decode_lease(result['lease'])['proof']==gh.cap['proof'] and gh.mutations==[]
 
 
-def test_proven_advanced_main_preserves_original_intent_and_current_proof(cli,tmp_path):
+def test_historical_pr_base_with_advanced_main_keeps_ship_and_waits_for_sync(cli,tmp_path):
     gh,invoke=cli
     original=copy.deepcopy(gh.cap['intent']);current=copy.deepcopy(gh.cap['proof'])
-    advance_main(gh,tmp_path)
+    historical=gh.snapshot['baseRefOid'];advanced=advance_main(gh,tmp_path)['sha']
+    assert gh.snapshot['baseRefOid']==gh.cap['pr']['base']['sha']==historical!=advanced
+    gh.cap['status']['mergeStateStatus']='BEHIND'
     code,result,_=invoke(fixed,'next','merge')
-    assert code==0 and result['action']=='merge',result
-    lease=fixed.decode_lease(result['lease'])
-    assert lease['intent']==original and lease['proof']==current
+    # Ship authorization succeeds; the independent CLEAN gate correctly waits
+    # for base sync. An authentic historical base must not become lost ship.
+    assert code==0 and result['action']=='wait',result
+    assert not result.get('lease') and gh.mutations==[]
+    assert gh.cap['intent']==original and gh.cap['proof']==current
+    assert ('api',f'repos/{REPO}/compare/{historical}...{advanced}') in gh.calls
+    assert gh.calls.count(('api',f'repos/{REPO}/git/ref/heads/main'))>=2
+
+
+@pytest.mark.parametrize('when',['graph','timeline'])
+def test_live_main_move_is_detected_even_when_pr_base_and_timeline_stay_historical(cli,when):
+    gh,invoke=cli
+    historical=gh.snapshot['baseRefOid'];gh.move_main_when=when
+    code,result,_=invoke(fixed,'next','merge')
+    assert gh.snapshot['baseRefOid']==gh.cap['pr']['base']['sha']==historical
+    assert gh.main_head!=historical
+    assert code==2 or result['action'] in ('fallback','wait'),result
+    assert not result.get('lease') and gh.mutations==[]
 
 
 def test_two_hop_chain_uses_each_source_proof_same_ship_and_new_final_proof(cli,tmp_path):

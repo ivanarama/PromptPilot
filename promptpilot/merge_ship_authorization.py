@@ -162,14 +162,17 @@ def _resolve(pp,config,snapshot,pr,commit,main_ref,cleanup,commits,ancestry):
     _need(snapshot['labels'].count('ship')==1
           and not set(snapshot['labels'])&{'hold','manual','needs-decision','changes-requested'},
           'current label route is stopped')
-    main=snapshot['baseRefOid']
-    _need(all(isinstance(v,str) and _SHA.fullmatch(v) for v in (main,head)),'invalid current Git identity')
+    # Pull-request base metadata can remain at its historical commit while
+    # protected main advances. Only the separately authenticated ref is live.
+    pr_base=snapshot['baseRefOid'];main=main_ref['object']['sha']
+    _need(all(isinstance(v,str) and _SHA.fullmatch(v) for v in (main,head,pr_base)),
+          'invalid current Git identity')
     _need(main_ref['ref']=='refs/heads/main' and main_ref['object']['type']=='commit'
           and main_ref['object']['sha']==main,'current protected main ref differs')
     _need(type(pr['number']) is int and pr['number']>0 and pr['state']=='open'
           and pr['merged'] is False and pr['draft'] is False
           and pr['base']['repo']['full_name']==repo and pr['base']['ref']=='main'
-          and pr['base']['sha']==main and pr['head']['sha']==head
+          and pr['base']['sha']==pr_base and pr['head']['sha']==head
           and {x['name'] for x in pr['labels']}==set(snapshot['labels']),
           'live REST/GraphQL PR identity/state differs')
     edges=_full_edges(snapshot);candidate=current_lineage_candidate(snapshot,trusted)

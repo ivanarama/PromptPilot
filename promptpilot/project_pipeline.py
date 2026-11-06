@@ -730,15 +730,24 @@ def current_ship_authorized(gh, config, number, snapshot, *, info=None, intent=N
     if pr.get('number') != number:
         return False
     main = gh.json('api', f"repos/{repo}/git/ref/heads/{config['base_branch']}")
+    main_head = (main.get('object') or {}).get('sha')
+    if (not isinstance(main_head, str) or not re.fullmatch(r'[0-9a-f]{40}', main_head)
+            or main.get('ref') != f"refs/heads/{config['base_branch']}"
+            or (main.get('object') or {}).get('type') != 'commit'):
+        return False
     commits = {hop['head']: gh.json('api', f"repos/{repo}/git/commits/{hop['head']}")
                for hop in candidate['hops']}
-    ancestry = {base: gh.json('api', f"repos/{repo}/compare/{base}...{snapshot['baseRefOid']}")
+    ancestry = {base: gh.json('api', f"repos/{repo}/compare/{base}...{main_head}")
                 for base in dict.fromkeys(hop['base'] for hop in candidate['hops'])
-                if base != snapshot['baseRefOid']}
+                if base != main_head}
     # These graph/identity reads can wait on the network. Re-observe the full
     # stable timeline after them; a new revocation/override must not be hidden
     # by the earlier snapshot while this provenance path was doing extra work.
     if digest(stable_timeline(gh, config, number)) != digest(snapshot):
+        return False
+    # PR baseRefOid is historical metadata, so a stable PR timeline alone
+    # cannot reveal that protected main moved during these slow graph reads.
+    if digest(gh.json('api', f"repos/{repo}/git/ref/heads/{config['base_branch']}")) != digest(main):
         return False
     try:
         resolve_current_ship_facts(sys.modules[__name__], config, snapshot, pr,
