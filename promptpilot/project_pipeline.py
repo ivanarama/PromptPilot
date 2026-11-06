@@ -704,6 +704,60 @@ def trusted_ship_authorized(info: dict, trusted: str) -> bool:
             (latest.get("actor") or {}).get("login") == trusted)
 
 
+def current_ship_authorized(gh, config, number, snapshot, *, info=None, intent=None):
+    """One live ship gate: current sticky event or full canonical provenance.
+
+    This recovers only ship intent for an independently CURRENT reviewed HEAD.
+    The ordinary proof dict/digest, route election, CI and mutation fences stay
+    unchanged. Experimental old-review carry is neither consulted nor enabled.
+    """
+    from .merge_ship_authorization import (
+        ShipAuthorizationError, current_lineage_candidate, resolve_current_ship_facts)
+    trusted = config['trusted_account']
+    info = epoch(snapshot, trusted) if info is None else info
+    validate_epoch_safety(info, trusted)
+    if ('ship' not in snapshot['labels']
+            or set(snapshot['labels']) & {'hold','manual','needs-decision','changes-requested'}):
+        return False
+    if trusted_ship_authorized(info, trusted):
+        return True
+    candidate = current_lineage_candidate(snapshot, trusted)
+    current = proof(info, snapshot['headRefOid'], trusted)
+    if not candidate or not current or current['outcome'] != 'reviewed':
+        return False
+    repo = config['repository']
+    pr = gh.json('api', f'repos/{repo}/pulls/{number}')
+    if pr.get('number') != number:
+        return False
+    main = gh.json('api', f"repos/{repo}/git/ref/heads/{config['base_branch']}")
+    main_head = (main.get('object') or {}).get('sha')
+    if (not isinstance(main_head, str) or not re.fullmatch(r'[0-9a-f]{40}', main_head)
+            or main.get('ref') != f"refs/heads/{config['base_branch']}"
+            or (main.get('object') or {}).get('type') != 'commit'):
+        return False
+    commits = {hop['head']: gh.json('api', f"repos/{repo}/git/commits/{hop['head']}")
+               for hop in candidate['hops']}
+    ancestry = {base: gh.json('api', f"repos/{repo}/compare/{base}...{main_head}")
+                for base in dict.fromkeys(hop['base'] for hop in candidate['hops'])
+                if base != main_head}
+    # These graph/identity reads can wait on the network. Re-observe the full
+    # stable timeline after them; a new revocation/override must not be hidden
+    # by the earlier snapshot while this provenance path was doing extra work.
+    if digest(stable_timeline(gh, config, number)) != digest(snapshot):
+        return False
+    # PR baseRefOid is historical metadata, so a stable PR timeline alone
+    # cannot reveal that protected main moved during these slow graph reads.
+    if digest(gh.json('api', f"repos/{repo}/git/ref/heads/{config['base_branch']}")) != digest(main):
+        return False
+    try:
+        resolve_current_ship_facts(sys.modules[__name__], config, snapshot, pr,
+                                   commits[snapshot['headRefOid']], main,
+                                   cleanup_intent=intent, commits=commits, ancestry=ancestry)
+    except ShipAuthorizationError:
+        return False
+    return True
+
+
 def post_comment(gh: GitHub, config: dict, number: int, body: str) -> dict:
     value = gh.json("api", f"repos/{config['repository']}/issues/{number}/comments",
                     "--method", "POST", "--input", "-", input_value={"body": body})
@@ -2105,7 +2159,7 @@ def pending_merge_action(gh: GitHub, config: dict, intent: dict) -> dict:
     if established.get('protocol') == 'review-routing-v1':
         return {'action': 'wait', 'stage': 'merge', 'number': intent['number'],
                 'reason': 'typed merge intent has an unresolved send; observe the original outcome, never resend'}
-    if not trusted_ship_authorized(info, config["trusted_account"]):
+    if not current_ship_authorized(gh, config, intent['number'], snapshot, info=info, intent=intent):
         return {"action": "fallback", "reason": "merge cleanup intent lost trusted ship"}
     status, checks = pr_checks(gh, config, intent["number"])
     body = status.get("body") or ""
@@ -2176,7 +2230,7 @@ def _base_sync_owner_action(gh: GitHub, config: dict, owner: dict) -> dict | Non
     info = epoch(snapshot, config["trusted_account"])
     validate_epoch_safety(info, config["trusted_account"])
     established = proof(info, head, config["trusted_account"])
-    if not established or not trusted_ship_authorized(info, config["trusted_account"]):
+    if not established or not current_ship_authorized(gh, config, number, snapshot, info=info):
         return None
     ready, reason = checks_ready(config, checks)
     if not ready:
@@ -2420,7 +2474,7 @@ def _ready_owner_action(gh: GitHub, config: dict, health: dict) -> dict | None:
     validate_epoch_safety(info, config["trusted_account"])
     established = proof(info, head, config["trusted_account"])
     if (not established or established.get("outcome") != "reviewed"
-            or not trusted_ship_authorized(info, config["trusted_account"])
+            or not current_ship_authorized(gh, config, number, snapshot, info=info)
             or not checks_ready(config, checks)[0]):
         return None
     lease = {"version": 1, "stage": "merge", "repository": config["repository"],
@@ -2531,7 +2585,7 @@ def next_merge(gh: GitHub, config: dict, *, config_path: str | None = None) -> d
     established = merge_review_proof(gh, config, item['number'], snapshot, health=health)
     if not established:
         return fallback_target(config, health, "merge", target, "ordinary canonical review proof not found")
-    if not trusted_ship_authorized(info, config["trusted_account"]):
+    if not current_ship_authorized(gh, config, item['number'], snapshot, info=info):
         return fallback_target(config, health, "merge", target,
                                "ship authorization is not a trusted current-HEAD event")
     status, checks = pr_checks(gh, config, item["number"])
@@ -2626,6 +2680,11 @@ def _complete_ordinary_merge(gh, config, lease, *, config_path=None, typed_guard
     established = merge_review_proof(gh, config, lease['number'], snapshot, health=health)
     if not established or established != lease["proof"]:
         raise PipelineError("review proof changed")
+    if lease.get('intent') is not None:
+        exact_merge_intent_index(snapshot, config, lease['intent'])
+    if not current_ship_authorized(gh, config, lease['number'], snapshot, info=info,
+                                   intent=lease.get('intent')):
+        raise PipelineError("trusted ship changed before cleanup intent")
     status, checks = pr_checks(gh, config, lease["number"])
     ready, reason = checks_ready(config, checks)
     if status.get("mergeStateStatus") != "CLEAN" or status.get("mergeable") != "MERGEABLE" or not ready:
@@ -2672,7 +2731,7 @@ def _complete_ordinary_merge(gh, config, lease, *, config_path=None, typed_guard
     current_proof = merge_review_proof(gh, config, lease['number'], snapshot)
     if not current_proof or current_proof != lease["proof"] or digest(current_proof) != intent["proof_sha256"]:
         raise PipelineError("review proof changed after cleanup intent")
-    if not trusted_ship_authorized(info, config["trusted_account"]):
+    if not current_ship_authorized(gh, config, lease['number'], snapshot, info=info, intent=intent):
         raise PipelineError("trusted ship changed after cleanup intent")
     if lease.get("ready_owner"):
         health = run_health(config, config_path=config_path)
