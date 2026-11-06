@@ -2297,9 +2297,17 @@ def _intake_snapshot_defer(config: dict, data: dict, profile_id: str,
     details = backpressure_details(config["backpressure"], data, refresh_failed=refresh_failed)
     reason = ("WIP: обновление снимка не удалось; новые задачи отложены" if refresh_failed else
               "WIP: свежий полный снимок недоступен; приём новых задач отложен")
-    return {"action": "defer", "defer_for": config.get("defer_for", "10m"),
-            "reason": reason + "; " + explain_backpressure(details),
-            "profile_id": profile_id, "queue_id": queue_id, "wip_diagnostics": details}
+    decision = {"action": "defer", "defer_for": config.get("defer_for", "10m"),
+                "reason": reason + "; " + explain_backpressure(details),
+                "profile_id": profile_id, "queue_id": queue_id, "wip_diagnostics": details}
+    snapshot = details["snapshot"]
+    retry_at = snapshot["retry_at"]
+    if (snapshot["refresh_state"] == "scan_in_progress" and retry_at
+            and datetime.fromisoformat(retry_at) > datetime.now(timezone.utc)):
+        # Timing hint only: the retry must still pass fresh snapshot/admission
+        # gates. Preserve the scan's backoff instead of adding the intake delay.
+        decision["defer_until"] = retry_at
+    return decision
 
 
 def dispatch_gate(task) -> dict | None:
