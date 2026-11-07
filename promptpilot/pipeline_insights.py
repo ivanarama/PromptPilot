@@ -2344,7 +2344,9 @@ def dispatch_gate(task) -> dict | None:
                     return _intake_snapshot_defer(config, data, profile_id, queue_config["id"])
                 return None
             from .pipeline_item_holds import complete_members, prepare
-            exclusions = prepare(task, queue_config, data)
+            from .merge_progress_probe import measurements
+            progress = measurements(sys.modules[__name__], task, profile_id, profile, queue_config, data)
+            exclusions = prepare(task, queue_config, data, verified_progress=progress)
             pressure = _backpressure_gate(config, data, excluded_numbers=exclusions)
             if pressure:
                 return {**pressure, "profile_id": profile_id, "queue_id": queue_config["id"],
@@ -3209,8 +3211,21 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
         _clear_budget_waiter_after_admission(task)
         return {"action": "prompt", "mode": "skill", "prompt": fallback_prompt}
     profile_id, profile, queue = matched
-    from .pipeline_item_holds import prepare
-    exclusions = prepare(task, queue, read_cached(profile_id, db.list_series())) if queue.get("item_blockers") is True else []
+    from .pipeline_item_holds import (prepare, claim_progress_attempt, released_progress,
+                                      progress_attempt_blocked, unproved_progress_hold)
+    from .merge_progress_probe import measurements
+    progress_data = read_cached(profile_id, db.list_series()) if queue.get("item_blockers") is True else {}
+    if progress_attempt_blocked(task, progress_data):
+        return {"action": "defer", "mode": "tool", "defer_for": "30m",
+                "reason": "canonical recovery progress was consumed by another occurrence",
+                "profile_id": profile_id, "queue_id": queue.get("id")}
+    progress = measurements(sys.modules[__name__], task, profile_id, profile, queue, progress_data, working_dir)
+    if unproved_progress_hold(task, progress_data, progress):
+        return {"action": "defer", "mode": "tool", "defer_for": "30m",
+                "reason": "held canonical recovery has no verified unused progress",
+                "profile_id": profile_id, "queue_id": queue.get("id")}
+    exclusions = prepare(task, queue, progress_data, verified_progress=progress) if queue.get("item_blockers") is True else []
+    progress_releases = released_progress(task) if progress else {}
     if exclusions:
         fallback_prompt += ("\n\nЛокальное ограничение приёма: не брать неизменные "
                             "задачи с зарегистрированным блокером: "
@@ -3366,6 +3381,9 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                 profile_id,
                 profile, queue)
         if not available:
+            if progress_releases:
+                return {"action": "block", "mode": "tool", "reason": "recovery proof tool unavailable: " + reason,
+                        "profile_id": profile_id, "queue_id": queue.get("id")}
             if mode == "auto" and not owned_preflight:
                 admission = _reserve_execution_admission(
                     task, profile_id, profile, queue, admission, "skill",
@@ -3382,6 +3400,10 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                 "action": "block", "mode": "tool", "reason": reason,
                 "profile_id": profile_id, "queue_id": queue.get("id"),
             }
+        if not claim_progress_attempt(task, progress, progress_releases):
+            return {"action": "defer", "mode": "tool", "defer_for": "30m",
+                    "reason": "canonical recovery progress already consumed or attempt not running",
+                    "profile_id": profile_id, "queue_id": queue.get("id")}
         try:
             if owned_preflight:
                 # Both worktrees must reserve in the scheduler's actual DB.
@@ -3431,6 +3453,9 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
             raise
         except RuntimeError as exc:
             reason = str(exc)
+            if progress_releases:
+                return {"action": "block", "mode": "tool", "reason": reason,
+                        "profile_id": profile_id, "queue_id": queue.get("id")}
             if mode == "auto" and not owned_preflight:
                 admission = _reserve_execution_admission(
                     task, profile_id, profile, queue, admission, "skill",
@@ -3449,6 +3474,19 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
             }
 
         preflight_action = preflight["action"].lower()
+        if progress_releases:
+            try:
+                lease = _validate_targeted_handoff(preflight, stage)
+                target = lease["target"]
+                fact = progress[target["number"]].facts
+                if (preflight_action != "fallback" or len(progress_releases) != 1
+                        or str(target["number"]) not in progress_releases
+                        or target["stage"] != "integration-merge-recovery" or target["head"] != fact["head"]
+                        or lease["config_sha256"] != fact["config_sha256"]):
+                    raise RuntimeError("recovery next changed its proven target/config")
+            except (RuntimeError, KeyError, ValueError, TypeError) as exc:
+                return {"action": "block", "mode": "tool", "reason": str(exc),
+                        "profile_id": profile_id, "queue_id": queue.get("id")}
         typed_response = preflight.get("protocol") == "review-routing-v1"
         routing_request = None
         token = preflight.get("lease")
@@ -3855,7 +3893,8 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                 if stage == "merge" and queue.get("item_blockers") is True:
                     from .pipeline_item_holds import register_target
                     target = fallback_lease["target"]
-                    register_target(task, target["number"], target["head"], "merge")
+                    register_target(task, target["number"], target["head"], "merge",
+                                    config_sha256=fallback_lease["config_sha256"])
                 gate_command = [*command[:-2], "gate-fallback", stage,
                                 *_lease_argument(task, preflight["handoff"]["lease"], "gate")]
                 envelope = {"protocol": "promptpilot-fallback-target-v1",

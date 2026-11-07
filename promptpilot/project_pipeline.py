@@ -1325,6 +1325,7 @@ def capabilities(config: dict) -> dict:
             "target_reservations": "sqlite-task-lease-v1",
             "parallel_fix_election": "disabled-by-default" if not config.get(
                 "parallel_fix_enabled") else "signed-target-v1",
+            "merge_admission_progress": "promptpilot-merge-admission-progress-v1",
             # Opt-in, not yet enabled in production (issue #42).
             "base_sync_merge": "experimental" if config.get("base_sync_merge") else "off",
             "base_sync_carry": "experimental" if config.get("base_sync_carry") else "off",
@@ -2774,6 +2775,9 @@ def run(argv=None) -> int:
     positive_parser.add_argument("--stage", required=True, choices=("merge", "tail"))
     inventory_parser = sub.add_parser("inventory")
     inventory_parser.add_argument("--health-file", help="read an existing health JSON snapshot")
+    progress_parser = sub.add_parser("inspect-merge-progress")
+    progress_parser.add_argument("--number", required=True, type=int)
+    progress_parser.add_argument("--head", required=True)
     next_parser = sub.add_parser("next")
     next_parser.add_argument("stage", choices=("review", "merge", "fix"))
     gate_parser = sub.add_parser("gate-fallback")
@@ -2832,6 +2836,9 @@ def run(argv=None) -> int:
             elif args.command == "inspect-routing-positive":
                 from .review_routing_positive import live
                 value = live(gh, config, args.number, purpose=args.stage)
+            elif args.command == "inspect-merge-progress":
+                from .merge_admission_progress import observe
+                value = observe(gh, config, args.config, args.number, args.head)
             elif args.command == "next":
                 if args.stage == "review":
                     value = next_review(gh, config, config_path=args.config)

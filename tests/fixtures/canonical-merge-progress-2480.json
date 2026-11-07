@@ -1,0 +1,701 @@
+{
+  "schema": "canonical-merge-progress-2480-replay-v1",
+  "origin": {
+    "description": "Public authentic after-intent #2480/f3 snapshot. Before-intent case removes exactly server comment6701643279; no production claim/epoch is created.",
+    "files": {
+      "merge-watch-2480-source-f3\\manual-preparation-20261107T035217Z\\snapshot.json": "f3b411fca966d68525fa369bb116e832dae7981f704237bcdb105fbac03aae1b",
+      "merge-watch-2480-source-f3\\manual-preparation-20261107T035217Z\\pr.json": "56d3cd69778f9a8d0eb429586f6fb971f70bbba8fbb0ef08d594106323e3ba6d",
+      "merge-watch-2480-source-f3\\manual-preparation-20261107T035217Z\\main-ref.json": "46ec3bd9065ef653643002cee0f2d587ed19340919dc8530a3dafea3c543d5a8",
+      "review2356\\2480-source-positive-proof-20261107T031902Z\\gh-06.json": "f9ee04bedaf8740d95a1165fe7254ece4ece34cb3a96e55497043030c22c9a7e",
+      "merge-watch-2480-source-f3\\manual-recovery-next-design-20261107T034148Z\\final-readonly-before-gate\\checks.json": "0913e8987c9a1566831102d9996a38c15ee33dc92b492c8e64055303f05cdb3c"
+    }
+  },
+  "snapshot": {
+    "headRefOid": "f3bbed2b515ce9fdab43a089cad45db92773c21c",
+    "baseRefOid": "0a33e5b8736d9f636b7256a5c366d4a1054646c1",
+    "baseRefName": "main",
+    "state": "OPEN",
+    "isDraft": false,
+    "labels": [
+      "queue:p0",
+      "reviewed",
+      "ship"
+    ],
+    "labelsComplete": true,
+    "updatedAt": "2026-11-07T03:27:33Z",
+    "edges": [
+      {
+        "cursor": "Y3Vyc29yOnYyOpPPAAABoaVEwUgH2gAzNTE1MDA0OTk2NzpjMzlkMjk2ZjczZGUyOWU3YmFkNjU3YmRmMDg3ZjAwZTQzODRjN2Ux",
+        "node": {
+          "__typename": "PullRequestCommit",
+          "id": "PURC_lADOSKrn-s8AAAABMveGr9oAKGMzOWQyOTZmNzNkZTI5ZTdiYWQ2NTdiZGYwODdmMDBlNDM4NGM3ZTE",
+          "commit": {
+            "oid": "c39d296f73de29e7bad657bdf087f00e4384c7e1"
+          }
+        }
+      },
+      {
+        "cursor": "Y3Vyc29yOnYyOpPPAAABoaVF_bABqzM1MTAwNjgzNTMz",
+        "node": {
+          "__typename": "LabeledEvent",
+          "id": "LE_lADOSKrn-s8AAAABcWoMl88AAAAILCntDQ",
+          "createdAt": "2026-11-04T06:36:30Z",
+          "actor": {
+            "login": "ivanarama"
+          },
+          "label": {
+            "name": "queue:p0"
+          }
+        }
+      },
+      {
+        "cursor": "Y3Vyc29yOnYyOpPPAAABoaVkP8gAqjY2MjQ5MDQ4NDc=",
+        "node": {
+          "__typename": "IssueComment",
+          "id": "IC_kwDOSKrn-s8AAAABiuAGjw",
+          "fullDatabaseId": "6624904847",
+          "createdAt": "2026-11-04T07:09:33Z",
+          "lastEditedAt": null,
+          "author": {
+            "login": "ivanarama"
+          },
+          "body": "**Ревью.** (круг 1)\nReviewed-SHA: c39d296f73de29e7bad657bdf087f00e4384c7e1\nOutcome-Label: changes-requested\nЧто меняется: PR #2480, HEAD c39d296f73de29e7bad657bdf087f00e4384c7e1, tree 817d532e4161e2d837abbf285944f82377374576: набор user_card из табличной части одной карточки сотрудника для in/not_in, строгий выбор источника и типов, типизированный dedupe, предел 1000 исходных строк и единое SQL-чтение карточки вместе с ТЧ в текущей транзакции. Проверены скалярная совместимость, распространение недоступности через отрицания, потребители HTTP/REST/DSL/виджеты/SSE, schema/describe, редактор роли и документация..\nПроверено: Независимо прочитаны все 17 изменённых файлов, полный diff от 19860a05739753d4412aa2c9b06bde7d7301158e и потребители access в UI, API, widget, entityservice и query. Список файлов совпал с GitHub; HEAD, tree и SHA-256 изменённых файлов проверены до и после тестов. Рабочая копия осталась чистой; git diff --check прошёл.; Среда: Go 1.26.10 darwin/amd64; отдельный PostgreSQL 16.13 с en_US.UTF-8/UTF8; установленный Node v22.21.0. go build -p 2 ./... — PASS.; go vet -p 2 для ./internal/access ./internal/auth ./internal/cli ./internal/configcheck ./internal/i18n ./internal/launcher ./internal/storage ./internal/ui и потребителей ./internal/api ./internal/widget ./internal/entityservice ./internal/query — PASS.; go test -json -count=1 -p 2 для ./internal/access ./internal/auth ./internal/cli ./internal/configcheck ./internal/i18n ./internal/launcher ./internal/storage ./internal/api ./internal/widget ./internal/entityservice ./internal/query: все пакеты прошли. С учётом точечных повторов Node-зависимых случаев конечные уникальные исходы тестов и подтестов: 7547 PASS, 492 SKIP, 0 FAIL; пропуски не засчитаны как PASS.; Полный UI проверен с инвентаризацией 1883 верхних тестов и штатными порциями по 128, timeout=10m на процесс. Конечные исходы: 1873 PASS и 10 SKIP верхнего уровня; вместе с подтестами 4307 PASS, 436 SKIP, 0 FAIL. Все 1883 имени получили конечный результат.; Первый UI-прогон остановился после порции 10: TestNoGridDateTimezonesHTTPAndJS и TestNoGridRefCardPolicyThroughHTTPAndJS требовали отсутствующий в PATH node. Исходный exit=1 и журналы сохранены. После добавления уже установленного Node 22.21.0 в PATH эти два теста прошли; повторены также 54 ранее пропущенных по этой причине UI-теста и 12 случаев auth/launcher. Оставшиеся 603 UI-теста выполнены без повторения всего набора. Исходники и лимит каждого процесса не менялись.; go test -json -count=1 -race -p 1 -run ^TestUserCard ./internal/ui ./internal/cli ./internal/launcher с TEST_DATABASE_URL отдельной PostgreSQL: 448 PASS, 0 FAIL, 0 SKIP, включая SQLite и PostgreSQL. Прошли все шесть конкурентных PG-сценариев, в том числе открытая READ COMMITTED DSL-транзакция; типы, 1000/1001, rollback/read-your-writes, HTTP/REST, XLSX, виджет/SSE и read-only запрет записи.; go run ./cmd/onebase check --project examples/trade; go run ./cmd/onebase check --project examples/user-card --lint; go run ./tools/i18ncheck — все PASS.; Фактический CI run 41786603871 подтверждён для точного HEAD c39d296f73de29e7bad657bdf087f00e4384c7e1. Обязательные build, vuln, smoke, e2e, test-windows, launcher-webview-build — SUCCESS; lint и postgres-integration — FAILURE. Локальный полный lint не запускался; прочитан фактический журнал CI lint.; postgres-integration остановился до продуктовых тестов: Ubuntu runner не нашёл postgresql-client-16, apt завершился с exit 100. Это установленная причина инфраструктурного отказа, а не результат SQL-тестов. Локальная PostgreSQL-матрица его не заменяет; успешный обязательный CI остаётся необходимым гейтом..\nБлокирующее: 1) [P1] Устранить падение обязательного lint на новых тестах. В CI точного HEAD (https://github.com/ivanarama/onebase/actions/runs/41786603871/job/126430137220) golangci-lint 2.11.4 завершился FAILURE с тремя gosec-замечаниями: G703 в internal/cli/user_card_table_part_test.go:19 и :27 на os.WriteFile, G115 в internal/ui/user_card_table_part_snapshot_test.go:220 на преобразовании int64 в uint32. Это воспроизводимый отказ обязательной проверки в добавленных файлах. Устранить замечания с сохранением действующего набора линтеров и получить успешный lint для нового HEAD.; 2) [P2] Обновить прежнее описание user_card в docs/features.md:8248. В действующем разделе со status: testing остаётся фраза «табличные части пока отклоняются», хотя новый соседний раздел docs/features.md:8257–8269, пример и успешно выполненный check уже поддерживают table_part/column. После этого PR каталог возможностей одновременно обещает поддержку и её отсутствие. Уточнить старую строку для скалярного field и сослаться на новый набор либо убрать устаревшее ограничение. Фактически неверное утверждение в поставляемой документации является блокирующим по CLAUDE.md..\nХвост:\n—\nВердикт: есть замечания.\n<!-- pp:review pp:tail=0 -->"
+        }
+      },
+      {
+        "cursor": "Y3Vyc29yOnYyOpPPAAABoaVkS4AAqjY2MjQ5MDU2Nzc=",
+        "node": {
+          "__typename": "IssueComment",
+          "id": "IC_kwDOSKrn-s8AAAABiuAJzQ",
+          "fullDatabaseId": "6624905677",
+          "createdAt": "2026-11-04T07:09:36Z",
+          "lastEditedAt": null,
+          "author": {
+            "login": "ivanarama"
+          },
+          "body": "PromptPilot service marker: REVIEW result publication claimed.\n<!-- pp:review-claim c39d296f73de29e7bad657bdf087f00e4384c7e1 review-comment=6624904847 epoch-sha256=a499a54d1531fe7fb37d4714b84bc4fcbf1930d6e166583959c72f03e7e48b68 -->"
+        }
+      },
+      {
+        "cursor": "Y3Vyc29yOnYyOpPPAAABoaVkVzgBqzM1MTAyODQ1NTEz",
+        "node": {
+          "__typename": "LabeledEvent",
+          "id": "LE_lADOSKrn-s8AAAABcWoMl88AAAAILErqSQ",
+          "createdAt": "2026-11-04T07:09:39Z",
+          "actor": {
+            "login": "ivanarama"
+          },
+          "label": {
+            "name": "changes-requested"
+          }
+        }
+      },
+      {
+        "cursor": "Y3Vyc29yOnYyOpPPAAABoaVkYvAAqjY2MjQ5MDc2Mjg=",
+        "node": {
+          "__typename": "IssueComment",
+          "id": "IC_kwDOSKrn-s8AAAABiuARbA",
+          "fullDatabaseId": "6624907628",
+          "createdAt": "2026-11-04T07:09:42Z",
+          "lastEditedAt": null,
+          "author": {
+            "login": "ivanarama"
+          },
+          "body": "PromptPilot service marker: REVIEW result committed.\n<!-- pp:head-reviewed c39d296f73de29e7bad657bdf087f00e4384c7e1 review-comment=6624904847 claim=6624905677 epoch-sha256=a499a54d1531fe7fb37d4714b84bc4fcbf1930d6e166583959c72f03e7e48b68 -->"
+        }
+      },
+      {
+        "cursor": "Y3Vyc29yOnYyOpPPAAABoaYCf4AAqjY2Mjc5OTM4MDI=",
+        "node": {
+          "__typename": "IssueComment",
+          "id": "IC_kwDOSKrn-s8AAAABiw8oyg",
+          "fullDatabaseId": "6627993802",
+          "createdAt": "2026-11-04T10:02:24Z",
+          "lastEditedAt": null,
+          "author": {
+            "login": "ivanarama"
+          },
+          "body": "Автоматическая доработка остановлена: полный локальный lint 2.11.4 на подготовленном кандидате завершился по таймауту (exit 124, 631.496 с). Успешный полный lint не получен.\n\nВ рамках двух блокеров подготовлены ровно три файла: запись CLI-фикстур ограничена через os.Root; проверка PostgreSQL advisory lock получает младшие 32 бита ключа без сужающего преобразования Go; устаревшее описание user_card в docs/features.md уточнено. Подавления правил не добавлены.\n\nСвежие проверки кандидата: публичная матрица ^TestUserCard в UI/CLI/launcher с -race -count=1 и atomic coverage на SQLite и отдельном PostgreSQL 16.13 — 448 PASS, 0 FAIL, 0 SKIP, включая все шесть конкурентных PostgreSQL-сценариев. Ранняя CLI-матрица, go build ./..., go vet затронутых пакетов, check примеров trade и user-card --lint прошли. Полные затронутые пакеты ещё не прогонялись; приёмка кандидата не завершена.\n\nИсходный HEAD: c39d296f73de29e7bad657bdf087f00e4384c7e1. Приватный кандидат: tree a914cbb97069522ac5c06742f08a81c0b0a99f6f. Код не опубликован; журналы и патч сохранены. Повтор неизменного неуспешного тяжёлого прогона не выполняется.\n\nНужен ответ мейнтейнера: какую совместимую среду использовать для завершения полного lint этого кандидата с сохранением версии, всех семи линтеров и лимита анализа 10 минут? После полного завершения проверок новый HEAD потребует независимого REVIEW и CI8.\n\n<!-- pp:fix-handoff needs-decision head=c39d296f73de29e7bad657bdf087f00e4384c7e1 -->"
+        }
+      },
+      {
+        "cursor": "Y3Vyc29yOnYyOpPPAAABoaYC_IABqzM1MTE2MDE5OTA4",
+        "node": {
+          "__typename": "LabeledEvent",
+          "id": "LE_lADOSKrn-s8AAAABcWoMl88AAAAILRPwxA",
+          "createdAt": "2026-11-04T10:02:56Z",
+          "actor": {
+            "login": "ivanarama"
+          },
+          "label": {
+            "name": "needs-decision"
+          }
+        }
+      },
+      {
+        "cursor": "Y3Vyc29yOnYyOpPPAAABoaYDeYABqzM1MTE2MDU1ODE5",
+        "node": {
+          "__typename": "UnlabeledEvent",
+          "id": "UNLE_lADOSKrn-s8AAAABcWoMl88AAAAILRR9Cw",
+          "createdAt": "2026-11-04T10:03:28Z",
+          "actor": {
+            "login": "ivanarama"
+          },
+          "label": {
+            "name": "changes-requested"
+          }
+        }
+      },
+      {
+        "cursor": "Y3Vyc29yOnYyOpPPAAABoafPjsAAqjY2Mzg2NDM5MDU=",
+        "node": {
+          "__typename": "IssueComment",
+          "id": "IC_kwDOSKrn-s8AAAABi7GqwQ",
+          "fullDatabaseId": "6638643905",
+          "createdAt": "2026-11-04T18:26:00Z",
+          "lastEditedAt": null,
+          "author": {
+            "login": "ivanarama"
+          },
+          "body": "Решение сопровождающего в рамках явно делегированной владельцем технической автономии от 08.10.2026.\n\nОснование: Текущий канонический REVIEW №6624904847 требует исправить тестовые G703/G115 и устаревшее описание scalar user_card. После этого FIX №16110 остановился на полном локальном lint по таймауту 631,496 с (exit 124); исходный HEAD не изменился, результат не является PASS. Принятый план 197 и контракт среза B остаются прежними. Проверенный отдельно локальный профиль с явно именованной операторской сборкой 2.11.4-onebase-leaf-perf1 сохраняет конфигурацию, все семь линтеров и исходный предел анализа; узкая оптимизация проверена сравнением с исходным алгоритмом и положительными/отрицательными контролями. Выбираю этот профиль только для одной доработки данного источника; результаты на других деревьях не являются проверкой #2480.\n\nРазрешаю одну содержательную доработку: Сохранить объём двух исходных блокеров: изменять только internal/cli/user_card_table_part_test.go, internal/ui/user_card_table_part_snapshot_test.go и соответствующее прежнее описание scalar user_card в docs/features.md. Запись CLI-фикстур ограничить os.Root внутри собственного временного проекта без подавлений G703; при наблюдении PostgreSQL advisory lock получать фактические младшие 32 бита lockKey без сужающего преобразования Go и без ослабления синхронизации/проверок; исправить устаревшую фразу о неподдерживаемой ТЧ, сохранив совместимость field для eq/ne и новый table_part/column для in/not_in. Продуктовые файлы, план, зависимости, .golangci.yml и CI workflows не менять. Подготовленный приватный кандидат можно восстановить только после проверки исходного HEAD, патча и полного дерева; его прошлые частичные проверки не заменяют недостающую полную приёмку. Для НОВОГО полного локального lint этого конечного кандидата выбираю существующий изолированный профиль operator 2.11.4-onebase-leaf-perf1: Go1.26.10 Darwin/amd64 CGO1, -j2/GOMAXPROCS2/GOMEMLIMIT7GiB/GOGC100, общий lint-flock, все пакеты ./... включая тесты, прежние семь линтеров и неизменные rules/exclusions, внутренний предел10m и внешний630s. Использовать точный уже проверенный bootstrap/profile/binary с новым приватным каталогом артефактов; их идентичности закреплены в неизменяемом scope этого решения. Это явно операторская сборка, не официальный upstream; официальный CI pin остаётся2.11.4, его новый exact-HEAD lint и все CI8 обязательны. Успех локального lint допускается только после реального exit0 на фактическом полном дереве, проверки целостности до/после и сохранения журнала. Другие деревья и прежний timeout не засчитывать. Все сценарии и assertions сохранить: публичный check/describe для корректных и некорректных селекторов; полная ^TestUserCard матрица UI/CLI/launcher с race/count1/atomic на SQLite и отдельном реальном PostgreSQL16 UTF8, включая standalone/read-snapshot/уже открытую DSL READ COMMITTED, конкурентную смену учётки и удаление, read-your-writes/rollback, отказ через not_in/not/any, предел1000/1001, HTTP/REST/DSL/XLSX/SSE и отрицательные контроли. Завершить все полные затронутые пакеты с реальной инвентаризацией и учётом SKIP отдельно, build/vet, проверки trade/user-card --lint, i18n и diff. Падение postgres-integration до тестов не считать успехом и не перезапускать вслепую; SQL-матрица не заменяет этот обязательный CI. Единственный обычный FIX публикует реальный непустой content-коммит с точным PP-Fix-Transition; затем новое независимое REVIEW и все восемь обязательных успешных CI, controller ship и serial MERGE. Фактическую паузу FIX сохранить; решение не разрешает запуск второго исполнителя, снятие паузы, изменение активных задач или публикацию приватной диагностики.\n\nСохранить принятый пользовательский контракт. Исполнитель — один FIX; не создавать дубликат PR. После push обязательны независимый REVIEW нового точного HEAD и все обязательные проверки main. Не обходить CI, не менять защиту ветки, не редактировать исторические pp-доказательства и не скрывать изменения в пустом коммите или base-sync. Новые продуктовые развилки возвращать владельцу.\n\npp:fix-decision c39d296f73de29e7bad657bdf087f00e4384c7e1\n\n<!-- pp:owner-autonomous-technical pr=2480 review=6624904847 epoch=a499a54d1531fe7fb37d4714b84bc4fcbf1930d6e166583959c72f03e7e48b68 -->\n\nGenerated-with: Codex\n"
+        }
+      },
+      {
+        "cursor": "Y3Vyc29yOnYyOpPPAAABoafQF3gBqzM1MTYxMDgzNzUy",
+        "node": {
+          "__typename": "LabeledEvent",
+          "id": "LE_lADOSKrn-s8AAAABcWoMl88AAAAIL8OPaA",
+          "createdAt": "2026-11-04T18:26:35Z",
+          "actor": {
+            "login": "ivanarama"
+          },
+          "label": {
+            "name": "changes-requested"
+          }
+        }
+      },
+      {
+        "cursor": "Y3Vyc29yOnYyOpPPAAABoafQKwABqzM1MTYxMDkwNTA2",
+        "node": {
+          "__typename": "UnlabeledEvent",
+          "id": "UNLE_lADOSKrn-s8AAAABcWoMl88AAAAIL8Opyg",
+          "createdAt": "2026-11-04T18:26:40Z",
+          "actor": {
+            "login": "ivanarama"
+          },
+          "label": {
+            "name": "needs-decision"
+          }
+        }
+      },
+      {
+        "cursor": "Y3Vyc29yOnYyOpPPAAABoajttKgAqjY2NDUyNjgzNjU=",
+        "node": {
+          "__typename": "IssueComment",
+          "id": "IC_kwDOSKrn-s8AAAABjBa_jQ",
+          "fullDatabaseId": "6645268365",
+          "createdAt": "2026-11-04T23:38:33Z",
+          "lastEditedAt": null,
+          "author": {
+            "login": "ivanarama"
+          },
+          "body": "Автоматическая доработка остановлена: новый полный локальный lint в профиле, разрешённом решением №6638643905 для HEAD c39d296f73de29e7bad657bdf087f00e4384c7e1, завершился таймаутом — exit 124, 630,995 с. Использована закреплённая операторская сборка 2.11.4-onebase-leaf-perf1, все семь линтеров и прежние лимиты. Это не успешная проверка.\n\nКандидат сохраняет объём двух исходных блокеров: исправления CLI-фикстур и наблюдения advisory lock в двух тестовых файлах, уточнение scalar user_card в docs/features.md. Полное дерево и все 4249 файлов/режимов совпали с разрешённым кандидатом до и после lint. Код не опубликован.\n\nСвежие проверки: ранняя публичная CLI-регрессия — 16 PASS; полная публичная матрица ^TestUserCard в UI/CLI/launcher с race/count=1/atomic на SQLite и отдельном PostgreSQL 16.13 UTF-8 — 448 PASS, 0 FAIL, 0 SKIP, включая все шесть конкурентных PostgreSQL-сценариев. Сборка ./..., vet восьми затронутых пакетов, check --lint для examples/trade и examples/user-card, i18n — PASS. Полные затронутые пакеты ещё не выполнены: последовательность остановлена на lint.\n\nНужно новое точное решение OWNER: какую проверенную среду или конечный профиль разрешить для полного lint этого исходного HEAD и кандидата при сохранении всех правил, лимитов и остальных обязательных проверок? Текущий профиль уже фактически испытан и не завершился успешно. Кандидат и журналы сохранены приватно. После содержательного FIX по-прежнему обязательны независимый REVIEW нового HEAD и все CI8.\n\n<!-- pp:fix-handoff needs-decision head=c39d296f73de29e7bad657bdf087f00e4384c7e1 -->\n\nGenerated-with: Codex\n"
+        }
+      },
+      {
+        "cursor": "Y3Vyc29yOnYyOpPPAAABoajuGjgBqzM1MTg2NzgzMDA3",
+        "node": {
+          "__typename": "LabeledEvent",
+          "id": "LE_lADOSKrn-s8AAAABcWoMl88AAAAIMUuzHw",
+          "createdAt": "2026-11-04T23:38:59Z",
+          "actor": {
+            "login": "ivanarama"
+          },
+          "label": {
+            "name": "needs-decision"
+          }
+        }
+      },
+      {
+        "cursor": "Y3Vyc29yOnYyOpPPAAABoajui4ABqzM1MTg2ODE0NjYz",
+        "node": {
+          "__typename": "UnlabeledEvent",
+          "id": "UNLE_lADOSKrn-s8AAAABcWoMl88AAAAIMUwuxw",
+          "createdAt": "2026-11-04T23:39:28Z",
+          "actor": {
+            "login": "ivanarama"
+          },
+          "label": {
+            "name": "changes-requested"
+          }
+        }
+      },
+      {
+        "cursor": "Y3Vyc29yOnYyOpPPAAABoaugHsAAqjY2NTc2Nzk2OTI=",
+        "node": {
+          "__typename": "IssueComment",
+          "id": "IC_kwDOSKrn-s8AAAABjNQhTA",
+          "fullDatabaseId": "6657679692",
+          "createdAt": "2026-11-05T12:12:40Z",
+          "lastEditedAt": null,
+          "author": {
+            "login": "ivanarama"
+          },
+          "body": "Решение сопровождающего в рамках явно делегированной владельцем технической автономии от 08.10.2026.\n\nОснование: Каноническое полное REVIEW №6624904847 точного HEAD сохраняет два блокера: G703/G115 в новых тестах и неверное прежнее описание scalar user_card. Решение №6638643905 потреблено новым подлинным handoff FIX №6645268365: полный lint операторской сборки завершился exit124 за630,995с, без публикации и без полной приёмки. Старый профиль 7GiB/GOGC100 не повторять. Выбираю только для этого источника проверенный отдельный ресурсный режим V2 2CPU/3GiB/GOGC50 и supervisor с безопасной обработкой завершённого дочернего процесса. Это новый конечный технический выбор режима исполнения, не PASS данного кандидата и не изменение принятого плана197/срезаB. Все правила, семь анализаторов, полный охват и прежние пределы сохраняются; реальные результаты других деревьев не заменяют проверки #2480.\n\nРазрешаю одну содержательную доработку: Сохранить объём двух исходных блокеров: изменять только internal/cli/user_card_table_part_test.go, internal/ui/user_card_table_part_snapshot_test.go и соответствующее прежнее описание scalar user_card в docs/features.md. Запись CLI-фикстур ограничить os.Root внутри собственного временного проекта без подавлений G703; при наблюдении PostgreSQL advisory lock получать фактические младшие 32 бита lockKey без сужающего преобразования Go и без ослабления синхронизации/проверок; исправить устаревшую фразу о неподдерживаемой ТЧ, сохранив совместимость field для eq/ne и новый table_part/column для in/not_in. Продуктовые файлы, план, зависимости, .golangci.yml и CI workflows не менять. Подготовленный приватный кандидат можно восстановить только после проверки исходного HEAD, патча и полного дерева; его прошлые частичные проверки не заменяют недостающую полную приёмку. Для НОВОГО полного локального lint этого конечного кандидата выбираю существующий изолированный профиль operator 2.11.4-onebase-leaf-perf1: Go1.26.10 Darwin/amd64 CGO1, -j2/GOMAXPROCS2/GOMEMLIMIT3GiB/GOGC50, общий lint-flock, все пакеты ./... включая тесты, прежние семь линтеров и неизменные rules/exclusions, внутренний предел10m и внешний630s. Использовать точный уже проверенный bootstrap/profile/binary с новым приватным каталогом артефактов; их идентичности закреплены в неизменяемом scope этого решения. Это явно операторская сборка, не официальный upstream; официальный CI pin остаётся2.11.4, его новый exact-HEAD lint и все CI8 обязательны. Успех локального lint допускается только после реального exit0 на фактическом полном дереве, проверки целостности до/после и сохранения журнала. Другие деревья и прежний timeout не засчитывать. Все сценарии и assertions сохранить: публичный check/describe для корректных и некорректных селекторов; полная ^TestUserCard матрица UI/CLI/launcher с race/count1/atomic на SQLite и отдельном реальном PostgreSQL16 UTF8, включая standalone/read-snapshot/уже открытую DSL READ COMMITTED, конкурентную смену учётки и удаление, read-your-writes/rollback, отказ через not_in/not/any, предел1000/1001, HTTP/REST/DSL/XLSX/SSE и отрицательные контроли. Завершить все полные затронутые пакеты с реальной инвентаризацией и учётом SKIP отдельно, build/vet, проверки trade/user-card --lint, i18n и diff. Падение postgres-integration до тестов не считать успехом и не перезапускать вслепую; SQL-матрица не заменяет этот обязательный CI. Единственный обычный FIX публикует реальный непустой content-коммит с точным PP-Fix-Transition; затем новое независимое REVIEW и все восемь обязательных успешных CI, controller ship и serial MERGE. Все действующие паузы FIX/worker сохранить; решение не разрешает запуск второго исполнителя, снятие паузы, изменение активных задач или публикацию приватной диагностики. Выбор профиля V2 заменяет только предыдущее конкретное локальное исполнение lint для этого HEAD: использовать проверенные bootstrap/profile/supervisor, связанные приватным scope, общий flock и НОВЫЙ абсолютный каталог артефактов. Полный lint должен быть выполнен заново на фактическом полном дереве с реальным exit0 и проверкой всех файлов/режимов до и после; старые timeout, частичные матрицы и результаты другого дерева не засчитывать. Для обычного полного unit/race/count1/atomic runner не экспортировать TEST_DATABASE_URL глобально; отдельно выполнить каждую обязательную PostgreSQL integration-команду с её настоящими CI flags/timeouts и всю принятую SQLite/PostgreSQL публичную матрицу. Сохранить все source-specific runner/инвентаризацию/точные deadlines; пропуски учитывать отдельно. До исполнения указатель этого конечного решения и проверенного V2 должен быть CAS-доставлен в BOTH FIXseries2 и фактическую unstarted pending native FIX task; active prompts не менять. Ни scope, ни доставленный указатель не заменяют обычную FIX election и актуальную публичную авторизацию.\n\nСохранить принятый пользовательский контракт. Исполнитель — один FIX; не создавать дубликат PR. После push обязательны независимый REVIEW нового точного HEAD и все обязательные проверки main. Не обходить CI, не менять защиту ветки, не редактировать исторические pp-доказательства и не скрывать изменения в пустом коммите или base-sync. Новые продуктовые развилки возвращать владельцу.\n\npp:fix-decision c39d296f73de29e7bad657bdf087f00e4384c7e1\n\n<!-- pp:owner-autonomous-technical pr=2480 review=6624904847 epoch=a499a54d1531fe7fb37d4714b84bc4fcbf1930d6e166583959c72f03e7e48b68 -->\n\nGenerated-with: Codex\n"
+        }
+      },
+      {
+        "cursor": "Y3Vyc29yOnYyOpPPAAABoaugQegBqzM1MjM4MjI3NTc1",
+        "node": {
+          "__typename": "LabeledEvent",
+          "id": "LE_lADOSKrn-s8AAAABcWoMl88AAAAINFyudw",
+          "createdAt": "2026-11-05T12:12:49Z",
+          "actor": {
+            "login": "ivanarama"
+          },
+          "label": {
+            "name": "changes-requested"
+          }
+        }
+      },
+      {
+        "cursor": "Y3Vyc29yOnYyOpPPAAABoaugUYgBqzM1MjM4MjMzMjAw",
+        "node": {
+          "__typename": "UnlabeledEvent",
+          "id": "UNLE_lADOSKrn-s8AAAABcWoMl88AAAAINFzEcA",
+          "createdAt": "2026-11-05T12:12:53Z",
+          "actor": {
+            "login": "ivanarama"
+          },
+          "label": {
+            "name": "needs-decision"
+          }
+        }
+      },
+      {
+        "cursor": "Y3Vyc29yOnYyOpPPAAABoaxsjrAAqjY2NjI1OTg2NzE=",
+        "node": {
+          "__typename": "IssueComment",
+          "id": "IC_kwDOSKrn-s8AAAABjR8wDw",
+          "fullDatabaseId": "6662598671",
+          "createdAt": "2026-11-05T15:55:58Z",
+          "lastEditedAt": null,
+          "author": {
+            "login": "ivanarama"
+          },
+          "body": "Автоматическая доработка остановлена на новом обязательном гейте: полный PostgreSQL UI не завершился в установленный лимит.\n\nКоманда `go test -race -count=1 -timeout 20m ./internal/ui` на фактическом кандидате завершилась `panic: test timed out after 20m0s`, exit 1; длительность процесса 1208,075 с. Конечный результат получили 1652 из 1883 тестов верхнего уровня. До остановки записаны 4282 PASS и 12 SKIP с учётом подтестов; сам пакет — FAIL и его полная приёмка не завершена. В момент таймаута выполнялся `TestPersonalNavigation_VisiblePlacementInsideRevokedParent/moved-inherited-group/postgres`; это положение выполнения, а не доказанная причина суммарного времени.\n\nСвежие результаты этого FIX:\n\n- полный локальный lint в разрешённом решением №6657679692 профиле V2 — exit 0, 473,591 с;\n- полный обычный runner всех 116 пакетов с race/count=1/atomic, UI4 и launcher2 — PASS: 17531 PASS, 1042 SKIP, 0 FAIL с учётом подтестов; инвентаризация и coverage проверены;\n- публичная матрица `^TestUserCard` UI/CLI/launcher на SQLite и собственной PostgreSQL 16.13 UTF-8 — 448 PASS, 0 FAIL, 0 SKIP, включая все шесть конкурентных PostgreSQL-сценариев; ранняя публичная CLI-проверка — 16 PASS;\n- остальные 13 обязательных PostgreSQL integration-команд с исходными CI-флагами и таймаутами — PASS; четыре legacy-теста транзакций после фактического задания документированного TEST_DSN на ту же собственную PostgreSQL — 4 PASS, без пропусков;\n- build ./..., vet восьми затронутых пакетов, trade и user-card --lint, i18n и diff --check — PASS.\n\nВсе 4249 файлов и Git-режимов остались точными до и после проверок. Кандидат сохраняет только три разрешённых файла: os.Root для записи CLI-фикстур, SQL-получение младших 32 бит advisory lock без сужения Go и исправление прежнего описания scalar user_card. Tree: a914cbb97069522ac5c06742f08a81c0b0a99f6f. Исходный HEAD: c39d296f73de29e7bad657bdf087f00e4384c7e1. Код не опубликован; журналы и точный патч сохранены приватно. Одинаковый неуспешный полный прогон не повторяется.\n\nНужен ответ мейнтейнера: какую совместимую среду либо конечную доработку, привязанную к этому исходному HEAD, разрешить для завершения полного PostgreSQL UI с прежней инвентаризацией, race/count=1 и лимитом 20 минут? Текущий объём решения №6657679692 ограничен тремя файлами; общая фикстура навигации требует отдельного точного решения перед её изменением. Все правила lint, обязательные проверки, независимый REVIEW нового HEAD после публикации FIX и CI8 сохраняются.\n\n<!-- pp:fix-handoff needs-decision head=c39d296f73de29e7bad657bdf087f00e4384c7e1 -->\n\nGenerated-with: Codex\n"
+        }
+      },
+      {
+        "cursor": "Y3Vyc29yOnYyOpPPAAABoaxtmFABqzM1MjU5OTcwNTY4",
+        "node": {
+          "__typename": "LabeledEvent",
+          "id": "LE_lADOSKrn-s8AAAABcWoMl88AAAAINah0CA",
+          "createdAt": "2026-11-05T15:57:06Z",
+          "actor": {
+            "login": "ivanarama"
+          },
+          "label": {
+            "name": "needs-decision"
+          }
+        }
+      },
+      {
+        "cursor": "Y3Vyc29yOnYyOpPPAAABoaxunggBqzM1MjYwMTAxNzY2",
+        "node": {
+          "__typename": "UnlabeledEvent",
+          "id": "UNLE_lADOSKrn-s8AAAABcWoMl88AAAAINap0hg",
+          "createdAt": "2026-11-05T15:58:13Z",
+          "actor": {
+            "login": "ivanarama"
+          },
+          "label": {
+            "name": "changes-requested"
+          }
+        }
+      },
+      {
+        "cursor": "Y3Vyc29yOnYyOpPPAAABoa1kqlAAqjY2Njg0NjcyMzk=",
+        "node": {
+          "__typename": "IssueComment",
+          "id": "IC_kwDOSKrn-s8AAAABjXi8Jw",
+          "fullDatabaseId": "6668467239",
+          "createdAt": "2026-11-05T20:26:58Z",
+          "lastEditedAt": null,
+          "author": {
+            "login": "ivanarama"
+          },
+          "body": "Решение сопровождающего в рамках явно делегированной владельцем технической автономии от 08.10.2026.\n\nОснование: Каноническое полное REVIEW №6624904847 точного HEAD сохраняет два исходных блокера: G703/G115 в тестах и неверное прежнее описание scalar user_card. Последующее решение №6657679692 уже потреблено подлинным handoff FIX №6662598671: lint V2 прошёл, однако полный PostgreSQL UI завершился timeout20m после 1652 из1883 верхних тестов, поэтому приёмка не завершена. Это суммарный предел пакета, не доказанное зависание названного последнего теста. Выбираю для этого exact source только новое расписание полного PG UI: восемь последовательных процессов вместо одного. Проверенный отдельный профиль использует существующие неизменённые inventory/event validators и сохраняет все имена, race/count1,20m на процесс. Его синтетические контроли не являются продуктовым PASS. Решение не переносит доказательства либо полномочия другого PR и не меняет контракт среза B плана197.\n\nРазрешаю одну содержательную доработку: Сохранить объём двух исходных блокеров: изменять только internal/cli/user_card_table_part_test.go, internal/ui/user_card_table_part_snapshot_test.go и соответствующее прежнее описание scalar user_card в docs/features.md. Запись CLI-фикстур ограничить os.Root внутри собственного временного проекта без подавлений G703; при наблюдении PostgreSQL advisory lock получать фактические младшие 32 бита lockKey без сужающего преобразования Go и без ослабления синхронизации/проверок; исправить устаревшую фразу о неподдерживаемой ТЧ, сохранив совместимость field для eq/ne и новый table_part/column для in/not_in. Продуктовые файлы, план, зависимости, .golangci.yml и CI workflows не менять. Подготовленный приватный кандидат можно восстановить только после проверки исходного HEAD, патча и полного дерева; его прошлые частичные проверки не заменяют недостающую полную приёмку. Для НОВОГО полного локального lint этого конечного кандидата выбираю существующий изолированный профиль operator 2.11.4-onebase-leaf-perf1: Go1.26.10 Darwin/amd64 CGO1, -j2/GOMAXPROCS2/GOMEMLIMIT3GiB/GOGC50, общий lint-flock, все пакеты ./... включая тесты, прежние семь линтеров и неизменные rules/exclusions, внутренний предел10m и внешний630s. Использовать точный уже проверенный bootstrap/profile/binary с новым приватным каталогом артефактов; их идентичности закреплены в неизменяемом scope этого решения. Это явно операторская сборка, не официальный upstream; официальный CI pin остаётся2.11.4, его новый exact-HEAD lint и все CI8 обязательны. Успех локального lint допускается только после реального exit0 на фактическом полном дереве, проверки целостности до/после и сохранения журнала. Другие деревья и прежний timeout не засчитывать. Все сценарии и assertions сохранить: публичный check/describe для корректных и некорректных селекторов; полная ^TestUserCard матрица UI/CLI/launcher с race/count1/atomic на SQLite и отдельном реальном PostgreSQL16 UTF8, включая standalone/read-snapshot/уже открытую DSL READ COMMITTED, конкурентную смену учётки и удаление, read-your-writes/rollback, отказ через not_in/not/any, предел1000/1001, HTTP/REST/DSL/XLSX/SSE и отрицательные контроли. Завершить все полные затронутые пакеты с реальной инвентаризацией и учётом SKIP отдельно, build/vet, проверки trade/user-card --lint, i18n и diff. Падение postgres-integration до тестов не считать успехом и не перезапускать вслепую; SQL-матрица не заменяет этот обязательный CI. Единственный обычный FIX публикует реальный непустой content-коммит с точным PP-Fix-Transition; затем новое независимое REVIEW и все восемь обязательных успешных CI, controller ship и serial MERGE. Все действующие паузы FIX/worker сохранить; решение не разрешает запуск второго исполнителя, снятие паузы, изменение активных задач или публикацию приватной диагностики. Выбор профиля V2 заменяет только предыдущее конкретное локальное исполнение lint для этого HEAD: использовать проверенные bootstrap/profile/supervisor, связанные приватным scope, общий flock и НОВЫЙ абсолютный каталог артефактов. Полный lint должен быть выполнен заново на фактическом полном дереве с реальным exit0 и проверкой всех файлов/режимов до и после; старые timeout, частичные матрицы и результаты другого дерева не засчитывать. Для обычного полного unit/race/count1/atomic runner не экспортировать TEST_DATABASE_URL глобально; отдельно выполнить каждую обязательную PostgreSQL integration-команду с её настоящими CI flags/timeouts и всю принятую SQLite/PostgreSQL публичную матрицу. Сохранить все source-specific runner/инвентаризацию/точные deadlines; пропуски учитывать отдельно. До исполнения указатель этого конечного решения и проверенного V2 должен быть CAS-доставлен в BOTH FIXseries2 и фактическую unstarted pending native FIX task; active prompts не менять. Ни scope, ни доставленный указатель не заменяют обычную FIX election и актуальную публичную авторизацию. НОВОЕ конечное уточнение для handoff №6662598671: вместо повторения уже неуспешной монолитной команды PostgreSQL UI разрешаю завершить ВЕСЬ пакет ./internal/ui восемью строго последовательными группами свежей полной инвентаризации Test/Example/Fuzz-seed. Использовать только неизменённый приватный pg_ui_groups.py и прежние закреплённые validators, чьи точные пути и SHA256 записаны в поле pg_ui_execution этого scope. Применение выбора относится исключительно к #2480 указанного HEAD и точному сохранённому трёхфайловому кандидату a914cbb97069522ac5c06742f08a81c0b0a99f6f после повторной проверки всех байтов/режимов. Профиль первоначально подготовлен отдельно; его метаданные другого PR не являются исходным proof или авторизацией #2480. Запуск из собственной candidate root с новым приватным абсолютным --artifacts, Go1.26.10, рабочим Node и собственной PostgreSQL16 UTF8 с реальной проверкой кириллицы; TEST_DATABASE_URL только для PG-этапа. Сохранить -race -count=1 -timeout=20m -json каждого процесса; группы последовательно, без увеличения concurrency. Все верхние имена должны исполниться ровно один раз, все начатые подтесты завершиться; отсутствие/дубликат/лишнее имя, fail-event, неполный процесс, изменённые source/tools/environment либо timeout прекращают приёмку. SKIP учитывается отдельно и не заменяет обязательные PG-ветки. Старые частичные PG UI журналы не переносить: никакого checkpoint/resume или засчитывания прежнего незавершённого пакета. Это меняет только grouping/суммарное расписание полного локального PG UI, не тестовые assertions, fixtures, продукт, frozen runner, workflows либо CI. Остальные13 PostgreSQL-команд и legacy TEST_DSN, полная SQLite/PG публичная матрица, обычный полный race/atomic inventory runner, lint V2, build/vet/trade/i18n и все прежние отрицательные контроли остаются обязательны по обычным exact-tree правилам. Изменение общей navigation-фикстуры НЕ разрешено этим решением. Опубликовать только после всей реальной приёмки через один обычный FIX с точным PP-Fix-Transition; затем новое независимое полное REVIEW, истинные CI8, controller-only ship и serial MERGE. До нового исполнения этот exact scope с SHA256 должен быть доставлен в BOTH series2 и фактическую unstarted pending native FIX; текущую FIX16920/#2523 и её prompt не менять.\n\nСохранить принятый пользовательский контракт. Исполнитель — один FIX; не создавать дубликат PR. После push обязательны независимый REVIEW нового точного HEAD и все обязательные проверки main. Не обходить CI, не менять защиту ветки, не редактировать исторические pp-доказательства и не скрывать изменения в пустом коммите или base-sync. Новые продуктовые развилки возвращать владельцу.\n\npp:fix-decision c39d296f73de29e7bad657bdf087f00e4384c7e1\n\n<!-- pp:owner-autonomous-technical pr=2480 review=6624904847 epoch=a499a54d1531fe7fb37d4714b84bc4fcbf1930d6e166583959c72f03e7e48b68 -->\n\nGenerated-with: Codex\n"
+        }
+      },
+      {
+        "cursor": "Y3Vyc29yOnYyOpPPAAABoa1kyZABqzM1MjgzNjYxOTYz",
+        "node": {
+          "__typename": "LabeledEvent",
+          "id": "LE_lADOSKrn-s8AAAABcWoMl88AAAAINxH0iw",
+          "createdAt": "2026-11-05T20:27:06Z",
+          "actor": {
+            "login": "ivanarama"
+          },
+          "label": {
+            "name": "changes-requested"
+          }
+        }
+      },
+      {
+        "cursor": "Y3Vyc29yOnYyOpPPAAABoa1k3RgBqzM1MjgzNjY4MjA2",
+        "node": {
+          "__typename": "UnlabeledEvent",
+          "id": "UNLE_lADOSKrn-s8AAAABcWoMl88AAAAINxIM7g",
+          "createdAt": "2026-11-05T20:27:11Z",
+          "actor": {
+            "login": "ivanarama"
+          },
+          "label": {
+            "name": "needs-decision"
+          }
+        }
+      },
+      {
+        "cursor": "Y3Vyc29yOnYyOpPPAAABobNJ7WgH2gAzNTE1MDA0OTk2NzoyOTAwMGUzMDg3ZjkyYzdlNjA3YjBlMjc3ZDRhOTI4N2NhNDRjYzRh",
+        "node": {
+          "__typename": "PullRequestCommit",
+          "id": "PURC_lADOSKrn-s8AAAABMveGr9oAKDI5MDAwZTMwODdmOTJjN2U2MDdiMGUyNzdkNGE5Mjg3Y2E0NGNjNGE",
+          "commit": {
+            "oid": "29000e3087f92c7e607b0e277d4a9287ca44cc4a"
+          }
+        }
+      },
+      {
+        "cursor": "Y3Vyc29yOnYyOpPPAAABobNLf8AH2gAzNTE1MDA0OTk2NzpmM2JiZWQyYjUxNWNlOWZkYWI0M2EwODljYWQ0NWRiOTI3NzNjMjFj",
+        "node": {
+          "__typename": "PullRequestCommit",
+          "id": "PURC_lADOSKrn-s8AAAABMveGr9oAKGYzYmJlZDJiNTE1Y2U5ZmRhYjQzYTA4OWNhZDQ1ZGI5Mjc3M2MyMWM",
+          "commit": {
+            "oid": "f3bbed2b515ce9fdab43a089cad45db92773c21c"
+          }
+        }
+      },
+      {
+        "cursor": "Y3Vyc29yOnYyOpPPAAABobPY-oAAqjY3MDEwNTk0MzQ=",
+        "node": {
+          "__typename": "IssueComment",
+          "id": "IC_kwDOSKrn-s8AAAABj2oNag",
+          "fullDatabaseId": "6701059434",
+          "createdAt": "2026-11-07T02:31:44Z",
+          "lastEditedAt": null,
+          "author": {
+            "login": "ivanarama"
+          },
+          "body": "Доработано по завершённому ревью текущего исходного HEAD.\n\n- В публичной CLI-регрессии чтение и запись файлов выполняются через `os.Root`: устранены оба G703 без ослабления отрицательных сценариев.\n- В PostgreSQL snapshot-тесте младшие 32 бита advisory lock сопоставляются в SQL; устранён G115, сохранены барьеры конкурентных изменений и проверки результата.\n- Исправлено противоречие в документации: для табличных частей описаны `in`/`not_in`, ссылка на сценарий и ограничение scalar-проверок `eq`/`ne`.\n\nОтправлен обычный непустой content-коммит `f3bbed2b515ce9fdab43a089cad45db92773c21c`, дерево `d4c78caf0fba98d7c9eaca174979c19fd206b45b`. Его проверенная база — исторический `main` `0a33e5b8736d9f636b7256a5c366d4a1054646c1`; более поздние изменения `main` эти результаты не включают. Исправление отдельно от merge-коммита базы, с `Generated-with: Codex` и точным `PP-Fix-Transition`.\n\nНа этом дереве завершены 25 логических проверок с Go 1.26.10: build, vet затронутых пакетов и потребителей, полный operator lint V2 (все семь правил), trade/user-card/i18n/diff, полный unit/race-набор 116 пакетов, все 13 PG-пакетов, четыре legacy-транзакции и полный UI на PostgreSQL в восьми свежих группах. UI: все 1893 верхних имени ровно один раз, 1883 PASS и 10 SKIP; события тестов/подтестов — 5421 PASS, 15 SKIP, 0 FAIL. Все шесть критических PG snapshot-сценариев — PASS. Отдельный публичный CLI-тест на Windows: 16 PASS, 0 SKIP/FAIL.\n\nПропуски PG не вызваны отсутствием DSN, клиента или прав. Пять UI-пропусков относятся к неподходящему диалекту; противоположные ветки прошли. Десять браузерных сценариев/fixture локально не выполнялись и не считаются PASS: применимые Windows/E2E CI остаются обязательными.\n\nОшибки нашей тестовой обвязки сохранены отдельно: первый optional preflight не нашёл чужой тест и остановился до запуска пакетов; исправленный полный unit-набор затем прошёл. После него строгий файловый guard обнаружил единственный Python bytecode-файл, созданный неизменённым pipelinecontract-тестом: байты архивированы и сопоставлены со свежей компиляцией исходника, удалён только этот файл, полный guard 4284 файлов/index восстановлен. Unit и девять ранее успешных стадий не повторялись; исходные отказы не переписаны в PASS. Итоговый aggregate SHA-256: `b1f401b3fc4817f4f562e070a6f561c3b00bc00061a25a7a6f15e78203c98064`.\n\nНезависимый статический аудит всех 17 файлов и итоговых доказательств выполнен отдельно от автора. Это ручная доработка, без заявления Native lease/admission. Далее нужны новое полное каноническое REVIEW и CI8 этого HEAD, затем обычная доказанная синхронизация с актуальным `main` и REVIEW/CI8 нового integration HEAD. Метки reviewed/ship этим комментарием не устанавливаются.\n\n<!-- pp:fix-pushed from=c39d296f73de29e7bad657bdf087f00e4384c7e1 head=f3bbed2b515ce9fdab43a089cad45db92773c21c review-comment=6624904847 claim=6624905677 epoch-sha256=a499a54d1531fe7fb37d4714b84bc4fcbf1930d6e166583959c72f03e7e48b68 -->\n"
+        }
+      },
+      {
+        "cursor": "Y3Vyc29yOnYyOpPPAAABobPZRLgBqzM1NDA5MDc2Mjcx",
+        "node": {
+          "__typename": "UnlabeledEvent",
+          "id": "UNLE_lADOSKrn-s8AAAABcWoMl88AAAAIPougLw",
+          "createdAt": "2026-11-07T02:32:03Z",
+          "actor": {
+            "login": "ivanarama"
+          },
+          "label": {
+            "name": "changes-requested"
+          }
+        }
+      },
+      {
+        "cursor": "Y3Vyc29yOnYyOpPPAAABobQBy7gAqjY3MDE1Mjc3Mzg=",
+        "node": {
+          "__typename": "IssueComment",
+          "id": "IC_kwDOSKrn-s8AAAABj3Eyug",
+          "fullDatabaseId": "6701527738",
+          "createdAt": "2026-11-07T03:16:19Z",
+          "lastEditedAt": null,
+          "author": {
+            "login": "ivanarama"
+          },
+          "body": "**Ревью.** (круг 2)\nReviewed-SHA: f3bbed2b515ce9fdab43a089cad45db92773c21c\nOutcome-Label: reviewed\nЧто меняется: Добавлен набор user_card из табличной части карточки сотрудника для in/not_in: строгий селектор и типы, один SQL statement в текущей транзакции, типизированный dedupe, предел 1000 исходных строк и закрытие всей политики роли при недоступном источнике. Обновлены schema/describe, редактор роли, пример и документация..\nПроверено: Полное независимое ревью HEAD f3bbed2b515ce9fdab43a089cad45db92773c21c: прочитаны весь diff (17 файлов), план 197, реализация и потребители. Проверены отрицательные условия, OR ролей, типы, отсутствие кеширования значений и сохранение скалярного режима.; Среда: Go 1.26.10 darwin/amd64, SQLite и отдельный PostgreSQL 16.13 с en_US.UTF-8. go build -p 2 ./...: PASS.; go test -p 2 -count=1: полные internal/access, auth, cli, configcheck, i18n, launcher, storage, api, widget, entityservice и UI. Совокупно 11190 PASS, 42 SKIP, 0 FAIL (события тестов и подтестов). Причины пропусков сохранены; они не засчитаны как выполненные PASS.; UI выполнен четырьмя частями с обычным лимитом каждого процесса: все 1893 теста верхнего уровня из фактической инвентаризации исполнены ровно один раз, пропусков инвентаризации и лишних запусков нет.; go test -p 2 -race -count=1 -run ^TestUserCard ./internal/ui ./internal/cli ./internal/launcher: 448 PASS, 0 FAIL, 0 SKIP. Публичные HTTP/REST/DSL, выгрузка, SSE, типы, 1000/1001 строк, read-only, собственные записи, rollback и согласованность снимка проверены на обоих диалектах.; Отрицательный контроль через приватный go -overlay с двухзапросным reader: получены ровно 6 ожидаемых нарушений согласованности и 6 успешных контролей стабильного снимка. Исходный checkout не изменялся; настоящая реализация проходит все 12 сценариев.; go vet всех 11 проверенных пакетов; go run ./cmd/onebase check --project examples/trade; check --project examples/user-card --lint; go run ./tools/i18ncheck; git diff --check: PASS. После проверок checkout чистый и HEAD неизменен.; Обязательные CI текущего HEAD: build, lint, postgres-integration, vuln, smoke, e2e, test-windows, launcher-webview-build — все 8 completed/success. Проверены новейшие check-runs этого SHA от GitHub Actions в run 42329634703..\nБлокирующее: нет.\nХвост:\n—\nВердикт: годится к мержу.\n<!-- pp:review pp:tail=0 -->"
+        }
+      },
+      {
+        "cursor": "Y3Vyc29yOnYyOpPPAAABobQB04gAqjY3MDE1MjgyMjU=",
+        "node": {
+          "__typename": "IssueComment",
+          "id": "IC_kwDOSKrn-s8AAAABj3E0oQ",
+          "fullDatabaseId": "6701528225",
+          "createdAt": "2026-11-07T03:16:21Z",
+          "lastEditedAt": null,
+          "author": {
+            "login": "ivanarama"
+          },
+          "body": "PromptPilot service marker: REVIEW result publication claimed.\n<!-- pp:review-claim f3bbed2b515ce9fdab43a089cad45db92773c21c review-comment=6701527738 epoch-sha256=0db8afe10102ce33ddc7c5fda2ee3f4d36083c644723294746121d541b35a9bc -->"
+        }
+      },
+      {
+        "cursor": "Y3Vyc29yOnYyOpPPAAABobQB30ABqzM1NDEwODUwNjgx",
+        "node": {
+          "__typename": "LabeledEvent",
+          "id": "LE_lADOSKrn-s8AAAABcWoMl88AAAAIPqazeQ",
+          "createdAt": "2026-11-07T03:16:24Z",
+          "actor": {
+            "login": "ivanarama"
+          },
+          "label": {
+            "name": "reviewed"
+          }
+        }
+      },
+      {
+        "cursor": "Y3Vyc29yOnYyOpPPAAABobQB6vgAqjY3MDE1MjkxMjk=",
+        "node": {
+          "__typename": "IssueComment",
+          "id": "IC_kwDOSKrn-s8AAAABj3E4KQ",
+          "fullDatabaseId": "6701529129",
+          "createdAt": "2026-11-07T03:16:27Z",
+          "lastEditedAt": null,
+          "author": {
+            "login": "ivanarama"
+          },
+          "body": "PromptPilot service marker: REVIEW result committed.\n<!-- pp:head-reviewed f3bbed2b515ce9fdab43a089cad45db92773c21c review-comment=6701527738 claim=6701528225 epoch-sha256=0db8afe10102ce33ddc7c5fda2ee3f4d36083c644723294746121d541b35a9bc -->"
+        }
+      },
+      {
+        "cursor": "Y3Vyc29yOnYyOpPPAAABobQHNnABqzM1NDExMDc3OTk3",
+        "node": {
+          "__typename": "LabeledEvent",
+          "id": "LE_lADOSKrn-s8AAAABcWoMl88AAAAIPqorbQ",
+          "createdAt": "2026-11-07T03:22:14Z",
+          "actor": {
+            "login": "ivanarama"
+          },
+          "label": {
+            "name": "ship"
+          }
+        }
+      },
+      {
+        "cursor": "Y3Vyc29yOnYyOpPPAAABobQMFIgAqjY3MDE2NDMyNzk=",
+        "node": {
+          "__typename": "IssueComment",
+          "id": "IC_kwDOSKrn-s8AAAABj3L2Dw",
+          "fullDatabaseId": "6701643279",
+          "createdAt": "2026-11-07T03:27:33Z",
+          "lastEditedAt": null,
+          "author": {
+            "login": "ivanarama"
+          },
+          "body": "<!-- pp:base-sync-intent from=f3bbed2b515ce9fdab43a089cad45db92773c21c base=11fdb64cb92349ef89dd6331b0fc14707cd40232 review-comment=6701527738 claim=6701528225 completion=6701529129 ship-event=LE_lADOSKrn-s8AAAABcWoMl88AAAAIPqorbQ previous=none -->"
+        }
+      }
+    ]
+  },
+  "pr": {
+    "number": 2480,
+    "state": "open",
+    "merged": false,
+    "draft": false,
+    "labels": [
+      {
+        "name": "ship"
+      },
+      {
+        "name": "reviewed"
+      },
+      {
+        "name": "queue:p0"
+      }
+    ],
+    "head": {
+      "sha": "f3bbed2b515ce9fdab43a089cad45db92773c21c",
+      "ref": "fix/2069",
+      "repo": {
+        "full_name": "ivanarama/onebase"
+      }
+    },
+    "base": {
+      "sha": "0a33e5b8736d9f636b7256a5c366d4a1054646c1",
+      "ref": "main",
+      "repo": {
+        "full_name": "ivanarama/onebase"
+      }
+    }
+  },
+  "main": {
+    "ref": "refs/heads/main",
+    "object": {
+      "sha": "11fdb64cb92349ef89dd6331b0fc14707cd40232",
+      "type": "commit",
+      "url": "https://api.github.com/repos/ivanarama/onebase/git/commits/11fdb64cb92349ef89dd6331b0fc14707cd40232"
+    }
+  },
+  "commit": {
+    "sha": "f3bbed2b515ce9fdab43a089cad45db92773c21c",
+    "tree": {
+      "sha": "d4c78caf0fba98d7c9eaca174979c19fd206b45b",
+      "url": "https://api.github.com/repos/ivanarama/onebase/git/trees/d4c78caf0fba98d7c9eaca174979c19fd206b45b"
+    },
+    "parents": [
+      {
+        "sha": "29000e3087f92c7e607b0e277d4a9287ca44cc4a",
+        "url": "https://api.github.com/repos/ivanarama/onebase/git/commits/29000e3087f92c7e607b0e277d4a9287ca44cc4a",
+        "html_url": "https://github.com/ivanarama/onebase/commit/29000e3087f92c7e607b0e277d4a9287ca44cc4a"
+      }
+    ]
+  },
+  "checks": {
+    "total_count": 14,
+    "check_runs": [
+      {
+        "id": 128273440494,
+        "name": "smoke",
+        "head_sha": "f3bbed2b515ce9fdab43a089cad45db92773c21c",
+        "app": {
+          "id": 15368
+        },
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "id": 128272998283,
+        "name": "bench",
+        "head_sha": "f3bbed2b515ce9fdab43a089cad45db92773c21c",
+        "app": {
+          "id": 15368
+        },
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "id": 128272998256,
+        "name": "Smoke windows-latest / shared",
+        "head_sha": "f3bbed2b515ce9fdab43a089cad45db92773c21c",
+        "app": {
+          "id": 15368
+        },
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "id": 128272998234,
+        "name": "lint",
+        "head_sha": "f3bbed2b515ce9fdab43a089cad45db92773c21c",
+        "app": {
+          "id": 15368
+        },
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "id": 128272998214,
+        "name": "e2e",
+        "head_sha": "f3bbed2b515ce9fdab43a089cad45db92773c21c",
+        "app": {
+          "id": 15368
+        },
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "id": 128272998202,
+        "name": "test-windows",
+        "head_sha": "f3bbed2b515ce9fdab43a089cad45db92773c21c",
+        "app": {
+          "id": 15368
+        },
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "id": 128272998197,
+        "name": "Smoke ubuntu-latest / private",
+        "head_sha": "f3bbed2b515ce9fdab43a089cad45db92773c21c",
+        "app": {
+          "id": 15368
+        },
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "id": 128272998187,
+        "name": "postgres-integration",
+        "head_sha": "f3bbed2b515ce9fdab43a089cad45db92773c21c",
+        "app": {
+          "id": 15368
+        },
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "id": 128272998181,
+        "name": "build",
+        "head_sha": "f3bbed2b515ce9fdab43a089cad45db92773c21c",
+        "app": {
+          "id": 15368
+        },
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "id": 128272998180,
+        "name": "Smoke windows-latest / private",
+        "head_sha": "f3bbed2b515ce9fdab43a089cad45db92773c21c",
+        "app": {
+          "id": 15368
+        },
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "id": 128272998169,
+        "name": "Smoke ubuntu-latest / shared",
+        "head_sha": "f3bbed2b515ce9fdab43a089cad45db92773c21c",
+        "app": {
+          "id": 15368
+        },
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "id": 128272998155,
+        "name": "vuln",
+        "head_sha": "f3bbed2b515ce9fdab43a089cad45db92773c21c",
+        "app": {
+          "id": 15368
+        },
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "id": 128272998154,
+        "name": "launcher-webview-build",
+        "head_sha": "f3bbed2b515ce9fdab43a089cad45db92773c21c",
+        "app": {
+          "id": 15368
+        },
+        "status": "completed",
+        "conclusion": "success"
+      },
+      {
+        "id": 128272943615,
+        "name": "classify",
+        "head_sha": "f3bbed2b515ce9fdab43a089cad45db92773c21c",
+        "app": {
+          "id": 15368
+        },
+        "status": "completed",
+        "conclusion": "success"
+      }
+    ]
+  },
+  "required_checks": [
+    "build",
+    "lint",
+    "postgres-integration",
+    "vuln",
+    "smoke",
+    "e2e",
+    "test-windows",
+    "launcher-webview-build"
+  ]
+}
