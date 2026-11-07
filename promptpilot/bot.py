@@ -3306,7 +3306,7 @@ def _machine_remote(machine: str):
     return machine_remote(m) if m and m.get("host") else None
 
 
-async def _herdr_cli(*args, host=None, timeout=15):
+async def _herdr_cli(*args, host=None, timeout=15, allow_error=False):
     """Run a herdr CLI command (locally or on `host`). Raw stdout or None."""
     import asyncio
     from .herdr_exec import herdr_argv
@@ -3323,13 +3323,14 @@ async def _herdr_cli(*args, host=None, timeout=15):
         out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except (FileNotFoundError, OSError, asyncio.TimeoutError):
         return None
-    if proc.returncode != 0:
+    if proc.returncode != 0 and not allow_error:
         return None
     return (out or err or b"").decode("utf-8", "replace")
 
 
-async def _herdr_json(*args, host=None, timeout=15):
-    raw = await _herdr_cli(*args, host=host, timeout=timeout)
+async def _herdr_json(*args, host=None, timeout=15, allow_error=False):
+    options = {'allow_error': True} if allow_error else {}
+    raw = await _herdr_cli(*args, host=host, timeout=timeout, **options)
     if raw is None:
         return None
     try:
@@ -3814,6 +3815,73 @@ async def _log_pane_prompt(pane: str, machine: str, host, text: str):
         logger.warning("prompt_log: запись не удалась: %s", e)
 
 
+def _native_same_terminal(before, after):
+    identity = before.get('terminal_id') or before.get('agent_session')
+    return bool(identity and identity == (after.get('terminal_id') or after.get('agent_session'))
+                and before.get('pane_id') == after.get('pane_id'))
+
+
+def _native_reply_started(before, after):
+    if not _native_same_terminal(before, after):
+        return False
+    if after.get('agent_status') == 'working' and before.get('agent_status') != 'working':
+        return True
+    old, new = before.get('completion_seq'), after.get('completion_seq')
+    return type(old) is int and type(new) is int and new > old
+
+
+async def _submit_native_reply(pane, prompt, before, host, allowed):
+    """Distinguish pasted text from a started turn; never paste the request twice."""
+    if before.get('agent_status') == 'blocked':
+        return 'blocked'
+    if before.get('agent_status') not in ('idle', 'done', 'working'):
+        return 'unconfirmed'
+    reply = await _herdr_json('agent', 'prompt', pane, prompt, '--wait', '--until',
+                              'working', '--timeout', '7000', host=host,
+                              timeout=12, allow_error=True)
+    if not await allowed():
+        return 'denied'
+    result = (reply or {}).get('result')
+    after = result.get('agent', {}) if isinstance(result, dict) else {}
+    if _native_reply_started(before, after):
+        return 'started'
+    if (isinstance(result, dict) and before.get('agent_status') == 'working'
+            and after.get('agent_status') == 'working' and _native_same_terminal(before, after)):
+        return 'busy'
+    if ((reply or {}).get('error') or {}).get('code') != 'agent_prompt_stalled':
+        return 'unconfirmed'
+    state = await _herdr_json('agent', 'get', pane, host=host)
+    current = ((state or {}).get('result') or {}).get('agent') or {}
+    if not await allowed():
+        return 'denied'
+    if _native_reply_started(before, current):
+        return 'started'
+    sequence = before.get('state_change_seq')
+    # Recover only the exact unchanged idle input box. Never press Enter in a
+    # permission dialog, a replacement terminal, or a turn that already moved.
+    if (current.get('agent_status') not in ('idle', 'done')
+            or before.get('agent_status') not in ('idle', 'done')
+            or not _native_same_terminal(before, current)
+            or type(sequence) is not int or current.get('state_change_seq') != sequence
+            or before.get('agent') != 'codex'):
+        return 'unconfirmed'
+    # Same non-character paste boundary as Herdr's upstream Windows Codex fix:
+    # https://github.com/herdrdev/herdr/pull/3961 . Right commits the buffered
+    # paste before Enter, instead of racing another bare Enter against it.
+    sent = await _herdr_json('agent', 'send-keys', pane, 'right', 'enter', host=host)
+    if not sent or not sent.get('result'):
+        return 'unconfirmed'
+    for _ in range(8):
+        await asyncio.sleep(.35)
+        state = await _herdr_json('agent', 'get', pane, host=host)
+        after = ((state or {}).get('result') or {}).get('agent') or {}
+        if _native_reply_started(before, after):
+            return 'started'
+        if not _native_same_terminal(before, after) or after.get('agent_status') == 'blocked':
+            break
+    return 'unconfirmed'
+
+
 async def herdr_reply_got_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pane = context.user_data.pop("herdr_reply_pane", None)
     host = context.user_data.pop("herdr_reply_host", None)
@@ -3829,15 +3897,23 @@ async def herdr_reply_got_text(update: Update, context: ContextTypes.DEFAULT_TYP
     if not await _check_herdr_reply_access(update):
         return ConversationHandler.END
     prompt = (result_files.native_instruction(delivery) if delivery else '') + update.message.text
-    res = await _herdr_json("agent", "prompt", pane, prompt, host=host)
-    if res and res.get("result"):
+    if not isinstance(agent, dict):
+        await update.message.reply_text('Сессия недоступна; запрос не отправлен.')
+        return ConversationHandler.END
+    async def allowed():
+        return await _check_herdr_reply_access(update)
+    submitted = await _submit_native_reply(pane, prompt, agent, host, allowed)
+    if submitted in ('started', 'busy'):
         if delivery:
             db.save_native_file_context(_herdr_watch_source(machine, host), delivery)
-        await update.message.reply_text("Отправлено ✓")
+        await update.message.reply_text('Запрос запущен ✓' if submitted == 'started'
+                                       else 'Передано в работающую сессию. Выполнение этого сообщения отдельно пока не подтверждено.')
         if LOG_PROMPTS:
             await _log_pane_prompt(pane, machine, host, update.message.text)
-    else:
-        await update.message.reply_text("Не удалось отправить — агент ещё существует?")
+    elif submitted == 'blocked':
+        await update.message.reply_text('Сессия ожидает подтверждения. Запрос не вставлен; сначала ответьте на диалог в сессии.')
+    elif submitted != 'denied':
+        await update.message.reply_text('Не удалось подтвердить запуск запроса. Текст мог остаться в поле ввода; проверьте экран сессии. Повторная вставка не выполнялась.')
     return ConversationHandler.END
 
 
