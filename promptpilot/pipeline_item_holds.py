@@ -227,6 +227,11 @@ def _attempt_key(task_id):
     return BASELINE + "attempt:" + str(task_id)
 
 
+def _task_identity(task):
+    return all(type(value) is int and value > 0 for value in (
+        getattr(task, "id", None), getattr(task, "series_id", None)))
+
+
 def released_progress(task):
     try:
         baseline = json.loads(db.get_setting(_attempt_key(task.id))
@@ -239,12 +244,14 @@ def released_progress(task):
 
 def progress_attempt_blocked(task, data):
     """A racing second claimed task must stop before even calling next."""
+    if not _task_identity(task):
+        return False
     from .merge_admission_progress import validate_facts, pp
     try:
-        holds = json.loads(db.get_setting(PREFIX + str(task.series_id)) or "{}")
         candidates = (data.get("diagnostics") or {}).get("merge_executable") or []
         if len(candidates) != 1 or candidates[0].get("stage") != "integration-merge-recovery":
             return False
+        holds = json.loads(db.get_setting(PREFIX + str(task.series_id)) or "{}")
         item = candidates[0]
         hold = holds.get(str(item["number"]))
         if (not isinstance(hold, dict) or hold.get("stage") != "merge" or hold.get("head") != item["head"]
@@ -268,6 +275,8 @@ def unproved_progress_hold(task, data, verified_progress):
     requires the separately verified canonical transition. Unrelated targets
     keep their existing election/exclusion policy.
     """
+    if not _task_identity(task):
+        return False
     try:
         items = (data.get("diagnostics") or {}).get("merge_executable") or []
         if len(items) != 1 or items[0].get("stage") != "integration-merge-recovery":

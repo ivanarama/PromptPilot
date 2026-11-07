@@ -58,6 +58,9 @@ def _target(queue, data, holds, task):
 
 def measurements(pi, task, profile_id, profile, queue, data, working_dir=None):
     """Return at most one authenticated hint; never elect, claim or run next."""
+    from .pipeline_item_holds import _task_identity
+    if not _task_identity(task):
+        return {}
     try:
         execution = queue.get("execution") or {}
         if (queue.get("item_blockers") is not True

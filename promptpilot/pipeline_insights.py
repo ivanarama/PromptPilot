@@ -3214,13 +3214,16 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
     from .pipeline_item_holds import (prepare, claim_progress_attempt, released_progress,
                                       progress_attempt_blocked, unproved_progress_hold)
     from .merge_progress_probe import measurements
+    progress_scope = (queue.get("item_blockers") is True
+        and str((queue.get("execution") or {}).get("stage") or queue.get("id") or "").lower() == "merge")
     progress_data = read_cached(profile_id, db.list_series()) if queue.get("item_blockers") is True else {}
-    if progress_attempt_blocked(task, progress_data):
+    if progress_scope and progress_attempt_blocked(task, progress_data):
         return {"action": "defer", "mode": "tool", "defer_for": "30m",
                 "reason": "canonical recovery progress was consumed by another occurrence",
                 "profile_id": profile_id, "queue_id": queue.get("id")}
-    progress = measurements(sys.modules[__name__], task, profile_id, profile, queue, progress_data, working_dir)
-    if unproved_progress_hold(task, progress_data, progress):
+    progress = measurements(sys.modules[__name__], task, profile_id, profile, queue, progress_data,
+                            working_dir) if progress_scope else {}
+    if progress_scope and unproved_progress_hold(task, progress_data, progress):
         return {"action": "defer", "mode": "tool", "defer_for": "30m",
                 "reason": "held canonical recovery has no verified unused progress",
                 "profile_id": profile_id, "queue_id": queue.get("id")}
