@@ -1930,6 +1930,78 @@ def test_budget_reservation_release_wakes_deferred_worker_immediately(
     assert stored["budget_wait_scope"] == "github-default"
 
 
+def test_repeated_fix_budget_waits_keep_one_occurrence_and_all_holds(
+        isolated_db, monkeypatch):
+    profile = _profile_with_costs(execution={"mode": "skill"}, core=200)
+    profile["queues"][0].update(id="fix", series_contains="Example - FIX")
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"example": profile})
+    monkeypatch.setattr(pipeline_insights, "_github_rate_limits", lambda: _limits(core=1000))
+    monkeypatch.setattr(worker, "load_providers", lambda: pytest.fail(
+        "a machine-owned budget wait must not load a provider"))
+
+    owner_created = isolated_db.create_task(TaskCreate(
+        prompt="Higher-priority budget owner", recurrence="4h", priority=1))
+    owner = isolated_db.get_next_runnable()
+    assert owner is not None and owner.id == owner_created.id
+    created = isolated_db.create_task(TaskCreate(
+        prompt="Example - FIX", recurrence="4h", priority=2))
+    hold_key = f"pipeline_item_holds:v1:{created.series_id}"
+    holds = json.dumps({str(number): {
+        "head": f"{number:040x}", "stage": "fix", "at": time.time(),
+        "reason": f"#{number} — existing blocker", "task_id": number,
+    } for number in range(1001, 1015)}, ensure_ascii=False, indent=2)
+    isolated_db.set_setting(hold_key, holds)
+
+    # A higher-priority real owner can reacquire between the waiter's wake and
+    # admission. Exercise two genuine release/claim/deny cycles, not two
+    # fabricated terminal НЕ СМОГ reports or manual run_now operations.
+    for attempt in range(2):
+        token = f"fix-contention-{attempt}"
+        assert _reserve(isolated_db, owner, token, core=800)["allowed"]
+        waiter = isolated_db.get_next_runnable()
+        assert waiter is not None and waiter.id == created.id
+        worker.execute_task(waiter)
+
+        deferred = isolated_db.get_task(created.id)
+        series = isolated_db.get_series(created.series_id)
+        assert deferred.status.value == "pending"
+        assert deferred.verdict is None and deferred.result is None
+        assert not series["paused"] and series["auto_pause_reason"] is None
+        assert _budget_wait_row(isolated_db, created.id)["budget_wait_scope"] == "github-default"
+        assert isolated_db.get_setting(hold_key) == holds
+        with isolated_db._connect() as conn:
+            assert conn.execute("SELECT count(*) FROM tasks WHERE series_id = ?",
+                                (created.series_id,)).fetchone()[0] == 1
+        assert isolated_db.get_next_runnable() is None
+        assert isolated_db.release_pipeline_github_budget(
+            "github-default", token=token, task_id=owner.id,
+            task_started_at=owner.started_at)
+
+    # A real reservation release wakes the existing occurrence exactly once,
+    # even when two ordinary queue claimers compete for it.
+    barrier = threading.Barrier(2)
+
+    def claim_waiter(_):
+        barrier.wait()
+        return isolated_db.get_next_runnable()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        claimed = list(pool.map(claim_waiter, range(2)))
+    winners = [task for task in claimed if task is not None]
+    assert len(winners) == 1 and winners[0].id == created.id
+    try:
+        route = pipeline_insights.execution_route(
+            winners[0], winners[0].prompt, retain_budget=True)
+        assert route["action"] == "prompt" and route["mode"] == "skill"
+        ledger = isolated_db.pipeline_github_budget_reservations("github-default")
+        assert ledger["count"] == 1 and ledger["totals"]["core"] == 200
+        assert ledger["items"][0]["task_id"] == created.id
+        assert isolated_db.get_setting(hold_key) == holds
+        assert not isolated_db.get_series(created.series_id)["paused"]
+    finally:
+        pipeline_insights.release_execution_admission()
+
+
 def test_worker_preserves_budget_handoff_for_soft_retry(
         isolated_db, monkeypatch):
     created = isolated_db.create_task(TaskCreate(
