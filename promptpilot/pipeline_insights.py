@@ -390,6 +390,9 @@ def _with_shared_budget_floor(policy: dict) -> dict:
     """Use the strongest hard reserve of every profile sharing this account."""
     floor = dict(policy["minimum_remaining"])
     priority_one_headroom = dict(policy["priority_one_headroom"])
+    snapshot_headroom = {resource: 0 for resource in floor}
+    if policy.get("essential_snapshot_headroom"):
+        snapshot_headroom.update(policy["costs"]["insights"])
     starvation_timeouts = []
     if policy.get("starvation_timeout_seconds", 0) > 0:
         starvation_timeouts.append(policy["starvation_timeout_seconds"])
@@ -402,12 +405,16 @@ def _with_shared_budget_floor(policy: dict) -> dict:
         for resource, value in candidate["priority_one_headroom"].items():
             priority_one_headroom[resource] = max(
                 priority_one_headroom[resource], value)
+        if candidate.get("essential_snapshot_headroom"):
+            for resource, value in candidate["costs"]["insights"].items():
+                snapshot_headroom[resource] = max(snapshot_headroom[resource], value)
         if candidate.get("starvation_timeout_seconds", 0) > 0:
             starvation_timeouts.append(
                 candidate["starvation_timeout_seconds"])
     selected = dict(policy)
     selected["minimum_remaining"] = floor
     selected["priority_one_headroom"] = priority_one_headroom
+    selected["snapshot_headroom"] = snapshot_headroom
     # The reservation ledger is account-wide. Every caller must therefore use
     # one deterministic deadline; the tightest explicit bound wins.
     selected["starvation_timeout_seconds"] = (
@@ -416,6 +423,32 @@ def _with_shared_budget_floor(policy: dict) -> dict:
         raise ValueError(
             "общий github_budget.priority_one_headroom требует "
             "github_budget.costs в каждом профиле с тем же GitHub token")
+    if any(snapshot_headroom.values()) and selected.get("costs") is None:
+        raise ValueError("общий essential snapshot headroom требует github_budget.costs")
+    return selected
+
+
+def _with_execution_snapshot_floor(policy: dict) -> dict:
+    """Keep one shared essential scan possible while provider work is running.
+
+    This is a hard admission gap, distinct from borrowable P1 headroom. Existing
+    soft headroom may already cover it: preserve their maximum, not their sum.
+    account-wide scan lease serializes scans, so protect the componentwise
+    largest scan once, rather than reserving one scan for every task. Scans
+    themselves pay their configured cost against the ordinary floor.
+    """
+    selected = dict(policy)
+    selected["snapshot_headroom_applied"] = False
+    headroom = policy.get("snapshot_headroom") or {}
+    if (policy.get("cost_accounting") and policy.get("budget_route")
+            not in (None, "insights") and any(headroom.values())):
+        soft = (policy.get("priority_one_headroom") or {}
+                if policy.get("priority_headroom_applied") else {})
+        selected["minimum_remaining"] = {
+            resource: minimum + max(0, headroom[resource] - soft.get(resource, 0))
+            for resource, minimum in policy["minimum_remaining"].items()
+        }
+        selected["snapshot_headroom_applied"] = True
     return selected
 
 
@@ -548,6 +581,9 @@ def _priority_budget_metadata(policy: dict) -> dict:
         "priority_headroom_applied": bool(
             policy.get("priority_headroom_applied")),
         "admission_priority": policy.get("admission_priority"),
+        "snapshot_headroom": dict(policy.get("snapshot_headroom") or {
+            resource: 0 for resource in resources}),
+        "snapshot_headroom_applied": bool(policy.get("snapshot_headroom_applied")),
     }
 
 
@@ -897,6 +933,7 @@ def _github_scan_admission(profile: dict, purpose: str,
                 # Optional/fresh scans preserve urgent-task headroom. Essential
                 # snapshot recovery is checked again under the shared lease.
                 policy = _budget_policy_for_admission_priority(policy, 10)
+            policy = _with_execution_snapshot_floor(policy)
     except (TypeError, ValueError) as exc:
         fallback = {
             "minimum_remaining": dict(_DEFAULT_GITHUB_BUDGET_MINIMUM),
@@ -1192,6 +1229,7 @@ def _reserve_execution_admission(
         policy = _budget_policy_for_route(policy, budget_route)
         policy = _budget_policy_for_admission_priority(
             policy, effective_priority)
+        policy = _with_execution_snapshot_floor(policy)
         if not policy.get("cost_accounting"):
             # Profiles without route costs keep the original one-shot floor
             # admission; they neither re-read limits nor create reservations.
