@@ -36,10 +36,10 @@ def reserve_fix(db, search):
     assert result["allowed"]
 
 
-def provider_task(db, priority=1):
-    db.create_task(TaskCreate(prompt="Example - REVIEW", recurrence="4h", priority=priority))
+def provider_task(db, priority=1, prompt="Example - REVIEW"):
+    db.create_task(TaskCreate(prompt=prompt, recurrence="4h", priority=priority))
     task = db.get_next_runnable()
-    return SimpleNamespace(**{**task.model_dump(), "series_title": "Example - REVIEW"})
+    return SimpleNamespace(**{**task.model_dump(), "series_title": prompt})
 
 
 @pytest.mark.parametrize("remaining", [28, 30])
@@ -149,13 +149,85 @@ def test_final_route_recheck_keeps_gap_after_early_admission(isolated_db, monkey
 @pytest.mark.parametrize("priority, floor", [(1, 12), (2, 16)])
 def test_p1_borrows_soft_reserve_but_not_essential_gap(monkeypatch, priority, floor):
     value = profile()
-    value["github_budget"]["priority_one_headroom"] = {"core": 0, "search": 4, "graphql": 0}
+    value["github_budget"]["priority_one_headroom"] = {"core": 0, "search": 14, "graphql": 0}
     monkeypatch.setattr(insights, "_profiles", lambda: {"example": value})
     policy = execution_policy(value, priority=priority)
     assert policy["minimum_remaining"]["search"] == floor
     result = insights._evaluate_github_budget(
         policy, _limits(), now=1000, reserved_other={"core": 0, "search": 12, "graphql": 0})
     assert not result["allowed"]
+
+
+def test_actual_soft_p1_reserve_does_not_double_count_or_starve_idle_fix(
+        isolated_db, monkeypatch):
+    value = profile()
+    value["github_budget"]["priority_one_headroom"] = {
+        "core": 1200, "search": 12, "graphql": 1000,
+    }
+    value["github_budget"]["costs"]["skill"] = {
+        "core": 1200, "search": 12, "graphql": 1000,
+    }
+    monkeypatch.setattr(insights, "_profiles", lambda: {"example": value})
+    monkeypatch.setattr(insights, "_github_rate_limits", _limits)
+    task = provider_task(isolated_db, priority=5)
+    result = insights.execution_route(task, task.prompt)
+    assert result["action"] == "prompt"
+    policy = execution_policy(value, priority=5)
+    assert policy["minimum_remaining"] == {"core": 1450, "search": 14, "graphql": 1100}
+
+
+def test_public_fix_then_merge_then_final_scan_with_actual_search_vectors(
+        isolated_db, monkeypatch):
+    fix, merge = profile(), profile()
+    for value, marker, cost in [(fix, "FIX stage", 12), (merge, "MERGE stage", 8)]:
+        value["queues"][0]["series_contains"] = marker
+        value["github_budget"]["priority_one_headroom"] = {
+            "core": 1200, "search": 12, "graphql": 1000,
+        }
+        value["github_budget"]["costs"]["skill"]["search"] = cost
+    monkeypatch.setattr(insights, "_profiles", lambda: {"fix": fix, "merge": merge})
+    monkeypatch.setattr(insights, "_github_rate_limits", _limits)
+    monkeypatch.setattr(insights, "_run_profile_health_check", lambda *_: {"state": "green"})
+    monkeypatch.setattr(insights, "_github_search", lambda *_: {
+        "count": 0, "items": [], "membership_complete": True})
+    first = provider_task(isolated_db, priority=5, prompt="FIX stage")
+    second = provider_task(isolated_db, prompt="MERGE stage")
+    insights.release_execution_admission()
+    try:
+        # Idle FIX fits: cost12 + max(soft12, scan10) + min2 == 26 <= 30.
+        admitted = insights.execution_route(first, first.prompt, retain_budget=True)
+        assert admitted["action"] == "prompt" and admitted["profile_id"] == "fix"
+        denied = insights.execution_route(second, second.prompt)
+        assert denied["action"] == "defer"
+        assert denied["github_budget"]["minimum_remaining"]["search"] == 12
+        assert denied["github_budget"]["reserved_other"]["search"] == 12
+        # Normal completed-attempt cleanup, never a running owner's refund.
+        isolated_db.mark_completed(first.id, "done")
+        insights.release_execution_admission()
+        assert insights.execution_route(second, second.prompt, retain_budget=True)["action"] == "prompt"
+        decisions = []
+        evaluate = insights._evaluate_github_budget
+
+        def observe(policy, *args, **kwargs):
+            decision = evaluate(policy, *args, **kwargs)
+            if policy.get("budget_route") == "insights":
+                decisions.append(copy.deepcopy(decision))
+            return decision
+
+        monkeypatch.setattr(insights, "_evaluate_github_budget", observe)
+        scanned = insights.analyze("merge", [], use_cache=False)
+        assert scanned["cache"]["complete"] is True
+        assert len(decisions) == 1 and decisions[0]["allowed"]
+        assert decisions[0]["requested_cost"]["search"] == 10
+        assert decisions[0]["minimum_remaining"]["search"] == 2
+        assert decisions[0]["reserved_other"]["search"] == 8
+        # API's final zero-cost view does not replace the actual scan decision.
+        assert scanned["github_budget"]["requested_cost"]["search"] == 0
+        ledger = isolated_db.pipeline_github_budget_reservations("github-default")
+        assert ledger["count"] == 1 and ledger["totals"]["search"] == 8
+    finally:
+        isolated_db.mark_completed(second.id, "done")
+        insights.release_execution_admission()
 
 
 def test_aged_waiter_still_pays_scan_gap(isolated_db, monkeypatch):

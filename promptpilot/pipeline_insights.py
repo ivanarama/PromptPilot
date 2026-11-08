@@ -431,7 +431,8 @@ def _with_shared_budget_floor(policy: dict) -> dict:
 def _with_execution_snapshot_floor(policy: dict) -> dict:
     """Keep one shared essential scan possible while provider work is running.
 
-    This is a hard admission gap, distinct from borrowable P1 headroom. The
+    This is a hard admission gap, distinct from borrowable P1 headroom. Existing
+    soft headroom may already cover it: preserve their maximum, not their sum.
     account-wide scan lease serializes scans, so protect the componentwise
     largest scan once, rather than reserving one scan for every task. Scans
     themselves pay their configured cost against the ordinary floor.
@@ -441,8 +442,10 @@ def _with_execution_snapshot_floor(policy: dict) -> dict:
     headroom = policy.get("snapshot_headroom") or {}
     if (policy.get("cost_accounting") and policy.get("budget_route")
             not in (None, "insights") and any(headroom.values())):
+        soft = (policy.get("priority_one_headroom") or {}
+                if policy.get("priority_headroom_applied") else {})
         selected["minimum_remaining"] = {
-            resource: minimum + headroom[resource]
+            resource: minimum + max(0, headroom[resource] - soft.get(resource, 0))
             for resource, minimum in policy["minimum_remaining"].items()
         }
         selected["snapshot_headroom_applied"] = True
