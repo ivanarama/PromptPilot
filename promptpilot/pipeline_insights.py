@@ -1084,7 +1084,8 @@ def _github_scan_admission(profile: dict, purpose: str,
             "repository": profile.get("repository", ""),
             "status": (None if decision.get("allowed")
                        else _refresh_blocked_status(decision)),
-        } if profile_id is not None and not lease.lost else None)
+        } if (profile_id is not None and budget_route == "insights"
+              and not lease.lost) else None)
         lease.release(refresh_status=refresh_status)
 
 
@@ -3151,7 +3152,8 @@ def _budget_defer_route(admission: dict, profile_id: str, profile: dict,
                         queue: dict,
                         *, mode: str = "tool", phase: str | None = None,
                         preflight: dict | None = None) -> dict:
-    _record_refresh_blocked(profile_id, profile, admission)
+    # This refusal belongs to the task route. Only an actual queue scan may
+    # publish or clear the shared profile refresh status.
     reason = str(admission.get("reason") or "GitHub scan отложен")
     context = None
     if phase:
@@ -4813,13 +4815,12 @@ def _with_persisted_refresh_status(result: dict, profile_id: str,
     status = event.get("status")
     if not isinstance(status, dict):
         return result
-    # An execution admission denial is not a failed queue refresh. TAIL/FIX
-    # budget contention must not poison a fresh shared snapshot for every
-    # other stage. Unknown legacy routes remain conservative.
+    # An execution admission denial is not a queue-refresh outcome, even if
+    # the last snapshot was independently invalidated. Ignore old task-status
+    # rows without changing the real cache stale/epoch/profile/lease guards.
+    # Unknown legacy routes remain conservative.
     route = (status.get("github_budget") or {}).get("budget_route")
-    cache = result.get("cache") or {}
-    if (route in {"skill", "tool_preflight", "tool", "fallback_targeted"}
-            and cache.get("complete") is True and cache.get("stale") is False):
+    if route in {"skill", "tool_preflight", "tool", "fallback_targeted"}:
         return result
     raw_defer_until = status.get("refresh_deferred_until")
     defer_until = _parse_time(raw_defer_until)
