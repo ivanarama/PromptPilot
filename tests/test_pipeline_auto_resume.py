@@ -7,7 +7,7 @@ from promptpilot import pipeline_insights, worker
 from promptpilot.models import TaskCreate
 
 
-def paused_series(isolated_db, monkeypatch, queue_id, reason):
+def paused_series(isolated_db, monkeypatch, queue_id, reason, *, verdict="НУЖЕН ЧЕЛОВЕК"):
     profile = {"repository": "owner/example", "queues": [{
         "id": queue_id, "series_contains": "Example - " + queue_id.upper(),
     }]}
@@ -19,8 +19,8 @@ def paused_series(isolated_db, monkeypatch, queue_id, reason):
         occurrence = isolated_db.get_next_runnable()
         assert occurrence is not None
         assert isolated_db.mark_completed(
-            occurrence.id, f"ИТОГ: НУЖЕН ЧЕЛОВЕК ({reason})",
-            verdict="НУЖЕН ЧЕЛОВЕК",
+            occurrence.id, f"ИТОГ: {verdict} ({reason})",
+            verdict=verdict,
             expected_started_at=occurrence.started_at,
         )
         worker._recur_after_run(occurrence)
@@ -130,3 +130,61 @@ def test_only_auto_paused_series_keeps_sampler_active(isolated_db, monkeypatch):
     assert isolated_db.series_action(series["id"], "pause")
     assert not pipeline_insights._profile_active(
         profile, [isolated_db.get_series(series["id"])])
+
+
+def test_legacy_unanchored_budget_pause_and_manual_pilot_survive_fresh_scan(
+        isolated_db, monkeypatch):
+    # Historical FIX task17176 ended with agent text, not a machine-owned
+    # deferred budget wait. A fresh snapshot cannot invent that provenance.
+    reason = "нет свежего допущенного снимка: budget_in_flight"
+    profile, series = paused_series(
+        isolated_db, monkeypatch, "fix", reason, verdict="НЕ СМОГ")
+    profile["title"] = "Example"
+    profile["queues"][0].update(
+        title="Fix", query="is:issue label:ready-fix", capacity=1)
+    profile["github_budget"] = {"minimum_remaining": {
+        "core": 100, "search": 0, "graphql": 100}}
+    monkeypatch.setattr(pipeline_insights, "_cache", {})
+    pilot = isolated_db.create_task(TaskCreate(
+        prompt="Pilot16 - FIX", recurrence="15m"))
+    assert isolated_db.series_action(pilot.series_id, "pause")
+    hold_key = f"pipeline_item_holds:v1:{series['id']}"
+    holds = json.dumps({str(number): {
+        "fingerprint": f"existing-{number}", "at": time.time(),
+        "reason": "existing blocker", "task_id": number,
+    } for number in range(1001, 1015)}, indent=2)
+    isolated_db.set_setting(hold_key, holds)
+    with isolated_db._connect() as conn:
+        before_series = [tuple(row) for row in conn.execute(
+            "SELECT * FROM task_series ORDER BY id")]
+        before_tasks = [tuple(row) for row in conn.execute(
+            "SELECT * FROM tasks ORDER BY id")]
+    pause_key = f"pipeline_repeat_blocker_pause:v1:{series['id']}"
+    pause = isolated_db.get_setting(pause_key)
+
+    reset = int(time.time()) + 3600
+    limits = {key: {"limit": limit, "remaining": limit, "used": 0, "reset": reset}
+              for key, limit in (("core", 5000), ("search", 30), ("graphql", 5000))}
+    assert isolated_db.record_pipeline_github_rate_snapshot("github-default", limits)
+    monkeypatch.setattr(pipeline_insights, "_github_rate_limits", lambda: limits)
+    monkeypatch.setattr(pipeline_insights, "_github_search", lambda *_a, **_kw: {
+        "count": 1, "membership_complete": True,
+        "items": [{"key": "issue:9001", "number": 9001, "kind": "issue"}]})
+    monkeypatch.setattr(pipeline_insights, "_gh_api_json", lambda *_: (_ for _ in ()).throw(
+        AssertionError("an unanchored pause must not invent a GitHub target")))
+
+    assert pipeline_insights.sample_active_profiles([series]) == {"example": "ok"}
+    cached = pipeline_insights.read_cached("example", [series])
+    assert cached["cache"]["complete"] is True and cached["cache"]["stale"] is False
+    assert cached["cache"]["token"]["profile_hash"] == pipeline_insights._profile_fingerprint(profile)
+    assert cached["github_budget"]["allowed"] is True
+    assert isolated_db.get_setting(pause_key) == pause
+    assert isolated_db.get_setting(hold_key) == holds
+    assert isolated_db.get_series(series["id"])["paused"]
+    assert isolated_db.get_series(pilot.series_id)["paused"]
+    assert isolated_db.get_series(pilot.series_id)["auto_pause_reason"] is None
+    with isolated_db._connect() as conn:
+        assert [tuple(row) for row in conn.execute(
+            "SELECT * FROM task_series ORDER BY id")] == before_series
+        assert [tuple(row) for row in conn.execute(
+            "SELECT * FROM tasks ORDER BY id")] == before_tasks
