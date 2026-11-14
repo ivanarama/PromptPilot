@@ -3630,6 +3630,53 @@ def has_setting_prefix(prefix: str) -> bool:
     return row is not None
 
 
+def settings_with_prefix(prefix: str, limit: int = 200) -> dict[str, str]:
+    with _connect() as conn:
+        return dict(conn.execute(
+            "SELECT key,value FROM settings WHERE substr(key,1,?)=? ORDER BY key LIMIT ?",
+            (len(prefix), prefix, limit)).fetchall())
+
+
+def claim_codex_answer(identity: str) -> bool:
+    """One explicit answer attempt across duplicate cards and bot restarts."""
+    with _connect(immediate=True) as conn:
+        return bool(conn.execute(
+            "INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",
+            ("codex-app-server.answer." + identity, _now())).rowcount)
+
+
+def queue_codex_question(key: str, record: dict) -> bool:
+    with _connect(immediate=True) as conn:
+        if not conn.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",
+                            (key, _json_dump(record))).rowcount:
+            return False
+        conn.execute(
+            "INSERT INTO notifications(tg_chat_id,message,created_at,machine,pane_id,kind) "
+            "VALUES(?,?,?,?,?,?)",
+            (record["chat_id"], key.rsplit(".", 1)[-1], _now(), record["machine"],
+             record["pane"], "codex.question"))
+    return True
+
+
+def finish_codex_tracking(key: str, turn_id: str, result: str, status: str,
+                          notifications: list[dict]) -> bool:
+    """Commit completion and its delivery outbox in the same transaction."""
+    with _connect(immediate=True) as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        record = _json_load(row["value"], {}) if row else {}
+        if record.get("done") or record.get("turn_id") != turn_id:
+            return False
+        record.update(done=True, result=result, status=status)
+        conn.execute("UPDATE settings SET value=? WHERE key=?", (_json_dump(record), key))
+        for note in notifications:
+            conn.execute(
+                "INSERT INTO notifications(tg_chat_id,message,created_at,machine,pane_id,kind) "
+                "VALUES(?,?,?,?,?,?)",
+                (record["chat_id"], note["message"], _now(), record["machine"],
+                 record["pane"], note["kind"]))
+    return True
+
+
 def increment_int_setting(key: str, default: int = 0) -> int:
     """Atomically increment an integer setting shared by all PP processes."""
     with _connect(immediate=True) as conn:

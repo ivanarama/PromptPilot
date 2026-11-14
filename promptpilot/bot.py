@@ -40,7 +40,7 @@ from telegram.ext import (
     filters,
 )
 
-from . import db, epf_tools, pipeline_insights, result_files
+from . import db, epf_tools, pipeline_insights, result_files, codex_app_server, codex_bridge, codex_telegram
 from .config import (
     DEFAULT_CLI, HERDR_RENOTIFY_COOLDOWN, HERDR_WATCH, HERDR_WATCH_INTERVAL, LOG_PROMPTS,
     ensure_herdr_launch_provider, herdr_launch_kind,
@@ -3424,7 +3424,18 @@ async def cb_herdr_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target = await _hd_ref_or_alert(query, ref)
     if target is None:
         return
-    _, pane, host = target
+    machine, pane, host = target
+    snapshot = None
+    if codex_telegram.enabled():
+        data = await _herdr_json("agent", "get", pane, host=host)
+        agent = ((data or {}).get("result") or {}).get("agent") or {}
+        snapshot = await codex_telegram.view(agent, host)
+    if snapshot and snapshot[3]:
+        if not await _check_herdr_reply_access(update):
+            return
+        await query.answer()
+        await codex_telegram.show_questions(update, snapshot[0], snapshot[3], ref, pane, machine, host)
+        return
     raw = await _herdr_cli('agent', 'read', pane, '--source', 'visible', '--format', 'text', host=host)
     if not raw or not _codex_question_pending(raw):
         await query.answer('Свёрнутого вопроса уже нет. Обновите окно.', show_alert=True)
@@ -3784,6 +3795,19 @@ async def cb_herdr_output(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     machine, pane, host = target
     await query.answer()
+    snapshot = None
+    if codex_telegram.enabled():
+        data = await _herdr_json("agent", "get", pane, host=host)
+        agent = ((data or {}).get("result") or {}).get("agent") or {}
+        snapshot = await codex_telegram.view(agent, host)
+    if snapshot:
+        result = next((codex_bridge.final_text(turn) for turn in snapshot[2]
+                       if turn.get("status") == "completed" and codex_bridge.final_text(turn)), "")
+        if result:
+            document = io.BytesIO(result.encode("utf-8"))
+            document.name = "codex_result.md"
+            await query.message.reply_document(document=document, caption="Последний завершённый ответ Codex")
+            return
     raw = await _herdr_cli("agent", "read", pane, "--source", "recent-unwrapped",
                            "--lines", "1000", "--format", "text", host=host, timeout=30)
     if not raw:
@@ -3922,6 +3946,12 @@ async def _submit_native_reply(pane, prompt, before, host, allowed):
 
 
 async def herdr_reply_got_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    token = context.user_data.pop("codex_answer_token", None)
+    if token:
+        if not await _check_herdr_reply_access(update):
+            return ConversationHandler.END
+        await codex_telegram.answer(update, context, token, text=update.message.text)
+        return ConversationHandler.END
     pane = context.user_data.pop("herdr_reply_pane", None)
     host = context.user_data.pop("herdr_reply_host", None)
     machine = context.user_data.pop("herdr_reply_machine", "")
@@ -3941,6 +3971,28 @@ async def herdr_reply_got_text(update: Update, context: ContextTypes.DEFAULT_TYP
         return ConversationHandler.END
     async def allowed():
         return await _check_herdr_reply_access(update)
+    dialog = await asyncio.to_thread(codex_bridge.resolve, agent, host)
+    if not await allowed():
+        return ConversationHandler.END
+    if agent.get("agent_status") == "blocked":
+        dialog = None  # Keep the existing permission-dialog guard on free-text replies.
+    if dialog:
+        try:
+            turn_id, steered = await asyncio.to_thread(dialog.send, prompt)
+        except codex_app_server.Unconfirmed:
+            await update.message.reply_text("Codex мог получить запрос. Проверьте окно перед повторной отправкой.")
+            return ConversationHandler.END
+        except codex_app_server.RPCError:
+            await update.message.reply_text("Codex не принял запрос. Обновите окно и проверьте ожидающий вопрос.")
+            return ConversationHandler.END
+        except codex_app_server.Unavailable:
+            pass  # No mutation was sent: keep the existing herdr path available.
+        else:
+            codex_telegram.track(dialog, turn_id, pane, machine, host, update.effective_chat.id, delivery)
+            await update.message.reply_text("Уточнение добавлено в текущую работу ✓" if steered else "Запрос запущен ✓")
+            if LOG_PROMPTS:
+                await _log_pane_prompt(pane, machine, host, update.message.text)
+            return ConversationHandler.END
     submitted = await _submit_native_reply(pane, prompt, agent, host, allowed)
     if submitted in ('started', 'busy'):
         if delivery:
@@ -3957,11 +4009,40 @@ async def herdr_reply_got_text(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def herdr_reply_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("codex_answer_token", None)
     context.user_data.pop("herdr_reply_pane", None)
     context.user_data.pop("herdr_reply_host", None)
     context.user_data.pop("herdr_reply_machine", None)
     await update.message.reply_text("Отменено.")
     return ConversationHandler.END
+
+
+@require_auth
+async def cb_codex_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from telegram.ext import ApplicationHandlerStop
+    query = update.callback_query
+    if query.data.startswith("cx_result:"):
+        await codex_telegram.output(update, query.data.split(":", 1)[1])
+    else:
+        await query.answer()
+        _, token, option = query.data.split(":", 2)
+        await codex_telegram.answer(update, context, token, option=int(option))
+    raise ApplicationHandlerStop
+
+
+@require_auth
+async def cb_codex_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    token = query.data.split(":", 1)[1]
+    if not await _check_herdr_reply_access(update):
+        return ConversationHandler.END
+    if not await codex_telegram.current_question(update, token):
+        await query.answer("Вопрос устарел. Откройте его заново.", show_alert=True)
+        return ConversationHandler.END
+    await query.answer()
+    context.user_data["codex_answer_token"] = token
+    await query.message.reply_text("Введите ответ на вопрос Codex (или /cancel):")
+    return ASK_HERDR_REPLY
 
 
 # ---------------------------------------------------------------------------
@@ -4095,7 +4176,24 @@ async def _render_window_card(query, context, idx: int) -> str:
     if tid:
         lines.append(f"Задача PromptPilot: #{tid}")
     lines.append(f"Панель: {w['pane_id']}")
-    tail = await _herdr_screen_tail(w["pane_id"], w["machine"], lines_n=12)
+    snapshot = await codex_telegram.view(agent, host)
+    if snapshot:
+        _, thread, turns, questions = snapshot
+        if questions:
+            lines[0] = f"❓ {_herdr_agent_label(agent)} — ожидает ответа"
+            tail = "\n\n".join(q["text"] + "\n" + "\n".join(
+                f"{i + 1}. {v}" for i, v in enumerate(q["options"])) for q in questions)
+        elif (thread.get("status") or {}).get("type") == "active":
+            if w["status"] == "blocked":
+                tail = await _herdr_screen_tail(w["pane_id"], w["machine"], lines_n=12)
+            else:
+                lines[0] = f"🔄 {_herdr_agent_label(agent)} — выполняется"
+                tail = "Codex выполняет запрос."
+        else:
+            lines[0] = f"💤 {_herdr_agent_label(agent)} — готов к новому запросу"
+            tail = next((codex_bridge.final_text(t) for t in turns if codex_bridge.final_text(t)), "")
+    else:
+        tail = await _herdr_screen_tail(w["pane_id"], w["machine"], lines_n=12)
     if tail:
         lines.append(f"\n{tail}")
 
@@ -4103,7 +4201,7 @@ async def _render_window_card(query, context, idx: int) -> str:
     rows = [[InlineKeyboardButton(REPLY_LABEL, callback_data=f"hd_reply:{ref}")]]
     rows.append([InlineKeyboardButton("📺 Экран", callback_data=f"hd_screen:{ref}"),
                  InlineKeyboardButton("📄 Вывод файлом", callback_data=f"hd_output:{ref}")])
-    if _codex_question_pending(tail):
+    if (snapshot and snapshot[3]) or _codex_question_pending(tail):
         lines.append("\n❓ Агент задал вопрос. Откройте его кнопкой ниже, чтобы увидеть текст и варианты ответа.")
         rows.insert(0, [InlineKeyboardButton('❓ Открыть вопрос', callback_data=f'hd_question:{ref}')])
     elif w["status"] == "blocked":
@@ -4317,7 +4415,21 @@ async def _notify_loop(bot):
                     continue
                 kb = None
                 note_text = note["message"]
-                if note.get("flow_ref"):
+                if note.get("kind") == "codex.question":
+                    record = db.get_setting(codex_telegram.QUESTION_PREFIX + note_text)
+                    record = json.loads(record) if record else None
+                    if not record or record.get("used") or record["expires_at"] < time.time():
+                        db.mark_notification_sent(note["id"])
+                        continue
+                    note_text, kb = codex_telegram.question_message(record, note["message"])
+                elif note.get("kind") == "codex.done":
+                    payload = json.loads(note_text)
+                    note_text = payload["text"]
+                    ref = f"{note.get('machine') or ''}:{note['pane_id']}"
+                    kb = InlineKeyboardMarkup([
+                        [InlineKeyboardButton("📄 Полный ответ", callback_data=f"cx_result:{payload['token']}")],
+                        [InlineKeyboardButton(REPLY_LABEL, callback_data=f"hd_reply:{ref}")]])
+                elif note.get("flow_ref"):
                     kb = _flow_keyboard(note["flow_ref"])
                 elif note.get("pane_id"):
                     # A blocked own task: same confirm/screen/reply buttons the
@@ -4828,6 +4940,7 @@ def run_bot():
         except Exception as e:
             logger.warning("set_my_commands failed: %s", e)
         asyncio.create_task(_notify_loop(application.bot))
+        asyncio.create_task(codex_telegram.watch_loop())
         if HERDR_WATCH:
             asyncio.create_task(_herdr_watch_loop(application.bot))
         else:
@@ -5010,7 +5123,8 @@ def run_bot():
 
     herdr_reply_conv = ConversationHandler(
         entry_points=[
-            CallbackQueryHandler(cb_herdr_reply_start, pattern=r"^hd_reply:")
+            CallbackQueryHandler(cb_herdr_reply_start, pattern=r"^hd_reply:"),
+            CallbackQueryHandler(cb_codex_text, pattern=r"^cx_text:"),
         ],
         states={
             ASK_HERDR_REPLY: [
@@ -5058,6 +5172,7 @@ def run_bot():
     app.add_handler(CallbackQueryHandler(cb_herdr_enter, pattern=r"^hd_enter:"), group=-1)
     app.add_handler(CallbackQueryHandler(cb_herdr_screen, pattern=r"^hd_screen:"), group=-1)
     app.add_handler(CallbackQueryHandler(cb_herdr_output, pattern=r"^hd_output:"), group=-1)
+    app.add_handler(CallbackQueryHandler(cb_codex_action, pattern=r"^cx_(?:answer|result):"), group=-1)
     app.add_handler(CallbackQueryHandler(cb_herdr_key, pattern=r"^hd_key:"), group=-1)
     app.add_handler(CallbackQueryHandler(_dispatch_question_callback, pattern=r'^hd_question:'), group=-1)
     app.add_handler(CallbackQueryHandler(_dispatch_question_callback, pattern=r'^hd_qkey:'), group=-1)
