@@ -16,6 +16,7 @@ dependencies = [
     "fastapi>=0.115",
     "python-multipart>=0.0.9",  # multipart-формы: /api/upload (вложения к задачам)
     "uvicorn[standard]>=0.34",
+    "websockets>=16,<18",  # Sans-I/O transport to the existing Codex daemon
     "click>=8.1",
     "pydantic>=2.0",
     "python-telegram-bot[job-queue]>=21.0",
