@@ -220,7 +220,7 @@ def _task_detail_keyboard(task) -> InlineKeyboardMarkup:
         action_row.append(InlineKeyboardButton("🔁 Повторить", callback_data=f"rerun:{task.id}"))
     if action_row:
         rows.append(action_row)
-    if task.result and len(result_files.visible_result(task.result)) > 800:
+    if task.result or task.error:
         rows.append([InlineKeyboardButton("📄 Полный вывод", callback_data=f"full_result:{task.id}")])
     final_row = [InlineKeyboardButton("← К списку", callback_data="tasklist")]
     if status != "running":
@@ -3306,7 +3306,7 @@ def _machine_remote(machine: str):
     return machine_remote(m) if m and m.get("host") else None
 
 
-async def _herdr_cli(*args, host=None, timeout=15):
+async def _herdr_cli(*args, host=None, timeout=15, allow_error=False):
     """Run a herdr CLI command (locally or on `host`). Raw stdout or None."""
     import asyncio
     from .herdr_exec import herdr_argv
@@ -3323,13 +3323,14 @@ async def _herdr_cli(*args, host=None, timeout=15):
         out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except (FileNotFoundError, OSError, asyncio.TimeoutError):
         return None
-    if proc.returncode != 0:
+    if proc.returncode != 0 and not allow_error:
         return None
     return (out or err or b"").decode("utf-8", "replace")
 
 
-async def _herdr_json(*args, host=None, timeout=15):
-    raw = await _herdr_cli(*args, host=host, timeout=timeout)
+async def _herdr_json(*args, host=None, timeout=15, allow_error=False):
+    options = {'allow_error': True} if allow_error else {}
+    raw = await _herdr_cli(*args, host=host, timeout=timeout, **options)
     if raw is None:
         return None
     try:
@@ -3375,8 +3376,9 @@ def _screen_chrome(line: str) -> bool:
 
 
 def _codex_question_pending(text: str) -> bool:
-    return bool(re.search(r'\b[1-9]\d*\s+questions?\b', text, re.I)
-                and re.search(r'shift\s*\+\s*(?:↑|up)\s+to answer', text, re.I))
+    return bool(re.search(r'^\s*(?:[?❓•·]\s*)?[1-9]\d*\s+questions?\b', text, re.I | re.M)
+                and re.search(r'^\s*(?:[•·]\s*)?queued follow-up inputs\b|^\s*shift\s*\+\s*\S+\s+to answer',
+                              text, re.I | re.M))
 
 
 def _question_keyboard(ref):
@@ -3394,6 +3396,12 @@ def _question_text(raw):
     return '\n'.join(lines).strip() or 'Вопрос больше не отображается.'
 
 
+def _question_preview(raw):
+    # Codex opens the dialog at the bottom of the viewport. Keep that region
+    # in the preview; the full text above remains the stale-button identity.
+    return _question_text(raw)[-3500:]
+
+
 async def _show_herdr_question(query, context, ref, pane, host):
     import hashlib
     raw = await _herdr_cli('agent', 'read', pane, '--source', 'visible', '--format', 'text', host=host)
@@ -3405,7 +3413,7 @@ async def _show_herdr_question(query, context, ref, pane, host):
         'digest': hashlib.sha256(_question_text(raw).encode()).hexdigest(),
         'endpoint': list(host) if host else None, 'expires_at': time.time() + 600,
     }
-    await query.message.reply_text('❓ Вопрос агента\n\n' + _clip(_question_text(raw), 3500),
+    await query.message.reply_text('❓ Вопрос агента\n\n' + _question_preview(raw),
                                    reply_markup=_question_keyboard(ref))
 
 
@@ -3492,7 +3500,15 @@ async def _herdr_screen_tail(pane_id: str, machine: str = "", lines_n: int = 10)
     lines = [l.rstrip() for l in raw.splitlines() if not _screen_chrome(l)]
     while lines and not lines[-1]:
         lines.pop()
-    tail = lines[-lines_n:]
+    # Keep the pending-question summary even when terminal padding or a long
+    # footer would push it outside the usual preview. Its presence controls
+    # the Open question button, so clipping it silently removes that action.
+    if _codex_question_pending(raw):
+        question = next(line for line in raw.splitlines()
+                        if re.search(r'\b[1-9]\d*\s+questions?\b', line, re.I))
+        return "Queued follow-up inputs\n" + question[:120] + "\nОткройте вопрос кнопкой ниже."
+    else:
+        tail = lines[-lines_n:]
     # An agent that cleared its screen leaves the tail as blank padding; drop
     # the leading gap and collapse runs so the card isn't mostly whitespace.
     out = []
@@ -3758,6 +3774,30 @@ async def cb_herdr_screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.message.reply_text(f"📺 {pane}{f' ({machine})' if machine else ''}:\n{tail}")
 
 
+@require_auth
+async def cb_herdr_output(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Export available pane history, including sessions without a task row."""
+    import io
+    query = update.callback_query
+    target = await _hd_ref_or_alert(query, query.data.split(":", 1)[1])
+    if target is None:
+        return
+    machine, pane, host = target
+    await query.answer()
+    raw = await _herdr_cli("agent", "read", pane, "--source", "recent-unwrapped",
+                           "--lines", "1000", "--format", "text", host=host, timeout=30)
+    if not raw:
+        await query.message.reply_text("Вывода пока нет или окно уже закрыто.")
+        return
+    buf = io.BytesIO(raw.encode("utf-8"))
+    buf.name = "herdr_" + re.sub(r"[^\w-]", "_", pane) + ".txt"
+    await query.message.reply_document(
+        document=buf,
+        caption=f"Вывод окна {pane}{f' ({machine})' if machine else ''}. "
+                "Доступная история терминала: до 1000 строк.",
+    )
+
+
 async def _check_herdr_reply_access(update: Update) -> bool:
     """Use current private-chat authorization, including after awaited callbacks."""
     user, chat = update.effective_user, update.effective_chat
@@ -3814,6 +3854,73 @@ async def _log_pane_prompt(pane: str, machine: str, host, text: str):
         logger.warning("prompt_log: запись не удалась: %s", e)
 
 
+def _native_same_terminal(before, after):
+    identity = before.get('terminal_id') or before.get('agent_session')
+    return bool(identity and identity == (after.get('terminal_id') or after.get('agent_session'))
+                and before.get('pane_id') == after.get('pane_id'))
+
+
+def _native_reply_started(before, after):
+    if not _native_same_terminal(before, after):
+        return False
+    if after.get('agent_status') == 'working' and before.get('agent_status') != 'working':
+        return True
+    old, new = before.get('completion_seq'), after.get('completion_seq')
+    return type(old) is int and type(new) is int and new > old
+
+
+async def _submit_native_reply(pane, prompt, before, host, allowed):
+    """Distinguish pasted text from a started turn; never paste the request twice."""
+    if before.get('agent_status') == 'blocked':
+        return 'blocked'
+    if before.get('agent_status') not in ('idle', 'done', 'working'):
+        return 'unconfirmed'
+    reply = await _herdr_json('agent', 'prompt', pane, prompt, '--wait', '--until',
+                              'working', '--timeout', '7000', host=host,
+                              timeout=12, allow_error=True)
+    if not await allowed():
+        return 'denied'
+    result = (reply or {}).get('result')
+    after = result.get('agent', {}) if isinstance(result, dict) else {}
+    if _native_reply_started(before, after):
+        return 'started'
+    if (isinstance(result, dict) and before.get('agent_status') == 'working'
+            and after.get('agent_status') == 'working' and _native_same_terminal(before, after)):
+        return 'busy'
+    if ((reply or {}).get('error') or {}).get('code') != 'agent_prompt_stalled':
+        return 'unconfirmed'
+    state = await _herdr_json('agent', 'get', pane, host=host)
+    current = ((state or {}).get('result') or {}).get('agent') or {}
+    if not await allowed():
+        return 'denied'
+    if _native_reply_started(before, current):
+        return 'started'
+    sequence = before.get('state_change_seq')
+    # Recover only the exact unchanged idle input box. Never press Enter in a
+    # permission dialog, a replacement terminal, or a turn that already moved.
+    if (current.get('agent_status') not in ('idle', 'done')
+            or before.get('agent_status') not in ('idle', 'done')
+            or not _native_same_terminal(before, current)
+            or type(sequence) is not int or current.get('state_change_seq') != sequence
+            or before.get('agent') != 'codex'):
+        return 'unconfirmed'
+    # Same non-character paste boundary as Herdr's upstream Windows Codex fix:
+    # https://github.com/herdrdev/herdr/pull/3961 . Right commits the buffered
+    # paste before Enter, instead of racing another bare Enter against it.
+    sent = await _herdr_json('agent', 'send-keys', pane, 'right', 'enter', host=host)
+    if not sent or not sent.get('result'):
+        return 'unconfirmed'
+    for _ in range(8):
+        await asyncio.sleep(.35)
+        state = await _herdr_json('agent', 'get', pane, host=host)
+        after = ((state or {}).get('result') or {}).get('agent') or {}
+        if _native_reply_started(before, after):
+            return 'started'
+        if not _native_same_terminal(before, after) or after.get('agent_status') == 'blocked':
+            break
+    return 'unconfirmed'
+
+
 async def herdr_reply_got_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pane = context.user_data.pop("herdr_reply_pane", None)
     host = context.user_data.pop("herdr_reply_host", None)
@@ -3829,15 +3936,23 @@ async def herdr_reply_got_text(update: Update, context: ContextTypes.DEFAULT_TYP
     if not await _check_herdr_reply_access(update):
         return ConversationHandler.END
     prompt = (result_files.native_instruction(delivery) if delivery else '') + update.message.text
-    res = await _herdr_json("agent", "prompt", pane, prompt, host=host)
-    if res and res.get("result"):
+    if not isinstance(agent, dict):
+        await update.message.reply_text('Сессия недоступна; запрос не отправлен.')
+        return ConversationHandler.END
+    async def allowed():
+        return await _check_herdr_reply_access(update)
+    submitted = await _submit_native_reply(pane, prompt, agent, host, allowed)
+    if submitted in ('started', 'busy'):
         if delivery:
             db.save_native_file_context(_herdr_watch_source(machine, host), delivery)
-        await update.message.reply_text("Отправлено ✓")
+        await update.message.reply_text('Запрос запущен ✓' if submitted == 'started'
+                                       else 'Передано в работающую сессию. Выполнение этого сообщения отдельно пока не подтверждено.')
         if LOG_PROMPTS:
             await _log_pane_prompt(pane, machine, host, update.message.text)
-    else:
-        await update.message.reply_text("Не удалось отправить — агент ещё существует?")
+    elif submitted == 'blocked':
+        await update.message.reply_text('Сессия ожидает подтверждения. Запрос не вставлен; сначала ответьте на диалог в сессии.')
+    elif submitted != 'denied':
+        await update.message.reply_text('Не удалось подтвердить запуск запроса. Текст мог остаться в поле ввода; проверьте экран сессии. Повторная вставка не выполнялась.')
     return ConversationHandler.END
 
 
@@ -3986,7 +4101,10 @@ async def _render_window_card(query, context, idx: int) -> str:
 
     ref = f"{w['machine']}:{w['pane_id']}"
     rows = [[InlineKeyboardButton(REPLY_LABEL, callback_data=f"hd_reply:{ref}")]]
+    rows.append([InlineKeyboardButton("📺 Экран", callback_data=f"hd_screen:{ref}"),
+                 InlineKeyboardButton("📄 Вывод файлом", callback_data=f"hd_output:{ref}")])
     if _codex_question_pending(tail):
+        lines.append("\n❓ Агент задал вопрос. Откройте его кнопкой ниже, чтобы увидеть текст и варианты ответа.")
         rows.insert(0, [InlineKeyboardButton('❓ Открыть вопрос', callback_data=f'hd_question:{ref}')])
     elif w["status"] == "blocked":
         rows.append([InlineKeyboardButton("✅ Enter", callback_data=f"hd_enter:{ref}"),
@@ -4198,6 +4316,7 @@ async def _notify_loop(bot):
                     db.mark_notification_sent(note["id"])
                     continue
                 kb = None
+                note_text = note["message"]
                 if note.get("flow_ref"):
                     kb = _flow_keyboard(note["flow_ref"])
                 elif note.get("pane_id"):
@@ -4206,7 +4325,14 @@ async def _notify_loop(bot):
                     ref = f"{note.get('machine') or ''}:{note['pane_id']}"
                     kb = InlineKeyboardMarkup(_herdr_done_keyboard(ref) if note.get("kind") == "herdr.done"
                                               else _herdr_blocked_keyboard(ref))
-                await bot.send_message(chat_id=note["tg_chat_id"], text=_clip(note["message"]),
+                    if note.get("kind") != "herdr.done":
+                        tail = await _herdr_screen_tail(note["pane_id"], note.get("machine") or "")
+                        if tail:
+                            note_text += "\n\n" + tail
+                        if _codex_question_pending(tail):
+                            kb = InlineKeyboardMarkup([[
+                                InlineKeyboardButton("❓ Открыть вопрос", callback_data=f"hd_question:{ref}")]])
+                await bot.send_message(chat_id=note["tg_chat_id"], text=_clip(note_text),
                                        reply_markup=kb)
                 db.mark_notification_sent(note["id"])
             except (Forbidden, BadRequest) as e:
@@ -4260,6 +4386,8 @@ async def _notify_loop(bot):
                 if task.session_id:
                     note_rows[0].append(InlineKeyboardButton(REPLY_LABEL, callback_data=f"reply_task:{task.id}"))
                 note_rows.append([InlineKeyboardButton("🔁 Повторить", callback_data=f"rerun:{task.id}")])
+                if task.result or task.error:
+                    note_rows.append([InlineKeyboardButton("📄 Полный вывод", callback_data=f"full_result:{task.id}")])
                 note_kb = InlineKeyboardMarkup(note_rows)
                 # Agents answer in Markdown; raw «**жирный**» in the preview
                 # reads as noise. Try to render it, fall back to plain text on
@@ -4929,6 +5057,7 @@ def run_bot():
     # herdr bridge buttons must outrank active ConversationHandlers (group 0)
     app.add_handler(CallbackQueryHandler(cb_herdr_enter, pattern=r"^hd_enter:"), group=-1)
     app.add_handler(CallbackQueryHandler(cb_herdr_screen, pattern=r"^hd_screen:"), group=-1)
+    app.add_handler(CallbackQueryHandler(cb_herdr_output, pattern=r"^hd_output:"), group=-1)
     app.add_handler(CallbackQueryHandler(cb_herdr_key, pattern=r"^hd_key:"), group=-1)
     app.add_handler(CallbackQueryHandler(_dispatch_question_callback, pattern=r'^hd_question:'), group=-1)
     app.add_handler(CallbackQueryHandler(_dispatch_question_callback, pattern=r'^hd_qkey:'), group=-1)

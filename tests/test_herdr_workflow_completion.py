@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 import json
+import re
 import subprocess
 
 import pytest
@@ -350,7 +351,10 @@ def test_herdr_deduplicates_permission_flag_and_forwards_pipeline_paths(
             submitted.append(args[3])
             return 0, {"result": {"agent": {"agent_status": "done"}}}, ""
         if args[:2] == ["agent", "read"]:
-            return 0, None, _submitted_screen(submitted[-1], "done")
+            marker = re.search(r"PP-REPLY-END:[0-9a-f]{32}", submitted[-1])
+            return 0, None, _submitted_screen(submitted[-1], "done" + ("\n" + marker[0] if marker else ""))
+        if args[:2] == ["agent", "get"]:
+            return 0, {"result": {"agent": {"agent_status": "done"}}}, ""
         raise AssertionError(args)
 
     task = SimpleNamespace(
@@ -410,7 +414,10 @@ def test_remote_herdr_does_not_forward_local_pipeline_paths(
             submitted.append(args[3])
             return 0, {"result": {"agent": {"agent_status": "done"}}}, ""
         if args[:2] == ["agent", "read"]:
-            return 0, None, _submitted_screen(submitted[-1], "done")
+            marker = re.search(r"PP-REPLY-END:[0-9a-f]{32}", submitted[-1])
+            return 0, None, _submitted_screen(submitted[-1], "done" + ("\n" + marker[0] if marker else ""))
+        if args[:2] == ["agent", "get"]:
+            return 0, {"result": {"agent": {"agent_status": "done"}}}, ""
         raise AssertionError(args)
 
     task = SimpleNamespace(

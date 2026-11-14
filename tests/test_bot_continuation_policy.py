@@ -157,7 +157,9 @@ def _herdr_conversation(monkeypatch):
 
     async def rpc(*args, **kwargs):
         calls.append((args, kwargs))
-        return {"result": {"agent": {"terminal_id": "test-terminal"}}}
+        return {"result": {"agent": {"terminal_id": "test-terminal", "pane_id": "w1:p1",
+                                    "agent_status": "working" if args[:2] == ('agent','prompt') else 'idle',
+                                    "state_change_seq": 2 if args[:2] == ('agent','prompt') else 1}}}
 
     monkeypatch.setattr(bot, "_herdr_json", rpc)
     user, chat = SimpleNamespace(id=7), SimpleNamespace(id=7, type="private")
@@ -194,7 +196,8 @@ def test_herdr_reply_authorized_final_sends_once_and_clears_dialog(monkeypatch):
     assert asyncio.run(bot.cb_herdr_reply_start(entry, context)) == bot.ASK_HERDR_REPLY
     assert asyncio.run(bot.herdr_reply_got_text(final, context)) == bot.ConversationHandler.END
     assert calls == [(("agent", "get", "w1:p1"), {"host": None}),
-                     (("agent", "prompt", "w1:p1", "continue safely"), {"host": None})]
+                     (("agent", "prompt", "w1:p1", "continue safely", '--wait', '--until', 'working', '--timeout', '7000'),
+                      {"host": None, 'timeout': 12, 'allow_error': True})]
     assert context.user_data == {}
     asyncio.run(bot.herdr_reply_got_text(final, context))
     assert len(calls) == 2
