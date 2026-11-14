@@ -220,7 +220,7 @@ def _task_detail_keyboard(task) -> InlineKeyboardMarkup:
         action_row.append(InlineKeyboardButton("🔁 Повторить", callback_data=f"rerun:{task.id}"))
     if action_row:
         rows.append(action_row)
-    if task.result and len(result_files.visible_result(task.result)) > 800:
+    if task.result or task.error:
         rows.append([InlineKeyboardButton("📄 Полный вывод", callback_data=f"full_result:{task.id}")])
     final_row = [InlineKeyboardButton("← К списку", callback_data="tasklist")]
     if status != "running":
@@ -3376,8 +3376,9 @@ def _screen_chrome(line: str) -> bool:
 
 
 def _codex_question_pending(text: str) -> bool:
-    return bool(re.search(r'\b[1-9]\d*\s+questions?\b', text, re.I)
-                and re.search(r'shift\s*\+\s*(?:↑|up)\s+to answer', text, re.I))
+    return bool(re.search(r'^\s*(?:[?❓•·]\s*)?[1-9]\d*\s+questions?\b', text, re.I | re.M)
+                and re.search(r'^\s*(?:[•·]\s*)?queued follow-up inputs\b|^\s*shift\s*\+\s*\S+\s+to answer',
+                              text, re.I | re.M))
 
 
 def _question_keyboard(ref):
@@ -3392,7 +3393,9 @@ def _question_keyboard(ref):
 
 def _question_text(raw):
     lines = [line.rstrip() for line in raw.splitlines() if not _screen_chrome(line)]
-    return _clip('\n'.join(lines).strip(), 3500) or 'Вопрос больше не отображается.'
+    # Codex opens the dialog at the bottom of the viewport. Keep that region
+    # when old transcript above it exceeds the Telegram message budget.
+    return '\n'.join(lines).strip()[-3500:] or 'Вопрос больше не отображается.'
 
 
 async def _show_herdr_question(query, context, ref, pane, host):
@@ -3493,7 +3496,15 @@ async def _herdr_screen_tail(pane_id: str, machine: str = "", lines_n: int = 10)
     lines = [l.rstrip() for l in raw.splitlines() if not _screen_chrome(l)]
     while lines and not lines[-1]:
         lines.pop()
-    tail = lines[-lines_n:]
+    # Keep the pending-question summary even when terminal padding or a long
+    # footer would push it outside the usual preview. Its presence controls
+    # the Open question button, so clipping it silently removes that action.
+    if _codex_question_pending(raw):
+        question = next(line for line in raw.splitlines()
+                        if re.search(r'\b[1-9]\d*\s+questions?\b', line, re.I))
+        return "Queued follow-up inputs\n" + question[:120] + "\nОткройте вопрос кнопкой ниже."
+    else:
+        tail = lines[-lines_n:]
     # An agent that cleared its screen leaves the tail as blank padding; drop
     # the leading gap and collapse runs so the card isn't mostly whitespace.
     out = []
@@ -3757,6 +3768,30 @@ async def cb_herdr_screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.pop()
     tail = "\n".join(lines[-25:])[-3500:] or "(пусто)"
     await query.message.reply_text(f"📺 {pane}{f' ({machine})' if machine else ''}:\n{tail}")
+
+
+@require_auth
+async def cb_herdr_output(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Export available pane history, including sessions without a task row."""
+    import io
+    query = update.callback_query
+    target = await _hd_ref_or_alert(query, query.data.split(":", 1)[1])
+    if target is None:
+        return
+    machine, pane, host = target
+    await query.answer()
+    raw = await _herdr_cli("agent", "read", pane, "--source", "recent-unwrapped",
+                           "--lines", "1000", "--format", "text", host=host, timeout=30)
+    if not raw:
+        await query.message.reply_text("Вывода пока нет или окно уже закрыто.")
+        return
+    buf = io.BytesIO(raw.encode("utf-8"))
+    buf.name = "herdr_" + re.sub(r"[^\w-]", "_", pane) + ".txt"
+    await query.message.reply_document(
+        document=buf,
+        caption=f"Вывод окна {pane}{f' ({machine})' if machine else ''}. "
+                "Доступная история терминала: до 1000 строк.",
+    )
 
 
 async def _check_herdr_reply_access(update: Update) -> bool:
@@ -4062,7 +4097,10 @@ async def _render_window_card(query, context, idx: int) -> str:
 
     ref = f"{w['machine']}:{w['pane_id']}"
     rows = [[InlineKeyboardButton(REPLY_LABEL, callback_data=f"hd_reply:{ref}")]]
+    rows.append([InlineKeyboardButton("📺 Экран", callback_data=f"hd_screen:{ref}"),
+                 InlineKeyboardButton("📄 Вывод файлом", callback_data=f"hd_output:{ref}")])
     if _codex_question_pending(tail):
+        lines.append("\n❓ Агент задал вопрос. Откройте его кнопкой ниже, чтобы увидеть текст и варианты ответа.")
         rows.insert(0, [InlineKeyboardButton('❓ Открыть вопрос', callback_data=f'hd_question:{ref}')])
     elif w["status"] == "blocked":
         rows.append([InlineKeyboardButton("✅ Enter", callback_data=f"hd_enter:{ref}"),
@@ -4274,6 +4312,7 @@ async def _notify_loop(bot):
                     db.mark_notification_sent(note["id"])
                     continue
                 kb = None
+                note_text = note["message"]
                 if note.get("flow_ref"):
                     kb = _flow_keyboard(note["flow_ref"])
                 elif note.get("pane_id"):
@@ -4282,7 +4321,14 @@ async def _notify_loop(bot):
                     ref = f"{note.get('machine') or ''}:{note['pane_id']}"
                     kb = InlineKeyboardMarkup(_herdr_done_keyboard(ref) if note.get("kind") == "herdr.done"
                                               else _herdr_blocked_keyboard(ref))
-                await bot.send_message(chat_id=note["tg_chat_id"], text=_clip(note["message"]),
+                    if note.get("kind") != "herdr.done":
+                        tail = await _herdr_screen_tail(note["pane_id"], note.get("machine") or "")
+                        if tail:
+                            note_text += "\n\n" + tail
+                        if _codex_question_pending(tail):
+                            kb = InlineKeyboardMarkup([[
+                                InlineKeyboardButton("❓ Открыть вопрос", callback_data=f"hd_question:{ref}")]])
+                await bot.send_message(chat_id=note["tg_chat_id"], text=_clip(note_text),
                                        reply_markup=kb)
                 db.mark_notification_sent(note["id"])
             except (Forbidden, BadRequest) as e:
@@ -4336,6 +4382,8 @@ async def _notify_loop(bot):
                 if task.session_id:
                     note_rows[0].append(InlineKeyboardButton(REPLY_LABEL, callback_data=f"reply_task:{task.id}"))
                 note_rows.append([InlineKeyboardButton("🔁 Повторить", callback_data=f"rerun:{task.id}")])
+                if task.result or task.error:
+                    note_rows.append([InlineKeyboardButton("📄 Полный вывод", callback_data=f"full_result:{task.id}")])
                 note_kb = InlineKeyboardMarkup(note_rows)
                 # Agents answer in Markdown; raw «**жирный**» in the preview
                 # reads as noise. Try to render it, fall back to plain text on
@@ -5005,6 +5053,7 @@ def run_bot():
     # herdr bridge buttons must outrank active ConversationHandlers (group 0)
     app.add_handler(CallbackQueryHandler(cb_herdr_enter, pattern=r"^hd_enter:"), group=-1)
     app.add_handler(CallbackQueryHandler(cb_herdr_screen, pattern=r"^hd_screen:"), group=-1)
+    app.add_handler(CallbackQueryHandler(cb_herdr_output, pattern=r"^hd_output:"), group=-1)
     app.add_handler(CallbackQueryHandler(cb_herdr_key, pattern=r"^hd_key:"), group=-1)
     app.add_handler(CallbackQueryHandler(_dispatch_question_callback, pattern=r'^hd_question:'), group=-1)
     app.add_handler(CallbackQueryHandler(_dispatch_question_callback, pattern=r'^hd_qkey:'), group=-1)
