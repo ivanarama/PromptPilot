@@ -3649,7 +3649,16 @@ def queue_codex_question(key: str, record: dict) -> bool:
     with _connect(immediate=True) as conn:
         if not conn.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",
                             (key, _json_dump(record))).rowcount:
-            return False
+            previous = _json_load(conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()["value"], {})
+            if previous.get("used") or previous.get("question") != record.get("question"):
+                return False
+            expired = previous.get("expires_at", 0) < datetime.now(timezone.utc).timestamp()
+            previous["expires_at"] = record.get("expires_at", previous.get("expires_at", 0))
+            conn.execute("UPDATE settings SET value=? WHERE key=?", (_json_dump(previous), key))
+            if not expired or conn.execute(
+                    "SELECT 1 FROM notifications WHERE kind='codex.question' AND message=? "
+                    "AND sent_at IS NULL LIMIT 1", (key.rsplit(".", 1)[-1],)).fetchone():
+                return False
         conn.execute(
             "INSERT INTO notifications(tg_chat_id,message,created_at,machine,pane_id,kind) "
             "VALUES(?,?,?,?,?,?)",

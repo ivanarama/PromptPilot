@@ -126,7 +126,9 @@ class Client:
                 if item.get("type") in {"userMessage", "agentMessage"}:
                     turn["items"] = [v for v in turn["items"] if v.get("id") != item.get("id")] + [item]
             if "id" in message:
-                self.pending[json.dumps(message["id"])] = message
+                # Replays may get a new delivery timestamp; it isn't question identity.
+                self.pending[json.dumps(message["id"])] = {
+                    k: v for k, v in message.items() if k != "emittedAtMs"}
             elif message["method"] == "serverRequest/resolved":
                 self.pending.pop(json.dumps(params.get("requestId")), None)
         elif "id" in message:

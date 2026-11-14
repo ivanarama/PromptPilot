@@ -97,6 +97,14 @@ def test_completed_event_with_empty_items_retains_final_message(client):
     assert turn["status"] == "completed" and bridge.final_text(turn) == "Done"
 
 
+def test_request_replay_timestamp_does_not_change_question_identity(client):
+    request = {"id": 42, "method": "item/tool/requestUserInput", "params": {"threadId": "t", "questions": []}}
+    client._message({**request, "emittedAtMs": 100})
+    first = client.questions("t")
+    client._message({**request, "emittedAtMs": 200})
+    assert client.questions("t") == first
+
+
 def test_disabled_adapter_does_not_spawn_or_probe(monkeypatch):
     monkeypatch.setenv("PP_CODEX_APP_SERVER", "0")
     monkeypatch.setattr(app, "proxy_command", lambda *_: pytest.fail("disabled adapter spawned"))
@@ -213,6 +221,19 @@ def test_question_outbox_and_answer_claim_survive_restart(isolated_db):
     assert not db.queue_codex_question(tg.QUESTION_PREFIX + "same", record)
     assert db.claim_codex_answer("same")
     assert not db.claim_codex_answer("same")
+    assert len(db.get_unsent_notifications()) == 1
+
+
+def test_still_pending_question_is_redelivered_after_long_bot_downtime(isolated_db):
+    record = dict(chat_id=123, machine="", pane="w1:p1", question={"id": "same"}, expires_at=0)
+    key = tg.QUESTION_PREFIX + "old-question"
+    assert db.queue_codex_question(key, record)
+    first = db.get_unsent_notifications()[0]
+    db.mark_notification_sent(first["id"])
+    record["expires_at"] = 9999999999
+    assert db.queue_codex_question(key, record)
+    assert len(db.get_unsent_notifications()) == 1
+    assert not db.queue_codex_question(key, record)
     assert len(db.get_unsent_notifications()) == 1
 
 
