@@ -123,7 +123,8 @@ class RPC:
     def request(self, method, params, **kwargs):
         self.calls.append((method, params, kwargs))
         if method == "thread/list":return {"data": self.threads}
-        if method == "thread/read":return {"thread": self.threads[0]}
+        if method == "thread/loaded/list":return {"data": [t["id"] for t in self.threads]}
+        if method == "thread/read":return {"thread": next(t for t in self.threads if t["id"] == params["threadId"])}
         if method == "thread/turns/list":return {"data": self.turns}
         if method == "turn/start":return {"turn": {"id": "new-turn"}}
         return {}
@@ -144,6 +145,7 @@ def test_unique_loaded_dialog_resolves_with_windows_path_normalization(monkeypat
     rpc = RPC()
     monkeypatch.setattr(app, "get_client", lambda *_: rpc)
     assert bridge.resolve(agent()).thread_id == "t"
+    assert all(call[0] != "thread/list" for call in rpc.calls)
 
 
 def test_same_folder_alone_cannot_route_a_new_window_to_an_old_dialog(monkeypatch):

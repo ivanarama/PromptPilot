@@ -37,11 +37,14 @@ def resolve(agent, host=None):
             thread = client.request("thread/read", {"threadId": session})["thread"]
             candidates = [thread]
         else:
-            response = client.request("thread/list", {"cwd": cwd, "limit": 100})
-            candidates = response.get("data") or []
+            # Stored-history listing can scan years of rollouts. Only loaded
+            # dialogs can own the live pane, and this list is an in-memory query.
+            response = client.request("thread/loaded/list", {"limit": 100})
             # A truncated listing cannot establish uniqueness.
             if response.get("nextCursor"):
                 return None
+            candidates = [client.request("thread/read", {"threadId": thread_id})["thread"]
+                          for thread_id in response.get("data") or []]
         candidates = [t for t in candidates
                       if _path(t.get("cwd")) == _path(cwd)
                       and (t.get("status") or {}).get("type") in {"idle", "active"}]
