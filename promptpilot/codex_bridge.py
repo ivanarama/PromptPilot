@@ -138,6 +138,7 @@ class Dialog:
                     for index, question in enumerate(item["questions"]):
                         identity = json.dumps(["request_user_input_async", item["id"], index], separators=(",", ":"))
                         async_questions.append({"kind": "async", "id": identity,
+                                                "turn_id": turn["id"],
                                                 "text": question["title"],
                                                 "options": question.get("options") or []})
         return result + [q for q in async_questions if q["id"] not in answered]

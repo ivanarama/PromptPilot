@@ -84,13 +84,19 @@ async def current_question(update, token):
     return record, dialog, machine, pane, host
 
 
-def track(dialog, turn_id, pane, machine, host, chat_id, delivery=None):
+def track(dialog, turn_id, pane, machine, host, chat_id, delivery=None, inherit_from=None):
+    from . import bot
     key = TURN_PREFIX + _digest([list(host) if host else None, dialog.thread_id, turn_id, chat_id])
     previous = db.get_setting(key)
     if delivery is None and previous:
         delivery = json.loads(previous).get("delivery")
-    db.set_setting(key, json.dumps(bridge.tracked_turn(
-        dialog, turn_id, pane, machine, host, chat_id, delivery), ensure_ascii=False))
+    if delivery is None and inherit_from:
+        old_key = TURN_PREFIX + _digest([list(host) if host else None, dialog.thread_id, inherit_from, chat_id])
+        old = json.loads(db.get_setting(old_key, "{}"))
+        if (not old.get("done") or old.get("status") == "awaiting_input") and old.get("expires_at", 0) > time.time():
+            delivery = old.get("delivery")
+    db.save_codex_tracking(key, bridge.tracked_turn(
+        dialog, turn_id, pane, machine, host, chat_id, delivery), bot._herdr_watch_source(machine, host))
     return key
 
 
@@ -136,7 +142,8 @@ async def answer(update, context, token, text=None, option=None):
         await message.reply_text("Ответ сохранён. Ответьте на остальные вопросы в этой группе.")
     else:
         if isinstance(result, tuple):
-            track(dialog, result[0], pane, machine, host, update.effective_chat.id)
+            track(dialog, result[0], pane, machine, host, update.effective_chat.id,
+                  inherit_from=question.get("turn_id"))
         await message.reply_text("Ответ передан Codex ✓")
 
 

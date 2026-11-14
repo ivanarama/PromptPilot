@@ -289,6 +289,20 @@ def test_background_completion_uses_exact_turn_and_survives_restart(isolated_db,
     assert len(notes) == 1 and notes[0]["kind"] == "codex.done"
 
 
+def test_file_delivery_switch_retires_legacy_cursor_and_follows_question_turn(isolated_db):
+    dialog = SimpleNamespace(thread_id="t")
+    source = bot._herdr_watch_source("", None)
+    db.save_native_file_context(source, {"pane": "w1:p1", "tg_chat_id": 123, "queued": False})
+    delivery = {"id": "requested-files", "expires_at": 9999999999}
+    first = tg.track(dialog, "question-turn", "w1:p1", "", None, 123, delivery)
+    assert all(json.loads(v)["queued"] for v in db.settings_with_prefix("result-files.native.").values())
+    db.finish_codex_tracking(first, "question-turn", "Waiting for input", "awaiting_input", [])
+    second = tg.track(dialog, "answer-turn", "w1:p1", "", None, 123, inherit_from="question-turn")
+    assert json.loads(db.get_setting(second))["delivery"] == delivery
+    third = tg.track(dialog, "unrelated-turn", "w1:p1", "", None, 123)
+    assert json.loads(db.get_setting(third))["delivery"] is None
+
+
 def test_question_auth_rechecked_after_asynchronous_lookup(isolated_db, monkeypatch):
     query = SimpleNamespace(message=SimpleNamespace(reply_text=AsyncMock()))
     event = SimpleNamespace(message=None, callback_query=query, effective_chat=SimpleNamespace(id=123))

@@ -3686,6 +3686,18 @@ def finish_codex_tracking(key: str, turn_id: str, result: str, status: str,
     return True
 
 
+def save_codex_tracking(key: str, record: dict, legacy_source: str):
+    """Switch file observation to the exact turn without retaining an old manifest."""
+    slot = hashlib.sha256(_json_dump([record["pane"], record["chat_id"]]).encode()).hexdigest()
+    retired = {"pane": record["pane"], "tg_chat_id": record["chat_id"], "queued": True,
+               "expires_at": record["expires_at"]}
+    with _connect(immediate=True) as conn:
+        conn.executemany("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", [
+            (key, _json_dump(record)),
+            ("result-files.native." + legacy_source + "." + slot, _json_dump(retired)),
+        ])
+
+
 def increment_int_setting(key: str, default: int = 0) -> int:
     """Atomically increment an integer setting shared by all PP processes."""
     with _connect(immediate=True) as conn:
