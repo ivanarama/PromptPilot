@@ -2804,6 +2804,216 @@ def clear_pipeline_series_wake(series_id: int) -> bool:
         return deleted.rowcount > 0
 
 
+class ItemHoldResolutionConflict(ValueError):
+    """The operator's exact hold snapshot or nonce no longer matches."""
+
+
+def _item_hold_digest(raw: str) -> str:
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _item_hold_json(raw: str):
+    def unique_object(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("duplicate JSON key")
+            value[key] = item
+        return value
+
+    def no_constant(value):
+        raise ValueError("non-finite JSON value")
+
+    def finite_float(value):
+        result = float(value)
+        if not math.isfinite(result):
+            raise ValueError("non-finite JSON number")
+        return result
+
+    try:
+        return json.loads(raw, object_pairs_hook=unique_object,
+                          parse_constant=no_constant, parse_float=finite_float)
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise ItemHoldResolutionConflict("Malformed hold metadata") from exc
+
+
+def _item_hold_records(raw: str | None) -> dict:
+    value = {} if raw is None else _item_hold_json(raw)
+    if (not isinstance(value, dict)
+            or any(not isinstance(key, str)
+                   or not re.fullmatch(r"[1-9][0-9]*", key)
+                   or not isinstance(record, dict)
+                   for key, record in value.items())):
+        raise ItemHoldResolutionConflict("Malformed hold ledger")
+    return value
+
+
+def _item_hold_record_digest(record: dict) -> str:
+    return _item_hold_digest(json.dumps(
+        record, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        allow_nan=False))
+
+
+def _item_resolution_nonce_key(nonce: str) -> str:
+    if (not isinstance(nonce, str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", nonce)):
+        raise ValueError("request_nonce must contain 1..128 ASCII nonce characters")
+    return "pipeline_item_hold_resolution:v1:" + _item_hold_digest(nonce)
+
+
+def _item_resolution_receipt(raw: str) -> dict:
+    value = _item_hold_json(raw)
+    fields = {"schema", "receipt_id", "resolved_at", "request", "resolved_record",
+              "resolved_record_sha256", "before_raw_holds_sha256", "after_raw_holds_sha256",
+              "operator_resolution_only", "product_mutation_authorized",
+              "canonical_progress_claimed", "wake_requested"}
+    if (not isinstance(value, dict) or set(value) != fields
+            or value.get("schema") != "pipeline-item-hold-resolution-v1"
+            or not isinstance(value.get("request"), dict)
+            or not isinstance(value.get("resolved_record"), dict)
+            or not isinstance(value.get("receipt_id"), str)
+            or not re.fullmatch(r"[0-9a-f]{32}", value["receipt_id"])):
+        raise ItemHoldResolutionConflict("Malformed resolution receipt")
+    request = value["request"]
+    request_fields = {"series_id", "number", "expected_head", "expected_task_id",
+                      "expected_raw_holds_sha256", "request_nonce"}
+    try:
+        if set(request) != request_fields:
+            raise ValueError("unknown receipt request")
+        for name in ("series_id", "number", "expected_task_id"):
+            if type(request[name]) is not int or not 0 < request[name] <= 2**63 - 1:
+                raise ValueError("invalid receipt request identity")
+        _item_resolution_nonce_key(request["request_nonce"])
+        for name in ("before_raw_holds_sha256", "after_raw_holds_sha256",
+                     "resolved_record_sha256"):
+            if not isinstance(value[name], str) or not re.fullmatch(r"[0-9a-f]{64}", value[name]):
+                raise ValueError("invalid receipt digest")
+        stamp = datetime.fromisoformat(value["resolved_at"])
+        if stamp.tzinfo is None:
+            raise ValueError("missing receipt timezone")
+        record = value["resolved_record"]
+        if (not isinstance(request["expected_head"], str)
+                or not re.fullmatch(r"[0-9a-f]{40}", request["expected_head"])
+                or record.get("head") != request["expected_head"]
+                or type(record.get("task_id")) is not int
+                or record["task_id"] != request["expected_task_id"]
+                or value["before_raw_holds_sha256"] != request["expected_raw_holds_sha256"]
+                or value["resolved_record_sha256"] != _item_hold_record_digest(record)
+                or value["operator_resolution_only"] is not True
+                or any(value[name] is not False for name in (
+                    "product_mutation_authorized", "canonical_progress_claimed", "wake_requested"))):
+            raise ValueError("receipt contradicts resolution")
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise ItemHoldResolutionConflict("Malformed resolution receipt") from exc
+    return value
+
+
+def list_pipeline_item_holds(series_id: int) -> dict:
+    """Read exact hold bytes and canonical record digests without changing state."""
+    if type(series_id) is not int or not 0 < series_id <= 2**63 - 1:
+        raise ValueError("Invalid series ID")
+    with _connect() as conn:
+        conn.execute("BEGIN")
+        if conn.execute("SELECT 1 FROM task_series WHERE id=?", (series_id,)).fetchone() is None:
+            raise KeyError("Series not found")
+        row = conn.execute("SELECT value FROM settings WHERE key=?",
+                           (f"pipeline_item_holds:v1:{series_id}",)).fetchone()
+        raw = None if row is None else row["value"]
+        records = _item_hold_records(raw)
+        mode = conn.execute("SELECT value FROM settings WHERE key=?",
+                            (f"pipeline_item_hold_mode:v1:{series_id}",)).fetchone()
+        return {
+            "series_id": series_id, "raw_holds": raw,
+            "raw_holds_sha256": None if raw is None else _item_hold_digest(raw),
+            "hold_mode": None if mode is None else mode["value"],
+            "holds": [{"number": int(key), "record": record,
+                       "record_sha256": _item_hold_record_digest(record)}
+                      for key, record in sorted(records.items(), key=lambda pair: int(pair[0]))],
+        }
+
+
+def get_pipeline_item_hold_resolution(series_id: int, request_nonce: str) -> dict | None:
+    """Reconcile a lost response; this read never repeats the resolution."""
+    if type(series_id) is not int or not 0 < series_id <= 2**63 - 1:
+        raise ValueError("Invalid series ID")
+    key = _item_resolution_nonce_key(request_nonce)
+    with _connect() as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        if row is None:
+            return None
+        receipt = _item_resolution_receipt(row["value"])
+        if (receipt["request"].get("series_id") != series_id
+                or receipt["request"].get("request_nonce") != request_nonce):
+            raise ItemHoldResolutionConflict("Nonce belongs to another resolution")
+        return receipt
+
+
+def resolve_pipeline_item_hold(series_id: int, number: int, *, expected_head: str,
+                               expected_task_id: int, expected_raw_holds_sha256: str,
+                               request_nonce: str) -> dict:
+    """Explicit operator decision for ONE exact HEAD-bound hold, never admission.
+
+    The caller owns authorization and remediation assessment. No reason string,
+    quota reset, current review or machine progress is inferred here. Resolving
+    a hold does not wake work, alter an existing attempt or grant product rights.
+    The hold CAS and immutable nonce receipt commit together.
+    """
+    for value in (series_id, number, expected_task_id):
+        if type(value) is not int or not 0 < value <= 2**63 - 1:
+            raise ValueError("IDs must be positive SQLite integers")
+    if not isinstance(expected_head, str) or not re.fullmatch(r"[0-9a-f]{40}", expected_head):
+        raise ValueError("Expected HEAD must be a lowercase commit SHA")
+    if (not isinstance(expected_raw_holds_sha256, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", expected_raw_holds_sha256)):
+        raise ValueError("Expected raw hold SHA256 is required")
+    key = _item_resolution_nonce_key(request_nonce)
+    request = {"series_id": series_id, "number": number, "expected_head": expected_head,
+               "expected_task_id": expected_task_id,
+               "expected_raw_holds_sha256": expected_raw_holds_sha256,
+               "request_nonce": request_nonce}
+    with _connect(immediate=True) as conn:
+        prior = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        if prior is not None:
+            receipt = _item_resolution_receipt(prior["value"])
+            if receipt["request"] != request:
+                raise ItemHoldResolutionConflict("Nonce already used for a different request")
+            return receipt
+        if conn.execute("SELECT 1 FROM task_series WHERE id=?", (series_id,)).fetchone() is None:
+            raise KeyError("Series not found")
+        if conn.execute("SELECT 1 FROM tasks WHERE series_id=? AND status='running' LIMIT 1",
+                        (series_id,)).fetchone() is not None:
+            raise ItemHoldResolutionConflict("Series has a running attempt; wait for it to finish")
+        hold_key = f"pipeline_item_holds:v1:{series_id}"
+        row = conn.execute("SELECT value FROM settings WHERE key=?", (hold_key,)).fetchone()
+        if row is None or _item_hold_digest(row["value"]) != expected_raw_holds_sha256:
+            raise ItemHoldResolutionConflict("Hold ledger changed; read it again")
+        raw = row["value"]
+        records = _item_hold_records(raw)
+        target = records.get(str(number))
+        if (target is None or target.get("head") != expected_head
+                or type(target.get("task_id")) is not int
+                or target["task_id"] != expected_task_id):
+            raise ItemHoldResolutionConflict("Exact HEAD/task hold is absent or changed")
+        remaining = {name: record for name, record in records.items() if name != str(number)}
+        after = json.dumps(remaining, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+        receipt = {
+            "schema": "pipeline-item-hold-resolution-v1", "receipt_id": uuid.uuid4().hex,
+            "resolved_at": _now(), "request": request, "resolved_record": target,
+            "resolved_record_sha256": _item_hold_record_digest(target),
+            "before_raw_holds_sha256": expected_raw_holds_sha256,
+            "after_raw_holds_sha256": _item_hold_digest(after),
+            "operator_resolution_only": True, "product_mutation_authorized": False,
+            "canonical_progress_claimed": False, "wake_requested": False,
+        }
+        changed = conn.execute("UPDATE settings SET value=? WHERE key=? AND value=?",
+                               (after, hold_key, raw))
+        if changed.rowcount != 1:
+            raise ItemHoldResolutionConflict("Hold ledger CAS failed")
+        conn.execute("INSERT INTO settings(key,value) VALUES(?,?)",
+                     (key, json.dumps(receipt, ensure_ascii=False, sort_keys=True,
+                                      separators=(",", ":"), allow_nan=False)))
+        return receipt
+
 def series_action(series_id: int, action: str, *, retry_blocked: bool = False) -> bool:
     with _connect(immediate=True) as conn:
         row = conn.execute("SELECT * FROM task_series WHERE id = ?", (series_id,)).fetchone()

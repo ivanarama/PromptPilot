@@ -524,6 +524,56 @@ def api_series_action(series_id: int, body: SeriesAction):
         ) from exc
 
 
+class ItemHoldResolutionRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    expected_head: str = Field(pattern=r"^[0-9a-f]{40}$", strict=True)
+    expected_task_id: int = Field(gt=0, le=2**63 - 1, strict=True)
+    expected_raw_holds_sha256: str = Field(pattern=r"^[0-9a-f]{64}$", strict=True)
+    request_nonce: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$", strict=True)
+
+
+def _item_hold_api(call, *args, **kwargs):
+    try:
+        return call(*args, **kwargs)
+    except KeyError as exc:
+        raise HTTPException(404, "Series not found") from exc
+    except db.ItemHoldResolutionConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except sqlite3.OperationalError as exc:
+        code = getattr(exc, "sqlite_errorcode", None)
+        busy = (type(code) is int and code & 0xff in {5, 6}) or (
+            code is None and str(exc).lower().startswith((
+                "database is locked", "database table is locked", "database schema is locked")))
+        if not busy:
+            raise
+        raise HTTPException(
+            503, "Hold metadata is busy. Reconcile the request nonce receipt before retrying.",
+            headers={"Retry-After": "1"},
+        ) from exc
+
+
+@app.get("/api/schedule/{series_id}/holds")
+def api_pipeline_item_holds(series_id: int):
+    return _item_hold_api(db.list_pipeline_item_holds, series_id)
+
+
+@app.get("/api/schedule/{series_id}/hold-resolutions/{request_nonce}")
+def api_pipeline_item_hold_resolution(series_id: int, request_nonce: str):
+    receipt = _item_hold_api(db.get_pipeline_item_hold_resolution, series_id, request_nonce)
+    if receipt is None:
+        raise HTTPException(404, "No committed resolution for this nonce")
+    return receipt
+
+
+@app.post("/api/schedule/{series_id}/holds/{number}/resolve")
+def api_resolve_pipeline_item_hold(series_id: int, number: int,
+                                   body: ItemHoldResolutionRequest):
+    return _item_hold_api(db.resolve_pipeline_item_hold, series_id, number,
+                          **body.model_dump())
+
 @app.get("/api/pipeline-insights/profiles")
 def api_pipeline_profiles():
     return pipeline_insights.list_profiles()
