@@ -159,6 +159,7 @@ def _run(args, host=None, timeout=None):
             errors="replace",
             timeout=timeout,
             stdin=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
     except FileNotFoundError:
         raise HerdrError("ssh not found" if host else f"herdr CLI not found: {HERDR_BIN}")
