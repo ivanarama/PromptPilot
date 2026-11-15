@@ -2340,6 +2340,17 @@ def _intake_snapshot_defer(config: dict, data: dict, profile_id: str,
             "profile_id": profile_id, "queue_id": queue_id, "wip_diagnostics": details}
 
 
+def _required_snapshot_defer(profile_id: str, queue_id: str, state: str) -> dict:
+    # This is an observation prerequisite, never an empty-queue verdict or a
+    # replacement for execution/mutation admission. The ordinary sampler owns
+    # refreshes; starting agents must not each spend another scan's quota.
+    return {"action": "defer",
+            "defer_until": (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat(),
+            "reason": "Required pipeline snapshot unavailable: " + state,
+            "profile_id": profile_id, "queue_id": queue_id,
+            "snapshot_admission": {"state": state}}
+
+
 def dispatch_gate(task) -> dict | None:
     """Evaluate an optional user-owned, token-free gate for a series task.
 
@@ -2355,11 +2366,36 @@ def dispatch_gate(task) -> dict | None:
             config = queue_config.get("dispatch_gate")
             if not marker or marker not in title or not isinstance(config, dict):
                 continue
+            require_snapshot = config.get("require_fresh_snapshot", False)
+            if not isinstance(require_snapshot, bool):
+                return _required_snapshot_defer(
+                    profile_id, queue_config["id"],
+                    "dispatch_gate.require_fresh_snapshot must be a boolean")
             # Dispatch only decides whether starting an agent is useful; every
             # mutation is still protected by the project's own fresh gate.
             # Reuse the five-minute snapshot so several due stages cannot each
             # spend hundreds of GitHub requests on the same queue state.
-            data = read_cached(profile_id, db.list_series())
+            try:
+                data = read_cached(profile_id, db.list_series())
+            except Exception:
+                if require_snapshot:
+                    return _required_snapshot_defer(
+                        profile_id, queue_config["id"], "cached read failed")
+                raise
+            if require_snapshot:
+                observed = data.get("cache") if isinstance(data, dict) else None
+                cache = observed if isinstance(observed, dict) else {}
+                if (cache.get("available") is not True
+                        or cache.get("complete") is not True
+                        or cache.get("stale") is not False
+                        or cache.get("invalidated")
+                        or cache.get("refresh_blocked")):
+                    state = ("refresh_blocked=" + str(cache["refresh_blocked"])
+                             if cache.get("refresh_blocked") else
+                             "invalidated" if cache.get("invalidated") else
+                             "stale" if cache.get("stale") else "incomplete")
+                    return _required_snapshot_defer(
+                        profile_id, queue_config["id"], state)
             cache = data.get("cache") or {}
             if (isinstance(config.get("backpressure"), dict)
                     and (cache.get("stale") or not cache.get("complete"))):
