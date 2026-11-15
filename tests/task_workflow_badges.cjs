@@ -1,4 +1,5 @@
-// Exercise the real task-list renderer with actual persisted attribution fields.
+// Exercise the retained legacy detail renderer with persisted attribution fields.
+// The main task list delegates to the unified business feed.
 const fs = require('node:fs');
 const vm = require('node:vm');
 const assert = require('node:assert/strict');
@@ -33,12 +34,14 @@ const context = {
   timeAgo:()=> 'now', parseResult:()=>null, githubApiWait:()=>false,
   taskStatusLabel:task=>task.status, scheduleInfo:()=>'', verdictIcon:()=>'',
   uiSnapScrolls:()=>[], uiRestoreScrolls:()=>{}, esc:escape, escAttr:escape,
+  loadUnifiedTaskFeed:async()=>{calls.push('unified-feed');},
 };
 vm.createContext(context);
 vm.runInContext(html.slice(resultStart,resultEnd), context);
 vm.runInContext(html.slice(start,end), context);
 (async()=>{
   await context.loadTasks();
+  list.innerHTML = tasks.map(task=>context.renderLegacyTaskRow(task)).join('');
   const badges = [...list.innerHTML.matchAll(/class="task-meta task-workflow">(.*?)<\/div>/g)]
     .map(match=>match[1]);
   assert.equal(badges.length,4); // Same cwd/prompt is never a workflow link.
@@ -53,8 +56,9 @@ vm.runInContext(html.slice(start,end), context);
   assert.equal(badges[3],'Планировщик');
   tasks[2].workflow_stage_code='LATER';
   await context.loadTasks();
+  list.innerHTML = tasks.map(task=>context.renderLegacyTaskRow(task)).join('');
   assert.match(list.innerHTML,/Исполнитель.*этап FIRST/);
   assert.match(list.innerHTML,/Исполнитель.*этап LATER/);
-  assert.ok(calls.every(([url,options])=>url === '/api/tasks?limit=100' && options === undefined));
-  console.log('Actual task renderer: historical stage, current run, planner, escaping, no inference, read-only redraw PASS');
+  assert.deepEqual(calls,['unified-feed','unified-feed']);
+  console.log('Legacy detail renderer preserves attribution/escaping; main list delegates to unified feed PASS');
 })().catch(error=>{console.error(error);process.exitCode=1});

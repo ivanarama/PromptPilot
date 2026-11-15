@@ -4,6 +4,7 @@ import base64
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
+import sys
 import threading
 
 from fastapi import FastAPI
@@ -472,6 +473,29 @@ def test_deeply_nested_mcp_json_is_finite_parse_error_without_writes(client):
     assert response.status_code == 200 and response.json()["error"]["code"] == -32700
     with db._connect() as conn:
         assert list(conn.iterdump()) == before
+
+
+def test_json_depth_bound_survives_a_raised_process_recursion_limit(client):
+    previous = sys.getrecursionlimit()
+    try:
+        sys.setrecursionlimit(max(previous, 20000))
+        response = client.post("/api/external-clients/glm/mcp", content="[" * 128 + "0" + "]" * 128)
+        assert response.json()["error"]["code"] == -32700
+    finally:
+        sys.setrecursionlimit(previous)
+
+
+def test_json_brackets_and_escaped_quotes_inside_strings_are_not_nesting(client):
+    response = rpc(client, "ping", {"_meta": {"example": '[{"escaped":"quote\\\""}]' * 500}})
+    assert response.status_code == 200 and response.json()["result"] == {}
+
+
+@pytest.mark.parametrize("encoding", ["utf-16", "utf-32"])
+def test_non_utf8_json_cannot_bypass_the_structural_depth_scan(client, encoding):
+    raw = ('{"jsonrpc":"2.0","id":1,"method":"ping","params":{"_meta":'
+           '{"text":"quote\\\"","nested":' + "[" * 128 + "0" + "]" * 128 + '}}}').encode(encoding)
+    response = client.post("/api/external-clients/glm/mcp", content=raw)
+    assert response.json()["error"]["code"] == -32700
 
 
 @pytest.mark.parametrize("number", ["NaN", "Infinity", "-Infinity", "1e999"])

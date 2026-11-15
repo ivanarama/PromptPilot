@@ -483,6 +483,28 @@ def _finite_json_float(value):
     return parsed
 
 
+def _bounded_json_body(raw):
+    """Bound structural depth independently of the process recursion limit."""
+    depth, quoted, escaped = 0, False, False
+    for char in raw:
+        if quoted:
+            if escaped:
+                escaped = False
+            elif char == 92:
+                escaped = True
+            elif char == 34:
+                quoted = False
+        elif char == 34:
+            quoted = True
+        elif char in (91, 123):
+            depth += 1
+            if depth > 64:
+                raise ValueError("JSON nesting exceeds limit")
+        elif char in (93, 125):
+            depth -= 1
+    return json.loads(raw.decode("utf-8-sig"), parse_constant=_reject_json_constant, parse_float=_finite_json_float)
+
+
 @router.post("/api/external-clients/{client_id}/mcp")
 async def mcp(client_id: str, request: Request):
     chunks, size = [], 0
@@ -492,7 +514,7 @@ async def mcp(client_id: str, request: Request):
             raise HTTPException(413, "MCP request exceeds limit")
         chunks.append(chunk)
     try:
-        body = json.loads(b"".join(chunks), parse_constant=_reject_json_constant, parse_float=_finite_json_float)
+        body = _bounded_json_body(b"".join(chunks))
     except (ValueError, UnicodeError, RecursionError):
         return JSONResponse({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}})
     return await run_in_threadpool(_rpc, client_id, request.headers.get("Mcp-Session-Id"), body)
