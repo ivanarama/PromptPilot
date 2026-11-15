@@ -23,7 +23,10 @@ def windows_acl_metadata(path, failure=None, role="registry_parent"):
     command = r'''$ErrorActionPreference='Stop';$env:PSModulePath=[IO.Path]::Combine($PSHOME,'Modules');
 $a=Get-Acl -LiteralPath $env:PP_TEST_ACL_PATH;
 @{owner_sid=$a.GetOwner([System.Security.Principal.SecurityIdentifier]).Value;protected=$a.AreAccessRulesProtected;
-allow_sids=@($a.Access|Where-Object{$_.AccessControlType -eq 'Allow'}|ForEach-Object{$_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value})}|ConvertTo-Json -Compress'''
+allow_sids=@($a.Access|Where-Object{$_.AccessControlType -eq 'Allow'}|ForEach-Object{$_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value});
+access=@($a.Access|ForEach-Object{@{sid=$_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value;
+allow=$_.AccessControlType -eq 'Allow';rights=[long]$_.FileSystemRights;inheritance=[int]$_.InheritanceFlags;
+propagation=[int]$_.PropagationFlags;inherited=$_.IsInherited}})}|ConvertTo-Json -Depth 4 -Compress'''
     process = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', command],
                              env={**os.environ, 'PP_TEST_ACL_PATH': str(path)}, capture_output=True, timeout=15)
     result['metadata_exit_status'] = process.returncode
@@ -35,9 +38,11 @@ allow_sids=@($a.Access|Where-Object{$_.AccessControlType -eq 'Allow'}|ForEach-Ob
     if failure is None:
         try:
             REAL_WINDOWS_ACL(path, parent=True)
-        except subprocess.SubprocessError as error:
+        except (subprocess.SubprocessError, settings.SettingsError) as error:
             failure = error
     while failure is not None:
+        if isinstance(failure, settings.SettingsError):
+            result['policy_failure'] = {'type': type(failure).__name__, 'status': failure.status_code}
         if isinstance(failure, subprocess.CalledProcessError):
             cmd = failure.cmd
             result['acl_subprocess'] = {'program': Path(cmd[0]).name,
@@ -51,6 +56,19 @@ allow_sids=@($a.Access|Where-Object{$_.AccessControlType -eq 'Allow'}|ForEach-Ob
     return result
 
 
+def private_source_storage(tmp_path):
+    """Make ONLY a fresh leaf private; pytest's existing temp ACL is untouched."""
+    before = subprocess.check_output(['icacls', str(tmp_path)]) if os.name == 'nt' else tmp_path.stat().st_mode
+    leaf = tmp_path / 'private-source-settings'
+    leaf.mkdir(mode=0o700)
+    if os.name == 'nt':
+        REAL_WINDOWS_ACL(leaf, create=True, directory=True)
+        assert subprocess.check_output(['icacls', str(tmp_path)]) == before
+    else:
+        assert tmp_path.stat().st_mode == before
+    return leaf
+
+
 @pytest.fixture(autouse=True)
 def private_storage(monkeypatch):
     # CI POSIX exercises actual uid/mode checks. Portable Windows fixtures mock
@@ -61,8 +79,7 @@ def private_storage(monkeypatch):
 
 @pytest.fixture
 def registry(tmp_path):
-    tmp_path.chmod(0o700)
-    return tmp_path / "task-sources.json"
+    return private_source_storage(tmp_path) / "task-sources.json"
 
 
 def request(path, source_id="studio", **updates):
@@ -332,7 +349,7 @@ def test_probe_requires_exact_saved_or_draft_choice(registry):
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Actual Windows ACL implementation")
-def test_real_windows_inherited_temp_acl_public_save_works_without_changing_parent(registry, monkeypatch):
+def test_real_windows_private_leaf_public_save_preserves_its_parent_acl(registry, monkeypatch):
     monkeypatch.setattr(settings, "_windows_acl", REAL_WINDOWS_ACL)
     parent_acl = subprocess.check_output(['icacls', str(registry.parent)])
     assert settings.get_settings(sources_file=registry)['editable'], windows_acl_metadata(registry.parent)

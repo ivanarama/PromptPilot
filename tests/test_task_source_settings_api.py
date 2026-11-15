@@ -1,19 +1,22 @@
 """Actual authenticated API and real temporary registry/credentials/HTTP peers."""
 import hashlib
 import json
+import os
 from pathlib import Path
+import subprocess
 from urllib.parse import urlsplit
 
 import pytest
 
 from promptpilot import api
 from test_external_inbox import ASGIClient
+from test_task_source_settings import private_source_storage, windows_acl_metadata
 from test_task_sources import entry, peer, registry
 
 
 @pytest.fixture
 def owner(isolated_db, tmp_path, monkeypatch):
-    path = tmp_path / "task-sources.json"
+    path = private_source_storage(tmp_path) / "task-sources.json"
     monkeypatch.setenv("PP_TASK_SOURCES_FILE", str(path))
     monkeypatch.setattr(api, "API_TOKEN", "")
     return ASGIClient(api.app), path
@@ -33,6 +36,31 @@ def test_default_install_is_empty_editable_and_read_only(owner):
     assert response.status_code == 200
     assert response.json() == {"revision": "missing", "editable": True, "sources": [], "errors": []}
     assert set(path.parent.iterdir()) == before
+
+
+def test_untrusted_parent_create_directory_permission_is_refused_without_acl_rewrite(owner):
+    client, path = owner
+    if os.name == 'nt':
+        # Explicit AD applies to this fresh test leaf, not inherit-only. Rights4
+        # is CreateDirectories for a directory. Never touch pytest's parent.
+        subprocess.run(['icacls', str(path.parent), '/grant', '*S-1-5-32-545:(AD)', '/Q'],
+                       check=True, capture_output=True)
+        before = subprocess.check_output(['icacls', str(path.parent)])
+        metadata = windows_acl_metadata(path.parent)
+        assert any(rule['sid'] == 'S-1-5-32-545' and rule['rights'] & 4 and not rule['propagation'] & 2
+                   for rule in metadata['access']), metadata
+    else:
+        path.parent.chmod(0o722)
+        before = path.parent.stat().st_mode
+    response = client.get('/api/task-sources')
+    assert response.status_code == 200 and not response.json()['editable']
+    refused = put(client, 'studio', 'missing')
+    assert refused.status_code == 409 and not path.exists()
+    assert not path.with_name(path.name + '.credentials').exists()
+    if os.name == 'nt':
+        assert subprocess.check_output(['icacls', str(path.parent)]) == before
+    else:
+        assert path.parent.stat().st_mode == before
 
 
 def test_create_probe_edit_rotate_disconnect_through_actual_api(owner):
