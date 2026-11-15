@@ -496,7 +496,8 @@ def test_web_ui_exposes_workflow_and_live_agent_controls():
     )
 
     assert 'id="workflowModal"' in html
-    assert 'onclick="openWorkflows()"' in html
+    assert 'onclick="feedCreateWorkflow()"' in html
+    assert 'onclick="closeSettings();openWorkflows()"' in html
     assert "function wfDispatch(role)" in html
     assert "function wfStopTask(taskId)" in html
     assert "function wfRefreshScreen" in html

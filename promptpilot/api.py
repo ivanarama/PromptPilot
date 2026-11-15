@@ -25,7 +25,8 @@ from pydantic import BaseModel, Field
 import re as _re
 
 from . import db, epf_tools, flows, workflows
-from . import pipeline_insights
+from . import pipeline_insights, task_sources, external_inbox
+from . import task_feed
 from .config import ALLOWED_HOSTS, ALLOWED_ORIGINS, API_TOKEN, DB_DIR, DEFAULT_CLI, EFFORT_LEVELS, PIPELINE_SNAPSHOT_INTERVAL, get_provider_models, get_skills, load_providers, mask_secret_value, provider_available, RIGHTS_LEVELS, rights_supported, save_catalog_provider, PROJECTS_ROOT
 from .provider_catalog import CATALOG, catalog_entry, slugify, build_provider_entry
 from .models import (
@@ -113,6 +114,7 @@ async def _lifespan(application: FastAPI):
 app = FastAPI(title="PromptPilot", version="0.1.0", lifespan=_lifespan)
 
 app.include_router(workorder_router)
+app.include_router(external_inbox.router)
 
 
 _SAFE_METHODS = ("GET", "HEAD", "OPTIONS")
@@ -260,6 +262,7 @@ else:
 # for the lifetime of the server; a broken package now also fails at startup
 # instead of surfacing only when somebody opens the dashboard.
 _INDEX_HTML = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+_TASK_FEED_JS = (STATIC_DIR / "task-feed.js").read_text(encoding="utf-8")
 
 
 # --- API ---
@@ -330,6 +333,115 @@ def _attach_workflow_attribution(tasks: list, *, queue_details: bool = True) -> 
             task.queue_position = info["queue_position"]
             task.wait_reason = info["wait_reason"]
     return tasks
+
+
+def _feed_external_activity(items):
+    """Decorate local business rows with observed transport facts, not execution claims."""
+    by_workflow = {}
+    for activity in external_inbox.client_activity():
+        by_workflow[activity["workflow_id"]] = activity
+    for item in items:
+        if item["kind"] != "workflow" or item["source_id"] != "local":
+            continue
+        activity = by_workflow.get(item["object_id"])
+        if activity is None:
+            continue
+        exact = (activity.get("assignment_current") is True
+                 and activity.get("expected_version") == item.get("workflow", {}).get("state_version"))
+        configured = item.get("external_execution")
+        if not exact and (configured is not None or activity["state"] != "submitted"):
+            continue
+        info = {"client_id": activity["client_id"], "client_label": activity["client_id"],
+                "state": activity["state"], "run_id": activity["run_id"],
+                "last_seen_at": activity.get("last_signal_at"),
+                "execution_observed": False, "historical": not exact}
+        info["status_label"] = {
+            "claimed": "Приложение получило задание. Сигнал не доказывает активную работу модели.",
+            "submitted": "Результат передан в процесс. Проверки и приёмка учитываются отдельно.",
+            "submitting": "Передача результата ещё не подтверждена.",
+            "unknown": "Исход сдачи требует сверки. Повторная выдача остановлена.",
+        }.get(activity["state"], "Состояние подключения требует уточнения.")
+        if not exact:
+            info["status_label"] = "Последняя подтверждённая сдача внешнего исполнителя."
+        if exact and activity["state"] == "claimed" and item["status"] == "blocked":
+            item.update(status="active", status_label="Задание получено",
+                        status_reason="Внешнее приложение подтвердило получение текущего задания.")
+        if exact and activity["state"] == "unknown":
+            item.update(status="needs_attention", status_label="Требуется сверка сдачи",
+                        status_reason="Исход отправки неизвестен. Повторная выдача остановлена до сверки.")
+        item["external_execution"] = info
+
+
+@app.get("/api/task-feed")
+def api_task_feed(
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    status: Optional[task_feed.FeedStatus] = None,
+    kind: Optional[task_feed.FeedKind] = None,
+    q: Optional[str] = Query(default=None, max_length=200),
+    local_only: bool = False,
+    source_id: Optional[str] = Query(default=None, min_length=1, max_length=64,
+                                     pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]*$"),
+):
+    # local_only is also the federation recursion boundary for upgraded peers.
+    try:
+        items = task_feed.list_local_items()
+        _feed_external_activity(items)
+    except task_feed.FeedUnavailable as exc:
+        raise HTTPException(503, str(exc)) from exc
+    sources = [task_feed.local_source()]
+    errors = []
+    if not local_only:
+        remote = task_sources.list_source_items()
+        items.extend(remote["items"])
+        sources.extend(remote["sources"])
+        errors = remote["errors"]
+    if source_id:
+        if source_id not in {source["id"] for source in sources}:
+            raise HTTPException(404, "Источник не зарегистрирован")
+        items = [item for item in items if item["source_id"] == source_id]
+    selected = task_feed.paginate_items(
+        items, limit=limit, offset=offset, status=status, kind=kind, q=q)
+    counted = [item for item in items if (kind is None or item["kind"] == kind)
+               and (not q or q.casefold().strip() in
+                    (item["title"] + " " + item["objective"]).casefold())]
+    counts = {state: sum(item["status"] == state for item in counted)
+              for state in task_feed.STATUSES}
+    return {**selected, "sources": sources, "errors": errors, "counts": counts}
+
+
+@app.get("/api/task-feed/local/{kind}/{object_id}")
+def api_task_feed_detail(kind: task_feed.FeedKind, object_id: str):
+    try:
+        detail = task_feed.get_detail(kind, object_id)
+        if kind == "workflow":
+            _feed_external_activity([detail["item"]])
+            detail["external_execution"] = detail["item"].get("external_execution")
+            detail["external_result"] = external_inbox.client_result(object_id)
+        return detail
+    except task_feed.ItemNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except task_feed.FeedUnavailable as exc:
+        raise HTTPException(503, str(exc)) from exc
+
+
+@app.get("/api/task-feed/{source_id}/{kind}/{object_id}")
+def api_task_feed_source_detail(source_id: str, kind: task_feed.FeedKind,
+                                object_id: str):
+    if source_id == "local":
+        return api_task_feed_detail(kind, object_id)
+    if kind == "task":
+        if len(object_id) > 19 or not object_id.isascii() or not object_id.isdecimal():
+            raise HTTPException(404, "Задача источника не найдена")
+        object_id = int(object_id)
+        if object_id < 1 or object_id > 2**63 - 1:
+            raise HTTPException(404, "Задача источника не найдена")
+    detail = task_sources.get_source_detail(source_id, kind, object_id)
+    if detail.get("item") is None:
+        error = detail.get("error", {})
+        code = 404 if error.get("code") in {"source_not_found", "not_found"} else 503
+        raise HTTPException(code, error.get("message", "Источник временно недоступен"))
+    return detail
 
 
 @app.get("/api/tasks")
@@ -2187,6 +2299,12 @@ def api_flow_create_item(name: str, body: FlowItemRequest):
 
 
 # --- Frontend ---
+
+@app.get("/assets/task-feed.js")
+def task_feed_script():
+    return Response(content=_TASK_FEED_JS, media_type="application/javascript",
+                    headers={"Cache-Control": "no-store"})
+
 
 @app.get("/")
 def index():
