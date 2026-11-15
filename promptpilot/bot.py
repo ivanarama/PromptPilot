@@ -13,6 +13,7 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 import time
 import unicodedata
 import uuid
@@ -3319,6 +3320,7 @@ async def _herdr_cli(*args, host=None, timeout=15, allow_error=False):
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             stdin=asyncio.subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
         out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except (FileNotFoundError, OSError, asyncio.TimeoutError):
