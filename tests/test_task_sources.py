@@ -56,8 +56,8 @@ def registry(tmp_path, *entries):
     return path
 
 
-def entry(url, source_id="newis", **extra):
-    return {"id": source_id, "label": "NewIS", "base_url": url, **extra}
+def entry(url, source_id="studio-windows", **extra):
+    return {"id": source_id, "label": "Studio Windows", "base_url": url, **extra}
 
 
 def item(object_id="wf_one", **extra):
@@ -98,14 +98,14 @@ def test_upgraded_feed_pages_local_only_namespaces_and_strips_secrets(tmp_path, 
                      callback="ACCESS-SECRET") for n in range(start, min(start + 100, 101))]
         return 200, {"items": rows, "total": 101}, {}
 
-    monkeypatch.setenv("SOURCE_TEST_TOKEN", "ACCESS-SECRET")
+    monkeypatch.setenv("REMOTE_PP_TOKEN", "ACCESS-SECRET")
     with peer(respond) as (url, calls):
         result = sources.list_source_items(sources_file=registry(
-            tmp_path, entry(url, token_env="SOURCE_TEST_TOKEN")))
+            tmp_path, entry(url, token_env="REMOTE_PP_TOKEN")))
     assert len(calls) == 2 and all(c["authorization"] == "Bearer ACCESS-SECRET" for c in calls)
     assert len(result["items"]) == 101
-    assert result["items"][0]["id"] == "newis:workflow:wf_0"
-    assert all(v["readonly"] and v["source_id"] == "newis" for v in result["items"])
+    assert result["items"][0]["id"] == "studio-windows:workflow:wf_0"
+    assert all(v["readonly"] and v["source_id"] == "studio-windows" for v in result["items"])
     assert result["sources"][0]["status"] == "online"
     assert_private_free(result)
 
@@ -145,11 +145,11 @@ def test_http_failures_are_unavailable_no_legacy_fallback_or_error_leak(tmp_path
 
 
 def test_redirect_is_not_followed_and_token_not_sent_elsewhere(tmp_path, monkeypatch):
-    monkeypatch.setenv("SOURCE_TEST_TOKEN", "ACCESS-SECRET")
+    monkeypatch.setenv("REMOTE_PP_TOKEN", "ACCESS-SECRET")
     with peer(lambda path: (200, {}, {})) as (target, target_calls):
         with peer(lambda path: (302, {}, {"Location": target + "/steal"})) as (url, calls):
             result = sources.list_source_items(sources_file=registry(
-                tmp_path, entry(url, token_env="SOURCE_TEST_TOKEN")))
+                tmp_path, entry(url, token_env="REMOTE_PP_TOKEN")))
     assert len(calls) == 1 and target_calls == []
     assert result["sources"][0]["status"] == "unavailable"
     assert_private_free(result)
@@ -262,10 +262,10 @@ def test_modern_detail_whitelists_all_nested_history_and_result(tmp_path):
            "artifacts": [{"id": "a_one", "kind": "build", "path": "build/result.zip",
                           "metadata": {"token": "LEASE-SECRET"}}]}
     with peer(lambda path: (200, raw, {})) as (url, calls):
-        result = sources.get_source_detail("newis", "workflow", "wf_one",
+        result = sources.get_source_detail("studio-windows", "workflow", "wf_one",
                                            sources_file=registry(tmp_path, entry(url)))
     assert calls[0]["path"] == "/api/task-feed/local/workflow/wf_one"
-    assert result["item"]["id"] == "newis:workflow:wf_one"
+    assert result["item"]["id"] == "studio-windows:workflow:wf_one"
     assert result["history"]["role_groups"][0]["label"] == "Проверяющий"
     assert result["history"]["runs"][0]["round_no"] == 2
     assert result["result"]["characters"] == 123
@@ -290,7 +290,7 @@ def test_legacy_workflow_detail_reads_rounds_runs_events_only(tmp_path):
                       "input_sha256": "LEASE-SECRET", "output_json": "LEASE-SECRET"}], {}
 
     with peer(respond) as (url, calls):
-        result = sources.get_source_detail("newis", "workflow", "wf_one",
+        result = sources.get_source_detail("studio-windows", "workflow", "wf_one",
                                            sources_file=registry(tmp_path, entry(url)))
     assert len(calls) == 5 and all(v["method"] == "GET" for v in calls)
     assert result["source"]["status"] == "partial"
@@ -302,7 +302,7 @@ def test_legacy_workflow_detail_reads_rounds_runs_events_only(tmp_path):
 
 def test_task_404_never_falls_back_to_legacy_raw_task(tmp_path):
     with peer(lambda path: (404, {}, {})) as (url, calls):
-        result = sources.get_source_detail("newis", "task", 10,
+        result = sources.get_source_detail("studio-windows", "task", 10,
                                            sources_file=registry(tmp_path, entry(url)))
     assert len(calls) == 1 and result["source"]["status"] == "unavailable"
     assert result["item"] is None
@@ -310,9 +310,9 @@ def test_task_404_never_falls_back_to_legacy_raw_task(tmp_path):
 
 @pytest.mark.parametrize("source_id,kind,object_id", [
     ("http://evil.invalid", "workflow", "wf_one"),
-    ("unknown", "workflow", "wf_one"), ("newis", "workflow", "../../api/tasks"),
-    ("newis", "workflow", "http://evil.invalid"), ("newis", "command", "start"),
-    ("newis", "task", True), ("newis", "task", "10"),
+    ("unknown", "workflow", "wf_one"), ("studio-windows", "workflow", "../../api/tasks"),
+    ("studio-windows", "workflow", "http://evil.invalid"), ("studio-windows", "command", "start"),
+    ("studio-windows", "task", True), ("studio-windows", "task", "10"),
 ])
 def test_caller_identity_cannot_supply_urls_or_commands(tmp_path, source_id, kind, object_id):
     with peer(lambda path: pytest.fail("invalid caller caused network")) as (url, calls):
@@ -336,7 +336,7 @@ def test_legacy_detail_history_is_bounded(tmp_path):
         return 200, workflow(), {}
 
     with peer(respond) as (url, calls):
-        result = sources.get_source_detail("newis", "workflow", "wf_one",
+        result = sources.get_source_detail("studio-windows", "workflow", "wf_one",
                                            sources_file=registry(tmp_path, entry(url)))
     assert len(calls) == 9 and result["history"]["truncated"] is True
 
@@ -347,7 +347,7 @@ def test_untrusted_history_round_number_cannot_smuggle_nested_config(tmp_path):
                                   "round_no": {"lease_token": "LEASE-SECRET"}}], "events": []},
            "result": {"available": False}, "artifacts": []}
     with peer(lambda path: (200, raw, {})) as (url, _):
-        result = sources.get_source_detail("newis", "workflow", "wf_one",
+        result = sources.get_source_detail("studio-windows", "workflow", "wf_one",
                                            sources_file=registry(tmp_path, entry(url)))
     assert result["history"]["runs"][0]["round_no"] is None
     assert_private_free(result)
@@ -365,7 +365,7 @@ def test_pathological_json_nesting_is_safe_source_error(tmp_path):
 
 def test_huge_task_identifier_is_not_used_in_remote_url(tmp_path):
     with peer(lambda path: pytest.fail("unbounded identity caused network")) as (url, calls):
-        result = sources.get_source_detail("newis", "task", 2**100,
+        result = sources.get_source_detail("studio-windows", "task", 2**100,
                                            sources_file=registry(tmp_path, entry(url)))
     assert calls == [] and result["item"] is None
 
@@ -383,7 +383,7 @@ def test_detail_cannot_substitute_a_different_object(tmp_path):
     raw = {"item": item("wf_another"), "history": {"runs": [], "events": []},
            "result": {"available": False}, "artifacts": []}
     with peer(lambda path: (200, raw, {})) as (url, _):
-        result = sources.get_source_detail("newis", "workflow", "wf_one",
+        result = sources.get_source_detail("studio-windows", "workflow", "wf_one",
                                            sources_file=registry(tmp_path, entry(url)))
     assert result["item"] is None and result["source"]["status"] == "unavailable"
 

@@ -12,6 +12,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import re
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -63,7 +64,7 @@ print(json.dumps({'workflow_id':w.id,'task_id':standalone.id,'local_business_cou
                             cwd=root, env=env, input=json.dumps({"repository": str(repository)}).encode(),
                             capture_output=True, check=True, timeout=60)
     fixture = json.loads(seeded.stdout)
-    peer_workflow = {"id": "wf_newis_ui", "slug": "newis-fixture", "objective": "Тестовая заявка NewIS",
+    peer_workflow = {"id": "wf_studio_ui", "slug": "studio-fixture", "objective": "Тестовая задача студии",
                      "repository_path": "fixture-only", "candidate_branch": "main",
                      "status": "awaiting_human", "current_round": 1, "state_version": 4,
                      "created_at": "2026-11-15T00:00:00+00:00", "updated_at": "2026-11-15T00:00:00+00:00",
@@ -76,9 +77,9 @@ print(json.dumps({'workflow_id':w.id,'task_id':standalone.id,'local_business_cou
             parsed = urlsplit(self.path)
             if parsed.path == "/api/workflows":
                 return self.reply(200, [peer_workflow] if int(parse_qs(parsed.query).get("offset", ["0"])[0]) == 0 else [])
-            if parsed.path == "/api/workflows/wf_newis_ui":
+            if parsed.path == "/api/workflows/wf_studio_ui":
                 return self.reply(200, peer_workflow)
-            if parsed.path in ["/api/workflows/wf_newis_ui/rounds", "/api/workflows/wf_newis_ui/events"]:
+            if parsed.path in ["/api/workflows/wf_studio_ui/rounds", "/api/workflows/wf_studio_ui/events"]:
                 return self.reply(200, [])
             return self.reply(404, {})
 
@@ -96,9 +97,17 @@ print(json.dumps({'workflow_id':w.id,'task_id':standalone.id,'local_business_cou
     peer = ThreadingHTTPServer(("127.0.0.1", 0), Peer)
     thread = threading.Thread(target=peer.serve_forever, daemon=True)
     thread.start()
-    sources = output / "task-sources.json"
+    source_settings = output / "source-settings"
+    source_settings.mkdir()
+    if os.name == "nt":
+        sid = re.search(rb"S-1-5-(?:\d+-)*\d+", subprocess.check_output(
+            ["whoami.exe", "/user", "/fo", "csv", "/nh"])).group().decode("ascii")
+        subprocess.run(["icacls", str(source_settings), "/inheritance:r", "/grant:r",
+                        f"*{sid}:(OI)(CI)F", "*S-1-5-18:(OI)(CI)F", "/Q"],
+                       capture_output=True, check=True, timeout=15)
+    sources = source_settings / "task-sources.json"
     sources.write_text(json.dumps({"version": 1, "sources": [{
-        "id": "newis-ui", "label": "NewIS · тестовый источник",
+        "id": "studio-ui", "label": "Студия · тестовый источник",
         "base_url": f"http://127.0.0.1:{peer.server_port}", "token_env": "UI_SMOKE_SOURCE_TOKEN",
     }]}), encoding="utf-8")
     env["PP_TASK_SOURCES_FILE"] = str(sources)
@@ -168,13 +177,13 @@ print(json.dumps({'workflow_id':w.id,'task_id':standalone.id,'local_business_cou
                 assert json.load(response)["note"] == "UI acceptance note"
             checks.append("history_defaults_and_existing_note_control")
             page.locator("#feedSearch").fill("")
-            page.locator("#feedSource").select_option("newis-ui")
+            page.locator("#feedSource").select_option("studio-ui")
             page.wait_for_function("document.querySelectorAll('article.feed-row').length===1")
             peer_row = page.locator("article.feed-row")
             peer_row.locator("button.feed-toggle").click()
             peer_row.get_by_text("Просмотр подключённого источника", exact=True).wait_for()
             assert peer_row.get_by_role("button", name="Управление процессом").count() == 0
-            assert "Источник показывает только процессы" in page.locator("#feedSourceStatus").inner_text()
+            assert "Старый API" in page.locator("#feedSourceStatus").inner_text()
             checks.append("legacy_peer_is_readonly_and_explicitly_partial")
             page.locator("#feedSource").select_option("")
             page.wait_for_function("document.querySelectorAll('article.feed-row').length===100")
@@ -211,6 +220,53 @@ print(json.dumps({'workflow_id':w.id,'task_id':standalone.id,'local_business_cou
                 assert json.load(response)["running"] == 0
             checks.append("external_wizard_requires_explicit_plan_approval_no_provider_start")
             page.get_by_role("button", name="Закрыть", exact=True).filter(visible=True).last.click()
+            page.get_by_role("button", name="⚙ Настройки", exact=True).click()
+            page.locator("#settingsDialog").get_by_role("button", name="Источники", exact=True).click()
+            page.wait_for_function("!document.getElementById('taskSourceAdd').disabled")
+            page.locator("#taskSourceList button").first.click()
+            assert page.locator("#taskSourceToken").input_value() == ""
+            assert page.locator("#taskSourceAuth").input_value() == "preserve"
+            page.locator("#taskSourceProbe").click()
+            page.locator("#taskSourceProbeResult").get_by_text("Старый API", exact=False).wait_for()
+            assert "Workflow" in page.locator("#taskSourceProbeResult").inner_text()
+            page.locator("#taskSourceLabel").fill("Студия · переименовано")
+            page.locator("#taskSourceSave").click()
+            page.wait_for_function("document.getElementById('taskSourceMessage').textContent==='Источник сохранён.'")
+            config_rows = json.loads(sources.read_text(encoding="utf-8"))["sources"]
+            assert len(config_rows) == 1 and config_rows[0]["label"] == "Студия · переименовано"
+            assert config_rows[0]["token_env"] == "UI_SMOKE_SOURCE_TOKEN"
+            checks.append("settings_edit_preserves_existing_environment_credential")
+            page.locator("#taskSourceAdd").click()
+            page.locator("#taskSourceLabel").fill("Дополнительный компьютер")
+            page.locator("#taskSourceUrl").fill(f"http://127.0.0.1:{peer.server_port}")
+            page.locator("#taskSourceAuth").select_option("token")
+            page.locator("#taskSourceToken").fill("synthetic-ui-peer-credential")
+            page.locator("#taskSourceProbe").click()
+            page.locator("#taskSourceProbeResult").get_by_text("Старый API", exact=False).wait_for()
+            assert not sources.with_name(sources.name + ".credentials").exists()
+            page.locator("#taskSourceSave").click()
+            page.wait_for_function("document.getElementById('taskSourceMessage').textContent==='Источник сохранён.'")
+            assert page.locator("#taskSourceToken").input_value() == ""
+            with urlopen(url + "/api/task-sources", timeout=8) as response:
+                public = response.read().decode()
+                assert "synthetic-ui-peer-credential" not in public and "token_file" not in public
+                assert len(json.loads(public)["sources"]) == 2
+            assert "synthetic-ui-peer-credential" not in page.evaluate("JSON.stringify(localStorage)")
+            page.locator("#taskSourceDialog").screenshot(path=str(output / "source-settings-test-fixtures.png"))
+            checks.append("settings_add_probe_save_write_only_token_no_localstorage")
+            page.set_viewport_size({"width": 390, "height": 844})
+            assert page.evaluate("document.getElementById('taskSourceDialog').getBoundingClientRect().right<=innerWidth")
+            assert page.evaluate("document.getElementById('taskSourceDialog').scrollWidth<=document.getElementById('taskSourceDialog').clientWidth")
+            page.locator("#taskSourceDialog").screenshot(path=str(output / "source-settings-mobile-test-fixtures.png"))
+            checks.append("settings_dialog_mobile_no_horizontal_overflow")
+            page.set_viewport_size({"width": 1280, "height": 960})
+            page.once("dialog", lambda dialog: dialog.accept())
+            page.locator("#taskSourceDelete").click()
+            page.wait_for_function("document.getElementById('taskSourceMessage').textContent.startsWith('Источник отключён.')")
+            assert len(json.loads(sources.read_text(encoding="utf-8"))["sources"]) == 1
+            assert len(list(sources.with_name(sources.name + ".credentials").glob("*.key"))) == 1
+            checks.append("settings_disconnect_removes_binding_and_keeps_received_source_data")
+            page.locator("#taskSourceDialog").get_by_role("button", name="Закрыть", exact=True).click()
             page.locator("#feedSearch").fill("Проверка интерфейса")
             page.wait_for_function("document.querySelectorAll('article.feed-row').length===2")
             page.screenshot(path=str(output / "desktop-test-fixtures.png"))

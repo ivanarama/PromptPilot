@@ -28,7 +28,8 @@ MAX_SOURCES = 16
 MAX_PAGES = 10
 PAGE_SIZE = 100
 _IO_SLOTS = threading.BoundedSemaphore(16)
-LEGACY_MESSAGE = "Источник показывает только процессы"
+LEGACY_MESSAGE = ("Старый API источника. Доступны только Workflow. "
+                  "Для полного списка задач обновите PromptPilot на источнике.")
 _SOURCE_ID = re.compile(r"[a-z][a-z0-9_-]{0,47}\Z")
 _OBJECT_ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}\Z")
@@ -350,7 +351,9 @@ def _list_one(source):
                                **({} if legacy else {"local_only": "true"})})
         status = "partial" if legacy or truncated else "online"
         message = LEGACY_MESSAGE if legacy else "Показана только доступная часть списка"
-        public = source.public(status, **({"message": message} if status == "partial" else {}))
+        public = source.public(status, api="workflows" if legacy else "task-feed",
+                               capabilities={"tasks": not legacy, "workflows": True},
+                               **({"message": message} if status == "partial" else {}))
         return items, public
     except (_Unavailable, ValueError, TypeError, KeyError, AttributeError) as exc:
         error = exc if isinstance(exc, _Unavailable) else _Unavailable("invalid_response", "Источник вернул неподдерживаемые данные")

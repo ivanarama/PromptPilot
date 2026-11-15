@@ -18,15 +18,18 @@ from typing import List, Optional
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import Response
-from pydantic import BaseModel, Field
+from fastapi.responses import JSONResponse, Response
+from pydantic import BaseModel, ConfigDict, Field
 
 import re as _re
 
 from . import db, epf_tools, flows, workflows
 from . import pipeline_insights, task_sources, external_inbox
 from . import task_feed
+from . import task_source_settings
 from .config import ALLOWED_HOSTS, ALLOWED_ORIGINS, API_TOKEN, DB_DIR, DEFAULT_CLI, EFFORT_LEVELS, PIPELINE_SNAPSHOT_INTERVAL, get_provider_models, get_skills, load_providers, mask_secret_value, provider_available, RIGHTS_LEVELS, rights_supported, save_catalog_provider, PROJECTS_ROOT
 from .provider_catalog import CATALOG, catalog_entry, slugify, build_provider_entry
 from .models import (
@@ -115,6 +118,17 @@ app = FastAPI(title="PromptPilot", version="0.1.0", lifespan=_lifespan)
 
 app.include_router(workorder_router)
 app.include_router(external_inbox.router)
+
+
+@app.exception_handler(RequestValidationError)
+async def _source_settings_validation_error(request, exc):
+    # Pydantic's normal details may echo a write-only token from request input.
+    path = request.url.path
+    if path == "/api/task-sources" or path.startswith("/api/task-sources/"):
+        return JSONResponse(status_code=422, content={
+            "detail": "Неверные параметры источника. Проверьте название, адрес и авторизацию.",
+        })
+    return await request_validation_exception_handler(request, exc)
 
 
 _SAFE_METHODS = ("GET", "HEAD", "OPTIONS")
@@ -263,6 +277,7 @@ else:
 # instead of surfacing only when somebody opens the dashboard.
 _INDEX_HTML = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
 _TASK_FEED_JS = (STATIC_DIR / "task-feed.js").read_text(encoding="utf-8")
+_TASK_SOURCE_SETTINGS_JS = (STATIC_DIR / "task-source-settings.js").read_text(encoding="utf-8")
 
 
 # --- API ---
@@ -370,6 +385,53 @@ def _feed_external_activity(items):
             item.update(status="needs_attention", status_label="Требуется сверка сдачи",
                         status_reason="Исход отправки неизвестен. Повторная выдача остановлена до сверки.")
         item["external_execution"] = info
+
+
+class TaskSourceDeleteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    revision: str = Field(min_length=1, max_length=64)
+
+
+class TaskSourceProbeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    source_id: str | None = Field(default=None, min_length=1, max_length=48)
+    draft: task_source_settings.SourceDraft | None = None
+
+
+@app.get("/api/task-sources")
+def api_task_source_settings():
+    try:
+        return task_source_settings.get_settings()
+    except task_source_settings.SettingsError as exc:
+        raise HTTPException(exc.status_code, exc.message) from None
+
+
+@app.post("/api/task-sources/probe")
+def api_task_source_probe(request: TaskSourceProbeRequest):
+    if (request.source_id is None) == (request.draft is None):
+        raise HTTPException(400, "Выберите сохранённый источник или укажите настройки подключения")
+    try:
+        return task_source_settings.probe_source(source_id=request.source_id, draft=request.draft)
+    except task_source_settings.SettingsError as exc:
+        raise HTTPException(exc.status_code, exc.message) from None
+
+
+@app.put("/api/task-sources/{source_id}")
+def api_task_source_save(source_id: str, request: task_source_settings.SourceUpdate):
+    if source_id != request.id:
+        raise HTTPException(400, "Идентификатор источника не совпадает")
+    try:
+        return task_source_settings.upsert_source(source_id, request)
+    except task_source_settings.SettingsError as exc:
+        raise HTTPException(exc.status_code, exc.message) from None
+
+
+@app.delete("/api/task-sources/{source_id}")
+def api_task_source_delete(source_id: str, request: TaskSourceDeleteRequest):
+    try:
+        return task_source_settings.delete_source(source_id, request.revision)
+    except task_source_settings.SettingsError as exc:
+        raise HTTPException(exc.status_code, exc.message) from None
 
 
 @app.get("/api/task-feed")
@@ -2303,6 +2365,12 @@ def api_flow_create_item(name: str, body: FlowItemRequest):
 @app.get("/assets/task-feed.js")
 def task_feed_script():
     return Response(content=_TASK_FEED_JS, media_type="application/javascript",
+                    headers={"Cache-Control": "no-store"})
+
+
+@app.get("/assets/task-source-settings.js")
+def task_source_settings_script():
+    return Response(content=_TASK_SOURCE_SETTINGS_JS, media_type="application/javascript",
                     headers={"Cache-Control": "no-store"})
 
 

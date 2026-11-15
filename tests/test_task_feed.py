@@ -241,9 +241,9 @@ def test_business_filters_search_and_stable_page_counts(isolated_db):
     assert feed(limit=2) == feed(limit=2)
 
 
-def test_details_group_role_attempts_and_never_forward_newis_secret_config(isolated_db):
-    secret = "never-show-this-newis-lease"
-    wf = workflow("newis-run", {
+def test_details_group_role_attempts_and_never_forward_workorder_secret_config(isolated_db):
+    secret = "never-show-this-workorder-lease"
+    wf = workflow("website-run", {
         "workorder_guard": {"site_url": "https://example.invalid", "run_id": "fixture-run",
                             "worker_key": "fixture-worker", "lease_token": secret},
         "roles": {"executor": {"provider": "fixture", "model": "fixture-model", "machine": "fixture-pc"}},
@@ -336,8 +336,8 @@ def test_pure_peer_helpers_drop_unknown_nested_config_and_namespace_identity():
         "id": "wf_demo", "slug": "Business goal", "status": "awaiting_external",
         "objective": "Fixture", "config": {"workorder_guard": secret},
         "current_round": 1, "state_version": 3,
-    }, source_id="newis", source_label="NewIS", readonly=True)
-    assert item["id"] == "newis:workflow:wf_demo" and item["readonly"] is True
+    }, source_id="studio-windows", source_label="Studio Windows", readonly=True)
+    assert item["id"] == "studio-windows:workflow:wf_demo" and item["readonly"] is True
     projected = task_feed.namespace_item({**item, "raw_config": secret}, "second", "Other")
     assert projected["id"] == "second:workflow:wf_demo"
     run = task_feed.project_run({"role": "reviewer", "round_no": secret, "input": secret})
