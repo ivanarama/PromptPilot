@@ -59,6 +59,27 @@ def _safe_path(path):
             raise SettingsError(409, "Путь настроек не должен быть ссылкой")
 
 
+def _validate_windows_acl(metadata, sid, *, parent=False):
+    """Same policy for actual Windows metadata and platform-independent tests."""
+    trusted_owners = {sid, "S-1-5-18", "S-1-5-32-544"} if parent else {sid}
+    trusted_access = {sid, "S-1-5-18"}
+    if parent:
+        trusted_access |= {"S-1-5-32-544", "S-1-3-4"}
+    rules = metadata.get("access") if isinstance(metadata, dict) else None
+    if (not isinstance(rules, list) or len(rules) > 1024 or not isinstance(metadata.get("owner"), str)
+            or metadata["owner"] not in trusted_owners
+            or not parent and metadata.get("protected") is not True):
+        raise SettingsError(409, "Настройте закрытый доступ к хранилищу источников")
+    for rule in rules:
+        if (not isinstance(rule, dict) or type(rule.get("allow")) is not bool
+                or type(rule.get("rights")) is not int or not isinstance(rule.get("sid"), str)):
+            raise SettingsError(409, "Не удалось проверить права хранилища источников")
+        if rule["allow"] and rule["sid"] not in trusted_access:
+            # Concrete filesystem writes plus GENERIC_WRITE/GENERIC_ALL.
+            if not parent or rule["rights"] & 0x500D0156:
+                raise SettingsError(409, "Настройте закрытый доступ к хранилищу источников")
+
+
 def _windows_acl(path, *, create=False, directory=False, parent=False):
     from .workorder_private import owner_sid
     sid = owner_sid()
@@ -69,24 +90,28 @@ def _windows_acl(path, *, create=False, directory=False, parent=False):
         subprocess.run(["icacls", str(path), "/inheritance:r", "/grant:r",
                         f"*{sid}:{suffix}", f"*S-1-5-18:{suffix}", "/Q"],
                        check=True, capture_output=True, timeout=15)
+        # Elevated Windows tokens can create files owned by Administrators.
+        # Adopt ONLY this freshly created path, never an existing parent/key.
+        subprocess.run(["icacls", str(path), "/setowner", "*" + sid, "/Q"],
+                       check=True, capture_output=True, timeout=15)
         subprocess.run(["icacls", str(path), "/remove:g", "*S-1-5-32-544", "*S-1-3-4", "/Q"],
                        check=True, capture_output=True, timeout=15)
-    # Verify rather than chmod an existing directory or preserve unknown ACEs.
-    command = r"""$ErrorActionPreference='Stop';$p=$env:PP_SOURCE_SETTINGS_ACL_PATH;$s=$env:PP_SOURCE_SETTINGS_ACL_SID;
-$a=Get-Acl -LiteralPath $p;$parent=$env:PP_SOURCE_SETTINGS_ACL_PARENT -eq '1';
-if($a.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $s){exit 1};
-foreach($r in $a.Access){if($r.AccessControlType -eq 'Allow'){
-$id=$r.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value;
-$trusted=@($s,'S-1-5-18');if($parent){$trusted+= @('S-1-5-32-544','S-1-3-4')};
-if($id -notin $trusted){if(-not $parent){exit 1};
-$writes=[System.Security.AccessControl.FileSystemRights]'Write,Delete,DeleteSubdirectoriesAndFiles,ChangePermissions,TakeOwnership';
-if(($r.FileSystemRights -band $writes) -ne 0){exit 1}}}}"""
-    subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
-                   env={**os.environ, "PP_SOURCE_SETTINGS_ACL_PATH": str(path), "PP_SOURCE_SETTINGS_ACL_SID": sid,
-                        "PP_SOURCE_SETTINGS_ACL_PARENT": "1" if parent else "0"},
-                   # ACL replacement is allowed exclusively for freshly created
-                   # managed paths, never the registry's existing parent.
-                   check=True, capture_output=True, timeout=15)
+    # A PS7 parent may leave incompatible modules ahead of WindowsPowerShell5
+    # modules. Isolate ONLY this child before invoking any auto-loaded cmdlet.
+    command = r"""$ErrorActionPreference='Stop';$env:PSModulePath=[IO.Path]::Combine($PSHOME,'Modules');
+$a=Get-Acl -LiteralPath $env:PP_SOURCE_SETTINGS_ACL_PATH;
+@{owner=$a.GetOwner([System.Security.Principal.SecurityIdentifier]).Value;protected=$a.AreAccessRulesProtected;
+access=@($a.Access|ForEach-Object{@{sid=$_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value;
+allow=$_.AccessControlType -eq 'Allow';rights=[long]$_.FileSystemRights}})}|ConvertTo-Json -Depth 4 -Compress"""
+    process = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
+        env={**os.environ, "PP_SOURCE_SETTINGS_ACL_PATH": str(path)}, check=True, capture_output=True, timeout=15)
+    try:
+        if len(process.stdout) > 256 * 1024:
+            raise ValueError()
+        metadata = json.loads(process.stdout)
+    except (ValueError, TypeError):
+        raise SettingsError(503, "Не удалось проверить права хранилища источников") from None
+    _validate_windows_acl(metadata, sid, parent=parent)
 
 
 def _private(path, *, create=False, directory=False, parent=False):
@@ -188,9 +213,10 @@ def _locked(path):
     _private(path.parent, directory=True, parent=True)
     lock = path.with_name(path.name + ".lock")
     _safe_path(lock)
-    descriptor = os.open(lock, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    descriptor, created = _open_lock(lock)
     with os.fdopen(descriptor, "r+b") as stream:
-        _private(lock, create=stream.seek(0, 2) == 0)
+        _private(lock, create=created)
+        stream.seek(0, 2)
         if stream.tell() == 0:
             stream.write(b"\0")
             stream.flush()
@@ -213,6 +239,14 @@ def _locked(path):
             else:
                 fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
     # Never unlink the lock inode: another process may already hold/open it.
+
+
+def _open_lock(path):
+    flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        return os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o600), True
+    except FileExistsError:
+        return os.open(path, flags), False
 
 
 def _sync(directory):

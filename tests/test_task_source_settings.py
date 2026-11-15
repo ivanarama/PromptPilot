@@ -4,6 +4,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import threading
@@ -13,6 +14,41 @@ import pytest
 from promptpilot import task_source_settings as settings
 
 REAL_WINDOWS_ACL = settings._windows_acl
+
+
+def windows_acl_metadata(path, failure=None, role="registry_parent"):
+    """Failure-only SID/ACL diagnostics; no credential/config file contents."""
+    from promptpilot.workorder_private import owner_sid
+    result = {"role": role, "current_user_sid": owner_sid()}
+    command = r'''$ErrorActionPreference='Stop';$env:PSModulePath=[IO.Path]::Combine($PSHOME,'Modules');
+$a=Get-Acl -LiteralPath $env:PP_TEST_ACL_PATH;
+@{owner_sid=$a.GetOwner([System.Security.Principal.SecurityIdentifier]).Value;protected=$a.AreAccessRulesProtected;
+allow_sids=@($a.Access|Where-Object{$_.AccessControlType -eq 'Allow'}|ForEach-Object{$_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value})}|ConvertTo-Json -Compress'''
+    process = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', command],
+                             env={**os.environ, 'PP_TEST_ACL_PATH': str(path)}, capture_output=True, timeout=15)
+    result['metadata_exit_status'] = process.returncode
+    if process.returncode == 0:
+        result.update(json.loads(process.stdout))
+    else:
+        first_line = process.stderr.decode('utf-8', errors='replace').splitlines()
+        result['metadata_error'] = re.sub(r'[A-Za-z]:[\\/][^\s\r\n]+', '<path>', first_line[0][:300] if first_line else 'no diagnostic')
+    if failure is None:
+        try:
+            REAL_WINDOWS_ACL(path, parent=True)
+        except subprocess.SubprocessError as error:
+            failure = error
+    while failure is not None:
+        if isinstance(failure, subprocess.CalledProcessError):
+            cmd = failure.cmd
+            result['acl_subprocess'] = {'program': Path(cmd[0]).name,
+                'exit_status': failure.returncode,
+                'operation': next((x for x in cmd if x in ['/setowner', '/remove:g', '/grant:r']), 'verify'),
+                'role': ('managed_key' if len(cmd) > 1 and str(cmd[1]).endswith('.key') else role)}
+            first_line = (failure.stderr or b'').decode('utf-8', errors='replace').splitlines()
+            result['acl_subprocess']['error'] = re.sub(r'[A-Za-z]:[\\/][^\s\r\n]+', '<path>', first_line[0][:300] if first_line else 'no diagnostic')
+            break
+        failure = failure.__context__
+    return result
 
 
 @pytest.fixture(autouse=True)
@@ -299,11 +335,55 @@ def test_probe_requires_exact_saved_or_draft_choice(registry):
 def test_real_windows_inherited_temp_acl_public_save_works_without_changing_parent(registry, monkeypatch):
     monkeypatch.setattr(settings, "_windows_acl", REAL_WINDOWS_ACL)
     parent_acl = subprocess.check_output(['icacls', str(registry.parent)])
-    assert settings.get_settings(sources_file=registry)['editable']
-    response = settings.upsert_source('studio', request(registry, token='WRITE-ONLY-SECRET'), sources_file=registry)
+    assert settings.get_settings(sources_file=registry)['editable'], windows_acl_metadata(registry.parent)
+    try:
+        response = settings.upsert_source('studio', request(registry, token='WRITE-ONLY-SECRET'), sources_file=registry)
+    except settings.SettingsError as error:
+        raise AssertionError(windows_acl_metadata(registry.parent, error)) from None
     assert response['editable'] and response['sources'][0]['has_token']
     key = Path(saved(registry)[0]['token_file'])
     settings._private(key.parent, directory=True)
     settings._private(key)
+    from promptpilot.workorder_private import owner_sid
+    for path, role in [(key.parent, 'managed_key_directory'), (key, 'managed_key'), (registry, 'registry_file')]:
+        metadata = windows_acl_metadata(path, role=role)
+        assert metadata['owner_sid'] == owner_sid(), metadata
+        assert metadata['protected'], metadata
+        assert set(metadata['allow_sids']) == {owner_sid(), 'S-1-5-18'}, metadata
     assert subprocess.check_output(['icacls', str(registry.parent)]) == parent_acl
     assert_no_private(response, str(key))
+
+
+def test_parent_admin_owner_readonly_other_rules_pass_same_production_policy():
+    user = 'S-1-5-21-1-2-3-1000'
+    metadata = {'owner': 'S-1-5-32-544', 'protected': False, 'access': [
+        {'sid': user, 'allow': True, 'rights': 2032127},
+        {'sid': 'S-1-5-18', 'allow': True, 'rights': 2032127},
+        {'sid': 'S-1-5-32-544', 'allow': True, 'rights': 2032127},
+        {'sid': 'S-1-3-4', 'allow': True, 'rights': 2032127},
+        {'sid': 'S-1-5-11', 'allow': True, 'rights': 1179817}]}
+    settings._validate_windows_acl(metadata, user, parent=True)
+    with pytest.raises(settings.SettingsError):
+        settings._validate_windows_acl(metadata, user, parent=False)
+
+
+@pytest.mark.parametrize('rights', [2, 4, 0x10000, 0x40000, 0x80000, 0x40000000, 0x10000000])
+def test_parent_untrusted_write_and_generic_write_refused(rights):
+    user = 'S-1-5-21-1-2-3-1000'
+    metadata = {'owner': user, 'protected': True, 'access': [
+        {'sid': 'S-1-5-11', 'allow': True, 'rights': rights}]}
+    with pytest.raises(settings.SettingsError):
+        settings._validate_windows_acl(metadata, user, parent=True)
+
+
+def test_existing_empty_lock_is_opened_without_new_path_adoption(registry):
+    lock = registry.with_name(registry.name + '.lock')
+    lock.write_bytes(b'')
+    inode = lock.stat().st_ino
+    descriptor, created = settings._open_lock(lock)
+    os.close(descriptor)
+    assert not created and lock.read_bytes() == b'' and lock.stat().st_ino == inode
+    new_lock = registry.with_name('new.lock')
+    descriptor, created = settings._open_lock(new_lock)
+    os.close(descriptor)
+    assert created
