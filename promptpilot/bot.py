@@ -1531,16 +1531,14 @@ def _provider_buttons(machine: str = None):
 
 
 # Which wizard choices are worth remembering between tasks. Schedule and
-# recurrence are task-specific; a herdr target names a live session.
+# recurrence are task-specific; saved herdr targets are checked before reuse.
 _LAST_FIELDS = ("new_machine", "new_provider", "new_model", "new_effort", "new_dir",
                 "new_priority", "new_skip_permissions", "new_keep_pane", "new_worktree",
-                "new_detached")
+                "new_detached", "new_herdr_target")
 
 
 def _save_last_settings(chat_id: int, context):
     ud = context.user_data
-    if ud.get("new_herdr_target"):
-        return
     try:
         db.set_setting(f"tg_last_wizard:{chat_id}",
                        json.dumps({k: ud.get(k) for k in _LAST_FIELDS}))
@@ -1559,7 +1557,9 @@ def _load_last_settings(chat_id: int) -> Optional[dict]:
 def _last_settings_line(last: dict) -> str:
     provider = last.get("new_provider")
     parts = [_provider_label(provider) if provider else f"{DEFAULT_CLI} (по умолчанию)"]
-    if load_providers().get(provider, {}).get("herdr_source"):
+    if last.get("new_herdr_target"):
+        parts.append(f"сессия {last['new_herdr_target']}")
+    elif load_providers().get(provider, {}).get("herdr_source"):
         parts.append("новое окно Herdr")
     if last.get("new_model"):
         parts.append(last["new_model"])
@@ -1589,7 +1589,8 @@ async def _after_prompt(message, context: ContextTypes.DEFAULT_TYPE):
     # The user almost always runs the next task with the same provider and
     # folder — offer last time's settings before walking every step again.
     last = _load_last_settings(message.chat_id)
-    if last and not load_providers().get(last.get("new_provider") or DEFAULT_CLI, {}).get("session_target"):
+    if last and (last.get("new_herdr_target") or not load_providers().get(
+            last.get("new_provider") or DEFAULT_CLI, {}).get("session_target")):
         context.user_data["last_settings"] = last
         await message.reply_text(
             "Как в прошлый раз?\n" + _last_settings_line(last),
@@ -1675,6 +1676,7 @@ async def cb_last_use(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     last = context.user_data.pop("last_settings", None) or {}
     for key in _LAST_FIELDS:
+        context.user_data.pop(key, None)
         if key in last:
             context.user_data[key] = last[key]
     # The saved provider may be gone from providers.json by now
@@ -1683,6 +1685,18 @@ async def cb_last_use(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for key in _LAST_FIELDS:
             context.user_data.pop(key, None)
         return await _ask_machine_or_provider(query.edit_message_text, context)
+    machine = context.user_data.get("new_machine")
+    if machine and machine not in load_machines():
+        for key in _LAST_FIELDS:
+            context.user_data.pop(key, None)
+        await query.message.reply_text(
+            "Машина из прошлой задачи больше не зарегистрирована. Выберите настройки заново.")
+        return await _ask_machine_or_provider(query.edit_message_text, context)
+    if context.user_data.get("new_herdr_target"):
+        return await _confirm_herdr_target(query, context)
+    provider = context.user_data.get("new_provider") or DEFAULT_CLI
+    if load_providers().get(provider, {}).get("session_target"):
+        return await _show_herdr_targets(query, context)
     if context.user_data.get("new_worktree") and not _worktree_available(context):
         context.user_data["new_worktree"] = False
     return await _show_confirm(query.edit_message_text, context)
@@ -1907,6 +1921,23 @@ async def add_task_got_herdr_target(update: Update, context: ContextTypes.DEFAUL
         return ASK_HERDR_TARGET
     await query.answer()
     context.user_data["new_herdr_target"] = targets[idx]
+    return await _confirm_herdr_target(query, context)
+
+
+async def _confirm_herdr_target(query, context):
+    ud = context.user_data
+    target = ud["new_herdr_target"]
+    data = await _herdr_json("agent", "get", target, host=_machine_remote(ud.get("new_machine")))
+    agent = ((data or {}).get("result") or {}).get("agent") or {}
+    if not agent.get("pane_id"):
+        ud.pop("new_herdr_target", None)
+        ud.pop("new_dir", None)
+        await query.message.reply_text(
+            "Не удалось найти Herdr-сессию. Выберите окно для задачи заново.")
+        return await _show_herdr_targets(query, context)
+    # A live session owns its directory; an older wizard must not override it.
+    ud["new_dir"] = agent.get("cwd") or agent.get("foreground_cwd") or None
+    ud["new_worktree"] = False
     return await _show_confirm(query.edit_message_text, context)
 
 
