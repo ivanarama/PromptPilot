@@ -1,8 +1,10 @@
 """Bounded, local admission holds; these never grant mutation authority."""
 import hashlib
 import json
+import math
 import re
 import time
+from datetime import datetime
 
 from . import db
 
@@ -208,11 +210,66 @@ def _running_attempt(task, conn=None):
     return row["started_at"]
 
 
-def _progress_available(hold, current, task, started):
+def legacy_blocked_attempt(hold, task, conn=None):
+    """An exact legacy failure, never a HUMAN/manual/unknown hold exemption.
+
+    This is only a candidate for observing NEW public progress. It cannot
+    release a hold without the signed intent timestamp checked below.
+    """
+    required = {"head", "stage", "at", "reason", "task_id"}
+    if (not isinstance(hold, dict) or set(hold) - {"progress_attempt"} != required
+            or hold.get("stage") != "merge" or not isinstance(hold.get("head"), str)
+            or not re.fullmatch(r"[0-9a-f]{40}", hold["head"])
+            or not isinstance(hold.get("reason"), str)
+            or type(hold.get("task_id")) is not int or hold["task_id"] <= 0
+            or type(hold.get("at")) not in {int, float} or not math.isfinite(hold["at"])
+            or not 0 <= time.time() - hold["at"] < TTL
+            or not _task_identity(task) or hold["task_id"] == task.id):
+        return None
+    if conn is None:
+        with db._connect() as owned:
+            return legacy_blocked_attempt(hold, task, owned)
+    row = conn.execute("SELECT series_id,status,verdict,started_at,completed_at FROM tasks WHERE id=?",
+                       (hold["task_id"],)).fetchone()
+    if (not row or row["series_id"] != task.series_id or row["status"] != "completed"
+            or row["verdict"] != "НЕ СМОГ"):
+        return None
+    try:
+        start = datetime.fromisoformat(row["started_at"])
+        end = datetime.fromisoformat(row["completed_at"])
+        if (start.utcoffset() is None or end.utcoffset() is None
+                or not start <= end or end.timestamp() > hold["at"]):
+            return None
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return end.timestamp()
+
+
+def _legacy_progress_available(hold, current, task, conn=None):
+    from .merge_admission_progress import validate_facts, pp, _time
+    try:
+        validate_facts(current)
+        completed = legacy_blocked_attempt(hold, task, conn)
+        if (completed is None or current["phase"] != "pending-base-sync"
+                or current["head"] != hold["head"]):
+            return False
+        created = _time(current["intent"]["created_at"]).timestamp()
+        return max(completed, hold["at"]) < created <= time.time()
+    except (pp.PipelineError, TypeError, ValueError, KeyError, OverflowError):
+        return False
+
+
+def _progress_transition(hold, current, task, conn=None):
     from .merge_admission_progress import advanced
-    if (hold.get("verdict") != "НЕ СМОГ"
-            or hold.get("last_progress_verdict", "НЕ СМОГ") != "НЕ СМОГ" or hold.get("stage") != "merge"
-            or not advanced(hold.get("canonical_progress"), current)):
+    return (isinstance(hold, dict) and hold.get("verdict") == "НЕ СМОГ"
+            and hold.get("last_progress_verdict", "НЕ СМОГ") == "НЕ СМОГ"
+            and hold.get("stage") == "merge"
+            and advanced(hold.get("canonical_progress"), current)) or _legacy_progress_available(
+                hold, current, task, conn)
+
+
+def _progress_available(hold, current, task, started, conn=None):
+    if not _progress_transition(hold, current, task, conn):
         return False
     consumed = hold.get("progress_attempt")
     # A pending dispatch may observe availability, but does not consume it.
@@ -304,7 +361,6 @@ def claim_progress_attempt(task, verified_progress, released):
     current = _progress_facts(verified_progress)
     if not current:
         return not verified_progress and not released
-    from .merge_admission_progress import advanced
     from .project_pipeline import digest
     if {n for n, v in current.items() if v["phase"] == "pending-base-sync"} != set(released):
         return False
@@ -325,10 +381,10 @@ def claim_progress_attempt(task, verified_progress, released):
             fact = current[number]
             hold = holds.get(number)
             if (not isinstance(hold, dict) or hold.get("head") != fact["head"]
-                    or hold.get("stage") != "merge" or hold.get("verdict") != "НЕ СМОГ"
+                    or hold.get("stage") != "merge"
                     or type(hold.get("at")) not in {int, float}
                     or not 0 <= time.time() - hold["at"] < TTL
-                    or not advanced(hold.get("canonical_progress"), fact)):
+                    or not _progress_transition(hold, fact, task, conn)):
                 return False
             expected = released[number]
             consumed = hold.get("progress_attempt")
@@ -338,7 +394,7 @@ def claim_progress_attempt(task, verified_progress, released):
                 and digest({k: v for k, v in hold.items() if k != "progress_attempt"}) == expected)
             if digest(hold) != expected and not same_consumed:
                 return False
-            if not _progress_available(hold, fact, task, started):
+            if not _progress_available(hold, fact, task, started, conn):
                 return False
             if hold.get("progress_attempt") is None:
                 hold["progress_attempt"] = {"task_id": task.id, "started_at": started,

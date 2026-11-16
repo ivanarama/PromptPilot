@@ -288,6 +288,13 @@ def load_config(path: str) -> dict:
     data.setdefault("parallel_fix_enabled", False)
     if type(data["parallel_fix_enabled"]) is not bool:
         raise PipelineError("parallel_fix_enabled must be a boolean")
+    # Do not add an absent default to the signed config: existing v1 digests
+    # and frozen producers must remain byte-for-value compatible.
+    migration = data.get("legacy_merge_progress_migration", False)
+    if type(migration) is not bool:
+        raise PipelineError("legacy_merge_progress_migration must be a boolean")
+    if migration and data["fallback_handoff"] != "target-v1":
+        raise PipelineError("legacy_merge_progress_migration requires target-v1")
     data.setdefault("parallel_content_review", False)
     if not isinstance(data["parallel_content_review"], bool):
         raise PipelineError("parallel_content_review must be a boolean")
@@ -1766,7 +1773,7 @@ def next_review(gh: GitHub, config: dict, *, config_path: str | None = None) -> 
     owner = health.get("integration_owner") or {}
     if candidates and candidates[0].get("stage") != "review" and candidates[0].get("number") in excluded:
         if not parallel:
-            return {"action": "wait", "reason": "integration target awaits human resolution",
+            return {"action": "wait", "reason": "integration target has a local admission hold",
                     "number": candidates[0]["number"]}
         candidates = []
     # Ordinary content reviews are independent. Never skip an owner in order
@@ -2513,7 +2520,7 @@ def next_merge(gh: GitHub, config: dict, *, config_path: str | None = None) -> d
     if any(item.get("code") == "single_flight_barrier" for item in health.get("findings", [])):
         owner = health.get("integration_owner")
         if isinstance(owner, dict) and owner.get("number") in admission_exclusions():
-            return {"action": "wait", "reason": "single-flight owner awaits human resolution",
+            return {"action": "wait", "reason": "single-flight owner has a local admission hold",
                     "number": owner["number"]}
         # A validated REVIEW owner is not executable by MERGE. Launching the
         # full skill here only rediscovers the barrier and burns agent tokens.
@@ -2564,7 +2571,7 @@ def next_merge(gh: GitHub, config: dict, *, config_path: str | None = None) -> d
             raise PipelineError("ordinary MERGE election contains an integration stage")
         if target.get("number") in excluded:
             return {"action": "wait", "number": target["number"],
-                    "reason": "first executable MERGE target awaits human resolution"}
+                    "reason": "first executable MERGE target has a local admission hold"}
         item = next((value for value in queue
                      if value.get("number") == target.get("number")
                      and (value.get("head") or {}).get("sha") == target.get("head")), None)
