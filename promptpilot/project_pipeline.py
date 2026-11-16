@@ -201,8 +201,18 @@ def validate_review_lease(lease: dict, config: dict) -> None:
             raise PipelineError(f"review lease has an invalid {field}")
     if not isinstance(lease.get("anchor"), str) or not lease["anchor"]:
         raise PipelineError("review lease has an invalid epoch anchor")
+    explicit = lease.get("explicit_full_current_review")
+    if explicit is not None:
+        expected = {"version": 1, "head": lease["head"], "epoch": lease["epoch"],
+                    "anchor": lease["anchor"], "depth": lease.get("depth"),
+                    "prior_proof": explicit.get("prior_proof") if isinstance(explicit, dict) else None}
+        if (lease.get("completion_gate") != "target-v1" or not isinstance(explicit, dict)
+                or explicit != expected or type(explicit.get("version")) is not int
+                or not isinstance(explicit.get("prior_proof"), str)
+                or not re.fullmatch(r"[0-9a-f]{64}", explicit["prior_proof"])):
+            raise PipelineError("invalid explicit full current review grant")
     if (not isinstance(lease.get("depth"), int) or isinstance(lease.get("depth"), bool)
-            or lease["depth"] not in (0, 1)):
+            or lease["depth"] < 0 or (lease["depth"] not in (0, 1) and explicit is None)):
         raise PipelineError("review lease depth requires human escalation")
     completion_gate = lease.get("completion_gate", "health")
     if completion_gate not in {"health", "target-v1"}:
@@ -607,12 +617,15 @@ def review_gate(snapshot: dict, config: dict, lease: dict, *, require_outcome: s
     # ``ship`` is a sticky human intent: merge this exact HEAD if its review
     # succeeds.  It may be applied while REVIEW is still publishing its
     # claim/completion transaction, so it must not hide the PR from REVIEW.
-    if labels & {"hold", "needs-decision"}:
+    if labels & {"hold", "manual"}:
         raise PipelineError("review routing gate closed")
     info = epoch(snapshot, config["trusted_account"])
     validate_epoch_safety(info, config["trusted_account"])
     if info["hash"] != lease["epoch"] or info["anchor_id"] != lease["anchor"]:
         raise PipelineError("review epoch changed")
+    explicit = validated_explicit_review_grant(snapshot, config, lease, info)
+    if "needs-decision" in labels and not explicit:
+        raise PipelineError("review routing gate closed")
     if require_outcome and require_outcome not in labels:
         raise PipelineError(f"outcome label {require_outcome} disappeared")
     return info
@@ -633,14 +646,51 @@ def committed_review_depth(snapshot: dict, trusted: str) -> int:
     return len(review_ids)
 
 
+def explicit_full_current_review_grant(snapshot: dict, config: dict, info: dict) -> dict | None:
+    """Bind one trusted immutable request to its actual prior current-HEAD proof.
+
+    Lifetime depth is preserved. A request before the current HEAD, before its
+    completed review, or without that review's claim-bound proof grants nothing.
+    This fact only admits a new full audit; it supplies no positive review proof.
+    """
+    index = info["anchor_index"]
+    node = snapshot["edges"][index].get("node") or {}
+    trusted = config["trusted_account"]
+    if (node.get("__typename") != "IssueComment"
+            or (node.get("author") or {}).get("login") != trusted
+            or node.get("lastEditedAt") is not None
+            or not has_review_again(node.get("body") or "")):
+        return None
+    before = dict(snapshot, edges=snapshot["edges"][:index])
+    previous = epoch(before, trusted)
+    validate_epoch_safety(previous, trusted)
+    established = proof(previous, snapshot["headRefOid"], trusted)
+    if established is None:
+        return None
+    return {"version": 1, "head": snapshot["headRefOid"], "epoch": info["hash"],
+            "anchor": info["anchor_id"], "depth": committed_review_depth(snapshot, trusted),
+            "prior_proof": digest(established)}
+
+
+def validated_explicit_review_grant(snapshot: dict, config: dict, lease: dict, info: dict) -> bool:
+    explicit = lease.get("explicit_full_current_review")
+    if explicit is None:
+        return False
+    if (lease.get("completion_gate") != "target-v1"
+            or explicit != explicit_full_current_review_grant(snapshot, config, info)):
+        raise PipelineError("explicit full current review grant changed")
+    return True
+
+
 def content_review_target_gate(snapshot: dict, config: dict, lease: dict) -> dict:
     """Prove a leased ordinary REVIEW locally, without rereading other PRs."""
     info = review_gate(snapshot, config, lease)
     labels = set(snapshot["labels"])
-    if "changes-requested" in labels:
+    explicit = validated_explicit_review_grant(snapshot, config, lease, info)
+    if "changes-requested" in labels and not explicit:
         raise PipelineError("content REVIEW target entered the FIX route")
     depth = committed_review_depth(snapshot, config["trusted_account"])
-    if depth != int(lease.get("depth", -1)) or depth >= 2:
+    if depth != int(lease.get("depth", -1)) or (depth >= 2 and not explicit):
         raise PipelineError("review depth changed or requires human escalation")
     for _index, _edge, node in comments(info, config["trusted_account"]):
         body = (node.get("body") or "").strip()
@@ -1840,7 +1890,7 @@ def next_review(gh: GitHub, config: dict, *, config_path: str | None = None) -> 
         if config.get("fallback_handoff") == "target-v1":
             raise PipelineError("health election did not prove the exact content target")
         return {"action": "fallback", "reason": "health election did not prove the exact content target"}
-    if int(item.get("review_depth", 0)) >= 2:
+    if completion_gate != "target-v1" and int(item.get("review_depth", 0)) >= 2:
         if parallel_selected:
             raise PipelineError("parallel content REVIEW cannot use full-skill fallback")
         return fallback_target(
@@ -1856,11 +1906,22 @@ def next_review(gh: GitHub, config: dict, *, config_path: str | None = None) -> 
         if config.get("fallback_handoff") == "target-v1":
             raise PipelineError("review depth changed after health election")
         return {"action": "fallback", "reason": "review depth changed after health election", "target": item}
+    explicit = (explicit_full_current_review_grant(snapshot, config, info)
+                if completion_gate == "target-v1" else None)
+    if depth >= 2 and explicit is None:
+        if parallel_selected:
+            raise PipelineError("parallel content REVIEW cannot use full-skill fallback")
+        return fallback_target(
+            config, election_health, "review", item,
+            "third review round requires human-escalation rules", reservation=reservation,
+        )
     lease = {"version": 1, "stage": "review", "repository": config["repository"],
              "number": item["number"], "head": snapshot["headRefOid"],
              "snapshot": content_review_digest(snapshot), "epoch": info["hash"],
              "anchor": info["anchor_id"], "depth": depth,
              "completion_gate": completion_gate}
+    if explicit is not None:
+        lease["explicit_full_current_review"] = explicit
     if reservation is not None:
         lease["target_stage"] = item["stage"]
         lease["target_reservation"] = reservation
