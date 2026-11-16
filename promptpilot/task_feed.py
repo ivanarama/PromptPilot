@@ -20,7 +20,7 @@ STATUSES = frozenset({
     "queued", "active", "blocked", "needs_attention", "completed", "cancelled",
 })
 FeedStatus = Literal["queued", "active", "blocked", "needs_attention", "completed", "cancelled"]
-FeedKind = Literal["workflow", "task"]
+FeedKind = Literal["workflow", "task", "request"]
 ROLE_LABELS = {
     "planner": "Планировщик", "executor": "Исполнитель",
     "reviewer": "Проверяющий", "gate": "Проверки", "archiver": "Архивирование",
@@ -173,10 +173,10 @@ def namespace_item(item, source_id, label, readonly=True):
     if not isinstance(source_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", source_id):
         raise ValueError("Invalid task-feed source identity")
     kind = item.get("kind")
-    if kind not in {"workflow", "task"}:
+    if kind not in {"workflow", "task", "request"}:
         raise ValueError("Unknown task-feed kind")
     object_id = item.get("object_id")
-    if kind == "workflow":
+    if kind in {"workflow", "request"}:
         if not isinstance(object_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", object_id):
             raise ValueError("Invalid workflow identity")
     elif type(object_id) is not int or object_id <= 0:
@@ -200,11 +200,16 @@ def namespace_item(item, source_id, label, readonly=True):
             "state_version": summary.get("state_version")
             if type(summary.get("state_version")) is int else None,
         }
-    else:
+    elif kind == "task":
         summary = _object(item.get("task"))
         result["task"] = {k: summary.get(k) for k in (
             "status", "series_id", "scheduled_at", "next_run_at", "priority",
             "retry_count", "max_retries") if isinstance(summary.get(k), (str, int, type(None)))}
+    if kind == "request":
+        path = item.get("source_path")
+        if (isinstance(path, str) and re.fullmatch(r"/[A-Za-z0-9_/-]{1,1023}", path)
+                and "//" not in path):
+            result["source_path"] = path
     return result
 
 
@@ -355,7 +360,7 @@ def paginate_items(items, *, limit=50, offset=0, status=None, kind=None, q=None)
         raise ValueError("Invalid task-feed pagination")
     if status is not None and status not in STATUSES:
         raise ValueError("Invalid task-feed status")
-    if kind is not None and kind not in {"workflow", "task"}:
+    if kind is not None and kind not in {"workflow", "task", "request"}:
         raise ValueError("Invalid task-feed kind")
     query = q.casefold().strip() if isinstance(q, str) else ""
     selected = [r for r in items if (status is None or r["status"] == status)

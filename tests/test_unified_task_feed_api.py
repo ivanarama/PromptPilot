@@ -42,6 +42,24 @@ def grouped_workflow(tmp_path):
     return wf, children
 
 
+def test_application_request_list_filter_and_detail(client, tmp_path, monkeypatch):
+    row = {**item("order_123"), "kind": "request", "source_path": "/orders/order_123/",
+           "status": "needs_attention", "status_reason": "settings.xyz: unsupported format"}
+    def respond(path):
+        if urlsplit(path).path == "/api/task-feed":
+            return 200, {"items": [row], "total": 1}, {}
+        assert path == "/api/task-feed/local/request/order_123"
+        return 200, {"item": row, "history": {"runs": [], "events": []}}, {}
+    with peer(respond) as (url, calls):
+        monkeypatch.setenv("PP_TASK_SOURCES_FILE", str(registry(tmp_path, entry(url))))
+        result = feed(client, kind="request")
+        assert result["total"] == 1 and result["counts"]["needs_attention"] == 1
+        detail = client.get("/api/task-feed/studio-windows/request/order_123")
+    assert detail.status_code == 200
+    assert detail.json()["item"] == result["items"][0]
+    assert all(call["method"] == "GET" for call in calls)
+
+
 def test_grouping_counts_filters_and_pagination_happen_after_peer_merge(client, tmp_path, monkeypatch):
     wf, children = grouped_workflow(tmp_path)
     outside = db.create_task(TaskCreate(prompt="Outside independent task"))

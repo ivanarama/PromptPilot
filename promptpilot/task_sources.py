@@ -291,7 +291,7 @@ class _Client:
 def _identity(kind, object_id):
     if kind == "task":
         return type(object_id) is int and 0 < object_id <= 2**63 - 1
-    return kind == "workflow" and isinstance(object_id, str) and bool(_OBJECT_ID.fullmatch(object_id))
+    return kind in {"workflow", "request"} and isinstance(object_id, str) and bool(_OBJECT_ID.fullmatch(object_id))
 
 
 def _item(raw, source):
@@ -299,7 +299,14 @@ def _item(raw, source):
     if (not isinstance(raw, dict) or raw.get("source_id") != "local"
             or not _identity(raw.get("kind"), raw.get("object_id"))):
         raise _Unavailable("invalid_response", "Источник вернул неподдерживаемые данные")
-    return namespace_item(raw, source.id, source.label, readonly=True)
+    item = namespace_item(raw, source.id, source.label, readonly=True)
+    # Only a validated path on the explicitly registered origin may become a
+    # browser link. Peer-provided URLs and credentials never cross this boundary.
+    if item.get("source_path"):
+        origin = urllib.parse.urlsplit(source.base_url)
+        item["source_url"] = urllib.parse.urlunsplit(
+            (origin.scheme, origin.netloc, item.pop("source_path"), "", ""))
+    return item
 
 
 def _list_one(source):

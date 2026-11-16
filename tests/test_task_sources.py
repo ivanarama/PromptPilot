@@ -118,6 +118,42 @@ def test_nested_peer_sources_are_not_reimported(tmp_path):
     assert result["sources"][0]["status"] == "partial"
 
 
+def test_application_request_visible_before_workflow_with_same_origin_link(tmp_path):
+    request = {**item("order_1"), "kind": "request", "status": "needs_attention",
+               "status_label": "Ошибка приёма", "status_reason": "settings.xyz: формат не поддержан",
+               "source_path": "/pipeline/order_1/", "source_url": "https://evil.example/",
+               "lease_token": "LEASE-SECRET"}
+    def respond(path):
+        if urlsplit(path).path == "/api/task-feed":
+            return 200, {"items": [request], "total": 1}, {}
+        assert path == "/api/task-feed/local/request/order_1"
+        return 200, {"item": request, "history": {"runs": [], "events": [
+            {"seq": 1, "event_type": "Письмо получено", "payload": "LEASE-SECRET"}]}}, {}
+    with peer(respond) as (url, calls):
+        path = registry(tmp_path, entry(url))
+        result = sources.list_source_items(sources_file=path)
+        detail = sources.get_source_detail("studio-windows", "request", "order_1", sources_file=path)
+    row = result["items"][0]
+    assert row["id"] == "studio-windows:request:order_1"
+    assert row["status"] == "needs_attention" and row["readonly"]
+    assert row["source_url"] == url + "/pipeline/order_1/"
+    assert detail["item"] == row
+    assert detail["history"]["events"][0]["event_type"] == "Письмо получено"
+    assert all(call["method"] == "GET" for call in calls)
+    assert_private_free(result)
+    assert_private_free(detail)
+
+
+@pytest.mark.parametrize("path", ["//evil.example/x", "/../x", "/%2f%2fevil", "/x?token=secret",
+                                 "/x#fragment", "https://evil.example/", "/x\\evil", "/x\n"])
+def test_request_cannot_inject_browser_destination(tmp_path, path):
+    row = {**item("one"), "kind": "request", "source_path": path,
+           "source_url": "javascript:alert(1)"}
+    with peer(lambda _: (200, {"items": [row], "total": 1}, {})) as (url, _):
+        result = sources.list_source_items(sources_file=registry(tmp_path, entry(url)))
+    assert "source_url" not in result["items"][0]
+
+
 def test_only_404_falls_back_to_legacy_workflows_never_raw_tasks(tmp_path):
     def respond(path):
         if urlsplit(path).path == "/api/task-feed":

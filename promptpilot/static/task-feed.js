@@ -99,6 +99,8 @@ function feedRenderDetail(item) {
   const localControls = item.source_id === 'local' && !item.readonly;
   const manage = localControls && item.kind === 'workflow'
     ? `<button type="button" class="btn btn-sm btn-ghost" data-workflow="${feedAttr(item.object_id)}" onclick="feedManageWorkflow(this.dataset.workflow)">Управление процессом</button>` : '';
+  const sourceUrl = feedSourceUrl(value.source_url);
+  const sourceLink = sourceUrl ? `<a class="btn btn-sm btn-ghost" href="${feedAttr(sourceUrl)}" target="_blank" rel="noopener noreferrer">Открыть заявку в источнике</a>` : '';
   let advanced = '';
   if (localControls && item.kind === 'task' && cached.task) {
     const template = document.createElement('template');
@@ -111,8 +113,18 @@ function feedRenderDetail(item) {
     <div class="feed-facts"><div class="feed-fact"><span>Источник</span><b>${feedEsc(item.source_label)}</b></div>${executor.machine ? `<div class="feed-fact"><span>Компьютер</span><b>${feedEsc(executor.machine)}</b></div>` : ''}${executor.provider ? `<div class="feed-fact"><span>Исполнитель</span><b>${feedEsc(executor.provider)}${executor.model ? ' · ' + feedEsc(executor.model) : ''}</b></div>` : ''}${connection}</div>
     ${result.available ? `<p class="feed-result-note">Результат запуска получен${Number.isFinite(result.characters) ? ' · ' + Number(result.characters).toLocaleString('ru-RU') + ' символов' : ''}. ${item.kind === 'workflow' && item.status !== 'completed' ? 'Приёмка процесса ещё не завершена.' : ''}</p>` : ''}
     ${files}${reportHtml}${feedRenderHistory(detail)}${advanced}
-    <div class="feed-detail-footer"><span>Обновлено: ${feedEsc(feedTime(value.updated_at || value.created_at))}</span>${manage}${item.readonly ? '<span>Просмотр подключённого источника</span>' : ''}</div>
+    <div class="feed-detail-footer"><span>Обновлено: ${feedEsc(feedTime(value.updated_at || value.created_at))}</span>${manage}${sourceLink}${item.readonly ? '<span>Просмотр подключённого источника</span>' : ''}</div>
   </div>`;
+}
+
+function feedSourceUrl(value) {
+  if (typeof value !== 'string') return '';
+  try {
+    const url = new URL(value);
+    const local = ['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname);
+    return !url.username && !url.password && !url.search && !url.hash &&
+      (url.protocol === 'https:' || (url.protocol === 'http:' && local)) ? url.href : '';
+  } catch (_) { return ''; }
 }
 
 function feedArtifactUrl(value) {
