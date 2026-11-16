@@ -60,6 +60,8 @@ def _direct_writes_only(c):
             denied.append(True)
             return sqlite3.SQLITE_DENY
         return sqlite3.SQLITE_OK
+    # _connection exclusively owns and closes this connection. Keep the guard
+    # until close: Python 3.10 cannot disable an authorizer using None.
     c.set_authorizer(authorize)
     try:
         yield
@@ -67,8 +69,6 @@ def _direct_writes_only(c):
         if denied:
             raise ScopeDeliveryError('Trigger attempted an unrelated write; transaction rolled back') from None
         raise
-    finally:
-        c.set_authorizer(None)
 
 
 def digest(value):

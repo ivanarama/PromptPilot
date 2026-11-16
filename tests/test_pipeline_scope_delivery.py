@@ -206,3 +206,42 @@ def test_empty_or_oversized_utf8_scope_is_not_written(prepared, addition):
     before = snapshot(x['db'])
     assert call('POST', x['url'], dict(x['body'], addition=addition)).status_code == 409
     assert snapshot(x['db']) == before
+
+
+@pytest.mark.parametrize('hostile_trigger', [False, True], ids=['commit', 'trigger_refused'])
+def test_callable_only_authorizer_runtime_keeps_atomic_delivery(prepared, monkeypatch, hostile_trigger):
+    """Python 3.10 accepts a callback, but cannot unregister it with None."""
+    x = prepared
+    original = delivery._connection
+
+    class CallableOnlyAuthorizer:
+        def __init__(self, connection):
+            self.connection = connection
+
+        def __getattr__(self, name):
+            return getattr(self.connection, name)
+
+        def set_authorizer(self, callback):
+            if not callable(callback):
+                raise TypeError('authorizer_callback must be callable')
+            return self.connection.set_authorizer(callback)
+
+    @contextmanager
+    def callable_only_connection(*, readonly):
+        with original(readonly=readonly) as connection:
+            yield CallableOnlyAuthorizer(connection)
+
+    if hostile_trigger:
+        with x['db']._connect() as c:
+            c.execute("CREATE TRIGGER legacy_runtime_hostile AFTER UPDATE OF prompt ON tasks "
+                      f"BEGIN UPDATE tasks SET note='forbidden' WHERE id={x['other'].id}; END")
+    before = snapshot(x['db'])
+    monkeypatch.setattr(delivery, '_connection', callable_only_connection)
+    response = call('POST', x['url'], x['body'])
+    assert response.status_code == (409 if hostile_trigger else 200), response.text
+    if hostile_trigger:
+        assert snapshot(x['db']) == before
+    else:
+        result = response.json()
+        assert result['delivery_state'] == 'delivered'
+        assert call('GET', x['url'] + '/' + x['body']['request_nonce']).json() == result
