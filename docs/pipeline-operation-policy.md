@@ -3,6 +3,52 @@
 This is an operator deployment/configuration policy, not a replacement for the
 canonical OneBase skills, independent review or GitHub protection.
 
+## Decision publication and consumer delivery
+
+The normal producer delivers an immutable, conditional scope pointer **before**
+publishing a new decision or adding its runnable routing label. The pointer
+binds the exact source identity, immutable scope location and SHA256, current
+proof/epoch, and SHA256 of the expected exact UTF-8 decision body. It explicitly
+grants no authority until the consumer verifies a genuinely published matching
+canonical decision and all ordinary current admission gates. It is data, not a
+reservation, execution grant or substitute for proof.
+
+The producer first CAS-delivers that pointer to both the future schedule and a
+genuine neverstarted pending consumer, obtains and verifies the atomic transport
+receipt, and only then performs the ordinary public decision/routing handoff.
+A stale CAS, missing or started consumer, or paused queue without a pending
+consumer defers publication of the new decision. Never edit an active attempt,
+resume a queue, create a replacement task or report DONE to bypass that refusal.
+If publication fails after delivery, the pointer stays conditional and inert;
+the receipt does not authorize publication replay or execution.
+
+For an already published decision whose delivery was interrupted, retain the
+truthful `DECISION_PUBLISHED_DELIVERY_PENDING` state until the required exact
+scope reaches both rows. Reconcile the existing decision and transport receipt;
+do not publish a replacement decision or claim private preparation establishes
+delivery. Report consumer handoff complete only after the matching receipt and
+canonical publication have both been verified.
+
+The explicit operator API `GET /api/schedule/{id}/scope-delivery` returns opaque
+full-row revisions and readiness without exposing prompts. `POST` to the same
+path accepts those `series_revision`, `pending_id`, `pending_revision`, an opaque
+`addition` (at most 64 KiB UTF-8) and an explicitly supplied 32-hex `request_nonce`.
+It appends the exact text to both rows in one CAS transaction and preserves all
+rights, waits, pauses, holds and unrelated state. No scope paths are opened,
+decisions interpreted, tasks created, providers launched or queues resumed.
+Missing, ambiguous, already-started or guarded consumers fail closed.
+
+`GET /api/schedule/{id}/scope-delivery/{request_nonce}` reconciles an unknown
+response. Exact same-request retry returns the immutable old receipt, including
+when a later consumer exists; it never repeats the append. Another request under
+that nonce conflicts. The receipt proves historical data delivery, not current
+execution, admission, product acceptance or authority to change scheduler state.
+An absent consumer in a paused queue still needs a separately authorized normal
+operator resolution; the producer must leave delivery pending and never resume
+or rewrite an active attempt itself. All existing API authentication and browser
+origin checks apply. This API does not automatically wire an external private
+OWNER controller; that caller's procedure rollout must be reviewed separately.
+
 ## Release unit
 
 Deploy server, worker and bot from the **same frozen `pp` binary**. A release
