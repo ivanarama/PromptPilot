@@ -3,6 +3,34 @@
 This is an operator deployment/configuration policy, not a replacement for the
 canonical OneBase skills, independent review or GitHub protection.
 
+## Decision publication and consumer delivery
+
+A published technical decision is `DECISION_PUBLISHED_DELIVERY_PENDING` until
+its required exact scope has reached both the future schedule and a genuine
+neverstarted pending consumer. Private preparation or a public comment alone
+does not establish delivery. A producer must obtain the atomic transport receipt
+before reporting consumer handoff complete.
+
+The explicit operator API `GET /api/schedule/{id}/scope-delivery` returns opaque
+full-row revisions and readiness without exposing prompts. `POST` to the same
+path accepts those `series_revision`, `pending_id`, `pending_revision`, an opaque
+`addition` (at most64KiB UTF-8) and an explicitly supplied32-hex `request_nonce`.
+It appends the exact text to both rows in one CAS transaction and preserves all
+rights, waits, pauses, holds and unrelated state. No scope paths are opened,
+decisions interpreted, tasks created, providers launched or queues resumed.
+Missing, ambiguous, already-started or guarded consumers fail closed.
+
+`GET /api/schedule/{id}/scope-delivery/{request_nonce}` reconciles an unknown
+response. Exact same-request retry returns the immutable old receipt, including
+when a later consumer exists; it never repeats the append. Another request under
+that nonce conflicts. The receipt proves historical data delivery, not current
+execution, admission, product acceptance or authority to change scheduler state.
+An absent consumer in a paused queue still needs a separately authorized normal
+operator resolution; the producer must leave delivery pending and never resume
+or rewrite an active attempt itself. All existing API authentication and browser
+origin checks apply. This API does not automatically wire an external private
+OWNER controller; that caller's procedure rollout must be reviewed separately.
+
 ## Release unit
 
 Deploy server, worker and bot from the **same frozen `pp` binary**. A release
