@@ -2433,7 +2433,7 @@ def dispatch_gate(task) -> dict | None:
                            if isinstance(item, dict)}
                 if members and members.issubset(set(exclusions)):
                     return {"action": "defer", "defer_for": "30m",
-                            "reason": "неизменные задачи ожидают решения: " + ", ".join(f"#{n}" for n in exclusions),
+                            "reason": "локальное ограничение допуска неизменных задач: " + ", ".join(f"#{n}" for n in exclusions),
                             "profile_id": profile_id, "queue_id": queue_config["id"]}
             if config.get("skip_when_empty") and queue and queue["backlog"] == 0:
                 return {

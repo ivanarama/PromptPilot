@@ -3,6 +3,9 @@
 This is an operator deployment/configuration policy, not a replacement for the
 canonical OneBase skills, independent review or GitHub protection.
 
+See [legacy MERGE progress](legacy-merge-progress.md) for the separate, default-off
+single-use recovery of an exact legacy item hold after new canonical progress.
+
 ## Decision publication and consumer delivery
 
 The normal producer delivers an immutable, conditional scope pointer **before**

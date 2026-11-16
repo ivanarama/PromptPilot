@@ -62,11 +62,14 @@ def validate_facts(value):
     else:
         item = value["intent"]
         _need(value["phase"] == "pending-base-sync" and isinstance(item, dict)
-              and set(item) == INTENT_FIELDS, "unknown progress phase")
+              and set(item) in (INTENT_FIELDS, INTENT_FIELDS | {"created_at"}),
+              "unknown progress phase")
         _need(type(item["id"]) is int and 0 < item["id"] <= 2**63 - 1
               and isinstance(item["node"], str) and NODE.fullmatch(item["node"])
               and isinstance(item["body_sha256"], str) and HEX.fullmatch(item["body_sha256"])
               and isinstance(item["base"], str) and SHA.fullmatch(item["base"]), "invalid intent identity")
+        if "created_at" in item:
+            _time(item["created_at"])
     return value
 
 
@@ -94,6 +97,9 @@ class VerifiedProgress:
               and value["expires_at"] - value["issued_at"] == TTL
               and value["issued_at"] <= time.time() <= value["expires_at"], "expired attestation")
         facts = validate_facts(value["facts"])
+        if (facts.get("intent") or {}).get("created_at") is not None:
+            _need(config.get("legacy_merge_progress_migration") is True,
+                  "intent timestamp requires the paired migration opt-in")
         expected = {"repository": config["repository"], "config_sha256": pp.digest(config),
                     "config_path": str(Path(config_path).resolve()),
                     "checkout": str(Path(checkout).resolve()), "number": number, "head": head}
@@ -200,6 +206,11 @@ def _observe(gh, config, config_path, number, head):
         intents.append({"id": pp.comment_id(node), "node": node["id"],
                         "body_sha256": hashlib.sha256(node["body"].encode("utf8")).hexdigest(),
                         "base": match[2]})
+        if config.get("legacy_merge_progress_migration") is True:
+            # Only an explicit paired rollout extends the signed facts. The
+            # timestamp comes from the already-verified immutable server row;
+            # it is not an executor claim or an extra GitHub read.
+            intents[-1]["created_at"] = node["createdAt"]
     _need(len(intents) <= 1, "duplicate intents require full recovery")
     repo = config["repository"]
     pr = reader.json("api", f"repos/{repo}/pulls/{number}")

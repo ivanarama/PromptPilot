@@ -11,7 +11,7 @@ from .merge_admission_progress import MAX_READS, PROTOCOL, VerifiedProgress, val
 CACHE = "pipeline_merge_progress:v1:"
 
 
-def _target(queue, data, holds, task):
+def _target(queue, data, holds, task, *, legacy_migration=False):
     cache = data.get("cache") or {}
     age, ttl = cache.get("age_seconds"), cache.get("ttl_seconds")
     if (cache.get("complete") is not True or cache.get("stale") or cache.get("invalidated")
@@ -30,21 +30,28 @@ def _target(queue, data, holds, task):
                 and 0 <= time.time() - hold["at"] < 24 * 3600 and hold.get("head") == head
                 and hold.get("stage", "review") == "merge")
         if live:
-            # Never migrate a legacy/HUMAN hold using a new probe.
+            # A legacy failure needs its explicit paired rollout and a later
+            # signed server intent. HUMAN/manual/unknown holds stay excluded.
+            from .pipeline_item_holds import legacy_blocked_attempt
+            legacy = legacy_migration and legacy_blocked_attempt(hold, task) is not None
             try:
                 old = validate_facts(hold.get("canonical_progress"))
             except (pp.PipelineError, TypeError, ValueError):
-                continue
+                if not legacy:
+                    continue
+                old = None
             consumed = hold.get("progress_attempt")
             started = getattr(task, "started_at", None)
             if consumed is not None and (not isinstance(consumed, dict)
                     or consumed.get("task_id") != task.id or not hasattr(started, "isoformat")
                     or consumed.get("started_at") != started.isoformat()):
                 continue
-            if (hold.get("verdict") != "НЕ СМОГ"
+            if (not legacy and (hold.get("verdict") != "НЕ СМОГ"
                     or hold.get("last_progress_verdict", "НЕ СМОГ") != "НЕ СМОГ"
                     or old["phase"] != "reviewed-source"
-                    or stage != "integration-merge-recovery"):
+                    or stage != "integration-merge-recovery")):
+                continue
+            if legacy and stage != "integration-merge-recovery":
                 continue
         elif stage != "merge":
             continue
@@ -70,9 +77,6 @@ def measurements(pi, task, profile_id, profile, queue, data, working_dir=None):
             return {}
         holds = json.loads(db.get_setting("pipeline_item_holds:v1:" + str(task.series_id)) or "{}")
         if not isinstance(holds, dict):
-            return {}
-        target = _target(queue, data, holds, task)
-        if target is None:
             return {}
         command = pi._tool_command(execution, "merge")
         if not command or command[-2:] != ["next", "merge"] or command.count("--config") > 1:
@@ -111,6 +115,10 @@ def measurements(pi, task, profile_id, profile, queue, data, working_dir=None):
         if (config.get("fallback_handoff") != "target-v1"
                 or config["repository"] != profile.get("repository")
                 or data.get("repository") != config["repository"]):
+            return {}
+        target = _target(queue, data, holds, task,
+                         legacy_migration=config.get("legacy_merge_progress_migration") is True)
+        if target is None:
             return {}
         key = CACHE + str(task.id)
         saved = db.get_setting(key)

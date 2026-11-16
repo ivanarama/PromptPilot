@@ -104,7 +104,7 @@ def worker_replay(isolated_db, tmp_path, monkeypatch):
     monkeypatch.setattr(pi, "_tool_available", available)
     monkeypatch.setattr(pi, "_tool_preflight", preflight)
     monkeypatch.setattr(pi, "_reserve_execution_admission", lambda *_a, **_kw: {"allowed": True})
-    state.update(data=data, queue=queue, config=path, thread_context=inside)
+    state.update(data=data, queue=queue, config=path, thread_context=inside, archive=archive)
     return state
 
 
