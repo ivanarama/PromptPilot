@@ -8,7 +8,7 @@ import sqlite3
 import time
 import unicodedata
 import uuid
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -1413,6 +1413,22 @@ def recent_working_dirs(limit: int = 8, machine: Optional[str] = None) -> list:
         return [r["working_dir"] for r in rows]
 
 
+class TaskClaimBusy(sqlite3.OperationalError):
+    """SQLite refused entry before the task-claim transaction body ran."""
+
+
+def _is_sqlite_claim_contention(error: sqlite3.OperationalError) -> bool:
+    code = getattr(error, "sqlite_errorcode", None)
+    if code is not None:
+        # Extended SQLite results retain the primary code in their low byte.
+        return isinstance(code, int) and code & 0xff in (5, 6)  # BUSY, LOCKED
+    # Python 3.10 does not expose SQLite result codes. Only canonical lock
+    # messages qualify; I/O, corruption and other operational errors must fail.
+    message = str(error).lower()
+    return any(message == text or message.startswith(text + ": ") for text in (
+        "database is locked", "database table is locked", "database schema is locked"))
+
+
 def get_next_runnable(
         busy_keys=(), key_fn=None, order_key_fn=None, *,
         budget_wait_scope: str | None = None,
@@ -1435,7 +1451,19 @@ def get_next_runnable(
     """
     now = _now()
     busy = set(busy_keys or ())
-    with _connect(immediate=True) as conn:
+    with ExitStack() as transaction:
+        try:
+            conn = transaction.enter_context(_connect(immediate=True))
+        except sqlite3.OperationalError as exc:
+            # _connect has not yielded: no pause/fairness/selection or task
+            # mutation has run. Do not catch body/commit/rollback errors here.
+            if not _is_sqlite_claim_contention(exc):
+                raise
+            deferred = TaskClaimBusy(str(exc))
+            for name in ("sqlite_errorcode", "sqlite_errorname"):
+                if hasattr(exc, name):
+                    setattr(deferred, name, getattr(exc, name))
+            raise deferred from exc
         paused = conn.execute(
             "SELECT value FROM settings WHERE key = 'worker_paused'"
         ).fetchone()

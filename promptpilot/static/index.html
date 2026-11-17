@@ -4,6 +4,8 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>PromptPilot</title>
+<link rel="stylesheet" href="/assets/agent-connections.css">
+<link rel="stylesheet" href="/assets/workflow-progress.css">
 <style>
   :root {
     color-scheme: dark;
@@ -1123,6 +1125,7 @@
   <p style="color:var(--text2);font-size:12px">Тема применяется сразу и сохраняется в этом браузере, если доступно локальное хранилище.</p>
   <div class="settings-links">
     <button class="btn btn-ghost" onclick="closeSettings();openTaskSourceSettings()">Источники</button>
+    <button class="btn btn-ghost" onclick="closeSettings();openAgentConnections()">Подключения агентов</button>
     <button class="btn btn-ghost" onclick="closeSettings();openProviders()">Помощники</button>
     <button class="btn btn-ghost" onclick="closeSettings();openWorkflows()">Воркфлоу</button>
     <button class="btn btn-ghost" onclick="closeSettings();openSchedule()">Расписание</button>
@@ -1167,6 +1170,8 @@
 
 <script src="/assets/task-feed.js"></script>
 <script src="/assets/task-source-settings.js"></script>
+<script src="/assets/agent-connections.js"></script>
+<script src="/assets/workflow-progress.js"></script>
 <script>
 let uiThemeChoice = 'dark';
 let uiThemeMedia = null;
@@ -1209,6 +1214,7 @@ let skillsCache = {};
 let skillsPanelOpen = false;
 let workflowCache = [];
 let selectedWorkflowId = null;
+let workflowSelectionSerial = 0;
 let selectedWorkflowData = null;
 let activeWorkflowTaskId = null;
 
@@ -1925,6 +1931,17 @@ function openWorkflows() {
 
 function closeWorkflows() { document.getElementById('workflowModal').classList.remove('open'); }
 
+async function openWorkflowFromLocation() {
+  const match = /^#workflow\/(wf_[0-9a-f]{32})$/.exec(location.hash);
+  if (!match) return;
+  selectedWorkflowId = match[1];
+  document.getElementById('workflowModal').classList.add('open');
+  try { await loadWorkflows(); }
+  catch (_) { toast('Не удалось открыть карточку задачи'); }
+}
+
+window.addEventListener('hashchange', openWorkflowFromLocation);
+
 let workflowAutoRefreshBusy = false;
 
 function captureWorkflowOpenDetails() {
@@ -2382,25 +2399,27 @@ async function loadWorkflows() {
   const list = document.getElementById('wfList');
   list.innerHTML = workflowCache.length ? workflowCache.map(w => `
     <div class="wf-row${w.id === selectedWorkflowId ? ' active' : ''}" onclick="selectWorkflow('${escAttr(w.id)}')">
-      <div class="wf-title">${esc(w.slug)}</div>
-      <div class="wf-meta">${esc(w.status)} · раунд ${w.current_round} · v${w.state_version}</div>
+      <div class="wf-title">${esc(typeof w.config?.agent_task_title === 'string' && w.config.agent_task_title.trim() ? w.config.agent_task_title : w.slug)}</div>
+      <div class="wf-meta">${esc(typeof WorkflowProgress !== 'undefined' ? WorkflowProgress.statusLabel(w.status) : w.status)} · раунд ${w.current_round} · v${w.state_version}</div>
     </div>`).join('') : '<div class="wf-meta">Workflow пока нет.</div>';
   if (!selectedWorkflowId && workflowCache.length) selectedWorkflowId = workflowCache[0].id;
   if (selectedWorkflowId) await selectWorkflow(selectedWorkflowId);
 }
 
 async function selectWorkflow(id) {
+  const selectionSerial = ++workflowSelectionSerial;
   selectedWorkflowId = id;
   document.querySelectorAll('.wf-row').forEach(row => row.classList.remove('active'));
   const wf = workflowCache.find(item => item.id === id) || await fetchJSON(`${API}/workflows/${id}`);
-  selectedWorkflowData = wf;
-  const [rounds, events, findings, plan, stages, elicitation] = await Promise.all([
+  if (selectedWorkflowId !== id || selectionSerial !== workflowSelectionSerial) return;
+  const [rounds, events, findings, plan, stages, elicitation, progress] = await Promise.all([
     fetchJSON(`${API}/workflows/${id}/rounds`),
     fetchJSON(`${API}/workflows/${id}/events?limit=200&tail=true`),
     fetchJSON(`${API}/workflows/${id}/findings`),
     fetchJSON(`${API}/workflows/${id}/plan`),
     fetchJSON(`${API}/workflows/${id}/stages`),
     fetchJSON(`${API}/workflows/${id}/elicitation`),
+    fetchJSON(`${API}/workflows/${id}/progress`).catch(() => null),
   ]);
   const current = rounds.find(r => r.round_no === wf.current_round);
   const runs = current ? await fetchJSON(`${API}/workflows/${id}/rounds/${current.id}/runs`) : [];
@@ -2419,8 +2438,11 @@ async function selectWorkflow(id) {
       }
     } catch (_) {}
   }
+  if (selectedWorkflowId !== id || selectionSerial !== workflowSelectionSerial) return;
+  selectedWorkflowData = wf;
   const openDetailKeys = captureWorkflowOpenDetails();
-  renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, plannerTask, orphanPane, elicitation);
+  const sameFrameProgress = progress?.workflow_id === wf.id && progress?.state_version === wf.state_version ? progress : null;
+  renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, plannerTask, orphanPane, elicitation, sameFrameProgress);
   restoreWorkflowOpenDetails(openDetailKeys);
   const idx = workflowCache.findIndex(item => item.id === id);
   if (idx >= 0) workflowCache[idx] = wf;
@@ -2613,11 +2635,11 @@ function workflowOwnerInfo(wf, activeRun, reviewerDone, decisionState = {}) {
 
 function workflowRoundRow(round, current = false) {
   const historical = !!round.summary?.historical;
-  const summary = round.summary?.summary || (current ? 'Текущий автоматизированный раунд' : 'Описание не зафиксировано');
+  const summary = round.summary?.summary || (current ? 'Текущий раунд задачи' : 'Описание не зафиксировано');
   const hashes = [round.candidate_sha && `candidate ${round.candidate_sha.slice(0, 8)}`,
                   round.audit_sha && `audit ${round.audit_sha.slice(0, 8)}`].filter(Boolean).join(' · ');
   return `<div class="wf-round${current ? ' current' : ''}">
-    <div><b>Раунд ${round.round_no}</b> · ${historical ? 'импортированная история' : 'PromptPilot'} · ${esc(round.status)}</div>
+    <div><b>Раунд ${round.round_no}</b> · ${historical ? 'импортированная история' : 'PromptPilot'} · ${esc(({queued:'Ожидает запуска',executing:'Выполняется',awaiting_external:'Ждём внешний результат',gating:'Проверяется',reviewing:'На независимом ревью',revision_required:'Возвращён на доработку',awaiting_human:'Нужно решение владельца',completed:'Завершён',failed:'Ошибка',cancelled:'Отменён'})[round.status] || 'Нет данных о состоянии')}</div>
     <div class="wf-round-summary">${esc(summary)}</div>
     ${hashes ? `<div class="wf-meta">${esc(hashes)}</div>` : ''}
   </div>`;
@@ -2698,23 +2720,20 @@ function workflowPlanHtml(wf, plan, stages) {
     max_revision_rounds: st.max_revision_rounds || null,
     execution_mode: st.execution_mode || 'automatic',
   })) : null;
-  // U1: монотонный собственный % прогресса на каждой карточке (переходы видны)
+  // Report completed stages only; an active stage has no measured half-percent.
   const total = Math.max(stages.length, 1);
   const completedCount = stages.filter(s => s.status === 'completed').length;
   const cards = stages.map((stage, index) => {
     if (editable) return workflowStageEditorCard(stage, index);
     if (amendable) return workflowStageEditorCard(stage, index, index < frozenN);
-    const done = stages.slice(0, index + 1).filter(s => s.status === 'completed').length;
-    const pct = stage.status === 'completed'
-      ? Math.round(done / total * 100)
-      : Math.round((done + (stage.status === 'executing' || stage.status === 'reviewing' || stage.status === 'gating' ? 0.5 : 0)) / total * 100);
+    const displayedState = stage.id === wf.current_stage_id ? wf.status : stage.status;
     const shortGoal = String(stage.objective || '').split('.')[0].slice(0, 90);
     return `
     <div class="wf-stage-card" data-status="${escAttr(stage.status)}" style="min-height:96px">
-      <div class="wf-stage-title">${index + 1}/${total} · ${Math.max(0, pct)}% <span class="task-status" data-s="${escAttr(stage.status)}">${esc(stage.status)}</span></div>
+      <div class="wf-stage-title">Этап ${index + 1} из ${total} <span class="task-status" data-s="${escAttr(stage.status)}">${esc(({draft:'Черновик',queued:'Ожидает запуска',ready:'Готов к запуску',executing:'Выполняется',awaiting_external:'Ждём внешний результат',gating:'Проверяется',reviewing:'На ревью',revision_required:'Нужны исправления',completed:'Завершён',failed:'Ошибка',cancelled:'Отменён'})[displayedState] || 'Нет данных')}</span></div>
       <div style="font-weight:600;margin:2px 0">${esc(stage.code)} · ${esc(stage.title)}</div>
       <div class="wf-round-summary" style="display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden">${esc(shortGoal)}</div>
-      <div class="wf-meta">${esc(stage.stage_type)}${stage.execution_mode === 'external' ? ' · вне PromptPilot' : ''} · gate: ${(stage.acceptance_gates || []).length} · возвратов: ${wf.config?.planning?.max_revisions_per_stage ?? stage.max_revision_rounds ?? 3}</div>
+      <div class="wf-meta">${esc(stage.stage_type === 'integration' ? 'Итоговый этап' : 'Доработка')}${stage.execution_mode === 'external' ? ' · внешний исполнитель' : ''} · проверок: ${(stage.acceptance_gates || []).length} · возвратов: ${wf.config?.planning?.max_revisions_per_stage ?? stage.max_revision_rounds ?? 3}</div>
     </div>`;
   }).join('');
   const controls = editable ? `<div class="wf-actions">
@@ -2727,7 +2746,7 @@ function workflowPlanHtml(wf, plan, stages) {
     <button class="btn btn-sm btn-primary" onclick="wfAmendPlan()">Перепланировать хвост</button>
     <span class="cz-hint">F5: замороженные 🔖 этапы — история; правится только хвост; причина обязательна и попадёт в журнал</span>
   </div>` : '';
-  return `<div class="wf-section-title">План этапов · ${stages.length}</div>
+  return `<div class="wf-section-title">План этапов · завершено ${completedCount} из ${stages.length}</div>
     ${editable ? '<div class="wf-meta">Последний этап должен иметь тип integration. Gate-команды выполняются только после ручного утверждения плана.</div>' : ''}
     <div class="wf-stage-list" id="wfStageList">${cards || '<div class="wf-meta">Планировщик ещё не сформировал этапы.</div>'}</div>${controls}`;
 }
@@ -2741,7 +2760,7 @@ function workflowExternalFormHtml(wf, runs) {
   const token = [wf.id, run.id, wf.state_version, run.input_sha256].map(x => escAttr(JSON.stringify(x))).join(', ');
   return `<div class="wf-stage" style="border-color:var(--yellow)">
     <b>Задание для внешнего исполнителя</b> ? попытка ${run.attempt_no}
-    <div class="result-block"><pre id="wfExternalAssignment">${esc(run.input?.assignment || '')}</pre></div>
+    <details data-wf-detail="external-assignment"><summary>Текст задания исполнителю</summary><div class="result-block"><pre id="wfExternalAssignment">${esc(run.input?.assignment || '')}</pre></div></details>
     <button class="btn btn-sm btn-ghost" onclick="wfCopyAssignment()">Скопировать задание</button>
   </div><div class="wf-form wide" id="wfExternalForm-${id}"
       data-workflow="${escAttr(wf.id)}" data-run="${id}" data-version="${wf.state_version}"
@@ -2785,7 +2804,8 @@ async function wfAnswerElicitation() {
   finally { button.disabled = false; }
 }
 
-function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, plannerTask, orphanPane = null, elicitation = null) {
+function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, plannerTask, orphanPane = null, elicitation = null, progress = null) {
+  const displayTitle = typeof wf.config?.agent_task_title === 'string' && wf.config.agent_task_title.trim() ? wf.config.agent_task_title : wf.slug;
   const terminal = ['completed','failed','cancelled'].includes(wf.status);
   const plannerRun = wf.status === 'planning' && plannerTask ? {role:'planner', task_id:plannerTask.id, status:plannerTask.status} : null;
   const activeRun = plannerRun || [...runs].reverse().find(r => ['pending','running'].includes(r.status));
@@ -2860,9 +2880,10 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, 
       <button class="btn btn-sm btn-ghost wide" onclick="wfReview('HUMAN_REQUIRED')">Нужен человек</button></div>`;
   }
   const runRows = (plannerTask ? [`<div class="wf-round${plannerRun ? ' current' : ''}"><b>planner</b> · ${esc(plannerTask.status)} · task #${plannerTask.id}</div>`] : [])
-    .concat(runs.map(r => `<div class="wf-round${r === activeRun ? ' current' : ''}"><b>${esc(r.role)} · попытка ${r.attempt_no}</b> · ${esc(r.status)}${r.task_id ? ` · task #${r.task_id}` : ''}${r.input?.execution_mode === 'external' ? ` · вне PromptPilot${r.output?.external?.performer ? ': ' + esc(r.output.external.performer) : ''}` : ''}</div>`)).join('');
+    .concat(runs.map(r => `<div class="wf-round${r === activeRun ? ' current' : ''}"><b>${esc(({executor:'Исполнитель',reviewer:'Проверяющий',gate:'Проверки',planner:'Планировщик'})[r.role] || r.role)} · попытка ${r.attempt_no}</b> · ${esc(typeof WorkflowProgress !== 'undefined' ? WorkflowProgress.statusLabel(r.status) : r.status)}${r.task_id ? ` · task #${r.task_id}` : ''}${r.input?.execution_mode === 'external' ? ` · вне PromptPilot${r.output?.external?.performer ? ': ' + esc(r.output.external.performer) : ''}` : ''}</div>`)).join('');
   const eventRows = [...events].reverse().slice(0, 30).map(e => `<div class="wf-event"><code>${esc(e.event_type)}</code> · ${formatTime(e.created_at)}</div>`).join('');
-  const historyRows = pastRounds.map(r => workflowRoundRow(r)).join('');
+  const readableProgress = typeof WorkflowProgress !== 'undefined' ? WorkflowProgress.renderSummary({workflow:wf, stages, progress}) : '';
+  const historyRows = typeof WorkflowProgress !== 'undefined' ? WorkflowProgress.renderHistory({workflow:wf, rounds, progress}) : pastRounds.map(r => workflowRoundRow(r)).join('');
   // Scroll-jump fix: the 5s auto-refresh rebuilds this pane from scratch.
   // While innerHTML is being replaced the pane momentarily collapses, so the
   // modal scroller clamps to the top, and every rebuilt scrollable block
@@ -2876,17 +2897,18 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, 
   const wfModalScroller = wfPane.closest('.modal');
   const wfSnapModalTop = wfModalScroller ? wfModalScroller.scrollTop : 0;
   wfPane.innerHTML = `
-    <div class="wf-title">${esc(wf.slug)} <span class="task-status" data-s="${escAttr(wf.status)}">${esc(statusInfo[0])}</span>
+    <div class="wf-title">${esc(displayTitle)} <span class="task-status" data-s="${escAttr(wf.status)}">${esc(statusInfo[0])}</span>
       ${wf.config?.automation?.enabled ? '<span class="task-status" data-s="running">АВТО</span>' : '<span class="wf-meta">ручной режим</span>'}</div>
-    <div class="wf-stage" style="border-color:${ownerInfo.color}">
+    ${readableProgress || `<div class="wf-stage" style="border-color:${ownerInfo.color}">
       <div class="wf-stage-title">🏓 Мяч сейчас: <span style="color:${ownerInfo.color}">${esc(ownerInfo.who)}</span></div>
       ${humanAlert ? `<div class="wf-round-summary"><b>${esc(humanAlert[0])}</b> · ${esc(humanAlert[1])}</div>` : ''}
       <div class="wf-round-summary">${esc(ownerInfo.detail)}</div>
       ${ownerInfo.next ? `<div class="wf-next">${esc(ownerInfo.next)}</div>` : ''}
-    </div>
+    </div>`}
+    ${readableProgress && humanAlert ? `<div class="wf-stage" role="note"><strong>${esc(humanAlert[0])}</strong><div class="wf-round-summary">${esc(humanAlert[1])}</div></div>` : ''}
     <div class="wf-stage">
       <div class="wf-stage-title">${esc(stage.code ? `${stage.code}: ${stageTitle}` : stageTitle)}</div>
-      <div class="wf-round-summary">${esc(stageGoal)}</div>
+      <details class="wf-goal-details" data-wf-detail="stage-objective"><summary>Цель этапа полностью</summary><div class="wf-round-summary">${esc(stageGoal)}</div></details>
       <div class="wf-next">${esc(statusInfo[1])}</div>
       ${stopReason && ['awaiting_human','revision_required','failed'].includes(wf.status)
         ? `<div class="wf-round-summary" style="color:var(--red)"><b>Причина остановки:</b> ${esc(stopReason)}</div>`
@@ -2905,7 +2927,7 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, 
     ${workflowPlanHtml(wf, plan, stages)}
     ${action}
     <div class="wf-section-title">Текущий раунд</div>
-    ${currentRound ? workflowRoundRow(currentRound, true) : '<div class="wf-meta">Текущий раунд ещё не создан.</div>'}
+    ${currentRound ? workflowRoundRow({...currentRound, status:wf.status}, true) : '<div class="wf-meta">Текущий раунд ещё не создан.</div>'}
     <div class="wf-section-title">Попытки исполнителей и проверяющих в текущем раунде</div>
     ${runRows || '<div class="wf-meta">Попыток пока нет.</div>'}
     ${activeTaskId ? `<div class="detail-label">Экран агента task #${activeTaskId}
@@ -2920,7 +2942,7 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, 
         <button class="btn btn-sm btn-ghost" onclick="wfSendKey('esc')">Esc</button>
         <button class="btn btn-sm btn-copy" onclick="wfRefreshScreen(${activeTaskId}, true)">Обновить экран</button>
       </div>` : ''}
-    <div class="wf-section-title">История завершённых раундов</div>
+    <div class="wf-section-title">Предыдущие раунды</div>
     <div class="wf-history">${historyRows || '<div class="wf-meta">Истории пока нет.</div>'}</div>
     <details class="wf-technical" data-wf-detail="technical-log"><summary>Технический журнал · ${events.length} событий · state version ${wf.state_version}</summary>
       <div class="wf-history">${eventRows || '<div class="wf-meta">Событий пока нет.</div>'}</div>
@@ -5050,6 +5072,7 @@ loadCosts();
 loadHealth();
 refresh();
 if (location.hash === '#pipelines') openPipelines();
+openWorkflowFromLocation();
 setInterval(refresh, 5000);
 setInterval(() => pollScreen(), 4000);  // только для раскрытой карточки с herdr-панелью
 setInterval(() => wfRefreshScreen(), 4000);  // экран активного task прямо в workflow

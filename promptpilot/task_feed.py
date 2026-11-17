@@ -115,7 +115,7 @@ def project_workflow(row, *, source_id="local", source_label=None,
         return (text.replace(token, "[redacted]") if isinstance(token, str) and token else text)[:limit]
     item = {
         "kind": "workflow", "object_id": _text(row.get("id"), 128),
-        "title": display(row.get("slug"), 300),
+        "title": display(_text(configuration.get("agent_task_title"), 300) or row.get("slug"), 300),
         "objective": display(row.get("objective"), 1500),
         "status": state, "status_label": label, "status_reason": reason,
         "created_at": row.get("created_at"), "updated_at": row.get("updated_at"),

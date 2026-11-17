@@ -515,7 +515,7 @@ def test_web_ui_exposes_workflow_and_live_agent_controls():
     assert "Показать отчёт независимого аудитора" in html
     assert "Причина остановки:" in html
     assert "review.awaiting_decision" in html
-    assert "История завершённых раундов" in html
+    assert "Предыдущие раунды" in html
     assert "Технический журнал" in html
     assert "Настройки автономного workflow" in html
     assert "Новый автономный workflow" in html

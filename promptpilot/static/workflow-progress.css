@@ -1,0 +1,33 @@
+.wf-progress { background:var(--bg,#141820); border:1px solid var(--border,#48505b); border-radius:10px; padding:16px; margin:12px 0; overflow-wrap:anywhere; }
+.wf-progress-location { font-size:13px; font-weight:650; color:var(--text2,#aeb8c5); }
+.wf-progress-stage { margin-top:5px; font-size:14px; }
+.wf-progress h3 { font-size:19px; line-height:1.4; margin:10px 0; }
+.wf-progress p { margin:7px 0; line-height:1.55; }
+.wf-progress-owner { font-size:14px; }
+.wf-progress-next { color:var(--text,#e9edf2); }
+.wf-progress-steps { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:7px; padding:0; margin:16px 0 4px; list-style:none; }
+.wf-progress-steps li { min-width:0; border-top:4px solid var(--border,#48505b); border-radius:5px; padding:9px 7px; background:var(--surface,#202630); }
+.wf-progress-step-label { display:block; font-size:13px; font-weight:600; }
+.wf-progress-steps small { display:block; margin-top:5px; color:var(--text2,#aeb8c5); }
+.wf-progress-steps [data-progress-state=done] { border-color:var(--green,#69c187); }
+.wf-progress-steps [data-progress-state=current] { border-color:var(--accent,#8dbbff); }
+.wf-progress-steps [data-progress-state=blocked] { border-color:var(--red,#f58e8e); }
+.wf-progress-return { border-left:4px solid var(--yellow,#e6c36d); background:var(--surface,#202630); padding:12px; margin-top:16px; border-radius:6px; }
+.wf-progress-return h4 { margin:0 0 6px; font-size:15px; }
+.wf-progress-basis { color:var(--text2,#aeb8c5); font-size:12px; }
+.wf-progress-file-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; margin-top:10px; }
+.wf-progress-files { min-width:0; font-size:13px; }
+.wf-progress-files ul { padding-left:18px; margin:6px 0; }
+.wf-progress-files li { margin:5px 0; overflow-wrap:anywhere; }
+.wf-progress-history { border-left:3px solid var(--border,#48505b); padding:10px 12px; margin:8px 0; background:var(--bg,#141820); border-radius:6px; overflow-wrap:anywhere; }
+.wf-progress-history>div { display:flex; flex-wrap:wrap; gap:8px 14px; }
+.wf-progress-history span { color:var(--text2,#aeb8c5); }
+.wf-progress-history p { margin:6px 0 0; line-height:1.5; }
+.wf-goal-details { margin-top:8px; }
+.wf-goal-details summary { cursor:pointer; font-size:13px; }
+.wf-goal-details .wf-round-summary { margin-top:8px; white-space:pre-wrap; overflow-wrap:anywhere; }
+@media(max-width:650px) {
+  .wf-progress { padding:12px; }
+  .wf-progress-steps { grid-template-columns:repeat(2,minmax(0,1fr)); }
+  .wf-progress-file-grid { grid-template-columns:minmax(0,1fr); }
+}

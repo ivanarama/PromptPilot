@@ -30,6 +30,7 @@ from . import db, epf_tools, flows, workflows
 from . import pipeline_insights, task_sources, external_inbox
 from . import task_feed, task_feed_visibility
 from . import task_source_settings
+from . import agent_admin, agent_mcp
 from .config import ALLOWED_HOSTS, ALLOWED_ORIGINS, API_TOKEN, DB_DIR, DEFAULT_CLI, EFFORT_LEVELS, PIPELINE_SNAPSHOT_INTERVAL, get_provider_models, get_skills, load_providers, mask_secret_value, provider_available, RIGHTS_LEVELS, rights_supported, save_catalog_provider, PROJECTS_ROOT
 from .provider_catalog import CATALOG, catalog_entry, slugify, build_provider_entry
 from .models import (
@@ -118,6 +119,8 @@ app = FastAPI(title="PromptPilot", version="0.1.0", lifespan=_lifespan)
 
 app.include_router(workorder_router)
 app.include_router(external_inbox.router)
+app.include_router(agent_admin.router)
+app.include_router(agent_mcp.router)
 
 
 @app.exception_handler(RequestValidationError)
@@ -127,6 +130,10 @@ async def _source_settings_validation_error(request, exc):
     if path == "/api/task-sources" or path.startswith("/api/task-sources/"):
         return JSONResponse(status_code=422, content={
             "detail": "Неверные параметры источника. Проверьте название, адрес и авторизацию.",
+        })
+    if path == "/api/agent-control" or path.startswith("/api/agent-control/"):
+        return JSONResponse(status_code=422, content={
+            "detail": "Неверные настройки проекта или подключения агента.",
         })
     return await request_validation_exception_handler(request, exc)
 
@@ -233,6 +240,13 @@ async def _auth(request, call_next):
     if request.method not in _SAFE_METHODS:
         if request.headers.get("sec-fetch-site") == "cross-site":
             return Response(status_code=403, content="cross-site request refused")
+    if request.url.path == agent_mcp.MCP_PATH:
+        # Only this exact endpoint accepts scoped creator credentials. Its
+        # router authenticates and rechecks project grants. Ordinary REST
+        # mutations still require the administrator's independent token.
+        if not agent_mcp._origin_allowed(request):
+            return Response(status_code=403, content="Origin is not allowed")
+        return await call_next(request)
     if not API_TOKEN:
         host = request.headers.get("host", "")
         if not _trusted_host(host):
@@ -278,6 +292,10 @@ else:
 _INDEX_HTML = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
 _TASK_FEED_JS = (STATIC_DIR / "task-feed.js").read_text(encoding="utf-8")
 _TASK_SOURCE_SETTINGS_JS = (STATIC_DIR / "task-source-settings.js").read_text(encoding="utf-8")
+_AGENT_CONNECTIONS_JS = (STATIC_DIR / "agent-connections.js").read_text(encoding="utf-8")
+_AGENT_CONNECTIONS_CSS = (STATIC_DIR / "agent-connections.css").read_text(encoding="utf-8")
+_WORKFLOW_PROGRESS_JS = (STATIC_DIR / "workflow-progress.js").read_text(encoding="utf-8")
+_WORKFLOW_PROGRESS_CSS = (STATIC_DIR / "workflow-progress.css").read_text(encoding="utf-8")
 
 
 # --- API ---
@@ -1074,6 +1092,17 @@ def api_get_workflow(workflow_id: str):
     if not workflow:
         raise HTTPException(404, "Workflow not found")
     return workflow
+
+
+@app.get("/api/workflows/{workflow_id}/progress")
+def api_workflow_progress(workflow_id: str):
+    from . import workflow_progress
+    try:
+        return workflow_progress.get_progress(workflow_id)
+    except workflow_progress.ProgressNotFound:
+        raise HTTPException(404, "Workflow not found") from None
+    except workflow_progress.ProgressUnavailable:
+        raise HTTPException(503, "Workflow progress is unavailable") from None
 
 
 @app.patch("/api/workflows/{workflow_id}", response_model=WorkflowInDB)
@@ -2397,6 +2426,30 @@ def task_source_settings_script():
                     headers={"Cache-Control": "no-store"})
 
 
+@app.get("/assets/agent-connections.js")
+def agent_connections_script():
+    return Response(content=_AGENT_CONNECTIONS_JS, media_type="application/javascript",
+                    headers={"Cache-Control": "no-store"})
+
+
+@app.get("/assets/agent-connections.css")
+def agent_connections_style():
+    return Response(content=_AGENT_CONNECTIONS_CSS, media_type="text/css",
+                    headers={"Cache-Control": "no-store"})
+
+
 @app.get("/")
 def index():
     return Response(content=_INDEX_HTML, media_type="text/html")
+
+
+@app.get("/assets/workflow-progress.js")
+def workflow_progress_script():
+    return Response(content=_WORKFLOW_PROGRESS_JS, media_type="application/javascript",
+                    headers={"Cache-Control": "no-store"})
+
+
+@app.get("/assets/workflow-progress.css")
+def workflow_progress_style():
+    return Response(content=_WORKFLOW_PROGRESS_CSS, media_type="text/css",
+                    headers={"Cache-Control": "no-store"})

@@ -2986,10 +2986,18 @@ def run_worker():
         busy_keys = [lk for lk, _task in in_flight.values() if lk]
         busy_keys.extend(
             item["lock"] for item in stuck_recoveries.values() if item["lock"])
-        task, lane_id = _claim_next_task(
-            busy_keys=busy_keys,
-            busy_lane_ids=task_lanes.values(),
-        )
+        try:
+            task, lane_id = _claim_next_task(
+                busy_keys=busy_keys,
+                busy_lane_ids=task_lanes.values(),
+            )
+        except db.TaskClaimBusy:
+            # The DB refused entry before any task was selected or changed.
+            # Retry through the ordinary loop so pause, slots and fences are
+            # checked again; never replay an unknown claim/commit outcome.
+            print("  !! task claim deferred: SQLite is busy; waiting for next poll", flush=True)
+            time.sleep(POLL_INTERVAL)
+            continue
         if task is None:
             time.sleep(POLL_INTERVAL)
             continue
