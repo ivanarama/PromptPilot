@@ -2838,6 +2838,8 @@ def run(argv=None) -> int:
     sub.add_parser("capabilities")
     source_refresh_parser = sub.add_parser("source-refresh")
     source_refresh_parser.add_argument("--profile", required=True)
+    budget_refresh_parser = sub.add_parser("budget-refresh")
+    budget_refresh_parser.add_argument("--profile", required=True)
     routing_parser = sub.add_parser("validate-routing-report")
     routing_parser.add_argument("--report", required=True)
     routing_parser.add_argument("--head", required=True)
@@ -2874,10 +2876,10 @@ def run(argv=None) -> int:
     complete_lease.add_argument("--lease-file")
     complete_parser.add_argument("--report")
     args = parser.parse_args(argv)
-    if args.command == "source-refresh":
+    if args.command in ("source-refresh", "budget-refresh"):
         from .pipeline_source_refresh import run as source_refresh_run
 
-        return source_refresh_run(["--profile", args.profile])
+        return source_refresh_run(["--profile", args.profile], budget_only=args.command == "budget-refresh")
     try:
         if getattr(args, "lease_file", None):
             path = Path(args.lease_file)

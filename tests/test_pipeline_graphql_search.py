@@ -272,6 +272,16 @@ def test_server_cost_preview_larger_than_unchanged_estimate_refuses_before_data(
     assert ledger(f) == before and f.db.list_pipeline_snapshots("example") == []
 
 
+def test_actual_graphql_transport_with_zero_estimate_refuses_before_preview(continuation, monkeypatch):
+    f = continuation; monkeypatch.setattr(pi, "_github_search", REAL_SEARCH); stable_rates(monkeypatch)
+    f.profile["github_budget"]["costs"]["insights"]["graphql"] = 0
+    before = ledger(f); calls = gh_transport(monkeypatch, [])
+    result = source.refresh("example", f.env)
+    assert result["state"] == "refused" and result["reason"] == "invalid_config"
+    assert not calls and not calls.previews and result["source_refreshed"] is False
+    assert ledger(f) == before and f.db.list_pipeline_snapshots("example") == []
+
+
 def test_quota_drop_after_preview_is_wait_before_search_data(continuation, monkeypatch):
     f = continuation; monkeypatch.setattr(pi, "_github_search", REAL_SEARCH); stable_rates(monkeypatch)
     snapshots = iter([_limits(), _limits(), _limits(graphql=1199)])

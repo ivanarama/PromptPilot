@@ -106,6 +106,7 @@ class _GraphQLSearchBudget:
         self.last_limits = copy.deepcopy(admission["github_rate_limit"])
         # The initial canonical rateLimit observation has already executed.
         self.observed_spend, self.pending_cost = 1, 0
+        self.used = False
 
     def _allowance_denied(self, reason):
         return _budget_denied(self.policy, state="budget_in_flight", reason=reason,
@@ -113,6 +114,7 @@ class _GraphQLSearchBudget:
             status_revision=_current_github_scan_status_revision())
 
     def before_request(self, query_cost):
+        self.used = True
         _ensure_github_scan_lease(renew=True)
         ceiling = self.policy["requested_cost"]["graphql"]
         if query_cost > ceiling:
@@ -990,7 +992,8 @@ def _arm_budget_waiter(task, decision: dict, *, starvation_timeout_seconds: int 
 @contextmanager
 def _github_scan_admission(profile: dict, purpose: str,
                            *, profile_id: str | None = None,
-                           budget_route: str | None = None, task=None):
+                           budget_route: str | None = None, task=None,
+                           publish_refresh_status: bool = True):
     """Admit one expensive scan and hold its cross-process reservation."""
     now = time.time()
     admission_priority = getattr(
@@ -1163,7 +1166,7 @@ def _github_scan_admission(profile: dict, purpose: str,
             "repository": profile.get("repository", ""),
             "status": (None if decision.get("allowed")
                        else _refresh_blocked_status(decision)),
-        } if profile_id is not None and not lease.lost else None)
+        } if publish_refresh_status and profile_id is not None and not lease.lost else None)
         lease.release(refresh_status=refresh_status)
 
 
@@ -5352,6 +5355,10 @@ def _analyze_without_budget(profile_id: str, series: list[dict], *,
         ]
         lease = getattr(_scan_lease_context, "lease", None)
         search_budget = getattr(lease, "search_budget", None)
+        if search_budget is not None and not search_budget.used:
+            # Other observation transports retain their existing semantics.
+            # This allowance accounts requests made by GraphQL search only.
+            search_budget = None
         if db.is_paused():
             github_rate_limit = (cached[1].get("github_rate_limit")
                                  if cached else None)

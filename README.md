@@ -1461,6 +1461,15 @@ soft P1 headroom нижних приоритетов сохраняется. П�
 При ожидании возвращается exit3, при отказе — exit2. Обычные project-only
 команды `pipelinectl`, включая capabilities, продолжают работать без Native DB.
 
+Если нужны только свежие лимиты для отдельного бюджетного checkpoint,
+используй `pp pipelinectl budget-refresh --profile <profile-id>` из той же
+допущенной Native-задачи. Команда сохраняет прежние стоимость `insights`,
+резервы, priority и floors, но останавливается после защищённой записи лимитов:
+Source/checker/cache/history не обновляются, Source и mutation admission не
+выдаются. Результат не продлевает TTL и не заменяет последующие гейты.
+Подробности и семантика отказов — в
+[описании task-bound budget refresh](docs/TASK_BOUND_BUDGET_REFRESH.md).
+
 Worker передаёт фактический `PP_TASK_STARTED_AT` вместе с `PP_TASK_ID` обычным
 CLI и новым herdr-панам, заменяя унаследованные/provider значения. Это marker
 попытки, а не изменение приоритета или разрешение обходить очередь/бюджет.

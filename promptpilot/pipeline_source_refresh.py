@@ -1,6 +1,6 @@
-"""Task-bound, costed Native source refresh inside an existing admitted session.
+"""Task-bound, costed Native Source or budget observations in an admitted session.
 
-Only this command imports Native DB services. Project-only pipelinectl commands
+These commands import Native DB services. Project-only pipelinectl commands
 remain DB-free. No provider, task, skill reservation or product grant is created.
 """
 import argparse
@@ -10,6 +10,7 @@ import json
 import os
 import sqlite3
 import sys
+import time
 
 from .task_identity import task_execution_fingerprint
 
@@ -60,7 +61,15 @@ class _Continuation:
                 "Native source refresh attempt fence lost") from exc
 
 
-def refresh(profile_id, environ=None):
+def _budget_observation_flags():
+    return {"source_refreshed": False, "source_admission_granted": False,
+            "native_source_admission_granted": False, "native_admission_granted": False,
+            "mutable_admission_granted": False, "granted": False,
+            "product_mutation_authorized": False,
+            "scope": "Native-budget-observation-only"}
+
+
+def refresh(profile_id, environ=None, *, budget_only=False):
     env = os.environ if environ is None else environ
     raw_id = env.get("PP_TASK_ID", "")
     if (not isinstance(raw_id, str) or not raw_id.isascii() or not raw_id.isdecimal()
@@ -96,15 +105,43 @@ def refresh(profile_id, environ=None):
         # INSIGHTS pays its own configured scan estimate against the normal
         # scan floor at the actual task priority. Its existing execution promise
         # is counted once by the read-only ledger; it is never reserved again.
+        requested_at = time.time()
         with pi._github_scan_admission(profiles[profile_id],
                 f"Native source continuation {profile_id}/{matched[2]['id']}",
-                profile_id=profile_id, budget_route="insights", task=task) as admission:
+                profile_id=profile_id, budget_route="insights", task=task,
+                publish_refresh_status=not budget_only) as admission:
             if not admission.get("allowed"):
-                return {"state": "wait", "source_refreshed": False,
+                result = {"state": "wait", "source_refreshed": False,
                         "admitted_route": continuation.guard["route"],
                         "existing_execution_reservation_reused": True,
                         "budget": pi._public_budget_decision(admission),
                         "mutable_admission_granted": False}
+                if budget_only:
+                    result.update(_budget_observation_flags(), rate_snapshot_refreshed=False)
+                    if admission.get("state") not in {
+                            "low", "budget_in_flight", "scan_in_progress", "priority_waiter",
+                            "fairness_waiter", "ledger_changed"}:
+                        result["state"] = "refused"
+                return result
+            if budget_only:
+                # Admission already obtained canonical REST + GraphQL rates and
+                # wrote them under its actual lease/Native continuation guard.
+                # Do not enter Source collection, checker, publication or trends.
+                pi._ensure_github_scan_lease(renew=True)
+                snapshot = db.get_pipeline_github_rate_snapshot(continuation.policy["lease_scope"])
+                if (snapshot is None or snapshot["limits"] != admission.get("github_rate_limit")
+                        or not requested_at <= snapshot["observed_at"] <= time.time()):
+                    raise ValueError("this Native budget observation was not durably recorded")
+                pi._ensure_github_scan_lease()
+                return {**_budget_observation_flags(), "state": "refreshed",
+                        "rate_snapshot_refreshed": True, "rate_snapshot": snapshot,
+                        "task_id": task.id, "task_started_at": continuation.guard["started_at"],
+                        "native_session_bound": True,
+                        "profile_id": profile_id, "queue_id": matched[2]["id"],
+                        "admitted_route": continuation.guard["route"],
+                        "existing_execution_reservation_reused": True,
+                        "existing_skill_reservation_reused": continuation.guard["route"] == "skill",
+                        "budget": pi._public_budget_decision(admission)}
             try:
                 continuation.check()
                 result = pi._analyze_without_budget(profile_id, db.list_series(),
@@ -153,18 +190,33 @@ def refresh(profile_id, environ=None):
         pi._scan_lease_context.continuation = previous
 
 
-def run(argv=None):
+def run(argv=None, *, budget_only=False):
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="strict")
-    parser = argparse.ArgumentParser(prog="pipelinectl source-refresh", description=__doc__)
+    command = "budget-refresh" if budget_only else "source-refresh"
+    parser = argparse.ArgumentParser(prog="pipelinectl " + command, description=__doc__)
     parser.add_argument("--profile", required=True)
     args = parser.parse_args(argv)
     try:
-        result = refresh(args.profile)
+        result = refresh(args.profile, budget_only=budget_only)
     except (OSError, sqlite3.Error, KeyError, TypeError, ValueError, RuntimeError) as exc:
         result = {"state": "refused", "source_refreshed": False, "reason": str(exc),
                   "mutable_admission_granted": False}
+        if budget_only:
+            result.update(_budget_observation_flags(), rate_snapshot_refreshed=False)
+    if budget_only:
+        # Normalize every successful/refused early return at the public boundary.
+        # Admission can deny AFTER its canonical rate cache write, so failure is
+        # not evidence that no observation was stored.
+        result.update(_budget_observation_flags())
+        result.setdefault("rate_snapshot_refreshed", False)
+        result["admitted_observation"] = (result.get("state") == "refreshed"
+                                          and result["rate_snapshot_refreshed"] is True)
+        if not result["admitted_observation"]:
+            result["rate_cache_write_not_excluded"] = True
     print(json.dumps(result, ensure_ascii=False, default=str))
+    if budget_only:
+        return 0 if result.get("rate_snapshot_refreshed") is True else 3 if result["state"] == "wait" else 2
     return 0 if result.get("source_refreshed") is True else 3 if result["state"] == "wait" else 2
 
 
