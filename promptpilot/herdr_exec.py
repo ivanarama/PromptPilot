@@ -43,6 +43,7 @@ from .config import (HERDR_BIN, HERDR_KEEP_PANE, HERDR_READ_LINES, HERDR_START_T
                      HERDR_WORKTREE_TIMEOUT_SECONDS, guard_enabled,
                      guard_settings_file, resolve_effort, rights_args)
 from .process_tree import run_owned
+from .task_identity import apply_task_markers
 from .remote import (POWERSHELL, REMOTE_CALL_TIMEOUT, as_remote, ps_quote,
                      ssh_command, ssh_script)
 
@@ -876,7 +877,7 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
                     tab_env[k] = str(v)
             # Scheduler identity is reserved per claimed attempt. A stale
             # provider-level setting must never retag this owned session.
-            tab_env["PP_TASK_ID"] = str(task.id)
+            apply_task_markers(tab_env, task)
             env_args = [part for key, value in tab_env.items()
                         for part in ("--env", f"{key}={value}")]
 
