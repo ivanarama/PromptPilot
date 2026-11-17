@@ -125,6 +125,22 @@ def test_shared_scan_wait_is_honored_without_resampling(isolated_db, monkeypatch
     assert calls == []
 
 
+def test_explicit_defer_retries_at_its_deadline_once(isolated_db, monkeypatch, clock):
+    _, blocked, calls = install(monkeypatch, {"example": profile()}, clock, duration=0)
+    clock[0] += 180
+    blocked["example"] = {"refresh_blocked": "scan_in_progress",
+                          "refresh_deferred_until": datetime.fromtimestamp(
+                              clock[0] + 120, timezone.utc).isoformat()}
+    state = {}
+    assert sampling.sample_scheduled_profiles([], 300, state) == 120
+    clock[0] += 120
+    # The public read_cached overlay drops an expired deferred status before
+    # the coordinator reads it. It must now sample, without another full wait.
+    blocked.clear()
+    assert sampling.sample_scheduled_profiles([], 300, state) == 150
+    assert len(calls) == 1
+
+
 def test_failed_scan_waits_instead_of_retrying_until_green(isolated_db, monkeypatch, clock):
     _, _, calls = install(monkeypatch, {"example": profile()}, clock)
     clock[0] += 180
