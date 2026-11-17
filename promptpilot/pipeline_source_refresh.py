@@ -110,6 +110,17 @@ def refresh(profile_id, environ=None):
                 result = pi._analyze_without_budget(profile_id, db.list_series(),
                     use_cache=False, refresh_diagnostics=True)
                 pi._ensure_github_scan_lease(renew=True)
+            except pi._GitHubSearchBudgetDenied as exc:
+                return {"state": "refused" if exc.decision.get("state") == "invalid_config" else "wait",
+                        "source_refreshed": False, "reason": exc.decision["state"],
+                        "budget": pi._public_budget_decision(exc.decision),
+                        "mutable_admission_granted": False}
+            except pi._GitHubRateLimitUnavailable as exc:
+                denied = pi._replace_admission_with_rate_limit_failure(
+                    admission, profiles[profile_id], exc)
+                return {"state": "wait", "source_refreshed": False,
+                        "reason": denied["state"], "budget": pi._public_budget_decision(denied),
+                        "mutable_admission_granted": False}
             except pi._GitHubScanLeaseFailure:
                 return {"state": "refused", "source_refreshed": False,
                         "reason": "Native attempt or scan publication fence lost",
@@ -134,6 +145,7 @@ def refresh(profile_id, environ=None):
                 "existing_skill_reservation_reused": continuation.guard["route"] == "skill",
                 "profile_id": profile_id, "queue_id": matched[2]["id"],
                 "budget": pi._public_budget_decision(admission), "cache": cache,
+                "source_search_usage": result.get("source_search_usage"),
                 "snapshot_token": continuation.published if complete else None,
                 "scope": "Native-source-observation-only", "mutable_admission_granted": False,
                 "product_mutation_authorized": False}
