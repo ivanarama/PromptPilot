@@ -39,7 +39,7 @@ class _Continuation:
         if _profile_digest(self.insights._profiles()) != self.profiles_sha256:
             raise ValueError("source refresh profile policy changed")
         result = self.db.pipeline_source_refresh_state(self.policy["lease_scope"],
-            self.task_id, self.profile_id, self.queue_id, self.policy["costs"]["skill"],
+            self.task_id, self.profile_id, self.queue_id, self.policy["costs"],
             starvation_timeout_seconds=(policy or self.policy).get("starvation_timeout_seconds", 0))
         observed = result.pop("guard")
         if any(observed[key] != value for key, value in self.expected_attempt.items()):
@@ -94,13 +94,15 @@ def refresh(profile_id, environ=None):
     pi._scan_lease_context.continuation = continuation
     try:
         # INSIGHTS pays its own configured scan estimate against the normal
-        # scan floor at the actual task priority. Its existing SKILL promise
+        # scan floor at the actual task priority. Its existing execution promise
         # is counted once by the read-only ledger; it is never reserved again.
         with pi._github_scan_admission(profiles[profile_id],
                 f"Native source continuation {profile_id}/{matched[2]['id']}",
                 profile_id=profile_id, budget_route="insights", task=task) as admission:
             if not admission.get("allowed"):
                 return {"state": "wait", "source_refreshed": False,
+                        "admitted_route": continuation.guard["route"],
+                        "existing_execution_reservation_reused": True,
                         "budget": pi._public_budget_decision(admission),
                         "mutable_admission_granted": False}
             try:
@@ -127,7 +129,9 @@ def refresh(profile_id, environ=None):
                            else "complete source snapshot was not published"),
                 "source_refreshed": complete,
                 "task_id": task.id, "task_started_at": continuation.guard["started_at"],
-                "native_session_bound": True, "existing_skill_reservation_reused": True,
+                "native_session_bound": True, "existing_execution_reservation_reused": True,
+                "admitted_route": continuation.guard["route"],
+                "existing_skill_reservation_reused": continuation.guard["route"] == "skill",
                 "profile_id": profile_id, "queue_id": matched[2]["id"],
                 "budget": pi._public_budget_decision(admission), "cache": cache,
                 "snapshot_token": continuation.published if complete else None,

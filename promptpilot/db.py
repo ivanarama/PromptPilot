@@ -4181,7 +4181,7 @@ def _active_pipeline_budget_reservations(conn, values: list[dict]) -> tuple[list
     return active, len(active) != len(values)
 
 
-def _pipeline_source_refresh_state(conn, scope, task_id, profile_id, queue_id, cost,
+def _pipeline_source_refresh_state(conn, scope, task_id, profile_id, queue_id, route_costs,
                                    starvation_timeout_seconds=0):
     """Read an admitted running attempt without pruning any foreign ledger."""
     from .config import TASK_TIMEOUT
@@ -4210,7 +4210,8 @@ def _pipeline_source_refresh_state(conn, scope, task_id, profile_id, queue_id, c
     if (started.tzinfo is None or started.timestamp() > now
             or timeout and now >= started.timestamp() + timeout):
         raise ValueError("source refresh attempt lifetime is invalid")
-    cost = _pipeline_budget_vector(cost, "continuation skill cost")
+    costs = {route: _pipeline_budget_vector(route_costs[route], f"continuation {route} cost")
+             for route in ("skill", "fallback_targeted")}
     key = _pipeline_github_budget_reservation_key(scope)
     values = _load_pipeline_budget_reservations(
         conn, key)
@@ -4223,15 +4224,17 @@ def _pipeline_source_refresh_state(conn, scope, task_id, profile_id, queue_id, c
     own = [r for r in values if r["task_id"] == task_id]
     if (len(own) != 1 or own[0]["task_started_at"] != row["started_at"]
             or own[0]["profile_id"] != profile_id or own[0]["queue_id"] != queue_id
-            or own[0]["route"] != "skill" or own[0]["cost"] != cost):
-        raise ValueError("source refresh requires its exact existing skill reservation")
+            or own[0]["route"] not in costs
+            or own[0]["cost"] != costs[own[0]["route"]]):
+        raise ValueError("source refresh requires its exact existing execution reservation")
     active, _changed = _active_pipeline_budget_reservations(conn, values)
     guard = {"scope": scope, "task_id": task_id, "started_at": row["started_at"],
              "session_id": row["session_id"], "herdr_pane": row["herdr_pane"],
              "series_id": row["series_id"],
              "priority": row["priority"], "profile_id": profile_id, "queue_id": queue_id,
              "execution_sha256": task_execution_fingerprint(row),
-             "cost": dict(cost), "token": own[0]["token"]}
+             "route": own[0]["route"], "cost": dict(own[0]["cost"]),
+             "route_costs": costs, "token": own[0]["token"]}
     waiting = _pipeline_github_budget_waiter_summary(conn, scope,
         starvation_timeout_seconds=starvation_timeout_seconds, now=now)
     return {"guard": guard, "totals": {r: sum(v["cost"][r] for v in active)
@@ -4241,19 +4244,19 @@ def _pipeline_source_refresh_state(conn, scope, task_id, profile_id, queue_id, c
             "woken_waiters": {"count": 0, "min_priority": None}, "waiting_waiters": waiting}
 
 
-def pipeline_source_refresh_state(scope, task_id, profile_id, queue_id, cost,
+def pipeline_source_refresh_state(scope, task_id, profile_id, queue_id, route_costs,
                                   *, starvation_timeout_seconds=0):
     """Observe existing Native admission; never reserve, release or clean it."""
     with _connect() as conn:
         conn.execute("BEGIN")
-        return _pipeline_source_refresh_state(conn, scope, task_id, profile_id, queue_id, cost,
+        return _pipeline_source_refresh_state(conn, scope, task_id, profile_id, queue_id, route_costs,
                                               starvation_timeout_seconds)
 
 
 def _pipeline_source_refresh_guard_matches(conn, guard):
     try:
         observed = _pipeline_source_refresh_state(conn, guard["scope"], guard["task_id"],
-            guard["profile_id"], guard["queue_id"], guard["cost"])
+            guard["profile_id"], guard["queue_id"], guard["route_costs"])
         return observed["guard"] == guard
     except (KeyError, TypeError, ValueError, OverflowError):
         return False

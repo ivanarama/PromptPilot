@@ -54,6 +54,72 @@ def ledger(f):
     return f.db.get_setting(f.db._pipeline_github_budget_reservation_key("github-default"))
 
 
+@pytest.fixture
+def targeted_merge(continuation):
+    f = continuation
+    f.profile["queues"][0].update(id="merge", series_contains="Example - MERGE")
+    cost = {"core": 1000, "search": 8, "graphql": 1000}
+    f.profile["github_budget"]["costs"]["fallback_targeted"] = cost
+    with f.db._connect() as c:
+        c.execute("UPDATE tasks SET prompt='Example - MERGE' WHERE id=?", (f.task.id,))
+        c.execute("UPDATE task_series SET title='Example - MERGE',prompt='Example - MERGE' WHERE id=?",
+                  (f.task.series_id,))
+    assert f.db.release_pipeline_github_budget("github-default", token="existing-skill",
+        task_id=f.task.id, task_started_at=f.task.started_at)
+    assert f.db.reserve_pipeline_github_budget("github-default", token="actual-targeted-admission",
+        task_id=f.task.id, task_started_at=f.task.started_at, profile_id="example", queue_id="merge",
+        route="fallback_targeted", cost=cost, limits=_limits(),
+        minimum_remaining={"core": 250, "search": 2, "graphql": 100})["allowed"]
+    return f
+
+
+def test_targeted_merge_refresh_uses_exact_existing_native_route_cost_once(targeted_merge):
+    f = targeted_merge
+    before = ledger(f)
+    result = source.refresh("example", f.env)
+    assert result["source_refreshed"] is True and result["admitted_route"] == "fallback_targeted"
+    assert result["existing_execution_reservation_reused"] is True
+    assert result["existing_skill_reservation_reused"] is False
+    assert result["budget"]["reserved_other"]["search"] == 8
+    assert result["budget"]["requested_cost"]["search"] == 10
+    assert result["budget"]["effective_after"]["search"] == 12
+    assert result["budget"]["minimum_remaining"]["search"] == 2
+    assert ledger(f) == before and len(f.db.list_pipeline_snapshots("example")) == 1
+
+
+@pytest.mark.parametrize("fault", ["wrong-cost", "unsupported-route", "ambiguous-route"])
+def test_targeted_route_needs_exact_unique_canonical_native_admission(targeted_merge, monkeypatch, fault):
+    f = targeted_merge
+    key = f.db._pipeline_github_budget_reservation_key("github-default")
+    value = json.loads(ledger(f))
+    if fault == "wrong-cost":
+        value["reservations"][0]["cost"]["search"] = 7
+    elif fault == "unsupported-route":
+        value["reservations"][0]["route"] = "tool"
+    else:
+        value["reservations"].append(dict(value["reservations"][0], token="second-route", route="skill"))
+    f.db.set_setting(key, json.dumps(value))
+    before = ledger(f)
+    monkeypatch.setattr(pi, "_github_rate_limits", lambda: pytest.fail("invalid route reached GitHub"))
+    with pytest.raises(ValueError):
+        source.refresh("example", f.env)
+    assert ledger(f) == before and f.db.list_pipeline_snapshots("example") == []
+
+
+def test_route_hint_cannot_replace_authentic_native_election_or_choose_lower_cost(continuation, monkeypatch):
+    f = continuation
+    f.profile["github_budget"]["costs"]["fallback_targeted"] = {"core": 1000, "search": 8, "graphql": 1000}
+    f.env.update(PP_ADMITTED_ROUTE="fallback_targeted", PP_SOURCE_REFRESH_ROUTE="fallback_targeted")
+    result = source.refresh("example", f.env)
+    assert result["admitted_route"] == "skill"
+    assert result["budget"]["reserved_other"]["search"] == 12
+    f.db.release_pipeline_github_budget("github-default", token="existing-skill",
+        task_id=f.task.id, task_started_at=f.task.started_at)
+    monkeypatch.setattr(pi, "_github_rate_limits", lambda: pytest.fail("unelected route reached GitHub"))
+    with pytest.raises(ValueError, match="existing execution reservation"):
+        source.refresh("example", f.env)
+
+
 def test_priority_one_refresh_uses_scan_floor_and_existing_skill_promise_once(continuation):
     f = continuation
     before = ledger(f)
@@ -80,6 +146,7 @@ def test_lower_priority_scan_retains_soft_priority_one_headroom(continuation):
     result = source.refresh("example", f.env)
     assert result["state"] == "wait" and result["source_refreshed"] is False
     assert result["budget"]["minimum_remaining"]["search"] == 14
+    assert result["admitted_route"] == "skill" and result["existing_execution_reservation_reused"] is True
     assert f.checks == f.searches == []
 
 
@@ -152,7 +219,7 @@ def test_unbound_attempt_is_refused_before_any_github_io(continuation, monkeypat
 
 
 @pytest.mark.parametrize("fault", ["session", "cancel", "lease", "epoch", "start",
-                                  "priority", "series", "reservation", "prompt", "working_dir",
+                                  "priority", "series", "reservation", "route", "prompt", "working_dir",
                                   "provider", "rights", "model", "effort", "task_timeout"])
 def test_drift_before_publication_cannot_publish_cache_or_history(continuation, monkeypatch, fault):
     f = continuation
@@ -168,10 +235,13 @@ def test_drift_before_publication_cannot_publish_cache_or_history(continuation, 
                 f.db.set_setting(f.db._pipeline_scan_lease_key("github-default"), "{}")
             elif fault == "epoch":
                 f.db.increment_int_setting(pi._CACHE_EPOCH_KEY)
-            elif fault == "reservation":
+            elif fault in {"reservation", "route"}:
                 key = f.db._pipeline_github_budget_reservation_key("github-default")
                 value = json.loads(ledger(f))
-                value["reservations"][0]["token"] = "new-attempt-admission"
+                if fault == "reservation":
+                    value["reservations"][0]["token"] = "new-attempt-admission"
+                else:
+                    value["reservations"][0]["route"] = "fallback_targeted"
                 f.db.set_setting(key, json.dumps(value))
             else:
                 column, value = {"start": ("started_at", datetime.now(timezone.utc).isoformat()),
@@ -187,7 +257,7 @@ def test_drift_before_publication_cannot_publish_cache_or_history(continuation, 
     assert result["source_refreshed"] is False
     assert f.db.list_pipeline_snapshots("example") == []
     assert f.db.get_setting(pi._cache_key("example", pi._profile_fingerprint(f.profile))) is None
-    if fault != "reservation":
+    if fault not in {"reservation", "route"}:
         assert ledger(f) == before
 
 
