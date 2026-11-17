@@ -98,39 +98,45 @@ def search(repository, query, request, check, budget=None, after_data_request=No
         check()
         predicted = None
         if budget is not None:
-            # The server evaluates the exact query cost without evaluating its
-            # data fields. The ordinary costed scan policy is rechecked before
-            # both the preview and actual request; neither creates admission.
-            budget.before_request(1)
+            budget.before_preview()
             check()
-            preview = request(["graphql"], {"query": document.replace(
-                "rateLimit { cost }", "rateLimit(dryRun: true) { cost }"), "variables": variables})
-            check()
-            if (not isinstance(preview, dict) or preview.get("errors")
-                    or "errors" in preview and not isinstance(preview["errors"], list)
-                    or not isinstance(preview.get("data"), dict)
-                    or not isinstance(preview["data"].get("rateLimit"), dict)):
-                raise ValueError("GraphQL search cost preview failed")
-            predicted = _cost(preview["data"]["rateLimit"].get("cost"))
+            try:
+                preview = request(["graphql"], {"query": document.replace(
+                    "rateLimit { cost }", "rateLimit(dryRun: true) { cost }"), "variables": variables})
+                check()  # a preview pause forbids even the next metadata RPC
+                if (not isinstance(preview, dict) or preview.get("errors")
+                        or "errors" in preview and not isinstance(preview["errors"], list)
+                        or not isinstance(preview.get("data"), dict)
+                        or not isinstance(preview["data"].get("rateLimit"), dict)):
+                    raise ValueError("GraphQL search cost preview failed")
+                predicted = _cost(preview["data"]["rateLimit"].get("cost"))
+                budget.after_preview(predicted)
+            except BaseException:
+                budget.failed_request(); raise
             previews += 1
-            budget.before_request(predicted)
+            budget.before_data(predicted)
             check()
-        payload = request(["graphql"], {"query": document, "variables": variables})
-        # A complete response already in flight may finish as an observation.
-        # The caller still fences its lease/Native attempt after the response;
-        # all subsequent requests, including metadata, check pause beforehand.
-        (after_data_request or check)()
-        if (not isinstance(payload, dict) or payload.get("errors")
-                or "errors" in payload and not isinstance(payload["errors"], list)
-                or not isinstance(payload.get("data"), dict)):
-            raise ValueError("GraphQL search returned errors or partial data")
-        data = payload["data"]
-        rate = data.get("rateLimit")
-        if not isinstance(rate, dict):
-            raise ValueError("GraphQL search cost observation is missing")
-        actual = _cost(rate.get("cost"))
-        if predicted is not None and actual > predicted:
-            raise ValueError("GraphQL search cost changed after preview")
+        try:
+            payload = request(["graphql"], {"query": document, "variables": variables})
+            # Finish a complete in-flight observation, retaining the exact
+            # Native/lease fence. Every further RPC still checks pause first.
+            (after_data_request or check)()
+            if (not isinstance(payload, dict) or payload.get("errors")
+                    or "errors" in payload and not isinstance(payload["errors"], list)
+                    or not isinstance(payload.get("data"), dict)):
+                raise ValueError("GraphQL search returned errors or partial data")
+            data = payload["data"]
+            rate = data.get("rateLimit")
+            if not isinstance(rate, dict):
+                raise ValueError("GraphQL search cost observation is missing")
+            actual = _cost(rate.get("cost"))
+            if budget is not None:
+                budget.after_data(actual)
+            elif predicted is not None and actual > predicted:
+                raise ValueError("GraphQL search cost changed after preview")
+        except BaseException:
+            if budget is not None:budget.failed_request()
+            raise
         cost += actual
         requests += 1
         return data

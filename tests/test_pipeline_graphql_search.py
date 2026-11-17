@@ -34,9 +34,20 @@ def page(nodes, count=None, more=False, cursor=None, cost=1):
         "nodes": nodes, "pageInfo": {"hasNextPage": more, "endCursor": cursor}}}}
 
 
+def observed_rates(limits):
+    lease = getattr(pi._scan_lease_context, "lease", None)
+    if lease is not None:
+        lease.last_graphql_metadata_cost = 1
+    return copy.deepcopy(limits)
+
+
 def stable_rates(monkeypatch):
+    # These transport tests have no external checker RPCs. Protocol-bearing
+    # checker invocations and their cost are exercised separately.
+    for profile in pi._profiles().values():
+        profile.pop("health_check", None)
     limits = _limits()
-    monkeypatch.setattr(pi, "_github_rate_limits", lambda: copy.deepcopy(limits))
+    monkeypatch.setattr(pi, "_github_rate_limits", lambda: observed_rates(limits))
     return limits
 
 
@@ -247,7 +258,7 @@ def test_public_source_loses_no_fences_between_search_or_nested_label_pages(cont
 @pytest.mark.parametrize("resource,remaining", [("core", 1499), ("search", 23), ("graphql", 1199)])
 def test_nested_labels_recheck_every_resource_before_another_query(continuation, monkeypatch, resource, remaining):
     f = continuation; monkeypatch.setattr(pi, "_github_search", REAL_SEARCH); stable_rates(monkeypatch)
-    current = _limits(); monkeypatch.setattr(pi, "_github_rate_limits", lambda: copy.deepcopy(current))
+    current = _limits(); monkeypatch.setattr(pi, "_github_rate_limits", lambda: observed_rates(current))
     item = node(1, labels=("first",)); item["labels"].update(totalCount=2, pageInfo={"hasNextPage": True, "endCursor": "labels"})
     before = ledger(f)
     def lower(_number, _payload):
@@ -269,7 +280,7 @@ def test_server_cost_preview_larger_than_unchanged_estimate_refuses_before_data(
     before = ledger(f)
     calls = gh_transport(monkeypatch, [], preview_cost=101)
     result = source.refresh("example", f.env)
-    assert result["state"] == "refused" and result["reason"] == "invalid_config"
+    assert result["state"] == "wait" and result["budget"]["source_cost_uncertain"] is True
     assert not calls and len(calls.previews) == 1
     assert ledger(f) == before and f.db.list_pipeline_snapshots("example") == []
 
@@ -279,7 +290,7 @@ def test_actual_graphql_transport_with_zero_estimate_refuses_before_preview(cont
     f.profile["github_budget"]["costs"]["insights"]["graphql"] = 0
     before = ledger(f); calls = gh_transport(monkeypatch, [])
     result = source.refresh("example", f.env)
-    assert result["state"] == "refused" and result["reason"] == "invalid_config"
+    assert result["state"] == "wait" and result["source_refreshed"] is False
     assert not calls and not calls.previews and result["source_refreshed"] is False
     assert ledger(f) == before and f.db.list_pipeline_snapshots("example") == []
 
@@ -287,7 +298,7 @@ def test_actual_graphql_transport_with_zero_estimate_refuses_before_preview(cont
 def test_quota_drop_after_preview_is_wait_before_search_data(continuation, monkeypatch):
     f = continuation; monkeypatch.setattr(pi, "_github_search", REAL_SEARCH); stable_rates(monkeypatch)
     snapshots = iter([_limits(), _limits(), _limits(graphql=1199)])
-    monkeypatch.setattr(pi, "_github_rate_limits", lambda: next(snapshots))
+    monkeypatch.setattr(pi, "_github_rate_limits", lambda: observed_rates(next(snapshots)))
     before = ledger(f); calls = gh_transport(monkeypatch, [])
     result = source.refresh("example", f.env)
     assert result["state"] == "wait" and not calls and len(calls.previews) == 1
@@ -297,8 +308,9 @@ def test_quota_drop_after_preview_is_wait_before_search_data(continuation, monke
 def test_actual_cost_above_server_preview_never_publishes(continuation, monkeypatch):
     f = continuation; monkeypatch.setattr(pi, "_github_search", REAL_SEARCH); stable_rates(monkeypatch)
     before = ledger(f); calls = gh_transport(monkeypatch, [page([node(1)], cost=2)], preview_cost=1)
-    with pytest.raises(ValueError, match="cost changed after preview"):
-        source.refresh("example", f.env)
+    result = source.refresh("example", f.env)
+    assert result["state"] == "wait" and result["budget"]["source_cost_uncertain"] is True
+    assert result["budget"]["source_cost_observed_actual"] == 6
     assert len(calls) == len(calls.previews) == 1
     assert ledger(f) == before and f.db.list_pipeline_snapshots("example") == []
 
@@ -362,10 +374,11 @@ def test_malformed_preview_errors_never_start_data_request(continuation, monkeyp
 
 def test_pause_during_cost_preview_stops_before_any_later_metadata_or_data(continuation, monkeypatch):
     f = continuation; monkeypatch.setattr(pi, "_github_search", REAL_SEARCH)
+    stable_rates(monkeypatch)
     limits = _limits(); observations = []
     def rates():
         observations.append(True)
-        return copy.deepcopy(limits)
+        return observed_rates(limits)
     monkeypatch.setattr(pi, "_github_rate_limits", rates)
     before = ledger(f)
     calls = gh_transport(monkeypatch, [], preview_callback=lambda: f.db.set_setting("worker_paused", "1"))

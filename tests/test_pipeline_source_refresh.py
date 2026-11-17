@@ -12,10 +12,11 @@ from promptpilot import pipeline_insights as pi, pipeline_source_refresh as sour
 from promptpilot.models import TaskCreate
 from promptpilot.task_identity import apply_task_markers
 from tests.test_github_budget import _limits
+from tests.source_cost_fixtures import checker_receipt, declare_checker, observed_rates
 
 
 @pytest.fixture
-def continuation(isolated_db, monkeypatch):
+def continuation(isolated_db, monkeypatch, tmp_path):
     profile = {"title": "Example", "repository": "owner/example", "queues": [{
         "id": "fix", "title": "Fix", "capacity": 1, "query": "is:pr",
         "series_contains": "Example - FIX"}], "health_check": {"command": ["checker"]},
@@ -25,13 +26,18 @@ def continuation(isolated_db, monkeypatch):
             "costs": {r: {"core": 1200, "search": 12, "graphql": 1000}
                       for r in pi._GITHUB_BUDGET_ROUTES}}}
     profile["github_budget"]["costs"]["insights"] = {"core": 50, "search": 10, "graphql": 100}
+    declare_checker(profile, tmp_path)
     monkeypatch.setattr(pi, "_profiles", lambda: {"example": profile})
     monkeypatch.setattr(pi, "_cache", {})
-    monkeypatch.setattr(pi, "_github_rate_limits", lambda: _limits())
+    monkeypatch.setattr(pi, "_github_rate_limits", lambda: observed_rates(_limits()))
     checks = []
     searches = []
-    monkeypatch.setattr(pi, "_run_profile_health_check",
-                        lambda _: checks.append(True) or {"state": "green", "findings": []})
+    def checker(value):
+        if not value.get("health_check"):
+            return None
+        checks.append(True)
+        return checker_receipt({"state": "green", "findings": []})
+    monkeypatch.setattr(pi, "_run_profile_health_check", checker)
     def search(*_args):
         pi._ensure_github_scan_lease()
         searches.append(True)
