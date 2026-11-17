@@ -1674,9 +1674,14 @@ def test_low_budget_defers_skill_and_tool_routes_without_preflight(
     assert route["defer_until"] == datetime.fromtimestamp(
         reset + 17, timezone.utc).isoformat()
     assert "defer_for" not in route
+    assert route["github_budget"]["state"] == "low"
     cached = pipeline_insights.read_cached("example", [])
-    assert cached["cache"]["refresh_blocked"] == "low"
-    assert cached["cache"]["refresh_deferred_until"] == route["defer_until"]
+    assert cached["cache"].get("refresh_blocked") is None
+    assert cached["github_budget"]["allowed"] is False
+    # This fixture replaces the HTTP reader without persisting its rate
+    # observation. A separate dashboard must not invent those missing limits.
+    assert cached["github_budget"]["state"] == "rate_limit_unavailable"
+    assert isolated_db.get_pipeline_refresh_status("example") is None
 
 
 def test_low_budget_defer_survives_refresh_status_database_error(
@@ -1704,7 +1709,7 @@ def test_low_budget_defer_survives_refresh_status_database_error(
         reset + 17, timezone.utc).isoformat()
 
 
-def test_transient_lease_failure_after_admission_keeps_durable_denial(
+def test_transient_task_lease_failure_does_not_publish_queue_denial(
         isolated_db, monkeypatch):
     execution = {"mode": "tool", "command": ["pipeline-tool"]}
     profile = _profile(execution=execution)
@@ -1726,9 +1731,9 @@ def test_transient_lease_failure_after_admission_keeps_durable_denial(
     assert route["action"] == "defer"
     assert route["github_budget"]["state"] == "lease_unavailable"
     event = isolated_db.get_pipeline_refresh_status("example")
-    assert event["status"]["refresh_blocked"] == "lease_unavailable"
+    assert event is None
     assert pipeline_insights.read_cached(
-        "example", [])["cache"]["refresh_blocked"] == "lease_unavailable"
+        "example", [])["cache"].get("refresh_blocked") is None
 
 
 @pytest.mark.parametrize(("failure", "expected_state"), [
@@ -1768,7 +1773,7 @@ def test_post_preflight_rate_recheck_preserves_exact_lease_failure(
     assert route["action"] == "defer"
     assert route["github_budget"]["state"] == expected_state
     event = isolated_db.get_pipeline_refresh_status("example")
-    assert event["status"]["refresh_blocked"] == expected_state
+    assert event is None
 
 
 def test_post_preflight_budget_denial_keeps_sanitized_context(
