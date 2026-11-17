@@ -181,7 +181,7 @@ def test_scan_defer_result_retries_at_the_explicit_deadline(
 
 def test_other_profile_wakeup_does_not_retry_a_failed_scan_early(
         isolated_db, monkeypatch, clock):
-    _, _, calls = install(monkeypatch, {"failed": profile(), "healthy": profile()},
+    _, _, calls = install(monkeypatch, {"failed": profile(), "healthy": profile(225)},
                           clock, duration=0)
     original = pi.analyze
 
@@ -194,11 +194,11 @@ def test_other_profile_wakeup_does_not_retry_a_failed_scan_early(
     monkeypatch.setattr(pi, "analyze", scan)
     clock[0] += 180
     state = {}
-    assert sampling.sample_scheduled_profiles([], 300, state) == 150
-    clock[0] += 150
-    assert sampling.sample_scheduled_profiles([], 300, state) == 150
+    assert sampling.sample_scheduled_profiles([], 300, state) == 75
+    clock[0] += 75  # The failed Source is still fresh, but past its early due time.
+    assert sampling.sample_scheduled_profiles([], 300, state) == 75
     assert [key for key, _ in calls].count("failed") == 1
-    clock[0] += 150
+    clock[0] += 225
     sampling.sample_scheduled_profiles([], 300, state)
     failed = [stamp for key, stamp in calls if key == "failed"]
     assert len(failed) == 2 and failed[1] - failed[0] == 300
