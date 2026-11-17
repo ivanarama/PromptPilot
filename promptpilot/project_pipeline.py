@@ -1383,6 +1383,7 @@ def capabilities(config: dict) -> dict:
             "parallel_fix_election": "disabled-by-default" if not config.get(
                 "parallel_fix_enabled") else "signed-target-v1",
             "merge_admission_progress": "promptpilot-merge-admission-progress-v1",
+            "native_source_refresh": "existing-admitted-task-insights-v1",
             # Opt-in, not yet enabled in production (issue #42).
             "base_sync_merge": "experimental" if config.get("base_sync_merge") else "off",
             "base_sync_carry": "experimental" if config.get("base_sync_carry") else "off",
@@ -2835,6 +2836,8 @@ def run(argv=None) -> int:
     parser.add_argument("--config", default="pipelinectl.json")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("capabilities")
+    source_refresh_parser = sub.add_parser("source-refresh")
+    source_refresh_parser.add_argument("--profile", required=True)
     routing_parser = sub.add_parser("validate-routing-report")
     routing_parser.add_argument("--report", required=True)
     routing_parser.add_argument("--head", required=True)
@@ -2871,6 +2874,10 @@ def run(argv=None) -> int:
     complete_lease.add_argument("--lease-file")
     complete_parser.add_argument("--report")
     args = parser.parse_args(argv)
+    if args.command == "source-refresh":
+        from .pipeline_source_refresh import run as source_refresh_run
+
+        return source_refresh_run(["--profile", args.profile])
     try:
         if getattr(args, "lease_file", None):
             path = Path(args.lease_file)

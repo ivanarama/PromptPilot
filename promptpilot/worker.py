@@ -21,6 +21,7 @@ from .config import (BASE_DELAY, CONCURRENCY, DEFAULT_CLI, MAX_DELAY, MIN_FREE_M
                      VERDICT_REPAIR_TIMEOUT, VERDICT_REQUIRED, RightsUnsupported,
                      build_cmd, get_provider_env, load_providers, rights_args)
 from .process_tree import OwnedProcess, ProcessTreeError
+from .task_identity import apply_task_markers
 
 # Our quota is spent — the wait is measured in hours and nothing else will get
 # through either.
@@ -1907,7 +1908,7 @@ def _execute_task_body(task, admission_complete=None, workorder_check=None):
     env.pop("PP_TASK_STARTED_AT", None)
     env.pop("PP_PROVIDER_OWNERSHIP_KIND", None)
     env.pop("PP_PIPELINE_TARGET_TOKEN", None)
-    env["PP_TASK_ID"] = str(task.id)
+    apply_task_markers(env, task)
     if pipeline_replicas is not None:
         env["PP_PIPELINE_REPLICAS"] = pipeline_replicas
         env["PP_TASK_STARTED_AT"] = pipeline_task_started_at
@@ -1925,7 +1926,7 @@ def _execute_task_body(task, admission_complete=None, workorder_check=None):
         # The marker rides the local ssh process too, so a live remote run is
         # found by live_task_ids() and recover_running() won't relaunch it into
         # a second concurrent run in the same remote directory.
-        env["PP_TASK_ID"] = str(task.id)
+        apply_task_markers(env, task)
     else:
         # On Windows, .cmd/.bat wrappers (e.g. npm-installed CLIs like qwen) are
         # invisible to subprocess without shell=True.  shutil.which() resolves the

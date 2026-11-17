@@ -3933,10 +3933,15 @@ def set_setting_if_newer_revision(
         lease_guard: Optional[dict] = None,
         publication_revision_key: Optional[str] = None,
         companion_key: Optional[str] = None,
-        companion_value: Optional[str] = None) -> bool:
+        companion_value: Optional[str] = None,
+        pipeline_snapshot: Optional[dict] = None) -> bool:
     """Atomically publish a newer revision while a durable guard matches."""
     if (companion_key is None) != (companion_value is None):
         raise ValueError("companion_key and companion_value must be set together")
+    if pipeline_snapshot is not None:
+        continuation = (lease_guard or {}).get("continuation") or {}
+        if not continuation or pipeline_snapshot.get("profile_id") != continuation.get("profile_id"):
+            raise ValueError("atomic source snapshot requires its Native continuation fence")
     with _connect(immediate=True) as conn:
         if (lease_guard is not None
                 and not _pipeline_scan_lease_guard_matches(conn, lease_guard)):
@@ -3984,6 +3989,14 @@ def set_setting_if_newer_revision(
             conn.execute(
                 "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
                 (publication_revision_key, str(int(revision))),
+            )
+        if pipeline_snapshot is not None:
+            conn.execute(
+                "INSERT INTO pipeline_snapshots(profile_id,repository,captured_at,payload_json) "
+                "VALUES(?,?,?,?)",
+                (pipeline_snapshot["profile_id"], pipeline_snapshot["repository"],
+                 pipeline_snapshot["captured_at"], json.dumps(pipeline_snapshot["payload"],
+                     ensure_ascii=False, separators=(",", ":"))),
             )
     return True
 
@@ -4166,6 +4179,87 @@ def _active_pipeline_budget_reservations(conn, values: list[dict]) -> tuple[list
                 and row["started_at"] == item["task_started_at"]):
             active.append(item)
     return active, len(active) != len(values)
+
+
+def _pipeline_source_refresh_state(conn, scope, task_id, profile_id, queue_id, route_costs,
+                                   starvation_timeout_seconds=0):
+    """Read an admitted running attempt without pruning any foreign ledger."""
+    from .config import TASK_TIMEOUT
+    from .task_identity import task_execution_fingerprint
+
+    if type(task_id) is not int or task_id <= 0:
+        raise ValueError("source refresh requires a worker task identity")
+    row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+    session = row["session_id"] or row["herdr_pane"] if row is not None else None
+    if (row is None or row["status"] != "running" or not row["series_id"]
+            or not isinstance(session, str) or not session
+            or row["machine"] or row["detached"]):
+        raise ValueError("source refresh requires a live local Native session")
+    series = conn.execute("SELECT paused,ended_at FROM task_series WHERE id=?",
+                          (row["series_id"],)).fetchone()
+    controls = {r["key"]: r["value"] for r in conn.execute(
+        "SELECT key,value FROM settings WHERE key IN ('worker_paused',?)",
+        (f"cancel_task:{task_id}",))}
+    if (series is None or series["paused"] or series["ended_at"]
+            or controls.get("worker_paused", "0") != "0"
+            or controls.get(f"cancel_task:{task_id}") == "1"):
+        raise ValueError("source refresh attempt is paused, cancelled or ended")
+    started = datetime.fromisoformat(row["started_at"])
+    now = time.time()
+    timeout = row["task_timeout"] if row["task_timeout"] is not None else TASK_TIMEOUT
+    if (started.tzinfo is None or started.timestamp() > now
+            or timeout and now >= started.timestamp() + timeout):
+        raise ValueError("source refresh attempt lifetime is invalid")
+    costs = {route: _pipeline_budget_vector(route_costs[route], f"continuation {route} cost")
+             for route in ("skill", "fallback_targeted")}
+    key = _pipeline_github_budget_reservation_key(scope)
+    values = _load_pipeline_budget_reservations(
+        conn, key)
+    # One task attempt cannot borrow admission from a second account scope.
+    for other in conn.execute("SELECT key FROM settings WHERE substr(key,1,?)=? AND key<>?",
+            (len(_PIPELINE_GITHUB_BUDGET_RESERVATION_PREFIX),
+             _PIPELINE_GITHUB_BUDGET_RESERVATION_PREFIX, key)):
+        if any(v["task_id"] == task_id for v in _load_pipeline_budget_reservations(conn, other["key"])):
+            raise ValueError("source refresh attempt owns ambiguous admission scopes")
+    own = [r for r in values if r["task_id"] == task_id]
+    if (len(own) != 1 or own[0]["task_started_at"] != row["started_at"]
+            or own[0]["profile_id"] != profile_id or own[0]["queue_id"] != queue_id
+            or own[0]["route"] not in costs
+            or own[0]["cost"] != costs[own[0]["route"]]):
+        raise ValueError("source refresh requires its exact existing execution reservation")
+    active, _changed = _active_pipeline_budget_reservations(conn, values)
+    guard = {"scope": scope, "task_id": task_id, "started_at": row["started_at"],
+             "session_id": row["session_id"], "herdr_pane": row["herdr_pane"],
+             "series_id": row["series_id"],
+             "priority": row["priority"], "profile_id": profile_id, "queue_id": queue_id,
+             "execution_sha256": task_execution_fingerprint(row),
+             "route": own[0]["route"], "cost": dict(own[0]["cost"]),
+             "route_costs": costs, "token": own[0]["token"]}
+    waiting = _pipeline_github_budget_waiter_summary(conn, scope,
+        starvation_timeout_seconds=starvation_timeout_seconds, now=now)
+    return {"guard": guard, "totals": {r: sum(v["cost"][r] for v in active)
+                                        for r in _PIPELINE_GITHUB_BUDGET_RESOURCES},
+            "count": len(active), "items": active,
+            "revision": _pipeline_github_budget_revision(conn, scope),
+            "woken_waiters": {"count": 0, "min_priority": None}, "waiting_waiters": waiting}
+
+
+def pipeline_source_refresh_state(scope, task_id, profile_id, queue_id, route_costs,
+                                  *, starvation_timeout_seconds=0):
+    """Observe existing Native admission; never reserve, release or clean it."""
+    with _connect() as conn:
+        conn.execute("BEGIN")
+        return _pipeline_source_refresh_state(conn, scope, task_id, profile_id, queue_id, route_costs,
+                                              starvation_timeout_seconds)
+
+
+def _pipeline_source_refresh_guard_matches(conn, guard):
+    try:
+        observed = _pipeline_source_refresh_state(conn, guard["scope"], guard["task_id"],
+            guard["profile_id"], guard["queue_id"], guard["route_costs"])
+        return observed["guard"] == guard
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return False
 
 
 def _write_pipeline_budget_reservations(conn, key: str, values: list[dict]) -> None:
@@ -4865,7 +4959,7 @@ def _pipeline_scan_lease_guard_matches(conn, guard: dict) -> bool:
         expires_at = float(payload["expires_at"])
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
         return False
-    return (
+    owned = (
         isinstance(payload, dict)
         and payload.get("version") == 1
         and _valid_pipeline_scan_token(payload.get("token"))
@@ -4873,6 +4967,9 @@ def _pipeline_scan_lease_guard_matches(conn, guard: dict) -> bool:
         and math.isfinite(expires_at)
         and expires_at > time.time()
     )
+    if owned and guard.get("continuation") is not None:
+        return _pipeline_source_refresh_guard_matches(conn, guard["continuation"])
+    return owned
 
 
 def acquire_pipeline_scan_lease(

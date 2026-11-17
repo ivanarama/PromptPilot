@@ -123,7 +123,11 @@ class _GitHubScanLease:
 
     @property
     def guard(self) -> dict:
-        return {"scope": self.scope, "token": self.token}
+        result = {"scope": self.scope, "token": self.token}
+        continuation = getattr(self, "continuation", None)
+        if continuation is not None:
+            result["continuation"] = continuation.guard
+        return result
 
     def _mark_lost(self) -> None:
         with self._state_lock:
@@ -801,6 +805,9 @@ def _evaluate_github_budget(policy: dict, limits: dict | None, *,
 
 def _budget_reservation_ledger(policy: dict, *, now: float | None = None) -> dict:
     """Read the shared ledger, adding fairness options only when enabled."""
+    continuation = getattr(_scan_lease_context, "continuation", None)
+    if continuation is not None:
+        return continuation.ledger(policy)
     timeout = int(policy.get("starvation_timeout_seconds") or 0)
     if not timeout:
         return db.pipeline_github_budget_reservations(policy["lease_scope"])
@@ -872,6 +879,8 @@ def _priority_waiter_decision(
 
 def _arm_budget_waiter(task, decision: dict, *, starvation_timeout_seconds: int = 0) -> dict:
     """Persist a budget handoff before the serial admission lease is released."""
+    if getattr(_scan_lease_context, "continuation", None) is not None:
+        return decision  # This attempt already owns admission; no scheduler edits.
     state = decision.get("state")
     if state not in {
             "budget_in_flight", "ledger_changed", "priority_waiter",
@@ -1004,6 +1013,7 @@ def _github_scan_admission(profile: dict, purpose: str,
         policy["lease_scope"], token, policy["lease_seconds"],
         status_revision=(status_revision
                          if isinstance(status_revision, int) else None))
+    lease.continuation = getattr(_scan_lease_context, "continuation", None)
     lease.expires_at = acquired.get("expires_at")
     previous = getattr(_scan_lease_context, "lease", None)
     _scan_lease_context.lease = lease
@@ -1092,6 +1102,9 @@ def _ensure_github_scan_lease(*, renew: bool = False) -> None:
     lease = getattr(_scan_lease_context, "lease", None)
     if lease is not None:
         lease.ensure_owned(renew=renew)
+    continuation = getattr(_scan_lease_context, "continuation", None)
+    if continuation is not None:
+        continuation.check()
 
 
 def _current_github_scan_status_revision() -> int | None:
@@ -1186,6 +1199,8 @@ def _reservation_denied(policy: dict, limits: dict | None, result: dict, *,
 
 def _clear_budget_waiter_after_admission(task) -> None:
     """Settle a durable handoff when no in-flight reservation will do it."""
+    if getattr(_scan_lease_context, "continuation", None) is not None:
+        return
     task_id = getattr(task, "id", None)
     started_at = getattr(task, "started_at", None)
     # Synthetic/read-only callers cannot own a durable marker. Real worker
@@ -1546,7 +1561,7 @@ def _profile_lock(profile_id: str) -> threading.Lock:
 
 
 def _publish_cache(profile_id: str, profile: dict, generation: int, epoch: int,
-                   revision: int, result: dict) -> bool:
+                   revision: int, result: dict, *, pipeline_snapshot=None) -> bool:
     """Atomically publish a complete last-good response if still current."""
     with _cache_state_lock:
         if generation != _cache_generation:
@@ -1574,7 +1589,8 @@ def _publish_cache(profile_id: str, profile: dict, generation: int, epoch: int,
                 publication_revision_key=(
                     _published_profile_revision_key(profile_id)),
                 companion_key=_published_profile_key(profile_id),
-                companion_value=profile_hash):
+                companion_value=profile_hash,
+                **({"pipeline_snapshot": pipeline_snapshot} if pipeline_snapshot is not None else {})):
             if lease is not None:
                 # The CAS can also lose to an ordinary cache invalidation or a
                 # newer refresh. Distinguish that benign race from a rejected
@@ -1583,6 +1599,10 @@ def _publish_cache(profile_id: str, profile: dict, generation: int, epoch: int,
             return False
         _cache[profile_id] = (
             generated_at, result, epoch, profile_hash, revision)
+        continuation = getattr(_scan_lease_context, "continuation", None)
+        if continuation is not None:
+            continuation.published = {"profile_hash": profile_hash, "epoch": epoch,
+                                      "revision": revision, "generated_at": generated_at}
         return True
 
 
@@ -5295,17 +5315,22 @@ def _analyze_without_budget(profile_id: str, series: list[dict], *,
             "generated_at": now.timestamp(),
         }
         _ensure_github_scan_lease()
+        continuation = getattr(_scan_lease_context, "continuation", None)
+        atomic_snapshot = ({"profile_id": profile_id, "repository": profile["repository"],
+                            "captured_at": now.isoformat(), "payload": snapshot}
+                           if continuation is not None else None)
         published = _publish_cache(
             profile_id, profile, cache_generation, cache_epoch,
-            refresh_revision, result)
+            refresh_revision, result,
+            **({"pipeline_snapshot": atomic_snapshot} if atomic_snapshot is not None else {}))
         if not published:
             return read_cached(profile_id, series)
         # Raw trend history records only observations that won the same CAS as
         # the full cache. A rejected/stale writer must not poison later charts.
         lease = getattr(_scan_lease_context, "lease", None)
-        saved_snapshot = db.add_pipeline_snapshot(
+        saved_snapshot = True if continuation is not None else db.add_pipeline_snapshot(
             profile_id, profile["repository"], snapshot, now,
-            lease_guard=({"scope": lease.scope, "token": lease.token}
+            lease_guard=(lease.guard
                          if lease is not None else None),
         )
         if lease is not None and saved_snapshot is None:
