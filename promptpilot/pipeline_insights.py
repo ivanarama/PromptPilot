@@ -2362,13 +2362,42 @@ def _intake_snapshot_defer(config: dict, data: dict, profile_id: str,
 
 def _required_snapshot_defer(profile_id: str, queue_id: str, state: str) -> dict:
     # This is an observation prerequisite, never an empty-queue verdict or a
-    # replacement for execution/mutation admission. The ordinary sampler owns
-    # refreshes; starting agents must not each spend another scan's quota.
+    # replacement for execution/mutation admission. Refreshes use the same
+    # shared scan lease/budget as the sampler, before any provider is loaded.
     return {"action": "defer",
             "defer_until": (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat(),
             "reason": "Required pipeline snapshot unavailable: " + state,
             "profile_id": profile_id, "queue_id": queue_id,
             "snapshot_admission": {"state": state}}
+
+
+def _required_snapshot_state(data, profile: dict, queue_id: str | None) -> str | None:
+    cache = data.get("cache") if isinstance(data, dict) else None
+    if not isinstance(cache, dict):
+        return "missing cache metadata"
+    if cache.get("refresh_blocked"):
+        return "refresh_blocked=" + str(cache["refresh_blocked"])
+    if cache.get("invalidated"):
+        return "invalidated"
+    if cache.get("stale") is not False:
+        return "stale"
+    if cache.get("available") is not True or cache.get("complete") is not True:
+        return "incomplete"
+    if cache.get("profile_hash") != _profile_fingerprint(profile):
+        return "profile changed"
+    # This queue's Source prerequisite must not turn an unrelated partial TAIL
+    # into a new global dependency. Project-owned global gates still apply.
+    queues = data.get("queues")
+    members = [q for q in queues if isinstance(q, dict) and q.get("id") == queue_id] if isinstance(queues, list) else []
+    if not queue_id or len(members) != 1 or members[0].get("membership_complete") is not True:
+        return "incomplete queue membership"
+    if profile.get("health_check"):
+        diagnostics = data.get("diagnostics")
+        if not isinstance(diagnostics, dict):
+            return "checker unavailable"
+        if diagnostics.get("checker_failed") or diagnostics.get("errors"):
+            return "checker failed"
+    return None
 
 
 def dispatch_gate(task) -> dict | None:
@@ -2391,6 +2420,7 @@ def dispatch_gate(task) -> dict | None:
                 return _required_snapshot_defer(
                     profile_id, queue_config["id"],
                     "dispatch_gate.require_fresh_snapshot must be a boolean")
+            profile_hash = _profile_fingerprint(profile) if require_snapshot else None
             # Dispatch only decides whether starting an agent is useful; every
             # mutation is still protected by the project's own fresh gate.
             # Reuse the five-minute snapshot so several due stages cannot each
@@ -2402,33 +2432,34 @@ def dispatch_gate(task) -> dict | None:
                     return _required_snapshot_defer(
                         profile_id, queue_config["id"], "cached read failed")
                 raise
-            if require_snapshot:
-                observed = data.get("cache") if isinstance(data, dict) else None
-                cache = observed if isinstance(observed, dict) else {}
-                if (cache.get("available") is not True
-                        or cache.get("complete") is not True
-                        or cache.get("stale") is not False
-                        or cache.get("invalidated")
-                        or cache.get("refresh_blocked")):
-                    state = ("refresh_blocked=" + str(cache["refresh_blocked"])
-                             if cache.get("refresh_blocked") else
-                             "invalidated" if cache.get("invalidated") else
-                             "stale" if cache.get("stale") else "incomplete")
-                    return _required_snapshot_defer(
-                        profile_id, queue_config["id"], state)
-            cache = data.get("cache") or {}
-            if (isinstance(config.get("backpressure"), dict)
-                    and (cache.get("stale") or not cache.get("complete"))):
+            cache = data.get("cache") or {} if isinstance(data, dict) else {}
+            if ((require_snapshot and _required_snapshot_state(data, profile, queue_config["id"]) is not None)
+                    or (isinstance(config.get("backpressure"), dict)
+                        and (cache.get("stale") or not cache.get("complete")))):
                 # Intake cannot rely on stale state indefinitely. Refresh via
                 # the existing shared scan lease/budget and cache, never via an
                 # agent or an unbudgeted direct GitHub request.
                 try:
                     data = analyze(profile_id, db.list_series(), use_cache=False,
-                                   refresh_diagnostics=True)
+                                   refresh_diagnostics=True,
+                                   **({"reuse_fresh": True, "snapshot_queue_id": queue_config["id"]}
+                                      if require_snapshot else {}))
                 except Exception:
+                    if require_snapshot:
+                        return _required_snapshot_defer(profile_id, queue_config["id"], "refresh failed")
                     return _intake_snapshot_defer(config, data, profile_id,
                                                    queue_config["id"], refresh_failed=True)
-                cache = data.get("cache") or {}
+                cache = data.get("cache") or {} if isinstance(data, dict) else {}
+            if require_snapshot:
+                try:
+                    current = _profiles().get(profile_id)
+                    state = ("worker paused" if db.is_paused() else "profile changed"
+                             if not isinstance(current, dict) or _profile_fingerprint(current) != profile_hash
+                             else _required_snapshot_state(data, current, queue_config["id"]))
+                except Exception:
+                    state = "snapshot revalidation failed"
+                if state is not None:
+                    return _required_snapshot_defer(profile_id, queue_config["id"], state)
             # A stale/partial empty snapshot must never complete a live stage as
             # empty, and stale diagnostics must not defer it. The project-owned
             # preflight remains the authoritative fallback.
@@ -5099,7 +5130,9 @@ def _budget_blocked_cached(profile_id: str, profile: dict, series: list[dict],
 
 def _analyze_without_budget(profile_id: str, series: list[dict], *,
                             use_cache: bool = True,
-                            refresh_diagnostics: bool = False) -> dict:
+                            refresh_diagnostics: bool = False,
+                            reuse_fresh: bool = False,
+                            snapshot_queue_id: str | None = None) -> dict:
     profiles = _profiles()
     if profile_id not in profiles:
         raise KeyError(profile_id)
@@ -5118,6 +5151,12 @@ def _analyze_without_budget(profile_id: str, series: list[dict], *,
         if profile_id not in profiles:
             raise KeyError(profile_id)
         profile = profiles[profile_id]
+        if reuse_fresh:
+            # A due task may have observed the old cache before another scan
+            # won this lock. Reuse its complete publication, not another scan.
+            fresh = read_cached(profile_id, series)
+            if _required_snapshot_state(fresh, profile, snapshot_queue_id) is None:
+                return fresh
         cached, _source, cache_epoch = _cached_entry(profile_id, profile)
         _unused, cache_generation = _cache_snapshot(profile_id)
         refresh_revision = db.increment_int_setting(
@@ -5371,7 +5410,8 @@ def _analyze_without_budget(profile_id: str, series: list[dict], *,
 
 
 def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True,
-            refresh_diagnostics: bool = False) -> dict:
+            refresh_diagnostics: bool = False, reuse_fresh: bool = False,
+            snapshot_queue_id: str | None = None) -> dict:
     """Read cached insights or run one budgeted, cross-process live scan."""
     if use_cache:
         return read_cached(profile_id, series)
@@ -5390,7 +5430,8 @@ def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True,
         try:
             result = _analyze_without_budget(
                 profile_id, series, use_cache=False,
-                refresh_diagnostics=refresh_diagnostics)
+                refresh_diagnostics=refresh_diagnostics,
+                **({"reuse_fresh": True, "snapshot_queue_id": snapshot_queue_id} if reuse_fresh else {}))
             _ensure_github_scan_lease(renew=True)
         except _GitHubScanLeaseFailure as exc:
             return _budget_blocked_cached(
