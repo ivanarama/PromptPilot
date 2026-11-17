@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import List, Optional
 from urllib.parse import urlsplit
 
-from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Path as PathParam, Query, UploadFile
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.concurrency import run_in_threadpool
@@ -28,7 +28,7 @@ import re as _re
 
 from . import db, epf_tools, flows, workflows
 from . import pipeline_insights, task_sources, external_inbox
-from . import task_feed
+from . import task_feed, task_feed_visibility
 from . import task_source_settings
 from .config import ALLOWED_HOSTS, ALLOWED_ORIGINS, API_TOKEN, DB_DIR, DEFAULT_CLI, EFFORT_LEVELS, PIPELINE_SNAPSHOT_INTERVAL, get_provider_models, get_skills, load_providers, mask_secret_value, provider_available, RIGHTS_LEVELS, rights_supported, save_catalog_provider, PROJECTS_ROOT
 from .provider_catalog import CATALOG, catalog_entry, slugify, build_provider_entry
@@ -442,6 +442,7 @@ def api_task_feed(
     kind: Optional[task_feed.FeedKind] = None,
     q: Optional[str] = Query(default=None, max_length=200),
     local_only: bool = False,
+    include_hidden: bool = False,
     source_id: Optional[str] = Query(default=None, min_length=1, max_length=64,
                                      pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]*$"),
 ):
@@ -458,6 +459,11 @@ def api_task_feed(
         items.extend(remote["items"])
         sources.extend(remote["sources"])
         errors = remote["errors"]
+        # Preferences belong to this dashboard. Peer exports retain every item.
+        try:
+            items = task_feed_visibility.apply(items, include_hidden=include_hidden)
+        except task_feed.FeedUnavailable as exc:
+            raise HTTPException(503, str(exc)) from exc
     if source_id:
         if source_id not in {source["id"] for source in sources}:
             raise HTTPException(404, "Источник не зарегистрирован")
@@ -470,6 +476,23 @@ def api_task_feed(
     counts = {state: sum(item["status"] == state for item in counted)
               for state in task_feed.STATUSES}
     return {**selected, "sources": sources, "errors": errors, "counts": counts}
+
+
+class FeedVisibilityRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    hidden: bool
+
+
+@app.put("/api/task-feed/{source_id}/{kind}/{object_id}/visibility")
+def api_task_feed_visibility(
+    request: FeedVisibilityRequest,
+    source_id: str = PathParam(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$"),
+    kind: task_feed.FeedKind = PathParam(),
+    object_id: str = PathParam(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$"),
+):
+    # Only a local preference write; never forwards a mutation to a source.
+    task_feed_visibility.set_hidden(source_id, kind, object_id, request.hidden)
+    return {"ok": True, "hidden": request.hidden}
 
 
 @app.get("/api/task-feed/local/{kind}/{object_id}")
