@@ -847,6 +847,7 @@
   </div>
 
   <div class="feed-toolbar">
+    <label style="display:flex;align-items:center;gap:8px"><input type="checkbox" id="feedIncludeHidden" onchange="feedChangeHidden(this.checked)">Показать скрытые</label>
     <label class="feed-search"><span class="visually-hidden">Поиск задач</span><input type="search" id="feedSearch" placeholder="Найти задачу" maxlength="200" oninput="feedChangeSearch(this.value)"></label>
     <label><span class="visually-hidden">Компьютер или источник</span><select id="feedSource" onchange="feedChangeSource(this.value)"><option value="">Все компьютеры и источники</option></select></label>
   </div>

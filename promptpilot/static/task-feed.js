@@ -3,6 +3,8 @@ let feedItems = [];
 let feedExpanded = null;
 let feedDetails = new Map();
 let feedSource = '';
+let feedIncludeHidden = false;
+let feedVisibilityEpoch = 0;
 let feedSearch = '';
 let feedLimit = 100;
 let feedOffset = 0;
@@ -113,7 +115,7 @@ function feedRenderDetail(item) {
     <div class="feed-facts"><div class="feed-fact"><span>Источник</span><b>${feedEsc(item.source_label)}</b></div>${executor.machine ? `<div class="feed-fact"><span>Компьютер</span><b>${feedEsc(executor.machine)}</b></div>` : ''}${executor.provider ? `<div class="feed-fact"><span>Исполнитель</span><b>${feedEsc(executor.provider)}${executor.model ? ' · ' + feedEsc(executor.model) : ''}</b></div>` : ''}${connection}</div>
     ${result.available ? `<p class="feed-result-note">Результат запуска получен${Number.isFinite(result.characters) ? ' · ' + Number(result.characters).toLocaleString('ru-RU') + ' символов' : ''}. ${item.kind === 'workflow' && item.status !== 'completed' ? 'Приёмка процесса ещё не завершена.' : ''}</p>` : ''}
     ${files}${reportHtml}${feedRenderHistory(detail)}${advanced}
-    <div class="feed-detail-footer"><span>Обновлено: ${feedEsc(feedTime(value.updated_at || value.created_at))}</span>${manage}${sourceLink}${item.readonly ? '<span>Просмотр подключённого источника</span>' : ''}</div>
+    <div class="feed-detail-footer"><span>Обновлено: ${feedEsc(feedTime(value.updated_at || value.created_at))}</span><button type="button" class="btn btn-sm btn-ghost" data-feed-key="${feedAttr(item.id)}" onclick="feedSetHidden(this)">${item.hidden ? 'Вернуть на дашборд' : 'Скрыть с дашборда'}</button>${manage}${sourceLink}${item.readonly ? '<span>Просмотр подключённого источника</span>' : ''}</div>
   </div>`;
 }
 
@@ -144,7 +146,7 @@ function feedRender(items, total) {
   } else {
     list.innerHTML = items.map(item => `<article class="task-row feed-row${feedExpanded === item.id ? ' expanded' : ''}" data-feed-key="${feedAttr(item.id)}">
       <button type="button" class="task-header feed-toggle" data-feed-key="${feedAttr(item.id)}" onclick="toggleFeedItem(this.dataset.feedKey)" aria-expanded="${feedExpanded === item.id}">
-        <span class="feed-state" data-status="${feedAttr(item.status)}">${feedEsc(FEED_LABELS[item.status] || item.status_label || 'Нет данных')}</span><span class="task-prompt">${feedEsc(item.title)}</span><span class="feed-source">${feedEsc(item.source_label)}</span><span class="feed-chevron" aria-hidden="true">${feedExpanded === item.id ? '⌃' : '⌄'}</span>
+        <span class="feed-state" data-status="${feedAttr(item.status)}">${feedEsc(FEED_LABELS[item.status] || item.status_label || 'Нет данных')}</span><span class="task-prompt">${item.hidden ? 'Скрыта · ' : ''}${feedEsc(item.title)}</span><span class="feed-source">${feedEsc(item.source_label)}</span><span class="feed-chevron" aria-hidden="true">${feedExpanded === item.id ? '⌃' : '⌄'}</span>
       </button>${feedExpanded === item.id ? feedRenderDetail(item) : ''}</article>`).join('');
   }
   const more = document.getElementById('feedMore');
@@ -168,14 +170,15 @@ async function feedFetchDetail(item) {
 async function loadUnifiedTaskFeed() {
   if (feedLoading) { feedReload = true; return; }
   feedLoading = true;
-  const selected = [currentFilter, feedSource, feedSearch, feedLimit, feedOffset].join('|');
+  const selected = [currentFilter, feedSource, feedSearch, feedLimit, feedOffset, feedIncludeHidden, feedVisibilityEpoch].join('|');
   const params = new URLSearchParams({limit:String(feedLimit), offset:String(feedOffset)});
   if (currentFilter) params.set('status', currentFilter);
   if (feedSource) params.set('source_id', feedSource);
   if (feedSearch.trim()) params.set('q', feedSearch.trim());
+  if (feedIncludeHidden) params.set('include_hidden', 'true');
   try {
     const result = await fetchJSON(`${API}/task-feed?${params}`);
-    if (selected !== [currentFilter, feedSource, feedSearch, feedLimit, feedOffset].join('|')) { feedReload = true; return; }
+    if (selected !== [currentFilter, feedSource, feedSearch, feedLimit, feedOffset, feedIncludeHidden, feedVisibilityEpoch].join('|')) { feedReload = true; return; }
     if (result.total > 0 && feedOffset >= result.total) {
       feedOffset = Math.floor((result.total - 1) / feedLimit) * feedLimit;
       feedReload = true; return;
@@ -186,7 +189,7 @@ async function loadUnifiedTaskFeed() {
       try { await feedFetchDetail(active); }
       catch (_) { feedDetails.set(active.id, {error:'Карточка временно недоступна. Последнее состояние списка сохранено.'}); }
     }
-    if (selected !== [currentFilter, feedSource, feedSearch, feedLimit, feedOffset].join('|')) { feedReload = true; return; }
+    if (selected !== [currentFilter, feedSource, feedSearch, feedLimit, feedOffset, feedIncludeHidden, feedVisibilityEpoch].join('|')) { feedReload = true; return; }
     feedItems = incoming;
     feedTotal = Number(result.total || 0);
     feedRenderSources(Array.isArray(result.sources) ? result.sources : [], Array.isArray(result.errors) ? result.errors : []);
@@ -194,7 +197,7 @@ async function loadUnifiedTaskFeed() {
     if (!incoming.some(item => item.id === feedExpanded)) { feedExpanded = null; expandedId = null; }
     feedRender(feedItems, feedTotal);
   } catch (_) {
-    if (selected !== [currentFilter, feedSource, feedSearch, feedLimit, feedOffset].join('|')) { feedReload = true; return; }
+    if (selected !== [currentFilter, feedSource, feedSearch, feedLimit, feedOffset, feedIncludeHidden, feedVisibilityEpoch].join('|')) { feedReload = true; return; }
     document.getElementById('feedSourceStatus').hidden = false;
     document.getElementById('feedSourceStatus').textContent = 'Список временно недоступен. Показаны последние полученные данные.';
   } finally {
@@ -237,6 +240,27 @@ function feedCreateWorkflow() {
   if (!document.getElementById('wfCreateForm').classList.contains('open')) toggleWorkflowCreate();
 }
 function feedChangeSource(value) { feedSource = value; feedOffset = 0; loadTasks(); }
+function feedChangeHidden(value) { feedIncludeHidden = value; feedOffset = 0; loadTasks(); }
+async function feedSetHidden(button) {
+  const item = feedItems.find(row => row.id === button.dataset.feedKey);
+  if (!item) return;
+  const hidden = !item.hidden;
+  button.disabled = true;
+  try {
+    await fetchJSON(`${API}/task-feed/${encodeURIComponent(item.source_id)}/${encodeURIComponent(item.kind)}/${encodeURIComponent(item.object_id)}/visibility`, {
+      method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify({hidden}),
+    });
+    // Invalidate an in-flight refresh so an older response cannot undo this action.
+    feedVisibilityEpoch++;
+    feedExpanded = null; expandedId = null; feedDetails.delete(item.id); feedOffset = 0;
+    if (hidden && !feedIncludeHidden) feedItems = feedItems.filter(row => row.id !== item.id);
+    else feedItems = feedItems.map(row => row.id === item.id ? {...row, hidden} : row);
+    feedRender(feedItems, feedTotal);
+    toast(hidden ? 'Карточка скрыта. Вернуть её можно через «Показать скрытые».' : 'Карточка возвращена на дашборд.');
+    await loadUnifiedTaskFeed();
+  } catch (_) { toast('Не удалось изменить видимость карточки. Попробуйте ещё раз.'); }
+  finally { button.disabled = false; }
+}
 function feedChangeSearch(value) {
   feedSearch = value.slice(0, 200); feedOffset = 0;
   clearTimeout(feedSearchTimer); feedSearchTimer = setTimeout(() => loadTasks(), 250);
