@@ -43,11 +43,17 @@ A search request statically asks for at most
 asks for at most one item and100 labels. These bounds are below GitHub's
 500,000-node request limit. **These metrics are observations, not admission or
 proof grants.** Data-query cost excludes cost-preview and rate-metadata overhead
-and the external health checker. These values do not establish that a particular configured GraphQL cost
-estimate covers every queue size and external health checker. Before activation,
-qualify the measured query costs plus the checker on the largest supported queue;
-an inadequate estimate requires its ordinary reviewed configuration change.
-Do not infer live query cost from test fixtures.
+and the external health checker. These values do not establish that a particular
+configured GraphQL estimate covers every queue size and checker. Activation
+requires the qualified artifact and its existing publication/admission fences.
+Each ordinary admitted scan then uses the server previews and canonical
+whole-operation accounting to decide whether its actual observation fits. A
+larger scan that cannot fit returns a typed wait without a partial Source grant;
+its first successful complete observation records the actual query costs. The
+existing immutable checker cost bound still requires review. Any inadequate
+configured estimate requires its ordinary reviewed configuration change. Do
+not infer live query cost from fixtures or create synthetic Native identities
+to obtain qualification evidence.
 
 All producers need the accepted implementation: API sampler, worker, and any
 separately installed `pipelinectl source-refresh` package. Updating only the CLI
