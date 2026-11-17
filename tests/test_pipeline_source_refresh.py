@@ -274,6 +274,38 @@ def test_retarget_between_route_matching_and_first_fence_is_refused(continuation
     assert f.db.list_pipeline_snapshots("example") == []
 
 
+@pytest.mark.parametrize("changed", ["attempt", "session", "series", "priority"])
+def test_first_fence_cannot_silently_rebind_the_initial_native_attempt(continuation, monkeypatch, changed):
+    f = continuation
+    original = f.db.pipeline_source_refresh_state
+    def observe(*args, **kwargs):
+        with f.db._connect() as c:
+            if changed == "attempt":
+                start = datetime.now(timezone.utc).isoformat()
+                c.execute("UPDATE tasks SET started_at=?,session_id='new-session' WHERE id=?",
+                          (start, f.task.id))
+                key = f.db._pipeline_github_budget_reservation_key("github-default")
+                value = json.loads(c.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()[0])
+                value["reservations"][0]["task_started_at"] = start
+                value["reservations"][0]["token"] = "new-native-admission"
+                c.execute("UPDATE settings SET value=? WHERE key=?", (json.dumps(value), key))
+            else:
+                column, value = {"session": ("session_id", "new-session"),
+                                 "series": ("series_id", 999), "priority": ("priority", 2)}[changed]
+                if changed == "series":
+                    # Existing valid future series, not a missing-parent error.
+                    now = datetime.now(timezone.utc).isoformat()
+                    c.execute("INSERT INTO task_series(id,title,prompt,base_recurrence,created_at,updated_at) "
+                              "VALUES(999,'Example - FIX','Example - FIX','1h',?,?)", (now, now))
+                c.execute(f"UPDATE tasks SET {column}=? WHERE id=?", (value, f.task.id))
+        return original(*args, **kwargs)
+    monkeypatch.setattr(f.db, "pipeline_source_refresh_state", observe)
+    monkeypatch.setattr(pi, "_github_rate_limits", lambda: pytest.fail("rebound attempt reached GitHub"))
+    with pytest.raises(ValueError, match="attempt or execution inputs"):
+        source.refresh("example", f.env)
+    assert f.db.list_pipeline_snapshots("example") == []
+
+
 def test_future_series_edits_do_not_retarget_the_claimed_unchanged_task(continuation, monkeypatch):
     f = continuation
     original = f.db.set_setting_if_newer_revision

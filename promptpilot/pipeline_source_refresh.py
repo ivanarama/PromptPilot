@@ -4,6 +4,7 @@ Only this command imports Native DB services. Project-only pipelinectl commands
 remain DB-free. No provider, task, skill reservation or product grant is created.
 """
 import argparse
+from datetime import timezone
 import hashlib
 import json
 import os
@@ -20,7 +21,7 @@ def _profile_digest(profiles):
 
 class _Continuation:
     def __init__(self, db, insights, profiles, profile_id, queue_id, task_id, marker,
-                 expected_execution):
+                 expected_attempt):
         self.db, self.insights = db, insights
         self.profile_id, self.queue_id, self.task_id = profile_id, queue_id, task_id
         self.profiles_sha256 = _profile_digest(profiles)
@@ -29,7 +30,7 @@ class _Continuation:
             raise ValueError("source refresh requires a costed Native profile")
         self.policy = insights._with_shared_budget_floor(self.policy)
         self.marker = marker
-        self.expected_execution = expected_execution
+        self.expected_attempt = expected_attempt
         self.guard = None
         self.published = None
         self.ledger()
@@ -41,8 +42,8 @@ class _Continuation:
             self.task_id, self.profile_id, self.queue_id, self.policy["costs"]["skill"],
             starvation_timeout_seconds=(policy or self.policy).get("starvation_timeout_seconds", 0))
         observed = result.pop("guard")
-        if observed["execution_sha256"] != self.expected_execution:
-            raise ValueError("source refresh claimed execution inputs changed")
+        if any(observed[key] != value for key, value in self.expected_attempt.items()):
+            raise ValueError("source refresh claimed attempt or execution inputs changed")
         if self.marker is not None and self.marker != observed["started_at"]:
             raise ValueError("worker start marker differs from the running attempt")
         if self.guard is None:
@@ -74,14 +75,19 @@ def refresh(profile_id, environ=None):
     from . import db, pipeline_insights as pi
 
     task = db.get_task(int(raw_id))
-    matched = pi._matching_queue(task) if task is not None else None
+    if task is None or task.status.value != "running":
+        raise ValueError("source refresh requires an already running Native task")
+    matched = pi._matching_queue(task)
     if matched is None or matched[0] != profile_id:
         raise ValueError("source refresh profile does not own this Native task")
     profiles = pi._profiles()
+    expected_attempt = {key: getattr(task, key) for key in (
+        "session_id", "herdr_pane", "series_id", "priority")}
+    expected_attempt["started_at"] = (task.started_at.astimezone(timezone.utc).isoformat()
+                                      if task.started_at is not None else None)
+    expected_attempt["execution_sha256"] = task_execution_fingerprint(task)
     continuation = _Continuation(db, pi, profiles, profile_id, str(matched[2]["id"]),
-                                 task.id, marker, task_execution_fingerprint(task))
-    if task.priority != continuation.guard["priority"]:
-        raise ValueError("source refresh task priority changed")
+                                 task.id, marker, expected_attempt)
     previous = getattr(pi._scan_lease_context, "continuation", None)
     if previous is not None:
         raise ValueError("nested Native source refresh is forbidden")
