@@ -40,7 +40,7 @@ def stable_rates(monkeypatch):
     return limits
 
 
-def gh_transport(monkeypatch, responses, callback=None, preview_cost=1, preview_errors="absent"):
+def gh_transport(monkeypatch, responses, callback=None, preview_cost=1, preview_errors="absent", preview_callback=None):
     """Exercise actual _gh_api_json argv/stdin/JSON parsing, never real gh."""
     class Calls(list):
         previews = None
@@ -51,6 +51,8 @@ def gh_transport(monkeypatch, responses, callback=None, preview_cost=1, preview_
         payload = json.loads(kwargs["input"])
         if "dryRun: true" in payload["query"]:
             calls.previews.append(payload)
+            if preview_callback:
+                preview_callback()
             response = {"data": {"rateLimit": {"cost": preview_cost}}}
             if preview_errors != "absent": response["errors"] = preview_errors
             return SimpleNamespace(returncode=0, stdout=json.dumps(response), stderr="")
@@ -356,3 +358,18 @@ def test_malformed_preview_errors_never_start_data_request(continuation, monkeyp
     calls = gh_transport(monkeypatch, [], preview_errors=errors)
     with pytest.raises(ValueError, match="preview failed"): source.refresh("example", f.env)
     assert not calls and len(calls.previews) == 1 and f.db.list_pipeline_snapshots("example") == []
+
+
+def test_pause_during_cost_preview_stops_before_any_later_metadata_or_data(continuation, monkeypatch):
+    f = continuation; monkeypatch.setattr(pi, "_github_search", REAL_SEARCH)
+    limits = _limits(); observations = []
+    def rates():
+        observations.append(True)
+        return copy.deepcopy(limits)
+    monkeypatch.setattr(pi, "_github_rate_limits", rates)
+    before = ledger(f)
+    calls = gh_transport(monkeypatch, [], preview_callback=lambda: f.db.set_setting("worker_paused", "1"))
+    result = source.refresh("example", f.env)
+    assert result["source_refreshed"] is False and not calls and len(calls.previews) == 1
+    assert len(observations) == 2  # initial admission and the pre-preview observation
+    assert ledger(f) == before and f.db.list_pipeline_snapshots("example") == []

@@ -84,7 +84,7 @@ def _item_metadata(item):
             raise ValueError("invalid GraphQL search item timestamp") from exc
 
 
-def search(repository, query, request, check, budget=None):
+def search(repository, query, request, check, budget=None, after_data_request=None):
     """Return the existing normalized search contract plus measured API usage.
 
     Search syntax is passed intact, including quotes, qualifiers and boolean
@@ -116,7 +116,10 @@ def search(repository, query, request, check, budget=None):
             budget.before_request(predicted)
             check()
         payload = request(["graphql"], {"query": document, "variables": variables})
-        check()
+        # A complete response already in flight may finish as an observation.
+        # The caller still fences its lease/Native attempt after the response;
+        # all subsequent requests, including metadata, check pause beforehand.
+        (after_data_request or check)()
         if (not isinstance(payload, dict) or payload.get("errors")
                 or "errors" in payload and not isinstance(payload["errors"], list)
                 or not isinstance(payload.get("data"), dict)):

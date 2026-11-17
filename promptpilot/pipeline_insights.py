@@ -1720,7 +1720,8 @@ def _github_search(repository: str, query: str) -> dict:
         _ensure_github_scan_lease(renew=True)
 
     lease = getattr(_scan_lease_context, "lease", None)
-    return search(repository, query, _gh_api_json, check, getattr(lease, "search_budget", None))
+    return search(repository, query, _gh_api_json, check, getattr(lease, "search_budget", None),
+                  after_data_request=lambda: _ensure_github_scan_lease(renew=True))
 
 
 def _github_count(repository: str, query: str) -> int:
