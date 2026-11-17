@@ -57,6 +57,7 @@ def sample_scheduled_profiles(series, interval, state):
     now = time.time()
     initial = state.setdefault("started_at", now)
     deadlines = state.setdefault("deadlines", {})
+    retries = state.setdefault("retry_deadlines", {})
     active = {key: value for key, value in insights._profiles().items()
               if insights._profile_active(value, series)}
     due, errors = [], {}
@@ -64,7 +65,8 @@ def sample_scheduled_profiles(series, interval, state):
         try:
             lead = refresh_ahead_seconds(profile)
             ordinary = deadlines.get(key, now if lead else initial + interval)
-            if _delay(key, profile, series, ordinary, now) <= 0:
+            if _delay(key, profile, series, ordinary, now,
+                      reuse=now >= retries.get(key, 0)) <= 0:
                 due.append(key)
         except (TypeError, ValueError) as exc:
             errors[key] = True
@@ -78,6 +80,14 @@ def sample_scheduled_profiles(series, interval, state):
         completed = time.time()
         for key in due:
             deadlines[key] = completed + interval
+            if key in failed:
+                retries[key] = deadlines[key]
+                cache = insights.read_cached(key, series).get("cache") or {}
+                deferred = insights._parse_time(cache.get("refresh_deferred_until"))
+                if deferred is not None and deferred.timestamp() > completed:
+                    retries[key] = deadlines[key] = deferred.timestamp()
+            else:
+                retries.pop(key, None)
     now = time.time()
     waits = [interval]
     for key, profile in active.items():
@@ -85,5 +95,6 @@ def sample_scheduled_profiles(series, interval, state):
             continue
         ordinary = deadlines.get(key, now if refresh_ahead_seconds(profile)
                                  else initial + interval)
-        waits.append(_delay(key, profile, series, ordinary, now, reuse=key not in failed))
+        waits.append(_delay(key, profile, series, ordinary, now,
+                            reuse=now >= retries.get(key, 0)))
     return max(1, min(waits))

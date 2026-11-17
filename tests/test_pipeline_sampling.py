@@ -154,6 +154,56 @@ def test_failed_scan_waits_instead_of_retrying_until_green(isolated_db, monkeypa
     assert calls == ["failed"]
 
 
+def test_scan_defer_result_retries_at_the_explicit_deadline(
+        isolated_db, monkeypatch, clock):
+    _, blocked, calls = install(monkeypatch, {"example": profile()}, clock, duration=0)
+    original = pi.analyze
+    attempts = []
+
+    def scan(key, *args, **kwargs):
+        attempts.append(clock[0])
+        if len(attempts) == 1:
+            blocked[key] = {"refresh_blocked": "scan_in_progress",
+                            "refresh_deferred_until": datetime.fromtimestamp(
+                                clock[0] + 120, timezone.utc).isoformat()}
+            return pi.read_cached(key, [])
+        return original(key, *args, **kwargs)
+
+    monkeypatch.setattr(pi, "analyze", scan)
+    clock[0] += 180
+    state = {}
+    assert sampling.sample_scheduled_profiles([], 300, state) == 120
+    clock[0] += 120
+    blocked.clear()  # Public read_cached drops the expired defer overlay.
+    assert sampling.sample_scheduled_profiles([], 300, state) == 150
+    assert attempts[1] - attempts[0] == 120 and len(calls) == 1
+
+
+def test_other_profile_wakeup_does_not_retry_a_failed_scan_early(
+        isolated_db, monkeypatch, clock):
+    _, _, calls = install(monkeypatch, {"failed": profile(), "healthy": profile()},
+                          clock, duration=0)
+    original = pi.analyze
+
+    def scan(key, *args, **kwargs):
+        if key == "failed":
+            calls.append((key, clock[0]))
+            raise RuntimeError("checker failed")
+        return original(key, *args, **kwargs)
+
+    monkeypatch.setattr(pi, "analyze", scan)
+    clock[0] += 180
+    state = {}
+    assert sampling.sample_scheduled_profiles([], 300, state) == 150
+    clock[0] += 150
+    assert sampling.sample_scheduled_profiles([], 300, state) == 150
+    assert [key for key, _ in calls].count("failed") == 1
+    clock[0] += 150
+    sampling.sample_scheduled_profiles([], 300, state)
+    failed = [stamp for key, stamp in calls if key == "failed"]
+    assert len(failed) == 2 and failed[1] - failed[0] == 300
+
+
 def test_global_pause_does_not_sample_or_wake(isolated_db, monkeypatch, clock):
     _, _, calls = install(monkeypatch, {"example": profile()}, clock)
     isolated_db.set_setting("worker_paused", "1")
