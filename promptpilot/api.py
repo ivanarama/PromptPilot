@@ -73,7 +73,7 @@ from .workorder_api import router as workorder_router
 from .pipeline_scope_delivery import router as scope_delivery_router
 
 
-def _sample_pipeline_profiles():
+def _sample_pipeline_profiles(deadlines=None):
     """Run the complete snapshot read outside the HTTP event loop.
 
     ``asyncio.to_thread`` only moves evaluation of its callable and arguments.
@@ -81,17 +81,23 @@ def _sample_pipeline_profiles():
     the event-loop thread first, so slow storage could freeze every API route
     before the sampler even reached its worker thread.
     """
-    return pipeline_insights.sample_active_profiles(db.list_series())
+    series = db.list_series()
+    if deadlines is None:
+        return pipeline_insights.sample_active_profiles(series)
+    from .pipeline_sampling import sample_scheduled_profiles
+    return sample_scheduled_profiles(series, PIPELINE_SNAPSHOT_INTERVAL, deadlines)
 
 
 async def _pipeline_sampler():
     """Collect profile-scoped queue history without invoking an LLM."""
+    deadlines = {}
     while True:
-        await asyncio.sleep(PIPELINE_SNAPSHOT_INTERVAL)
         try:
-            await asyncio.to_thread(_sample_pipeline_profiles)
+            delay = await asyncio.to_thread(_sample_pipeline_profiles, deadlines)
         except Exception as exc:
             print(f"pipeline sampler: {exc}", file=sys.stderr)
+            delay = PIPELINE_SNAPSHOT_INTERVAL
+        await asyncio.sleep(delay)
 
 
 @asynccontextmanager
