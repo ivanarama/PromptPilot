@@ -19,6 +19,11 @@ def main():
 
         raise SystemExit(run(args[1:]))
 
+    if args[:2] == ["workflow", "verify-external"]:
+        from .native_external_gate import main as verify_external
+
+        raise SystemExit(verify_external(args[2:]))
+
     from .cli import cli
 
     cli()

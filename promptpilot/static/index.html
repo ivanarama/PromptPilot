@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>PromptPilot</title>
+<link rel="stylesheet" href="/assets/agent-connections.css">
 <style>
   :root {
     color-scheme: dark;
@@ -1123,6 +1124,7 @@
   <p style="color:var(--text2);font-size:12px">Тема применяется сразу и сохраняется в этом браузере, если доступно локальное хранилище.</p>
   <div class="settings-links">
     <button class="btn btn-ghost" onclick="closeSettings();openTaskSourceSettings()">Источники</button>
+    <button class="btn btn-ghost" onclick="closeSettings();openAgentConnections()">Подключения агентов</button>
     <button class="btn btn-ghost" onclick="closeSettings();openProviders()">Помощники</button>
     <button class="btn btn-ghost" onclick="closeSettings();openWorkflows()">Воркфлоу</button>
     <button class="btn btn-ghost" onclick="closeSettings();openSchedule()">Расписание</button>
@@ -1167,6 +1169,7 @@
 
 <script src="/assets/task-feed.js"></script>
 <script src="/assets/task-source-settings.js"></script>
+<script src="/assets/agent-connections.js"></script>
 <script>
 let uiThemeChoice = 'dark';
 let uiThemeMedia = null;
@@ -1925,6 +1928,17 @@ function openWorkflows() {
 
 function closeWorkflows() { document.getElementById('workflowModal').classList.remove('open'); }
 
+async function openWorkflowFromLocation() {
+  const match = /^#workflow\/(wf_[0-9a-f]{32})$/.exec(location.hash);
+  if (!match) return;
+  selectedWorkflowId = match[1];
+  document.getElementById('workflowModal').classList.add('open');
+  try { await loadWorkflows(); }
+  catch (_) { toast('Не удалось открыть карточку задачи'); }
+}
+
+window.addEventListener('hashchange', openWorkflowFromLocation);
+
 let workflowAutoRefreshBusy = false;
 
 function captureWorkflowOpenDetails() {
@@ -2393,6 +2407,7 @@ async function selectWorkflow(id) {
   selectedWorkflowId = id;
   document.querySelectorAll('.wf-row').forEach(row => row.classList.remove('active'));
   const wf = workflowCache.find(item => item.id === id) || await fetchJSON(`${API}/workflows/${id}`);
+  if (selectedWorkflowId !== id) return;
   selectedWorkflowData = wf;
   const [rounds, events, findings, plan, stages, elicitation] = await Promise.all([
     fetchJSON(`${API}/workflows/${id}/rounds`),
@@ -2419,6 +2434,7 @@ async function selectWorkflow(id) {
       }
     } catch (_) {}
   }
+  if (selectedWorkflowId !== id) return;
   const openDetailKeys = captureWorkflowOpenDetails();
   renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, plannerTask, orphanPane, elicitation);
   restoreWorkflowOpenDetails(openDetailKeys);
@@ -5050,6 +5066,7 @@ loadCosts();
 loadHealth();
 refresh();
 if (location.hash === '#pipelines') openPipelines();
+openWorkflowFromLocation();
 setInterval(refresh, 5000);
 setInterval(() => pollScreen(), 4000);  // только для раскрытой карточки с herdr-панелью
 setInterval(() => wfRefreshScreen(), 4000);  // экран активного task прямо в workflow

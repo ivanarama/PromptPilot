@@ -396,6 +396,16 @@ def workflow_group():
     """Manage the W1 workflow pilot and its append-only history."""
 
 
+@workflow_group.command("verify-external")
+@click.argument("workflow_id")
+def workflow_verify_external(workflow_id):
+    """Verify a current external receipt and configured artifacts without applying files."""
+    from .native_external_gate import main
+
+    if main([workflow_id]):
+        raise click.ClickException("External result did not pass verification")
+
+
 @workflow_group.command("create")
 @click.argument("file_path", type=click.Path(exists=True, dir_okay=False))
 def workflow_create(file_path):
