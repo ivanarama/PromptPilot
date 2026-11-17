@@ -10,6 +10,8 @@ import os
 import sqlite3
 import sys
 
+from .task_identity import task_execution_fingerprint
+
 
 def _profile_digest(profiles):
     return hashlib.sha256(json.dumps(profiles, sort_keys=True, ensure_ascii=False,
@@ -17,7 +19,8 @@ def _profile_digest(profiles):
 
 
 class _Continuation:
-    def __init__(self, db, insights, profiles, profile_id, queue_id, task_id, marker):
+    def __init__(self, db, insights, profiles, profile_id, queue_id, task_id, marker,
+                 expected_execution):
         self.db, self.insights = db, insights
         self.profile_id, self.queue_id, self.task_id = profile_id, queue_id, task_id
         self.profiles_sha256 = _profile_digest(profiles)
@@ -26,6 +29,7 @@ class _Continuation:
             raise ValueError("source refresh requires a costed Native profile")
         self.policy = insights._with_shared_budget_floor(self.policy)
         self.marker = marker
+        self.expected_execution = expected_execution
         self.guard = None
         self.published = None
         self.ledger()
@@ -37,6 +41,8 @@ class _Continuation:
             self.task_id, self.profile_id, self.queue_id, self.policy["costs"]["skill"],
             starvation_timeout_seconds=(policy or self.policy).get("starvation_timeout_seconds", 0))
         observed = result.pop("guard")
+        if observed["execution_sha256"] != self.expected_execution:
+            raise ValueError("source refresh claimed execution inputs changed")
         if self.marker is not None and self.marker != observed["started_at"]:
             raise ValueError("worker start marker differs from the running attempt")
         if self.guard is None:
@@ -73,7 +79,7 @@ def refresh(profile_id, environ=None):
         raise ValueError("source refresh profile does not own this Native task")
     profiles = pi._profiles()
     continuation = _Continuation(db, pi, profiles, profile_id, str(matched[2]["id"]),
-                                 task.id, marker)
+                                 task.id, marker, task_execution_fingerprint(task))
     if task.priority != continuation.guard["priority"]:
         raise ValueError("source refresh task priority changed")
     previous = getattr(pi._scan_lease_context, "continuation", None)

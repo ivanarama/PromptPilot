@@ -4185,6 +4185,7 @@ def _pipeline_source_refresh_state(conn, scope, task_id, profile_id, queue_id, c
                                    starvation_timeout_seconds=0):
     """Read an admitted running attempt without pruning any foreign ledger."""
     from .config import TASK_TIMEOUT
+    from .task_identity import task_execution_fingerprint
 
     if type(task_id) is not int or task_id <= 0:
         raise ValueError("source refresh requires a worker task identity")
@@ -4229,6 +4230,7 @@ def _pipeline_source_refresh_state(conn, scope, task_id, profile_id, queue_id, c
              "session_id": row["session_id"], "herdr_pane": row["herdr_pane"],
              "series_id": row["series_id"],
              "priority": row["priority"], "profile_id": profile_id, "queue_id": queue_id,
+             "execution_sha256": task_execution_fingerprint(row),
              "cost": dict(cost), "token": own[0]["token"]}
     waiting = _pipeline_github_budget_waiter_summary(conn, scope,
         starvation_timeout_seconds=starvation_timeout_seconds, now=now)

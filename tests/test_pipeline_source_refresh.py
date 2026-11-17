@@ -152,7 +152,8 @@ def test_unbound_attempt_is_refused_before_any_github_io(continuation, monkeypat
 
 
 @pytest.mark.parametrize("fault", ["session", "cancel", "lease", "epoch", "start",
-                                  "priority", "series", "reservation"])
+                                  "priority", "series", "reservation", "prompt", "working_dir",
+                                  "provider", "rights", "model", "effort", "task_timeout"])
 def test_drift_before_publication_cannot_publish_cache_or_history(continuation, monkeypatch, fault):
     f = continuation
     before = ledger(f)
@@ -174,7 +175,10 @@ def test_drift_before_publication_cannot_publish_cache_or_history(continuation, 
                 f.db.set_setting(key, json.dumps(value))
             else:
                 column, value = {"start": ("started_at", datetime.now(timezone.utc).isoformat()),
-                                 "priority": ("priority", 2), "series": ("series_id", None)}[fault]
+                                 "priority": ("priority", 2), "series": ("series_id", None),
+                                 **{key: (key, "changed-input") for key in (
+                                     "prompt", "working_dir", "provider", "rights", "model", "effort")},
+                                 "task_timeout": ("task_timeout", 601)}[fault]
                 with f.db._connect() as c:
                     c.execute(f"UPDATE tasks SET {column}=? WHERE id=?", (value, f.task.id))
         return original(*args, **kwargs)
@@ -254,6 +258,33 @@ def test_other_scope_admission_for_same_task_is_ambiguous(continuation, monkeypa
     monkeypatch.setattr(pi, "_github_rate_limits", lambda: pytest.fail("ambiguous admission reached GitHub"))
     with pytest.raises(ValueError, match="ambiguous"):
         source.refresh("example", f.env)
+
+
+def test_retarget_between_route_matching_and_first_fence_is_refused(continuation, monkeypatch):
+    f = continuation
+    original = f.db.pipeline_source_refresh_state
+    def observe(*args, **kwargs):
+        with f.db._connect() as c:
+            c.execute("UPDATE tasks SET prompt='a different queue' WHERE id=?", (f.task.id,))
+        return original(*args, **kwargs)
+    monkeypatch.setattr(f.db, "pipeline_source_refresh_state", observe)
+    monkeypatch.setattr(pi, "_github_rate_limits", lambda: pytest.fail("retarget reached GitHub"))
+    with pytest.raises(ValueError, match="execution inputs"):
+        source.refresh("example", f.env)
+    assert f.db.list_pipeline_snapshots("example") == []
+
+
+def test_future_series_edits_do_not_retarget_the_claimed_unchanged_task(continuation, monkeypatch):
+    f = continuation
+    original = f.db.set_setting_if_newer_revision
+    def publish(*args, **kwargs):
+        if kwargs.get("pipeline_snapshot") is not None:
+            with f.db._connect() as c:
+                c.execute("UPDATE task_series SET title='future title',provider='future-provider',"
+                          "working_dir='future-directory' WHERE id=?", (f.task.series_id,))
+        return original(*args, **kwargs)
+    monkeypatch.setattr(f.db, "set_setting_if_newer_revision", publish)
+    assert source.refresh("example", f.env)["source_refreshed"] is True
 
 
 @pytest.mark.parametrize("failed", [True, "true"])
