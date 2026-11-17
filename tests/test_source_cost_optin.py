@@ -2,6 +2,7 @@
 import ast
 import hashlib
 import inspect
+import copy
 import json
 import textwrap
 from types import SimpleNamespace
@@ -111,3 +112,29 @@ def test_modern_checker_declaration_without_pricing_optin_refuses_before_rpc(con
     monkeypatch.setattr(pi,"_run_profile_health_check",lambda _:pytest.fail("undeclared pricing spawned checker"))
     with pytest.raises(ValueError,match="requires github_budget.source_cost_protocol"):
         source.refresh("example",f.env)
+
+
+def test_modern_optin_cannot_reuse_legacy_no_health_full_cache(continuation,monkeypatch):
+    f=continuation
+    f.profile.pop("health_check")
+    f.profile["github_budget"].pop("source_cost_protocol")
+    legacy_projection=copy.deepcopy(f.profile);legacy_projection.pop("github_budget")
+    old_hash=pi._profile_fingerprint(f.profile)
+    assert old_hash==hashlib.sha256(json.dumps(legacy_projection,ensure_ascii=False,sort_keys=True,
+        separators=(",",":"),default=str).encode()).hexdigest()
+    monkeypatch.setattr(pi,"_github_search",REAL_SEARCH)
+    calls=source_transport(monkeypatch,[page([]),page([])])
+    assert source.refresh("example",f.env)["source_refreshed"]
+    old_key=pi._cache_key("example",old_hash);old_bytes=f.db.get_setting(old_key)
+    f.profile["github_budget"]["source_cost_protocol"]="source-graphql-cost-v1"
+    modern_hash=pi._profile_fingerprint(f.profile)
+    assert modern_hash!=old_hash
+    cached=pi.read_cached("example",f.db.list_series())
+    assert pi._required_snapshot_state(cached,f.profile,"fix") is not None
+    result=pi.analyze("example",f.db.list_series(),use_cache=False,reuse_fresh=True,snapshot_queue_id="fix")
+    assert len(calls)==2 and result["source_search_usage"]["successful_observation_cost_proved"] is True
+    assert result["source_search_usage"]["conservative_graphql_spend"]==6
+    assert f.db.get_setting(old_key)==old_bytes and len(f.db.list_pipeline_snapshots("example"))==2
+    f.profile["github_budget"]["minimum_remaining"]["core"]+=17
+    f.profile["github_budget"]["costs"]["insights"]["graphql"]+=10
+    assert pi._profile_fingerprint(f.profile)==modern_hash

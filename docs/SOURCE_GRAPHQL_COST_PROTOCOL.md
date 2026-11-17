@@ -67,3 +67,15 @@ same new profile/artifact with a successful checker receipt and the original
 health TTL. No new checker RPC means current checker cost0; the old receipt SHA
 and age remain reuse provenance, without recharging old cost or matching its old
 nonce to this new operation. Old unmetered diagnostics are not that proof.
+
+The v1 opt-in has its own Source fingerprint namespace. Legacy fingerprints and
+numeric budget tuning retain their previous meaning; a fresh legacy snapshot
+cannot satisfy a v1 Source gate, even for profiles without an external checker.
+
+A genuine invoked-checker failure, including a missing or invalid cost receipt,
+records a monotone failure revision under the owned Source/Native fence. Later
+availability waits, status clears and defer expiry preserve that per-fingerprint
+watermark. Cached data stays readable but cannot satisfy the Source gate until
+a fresh checker and complete Source publication acknowledge it in the existing
+publication CAS. Reused diagnostics never advance the acknowledgement, check
+time or nonce; a lost publication fence leaves recovery outstanding.

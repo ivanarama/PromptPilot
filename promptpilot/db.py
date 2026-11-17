@@ -4906,16 +4906,18 @@ def _next_pipeline_refresh_revision(conn) -> int:
 
 def _write_pipeline_refresh_status(
         conn, key: str, repository: str, status: Optional[dict],
-        revision: int) -> bool:
+        revision: int, *, checker_failure_profile_hash: Optional[str] = None) -> bool:
     """Publish one already-allocated event if it is newer for this profile."""
     row = conn.execute(
         "SELECT value FROM settings WHERE key = ?", (key,)
     ).fetchone()
     existing_revision = 0
+    checker_failures = None
     if row is not None:
         try:
             existing = json.loads(row["value"])
             existing_revision = existing["revision"]
+            checker_failures = existing.get("source_checker_failure_revisions")
             if (not isinstance(existing, dict)
                     or existing.get("version") != 1
                     or isinstance(existing_revision, bool)
@@ -4926,14 +4928,19 @@ def _write_pipeline_refresh_status(
             existing_revision = 0
     if existing_revision >= revision:
         return False
+    if checker_failure_profile_hash is not None:
+        if checker_failures is not None and not isinstance(checker_failures,dict):
+            raise ValueError("invalid causal Source checker failure watermarks")
+        checker_failures = dict(checker_failures or {})
+        checker_failures[checker_failure_profile_hash] = revision
+    payload = {"version": 1, "repository": str(repository), "revision": revision, "status": status}
+    if checker_failures is not None:
+        # A later availability event or successful skill admission cannot erase
+        # this causal watermark. Only a fresh complete Source can acknowledge it.
+        payload["source_checker_failure_revisions"] = checker_failures
     conn.execute(
         "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
-        (key, json.dumps({
-            "version": 1,
-            "repository": str(repository),
-            "revision": revision,
-            "status": status,
-        }, ensure_ascii=False, separators=(",", ":"))),
+        (key, json.dumps(payload, ensure_ascii=False, separators=(",", ":"))),
     )
     return True
 
@@ -5082,7 +5089,8 @@ def renew_pipeline_scan_lease(
 
 def release_pipeline_scan_lease(
         scope: str, token: str, *,
-        refresh_status: Optional[dict] = None) -> bool:
+        refresh_status: Optional[dict] = None,
+        checker_failure_guard: Optional[dict] = None) -> bool:
     """Release a lease and optionally publish final refresh status atomically."""
     key = _pipeline_scan_lease_key(scope)
     owner = token
@@ -5125,8 +5133,20 @@ def release_pipeline_scan_lease(
             # completed while this owner held the lease; a successor can only
             # allocate a later revision after this transaction commits.
             revision = _next_pipeline_refresh_revision(conn)
+            failure_hash = ((final_status or {}).get("github_budget") or {}).get("source_checker_failure_profile_hash")
+            if failure_hash is not None:
+                if (not isinstance(failure_hash, str) or re.fullmatch(r"[0-9a-f]{64}", failure_hash) is None
+                        or (final_status or {}).get("refresh_blocked") != "checker_failed"
+                        or not isinstance(checker_failure_guard, dict)
+                        or checker_failure_guard.get("scope") != scope
+                        or checker_failure_guard.get("token") != owner
+                        or (isinstance(checker_failure_guard.get("continuation"),dict)
+                            and checker_failure_guard["continuation"].get("profile_id") != refresh_status["profile_id"])
+                        or not _pipeline_scan_lease_guard_matches(conn, checker_failure_guard)):
+                    failure_hash = None
             _write_pipeline_refresh_status(
-                conn, status_key, status_repository, final_status, revision)
+                conn, status_key, status_repository, final_status, revision,
+                checker_failure_profile_hash=failure_hash)
         conn.execute("DELETE FROM settings WHERE key = ?", (key,))
     return True
 
@@ -5165,7 +5185,7 @@ def publish_pipeline_refresh_status(
             conn, key, repository, status, event_revision)
 
 
-def get_pipeline_refresh_status(profile_id: str) -> Optional[dict]:
+def get_pipeline_refresh_status(profile_id: str, *, strict: bool = False) -> Optional[dict]:
     """Read one validated status event, including a clear tombstone."""
     raw = get_setting(_pipeline_refresh_status_key(profile_id))
     if raw is None:
@@ -5180,6 +5200,8 @@ def get_pipeline_refresh_status(profile_id: str) -> Optional[dict]:
                 or status is not None and not isinstance(status, dict)):
             raise ValueError("invalid refresh status payload")
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        if strict:
+            raise ValueError("invalid durable pipeline refresh status")
         return None
     return payload
 

@@ -304,7 +304,8 @@ class _GraphQLSearchBudget:
             actual = validate_receipt(receipt, expected, nonce=context["nonce"], allowance=context["allowance"])
             self.cost.settle(actual, allow_zero=True)
         except (OSError, TypeError, ValueError) as exc:
-            self.cost.poison(); self._deny(str(exc), "unavailable")
+            self.cost.poison()
+            raise ValueError("Source checker cost protocol failed: " + str(exc)) from exc
         self.envelope.charge_graphql(actual)
         proof = {"executable_sha256":expected["executable_sha256"], "receipt_sha256":digest(receipt)}
         diagnostics["source_graphql_cost_proof"] = proof
@@ -498,8 +499,19 @@ class _GitHubScanLease:
             if self._thread is not None:
                 self._thread.join(timeout=2)
             try:
+                failure = ((refresh_status or {}).get("status") or {}).get("github_budget", {}).get(
+                    "source_checker_failure_profile_hash") is not None
+                failure_guard = None
+                if failure:
+                    try:
+                        if getattr(self,"continuation",None) is not None:
+                            self.continuation.check()
+                        failure_guard = self.guard
+                    except _GitHubScanLeaseFailure:
+                        pass  # still release our own token; no new failure proof
                 db.release_pipeline_scan_lease(
-                    self.scope, self.token, refresh_status=refresh_status)
+                    self.scope, self.token, refresh_status=refresh_status,
+                    **({"checker_failure_guard": failure_guard} if failure else {}))
             except Exception:
                 # A failed release stays fail-closed until the renewable lease
                 # expires; never let cleanup hide the scan's original outcome.
@@ -1741,7 +1753,9 @@ def _profile_fingerprint(profile: dict) -> str:
     # means. Keep last-good data readable when an operator enables/tunes the
     # budget while GitHub quota is already low.
     observed_profile = copy.deepcopy(profile)
-    observed_profile.pop("github_budget", None)
+    budget = observed_profile.pop("github_budget", None)
+    if isinstance(budget,dict) and budget.get("source_cost_protocol")=="source-graphql-cost-v1":
+        observed_profile = {"profile":observed_profile, "source_cost_protocol":"source-graphql-cost-v1"}
     encoded = json.dumps(
         observed_profile, ensure_ascii=False, sort_keys=True,
         separators=(",", ":"), default=str,
@@ -5138,6 +5152,28 @@ def _empty_cached_result(profile_id: str, profile: dict) -> dict:
     }
 
 
+def _source_checker_failure_revision(event, profile):
+    if event is None:
+        return 0
+    markers = event.get("source_checker_failure_revisions")
+    if markers is None:
+        return 0
+    if (not isinstance(markers,dict) or any(
+            not isinstance(pin,str) or re.fullmatch(r"[0-9a-f]{64}",pin) is None
+            or type(revision)is not int or not 0<revision<=event["revision"]
+            for pin,revision in markers.items())):
+        raise ValueError("invalid causal Source checker failure watermark")
+    return markers.get(_profile_fingerprint(profile),0)
+
+
+def _source_checker_verified_revision(result, event):
+    value=result.get("source_checker_verified_failure_revision",0)
+    if (type(value)is not int or value<0
+            or value>0 and (event is None or value>event["revision"])):
+        raise ValueError("invalid Source checker recovery acknowledgement")
+    return value
+
+
 def _with_persisted_refresh_status(result: dict, profile_id: str,
                                    profile: dict) -> dict:
     """Overlay a still-actionable denial on a quota-free cached response."""
@@ -5148,15 +5184,32 @@ def _with_persisted_refresh_status(result: dict, profile_id: str,
         # Invalid opt-in configuration is itself an admission blocker and its
         # persisted explanation remains useful until the profile is corrected.
         pass
+    raw_budget=profile.get("github_budget")
+    modern=isinstance(raw_budget,dict) and raw_budget.get("source_cost_protocol")=="source-graphql-cost-v1"
     try:
-        event = db.get_pipeline_refresh_status(profile_id)
+        event = db.get_pipeline_refresh_status(profile_id,**({"strict":True} if modern else {}))
+        failure_revision=_source_checker_failure_revision(event,profile) if modern else 0
+        verified_revision=_source_checker_verified_revision(result,event) if modern else 0
+        if failure_revision and verified_revision<failure_revision:
+            data=copy.deepcopy(result)
+            data.setdefault("cache",{}).update(refresh_blocked="checker_failed",
+                refresh_blocked_reason="latest genuine checker failure requires a fresh checker and complete Source publication")
+            return data
     except (OSError, sqlite3.Error, TypeError, ValueError):
+        if modern:
+            data=copy.deepcopy(result)
+            data.setdefault("cache",{}).update(refresh_blocked="checker_state_unavailable")
+            return data
         return result
     if (not isinstance(event, dict)
             or event.get("repository") != str(profile.get("repository", ""))):
         return result
     status = event.get("status")
     if not isinstance(status, dict):
+        return result
+    if modern and event.get("source_checker_failure_revisions") is not None and status.get("refresh_blocked")=="checker_failed":
+        # A complete publication has acknowledged this exact failure, or the
+        # failure belongs to a different immutable checker/profile namespace.
         return result
     # An execution admission denial is not a failed queue refresh. TAIL/FIX
     # budget contention must not poison a fresh shared snapshot for every
@@ -5431,6 +5484,14 @@ def _analyze_without_budget(profile_id: str, series: list[dict], *,
                                 "invalid_config")
         if modern_budget is not None:
             modern_budget.activate()
+        checker_failure_revision=0
+        checker_verified_revision=0
+        if modern_budget is not None:
+            checker_event=db.get_pipeline_refresh_status(profile_id,strict=True)
+            checker_failure_revision=_source_checker_failure_revision(checker_event,profile)
+            checker_verified_revision=_source_checker_verified_revision(cached[1],checker_event) if cached else 0
+            if checker_failure_revision>checker_verified_revision:
+                refresh_diagnostics=True
         health_cache_seconds = max(0, int(health_config.get("cache_seconds", 1800)))
         diagnostics = None
         diagnostics_generated_at = None
@@ -5451,15 +5512,20 @@ def _analyze_without_budget(profile_id: str, series: list[dict], *,
             diagnostics = _run_profile_health_check(profile)
             diagnostics_generated_at = time.time()
             if modern_budget is not None and health_config.get("source_graphql_cost"):
+                if not (isinstance(diagnostics,dict) and diagnostics.get("checker_failed")):
+                    try:
+                        search_budget.consume_health(diagnostics, profile)
+                    except ValueError as exc:
+                        diagnostics=dict(diagnostics or {}, checker_failed=True, summary=str(exc))
                 if isinstance(diagnostics, dict) and diagnostics.get("checker_failed"):
                     search_budget.failed_request()
                     search_budget._record_denial(diagnostics.get("summary") or "Source checker failed",
                                                  "checker_failed")
+                    search_budget.admission["source_checker_failure_profile_hash"]=_profile_fingerprint(profile)
                     failed = read_cached(profile_id, series)
                     failed["diagnostics"] = diagnostics
                     failed.setdefault("cache", {}).update(refresh_blocked="checker_failed", stale=True)
                     return failed
-                search_budget.consume_health(diagnostics, profile)
         elif modern_budget is not None and health_config:
             if health_config.get("source_graphql_cost"):
                 search_budget.reuse_health(diagnostics, profile, time.time() - float(diagnostics_generated_at))
@@ -5650,6 +5716,10 @@ def _analyze_without_budget(profile_id: str, series: list[dict], *,
             "generated_at": now.timestamp(),
         }
         if isinstance(search_budget,_GraphQLSearchBudget):
+            if (search_budget.health_provenance and not search_budget.health_provenance["reused"]
+                    and all(queue.get("membership_complete") is True for queue in queues)):
+                checker_verified_revision=max(checker_verified_revision,checker_failure_revision)
+            result["source_checker_verified_failure_revision"]=checker_verified_revision
             result["source_search_usage"] = {
                 "graphql_allowance": search_budget.policy["requested_cost"]["graphql"],
                 "conservative_graphql_spend": search_budget.observed_spend + search_budget.pending_cost,
@@ -5768,6 +5838,8 @@ def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True,
         cache.pop("refresh_blocked_reason", None)
         cache.pop("refresh_deferred_until", None)
         cache.pop("refresh_budget", None)
+    if (profile.get("github_budget") or {}).get("source_cost_protocol")=="source-graphql-cost-v1":
+        result=_with_persisted_refresh_status(result,profile_id,profile)
     return _with_live_github_budget_state(result, profile)
 
 
