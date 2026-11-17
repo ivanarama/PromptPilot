@@ -2195,6 +2195,16 @@ def test_pause_during_first_search_stops_all_subsequent_github_io(
     assert isolated_db.list_pipeline_snapshots("mid-pause") == []
 
 
+def _graphql_pause_page(total, number=42):
+    item = {"__typename": "Issue", "id": "node-" + str(number), "number": number,
+        "title": "Ready", "createdAt": "2026-09-01T00:00:00Z", "updatedAt": "2026-09-02T00:00:00Z",
+        "closedAt": None, "url": "https://example.test/" + str(number),
+        "repository": {"nameWithOwner": "owner/example"},
+        "labels": {"totalCount": 0, "nodes": [], "pageInfo": {"hasNextPage": False, "endCursor": None}}}
+    return {"data": {"rateLimit": {"cost": 1}, "search": {"issueCount": total, "nodes": [item],
+        "pageInfo": {"hasNextPage": total > 1, "endCursor": "next" if total > 1 else None}}}}
+
+
 def test_github_search_does_not_start_page_two_after_pause(
         isolated_db, monkeypatch):
     calls = []
@@ -2204,7 +2214,7 @@ def test_github_search_does_not_start_page_two_after_pause(
         isolated_db.set_setting("worker_paused", "1")
         return SimpleNamespace(
             returncode=0, stderr="",
-            stdout=json.dumps({"total_count": 250, "items": [{}] * 100}),
+            stdout=json.dumps(_graphql_pause_page(250)),
         )
 
     monkeypatch.setattr(pipeline_insights, "_gh_executable", lambda: "gh")
@@ -2216,7 +2226,7 @@ def test_github_search_does_not_start_page_two_after_pause(
         pipeline_insights._github_search("owner/example", "is:pr")
 
     assert len(calls) == 1
-    assert "page=1" in calls[0]
+    assert calls[0] == ["gh", "api", "graphql", "--input", "-"]
 
 
 def test_interrupted_pagination_never_publishes_partial_snapshot(
@@ -2235,7 +2245,7 @@ def test_interrupted_pagination_never_publishes_partial_snapshot(
         isolated_db.set_setting("worker_paused", "1")
         return SimpleNamespace(
             returncode=0, stderr="",
-            stdout=json.dumps({"total_count": 250, "items": [{}] * 100}),
+            stdout=json.dumps(_graphql_pause_page(250)),
         )
 
     monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"pagination": profile})
@@ -2258,12 +2268,6 @@ def test_interrupted_pagination_never_publishes_partial_snapshot(
 
 def test_completed_first_page_remains_a_valid_snapshot_when_pause_arrives(
         isolated_db, monkeypatch):
-    item = {
-        "number": 42, "title": "Ready", "labels": [],
-        "created_at": "2026-09-01T00:00:00Z",
-        "updated_at": "2026-09-02T00:00:00Z",
-        "html_url": "https://example.test/42",
-    }
     calls = []
 
     def run(command, **_kwargs):
@@ -2271,7 +2275,7 @@ def test_completed_first_page_remains_a_valid_snapshot_when_pause_arrives(
         isolated_db.set_setting("worker_paused", "1")
         return SimpleNamespace(
             returncode=0, stderr="",
-            stdout=json.dumps({"total_count": 1, "items": [item]}),
+            stdout=json.dumps(_graphql_pause_page(1)),
         )
 
     monkeypatch.setattr(pipeline_insights, "_gh_executable", lambda: "gh")

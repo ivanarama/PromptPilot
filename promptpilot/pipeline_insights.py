@@ -93,6 +93,75 @@ class _GitHubRateLimitUnavailable(RuntimeError):
     """The authenticated GitHub budget cannot be proved from valid responses."""
 
 
+class _GitHubSearchBudgetDenied(RuntimeError):
+    def __init__(self, decision):
+        super().__init__(decision["reason"])
+        self.decision = decision
+
+
+class _GraphQLSearchBudget:
+    """Recheck the existing complete scan estimate before every GraphQL page."""
+    def __init__(self, policy, admission):
+        self.policy, self.admission = policy, admission
+        self.last_limits = copy.deepcopy(admission["github_rate_limit"])
+        # The initial canonical rateLimit observation has already executed.
+        self.observed_spend, self.pending_cost = 1, 0
+        self.used = False
+
+    def _allowance_denied(self, reason):
+        return _budget_denied(self.policy, state="budget_in_flight", reason=reason,
+            now=time.time(), limits=self.last_limits,
+            status_revision=_current_github_scan_status_revision())
+
+    def before_request(self, query_cost):
+        self.used = True
+        _ensure_github_scan_lease(renew=True)
+        ceiling = self.policy["requested_cost"]["graphql"]
+        if query_cost > ceiling:
+            decision = _budget_denied(self.policy, state="invalid_config",
+                reason="GraphQL search query cost exceeds configured insights estimate",
+                now=time.time(), status_revision=_current_github_scan_status_revision())
+            decision["graphql_query_cost"] = query_cost
+            decision["configured_graphql_cost"] = ceiling
+        elif self.observed_spend + self.pending_cost + 1 + query_cost > ceiling:
+            decision = self._allowance_denied(
+                "Whole Source GraphQL estimate cannot cover another rate observation and query")
+        else:
+            # Same canonical metadata producer as initial scan admission, with
+            # its existing lease and Native-attempt publication fence. Never
+            # relabel earlier Core/Search counters with a new timestamp.
+            limits = _github_rate_limits()
+            reservations = _budget_reservation_ledger(self.policy)
+            before, current = self.last_limits["graphql"], limits["graphql"]
+            if current["reset"] != before["reset"] or current["remaining"] > before["remaining"]:
+                decision = self._allowance_denied(
+                    "Source GraphQL observation window changed; cumulative scan cost is unproved")
+            else:
+                # One allowance belongs to the entire leased Source operation,
+                # including its health checker, every queue/page, previews and
+                # rate observations. External consumption counts conservatively.
+                # The known previous request and this metadata query cost at
+                # least their reserved amount even if counters lag a response.
+                self.observed_spend += max(before["remaining"] - current["remaining"],
+                                           self.pending_cost + 1)
+                self.pending_cost = 0
+                self.last_limits = copy.deepcopy(limits)
+                if self.observed_spend + query_cost > ceiling:
+                    decision = self._allowance_denied(
+                        "Whole Source GraphQL observation allowance is exhausted")
+                else:
+                    decision = _evaluate_github_budget(self.policy, limits, now=time.time(),
+                        status_revision=_current_github_scan_status_revision(),
+                        reserved_other=reservations["totals"], active_reservations=reservations["count"])
+        if not decision["allowed"]:
+            lease = self.admission.get("_lease")
+            self.admission.clear()
+            self.admission.update(decision)
+            self.admission["_lease"] = lease
+            raise _GitHubSearchBudgetDenied(decision)
+        self.pending_cost = query_cost
+
+
 class _GitHubScanLease:
     """Renew one SQLite-backed scan lease while external work is in flight."""
 
@@ -923,7 +992,8 @@ def _arm_budget_waiter(task, decision: dict, *, starvation_timeout_seconds: int 
 @contextmanager
 def _github_scan_admission(profile: dict, purpose: str,
                            *, profile_id: str | None = None,
-                           budget_route: str | None = None, task=None):
+                           budget_route: str | None = None, task=None,
+                           publish_refresh_status: bool = True):
     """Admit one expensive scan and hold its cross-process reservation."""
     now = time.time()
     admission_priority = getattr(
@@ -1086,6 +1156,8 @@ def _github_scan_admission(profile: dict, purpose: str,
                     "fairness_waiter", "scan_in_progress"}):
             _clear_budget_waiter_after_admission(task)
         decision["_lease"] = lease
+        if decision.get("allowed") and policy.get("cost_accounting"):
+            lease.search_budget = _GraphQLSearchBudget(policy, decision)
         yield decision
     finally:
         _scan_lease_context.lease = previous
@@ -1094,7 +1166,7 @@ def _github_scan_admission(profile: dict, purpose: str,
             "repository": profile.get("repository", ""),
             "status": (None if decision.get("allowed")
                        else _refresh_blocked_status(decision)),
-        } if profile_id is not None and not lease.lost else None)
+        } if publish_refresh_status and profile_id is not None and not lease.lost else None)
         lease.release(refresh_status=refresh_status)
 
 
@@ -1639,55 +1711,17 @@ def _gh_executable() -> str:
 
 
 def _github_search(repository: str, query: str) -> dict:
-    """Return count plus public item metadata used for age and movement metrics."""
-    def fetch_page(page: int) -> dict:
-        _ensure_github_scan_lease(renew=True)
-        command = [
-            _gh_executable(), "api", "search/issues", "--method", "GET",
-            "--field", f"q=repo:{repository} {query}", "--field", "per_page=100",
-            "--field", f"page={page}",
-        ]
-        run = subprocess.run(command, capture_output=True, text=True, timeout=30,
-                             encoding="utf-8", errors="replace")
-        _ensure_github_scan_lease()
-        if run.returncode:
-            raise RuntimeError(
-                (run.stderr or run.stdout or "gh api завершился с ошибкой").strip())
-        return json.loads(run.stdout)
+    """Read exact queue membership without spending the REST Search window."""
+    from .github_search import search
 
-    if db.is_paused():
-        raise _GitHubScanPaused("pipeline scan interrupted by global pause")
-    payload = fetch_page(1)
-    total = int(payload.get("total_count", len(payload.get("items", []))))
-    raw_items = list(payload.get("items", []))
-    # GitHub Search exposes at most 1000 matches. Fetching all exposed pages keeps
-    # movement metrics exact for ordinary queues instead of silently sampling 100.
-    exposed_total = min(total, 1000)
-    for page in range(2, math.ceil(exposed_total / 100) + 1):
-        # Page 1 may have been in flight when pause was enabled. It is safe to
-        # finish that request, but never start another page from a partial scan.
+    def check():
         if db.is_paused():
             raise _GitHubScanPaused("pipeline scan interrupted by global pause")
-        page_items = fetch_page(page).get("items", [])
-        raw_items.extend(page_items)
-        if len(page_items) < 100:
-            break
+        _ensure_github_scan_lease(renew=True)
 
-    items = []
-    for item in raw_items:
-        kind = "pr" if item.get("pull_request") is not None else "issue"
-        number = int(item["number"])
-        items.append({
-            "key": f"{kind}:{number}", "kind": kind, "number": number,
-            "title": item.get("title") or f"#{number}",
-            "labels": sorted(label.get("name", "") for label in item.get("labels", [])
-                             if label.get("name")),
-            "created_at": item.get("created_at"), "updated_at": item.get("updated_at"),
-            "closed_at": item.get("closed_at"),
-            "merged_at": (item.get("pull_request") or {}).get("merged_at"),
-            "url": item.get("html_url"),
-        })
-    return {"count": total, "items": items, "membership_complete": total <= len(items)}
+    lease = getattr(_scan_lease_context, "lease", None)
+    return search(repository, query, _gh_api_json, check, getattr(lease, "search_budget", None),
+                  after_data_request=lambda: _ensure_github_scan_lease(renew=True))
 
 
 def _github_count(repository: str, query: str) -> int:
@@ -5262,6 +5296,7 @@ def _analyze_without_budget(profile_id: str, series: list[dict], *,
                 "task_status": matching.get("next_status") if matching else None,
                 **projection,
                 "membership_complete": membership_complete, "age": age,
+                "search_usage": [search["usage"] for search in searches if "usage" in search],
                 "admission_items": ordered_members,
                 "items": ordered_members[:priority_settings["max_items"]]
                 if priority_settings else [],
@@ -5319,12 +5354,24 @@ def _analyze_without_budget(profile_id: str, series: list[dict], *,
             and isinstance(queue.get("replica_status"), dict)
             and not queue["replica_status"].get("valid", True)
         ]
+        lease = getattr(_scan_lease_context, "lease", None)
+        search_budget = getattr(lease, "search_budget", None)
+        if search_budget is not None and not search_budget.used:
+            # Other observation transports retain their existing semantics.
+            # This allowance accounts requests made by GraphQL search only.
+            search_budget = None
         if db.is_paused():
             github_rate_limit = (cached[1].get("github_rate_limit")
                                  if cached else None)
         else:
             try:
-                github_rate_limit = _github_rate_limits()
+                if search_budget is not None:
+                    # Reserve and charge the final metadata request to the same
+                    # whole-operation allowance before either cache/history CAS.
+                    search_budget.before_request(0)
+                    github_rate_limit = copy.deepcopy(search_budget.last_limits)
+                else:
+                    github_rate_limit = _github_rate_limits()
             except _GitHubRateLimitUnavailable:
                 # Without an admission policy this is optional UI telemetry,
                 # not a safety gate. Budget-enabled profiles still propagate
@@ -5353,6 +5400,13 @@ def _analyze_without_budget(profile_id: str, series: list[dict], *,
             "bottleneck": bottleneck["id"] if bottleneck and bottleneck["backlog"] else None,
             "generated_at": now.timestamp(),
         }
+        if search_budget is not None:
+            result["source_search_usage"] = {
+                "graphql_allowance": search_budget.policy["requested_cost"]["graphql"],
+                "conservative_graphql_spend": search_budget.observed_spend + search_budget.pending_cost,
+                "scope": "whole leased Source operation including health, metadata, previews and data",
+                "admission_granted": False,
+            }
         _ensure_github_scan_lease()
         continuation = getattr(_scan_lease_context, "continuation", None)
         atomic_snapshot = ({"profile_id": profile_id, "repository": profile["repository"],
@@ -5438,6 +5492,8 @@ def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True,
                 profile_id, profile, series,
                 _replace_admission_with_lease_failure(
                     admission, profile, exc))
+        except _GitHubSearchBudgetDenied as exc:
+            return _budget_blocked_cached(profile_id, profile, series, exc.decision)
         except _GitHubRateLimitUnavailable as exc:
             return _budget_blocked_cached(
                 profile_id, profile, series,
