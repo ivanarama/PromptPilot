@@ -93,6 +93,258 @@ class _GitHubRateLimitUnavailable(RuntimeError):
     """The authenticated GitHub budget cannot be proved from valid responses."""
 
 
+class _GitHubSearchBudgetDenied(RuntimeError):
+    def __init__(self, decision):
+        super().__init__(decision["reason"])
+        self.decision = decision
+
+
+class _LegacyGraphQLSearchBudget:
+    """Recheck the existing complete scan estimate before every GraphQL page."""
+    def __init__(self, policy, admission):
+        self.policy, self.admission = policy, admission
+        self.last_limits = copy.deepcopy(admission["github_rate_limit"])
+        # The initial canonical rateLimit observation has already executed.
+        self.observed_spend, self.pending_cost = 1, 0
+        self.used = False
+
+    def _allowance_denied(self, reason):
+        return _budget_denied(self.policy, state="budget_in_flight", reason=reason,
+            now=time.time(), limits=self.last_limits,
+            status_revision=_current_github_scan_status_revision())
+
+    def before_request(self, query_cost):
+        self.used = True
+        _ensure_github_scan_lease(renew=True)
+        ceiling = self.policy["requested_cost"]["graphql"]
+        if query_cost > ceiling:
+            decision = _budget_denied(self.policy, state="invalid_config",
+                reason="GraphQL search query cost exceeds configured insights estimate",
+                now=time.time(), status_revision=_current_github_scan_status_revision())
+            decision["graphql_query_cost"] = query_cost
+            decision["configured_graphql_cost"] = ceiling
+        elif self.observed_spend + self.pending_cost + 1 + query_cost > ceiling:
+            decision = self._allowance_denied(
+                "Whole Source GraphQL estimate cannot cover another rate observation and query")
+        else:
+            # Same canonical metadata producer as initial scan admission, with
+            # its existing lease and Native-attempt publication fence. Never
+            # relabel earlier Core/Search counters with a new timestamp.
+            limits = _github_rate_limits()
+            reservations = _budget_reservation_ledger(self.policy)
+            before, current = self.last_limits["graphql"], limits["graphql"]
+            if current["reset"] != before["reset"] or current["remaining"] > before["remaining"]:
+                decision = self._allowance_denied(
+                    "Source GraphQL observation window changed; cumulative scan cost is unproved")
+            else:
+                # One allowance belongs to the entire leased Source operation,
+                # including its health checker, every queue/page, previews and
+                # rate observations. External consumption counts conservatively.
+                # The known previous request and this metadata query cost at
+                # least their reserved amount even if counters lag a response.
+                self.observed_spend += max(before["remaining"] - current["remaining"],
+                                           self.pending_cost + 1)
+                self.pending_cost = 0
+                self.last_limits = copy.deepcopy(limits)
+                if self.observed_spend + query_cost > ceiling:
+                    decision = self._allowance_denied(
+                        "Whole Source GraphQL observation allowance is exhausted")
+                else:
+                    decision = _evaluate_github_budget(self.policy, limits, now=time.time(),
+                        status_revision=_current_github_scan_status_revision(),
+                        reserved_other=reservations["totals"], active_reservations=reservations["count"])
+        if not decision["allowed"]:
+            lease = self.admission.get("_lease")
+            self.admission.clear()
+            self.admission.update(decision)
+            self.admission["_lease"] = lease
+            raise _GitHubSearchBudgetDenied(decision)
+        self.pending_cost = query_cost
+
+    def before_preview(self):
+        self.before_request(1)
+
+    def after_preview(self, cost):
+        pass
+
+    def before_data(self, quote):
+        self.before_request(quote)
+
+    def after_data(self, actual):
+        if actual > self.pending_cost:
+            raise ValueError("GraphQL search cost changed after preview")
+
+    def metadata(self):
+        self.before_request(0)
+
+    def failed_request(self):
+        pass
+
+
+class _GraphQLSearchBudget:
+    """Successful own-cost proof and a separate conservative account view."""
+    def __init__(self, policy, admission):
+        from .github_observation_budget import AvailabilityEnvelope, ObservationCost
+        self.policy, self.admission = policy, admission
+        self.last_limits = copy.deepcopy(admission["github_rate_limit"])
+        self.cost = ObservationCost(policy["requested_cost"]["graphql"])
+        self.envelope = AvailabilityEnvelope(self.last_limits)
+        lease = admission.get("_lease")
+        self.initial_metadata_cost = getattr(lease, "last_graphql_metadata_cost", None)
+        self.used = False
+        self.health_context = None
+        self.health_provenance = None
+
+    @property
+    def observed_spend(self):
+        return self.cost.charged
+
+    @property
+    def pending_cost(self):
+        return self.cost.escrow
+
+    def _record_denial(self, reason, state):
+        decision = _budget_denied(self.policy, state=state, reason=reason,
+            now=time.time(), limits=self.last_limits,
+            status_revision=_current_github_scan_status_revision())
+        decision["source_cost_uncertain"] = self.cost.uncertain
+        decision["source_cost_charged"] = self.cost.charged
+        decision["source_cost_observed_actual"] = self.cost.observed_actual
+        lease = self.admission.get("_lease")
+        self.admission.clear(); self.admission.update(decision); self.admission["_lease"] = lease
+        return decision
+
+    def _deny(self, reason, state="budget_in_flight"):
+        raise _GitHubSearchBudgetDenied(self._record_denial(reason, state))
+
+    def activate(self):
+        if not self.used:
+            self.used = True
+            try:
+                self.cost.bootstrap(self.initial_metadata_cost)
+            except ValueError as exc:
+                self._deny(str(exc), "unavailable")
+
+    def check_account(self):
+        reservations = _budget_reservation_ledger(self.policy)
+        projected = self.envelope.projected_limits(self.last_limits)
+        decision = _evaluate_github_budget(self.policy, projected, now=time.time(),
+            status_revision=_current_github_scan_status_revision(),
+            reserved_other=reservations["totals"], active_reservations=reservations["count"])
+        # Never store or label our conservative projection as a canonical rate.
+        decision["github_rate_limit"] = copy.deepcopy(self.last_limits)
+        decision["source_availability_envelope"] = {k:r["remaining"] for k,r in projected.items()}
+        if not decision["allowed"]:
+            lease = self.admission.get("_lease")
+            self.admission.clear(); self.admission.update(decision); self.admission["_lease"] = lease
+            raise _GitHubSearchBudgetDenied(decision)
+
+    def metadata(self):
+        self.activate(); _ensure_github_scan_lease(renew=True); self.check_account()
+        try:
+            self.cost.reserve()  # unknown pricing: one finite remaining escrow
+            limits = _github_rate_limits()
+            lease = self.admission.get("_lease")
+            actual = getattr(lease, "last_graphql_metadata_cost", None)
+            self.cost.settle(actual)
+        except _GitHubScanLeaseFailure:
+            self.cost.poison(); raise
+        except _GitHubRateLimitUnavailable:
+            self.cost.poison(); raise
+        except ValueError as exc:
+            self.cost.poison(); self._deny(str(exc), "unavailable")
+        self.envelope.charge_graphql(actual)
+        self.envelope.observe(limits)
+        self.last_limits = copy.deepcopy(limits)
+        self.check_account()
+
+    def before_preview(self):
+        self.metadata()
+        try:self.cost.reserve()
+        except ValueError as exc:self._deny(str(exc))
+
+    def after_preview(self, cost):
+        self._settle(cost)
+
+    def before_data(self, quote):
+        self.metadata()
+        try:self.cost.reserve(quote)
+        except ValueError as exc:self._deny(str(exc))
+
+    def after_data(self, actual):
+        self._settle(actual)
+
+    def _settle(self, actual):
+        try:self.cost.settle(actual)
+        except ValueError as exc:self._deny(str(exc), "unavailable")
+        self.envelope.charge_graphql(actual)
+
+    def failed_request(self):
+        self.cost.poison()
+
+    def prepare_health(self, profile):
+        from .source_graphql_cost import health_contract
+        self.activate(); self.check_account()
+        try:
+            expected = health_contract(profile)
+        except (OSError, ValueError) as exc:self._deny(str(exc), "invalid_config")
+        try:
+            self.cost.reserve()
+        except ValueError as exc:self._deny(str(exc))
+        self.health_context = dict(expected, nonce=uuid.uuid4().hex, allowance=self.cost.escrow)
+
+    def consume_health(self, diagnostics, profile):
+        from .source_graphql_cost import digest, health_contract, validate_receipt
+        try:
+            expected = health_contract(profile)  # artifact/contract must still be exact
+            receipt = (diagnostics or {}).get("source_graphql_usage")
+            context = self.health_context
+            if (diagnostics or {}).get("exit_code") not in (0,1) or type((diagnostics or {}).get("exit_code")) is not int:
+                raise ValueError("technical checker exit cannot prove successful Source cost")
+            actual = validate_receipt(receipt, expected, nonce=context["nonce"], allowance=context["allowance"])
+            self.cost.settle(actual, allow_zero=True)
+        except (OSError, TypeError, ValueError) as exc:
+            self.cost.poison()
+            raise ValueError("Source checker cost protocol failed: " + str(exc)) from exc
+        self.envelope.charge_graphql(actual)
+        proof = {"executable_sha256":expected["executable_sha256"], "receipt_sha256":digest(receipt)}
+        diagnostics["source_graphql_cost_proof"] = proof
+        self.health_provenance = dict(proof, reused=False, charged=actual)
+        self.health_context = None
+
+    def refuse_health(self, payload, profile):
+        from .source_graphql_cost import health_contract, validate_refusal
+        if not isinstance(payload,dict) or set(payload)!={"source_graphql_usage"}:
+            raise ValueError("invalid Source checker allowance refusal report")
+        expected = health_contract(profile)
+        context = self.health_context
+        actual = validate_refusal(payload["source_graphql_usage"], expected,
+            nonce=context["nonce"], allowance=context["allowance"])
+        self.cost.settle(actual, allow_zero=True)
+        self.envelope.charge_graphql(actual)
+        self.health_context = None
+        self._deny("Source checker clean allowance_exhausted refusal", "budget_in_flight")
+
+    def reuse_health(self, diagnostics, profile, age):
+        from .source_graphql_cost import digest, health_contract, validate_receipt
+        self.activate()
+        try:
+            ttl = max(0,int(profile["health_check"].get("cache_seconds",1800)))
+            if (not isinstance(age,(int,float)) or isinstance(age,bool)
+                    or not math.isfinite(age) or not 0<=age<ttl):
+                raise ValueError("cached health cost proof is outside its original TTL")
+            expected = health_contract(profile)
+            if type(diagnostics.get("exit_code"))is not int or diagnostics["exit_code"] not in (0,1):
+                raise ValueError("cached technical checker failure cannot prove Source cost")
+            receipt = (diagnostics or {}).get("source_graphql_usage")
+            validate_receipt(receipt, expected, nonce=receipt["nonce"], allowance=receipt["allowance"])
+            proof = diagnostics["source_graphql_cost_proof"]
+            if proof != {"executable_sha256":expected["executable_sha256"], "receipt_sha256":digest(receipt)}:
+                raise ValueError("cached health cost proof differs from current artifact/receipt")
+        except (OSError, KeyError, TypeError, ValueError) as exc:self._deny(str(exc), "unavailable")
+        self.health_provenance = dict(proof, reused=True, age_seconds=age, charged=0)
+
+
 class _GitHubScanLease:
     """Renew one SQLite-backed scan lease while external work is in flight."""
 
@@ -123,7 +375,11 @@ class _GitHubScanLease:
 
     @property
     def guard(self) -> dict:
-        return {"scope": self.scope, "token": self.token}
+        result = {"scope": self.scope, "token": self.token}
+        continuation = getattr(self, "continuation", None)
+        if continuation is not None:
+            result["continuation"] = continuation.guard
+        return result
 
     def _mark_lost(self) -> None:
         with self._state_lock:
@@ -243,8 +499,19 @@ class _GitHubScanLease:
             if self._thread is not None:
                 self._thread.join(timeout=2)
             try:
+                failure = ((refresh_status or {}).get("status") or {}).get("github_budget", {}).get(
+                    "source_checker_failure_profile_hash") is not None
+                failure_guard = None
+                if failure:
+                    try:
+                        if getattr(self,"continuation",None) is not None:
+                            self.continuation.check()
+                        failure_guard = self.guard
+                    except _GitHubScanLeaseFailure:
+                        pass  # still release our own token; no new failure proof
                 db.release_pipeline_scan_lease(
-                    self.scope, self.token, refresh_status=refresh_status)
+                    self.scope, self.token, refresh_status=refresh_status,
+                    **({"checker_failure_guard": failure_guard} if failure else {}))
             except Exception:
                 # A failed release stays fail-closed until the renewable lease
                 # expires; never let cleanup hide the scan's original outcome.
@@ -311,14 +578,23 @@ def _strict_budget_vector(raw: dict, path: str) -> dict:
 def _github_budget_policy(profile: dict) -> dict | None:
     """Normalize the opt-in admission policy without changing legacy profiles."""
     raw = profile.get("github_budget")
+    health = profile.get("health_check") or {}
+    declared_cost = isinstance(health,dict) and "source_graphql_cost" in health
     if raw is None or raw is False:
+        if declared_cost:raise ValueError("Source checker cost declaration requires github_budget.source_cost_protocol")
         return None
     if not isinstance(raw, dict):
         raise ValueError("github_budget должен быть JSON-объектом")
     enabled = raw.get("enabled", True)
+    source_cost_protocol = raw.get("source_cost_protocol")
+    if "source_cost_protocol" in raw and source_cost_protocol != "source-graphql-cost-v1":
+        raise ValueError("unsupported github_budget.source_cost_protocol")
+    if declared_cost and source_cost_protocol is None:
+        raise ValueError("Source checker cost declaration requires github_budget.source_cost_protocol")
     if not isinstance(enabled, bool):
         raise ValueError("github_budget.enabled должен быть true или false")
     if not enabled:
+        if source_cost_protocol is not None:raise ValueError("Source cost protocol requires enabled github_budget")
         return None
 
     minimum_remaining = _minimum_remaining(
@@ -360,8 +636,10 @@ def _github_budget_policy(profile: dict) -> dict | None:
         raise ValueError("github_budget.essential_snapshot_headroom must be a boolean")
     if essential_snapshot_headroom and costs is None:
         raise ValueError("github_budget.essential_snapshot_headroom requires costs")
+    if source_cost_protocol is not None and costs is None:
+        raise ValueError("Source cost protocol requires configured finite costs")
 
-    return {
+    policy = {
         "minimum_remaining": minimum_remaining,
         "priority_one_headroom": priority_one_headroom,
         "costs": costs,
@@ -384,6 +662,9 @@ def _github_budget_policy(profile: dict) -> dict | None:
         # profiles cannot accidentally opt out of each other's reservation.
         "lease_scope": _GITHUB_SCAN_LEASE_SCOPE,
     }
+    if source_cost_protocol is not None:
+        policy["source_cost_protocol"] = source_cost_protocol
+    return policy
 
 
 def _with_shared_budget_floor(policy: dict) -> dict:
@@ -801,6 +1082,9 @@ def _evaluate_github_budget(policy: dict, limits: dict | None, *,
 
 def _budget_reservation_ledger(policy: dict, *, now: float | None = None) -> dict:
     """Read the shared ledger, adding fairness options only when enabled."""
+    continuation = getattr(_scan_lease_context, "continuation", None)
+    if continuation is not None:
+        return continuation.ledger(policy)
     timeout = int(policy.get("starvation_timeout_seconds") or 0)
     if not timeout:
         return db.pipeline_github_budget_reservations(policy["lease_scope"])
@@ -872,6 +1156,8 @@ def _priority_waiter_decision(
 
 def _arm_budget_waiter(task, decision: dict, *, starvation_timeout_seconds: int = 0) -> dict:
     """Persist a budget handoff before the serial admission lease is released."""
+    if getattr(_scan_lease_context, "continuation", None) is not None:
+        return decision  # This attempt already owns admission; no scheduler edits.
     state = decision.get("state")
     if state not in {
             "budget_in_flight", "ledger_changed", "priority_waiter",
@@ -914,7 +1200,8 @@ def _arm_budget_waiter(task, decision: dict, *, starvation_timeout_seconds: int 
 @contextmanager
 def _github_scan_admission(profile: dict, purpose: str,
                            *, profile_id: str | None = None,
-                           budget_route: str | None = None, task=None):
+                           budget_route: str | None = None, task=None,
+                           publish_refresh_status: bool = True):
     """Admit one expensive scan and hold its cross-process reservation."""
     now = time.time()
     admission_priority = getattr(
@@ -1004,6 +1291,8 @@ def _github_scan_admission(profile: dict, purpose: str,
         policy["lease_scope"], token, policy["lease_seconds"],
         status_revision=(status_revision
                          if isinstance(status_revision, int) else None))
+    lease.continuation = getattr(_scan_lease_context, "continuation", None)
+    lease.source_cost_protocol = policy.get("source_cost_protocol")
     lease.expires_at = acquired.get("expires_at")
     previous = getattr(_scan_lease_context, "lease", None)
     _scan_lease_context.lease = lease
@@ -1076,6 +1365,10 @@ def _github_scan_admission(profile: dict, purpose: str,
                     "fairness_waiter", "scan_in_progress"}):
             _clear_budget_waiter_after_admission(task)
         decision["_lease"] = lease
+        if decision.get("allowed") and policy.get("cost_accounting"):
+            meter = (_GraphQLSearchBudget if policy.get("source_cost_protocol") == "source-graphql-cost-v1"
+                     else _LegacyGraphQLSearchBudget)
+            lease.search_budget = meter(policy, decision)
         yield decision
     finally:
         _scan_lease_context.lease = previous
@@ -1084,8 +1377,8 @@ def _github_scan_admission(profile: dict, purpose: str,
             "repository": profile.get("repository", ""),
             "status": (None if decision.get("allowed")
                        else _refresh_blocked_status(decision)),
-        } if (profile_id is not None and budget_route == "insights"
-              and not lease.lost) else None)
+        } if (publish_refresh_status and profile_id is not None
+              and budget_route == "insights" and not lease.lost) else None)
         lease.release(refresh_status=refresh_status)
 
 
@@ -1093,6 +1386,9 @@ def _ensure_github_scan_lease(*, renew: bool = False) -> None:
     lease = getattr(_scan_lease_context, "lease", None)
     if lease is not None:
         lease.ensure_owned(renew=renew)
+    continuation = getattr(_scan_lease_context, "continuation", None)
+    if continuation is not None:
+        continuation.check()
 
 
 def _current_github_scan_status_revision() -> int | None:
@@ -1187,6 +1483,8 @@ def _reservation_denied(policy: dict, limits: dict | None, result: dict, *,
 
 def _clear_budget_waiter_after_admission(task) -> None:
     """Settle a durable handoff when no in-flight reservation will do it."""
+    if getattr(_scan_lease_context, "continuation", None) is not None:
+        return
     task_id = getattr(task, "id", None)
     started_at = getattr(task, "started_at", None)
     # Synthetic/read-only callers cannot own a durable marker. Real worker
@@ -1456,7 +1754,9 @@ def _profile_fingerprint(profile: dict) -> str:
     # means. Keep last-good data readable when an operator enables/tunes the
     # budget while GitHub quota is already low.
     observed_profile = copy.deepcopy(profile)
-    observed_profile.pop("github_budget", None)
+    budget = observed_profile.pop("github_budget", None)
+    if isinstance(budget,dict) and budget.get("source_cost_protocol")=="source-graphql-cost-v1":
+        observed_profile = {"profile":observed_profile, "source_cost_protocol":"source-graphql-cost-v1"}
     encoded = json.dumps(
         observed_profile, ensure_ascii=False, sort_keys=True,
         separators=(",", ":"), default=str,
@@ -1547,7 +1847,7 @@ def _profile_lock(profile_id: str) -> threading.Lock:
 
 
 def _publish_cache(profile_id: str, profile: dict, generation: int, epoch: int,
-                   revision: int, result: dict) -> bool:
+                   revision: int, result: dict, *, pipeline_snapshot=None) -> bool:
     """Atomically publish a complete last-good response if still current."""
     with _cache_state_lock:
         if generation != _cache_generation:
@@ -1575,7 +1875,8 @@ def _publish_cache(profile_id: str, profile: dict, generation: int, epoch: int,
                 publication_revision_key=(
                     _published_profile_revision_key(profile_id)),
                 companion_key=_published_profile_key(profile_id),
-                companion_value=profile_hash):
+                companion_value=profile_hash,
+                **({"pipeline_snapshot": pipeline_snapshot} if pipeline_snapshot is not None else {})):
             if lease is not None:
                 # The CAS can also lose to an ordinary cache invalidation or a
                 # newer refresh. Distinguish that benign race from a rejected
@@ -1584,6 +1885,10 @@ def _publish_cache(profile_id: str, profile: dict, generation: int, epoch: int,
             return False
         _cache[profile_id] = (
             generated_at, result, epoch, profile_hash, revision)
+        continuation = getattr(_scan_lease_context, "continuation", None)
+        if continuation is not None:
+            continuation.published = {"profile_hash": profile_hash, "epoch": epoch,
+                                      "revision": revision, "generated_at": generated_at}
         return True
 
 
@@ -1620,55 +1925,17 @@ def _gh_executable() -> str:
 
 
 def _github_search(repository: str, query: str) -> dict:
-    """Return count plus public item metadata used for age and movement metrics."""
-    def fetch_page(page: int) -> dict:
-        _ensure_github_scan_lease(renew=True)
-        command = [
-            _gh_executable(), "api", "search/issues", "--method", "GET",
-            "--field", f"q=repo:{repository} {query}", "--field", "per_page=100",
-            "--field", f"page={page}",
-        ]
-        run = subprocess.run(command, capture_output=True, text=True, timeout=30,
-                             encoding="utf-8", errors="replace")
-        _ensure_github_scan_lease()
-        if run.returncode:
-            raise RuntimeError(
-                (run.stderr or run.stdout or "gh api завершился с ошибкой").strip())
-        return json.loads(run.stdout)
+    """Read exact queue membership without spending the REST Search window."""
+    from .github_search import search
 
-    if db.is_paused():
-        raise _GitHubScanPaused("pipeline scan interrupted by global pause")
-    payload = fetch_page(1)
-    total = int(payload.get("total_count", len(payload.get("items", []))))
-    raw_items = list(payload.get("items", []))
-    # GitHub Search exposes at most 1000 matches. Fetching all exposed pages keeps
-    # movement metrics exact for ordinary queues instead of silently sampling 100.
-    exposed_total = min(total, 1000)
-    for page in range(2, math.ceil(exposed_total / 100) + 1):
-        # Page 1 may have been in flight when pause was enabled. It is safe to
-        # finish that request, but never start another page from a partial scan.
+    def check():
         if db.is_paused():
             raise _GitHubScanPaused("pipeline scan interrupted by global pause")
-        page_items = fetch_page(page).get("items", [])
-        raw_items.extend(page_items)
-        if len(page_items) < 100:
-            break
+        _ensure_github_scan_lease(renew=True)
 
-    items = []
-    for item in raw_items:
-        kind = "pr" if item.get("pull_request") is not None else "issue"
-        number = int(item["number"])
-        items.append({
-            "key": f"{kind}:{number}", "kind": kind, "number": number,
-            "title": item.get("title") or f"#{number}",
-            "labels": sorted(label.get("name", "") for label in item.get("labels", [])
-                             if label.get("name")),
-            "created_at": item.get("created_at"), "updated_at": item.get("updated_at"),
-            "closed_at": item.get("closed_at"),
-            "merged_at": (item.get("pull_request") or {}).get("merged_at"),
-            "url": item.get("html_url"),
-        })
-    return {"count": total, "items": items, "membership_complete": total <= len(items)}
+    lease = getattr(_scan_lease_context, "lease", None)
+    return search(repository, query, _gh_api_json, check, getattr(lease, "search_budget", None),
+                  after_data_request=lambda: _ensure_github_scan_lease(renew=True))
 
 
 def _github_count(repository: str, query: str) -> int:
@@ -1744,13 +2011,19 @@ def _gh_api_json(args: list[str], input_value: dict | None = None):
     _ensure_github_scan_lease()
     if run.returncode:
         raise RuntimeError((run.stderr or run.stdout or "gh api failed").strip())
-    return json.loads(run.stdout) if run.stdout.strip() else None
+    if not run.stdout.strip():
+        return None
+    lease = getattr(_scan_lease_context, "lease", None)
+    if getattr(lease,"source_cost_protocol",None) == "source-graphql-cost-v1":
+        from .source_graphql_cost import unique_object
+        return json.loads(run.stdout, object_pairs_hook=unique_object)
+    return json.loads(run.stdout)
 
 
 _GITHUB_LOGIN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?")
 _GITHUB_RATE_LIMIT_QUERY = """query PromptPilotRateLimit {
   viewer { login }
-  rateLimit { limit remaining resetAt used }
+  rateLimit { limit remaining resetAt used cost }
 }"""
 
 
@@ -1914,6 +2187,11 @@ def _github_rate_limits() -> dict:
     }
     lease = getattr(_scan_lease_context, "lease", None)
     if isinstance(lease, _GitHubScanLease):
+        rate = (graphql_payload.get("data") or {}).get("rateLimit") or {}
+        cost = rate.get("cost")
+        clean_errors = ("errors" not in graphql_payload or
+                        isinstance(graphql_payload["errors"], list) and not graphql_payload["errors"])
+        lease.last_graphql_metadata_cost = cost if clean_errors and type(cost) is int and cost >= 1 else None
         try:
             stored = db.record_pipeline_github_rate_snapshot(
                 lease.scope, result, observed_at=time.time(),
@@ -2341,6 +2619,46 @@ def _intake_snapshot_defer(config: dict, data: dict, profile_id: str,
             "profile_id": profile_id, "queue_id": queue_id, "wip_diagnostics": details}
 
 
+def _required_snapshot_defer(profile_id: str, queue_id: str, state: str) -> dict:
+    # This is an observation prerequisite, never an empty-queue verdict or a
+    # replacement for execution/mutation admission. Refreshes use the same
+    # shared scan lease/budget as the sampler, before any provider is loaded.
+    return {"action": "defer",
+            "defer_until": (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat(),
+            "reason": "Required pipeline snapshot unavailable: " + state,
+            "profile_id": profile_id, "queue_id": queue_id,
+            "snapshot_admission": {"state": state}}
+
+
+def _required_snapshot_state(data, profile: dict, queue_id: str | None) -> str | None:
+    cache = data.get("cache") if isinstance(data, dict) else None
+    if not isinstance(cache, dict):
+        return "missing cache metadata"
+    if cache.get("refresh_blocked"):
+        return "refresh_blocked=" + str(cache["refresh_blocked"])
+    if cache.get("invalidated"):
+        return "invalidated"
+    if cache.get("stale") is not False:
+        return "stale"
+    if cache.get("available") is not True or cache.get("complete") is not True:
+        return "incomplete"
+    if cache.get("profile_hash") != _profile_fingerprint(profile):
+        return "profile changed"
+    # This queue's Source prerequisite must not turn an unrelated partial TAIL
+    # into a new global dependency. Project-owned global gates still apply.
+    queues = data.get("queues")
+    members = [q for q in queues if isinstance(q, dict) and q.get("id") == queue_id] if isinstance(queues, list) else []
+    if not queue_id or len(members) != 1 or members[0].get("membership_complete") is not True:
+        return "incomplete queue membership"
+    if profile.get("health_check"):
+        diagnostics = data.get("diagnostics")
+        if not isinstance(diagnostics, dict):
+            return "checker unavailable"
+        if diagnostics.get("checker_failed") or diagnostics.get("errors"):
+            return "checker failed"
+    return None
+
+
 def dispatch_gate(task) -> dict | None:
     """Evaluate an optional user-owned, token-free gate for a series task.
 
@@ -2356,24 +2674,51 @@ def dispatch_gate(task) -> dict | None:
             config = queue_config.get("dispatch_gate")
             if not marker or marker not in title or not isinstance(config, dict):
                 continue
+            require_snapshot = config.get("require_fresh_snapshot", False)
+            if not isinstance(require_snapshot, bool):
+                return _required_snapshot_defer(
+                    profile_id, queue_config["id"],
+                    "dispatch_gate.require_fresh_snapshot must be a boolean")
+            profile_hash = _profile_fingerprint(profile) if require_snapshot else None
             # Dispatch only decides whether starting an agent is useful; every
             # mutation is still protected by the project's own fresh gate.
             # Reuse the five-minute snapshot so several due stages cannot each
             # spend hundreds of GitHub requests on the same queue state.
-            data = read_cached(profile_id, db.list_series())
-            cache = data.get("cache") or {}
-            if (isinstance(config.get("backpressure"), dict)
-                    and (cache.get("stale") or not cache.get("complete"))):
+            try:
+                data = read_cached(profile_id, db.list_series())
+            except Exception:
+                if require_snapshot:
+                    return _required_snapshot_defer(
+                        profile_id, queue_config["id"], "cached read failed")
+                raise
+            cache = data.get("cache") or {} if isinstance(data, dict) else {}
+            if ((require_snapshot and _required_snapshot_state(data, profile, queue_config["id"]) is not None)
+                    or (isinstance(config.get("backpressure"), dict)
+                        and (cache.get("stale") or not cache.get("complete")))):
                 # Intake cannot rely on stale state indefinitely. Refresh via
                 # the existing shared scan lease/budget and cache, never via an
                 # agent or an unbudgeted direct GitHub request.
                 try:
                     data = analyze(profile_id, db.list_series(), use_cache=False,
-                                   refresh_diagnostics=True)
+                                   refresh_diagnostics=True,
+                                   **({"reuse_fresh": True, "snapshot_queue_id": queue_config["id"]}
+                                      if require_snapshot else {}))
                 except Exception:
+                    if require_snapshot:
+                        return _required_snapshot_defer(profile_id, queue_config["id"], "refresh failed")
                     return _intake_snapshot_defer(config, data, profile_id,
                                                    queue_config["id"], refresh_failed=True)
-                cache = data.get("cache") or {}
+                cache = data.get("cache") or {} if isinstance(data, dict) else {}
+            if require_snapshot:
+                try:
+                    current = _profiles().get(profile_id)
+                    state = ("worker paused" if db.is_paused() else "profile changed"
+                             if not isinstance(current, dict) or _profile_fingerprint(current) != profile_hash
+                             else _required_snapshot_state(data, current, queue_config["id"]))
+                except Exception:
+                    state = "snapshot revalidation failed"
+                if state is not None:
+                    return _required_snapshot_defer(profile_id, queue_config["id"], state)
             # A stale/partial empty snapshot must never complete a live stage as
             # empty, and stale diagnostics must not defer it. The project-owned
             # preflight remains the authoritative fallback.
@@ -2398,7 +2743,7 @@ def dispatch_gate(task) -> dict | None:
                            if isinstance(item, dict)}
                 if members and members.issubset(set(exclusions)):
                     return {"action": "defer", "defer_for": "30m",
-                            "reason": "неизменные задачи ожидают решения: " + ", ".join(f"#{n}" for n in exclusions),
+                            "reason": "локальное ограничение допуска неизменных задач: " + ", ".join(f"#{n}" for n in exclusions),
                             "profile_id": profile_id, "queue_id": queue_config["id"]}
             if config.get("skip_when_empty") and queue and queue["backlog"] == 0:
                 return {
@@ -4148,6 +4493,12 @@ def _run_profile_health_check(profile: dict) -> dict | None:
             env["PATH"] = gh_dir + os.pathsep + env.get("PATH", "")
     try:
         _ensure_github_scan_lease(renew=True)
+        lease = getattr(_scan_lease_context, "lease", None)
+        meter = getattr(lease, "search_budget", None)
+        context = getattr(meter, "health_context", None)
+        if context is not None:
+            command = list(command) + ["-source-graphql-budget", str(context["allowance"]),
+                                       "-source-graphql-nonce", context["nonce"]]
         run = subprocess.run(
             command, cwd=config.get("working_dir") or None, env=env,
             capture_output=True, text=True,
@@ -4155,10 +4506,18 @@ def _run_profile_health_check(profile: dict) -> dict | None:
             encoding="utf-8", errors="replace",
         )
         _ensure_github_scan_lease()
-        payload = json.loads(run.stdout)
+        if context is not None:
+            from .source_graphql_cost import unique_object
+            payload = json.loads(run.stdout, object_pairs_hook=unique_object)
+        else:
+            payload = json.loads(run.stdout)
+        if context is not None and run.returncode == 75:
+            meter.refuse_health(payload, profile)
         if not isinstance(payload, dict) or payload.get("state") not in (
                 "green", "yellow", "red"):
             raise ValueError("ожидался JSON со state green/yellow/red")
+        if context is not None and (type(run.returncode) is not int or run.returncode not in (0, 1)):
+            raise ValueError(f"Source checker technical exit {run.returncode}")
         payload.setdefault("findings", [])
         payload["exit_code"] = run.returncode
         return payload
@@ -4795,6 +5154,28 @@ def _empty_cached_result(profile_id: str, profile: dict) -> dict:
     }
 
 
+def _source_checker_failure_revision(event, profile):
+    if event is None:
+        return 0
+    markers = event.get("source_checker_failure_revisions")
+    if markers is None:
+        return 0
+    if (not isinstance(markers,dict) or any(
+            not isinstance(pin,str) or re.fullmatch(r"[0-9a-f]{64}",pin) is None
+            or type(revision)is not int or not 0<revision<=event["revision"]
+            for pin,revision in markers.items())):
+        raise ValueError("invalid causal Source checker failure watermark")
+    return markers.get(_profile_fingerprint(profile),0)
+
+
+def _source_checker_verified_revision(result, event):
+    value=result.get("source_checker_verified_failure_revision",0)
+    if (type(value)is not int or value<0
+            or value>0 and (event is None or value>event["revision"])):
+        raise ValueError("invalid Source checker recovery acknowledgement")
+    return value
+
+
 def _with_persisted_refresh_status(result: dict, profile_id: str,
                                    profile: dict) -> dict:
     """Overlay a still-actionable denial on a quota-free cached response."""
@@ -4805,15 +5186,32 @@ def _with_persisted_refresh_status(result: dict, profile_id: str,
         # Invalid opt-in configuration is itself an admission blocker and its
         # persisted explanation remains useful until the profile is corrected.
         pass
+    raw_budget=profile.get("github_budget")
+    modern=isinstance(raw_budget,dict) and raw_budget.get("source_cost_protocol")=="source-graphql-cost-v1"
     try:
-        event = db.get_pipeline_refresh_status(profile_id)
+        event = db.get_pipeline_refresh_status(profile_id,**({"strict":True} if modern else {}))
+        failure_revision=_source_checker_failure_revision(event,profile) if modern else 0
+        verified_revision=_source_checker_verified_revision(result,event) if modern else 0
+        if failure_revision and verified_revision<failure_revision:
+            data=copy.deepcopy(result)
+            data.setdefault("cache",{}).update(refresh_blocked="checker_failed",
+                refresh_blocked_reason="latest genuine checker failure requires a fresh checker and complete Source publication")
+            return data
     except (OSError, sqlite3.Error, TypeError, ValueError):
+        if modern:
+            data=copy.deepcopy(result)
+            data.setdefault("cache",{}).update(refresh_blocked="checker_state_unavailable")
+            return data
         return result
     if (not isinstance(event, dict)
             or event.get("repository") != str(profile.get("repository", ""))):
         return result
     status = event.get("status")
     if not isinstance(status, dict):
+        return result
+    if modern and event.get("source_checker_failure_revisions") is not None and status.get("refresh_blocked")=="checker_failed":
+        # A complete publication has acknowledged this exact failure, or the
+        # failure belongs to a different immutable checker/profile namespace.
         return result
     # An execution admission denial is not a queue-refresh outcome, even if
     # the last snapshot was independently invalidated. Ignore old task-status
@@ -5044,7 +5442,9 @@ def _budget_blocked_cached(profile_id: str, profile: dict, series: list[dict],
 
 def _analyze_without_budget(profile_id: str, series: list[dict], *,
                             use_cache: bool = True,
-                            refresh_diagnostics: bool = False) -> dict:
+                            refresh_diagnostics: bool = False,
+                            reuse_fresh: bool = False,
+                            snapshot_queue_id: str | None = None) -> dict:
     profiles = _profiles()
     if profile_id not in profiles:
         raise KeyError(profile_id)
@@ -5063,6 +5463,12 @@ def _analyze_without_budget(profile_id: str, series: list[dict], *,
         if profile_id not in profiles:
             raise KeyError(profile_id)
         profile = profiles[profile_id]
+        if reuse_fresh:
+            # A due task may have observed the old cache before another scan
+            # won this lock. Reuse its complete publication, not another scan.
+            fresh = read_cached(profile_id, series)
+            if _required_snapshot_state(fresh, profile, snapshot_queue_id) is None:
+                return fresh
         cached, _source, cache_epoch = _cached_entry(profile_id, profile)
         _unused, cache_generation = _cache_snapshot(profile_id)
         refresh_revision = db.increment_int_setting(
@@ -5071,6 +5477,22 @@ def _analyze_without_budget(profile_id: str, series: list[dict], *,
             return _paused_cached(profile_id, series)
         priority_settings = _priority_settings(profile)
         health_config = profile.get("health_check") or {}
+        lease = getattr(_scan_lease_context, "lease", None)
+        search_budget = getattr(lease, "search_budget", None)
+        modern_budget = search_budget if isinstance(search_budget,_GraphQLSearchBudget) else None
+        if modern_budget is not None and health_config and not health_config.get("source_graphql_cost"):
+            modern_budget._deny("budgeted GraphQL Source health_check requires an artifact-bound Source cost protocol",
+                                "invalid_config")
+        if modern_budget is not None:
+            modern_budget.activate()
+        checker_failure_revision=0
+        checker_verified_revision=0
+        if modern_budget is not None:
+            checker_event=db.get_pipeline_refresh_status(profile_id,strict=True)
+            checker_failure_revision=_source_checker_failure_revision(checker_event,profile)
+            checker_verified_revision=_source_checker_verified_revision(cached[1],checker_event) if cached else 0
+            if checker_failure_revision>checker_verified_revision:
+                refresh_diagnostics=True
         health_cache_seconds = max(0, int(health_config.get("cache_seconds", 1800)))
         diagnostics = None
         diagnostics_generated_at = None
@@ -5080,12 +5502,34 @@ def _analyze_without_budget(profile_id: str, series: list[dict], *,
             effective_health_ttl = min(60, health_cache_seconds) if (
                 isinstance(cached_diagnostics, dict)
                 and cached_diagnostics.get("checker_failed")) else health_cache_seconds
-            if (diagnostics_generated_at is not None
-                    and time.time() - float(diagnostics_generated_at) < effective_health_ttl):
+            diagnostics_age = (time.time() - float(diagnostics_generated_at)
+                               if diagnostics_generated_at is not None else None)
+            if (diagnostics_age is not None and diagnostics_age < effective_health_ttl
+                    and (modern_budget is None or math.isfinite(diagnostics_age) and diagnostics_age >= 0)):
                 diagnostics = cached_diagnostics
         if diagnostics is None:
+            if modern_budget is not None and health_config.get("source_graphql_cost"):
+                modern_budget.prepare_health(profile)
             diagnostics = _run_profile_health_check(profile)
             diagnostics_generated_at = time.time()
+            if modern_budget is not None and health_config.get("source_graphql_cost"):
+                if not (isinstance(diagnostics,dict) and diagnostics.get("checker_failed")):
+                    try:
+                        search_budget.consume_health(diagnostics, profile)
+                    except ValueError as exc:
+                        diagnostics=dict(diagnostics or {}, checker_failed=True, summary=str(exc))
+                if isinstance(diagnostics, dict) and diagnostics.get("checker_failed"):
+                    search_budget.failed_request()
+                    search_budget._record_denial(diagnostics.get("summary") or "Source checker failed",
+                                                 "checker_failed")
+                    search_budget.admission["source_checker_failure_profile_hash"]=_profile_fingerprint(profile)
+                    failed = read_cached(profile_id, series)
+                    failed["diagnostics"] = diagnostics
+                    failed.setdefault("cache", {}).update(refresh_blocked="checker_failed", stale=True)
+                    return failed
+        elif modern_budget is not None and health_config:
+            if health_config.get("source_graphql_cost"):
+                search_budget.reuse_health(diagnostics, profile, time.time() - float(diagnostics_generated_at))
         if db.is_paused():
             return _paused_cached(profile_id, series)
         target_hours = float(profile.get("target_clear_hours", 8))
@@ -5168,6 +5612,7 @@ def _analyze_without_budget(profile_id: str, series: list[dict], *,
                 "task_status": matching.get("next_status") if matching else None,
                 **projection,
                 "membership_complete": membership_complete, "age": age,
+                "search_usage": [search["usage"] for search in searches if "usage" in search],
                 "admission_items": ordered_members,
                 "items": ordered_members[:priority_settings["max_items"]]
                 if priority_settings else [],
@@ -5225,12 +5670,24 @@ def _analyze_without_budget(profile_id: str, series: list[dict], *,
             and isinstance(queue.get("replica_status"), dict)
             and not queue["replica_status"].get("valid", True)
         ]
+        lease = getattr(_scan_lease_context, "lease", None)
+        search_budget = getattr(lease, "search_budget", None)
+        if search_budget is not None and not search_budget.used:
+            # Other observation transports retain their existing semantics.
+            # This allowance accounts requests made by GraphQL search only.
+            search_budget = None
         if db.is_paused():
             github_rate_limit = (cached[1].get("github_rate_limit")
                                  if cached else None)
         else:
             try:
-                github_rate_limit = _github_rate_limits()
+                if search_budget is not None:
+                    # Reserve and charge the final metadata request to the same
+                    # whole-operation allowance before either cache/history CAS.
+                    search_budget.metadata()
+                    github_rate_limit = copy.deepcopy(search_budget.last_limits)
+                else:
+                    github_rate_limit = _github_rate_limits()
             except _GitHubRateLimitUnavailable:
                 # Without an admission policy this is optional UI telemetry,
                 # not a safety gate. Budget-enabled profiles still propagate
@@ -5259,18 +5716,45 @@ def _analyze_without_budget(profile_id: str, series: list[dict], *,
             "bottleneck": bottleneck["id"] if bottleneck and bottleneck["backlog"] else None,
             "generated_at": now.timestamp(),
         }
+        if isinstance(search_budget,_GraphQLSearchBudget):
+            if (search_budget.health_provenance and not search_budget.health_provenance["reused"]
+                    and all(queue.get("membership_complete") is True for queue in queues)):
+                checker_verified_revision=max(checker_verified_revision,checker_failure_revision)
+            result["source_checker_verified_failure_revision"]=checker_verified_revision
+            result["source_search_usage"] = {
+                "graphql_allowance": search_budget.policy["requested_cost"]["graphql"],
+                "conservative_graphql_spend": search_budget.observed_spend + search_budget.pending_cost,
+                "health_cost_provenance": search_budget.health_provenance,
+                "uncertain_cost": search_budget.cost.uncertain,
+                "successful_observation_cost_proved": (search_budget.used
+                    and not search_budget.cost.uncertain and not search_budget.cost.escrow),
+                "scope": "whole leased Source operation including health, metadata, previews and data",
+                "admission_granted": False,
+            }
+        elif search_budget is not None:
+            result["source_search_usage"] = {
+                "graphql_allowance": search_budget.policy["requested_cost"]["graphql"],
+                "conservative_graphql_spend": search_budget.observed_spend + search_budget.pending_cost,
+                "scope": "legacy strict counter-window Source accounting",
+                "admission_granted": False,
+            }
         _ensure_github_scan_lease()
+        continuation = getattr(_scan_lease_context, "continuation", None)
+        atomic_snapshot = ({"profile_id": profile_id, "repository": profile["repository"],
+                            "captured_at": now.isoformat(), "payload": snapshot}
+                           if continuation is not None else None)
         published = _publish_cache(
             profile_id, profile, cache_generation, cache_epoch,
-            refresh_revision, result)
+            refresh_revision, result,
+            **({"pipeline_snapshot": atomic_snapshot} if atomic_snapshot is not None else {}))
         if not published:
             return read_cached(profile_id, series)
         # Raw trend history records only observations that won the same CAS as
         # the full cache. A rejected/stale writer must not poison later charts.
         lease = getattr(_scan_lease_context, "lease", None)
-        saved_snapshot = db.add_pipeline_snapshot(
+        saved_snapshot = True if continuation is not None else db.add_pipeline_snapshot(
             profile_id, profile["repository"], snapshot, now,
-            lease_guard=({"scope": lease.scope, "token": lease.token}
+            lease_guard=(lease.guard
                          if lease is not None else None),
         )
         if lease is not None and saved_snapshot is None:
@@ -5311,7 +5795,8 @@ def _analyze_without_budget(profile_id: str, series: list[dict], *,
 
 
 def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True,
-            refresh_diagnostics: bool = False) -> dict:
+            refresh_diagnostics: bool = False, reuse_fresh: bool = False,
+            snapshot_queue_id: str | None = None) -> dict:
     """Read cached insights or run one budgeted, cross-process live scan."""
     if use_cache:
         return read_cached(profile_id, series)
@@ -5330,13 +5815,16 @@ def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True,
         try:
             result = _analyze_without_budget(
                 profile_id, series, use_cache=False,
-                refresh_diagnostics=refresh_diagnostics)
+                refresh_diagnostics=refresh_diagnostics,
+                **({"reuse_fresh": True, "snapshot_queue_id": snapshot_queue_id} if reuse_fresh else {}))
             _ensure_github_scan_lease(renew=True)
         except _GitHubScanLeaseFailure as exc:
             return _budget_blocked_cached(
                 profile_id, profile, series,
                 _replace_admission_with_lease_failure(
                     admission, profile, exc))
+        except _GitHubSearchBudgetDenied as exc:
+            return _budget_blocked_cached(profile_id, profile, series, exc.decision)
         except _GitHubRateLimitUnavailable as exc:
             return _budget_blocked_cached(
                 profile_id, profile, series,
@@ -5345,11 +5833,14 @@ def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True,
     if admission.get("enabled"):
         result["github_budget"] = _public_budget_decision(admission)
     cache = result.get("cache")
-    if isinstance(cache, dict) and cache.get("refresh_blocked") != "worker_paused":
+    if (admission.get("allowed") and isinstance(cache, dict)
+            and cache.get("refresh_blocked") != "worker_paused"):
         cache.pop("refresh_blocked", None)
         cache.pop("refresh_blocked_reason", None)
         cache.pop("refresh_deferred_until", None)
         cache.pop("refresh_budget", None)
+    if (profile.get("github_budget") or {}).get("source_cost_protocol")=="source-graphql-cost-v1":
+        result=_with_persisted_refresh_status(result,profile_id,profile)
     return _with_live_github_budget_state(result, profile)
 
 
@@ -6056,12 +6547,14 @@ def _routing_markdown_text(value):
     return re.sub(r"([\\`*_{}\[\]()#+\-.!|>~])", r"\\\1", text)
 
 
-def sample_active_profiles(series: list[dict]) -> dict[str, str]:
+def sample_active_profiles(series: list[dict], *, profile_ids=None) -> dict[str, str]:
     """Refresh every configured pipeline that has a matching live series."""
     if db.is_paused():
         return {}
     outcomes = {}
     for profile_id, profile in _profiles().items():
+        if profile_ids is not None and profile_id not in profile_ids:
+            continue
         if not _profile_active(profile, series):
             continue
         try:
@@ -6069,8 +6562,14 @@ def sample_active_profiles(series: list[dict]) -> dict[str, str]:
             if (profile.get("github_budget") or {}).get("essential_snapshot_headroom") is True:
                 candidate = read_cached(profile_id, series)
                 cache = candidate.get("cache") or {}
+                from .pipeline_sampling import refresh_ahead_seconds
+                lead = refresh_ahead_seconds(profile)
+                age = cache.get("age_seconds")
+                early_due = bool(lead) and (
+                    not isinstance(age, (int, float)) or isinstance(age, bool)
+                    or not math.isfinite(age) or age >= _CACHE_TTL_SECONDS - lead)
                 if (cache.get("complete") is True and cache.get("stale") is False
-                        and not cache.get("refresh_blocked")):
+                        and not cache.get("refresh_blocked") and not early_due):
                     data = candidate
             if data is None:
                 data = analyze(profile_id, series, use_cache=False)

@@ -416,6 +416,7 @@ def test_stale_owned_session_must_be_verified_closed(monkeypatch):
 
 
 def test_rate_limit_is_not_requeued_when_owned_close_is_unverified(monkeypatch):
+    submitted = []
     def fake_run(args, host=None, timeout=None):
         if args[:2] == ["tab", "create"]:
             return 0, {"result": {
@@ -425,9 +426,12 @@ def test_rate_limit_is_not_requeued_when_owned_close_is_unverified(monkeypatch):
         if args[:2] == ["agent", "start"]:
             return 0, {"result": {"agent": {"agent_status": "idle"}}}, ""
         if args[:2] == ["agent", "prompt"]:
+            submitted.append(args[3])
+            return 0, {"result": {"agent": {"agent_status": "done"}}}, ""
+        if args[:2] == ["agent", "get"]:
             return 0, {"result": {"agent": {"agent_status": "done"}}}, ""
         if args[:2] == ["agent", "read"]:
-            return 0, None, "You reached your usage limit"
+            return 0, None, "> " + submitted[0].replace("\n", "\n  ") + "\nYou reached your usage limit"
         raise AssertionError(args)
 
     task = SimpleNamespace(

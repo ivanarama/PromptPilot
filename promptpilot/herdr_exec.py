@@ -43,6 +43,7 @@ from .config import (HERDR_BIN, HERDR_KEEP_PANE, HERDR_READ_LINES, HERDR_START_T
                      HERDR_WORKTREE_TIMEOUT_SECONDS, guard_enabled,
                      guard_settings_file, resolve_effort, rights_args)
 from .process_tree import run_owned
+from .task_identity import apply_task_markers
 from .remote import (POWERSHELL, REMOTE_CALL_TIMEOUT, as_remote, ps_quote,
                      ssh_command, ssh_script)
 
@@ -159,6 +160,7 @@ def _run(args, host=None, timeout=None):
             errors="replace",
             timeout=timeout,
             stdin=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
     except FileNotFoundError:
         raise HerdrError("ssh not found" if host else f"herdr CLI not found: {HERDR_BIN}")
@@ -660,6 +662,83 @@ def _wait_settled(name, until_args, deadline, cancel_check, host=None):
             return "__error__", raw
 
 
+def _wait_codex_reply(name, prompt, marker, deadline, cancel_check,
+                      on_blocked=None, host=None, observer=None):
+    """A terminal state is only a hint; require this request's final marker.
+
+    Codex can look idle between commentary and tool calls. It can also finish
+    an older turn after our request was queued. Neither completes our task.
+    """
+    blocked_since = None
+    idle_since = None
+    while True:
+        if cancel_check and cancel_check():
+            return "__cancel__", ""
+        now = time.monotonic()
+        if deadline and blocked_since is None and now > deadline:
+            return "__timeout__", ""
+        turn = None
+        if observer:
+            from . import codex_app_server, codex_bridge
+            try:
+                turn = observer.poll()
+                if turn and turn.get("status") == "completed":
+                    final = codex_bridge.final_text(turn)
+                    if final:
+                        return "done", codex_bridge.VerifiedReply(final)
+                    return "__error__", "Codex completed this turn without a final answer"
+                if turn and turn.get("status") in {"failed", "interrupted"}:
+                    error = turn.get("error") or {}
+                    if isinstance(error, dict) and error.get("codexErrorInfo") == "usageLimitExceeded":
+                        return "done", codex_bridge.VerifiedReply("You reached your usage limit\n" + error.get("message", ""))
+                    return "__error__", str(error or "Codex turn was interrupted")
+            except (codex_app_server.Unavailable, codex_app_server.RPCError):
+                # Read failures may fall back to the terminal. Never resend the prompt.
+                observer = None
+        if turn:
+            state = ("blocked" if observer.dialog.client.questions(observer.dialog.thread_id)
+                     else "working")
+            data, raw = {}, ""
+        else:
+            rc, data, raw = _run(["agent", "get", name], host=host)
+            if rc != 0:
+                return "__error__", raw
+            state = _agent_status(data)
+        if state == "blocked":
+            if blocked_since is None:
+                blocked_since = now
+                if on_blocked:
+                    on_blocked(_dig(data, "result", "agent", "pane_id") or name)
+        elif blocked_since is not None:
+            if deadline:
+                deadline += max(0, now - blocked_since)
+            blocked_since = None
+        if state not in {"idle", "done", "working", "blocked"}:
+            return "__error__", raw
+        if turn:
+            idle_since = None
+            time.sleep(2)
+            continue
+        rc, _, raw = _read_turn_screen(name, prompt, host)
+        if rc != 0:
+            return "__error__", raw
+        cleaned = _trim_transcript(raw, prompt)
+        if state in {"idle", "done"}:
+            # Provider errors cannot emit our marker, but still have to reach
+            # the caller's existing quota/environment failure handling.
+            if (_retry_reason(cleaned) or _looks_env_failure(cleaned)
+                    or (cleaned and cleaned.splitlines()[-1].strip() == marker)):
+                return state, raw
+            if idle_since is None:
+                idle_since = now
+            elif now - idle_since >= WORKFLOW_IDLE_GRACE_SECONDS:
+                return "__error__", ("Codex completion is unconfirmed: no final reply marker "
+                                     "after a stable idle state. The pane may still be working.")
+        else:
+            idle_since = None
+        time.sleep(2)
+
+
 def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
                  cancel_check=None, keep_pane: bool = None, host: str = None,
                  on_worktree=None, on_pane=None, on_session=None,
@@ -706,8 +785,9 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
     if require_closing_verdict:
         prompt = ensure_closing_verdict_contract(
             prompt, allow_targeted_stale=allow_targeted_stale)
-    if not getattr(task, "detached", False):
-        prompt = _with_turn_marker(prompt)
+    completion_marker = ""
+    target_kind = ""
+    observer = None
     if strict_ownership and getattr(task, "herdr_target", None):
         outcome["error"] = (
             "strict pipeline ownership is incompatible with herdr_target")
@@ -739,6 +819,7 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
                 outcome["error"] = (f"herdr-сессия «{target}» не найдена — панель закрыта? "
                                     f"({raw[:200]})")
                 return outcome
+            target_kind = _dig(data, "result", "agent", "agent") or ""
             name = target
             pane_id = _dig(data, "result", "agent", "pane_id") or target
             tab_id = None
@@ -796,7 +877,7 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
                     tab_env[k] = str(v)
             # Scheduler identity is reserved per claimed attempt. A stale
             # provider-level setting must never retag this owned session.
-            tab_env["PP_TASK_ID"] = str(task.id)
+            apply_task_markers(tab_env, task)
             env_args = [part for key, value in tab_env.items()
                         for part in ("--env", f"{key}={value}")]
 
@@ -891,7 +972,16 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
 
         # Start the agent, forwarding per-task flags to its CLI.
         # (target mode: the agent is already running — nothing to start)
-        kind = provider_cfg.get("kind", "claude")
+        kind = target_kind or provider_cfg.get("kind", "claude")
+        if not task.detached:
+            if kind == "codex" and not requires_verdict:
+                completion_marker = "PP-REPLY-END:" + uuid.uuid4().hex
+                prompt += ("\n\n<promptpilot-completion>\n"
+                           "Only after completing this request, put the following marker "
+                           "on its own line at the end of your FINAL answer. "
+                           "Do not emit it in progress updates or tool output:\n"
+                           + completion_marker + "\n</promptpilot-completion>")
+            prompt = _with_turn_marker(prompt)
         # provider-level extra CLI args (e.g. ["--effort", "max"] for claude)
         agent_args = list(provider_cfg.get("args") or [])
         if task.model:
@@ -942,6 +1032,14 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
         if on_started:
             on_started(pane_id)
 
+        if completion_marker:
+            from . import codex_app_server, codex_bridge
+            if codex_app_server.get_client(host) is not None:
+                rc, agent_data, _ = _run(["agent", "get", name], host=host)
+                if rc == 0:
+                    agent = _dig(agent_data, "result", "agent", default={})
+                    observer = codex_bridge.observe(agent, _turn_marker(prompt), host)
+
         # Detached: submit the prompt, confirm it landed, leave the pane open.
         if task.detached:
             rc, data, raw = _run(["agent", "prompt", name, prompt,
@@ -964,6 +1062,8 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
         # double it) — wait instead.
         deadline = time.monotonic() + timeout if timeout else None
         prompt_cmd = ["agent", "prompt", name, prompt, "--wait", "--timeout", "10000"]
+        if observer:
+            prompt_cmd += ["--until", "working"]
         state = ""
         for attempt in range(1, PROMPT_STALL_RETRIES + 1):
             rc, data, raw = _run(prompt_cmd, host=host)
@@ -973,13 +1073,19 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
             code = _error_code(data)
             if code == "timeout":
                 # prompt landed, agent is busy — fall into the chunked wait
-                state, raw = _wait_settled(name, [], deadline, cancel_check, host)
+                if observer:
+                    state = "working"
+                else:
+                    state, raw = _wait_settled(name, [], deadline, cancel_check, host)
                 break
             if code != "agent_prompt_stalled":
                 return fail(f"herdr agent prompt failed: {raw}")
             rc2, data2, _ = _run(["agent", "get", name], host=host)
             if rc2 == 0 and _agent_status(data2) == "working":
-                state, raw = _wait_settled(name, [], deadline, cancel_check, host)
+                if observer:
+                    state = "working"
+                else:
+                    state, raw = _wait_settled(name, [], deadline, cancel_check, host)
                 break
             # The text may be sitting unsent in the input box — some agent
             # builds swallow the submit key right after the paste. Press Enter
@@ -1010,6 +1116,11 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
         if deadline and blocked_since is not None:
             deadline += max(0, time.monotonic() - blocked_since)
 
+        if completion_marker and state not in {"__cancel__", "__timeout__", "__error__"}:
+            state, raw = _wait_codex_reply(
+                name, prompt, completion_marker, deadline, cancel_check,
+                on_blocked=on_blocked, host=host, observer=observer,
+            )
         if state not in {"__cancel__", "__timeout__", "__error__"}:
             state, raw = _stabilize_workflow_completion(
                 name, prompt, state, raw, deadline, cancel_check,
@@ -1049,15 +1160,23 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
         if state == "__error__":
             return fail(f"herdr agent wait failed: {raw}")
 
-        rc, _, raw = _read_turn_screen(name, prompt, host)
-        if rc != 0:
-            return fail(f"herdr agent read failed: {raw}")
-
-        if _turn_marker(prompt) and _turn_body(raw, prompt) is None:
-            return fail("herdr response is not correlated to this attempt: its owned turn marker is absent "
-                        "from the available history (maximum 1000 rendered rows)", keep_pane=False)
-
-        cleaned = _trim_transcript(raw, prompt)
+        from .codex_bridge import VerifiedReply
+        verified = isinstance(raw, VerifiedReply)
+        if verified:
+            cleaned = str(raw)
+        else:
+            rc, _, raw = _read_turn_screen(name, prompt, host)
+            if rc != 0:
+                return fail(f"herdr agent read failed: {raw}")
+            if _turn_marker(prompt) and _turn_body(raw, prompt) is None:
+                return fail("herdr response is not correlated to this attempt: its owned turn marker is absent "
+                            "from the available history (maximum 1000 rendered rows)", keep_pane=False)
+            cleaned = _trim_transcript(raw, prompt)
+        completion_confirmed = bool(
+            completion_marker and cleaned
+            and cleaned.splitlines()[-1].strip() == completion_marker)
+        if completion_confirmed:
+            cleaned = cleaned[:-len(completion_marker)].rstrip()
 
         reason = _retry_reason(cleaned)
         if reason:
@@ -1083,6 +1202,9 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
                 return outcome
             outcome.update(env_intent)
             return outcome
+
+        if completion_marker and not completion_confirmed and not verified:
+            return fail("herdr: final response marker is missing; completion is unconfirmed")
 
         closing_verdict = _closing_workflow_verdict(
             cleaned, allow_targeted_stale=allow_targeted_stale)

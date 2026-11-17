@@ -7,6 +7,9 @@ import pytest
 from promptpilot import pipeline_insights as insights
 from promptpilot.models import TaskCreate
 from test_github_budget import _budget_costs, _limits, _profile, _running_task
+from tests.test_source_checker_recovery import (
+    continuation as continuation, recovery as recovery,
+)
 
 
 def configured_profile(mode="auto"):
@@ -170,3 +173,42 @@ def test_early_queue_config_error_without_route_stays_durable(isolated_db, monke
     cached = insights.read_cached("example", [])
     assert cached["cache"]["refresh_blocked"] == "invalid_config"
     assert cached["github_budget"]["allowed"] is False
+
+
+@pytest.mark.parametrize("allowed", [False, True])
+def test_public_task_route_preserves_modern_checker_failure(recovery, monkeypatch, allowed):
+    f, _state, _calls, _health, _key, _cache, _snapshots, revision = recovery
+    before = f.db.get_pipeline_refresh_status("example")
+    if not allowed:
+        monkeypatch.setattr(insights, "_github_rate_limits", lambda: _limits(search=1))
+    task = SimpleNamespace(**{**f.task.model_dump(), "series_title": f.task.prompt})
+
+    result = insights.execution_route(task, task.prompt)
+
+    assert result["action"] == ("prompt" if allowed else "defer")
+    assert f.db.get_pipeline_refresh_status("example") == before
+    cached = insights.read_cached("example", f.db.list_series())
+    assert cached["cache"]["refresh_blocked"] == "checker_failed"
+    assert f.db.get_pipeline_refresh_status("example")["source_checker_failure_revisions"][insights._profile_fingerprint(f.profile)] == revision
+
+
+@pytest.mark.parametrize("allowed", [False, True])
+def test_public_report_does_not_publish_or_clear_queue_status(isolated_db, monkeypatch, allowed):
+    profile = configured_profile()
+    limits, published = setup_snapshot(isolated_db, monkeypatch, profile)
+    limits["value"] = _limits(search=1)
+    if allowed:
+        # A successful report must preserve an actual queue-scan denial.
+        assert insights.analyze("example", [], use_cache=False)["cache"]["refresh_blocked"] == "low"
+        limits["value"] = _limits()
+    before = isolated_db.get_pipeline_refresh_status("example")
+    epoch = insights._cache_epoch()
+
+    report = insights.build_period_report("example", [], hours=24, refresh_delivery=True)
+
+    assert report["delivery"]["status"] == ("refreshed" if allowed else "blocked")
+    assert isolated_db.get_pipeline_refresh_status("example") == before
+    assert insights._cache_epoch() == epoch
+    cached = insights.read_cached("example", [])
+    assert cached["cache"]["token"] == published["cache"]["token"]
+    assert cached["cache"].get("refresh_blocked") == ("low" if allowed else None)

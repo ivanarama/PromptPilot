@@ -2804,6 +2804,216 @@ def clear_pipeline_series_wake(series_id: int) -> bool:
         return deleted.rowcount > 0
 
 
+class ItemHoldResolutionConflict(ValueError):
+    """The operator's exact hold snapshot or nonce no longer matches."""
+
+
+def _item_hold_digest(raw: str) -> str:
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _item_hold_json(raw: str):
+    def unique_object(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("duplicate JSON key")
+            value[key] = item
+        return value
+
+    def no_constant(value):
+        raise ValueError("non-finite JSON value")
+
+    def finite_float(value):
+        result = float(value)
+        if not math.isfinite(result):
+            raise ValueError("non-finite JSON number")
+        return result
+
+    try:
+        return json.loads(raw, object_pairs_hook=unique_object,
+                          parse_constant=no_constant, parse_float=finite_float)
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise ItemHoldResolutionConflict("Malformed hold metadata") from exc
+
+
+def _item_hold_records(raw: str | None) -> dict:
+    value = {} if raw is None else _item_hold_json(raw)
+    if (not isinstance(value, dict)
+            or any(not isinstance(key, str)
+                   or not re.fullmatch(r"[1-9][0-9]*", key)
+                   or not isinstance(record, dict)
+                   for key, record in value.items())):
+        raise ItemHoldResolutionConflict("Malformed hold ledger")
+    return value
+
+
+def _item_hold_record_digest(record: dict) -> str:
+    return _item_hold_digest(json.dumps(
+        record, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        allow_nan=False))
+
+
+def _item_resolution_nonce_key(nonce: str) -> str:
+    if (not isinstance(nonce, str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", nonce)):
+        raise ValueError("request_nonce must contain 1..128 ASCII nonce characters")
+    return "pipeline_item_hold_resolution:v1:" + _item_hold_digest(nonce)
+
+
+def _item_resolution_receipt(raw: str) -> dict:
+    value = _item_hold_json(raw)
+    fields = {"schema", "receipt_id", "resolved_at", "request", "resolved_record",
+              "resolved_record_sha256", "before_raw_holds_sha256", "after_raw_holds_sha256",
+              "operator_resolution_only", "product_mutation_authorized",
+              "canonical_progress_claimed", "wake_requested"}
+    if (not isinstance(value, dict) or set(value) != fields
+            or value.get("schema") != "pipeline-item-hold-resolution-v1"
+            or not isinstance(value.get("request"), dict)
+            or not isinstance(value.get("resolved_record"), dict)
+            or not isinstance(value.get("receipt_id"), str)
+            or not re.fullmatch(r"[0-9a-f]{32}", value["receipt_id"])):
+        raise ItemHoldResolutionConflict("Malformed resolution receipt")
+    request = value["request"]
+    request_fields = {"series_id", "number", "expected_head", "expected_task_id",
+                      "expected_raw_holds_sha256", "request_nonce"}
+    try:
+        if set(request) != request_fields:
+            raise ValueError("unknown receipt request")
+        for name in ("series_id", "number", "expected_task_id"):
+            if type(request[name]) is not int or not 0 < request[name] <= 2**63 - 1:
+                raise ValueError("invalid receipt request identity")
+        _item_resolution_nonce_key(request["request_nonce"])
+        for name in ("before_raw_holds_sha256", "after_raw_holds_sha256",
+                     "resolved_record_sha256"):
+            if not isinstance(value[name], str) or not re.fullmatch(r"[0-9a-f]{64}", value[name]):
+                raise ValueError("invalid receipt digest")
+        stamp = datetime.fromisoformat(value["resolved_at"])
+        if stamp.tzinfo is None:
+            raise ValueError("missing receipt timezone")
+        record = value["resolved_record"]
+        if (not isinstance(request["expected_head"], str)
+                or not re.fullmatch(r"[0-9a-f]{40}", request["expected_head"])
+                or record.get("head") != request["expected_head"]
+                or type(record.get("task_id")) is not int
+                or record["task_id"] != request["expected_task_id"]
+                or value["before_raw_holds_sha256"] != request["expected_raw_holds_sha256"]
+                or value["resolved_record_sha256"] != _item_hold_record_digest(record)
+                or value["operator_resolution_only"] is not True
+                or any(value[name] is not False for name in (
+                    "product_mutation_authorized", "canonical_progress_claimed", "wake_requested"))):
+            raise ValueError("receipt contradicts resolution")
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise ItemHoldResolutionConflict("Malformed resolution receipt") from exc
+    return value
+
+
+def list_pipeline_item_holds(series_id: int) -> dict:
+    """Read exact hold bytes and canonical record digests without changing state."""
+    if type(series_id) is not int or not 0 < series_id <= 2**63 - 1:
+        raise ValueError("Invalid series ID")
+    with _connect() as conn:
+        conn.execute("BEGIN")
+        if conn.execute("SELECT 1 FROM task_series WHERE id=?", (series_id,)).fetchone() is None:
+            raise KeyError("Series not found")
+        row = conn.execute("SELECT value FROM settings WHERE key=?",
+                           (f"pipeline_item_holds:v1:{series_id}",)).fetchone()
+        raw = None if row is None else row["value"]
+        records = _item_hold_records(raw)
+        mode = conn.execute("SELECT value FROM settings WHERE key=?",
+                            (f"pipeline_item_hold_mode:v1:{series_id}",)).fetchone()
+        return {
+            "series_id": series_id, "raw_holds": raw,
+            "raw_holds_sha256": None if raw is None else _item_hold_digest(raw),
+            "hold_mode": None if mode is None else mode["value"],
+            "holds": [{"number": int(key), "record": record,
+                       "record_sha256": _item_hold_record_digest(record)}
+                      for key, record in sorted(records.items(), key=lambda pair: int(pair[0]))],
+        }
+
+
+def get_pipeline_item_hold_resolution(series_id: int, request_nonce: str) -> dict | None:
+    """Reconcile a lost response; this read never repeats the resolution."""
+    if type(series_id) is not int or not 0 < series_id <= 2**63 - 1:
+        raise ValueError("Invalid series ID")
+    key = _item_resolution_nonce_key(request_nonce)
+    with _connect() as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        if row is None:
+            return None
+        receipt = _item_resolution_receipt(row["value"])
+        if (receipt["request"].get("series_id") != series_id
+                or receipt["request"].get("request_nonce") != request_nonce):
+            raise ItemHoldResolutionConflict("Nonce belongs to another resolution")
+        return receipt
+
+
+def resolve_pipeline_item_hold(series_id: int, number: int, *, expected_head: str,
+                               expected_task_id: int, expected_raw_holds_sha256: str,
+                               request_nonce: str) -> dict:
+    """Explicit operator decision for ONE exact HEAD-bound hold, never admission.
+
+    The caller owns authorization and remediation assessment. No reason string,
+    quota reset, current review or machine progress is inferred here. Resolving
+    a hold does not wake work, alter an existing attempt or grant product rights.
+    The hold CAS and immutable nonce receipt commit together.
+    """
+    for value in (series_id, number, expected_task_id):
+        if type(value) is not int or not 0 < value <= 2**63 - 1:
+            raise ValueError("IDs must be positive SQLite integers")
+    if not isinstance(expected_head, str) or not re.fullmatch(r"[0-9a-f]{40}", expected_head):
+        raise ValueError("Expected HEAD must be a lowercase commit SHA")
+    if (not isinstance(expected_raw_holds_sha256, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", expected_raw_holds_sha256)):
+        raise ValueError("Expected raw hold SHA256 is required")
+    key = _item_resolution_nonce_key(request_nonce)
+    request = {"series_id": series_id, "number": number, "expected_head": expected_head,
+               "expected_task_id": expected_task_id,
+               "expected_raw_holds_sha256": expected_raw_holds_sha256,
+               "request_nonce": request_nonce}
+    with _connect(immediate=True) as conn:
+        prior = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        if prior is not None:
+            receipt = _item_resolution_receipt(prior["value"])
+            if receipt["request"] != request:
+                raise ItemHoldResolutionConflict("Nonce already used for a different request")
+            return receipt
+        if conn.execute("SELECT 1 FROM task_series WHERE id=?", (series_id,)).fetchone() is None:
+            raise KeyError("Series not found")
+        if conn.execute("SELECT 1 FROM tasks WHERE series_id=? AND status='running' LIMIT 1",
+                        (series_id,)).fetchone() is not None:
+            raise ItemHoldResolutionConflict("Series has a running attempt; wait for it to finish")
+        hold_key = f"pipeline_item_holds:v1:{series_id}"
+        row = conn.execute("SELECT value FROM settings WHERE key=?", (hold_key,)).fetchone()
+        if row is None or _item_hold_digest(row["value"]) != expected_raw_holds_sha256:
+            raise ItemHoldResolutionConflict("Hold ledger changed; read it again")
+        raw = row["value"]
+        records = _item_hold_records(raw)
+        target = records.get(str(number))
+        if (target is None or target.get("head") != expected_head
+                or type(target.get("task_id")) is not int
+                or target["task_id"] != expected_task_id):
+            raise ItemHoldResolutionConflict("Exact HEAD/task hold is absent or changed")
+        remaining = {name: record for name, record in records.items() if name != str(number)}
+        after = json.dumps(remaining, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+        receipt = {
+            "schema": "pipeline-item-hold-resolution-v1", "receipt_id": uuid.uuid4().hex,
+            "resolved_at": _now(), "request": request, "resolved_record": target,
+            "resolved_record_sha256": _item_hold_record_digest(target),
+            "before_raw_holds_sha256": expected_raw_holds_sha256,
+            "after_raw_holds_sha256": _item_hold_digest(after),
+            "operator_resolution_only": True, "product_mutation_authorized": False,
+            "canonical_progress_claimed": False, "wake_requested": False,
+        }
+        changed = conn.execute("UPDATE settings SET value=? WHERE key=? AND value=?",
+                               (after, hold_key, raw))
+        if changed.rowcount != 1:
+            raise ItemHoldResolutionConflict("Hold ledger CAS failed")
+        conn.execute("INSERT INTO settings(key,value) VALUES(?,?)",
+                     (key, json.dumps(receipt, ensure_ascii=False, sort_keys=True,
+                                      separators=(",", ":"), allow_nan=False)))
+        return receipt
+
 def series_action(series_id: int, action: str, *, retry_blocked: bool = False) -> bool:
     with _connect(immediate=True) as conn:
         row = conn.execute("SELECT * FROM task_series WHERE id = ?", (series_id,)).fetchone()
@@ -3630,6 +3840,74 @@ def has_setting_prefix(prefix: str) -> bool:
     return row is not None
 
 
+def settings_with_prefix(prefix: str, limit: int = 200) -> dict[str, str]:
+    with _connect() as conn:
+        return dict(conn.execute(
+            "SELECT key,value FROM settings WHERE substr(key,1,?)=? ORDER BY key LIMIT ?",
+            (len(prefix), prefix, limit)).fetchall())
+
+
+def claim_codex_answer(identity: str) -> bool:
+    """One explicit answer attempt across duplicate cards and bot restarts."""
+    with _connect(immediate=True) as conn:
+        return bool(conn.execute(
+            "INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",
+            ("codex-app-server.answer." + identity, _now())).rowcount)
+
+
+def queue_codex_question(key: str, record: dict) -> bool:
+    with _connect(immediate=True) as conn:
+        if not conn.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",
+                            (key, _json_dump(record))).rowcount:
+            previous = _json_load(conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()["value"], {})
+            if previous.get("used") or previous.get("question") != record.get("question"):
+                return False
+            expired = previous.get("expires_at", 0) < datetime.now(timezone.utc).timestamp()
+            previous["expires_at"] = record.get("expires_at", previous.get("expires_at", 0))
+            conn.execute("UPDATE settings SET value=? WHERE key=?", (_json_dump(previous), key))
+            if not expired or conn.execute(
+                    "SELECT 1 FROM notifications WHERE kind='codex.question' AND message=? "
+                    "AND sent_at IS NULL LIMIT 1", (key.rsplit(".", 1)[-1],)).fetchone():
+                return False
+        conn.execute(
+            "INSERT INTO notifications(tg_chat_id,message,created_at,machine,pane_id,kind) "
+            "VALUES(?,?,?,?,?,?)",
+            (record["chat_id"], key.rsplit(".", 1)[-1], _now(), record["machine"],
+             record["pane"], "codex.question"))
+    return True
+
+
+def finish_codex_tracking(key: str, turn_id: str, result: str, status: str,
+                          notifications: list[dict]) -> bool:
+    """Commit completion and its delivery outbox in the same transaction."""
+    with _connect(immediate=True) as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        record = _json_load(row["value"], {}) if row else {}
+        if record.get("done") or record.get("turn_id") != turn_id:
+            return False
+        record.update(done=True, result=result, status=status)
+        conn.execute("UPDATE settings SET value=? WHERE key=?", (_json_dump(record), key))
+        for note in notifications:
+            conn.execute(
+                "INSERT INTO notifications(tg_chat_id,message,created_at,machine,pane_id,kind) "
+                "VALUES(?,?,?,?,?,?)",
+                (record["chat_id"], note["message"], _now(), record["machine"],
+                 record["pane"], note["kind"]))
+    return True
+
+
+def save_codex_tracking(key: str, record: dict, legacy_source: str):
+    """Switch file observation to the exact turn without retaining an old manifest."""
+    slot = hashlib.sha256(_json_dump([record["pane"], record["chat_id"]]).encode()).hexdigest()
+    retired = {"pane": record["pane"], "tg_chat_id": record["chat_id"], "queued": True,
+               "expires_at": record["expires_at"]}
+    with _connect(immediate=True) as conn:
+        conn.executemany("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", [
+            (key, _json_dump(record)),
+            ("result-files.native." + legacy_source + "." + slot, _json_dump(retired)),
+        ])
+
+
 def increment_int_setting(key: str, default: int = 0) -> int:
     """Atomically increment an integer setting shared by all PP processes."""
     with _connect(immediate=True) as conn:
@@ -3655,10 +3933,15 @@ def set_setting_if_newer_revision(
         lease_guard: Optional[dict] = None,
         publication_revision_key: Optional[str] = None,
         companion_key: Optional[str] = None,
-        companion_value: Optional[str] = None) -> bool:
+        companion_value: Optional[str] = None,
+        pipeline_snapshot: Optional[dict] = None) -> bool:
     """Atomically publish a newer revision while a durable guard matches."""
     if (companion_key is None) != (companion_value is None):
         raise ValueError("companion_key and companion_value must be set together")
+    if pipeline_snapshot is not None:
+        continuation = (lease_guard or {}).get("continuation") or {}
+        if not continuation or pipeline_snapshot.get("profile_id") != continuation.get("profile_id"):
+            raise ValueError("atomic source snapshot requires its Native continuation fence")
     with _connect(immediate=True) as conn:
         if (lease_guard is not None
                 and not _pipeline_scan_lease_guard_matches(conn, lease_guard)):
@@ -3706,6 +3989,14 @@ def set_setting_if_newer_revision(
             conn.execute(
                 "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
                 (publication_revision_key, str(int(revision))),
+            )
+        if pipeline_snapshot is not None:
+            conn.execute(
+                "INSERT INTO pipeline_snapshots(profile_id,repository,captured_at,payload_json) "
+                "VALUES(?,?,?,?)",
+                (pipeline_snapshot["profile_id"], pipeline_snapshot["repository"],
+                 pipeline_snapshot["captured_at"], json.dumps(pipeline_snapshot["payload"],
+                     ensure_ascii=False, separators=(",", ":"))),
             )
     return True
 
@@ -3888,6 +4179,87 @@ def _active_pipeline_budget_reservations(conn, values: list[dict]) -> tuple[list
                 and row["started_at"] == item["task_started_at"]):
             active.append(item)
     return active, len(active) != len(values)
+
+
+def _pipeline_source_refresh_state(conn, scope, task_id, profile_id, queue_id, route_costs,
+                                   starvation_timeout_seconds=0):
+    """Read an admitted running attempt without pruning any foreign ledger."""
+    from .config import TASK_TIMEOUT
+    from .task_identity import task_execution_fingerprint
+
+    if type(task_id) is not int or task_id <= 0:
+        raise ValueError("source refresh requires a worker task identity")
+    row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+    session = row["session_id"] or row["herdr_pane"] if row is not None else None
+    if (row is None or row["status"] != "running" or not row["series_id"]
+            or not isinstance(session, str) or not session
+            or row["machine"] or row["detached"]):
+        raise ValueError("source refresh requires a live local Native session")
+    series = conn.execute("SELECT paused,ended_at FROM task_series WHERE id=?",
+                          (row["series_id"],)).fetchone()
+    controls = {r["key"]: r["value"] for r in conn.execute(
+        "SELECT key,value FROM settings WHERE key IN ('worker_paused',?)",
+        (f"cancel_task:{task_id}",))}
+    if (series is None or series["paused"] or series["ended_at"]
+            or controls.get("worker_paused", "0") != "0"
+            or controls.get(f"cancel_task:{task_id}") == "1"):
+        raise ValueError("source refresh attempt is paused, cancelled or ended")
+    started = datetime.fromisoformat(row["started_at"])
+    now = time.time()
+    timeout = row["task_timeout"] if row["task_timeout"] is not None else TASK_TIMEOUT
+    if (started.tzinfo is None or started.timestamp() > now
+            or timeout and now >= started.timestamp() + timeout):
+        raise ValueError("source refresh attempt lifetime is invalid")
+    costs = {route: _pipeline_budget_vector(route_costs[route], f"continuation {route} cost")
+             for route in ("skill", "fallback_targeted")}
+    key = _pipeline_github_budget_reservation_key(scope)
+    values = _load_pipeline_budget_reservations(
+        conn, key)
+    # One task attempt cannot borrow admission from a second account scope.
+    for other in conn.execute("SELECT key FROM settings WHERE substr(key,1,?)=? AND key<>?",
+            (len(_PIPELINE_GITHUB_BUDGET_RESERVATION_PREFIX),
+             _PIPELINE_GITHUB_BUDGET_RESERVATION_PREFIX, key)):
+        if any(v["task_id"] == task_id for v in _load_pipeline_budget_reservations(conn, other["key"])):
+            raise ValueError("source refresh attempt owns ambiguous admission scopes")
+    own = [r for r in values if r["task_id"] == task_id]
+    if (len(own) != 1 or own[0]["task_started_at"] != row["started_at"]
+            or own[0]["profile_id"] != profile_id or own[0]["queue_id"] != queue_id
+            or own[0]["route"] not in costs
+            or own[0]["cost"] != costs[own[0]["route"]]):
+        raise ValueError("source refresh requires its exact existing execution reservation")
+    active, _changed = _active_pipeline_budget_reservations(conn, values)
+    guard = {"scope": scope, "task_id": task_id, "started_at": row["started_at"],
+             "session_id": row["session_id"], "herdr_pane": row["herdr_pane"],
+             "series_id": row["series_id"],
+             "priority": row["priority"], "profile_id": profile_id, "queue_id": queue_id,
+             "execution_sha256": task_execution_fingerprint(row),
+             "route": own[0]["route"], "cost": dict(own[0]["cost"]),
+             "route_costs": costs, "token": own[0]["token"]}
+    waiting = _pipeline_github_budget_waiter_summary(conn, scope,
+        starvation_timeout_seconds=starvation_timeout_seconds, now=now)
+    return {"guard": guard, "totals": {r: sum(v["cost"][r] for v in active)
+                                        for r in _PIPELINE_GITHUB_BUDGET_RESOURCES},
+            "count": len(active), "items": active,
+            "revision": _pipeline_github_budget_revision(conn, scope),
+            "woken_waiters": {"count": 0, "min_priority": None}, "waiting_waiters": waiting}
+
+
+def pipeline_source_refresh_state(scope, task_id, profile_id, queue_id, route_costs,
+                                  *, starvation_timeout_seconds=0):
+    """Observe existing Native admission; never reserve, release or clean it."""
+    with _connect() as conn:
+        conn.execute("BEGIN")
+        return _pipeline_source_refresh_state(conn, scope, task_id, profile_id, queue_id, route_costs,
+                                              starvation_timeout_seconds)
+
+
+def _pipeline_source_refresh_guard_matches(conn, guard):
+    try:
+        observed = _pipeline_source_refresh_state(conn, guard["scope"], guard["task_id"],
+            guard["profile_id"], guard["queue_id"], guard["route_costs"])
+        return observed["guard"] == guard
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return False
 
 
 def _write_pipeline_budget_reservations(conn, key: str, values: list[dict]) -> None:
@@ -4534,16 +4906,18 @@ def _next_pipeline_refresh_revision(conn) -> int:
 
 def _write_pipeline_refresh_status(
         conn, key: str, repository: str, status: Optional[dict],
-        revision: int) -> bool:
+        revision: int, *, checker_failure_profile_hash: Optional[str] = None) -> bool:
     """Publish one already-allocated event if it is newer for this profile."""
     row = conn.execute(
         "SELECT value FROM settings WHERE key = ?", (key,)
     ).fetchone()
     existing_revision = 0
+    checker_failures = None
     if row is not None:
         try:
             existing = json.loads(row["value"])
             existing_revision = existing["revision"]
+            checker_failures = existing.get("source_checker_failure_revisions")
             if (not isinstance(existing, dict)
                     or existing.get("version") != 1
                     or isinstance(existing_revision, bool)
@@ -4554,14 +4928,19 @@ def _write_pipeline_refresh_status(
             existing_revision = 0
     if existing_revision >= revision:
         return False
+    if checker_failure_profile_hash is not None:
+        if checker_failures is not None and not isinstance(checker_failures,dict):
+            raise ValueError("invalid causal Source checker failure watermarks")
+        checker_failures = dict(checker_failures or {})
+        checker_failures[checker_failure_profile_hash] = revision
+    payload = {"version": 1, "repository": str(repository), "revision": revision, "status": status}
+    if checker_failures is not None:
+        # A later availability event or successful skill admission cannot erase
+        # this causal watermark. Only a fresh complete Source can acknowledge it.
+        payload["source_checker_failure_revisions"] = checker_failures
     conn.execute(
         "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
-        (key, json.dumps({
-            "version": 1,
-            "repository": str(repository),
-            "revision": revision,
-            "status": status,
-        }, ensure_ascii=False, separators=(",", ":"))),
+        (key, json.dumps(payload, ensure_ascii=False, separators=(",", ":"))),
     )
     return True
 
@@ -4587,7 +4966,7 @@ def _pipeline_scan_lease_guard_matches(conn, guard: dict) -> bool:
         expires_at = float(payload["expires_at"])
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
         return False
-    return (
+    owned = (
         isinstance(payload, dict)
         and payload.get("version") == 1
         and _valid_pipeline_scan_token(payload.get("token"))
@@ -4595,6 +4974,9 @@ def _pipeline_scan_lease_guard_matches(conn, guard: dict) -> bool:
         and math.isfinite(expires_at)
         and expires_at > time.time()
     )
+    if owned and guard.get("continuation") is not None:
+        return _pipeline_source_refresh_guard_matches(conn, guard["continuation"])
+    return owned
 
 
 def acquire_pipeline_scan_lease(
@@ -4707,7 +5089,8 @@ def renew_pipeline_scan_lease(
 
 def release_pipeline_scan_lease(
         scope: str, token: str, *,
-        refresh_status: Optional[dict] = None) -> bool:
+        refresh_status: Optional[dict] = None,
+        checker_failure_guard: Optional[dict] = None) -> bool:
     """Release a lease and optionally publish final refresh status atomically."""
     key = _pipeline_scan_lease_key(scope)
     owner = token
@@ -4750,8 +5133,20 @@ def release_pipeline_scan_lease(
             # completed while this owner held the lease; a successor can only
             # allocate a later revision after this transaction commits.
             revision = _next_pipeline_refresh_revision(conn)
+            failure_hash = ((final_status or {}).get("github_budget") or {}).get("source_checker_failure_profile_hash")
+            if failure_hash is not None:
+                if (not isinstance(failure_hash, str) or re.fullmatch(r"[0-9a-f]{64}", failure_hash) is None
+                        or (final_status or {}).get("refresh_blocked") != "checker_failed"
+                        or not isinstance(checker_failure_guard, dict)
+                        or checker_failure_guard.get("scope") != scope
+                        or checker_failure_guard.get("token") != owner
+                        or (isinstance(checker_failure_guard.get("continuation"),dict)
+                            and checker_failure_guard["continuation"].get("profile_id") != refresh_status["profile_id"])
+                        or not _pipeline_scan_lease_guard_matches(conn, checker_failure_guard)):
+                    failure_hash = None
             _write_pipeline_refresh_status(
-                conn, status_key, status_repository, final_status, revision)
+                conn, status_key, status_repository, final_status, revision,
+                checker_failure_profile_hash=failure_hash)
         conn.execute("DELETE FROM settings WHERE key = ?", (key,))
     return True
 
@@ -4790,7 +5185,7 @@ def publish_pipeline_refresh_status(
             conn, key, repository, status, event_revision)
 
 
-def get_pipeline_refresh_status(profile_id: str) -> Optional[dict]:
+def get_pipeline_refresh_status(profile_id: str, *, strict: bool = False) -> Optional[dict]:
     """Read one validated status event, including a clear tombstone."""
     raw = get_setting(_pipeline_refresh_status_key(profile_id))
     if raw is None:
@@ -4805,6 +5200,8 @@ def get_pipeline_refresh_status(profile_id: str) -> Optional[dict]:
                 or status is not None and not isinstance(status, dict)):
             raise ValueError("invalid refresh status payload")
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        if strict:
+            raise ValueError("invalid durable pipeline refresh status")
         return None
     return payload
 

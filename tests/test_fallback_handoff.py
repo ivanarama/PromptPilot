@@ -134,7 +134,23 @@ def test_cli_dispatch_handoff_runs_exactly_election_and_fresh_gate(config, monke
 
     monkeypatch.setattr(pp, "load_config", lambda _: dict(config))
     monkeypatch.setattr(pp, "run_health", run_health)
-    monkeypatch.setattr(pp, "GitHub", ReadOnlyGitHub)
+    class ReviewHistoryGitHub(ReadOnlyGitHub):
+        def graphql_page(self, owner, name, number, cursor):
+            result = super().graphql_page(owner, name, number, cursor)
+            if target_stage == "review":
+                # Ordinary third-round fallback still applies, but the reader
+                # now first proves whether a real later explicit request exists.
+                from tests.test_explicit_full_current_review import history
+                value = history()
+                value["edges"].pop()  # No new owner request: keep ordinary fallback.
+                for item in value["edges"]:
+                    node = item["node"]
+                    if node.get("author"):
+                        node["author"]["login"] = "ivanarama"
+                result["data"]["repository"]["pullRequest"]["timelineItems"]["edges"] = value["edges"]
+            return result
+
+    monkeypatch.setattr(pp, "GitHub", ReviewHistoryGitHub)
     cleanup_reads = []
     monkeypatch.setattr(pp, "pending_merge_intents", lambda *_: cleanup_reads.append(True) or [])
     monkeypatch.setattr(pp, "list_ship", lambda *_: pytest.fail("owner election must not rescan ship"))

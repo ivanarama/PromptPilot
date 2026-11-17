@@ -14,6 +14,10 @@ def main():
     """
     multiprocessing.freeze_support()
     args = sys.argv[1:]
+    if len(args) >= 2 and args[0] == "pipelinectl" and args[1] in ("source-refresh", "budget-refresh"):
+        from .pipeline_source_refresh import run
+
+        raise SystemExit(run(args[2:], budget_only=args[1] == "budget-refresh"))
     if args[:1] == ["pipelinectl"]:
         from .project_pipeline import run
 

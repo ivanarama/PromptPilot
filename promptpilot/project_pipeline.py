@@ -201,8 +201,18 @@ def validate_review_lease(lease: dict, config: dict) -> None:
             raise PipelineError(f"review lease has an invalid {field}")
     if not isinstance(lease.get("anchor"), str) or not lease["anchor"]:
         raise PipelineError("review lease has an invalid epoch anchor")
+    explicit = lease.get("explicit_full_current_review")
+    if explicit is not None:
+        expected = {"version": 1, "head": lease["head"], "epoch": lease["epoch"],
+                    "anchor": lease["anchor"], "depth": lease.get("depth"),
+                    "prior_proof": explicit.get("prior_proof") if isinstance(explicit, dict) else None}
+        if (lease.get("completion_gate") != "target-v1" or not isinstance(explicit, dict)
+                or explicit != expected or type(explicit.get("version")) is not int
+                or not isinstance(explicit.get("prior_proof"), str)
+                or not re.fullmatch(r"[0-9a-f]{64}", explicit["prior_proof"])):
+            raise PipelineError("invalid explicit full current review grant")
     if (not isinstance(lease.get("depth"), int) or isinstance(lease.get("depth"), bool)
-            or lease["depth"] not in (0, 1)):
+            or lease["depth"] < 0 or (lease["depth"] not in (0, 1) and explicit is None)):
         raise PipelineError("review lease depth requires human escalation")
     completion_gate = lease.get("completion_gate", "health")
     if completion_gate not in {"health", "target-v1"}:
@@ -288,6 +298,13 @@ def load_config(path: str) -> dict:
     data.setdefault("parallel_fix_enabled", False)
     if type(data["parallel_fix_enabled"]) is not bool:
         raise PipelineError("parallel_fix_enabled must be a boolean")
+    # Do not add an absent default to the signed config: existing v1 digests
+    # and frozen producers must remain byte-for-value compatible.
+    migration = data.get("legacy_merge_progress_migration", False)
+    if type(migration) is not bool:
+        raise PipelineError("legacy_merge_progress_migration must be a boolean")
+    if migration and data["fallback_handoff"] != "target-v1":
+        raise PipelineError("legacy_merge_progress_migration requires target-v1")
     data.setdefault("parallel_content_review", False)
     if not isinstance(data["parallel_content_review"], bool):
         raise PipelineError("parallel_content_review must be a boolean")
@@ -600,12 +617,15 @@ def review_gate(snapshot: dict, config: dict, lease: dict, *, require_outcome: s
     # ``ship`` is a sticky human intent: merge this exact HEAD if its review
     # succeeds.  It may be applied while REVIEW is still publishing its
     # claim/completion transaction, so it must not hide the PR from REVIEW.
-    if labels & {"hold", "needs-decision"}:
+    if labels & {"hold", "manual"}:
         raise PipelineError("review routing gate closed")
     info = epoch(snapshot, config["trusted_account"])
     validate_epoch_safety(info, config["trusted_account"])
     if info["hash"] != lease["epoch"] or info["anchor_id"] != lease["anchor"]:
         raise PipelineError("review epoch changed")
+    explicit = validated_explicit_review_grant(snapshot, config, lease, info)
+    if "needs-decision" in labels and not explicit:
+        raise PipelineError("review routing gate closed")
     if require_outcome and require_outcome not in labels:
         raise PipelineError(f"outcome label {require_outcome} disappeared")
     return info
@@ -626,14 +646,51 @@ def committed_review_depth(snapshot: dict, trusted: str) -> int:
     return len(review_ids)
 
 
+def explicit_full_current_review_grant(snapshot: dict, config: dict, info: dict) -> dict | None:
+    """Bind one trusted immutable request to its actual prior current-HEAD proof.
+
+    Lifetime depth is preserved. A request before the current HEAD, before its
+    completed review, or without that review's claim-bound proof grants nothing.
+    This fact only admits a new full audit; it supplies no positive review proof.
+    """
+    index = info["anchor_index"]
+    node = snapshot["edges"][index].get("node") or {}
+    trusted = config["trusted_account"]
+    if (node.get("__typename") != "IssueComment"
+            or (node.get("author") or {}).get("login") != trusted
+            or node.get("lastEditedAt") is not None
+            or not has_review_again(node.get("body") or "")):
+        return None
+    before = dict(snapshot, edges=snapshot["edges"][:index])
+    previous = epoch(before, trusted)
+    validate_epoch_safety(previous, trusted)
+    established = proof(previous, snapshot["headRefOid"], trusted)
+    if established is None:
+        return None
+    return {"version": 1, "head": snapshot["headRefOid"], "epoch": info["hash"],
+            "anchor": info["anchor_id"], "depth": committed_review_depth(snapshot, trusted),
+            "prior_proof": digest(established)}
+
+
+def validated_explicit_review_grant(snapshot: dict, config: dict, lease: dict, info: dict) -> bool:
+    explicit = lease.get("explicit_full_current_review")
+    if explicit is None:
+        return False
+    if (lease.get("completion_gate") != "target-v1"
+            or explicit != explicit_full_current_review_grant(snapshot, config, info)):
+        raise PipelineError("explicit full current review grant changed")
+    return True
+
+
 def content_review_target_gate(snapshot: dict, config: dict, lease: dict) -> dict:
     """Prove a leased ordinary REVIEW locally, without rereading other PRs."""
     info = review_gate(snapshot, config, lease)
     labels = set(snapshot["labels"])
-    if "changes-requested" in labels:
+    explicit = validated_explicit_review_grant(snapshot, config, lease, info)
+    if "changes-requested" in labels and not explicit:
         raise PipelineError("content REVIEW target entered the FIX route")
     depth = committed_review_depth(snapshot, config["trusted_account"])
-    if depth != int(lease.get("depth", -1)) or depth >= 2:
+    if depth != int(lease.get("depth", -1)) or (depth >= 2 and not explicit):
         raise PipelineError("review depth changed or requires human escalation")
     for _index, _edge, node in comments(info, config["trusted_account"]):
         body = (node.get("body") or "").strip()
@@ -1326,6 +1383,7 @@ def capabilities(config: dict) -> dict:
             "parallel_fix_election": "disabled-by-default" if not config.get(
                 "parallel_fix_enabled") else "signed-target-v1",
             "merge_admission_progress": "promptpilot-merge-admission-progress-v1",
+            "native_source_refresh": "existing-admitted-task-insights-v1",
             # Opt-in, not yet enabled in production (issue #42).
             "base_sync_merge": "experimental" if config.get("base_sync_merge") else "off",
             "base_sync_carry": "experimental" if config.get("base_sync_carry") else "off",
@@ -1766,7 +1824,7 @@ def next_review(gh: GitHub, config: dict, *, config_path: str | None = None) -> 
     owner = health.get("integration_owner") or {}
     if candidates and candidates[0].get("stage") != "review" and candidates[0].get("number") in excluded:
         if not parallel:
-            return {"action": "wait", "reason": "integration target awaits human resolution",
+            return {"action": "wait", "reason": "integration target has a local admission hold",
                     "number": candidates[0]["number"]}
         candidates = []
     # Ordinary content reviews are independent. Never skip an owner in order
@@ -1833,7 +1891,7 @@ def next_review(gh: GitHub, config: dict, *, config_path: str | None = None) -> 
         if config.get("fallback_handoff") == "target-v1":
             raise PipelineError("health election did not prove the exact content target")
         return {"action": "fallback", "reason": "health election did not prove the exact content target"}
-    if int(item.get("review_depth", 0)) >= 2:
+    if completion_gate != "target-v1" and int(item.get("review_depth", 0)) >= 2:
         if parallel_selected:
             raise PipelineError("parallel content REVIEW cannot use full-skill fallback")
         return fallback_target(
@@ -1849,11 +1907,22 @@ def next_review(gh: GitHub, config: dict, *, config_path: str | None = None) -> 
         if config.get("fallback_handoff") == "target-v1":
             raise PipelineError("review depth changed after health election")
         return {"action": "fallback", "reason": "review depth changed after health election", "target": item}
+    explicit = (explicit_full_current_review_grant(snapshot, config, info)
+                if completion_gate == "target-v1" else None)
+    if depth >= 2 and explicit is None:
+        if parallel_selected:
+            raise PipelineError("parallel content REVIEW cannot use full-skill fallback")
+        return fallback_target(
+            config, election_health, "review", item,
+            "third review round requires human-escalation rules", reservation=reservation,
+        )
     lease = {"version": 1, "stage": "review", "repository": config["repository"],
              "number": item["number"], "head": snapshot["headRefOid"],
              "snapshot": content_review_digest(snapshot), "epoch": info["hash"],
              "anchor": info["anchor_id"], "depth": depth,
              "completion_gate": completion_gate}
+    if explicit is not None:
+        lease["explicit_full_current_review"] = explicit
     if reservation is not None:
         lease["target_stage"] = item["stage"]
         lease["target_reservation"] = reservation
@@ -2513,7 +2582,7 @@ def next_merge(gh: GitHub, config: dict, *, config_path: str | None = None) -> d
     if any(item.get("code") == "single_flight_barrier" for item in health.get("findings", [])):
         owner = health.get("integration_owner")
         if isinstance(owner, dict) and owner.get("number") in admission_exclusions():
-            return {"action": "wait", "reason": "single-flight owner awaits human resolution",
+            return {"action": "wait", "reason": "single-flight owner has a local admission hold",
                     "number": owner["number"]}
         # A validated REVIEW owner is not executable by MERGE. Launching the
         # full skill here only rediscovers the barrier and burns agent tokens.
@@ -2564,7 +2633,7 @@ def next_merge(gh: GitHub, config: dict, *, config_path: str | None = None) -> d
             raise PipelineError("ordinary MERGE election contains an integration stage")
         if target.get("number") in excluded:
             return {"action": "wait", "number": target["number"],
-                    "reason": "first executable MERGE target awaits human resolution"}
+                    "reason": "first executable MERGE target has a local admission hold"}
         item = next((value for value in queue
                      if value.get("number") == target.get("number")
                      and (value.get("head") or {}).get("sha") == target.get("head")), None)
@@ -2767,6 +2836,10 @@ def run(argv=None) -> int:
     parser.add_argument("--config", default="pipelinectl.json")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("capabilities")
+    source_refresh_parser = sub.add_parser("source-refresh")
+    source_refresh_parser.add_argument("--profile", required=True)
+    budget_refresh_parser = sub.add_parser("budget-refresh")
+    budget_refresh_parser.add_argument("--profile", required=True)
     routing_parser = sub.add_parser("validate-routing-report")
     routing_parser.add_argument("--report", required=True)
     routing_parser.add_argument("--head", required=True)
@@ -2803,6 +2876,10 @@ def run(argv=None) -> int:
     complete_lease.add_argument("--lease-file")
     complete_parser.add_argument("--report")
     args = parser.parse_args(argv)
+    if args.command in ("source-refresh", "budget-refresh"):
+        from .pipeline_source_refresh import run as source_refresh_run
+
+        return source_refresh_run(["--profile", args.profile], budget_only=args.command == "budget-refresh")
     try:
         if getattr(args, "lease_file", None):
             path = Path(args.lease_file)

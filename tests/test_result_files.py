@@ -366,7 +366,7 @@ def test_new_reply_supersedes_previous_context(isolated_db, tmp_path):
 
 def test_native_reply_adds_file_instructions_to_authorized_request(isolated_db, tmp_path, monkeypatch):
     agent, _ = native_for(tmp_path)
-    rpc = AsyncMock(side_effect=[{'result': {'agent': agent}}, {'result': True}])
+    rpc = AsyncMock(side_effect=[{'result': {'agent': agent}}, {'result': {'agent': agent}}])
     monkeypatch.setattr(bot, '_herdr_json', rpc)
     monkeypatch.setattr(bot, 'is_authorized', lambda uid: uid == 123)
     monkeypatch.setattr(bot, 'LOG_PROMPTS', False)

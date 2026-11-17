@@ -3,6 +3,55 @@
 This is an operator deployment/configuration policy, not a replacement for the
 canonical OneBase skills, independent review or GitHub protection.
 
+See [legacy MERGE progress](legacy-merge-progress.md) for the separate, default-off
+single-use recovery of an exact legacy item hold after new canonical progress.
+
+## Decision publication and consumer delivery
+
+The normal producer delivers an immutable, conditional scope pointer **before**
+publishing a new decision or adding its runnable routing label. The pointer
+binds the exact source identity, immutable scope location and SHA256, current
+proof/epoch, and SHA256 of the expected exact UTF-8 decision body. It explicitly
+grants no authority until the consumer verifies a genuinely published matching
+canonical decision and all ordinary current admission gates. It is data, not a
+reservation, execution grant or substitute for proof.
+
+The producer first CAS-delivers that pointer to both the future schedule and a
+genuine neverstarted pending consumer, obtains and verifies the atomic transport
+receipt, and only then performs the ordinary public decision/routing handoff.
+A stale CAS, missing or started consumer, or paused queue without a pending
+consumer defers publication of the new decision. Never edit an active attempt,
+resume a queue, create a replacement task or report DONE to bypass that refusal.
+If publication fails after delivery, the pointer stays conditional and inert;
+the receipt does not authorize publication replay or execution.
+
+For an already published decision whose delivery was interrupted, retain the
+truthful `DECISION_PUBLISHED_DELIVERY_PENDING` state until the required exact
+scope reaches both rows. Reconcile the existing decision and transport receipt;
+do not publish a replacement decision or claim private preparation establishes
+delivery. Report consumer handoff complete only after the matching receipt and
+canonical publication have both been verified.
+
+The explicit operator API `GET /api/schedule/{id}/scope-delivery` returns opaque
+full-row revisions and readiness without exposing prompts. `POST` to the same
+path accepts those `series_revision`, `pending_id`, `pending_revision`, an opaque
+`addition` (at most 64 KiB UTF-8) and an explicitly supplied 32-hex `request_nonce`.
+It appends the exact text to both rows in one CAS transaction and preserves all
+rights, waits, pauses, holds and unrelated state. No scope paths are opened,
+decisions interpreted, tasks created, providers launched or queues resumed.
+Missing, ambiguous, already-started or guarded consumers fail closed.
+
+`GET /api/schedule/{id}/scope-delivery/{request_nonce}` reconciles an unknown
+response. Exact same-request retry returns the immutable old receipt, including
+when a later consumer exists; it never repeats the append. Another request under
+that nonce conflicts. The receipt proves historical data delivery, not current
+execution, admission, product acceptance or authority to change scheduler state.
+An absent consumer in a paused queue still needs a separately authorized normal
+operator resolution; the producer must leave delivery pending and never resume
+or rewrite an active attempt itself. All existing API authentication and browser
+origin checks apply. This API does not automatically wire an external private
+OWNER controller; that caller's procedure rollout must be reviewed separately.
+
 ## Release unit
 
 Deploy server, worker and bot from the **same frozen `pp` binary**. A release
@@ -120,6 +169,64 @@ no-op Resume on an already active series preserves them too. To explicitly
 retry blocked work through the API, send `{"action":"run_now","retry_blocked":true}`
 to `/api/schedule/<id>/action`. An actual paused-to-active Resume also clears
 holds. A rejected action on an already running occurrence clears nothing.
+
+### Resolve one exact hold explicitly
+
+An operator can resolve one HEAD-bound local admission hold without clearing the
+other holds or using Run now. This command records the operator's decision; it
+does not infer that a quota, product or source blocker has been fixed.
+
+1. Read `GET /api/schedule/{series_id}/holds`. The response includes the exact
+   `raw_holds`, its `raw_holds_sha256`, the unchanged `hold_mode`, and each item
+   with its `record` and canonical `record_sha256`.
+2. After an authorized operator decision, send
+   `POST /api/schedule/{series_id}/holds/{number}/resolve` with the fields below,
+   taken from the observed record and raw ledger. Choose one new request nonce
+   for this decision, then retain it to reconcile the response.
+
+```json
+{
+  "expected_head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "expected_task_id": 123,
+  "expected_raw_holds_sha256": "<raw_holds_sha256 from GET>",
+  "request_nonce": "operator-decision-unique-id"
+}
+```
+
+The selected entry must have that exact HEAD and integer originating task ID.
+Fingerprint-only legacy records are readable but are not guessed into this
+HEAD-bound command. A missing/stale entry, changed raw ledger, ambiguous or
+malformed ledger, reused nonce with a different request, or running attempt in
+this series returns a conflict. Invalid request fields are rejected. No partial
+hold change or resolution receipt is committed on refusal.
+
+The hold CAS and its durable receipt share one `BEGIN IMMEDIATE` transaction.
+Only the selected entry is removed; other records keep their canonical hashes.
+An empty ledger remains `{}`. The hold mode, series, tasks, retry counts, hard
+budget deadlines, waiter/wake metadata and leases are preserved. Other series
+may keep running. This command does not wake a task, claim an attempt, run a gate,
+refresh GitHub, resume a series, or modify GitHub. Existing retry-all controls
+retain their current behavior.
+
+An identical request with the same nonce returns the same committed receipt,
+including after a restart or after a later actor adds a new hold. It never
+removes that new hold. Changed parameters require a new decision and nonce;
+reusing the old nonce with different parameters returns `409`.
+
+After a lost response or `503`, read
+`GET /api/schedule/{series_id}/hold-resolutions/{request_nonce}` before deciding
+what happened. A known nonce returns its original receipt without a mutation;
+`404` means no committed receipt was observed. If a request remains in flight,
+reconcile again or submit only the identical nonce/request: serialization and
+idempotency prevent a second removal. Do not generate a new nonce just because
+the response was lost. Receipts are durable metadata and have no automatic TTL.
+
+These endpoints use the existing API authentication boundary. Their receipt is
+neither canonical source progress nor product/mutation admission. The caller
+must have explicit operator authority; untrusted GitHub prose is not such
+authority. Every subsequently elected Native attempt still needs its own
+current proof, ownership, CI, budget, scheduling and mutation gates. This API
+supplies no phase-budget contract or automatic reason-based resolution.
 
 FIX also enables `item_error_holds`. A terminal UNABLE naming exactly one
 fresh checker-measured PR rework parks that unchanged item for at most 24 hours.

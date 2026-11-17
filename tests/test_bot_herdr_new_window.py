@@ -52,7 +52,8 @@ def test_empty_windows_still_offer_creation_and_keep_prompt(wizard):
 def test_existing_window_selection_keeps_original_route(wizard, monkeypatch):
     agent = {"pane_id": "w1:p1", "workspace_id": "w1", "name": "existing-agent"}
     monkeypatch.setattr(bot, "_herdr_json", AsyncMock(side_effect=[
-        {"result": {"agents": [agent]}}, {"result": {"workspaces": []}}]))
+        {"result": {"agents": [agent]}}, {"result": {"workspaces": []}},
+        {"result": {"agent": agent}}]))
     event = update("pickprov:herdr-session")
     assert asyncio.run(bot.add_task_got_provider(event, wizard)) == bot.ASK_HERDR_TARGET
     assert "hst_i:0" in [b.callback_data for b in buttons(event.callback_query)]
@@ -60,6 +61,79 @@ def test_existing_window_selection_keeps_original_route(wizard, monkeypatch):
     assert asyncio.run(bot.add_task_got_herdr_target(update("hst_i:0"), wizard)) == bot.ASK_CONFIRM
     assert wizard.user_data["new_provider"] == "herdr-session"
     assert wizard.user_data["new_herdr_target"] == "existing-agent"
+
+
+def test_same_settings_after_session_task_reuses_session_not_older_new_window(wizard, isolated_db, monkeypatch):
+    route = config.ensure_herdr_launch_provider("codex")
+    wizard.user_data.update(new_provider=route, new_dir="old-directory")
+    bot._save_last_settings(123, wizard)
+    wizard.user_data.update(new_provider="herdr-session", new_herdr_target="w1:p1", new_dir="session-directory")
+    asyncio.run(bot._show_confirm(update("confirm").callback_query.edit_message_text, wizard))
+    assert asyncio.run(bot.cb_wiz_run(update("wiz_run"), wizard)) == bot.ConversationHandler.END
+    saved = bot._load_last_settings(123)
+    assert saved["new_provider"] == "herdr-session"
+    assert saved["new_herdr_target"] == "w1:p1"
+
+    next_wizard = SimpleNamespace(user_data={"new_prompt": "Continue the same conversation"})
+    message = update("", text="Continue the same conversation").message
+    assert asyncio.run(bot._after_prompt(message, next_wizard)) == bot.ASK_LAST
+    assert "сессия w1:p1" in message.reply_text.call_args.args[0]
+    assert "новое окно" not in message.reply_text.call_args.args[0]
+    rpc = AsyncMock(return_value={"result": {"agent": {"pane_id": "w1:p1", "cwd": "current-directory"}}})
+    monkeypatch.setattr(bot, "_herdr_json", rpc)
+    assert asyncio.run(bot.cb_last_use(update("last_use"), next_wizard)) == bot.ASK_CONFIRM
+    rpc.assert_awaited_once_with("agent", "get", "w1:p1", host=None)
+    assert next_wizard.user_data["new_dir"] == "current-directory"
+    assert next_wizard.user_data["new_worktree"] is False
+    assert asyncio.run(bot.cb_wiz_run(update("wiz_run"), next_wizard)) == bot.ConversationHandler.END
+    tasks = isolated_db.list_tasks()
+    assert len(tasks) == 2
+    assert all(t.provider == "herdr-session" and t.herdr_target == "w1:p1" for t in tasks)
+
+
+def test_closed_saved_session_requires_selection_without_creating_window(wizard, isolated_db, monkeypatch):
+    wizard.user_data["last_settings"] = {"new_provider": "herdr-session", "new_herdr_target": "closed",
+                                         "new_dir": "stale-directory"}
+    monkeypatch.setattr(bot, "_herdr_json", AsyncMock(return_value=None))
+    picker = AsyncMock(return_value=bot.ASK_HERDR_TARGET)
+    monkeypatch.setattr(bot, "_show_herdr_targets", picker)
+    assert asyncio.run(bot.cb_last_use(update("last_use"), wizard)) == bot.ASK_HERDR_TARGET
+    assert "new_herdr_target" not in wizard.user_data
+    assert "new_dir" not in wizard.user_data
+    assert wizard.user_data["new_prompt"] == "Проверь проект"
+    assert isolated_db.list_tasks() == []
+    picker.assert_awaited_once()
+
+
+def test_missing_saved_machine_never_falls_back_to_local_session(wizard, monkeypatch):
+    wizard.user_data["last_settings"] = {"new_provider": "herdr-session", "new_herdr_target": "w1:p1",
+                                         "new_machine": "removed"}
+    ask = AsyncMock(return_value=bot.ASK_MACHINE)
+    monkeypatch.setattr(bot, "_ask_machine_or_provider", ask)
+    assert asyncio.run(bot.cb_last_use(update("last_use"), wizard)) == bot.ASK_MACHINE
+    bot._herdr_json.assert_not_awaited()
+    assert "new_herdr_target" not in wizard.user_data
+    assert wizard.user_data["new_prompt"] == "Проверь проект"
+
+
+def test_saved_remote_session_is_revalidated_on_its_own_machine(wizard, monkeypatch):
+    monkeypatch.setattr(bot, "load_machines", lambda: {"mac": {"host": "user@remote"}})
+    wizard.user_data["last_settings"] = {"new_provider": "herdr-session", "new_herdr_target": "w1:p1",
+                                         "new_machine": "mac"}
+    rpc = AsyncMock(return_value={"result": {"agent": {"pane_id": "w1:p1", "cwd": "/project"}}})
+    monkeypatch.setattr(bot, "_herdr_json", rpc)
+    assert asyncio.run(bot.cb_last_use(update("last_use"), wizard)) == bot.ASK_CONFIRM
+    assert rpc.call_args.kwargs["host"].host == "user@remote"
+    assert wizard.user_data["new_machine"] == "mac"
+
+
+def test_legacy_session_settings_without_target_open_picker(wizard, monkeypatch):
+    wizard.user_data.update(new_herdr_target="stale", last_settings={"new_provider": "herdr-session"})
+    picker = AsyncMock(return_value=bot.ASK_HERDR_TARGET)
+    monkeypatch.setattr(bot, "_show_herdr_targets", picker)
+    assert asyncio.run(bot.cb_last_use(update("last_use"), wizard)) == bot.ASK_HERDR_TARGET
+    assert "new_herdr_target" not in wizard.user_data
+    picker.assert_awaited_once()
 
 
 def test_new_window_with_new_folder_preserves_agent_folder_and_keep_pane(wizard, isolated_db, tmp_path):

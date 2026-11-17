@@ -10,6 +10,7 @@ _TEST_HOME = tempfile.TemporaryDirectory(prefix="promptpilot-pytest-home-")
 os.environ["HOME"] = _TEST_HOME.name
 os.environ["USERPROFILE"] = _TEST_HOME.name
 os.environ["PP_DATA_DIR"] = str(Path(_TEST_HOME.name) / ".promptpilot")
+os.environ["PP_CODEX_APP_SERVER"] = "0"  # Never attach tests to the operator's live dialogs.
 
 from promptpilot import db
 
