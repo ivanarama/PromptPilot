@@ -6,24 +6,26 @@ import pytest
 from promptpilot import pipeline_insights as pi, worker
 from promptpilot.models import TaskCreate
 from tests.test_github_budget import _limits
+from tests.source_cost_fixtures import checker_receipt, declare_checker, observed_rates
 
 
 @pytest.fixture
-def gate(isolated_db, monkeypatch):
+def gate(isolated_db, monkeypatch, tmp_path):
     profile = {"title": "Example", "repository": "owner/example", "health_check": {"command": ["checker"]},
         "queues": [{"id": "fix", "title": "Fix", "query": "is:pr", "capacity": 1,
                     "series_contains": "Example - FIX", "dispatch_gate": {"require_fresh_snapshot": True}}],
         "github_budget": {"minimum_remaining": {"core": 250, "search": 2, "graphql": 100},
             "essential_snapshot_headroom": True,
             "costs": {r: {"core": 50, "search": 10, "graphql": 100} for r in pi._GITHUB_BUDGET_ROUTES}}}
+    declare_checker(profile, tmp_path)
     monkeypatch.setattr(pi, "_profiles", lambda: {"example": profile})
     monkeypatch.setattr(pi, "_cache", {})
-    monkeypatch.setattr(pi, "_github_rate_limits", lambda: _limits())
+    monkeypatch.setattr(pi, "_github_rate_limits", lambda: observed_rates(_limits()))
     calls = []
     def checker(_):
         pi._ensure_github_scan_lease()
         calls.append("checker")
-        return {"state": "green", "findings": []}
+        return checker_receipt({"state": "green", "findings": []})
     def search(*_):
         pi._ensure_github_scan_lease()
         calls.append("search")
