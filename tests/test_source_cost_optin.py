@@ -15,12 +15,17 @@ from tests.test_pipeline_source_refresh import continuation as continuation, led
 
 
 @pytest.mark.parametrize("method,expected", [
-    ("__init__","7a0aee36faa58231cff82a5d1f885fba94eeeff643ccddee0820860331608514"),
-    ("_allowance_denied","750a0fcaa7cb7605806fbdbc395379eec4c5aac28bcf3e3c52ece5bd9cfa5538"),
-    ("before_request","4667987f9924ccf48760b86bc2b90d787949d74fd1951a072aeb14cd66f5f0b4")])
+    ("__init__","76d51dbc8dc99e27257f86c85a647708cd828f2b6792a5a7f8969b782db9a448"),
+    ("_allowance_denied","285fc8d0aa0981565f11dbe129fa212a8a11447bfbbb972a5838e28845ae4da5"),
+    ("before_request","44f7dbde5005fd04670a894a8a77fc8f5fef45ec5073ed102c5e80904a020bc4")])
 def test_legacy_counter_algorithm_is_exact_accepted_0930_ast(method,expected):
     # Normative migration pin: no new math or fallback may enter this old policy.
     tree=ast.parse(textwrap.dedent(inspect.getsource(getattr(pi._LegacyGraphQLSearchBudget,method)))).body[0]
+    # Python3.12 adds empty PEP695 metadata absent from Python3.10's AST.
+    # Nonempty type parameters remain part of the pinned semantic structure.
+    for child in ast.walk(tree):
+        if getattr(child,"type_params",None)==[]:
+            del child.type_params
     assert hashlib.sha256(ast.dump(tree,include_attributes=False).encode()).hexdigest()==expected
 
 
