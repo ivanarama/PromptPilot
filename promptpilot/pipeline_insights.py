@@ -6546,12 +6546,14 @@ def _routing_markdown_text(value):
     return re.sub(r"([\\`*_{}\[\]()#+\-.!|>~])", r"\\\1", text)
 
 
-def sample_active_profiles(series: list[dict]) -> dict[str, str]:
+def sample_active_profiles(series: list[dict], *, profile_ids=None) -> dict[str, str]:
     """Refresh every configured pipeline that has a matching live series."""
     if db.is_paused():
         return {}
     outcomes = {}
     for profile_id, profile in _profiles().items():
+        if profile_ids is not None and profile_id not in profile_ids:
+            continue
         if not _profile_active(profile, series):
             continue
         try:
@@ -6559,8 +6561,14 @@ def sample_active_profiles(series: list[dict]) -> dict[str, str]:
             if (profile.get("github_budget") or {}).get("essential_snapshot_headroom") is True:
                 candidate = read_cached(profile_id, series)
                 cache = candidate.get("cache") or {}
+                from .pipeline_sampling import refresh_ahead_seconds
+                lead = refresh_ahead_seconds(profile)
+                age = cache.get("age_seconds")
+                early_due = bool(lead) and (
+                    not isinstance(age, (int, float)) or isinstance(age, bool)
+                    or not math.isfinite(age) or age >= _CACHE_TTL_SECONDS - lead)
                 if (cache.get("complete") is True and cache.get("stale") is False
-                        and not cache.get("refresh_blocked")):
+                        and not cache.get("refresh_blocked") and not early_due):
                     data = candidate
             if data is None:
                 data = analyze(profile_id, series, use_cache=False)

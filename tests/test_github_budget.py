@@ -3865,15 +3865,17 @@ def test_pipeline_sampler_reads_database_off_event_loop(monkeypatch):
         threads["database"] = threading.get_ident()
         return [{"id": 1}]
 
-    def sample(series):
+    def sample(series, interval, deadlines):
         threads["sample"] = threading.get_ident()
         assert series == [{"id": 1}]
+        assert interval == 1 and deadlines == {}
         raise asyncio.CancelledError
 
-    monkeypatch.setattr(api, "PIPELINE_SNAPSHOT_INTERVAL", 0)
+    from promptpilot import pipeline_sampling
+    monkeypatch.setattr(api, "PIPELINE_SNAPSHOT_INTERVAL", 1)
     monkeypatch.setattr(api.db, "list_series", list_series)
     monkeypatch.setattr(
-        api.pipeline_insights, "sample_active_profiles", sample)
+        pipeline_sampling, "sample_scheduled_profiles", sample)
 
     async def run_once():
         threads["event_loop"] = threading.get_ident()
