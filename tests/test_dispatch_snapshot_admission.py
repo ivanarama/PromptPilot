@@ -19,13 +19,17 @@ def dispatch(isolated_db, monkeypatch):
     }]}
     data = {"cache": {"available": True, "complete": True, "stale": False,
                       "invalidated": False},
-            "queues": [{"id": "fix", "backlog": 1}], "diagnostics": {}}
+            "queues": [{"id": "fix", "backlog": 1, "membership_complete": True}], "diagnostics": {}}
     calls = []
     monkeypatch.setattr(pi, "_profiles", lambda: {"example": profile})
-    monkeypatch.setattr(pi, "read_cached", lambda *_: deepcopy(data))
+    def cached(*_):
+        observed = deepcopy(data)
+        observed["cache"].setdefault("profile_hash", pi._profile_fingerprint(profile))
+        return observed
+    monkeypatch.setattr(pi, "read_cached", cached)
 
     def forbidden_scan(*_args, **_kwargs):
-        raise AssertionError("snapshot admission must not start a GitHub scan")
+        raise OSError("fixture admitted snapshot refresh is unavailable")
 
     monkeypatch.setattr(pi, "analyze", forbidden_scan)
 
@@ -146,7 +150,7 @@ def test_invalid_opt_in_is_deferred_as_configuration_error(dispatch, invalid):
     assert calls == []
 
 
-def test_opt_in_never_refreshes_stale_backpressure_snapshot(dispatch):
+def test_required_refresh_failure_still_defers_with_backpressure(dispatch):
     _db, _created, task, profile, data, calls = dispatch
     profile["queues"][0]["dispatch_gate"]["backpressure"] = {"max_active": 1}
     data["cache"]["stale"] = True
