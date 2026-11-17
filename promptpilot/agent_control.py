@@ -420,6 +420,7 @@ def create_task(connection_id, data: TaskCreate):
         slug = "agent-" + hashlib.sha256((connection_id + ":" + data.request_id).encode()).hexdigest()[:40]
         objective = data.objective + ("\n\nReference issue (context only): " + issue_url if issue_url else "")
         native = WorkflowCreate(slug=slug, objective=objective, repository_path=project["repository_path"], candidate_branch=project["branch_prefix"] + slug, config=_workflow_config(project, workflow_id))
+        native.config["agent_task_title"] = next(line.strip() for line in data.objective.splitlines() if line.strip())[:200]
         workflow = db.create_workflow(native, workflow_id=workflow_id, conn=conn)
         proposed = data.plan or [PlanStage(title=next(line.strip() for line in data.objective.splitlines() if line.strip())[:200], objective=objective)]
         specs = [WorkflowStageSpec(code=f"stage-{i+1:02}", title=stage.title, objective=stage.objective + ("\n\nReference issue (context only): " + issue_url if issue_url and issue_url not in stage.objective else ""), stage_type="integration" if i == len(proposed)-1 else "implementation", execution_mode="external", dependencies=[f"stage-{i:02}"] if i else [], allowed_paths=project["allowed_paths"], deliverables=project["deliverables"]) for i, stage in enumerate(proposed)]

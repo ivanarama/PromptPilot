@@ -2396,7 +2396,7 @@ async function loadWorkflows() {
   const list = document.getElementById('wfList');
   list.innerHTML = workflowCache.length ? workflowCache.map(w => `
     <div class="wf-row${w.id === selectedWorkflowId ? ' active' : ''}" onclick="selectWorkflow('${escAttr(w.id)}')">
-      <div class="wf-title">${esc(w.slug)}</div>
+      <div class="wf-title">${esc(typeof w.config?.agent_task_title === 'string' && w.config.agent_task_title.trim() ? w.config.agent_task_title : w.slug)}</div>
       <div class="wf-meta">${esc(w.status)} · раунд ${w.current_round} · v${w.state_version}</div>
     </div>`).join('') : '<div class="wf-meta">Workflow пока нет.</div>';
   if (!selectedWorkflowId && workflowCache.length) selectedWorkflowId = workflowCache[0].id;
@@ -2802,6 +2802,7 @@ async function wfAnswerElicitation() {
 }
 
 function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, plannerTask, orphanPane = null, elicitation = null) {
+  const displayTitle = typeof wf.config?.agent_task_title === 'string' && wf.config.agent_task_title.trim() ? wf.config.agent_task_title : wf.slug;
   const terminal = ['completed','failed','cancelled'].includes(wf.status);
   const plannerRun = wf.status === 'planning' && plannerTask ? {role:'planner', task_id:plannerTask.id, status:plannerTask.status} : null;
   const activeRun = plannerRun || [...runs].reverse().find(r => ['pending','running'].includes(r.status));
@@ -2892,7 +2893,7 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, 
   const wfModalScroller = wfPane.closest('.modal');
   const wfSnapModalTop = wfModalScroller ? wfModalScroller.scrollTop : 0;
   wfPane.innerHTML = `
-    <div class="wf-title">${esc(wf.slug)} <span class="task-status" data-s="${escAttr(wf.status)}">${esc(statusInfo[0])}</span>
+    <div class="wf-title">${esc(displayTitle)} <span class="task-status" data-s="${escAttr(wf.status)}">${esc(statusInfo[0])}</span>
       ${wf.config?.automation?.enabled ? '<span class="task-status" data-s="running">АВТО</span>' : '<span class="wf-meta">ручной режим</span>'}</div>
     <div class="wf-stage" style="border-color:${ownerInfo.color}">
       <div class="wf-stage-title">🏓 Мяч сейчас: <span style="color:${ownerInfo.color}">${esc(ownerInfo.who)}</span></div>

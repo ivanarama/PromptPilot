@@ -5,7 +5,7 @@ import json
 import httpx
 import pytest
 
-from promptpilot import agent_control as control, api, config, db
+from promptpilot import agent_control as control, api, config, db, task_feed
 
 
 def request(method, path, token, **kwargs):
@@ -73,6 +73,8 @@ def test_create_via_real_middleware_has_approval_and_no_task_dispatch(access):
     assert native.config["gate"]["enabled"] is True and native.config["gate"]["commands"]
     assert native.config["external_executor"]["client_id"] == "zcode"
     assert payload["issue_url"] in native.objective
+    assert native.config["agent_task_title"] == payload["objective"]
+    assert task_feed.project_workflow(native.model_dump(mode="json"))["title"] == payload["objective"]
     with db._connect() as conn:
         assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == 0
     again = tool(token, "pilot_create_task", payload).json()["result"]

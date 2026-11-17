@@ -1,5 +1,7 @@
 """Actual Git context boundary, including staged and untracked private content."""
 import hashlib
+import os
+from pathlib import Path
 import subprocess
 
 import pytest
@@ -66,3 +68,35 @@ def test_context_bounds_and_text_policy(project, name):
 def test_context_validates_slices(project, offset, length):
     with pytest.raises(context.ContextError):
         context.read_file(project, "README.md", offset, length)
+
+
+def test_context_does_not_inherit_another_git_directory(project, tmp_path, monkeypatch):
+    foreign = tmp_path / "foreign"
+    foreign.mkdir()
+    subprocess.run(["git", "-C", str(foreign), "init", "-b", "main"], check=True, capture_output=True)
+    (foreign / "README.md").write_text("Foreign private context", encoding="utf-8")
+    subprocess.run(["git", "-C", str(foreign), "add", "."], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(foreign), "-c", "user.name=Fixture", "-c", "user.email=test@example.invalid",
+                    "commit", "--no-gpg-sign", "-m", "Foreign fixture"], check=True, capture_output=True)
+    monkeypatch.setenv("GIT_DIR", str(foreign / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(foreign))
+    assert context.read_file(project, "README.md")["text"] == "Committed context: пример\n"
+
+
+def test_partial_clone_context_never_fetches_missing_objects(project, tmp_path):
+    source = Path(project["repository_path"])
+    subprocess.run(["git", "-C", str(source), "config", "uploadpack.allowFilter", "true"],
+                   check=True, capture_output=True)
+    clone = tmp_path / "partial.git"
+    subprocess.run(["git", "clone", "--bare", "--filter=blob:none", source.as_uri(), str(clone)],
+                   check=True, capture_output=True, timeout=20)
+    blob = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD:README.md"]).decode().strip()
+    offline = {**os.environ, "GIT_NO_LAZY_FETCH": "1", "GIT_ALLOW_PROTOCOL": ""}
+    def missing():
+        return subprocess.run(["git", "-C", str(clone), "cat-file", "-e", blob],
+                              env=offline, capture_output=True, timeout=10).returncode != 0
+    if not missing():
+        pytest.skip("This Git transport did not create a blob-filtered clone")
+    with pytest.raises(context.ContextError):
+        context.read_file({"repository_path": str(clone), "readable_paths": ["README.md"]}, "README.md")
+    assert missing()

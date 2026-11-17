@@ -44,10 +44,13 @@ def relative_path(value, *, prefix=False):
 
 
 def _git(repository, *args, input=None, accepted=(0,)):
+    environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    environment.update(GIT_NO_LAZY_FETCH="1", GIT_TERMINAL_PROMPT="0", GIT_ALLOW_PROTOCOL="",
+                       GIT_OPTIONAL_LOCKS="0", GIT_NO_REPLACE_OBJECTS="1")
     try:
-        result = subprocess.run(["git", "--no-optional-locks", "-c", "core.fsmonitor=false",
+        result = subprocess.run(["git", "--literal-pathspecs", "--no-optional-locks", "-c", "core.fsmonitor=false",
                                  "-C", str(repository), *args], input=input,
-                                capture_output=True, timeout=30)
+                                capture_output=True, timeout=30, env=environment)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise VerificationError("Git verification is unavailable") from exc
     require(result.returncode in accepted, "Patch or repository verification failed")

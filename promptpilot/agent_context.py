@@ -1,5 +1,6 @@
 """Bounded, project-scoped context from committed Git blobs, never arbitrary files."""
 import hashlib
+import os
 import re
 import stat
 import subprocess
@@ -30,9 +31,13 @@ def _relative(value, *, prefix=False):
 
 
 def _git(repository, *args, max_bytes=200000):
+    environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    environment.update(GIT_NO_LAZY_FETCH="1", GIT_TERMINAL_PROMPT="0", GIT_ALLOW_PROTOCOL="",
+                       GIT_OPTIONAL_LOCKS="0", GIT_NO_REPLACE_OBJECTS="1")
     try:
-        result = subprocess.run(["git", "-C", str(repository), *args],
-                                capture_output=True, timeout=10)
+        result = subprocess.run(["git", "--literal-pathspecs", "-c", "core.fsmonitor=false",
+                                 "-C", str(repository), *args],
+                                capture_output=True, timeout=10, env=environment)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise ContextError("Project context is temporarily unavailable") from exc
     _require(result.returncode == 0, "Requested committed file is unavailable")
