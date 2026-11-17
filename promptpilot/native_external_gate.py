@@ -26,7 +26,10 @@ def default_command():
 
 
 class VerificationError(ValueError):
-    pass
+    def __init__(self, message, *, code="verification_failed", **details):
+        super().__init__(message)
+        self.code = code
+        self.details = details
 
 
 def require(condition, message):
@@ -152,8 +155,11 @@ def verify(workflow_id, database):
                 "External performer proof mismatch")
         artifacts = list(conn.execute("SELECT path,sha256,content FROM external_inbox_artifacts_v1 WHERE job_id=?",
                                       (row["job_id"],)))
-        require(len(artifacts) == len(expected) and {a["path"] for a in artifacts} == set(expected),
-                "Submitted artifacts differ from the project policy")
+        if len(artifacts) != len(expected) or {a["path"] for a in artifacts} != set(expected):
+            received = [relative_path(a["path"]) for a in artifacts]
+            raise VerificationError("Submitted artifacts differ from the project policy",
+                code="artifact_paths_mismatch", expected_paths=sorted(expected),
+                received_paths=sorted(received))
         data = {}
         total = 0
         for item in artifacts:
@@ -192,8 +198,15 @@ def main(argv=None):
         require(data_dir, "PP_DATA_DIR is required for read-only workflow verification")
         print(json.dumps(verify(args.workflow_id, Path(data_dir) / "promptpilot.db"), ensure_ascii=False))
         return 0
-    except (VerificationError, sqlite3.Error, ValueError, TypeError, KeyError, OSError):
-        print("External result verification failed; inspect the current receipt and project policy.", file=sys.stderr)
+    except (VerificationError, sqlite3.Error, ValueError, TypeError, KeyError, OSError) as error:
+        # Only a fixed code and bounded logical artifact names cross this
+        # boundary. Never print exception text, SQL, repository paths or argv.
+        diagnostic = {"schema": "external-result-error-v1", "code": "verification_failed"}
+        if isinstance(error, VerificationError) and error.code == "artifact_paths_mismatch":
+            diagnostic["code"] = error.code
+            for key in ("expected_paths", "received_paths"):
+                diagnostic[key] = [name[:240] for name in error.details.get(key, [])[:8]]
+        print(json.dumps(diagnostic, ensure_ascii=True, separators=(",", ":")), file=sys.stderr)
         return 2
 
 

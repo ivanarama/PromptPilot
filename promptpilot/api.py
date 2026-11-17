@@ -294,6 +294,8 @@ _TASK_FEED_JS = (STATIC_DIR / "task-feed.js").read_text(encoding="utf-8")
 _TASK_SOURCE_SETTINGS_JS = (STATIC_DIR / "task-source-settings.js").read_text(encoding="utf-8")
 _AGENT_CONNECTIONS_JS = (STATIC_DIR / "agent-connections.js").read_text(encoding="utf-8")
 _AGENT_CONNECTIONS_CSS = (STATIC_DIR / "agent-connections.css").read_text(encoding="utf-8")
+_WORKFLOW_PROGRESS_JS = (STATIC_DIR / "workflow-progress.js").read_text(encoding="utf-8")
+_WORKFLOW_PROGRESS_CSS = (STATIC_DIR / "workflow-progress.css").read_text(encoding="utf-8")
 
 
 # --- API ---
@@ -1090,6 +1092,17 @@ def api_get_workflow(workflow_id: str):
     if not workflow:
         raise HTTPException(404, "Workflow not found")
     return workflow
+
+
+@app.get("/api/workflows/{workflow_id}/progress")
+def api_workflow_progress(workflow_id: str):
+    from . import workflow_progress
+    try:
+        return workflow_progress.get_progress(workflow_id)
+    except workflow_progress.ProgressNotFound:
+        raise HTTPException(404, "Workflow not found") from None
+    except workflow_progress.ProgressUnavailable:
+        raise HTTPException(503, "Workflow progress is unavailable") from None
 
 
 @app.patch("/api/workflows/{workflow_id}", response_model=WorkflowInDB)
@@ -2428,3 +2441,15 @@ def agent_connections_style():
 @app.get("/")
 def index():
     return Response(content=_INDEX_HTML, media_type="text/html")
+
+
+@app.get("/assets/workflow-progress.js")
+def workflow_progress_script():
+    return Response(content=_WORKFLOW_PROGRESS_JS, media_type="application/javascript",
+                    headers={"Cache-Control": "no-store"})
+
+
+@app.get("/assets/workflow-progress.css")
+def workflow_progress_style():
+    return Response(content=_WORKFLOW_PROGRESS_CSS, media_type="text/css",
+                    headers={"Cache-Control": "no-store"})

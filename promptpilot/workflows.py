@@ -3279,11 +3279,14 @@ def _run_gate_commands(workflow: WorkflowInDB, *, snapshot=None) -> WorkflowGate
             if completed.returncode:
                 failures += 1
             if completed.returncode and gate.stop_on_failure:
+                from .workflow_progress import external_diagnostic
+                diagnostic = external_diagnostic(output)
                 return WorkflowGateDecision(
                     expected_version=workflow.state_version,
                     verdict=GateVerdict.FAIL,
                     gate_id="automatic-gate",
-                    summary=f"Команда gate #{index} завершилась с кодом {completed.returncode}",
+                    summary=diagnostic["summary"] if diagnostic else
+                        f"Команда gate #{index} завершилась с кодом {completed.returncode}",
                     evidence=evidence,
                 )
         except subprocess.TimeoutExpired:

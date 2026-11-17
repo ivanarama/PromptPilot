@@ -46,6 +46,7 @@ def test_scoped_creator_cannot_use_owner_rest_or_owner_token_as_mcp(access):
     text = result.json()["result"]["content"][0]["text"]
     assert "repository_path" not in text and "workflow_config" not in text
     for method, path, body in [("GET", "/api/workflows", None),
+                                ("GET", "/api/workflows/wf_example/progress", None),
                                 ("POST", "/api/worker/resume", {}),
                                 ("POST", "/api/workflows", {}),
                                 ("POST", "/api/agent-control/connections", {})]:
@@ -67,6 +68,9 @@ def test_create_via_real_middleware_has_approval_and_no_task_dispatch(access):
     workflow = request("GET", "/api/workflows/" + created["task_id"], owner).json()
     # API details may wrap the workflow; inspect the canonical row as well.
     assert workflow
+    projection = request("GET", "/api/workflows/" + created["task_id"] + "/progress", owner)
+    assert projection.status_code == 200
+    assert projection.json()["current"]["status"] == "awaiting_plan_approval"
     native = db.get_workflow(created["task_id"])
     assert native.config["planning"]["require_approval"] is True
     assert native.config["automation"]["enabled"] is True

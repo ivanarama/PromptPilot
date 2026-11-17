@@ -135,3 +135,19 @@ def test_binary_or_outside_patch_refused(submitted, isolated_db):
         conn.execute("UPDATE external_inbox_artifacts_v1 SET content=?,sha256=? WHERE job_id=? AND path='changes.patch'",
                      (raw, hashlib.sha256(raw).hexdigest(), job_id))
     assert cli(workflow_id, isolated_db.DB_DIR).returncode == 2
+
+
+def test_public_cli_reports_only_safe_logical_names_for_artifact_mismatch(submitted, isolated_db):
+    workflow_id, _, repo = submitted
+    with db._connect(immediate=True) as conn:
+        row = conn.execute("SELECT config_json FROM workflows WHERE id=?", (workflow_id,)).fetchone()
+        configuration = json.loads(row[0])
+        configuration["external_result_policy"]["artifacts"] = ["renamed.patch", "RESULT.md"]
+        conn.execute("UPDATE workflows SET config_json=? WHERE id=?", (json.dumps(configuration), workflow_id))
+    result = cli(workflow_id, isolated_db.DB_DIR)
+    assert result.returncode == 2
+    diagnostic = json.loads(result.stderr)
+    assert diagnostic == {"schema": "external-result-error-v1", "code": "artifact_paths_mismatch",
+                          "expected_paths": ["RESULT.md", "renamed.patch"],
+                          "received_paths": ["RESULT.md", "changes.patch"]}
+    assert str(repo).encode() not in result.stderr
