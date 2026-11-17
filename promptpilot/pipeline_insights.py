@@ -923,7 +923,8 @@ def _arm_budget_waiter(task, decision: dict, *, starvation_timeout_seconds: int 
 @contextmanager
 def _github_scan_admission(profile: dict, purpose: str,
                            *, profile_id: str | None = None,
-                           budget_route: str | None = None, task=None):
+                           budget_route: str | None = None, task=None,
+                           publish_refresh_status: bool = True):
     """Admit one expensive scan and hold its cross-process reservation."""
     now = time.time()
     admission_priority = getattr(
@@ -1094,7 +1095,7 @@ def _github_scan_admission(profile: dict, purpose: str,
             "repository": profile.get("repository", ""),
             "status": (None if decision.get("allowed")
                        else _refresh_blocked_status(decision)),
-        } if profile_id is not None and not lease.lost else None)
+        } if publish_refresh_status and profile_id is not None and not lease.lost else None)
         lease.release(refresh_status=refresh_status)
 
 
