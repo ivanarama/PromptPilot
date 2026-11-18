@@ -62,21 +62,47 @@ def identity(value: dict) -> dict:
     return {"stage": stage, "number": number, "head": revision}
 
 
-def ordered_health_candidates(health: dict, *, excluded=()) -> list[dict]:
+def require_usable_health_shape(health: dict) -> None:
     from . import project_pipeline as pp
 
     if (not isinstance(health, dict)
-            or health.get("state") not in {"green", "yellow"}
+            or health.get("state") not in ("green", "yellow")
             or not isinstance(health.get("findings"), list)
             or any(not isinstance(item, dict)
                    or item.get("severity") == "red"
                    for item in health["findings"])):
         raise pp.PipelineError("FIX health is incomplete or red")
+
+
+def ordered_health_candidates(health: dict, *, excluded=()) -> list[dict]:
+    from . import project_pipeline as pp
+
+    require_usable_health_shape(health)
     ordered = pp._ordered_fix_candidates(health.get("fix_candidates"))
     keys = [identity(item) for item in ordered]
     if len({item["number"] for item in keys}) != len(keys):
         raise pp.PipelineError("FIX health contains duplicate target numbers")
     return [item for item in ordered if item["number"] not in excluded]
+
+
+def technical_health_candidates(health: dict) -> list[dict]:
+    """Validate the source-bound allowlist without loading scheduler state."""
+    from . import project_pipeline as pp
+    from .review_routing_wire import _fields, _source
+
+    values = health.get("technical_fix_candidates")
+    if not isinstance(values, list) or len(values) > 4096:
+        raise pp.PipelineError("checker lacks the complete source-bound technical FIX allowlist")
+    seen = set()
+    for item in values:
+        _fields(item, "stage number head source")
+        if pp._fix_candidate_key(item) != ("fix-pr", item["number"], item["head"]):
+            raise pp.PipelineError("technical FIX allowlist contains an unsupported target")
+        _source(item["source"])
+        if item["head"] != item["source"]["head"] or item["number"] in seen:
+            raise pp.PipelineError("technical FIX allowlist duplicates or changes a source")
+        seen.add(item["number"])
+    return values
 
 
 def health_gate(health: dict, target: dict, config: dict,

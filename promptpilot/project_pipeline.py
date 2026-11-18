@@ -1555,7 +1555,7 @@ def _fix_candidate_key(candidate: dict) -> tuple[str, int, str]:
     if not isinstance(candidate, dict):
         raise PipelineError("pipeline health returned an invalid FIX candidate")
     raw_stage = candidate.get("stage")
-    if raw_stage in {"review", "fix-pr"}:
+    if raw_stage in ("review", "fix-pr"):
         stage = "fix-pr"
         revision = candidate.get("head")
     elif raw_stage == "fix-issue":
@@ -2848,6 +2848,9 @@ def run(argv=None) -> int:
     positive_parser.add_argument("--stage", required=True, choices=("merge", "tail"))
     inventory_parser = sub.add_parser("inventory")
     inventory_parser.add_argument("--health-file", help="read an existing health JSON snapshot")
+    observe_fix_parser = sub.add_parser("observe-fix", help="explain FIX candidates from a saved snapshot")
+    observe_fix_parser.add_argument("--health-file", required=True)
+    observe_fix_parser.add_argument("--reservations-db", help="read reservations from this scheduler database")
     progress_parser = sub.add_parser("inspect-merge-progress")
     progress_parser.add_argument("--number", required=True, type=int)
     progress_parser.add_argument("--head", required=True)
@@ -2897,6 +2900,10 @@ def run(argv=None) -> int:
             value = inspect_file(args.report, args.head)
         elif args.command == "capabilities":
             value = capabilities(config)
+        elif args.command == "observe-fix":
+            from .fix_observation import observe
+
+            value = observe(config, args.health_file, args.reservations_db)
         else:
             gh = GitHub()
             if hasattr(gh, "timeout_seconds"):

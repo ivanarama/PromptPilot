@@ -12,29 +12,14 @@ from uuid import uuid4
 from . import db, project_pipeline as pp
 from . import review_routing_fix_request as requests
 from .pipeline_errors import PipelineError
+from .fix_handoff import technical_health_candidates as candidates
 from .review_routing_assignment import Assignment, require_assigned
 from .review_routing_history import verified_depth
 from .review_routing_lease import resolve
 from .review_routing_proof import _lease_nodes
 from .review_routing_snapshot import stable_timeline
 from .review_routing_transport import Transport
-from .review_routing_wire import _fields, _source, context, parse, records, render, sha
-
-
-def candidates(health):
-    values = health.get('technical_fix_candidates')
-    if not isinstance(values, list) or len(values) > 4096:
-        raise PipelineError('checker lacks the complete source-bound technical FIX allowlist')
-    seen = set()
-    for item in values:
-        _fields(item, 'stage number head source')
-        if pp._fix_candidate_key(item) != ('fix-pr', item['number'], item['head']):
-            raise PipelineError('technical FIX allowlist contains an unsupported target')
-        _source(item['source'])
-        if item['head'] != item['source']['head'] or item['number'] in seen:
-            raise PipelineError('technical FIX allowlist duplicates or changes a source')
-        seen.add(item['number'])
-    return values
+from .review_routing_wire import context, parse, records, render, sha
 
 
 def require_task(request):
