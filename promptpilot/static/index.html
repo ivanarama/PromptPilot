@@ -2840,6 +2840,8 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, 
       : `<button class="btn btn-sm btn-primary" onclick="wfStart()">Начать первый раунд</button>`;
   } else if (wf.status === 'awaiting_human' && plan?.status === 'failed' && !wf.current_round) {
     action = plannerForm;
+  } else if (wf.status === 'awaiting_human' && progress?.review_stop?.retry_available && !orphanPane) {
+    action = `<div class="wf-form"><p>${esc(progress.review_stop.action)}</p><button class="btn btn-sm btn-primary" onclick="wfRetryReview()">Повторить только ревью</button></div>`;
   } else if (wf.status === 'awaiting_external') {
     action = workflowExternalFormHtml(wf, runs);
   } else if (wf.status === 'queued' && stage.execution_mode === 'external') {
@@ -3225,6 +3227,10 @@ async function wfPlannerDispatch(regenerate = false) {
 }
 
 function wfAdvance() { return wfPost('advance', {}); }
+function wfRetryReview() {
+  return wfPost('review-retry', {expected_version:selectedWorkflowData.state_version,
+    reason:'Повтор ревью после устранения технической причины остановки.'});
+}
 function wfDownloadReport(format) {
   const link = document.createElement('a');
   link.href = `${API}/workflows/${selectedWorkflowId}/report?format=${format}`;

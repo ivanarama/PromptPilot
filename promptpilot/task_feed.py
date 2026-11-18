@@ -331,6 +331,12 @@ def _business_items(connection, *, kind=None, object_id=None):
         connection, "SELECT * FROM workflows" + (" WHERE id=?" if kind else ""),
         (object_id,) if kind else ())
     items = [project_workflow(row, source_label=source["label"]) for row in workflow_rows]
+    from .workflow_review_recovery import stop_reason
+    for row, item in zip(workflow_rows, items):
+        reason = stop_reason(connection, row)
+        if reason and reason['kind'] == 'review_timeout':
+            item.update(status='blocked', status_label='Ревью остановлено',
+                        status_reason=reason['summary'])
     if kind == "workflow":
         return items
     links = _links(connection, object_id if kind == "task" else None)

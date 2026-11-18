@@ -57,6 +57,7 @@ from .models import (
     WorkflowDispatchResult,
     WorkflowGateDecision,
     WorkflowGateRecovery,
+    WorkflowReviewRetry,
     WorkflowHistoryImport,
     WorkflowHumanInput,
     WorkflowElicitationAnswer,
@@ -1477,6 +1478,14 @@ def api_workflow_elicitation(workflow_id: str):
 def api_workflow_elicitation_answer(workflow_id: str, action: WorkflowElicitationAnswer):
     from . import workflow_elicitation
     return _workflow_action(workflow_elicitation.answer, workflow_id, action)
+
+
+@app.post("/api/workflows/{workflow_id}/review-retry", response_model=WorkflowInDB)
+def api_workflow_review_retry(workflow_id: str, action: WorkflowReviewRetry):
+    from . import workflow_review_recovery
+    result = _workflow_action(workflow_review_recovery.retry, workflow_id,
+                              action.expected_version, action.reason)
+    return workflows.advance_workflow(result.id)
 
 
 @app.post(

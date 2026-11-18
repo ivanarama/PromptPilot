@@ -236,6 +236,7 @@ class WorkflowRoleConfig(BaseModel):
     priority: int = Field(default=5, ge=1, le=10)
     max_retries: int = Field(default=5, ge=0, le=50)
     task_timeout: Optional[int] = Field(default=None, ge=0)
+    technical_review_retries: int = Field(default=0, ge=0, le=2)
     skip_permissions: bool = False
     worktree: bool = False
     keep_pane: bool = True
@@ -888,6 +889,12 @@ class WorkflowReviewDecision(BaseModel):
     # исполнителя (доказанно пустой diff). Неизвестное происхождение этот
     # флаг не подтверждает; автоприменение вердикта его не ставит.
     allow_no_diff: bool = False
+
+
+class WorkflowReviewRetry(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_version: int = Field(ge=0, strict=True)
+    reason: str = Field(min_length=1, max_length=4000)
 
 
 class WorkflowGateRecovery(BaseModel):

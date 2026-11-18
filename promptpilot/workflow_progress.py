@@ -229,6 +229,11 @@ def get_progress(workflow_id):
             client = _object(config.get("external_executor")).get("client_id")
             external = _external_state(conn, workflow, client, tables) if client and workflow["status"] == "awaiting_external" else None
             current = _current(workflow, stages, config, external)
+            from .workflow_review_recovery import stop_reason
+            review_stop = stop_reason(conn, workflow)
+            if review_stop:
+                current.update(headline=review_stop['summary'], owner=review_stop['owner'],
+                               detail=review_stop['detail'], next_action=review_stop['action'])
             stage = next((s for s in stages if s["id"] == workflow["current_stage_id"]), None)
             by_round = {r["id"]: r for r in rounds}
             last_return = None
@@ -256,7 +261,8 @@ def get_progress(workflow_id):
             current_round_ids = {r["id"] for r in rounds if r["round_no"] == workflow["current_round"]}
             result = {"workflow_id": workflow_id, "state_version": workflow["state_version"], "current": current,
                       "steps": _steps(workflow["status"], [e for e in events if e["round_id"] in current_round_ids], workflow["current_round"]),
-                      "last_return": last_return, "history": history}
+                      "last_return": last_return, "history": history,
+                      "review_stop": review_stop}
             token = _object(config.get("workorder_guard")).get("lease_token")
             if isinstance(token, str) and token:
                 # Same owner-visible strings as the task feed; control values
