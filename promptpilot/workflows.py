@@ -1635,6 +1635,7 @@ def record_review(workflow_id: str,
             "verdict": decision.verdict.value,
             "summary": decision.summary,
             "finding_count": len(decision.findings),
+            "reviewer_output_sha256": reviewer["output_sha256"],
         }
         if decision.verdict is ReviewVerdict.PASS:
             blockers = conn.execute(
@@ -3395,9 +3396,10 @@ def _latest_completed_reviewer(workflow: WorkflowInDB) -> Optional[WorkflowRunIn
         return None
     reviewers = [
         item for item in db.list_workflow_runs(current.id)
-        if item.role is WorkflowRole.REVIEWER and item.status.value == "completed"
+        if item.role is WorkflowRole.REVIEWER
     ]
-    return reviewers[-1] if reviewers else None
+    latest = max(reviewers, key=lambda item: item.attempt_no) if reviewers else None
+    return latest if latest and latest.status.value == "completed" else None
 
 
 def _pause_automation(workflow_id: str, reason: str,
@@ -3553,6 +3555,11 @@ def advance_workflow(workflow_id: str, max_actions: int = 12) -> WorkflowInDB:
                         return db.get_workflow(workflow.id,conn=conn)
                 if not workflow.current_round:
                     return workflow
+                from .workflow_review_recovery import automatic_retry
+                recovered = automatic_retry(workflow)
+                if recovered.state_version != workflow.state_version:
+                    workflow = recovered
+                    continue
                 current_round = next(
                     item for item in db.list_workflow_rounds(workflow.id)
                     if item.round_no == workflow.current_round
@@ -3580,10 +3587,23 @@ def advance_workflow(workflow_id: str, max_actions: int = 12) -> WorkflowInDB:
                 reviewer = _latest_completed_reviewer(workflow)
                 if not reviewer:
                     return workflow
+                review_output = reviewer.output or {}
+                report = (review_output["report_text"] if "report_text" in review_output
+                          else review_output.get("result") or "")
                 # no-diff или неизвестное происхождение уже превратили это
                 # ревью в ожидание человека — не применяем тот же вердикт
                 # повторно (touch-спам).
                 with db._connect() as conn:
+                    applied_human = conn.execute(
+                        "SELECT 1 FROM workflow_events WHERE workflow_id=? AND run_id=? "
+                        "AND event_type='review.human_required' AND "
+                        "(json_extract(payload_json,'$.reviewer_output_sha256')=? OR "
+                        "(json_extract(payload_json,'$.reviewer_output_sha256') IS NULL AND "
+                        "json_extract(payload_json,'$.summary')=?)) LIMIT 1",
+                        (workflow.id, reviewer.id, reviewer.output_sha256, report),
+                    ).fetchone()
+                    if applied_human:
+                        return workflow
                     blocked_seq = conn.execute(
                         """SELECT MAX(e.seq) FROM workflow_events e
                            JOIN workflow_runs r ON r.id = e.run_id
@@ -3601,9 +3621,6 @@ def advance_workflow(workflow_id: str, max_actions: int = 12) -> WorkflowInDB:
                     ).fetchone()[0]
                 if blocked_seq and blocked_seq >= reviewer_done_seq:
                     return workflow  # уже превращено в ожидание человека
-                review_output = reviewer.output or {}
-                report = (review_output["report_text"] if "report_text" in review_output
-                          else review_output.get("result") or "")
                 decision = parse_reviewer_report(report)
                 if not decision:
                     return _pause_automation(
@@ -3785,6 +3802,13 @@ def sync_task(task_id: int) -> Optional[WorkflowRunInDB]:
             if (
                 final_status == "completed"
                 and task_row["verdict"] not in SUCCESS_VERDICTS
+                and not (
+                    role is WorkflowRole.REVIEWER
+                    and task_row["verdict"] == "НУЖЕН ЧЕЛОВЕК"
+                    and (review_decision := parse_reviewer_report(
+                        output.get("report_text", output.get("result") or ""))) is not None
+                    and review_decision.verdict is ReviewVerdict.HUMAN_REQUIRED
+                )
             ):
                 if (
                     state not in TERMINAL_STATES
