@@ -160,3 +160,28 @@ def test_final_source_counts_every_foreign_reservation(merge_dispatch, monkeypat
     assert denied["budget"]["state"] == "budget_in_flight"
     assert denied["budget"]["reserved_other"]["search"] == 11
     assert ledger(f) == before and f.checks == f.searches == []
+
+@pytest.mark.parametrize("failure,expected", [
+    ("budget", "wait"), ("lease", "refused"), ("error", "refused"),
+])
+def test_spent_final_credit_is_reported_after_failed_scan(merge_dispatch, monkeypatch, failure, expected):
+    f = merge_dispatch
+    admit(f)
+    aged_waiter(f)
+
+    def failed_scan(*args, **kwargs):
+        if failure == "budget":
+            raise pi._GitHubSearchBudgetDenied({"state": "budget_in_flight", "reason": "test quota"})
+        if failure == "lease":
+            raise pi._GitHubScanLeaseLost("test lease loss")
+        raise ValueError("test failure after admission")
+
+    monkeypatch.setattr(pi, "_analyze_without_budget", failed_scan)
+    result = source.refresh("example", f.env, final=True)
+    assert result["state"] == expected and result["source_refreshed"] is False
+    assert result["budget"]["final_source_credit_used"] is True
+    if failure == "budget":
+        assert result["budget"]["state"] == "budget_in_flight"
+    replay = source.refresh("example", f.env, final=True)
+    assert replay["state"] == "wait" and replay["budget"]["state"] == "fairness_waiter"
+    assert "final_source_credit_used" not in replay["budget"]

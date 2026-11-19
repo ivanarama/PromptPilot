@@ -15,6 +15,9 @@ import time
 from .task_identity import task_execution_fingerprint
 
 
+_REFRESH_ERRORS = (OSError, sqlite3.Error, KeyError, TypeError, ValueError, RuntimeError)
+
+
 def _profile_digest(profiles):
     return hashlib.sha256(json.dumps(profiles, sort_keys=True, ensure_ascii=False,
                                     separators=(",", ":")).encode()).hexdigest()
@@ -22,7 +25,8 @@ def _profile_digest(profiles):
 
 class _Continuation:
     def __init__(self, db, insights, profiles, profile_id, queue_id, task_id, marker,
-                 expected_attempt):
+                 expected_attempt, final_source_spend):
+        self.final_source_spend = final_source_spend
         self.db, self.insights = db, insights
         self.profile_id, self.queue_id, self.task_id = profile_id, queue_id, task_id
         self.profiles_sha256 = _profile_digest(profiles)
@@ -69,7 +73,27 @@ def _budget_observation_flags():
             "scope": "Native-budget-observation-only"}
 
 
+def _refusal(error):
+    return {"state": "refused", "source_refreshed": False, "reason": str(error),
+            "mutable_admission_granted": False}
+
+
 def refresh(profile_id, environ=None, *, budget_only=False, final=False):
+    # The Source meter can replace its decision after a committed debit.
+    # Keep the actual spend independent of that later observation outcome.
+    final_source_spend = {}
+    try:
+        result = _refresh(profile_id, environ, budget_only, final, final_source_spend)
+    except _REFRESH_ERRORS as error:
+        if not final_source_spend:
+            raise
+        result = _refusal(error)
+    if final_source_spend:
+        result.setdefault("budget", {}).update(final_source_spend)
+    return result
+
+
+def _refresh(profile_id, environ, budget_only, final, final_source_spend):
     if final and budget_only:
         raise ValueError("final Source credit cannot fund a budget observation")
     env = os.environ if environ is None else environ
@@ -98,7 +122,7 @@ def refresh(profile_id, environ=None, *, budget_only=False, final=False):
                                       if task.started_at is not None else None)
     expected_attempt["execution_sha256"] = task_execution_fingerprint(task)
     continuation = _Continuation(db, pi, profiles, profile_id, str(matched[2]["id"]),
-                                 task.id, marker, expected_attempt)
+                                 task.id, marker, expected_attempt, final_source_spend)
     previous = getattr(pi._scan_lease_context, "continuation", None)
     if previous is not None:
         raise ValueError("nested Native source refresh is forbidden")
@@ -204,9 +228,8 @@ def run(argv=None, *, budget_only=False):
     args = parser.parse_args(argv)
     try:
         result = refresh(args.profile, budget_only=budget_only, final=getattr(args, "final", False))
-    except (OSError, sqlite3.Error, KeyError, TypeError, ValueError, RuntimeError) as exc:
-        result = {"state": "refused", "source_refreshed": False, "reason": str(exc),
-                  "mutable_admission_granted": False}
+    except _REFRESH_ERRORS as exc:
+        result = _refusal(exc)
         if budget_only:
             result.update(_budget_observation_flags(), rate_snapshot_refreshed=False)
     if budget_only:

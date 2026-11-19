@@ -1219,6 +1219,7 @@ def _admit_scan_budget(policy, limits, reservations, lease, priority, task_id, f
                 reservations["revision"], credit):
             return _reservation_denied(policy, limits, {"state": "ledger_changed"},
                                        status_revision=lease.status_revision)
+        lease.continuation.final_source_spend["final_source_credit_used"] = True
         decision["final_source_credit_used"] = True
     return decision
 
