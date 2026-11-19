@@ -171,6 +171,36 @@ CREATE TABLE IF NOT EXISTS pipeline_snapshots (
     payload_json TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS tail_discovery (
+    repository TEXT PRIMARY KEY,
+    revision INTEGER NOT NULL,
+    checkpoint_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS tail_candidates (
+    repository TEXT NOT NULL REFERENCES tail_discovery(repository) ON DELETE RESTRICT,
+    pr_number INTEGER NOT NULL CHECK(pr_number > 0),
+    merged_at TEXT NOT NULL,
+    head TEXT NOT NULL,
+    base TEXT NOT NULL,
+    last_observed_at TEXT NOT NULL,
+    pass_token TEXT NOT NULL,
+    revision INTEGER NOT NULL DEFAULT 1,
+    state TEXT NOT NULL DEFAULT 'pending-proof',
+    review_id TEXT,
+    review_updated_at TEXT,
+    review_body_digest TEXT,
+    epoch_digest TEXT,
+    completion_kind TEXT,
+    completion_digest TEXT,
+    next_check_at TEXT,
+    last_reason TEXT,
+    PRIMARY KEY (repository, pr_number)
+);
+CREATE INDEX IF NOT EXISTS idx_tail_candidates_pass
+    ON tail_candidates(repository, pass_token, pr_number);
+
 CREATE TABLE IF NOT EXISTS pipeline_target_reservations (
     repository TEXT NOT NULL,
     stage TEXT NOT NULL,
@@ -568,6 +598,7 @@ PIPELINE_TARGET_RESERVATION_SCHEMA_VERSION = "pipeline_target_reservations_v1"
 PIPELINE_TARGET_ATTEMPT_SCHEMA_VERSION = "pipeline_target_reservations_attempt_v2"
 PIPELINE_TARGET_OWNERSHIP_SCHEMA_VERSION = "pipeline_target_reservations_ownership_v3"
 PIPELINE_TARGET_HERDR_SCHEMA_VERSION = "pipeline_target_reservations_herdr_v4"
+TAIL_DISCOVERY_SCHEMA_VERSION = "tail_discovery_v1"
 PIPELINE_BUDGET_WAITER_FAIRNESS_SCHEMA_VERSION = \
     "pipeline_github_budget_waiter_fairness_v1"
 
@@ -687,6 +718,10 @@ def _init_db_once():
             """INSERT OR IGNORE INTO schema_migrations (version, applied_at)
                VALUES (?, ?)""",
             (PIPELINE_TARGET_HERDR_SCHEMA_VERSION, _now()),
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+            (TAIL_DISCOVERY_SCHEMA_VERSION, _now()),
         )
         fairness_migrated = conn.execute(
             "SELECT 1 FROM schema_migrations WHERE version = ?",

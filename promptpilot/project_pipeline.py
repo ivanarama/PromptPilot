@@ -2828,6 +2828,20 @@ def _complete_ordinary_merge(gh, config, lease, *, config_path=None, typed_guard
     return recover_merge_cleanup(gh, config, intent)
 
 
+def _tail_command(args, config):
+    import sqlite3
+    from .tail_discovery import discover
+    from .tail_store import backlog
+
+    try:
+        if args.command == "tail-backlog":
+            return backlog(config["repository"].lower(), limit=args.limit, after=args.after)
+        gh = GitHub(timeout_seconds=config["github_timeout_seconds"])
+        return discover(gh, config, args.max_pages)
+    except sqlite3.Error as exc:
+        raise PipelineError(f"TAIL local index: {exc}") from exc
+
+
 def run(argv=None) -> int:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="strict")
@@ -2836,6 +2850,12 @@ def run(argv=None) -> int:
     parser.add_argument("--config", default="pipelinectl.json")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("capabilities")
+    tail_discover = sub.add_parser("tail-discover", help="index merged PRs in the local TAIL backlog")
+    tail_discover.add_argument("--max-pages", type=int, default=5)
+    tail_backlog = sub.add_parser("tail-backlog", help="read the local TAIL backlog without contacting GitHub")
+    tail_backlog.add_argument("--json", action="store_true", help="emit JSON (the default)")
+    tail_backlog.add_argument("--limit", type=int, default=100)
+    tail_backlog.add_argument("--after", type=int, default=0, help="last PR number from the previous page")
     source_refresh_parser = sub.add_parser("source-refresh")
     source_refresh_parser.add_argument("--profile", required=True)
     budget_refresh_parser = sub.add_parser("budget-refresh")
@@ -2897,6 +2917,8 @@ def run(argv=None) -> int:
             value = inspect_file(args.report, args.head)
         elif args.command == "capabilities":
             value = capabilities(config)
+        elif args.command in ("tail-backlog", "tail-discover"):
+            value = _tail_command(args, config)
         else:
             gh = GitHub()
             if hasattr(gh, "timeout_seconds"):
