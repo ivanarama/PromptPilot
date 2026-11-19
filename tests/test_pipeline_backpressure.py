@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -89,6 +90,53 @@ def test_refresh_exception_still_defers_without_agent(admission, monkeypatch):
         raise RuntimeError("network unavailable")
     monkeypatch.setattr(pi, "analyze", analyze)
     assert pi.dispatch_gate(task)["action"] == "defer"
+
+
+@pytest.mark.parametrize("retry_at", [
+    None, "invalid", 123, {}, True, "2000-01-01T00:00:00Z",
+    "2040-01-01T00:00:00", "0001-01-01T00:00:00+01:00",
+    "9999-12-31T23:59:59-01:00",
+])
+def test_scan_wait_without_valid_future_deadline_keeps_intake_delay(admission, retry_at):
+    task, data = admission
+    data["cache"].update(stale=True, refresh_blocked="scan_in_progress",
+                         refresh_deferred_until=retry_at)
+
+    result = pi.dispatch_gate(task)
+
+    assert result["action"] == "defer"
+    assert result["defer_for"] == "10m"
+    assert "defer_until" not in result
+
+
+@pytest.mark.parametrize("state", ["low", "budget_in_flight", "worker_paused", None])
+def test_other_snapshot_waits_keep_intake_delay(admission, state):
+    task, data = admission
+    data["cache"].update(stale=True, refresh_blocked=state,
+                         refresh_deferred_until=(
+                             datetime.now(timezone.utc) + timedelta(minutes=2)).isoformat())
+
+    result = pi.dispatch_gate(task)
+
+    assert result["action"] == "defer"
+    assert result["defer_for"] == "10m"
+    assert "defer_until" not in result
+
+
+def test_failed_refresh_does_not_reuse_previous_scan_deadline(admission, monkeypatch):
+    task, data = admission
+    data["cache"].update(stale=True, refresh_blocked="scan_in_progress",
+                         refresh_deferred_until=(
+                             datetime.now(timezone.utc) + timedelta(minutes=2)).isoformat())
+
+    def failed(*_args, **_kwargs):
+        raise RuntimeError("refresh failed")
+
+    monkeypatch.setattr(pi, "analyze", failed)
+    result = pi.dispatch_gate(task)
+
+    assert result["action"] == "defer"
+    assert "defer_until" not in result
 
 
 def test_worker_passes_exception_scope_to_real_provider_boundary(admission, monkeypatch):

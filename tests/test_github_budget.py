@@ -101,6 +101,45 @@ def test_public_wip_gate_explains_existing_scan_lease(isolated_db, monkeypatch):
     assert result["wip_diagnostics"]["snapshot"]["refresh_state"] == "scan_in_progress"
 
 
+@pytest.mark.parametrize("busy_retry_seconds", [5, 120])
+def test_worker_retries_wip_at_scan_retry_without_loading_provider(
+        isolated_db, monkeypatch, busy_retry_seconds):
+    profile = _profile_with_costs(core=0)
+    profile["github_budget"]["busy_retry_seconds"] = busy_retry_seconds
+    profile["queues"][0]["dispatch_gate"] = {"backpressure": {
+        "max_active": 10, "active_fields": ["review_backlog"],
+        "candidate_field": "fix_candidates"}}
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"example": profile})
+    monkeypatch.setattr(pipeline_insights, "_cache", {})
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("A busy WIP scan must not start GitHub, preflight or a provider")
+
+    monkeypatch.setattr(pipeline_insights, "_github_rate_limits", forbidden)
+    monkeypatch.setattr(pipeline_insights, "_github_search", forbidden)
+    monkeypatch.setattr(pipeline_insights, "execution_route", forbidden)
+    monkeypatch.setattr(worker, "load_providers", forbidden)
+    lease = isolated_db.acquire_pipeline_scan_lease("github-default", "existing-scanner", 600)
+    assert lease["acquired"]
+    task = _running_task(isolated_db, "Example - REVIEW")
+    hold_key = f"pipeline_item_holds:v1:{task.series_id}"
+    holds = '{"123":{"reason":"awaiting runtime","at":1}}'
+    isolated_db.set_setting(hold_key, holds)
+    before = datetime.now(timezone.utc)
+
+    worker.execute_task(task)
+
+    after = datetime.now(timezone.utc)
+    deferred = isolated_db.get_task(task.id)
+    assert deferred.status.value == "pending"
+    assert before + timedelta(seconds=busy_retry_seconds) <= deferred.scheduled_at
+    assert deferred.scheduled_at <= after + timedelta(seconds=busy_retry_seconds)
+    assert "scan_in_progress" in deferred.error
+    assert isolated_db.get_setting(hold_key) == holds
+    assert isolated_db.acquire_pipeline_scan_lease(
+        "github-default", "another-scanner", 600)["acquired"] is False
+
+
 def test_public_wip_gate_retains_real_scan_denial_beside_allowed_zero_cost_view(isolated_db, monkeypatch):
     profile = _profile_with_costs(core=0)
     profile["github_budget"]["minimum_remaining"] = {"core": 100, "search": 2, "graphql": 100}
