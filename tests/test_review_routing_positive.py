@@ -100,6 +100,42 @@ def inspect(run, stage='merge'):
     return run('inspect-routing-positive', '--number', '42', '--stage', stage)
 
 
+def test_durable_tail_reuses_merged_native_positive_source(positive):
+    from promptpilot.tail_admission import classify
+
+    peer, _health, path, _run, _completed = positive
+    merged(peer)
+    config = pp.load_config(str(path))
+
+    class Reader:
+        def graphql_page(self, owner, repo, number, cursor):
+            return peer.json('api', 'graphql')
+
+        def json(self, *args, **kwargs):
+            result = peer.json(*args, **kwargs)
+            if args == ('api', 'repos/owner/repo/pulls/42'):
+                result['labels'] = peer.current['data']['repository']['pullRequest']['labels']['nodes']
+            return result
+
+        def run(self, *args):
+            assert args == ('api', '--paginate', 'repos/owner/repo/issues/42/comments?per_page=100', '--jq', '.[]')
+            graph = peer.json('api', 'graphql')['data']['repository']['pullRequest']['timelineItems']
+            return '\n'.join(json.dumps({'id': int(n['fullDatabaseId']), 'user': n['author'], 'body': n['body'],
+                                         'created_at': n['createdAt'], 'updated_at': n['lastEditedAt'] or n['createdAt']})
+                             for edge in graph['edges'] if (n := edge['node'])['__typename'] == 'IssueComment')
+
+    rest = rest_projection(peer)
+    candidate = dict(pr_number=42, head=rest['head']['sha'], base=rest['base']['ref'], merged_at=rest['merged_at'])
+    before = list(peer.posts)
+    result = classify(Reader(), config, candidate)
+    assert result['state'] == 'ready' and result['protocol'] == 'typed'
+    assert result['review_id'] == '1000' and result['items'][0]['kind'] == 'issue'
+    assert result['items'][0]['text'] == 'Preserve the source on restart'
+    assert result['items'][0]['item_sha256'] == sha(dict(kind='issue', title='Follow-up invariant',
+                                                        text='Preserve the source on restart'))
+    assert peer.posts == before
+
+
 def test_public_positive_context_retains_actual_typed_source_and_tail(positive):
     peer, _health, _path, run, completed = positive
     code, result = inspect(run)
