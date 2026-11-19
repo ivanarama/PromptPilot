@@ -1197,11 +1197,38 @@ def _arm_budget_waiter(task, decision: dict, *, starvation_timeout_seconds: int 
     return decision
 
 
+def _admit_scan_budget(policy, limits, reservations, lease, priority, task_id, final_source):
+    credit = reservations.get("final_source_cost") if final_source and lease.continuation else None
+    totals = reservations["totals"]
+    if credit is None:
+        waiting = _priority_waiter_decision(policy, limits, reservations,
+            priority=priority, task_id=task_id, status_revision=lease.status_revision)
+        if waiting is not None:
+            return waiting
+    else:
+        if credit != policy["requested_cost"]:
+            raise ValueError("reserved final Source cost differs from the current scan cost")
+        # The requested scan is already counted in this attempt's promise.
+        totals = {resource: total - credit[resource] for resource, total in totals.items()}
+    decision = _evaluate_github_budget(policy, limits, now=time.time(),
+        status_revision=lease.status_revision, reserved_other=totals,
+        active_reservations=reservations["count"])
+    decision["_budget_reservation_revision"] = reservations["revision"]
+    if credit is not None and decision["allowed"]:
+        if not db.spend_pipeline_final_source_credit(lease.continuation.guard, lease.guard,
+                reservations["revision"], credit):
+            return _reservation_denied(policy, limits, {"state": "ledger_changed"},
+                                       status_revision=lease.status_revision)
+        lease.continuation.final_source_spend["final_source_credit_used"] = True
+        decision["final_source_credit_used"] = True
+    return decision
+
+
 @contextmanager
 def _github_scan_admission(profile: dict, purpose: str,
                            *, profile_id: str | None = None,
                            budget_route: str | None = None, task=None,
-                           publish_refresh_status: bool = True):
+                           publish_refresh_status: bool = True, final_source: bool = False):
     """Admit one expensive scan and hold its cross-process reservation."""
     now = time.time()
     admission_priority = getattr(
@@ -1337,19 +1364,8 @@ def _github_scan_admission(profile: dict, purpose: str,
                         now=time.time(), limits=limits,
                         status_revision=lease.status_revision)
                 else:
-                    decision = _priority_waiter_decision(
-                        policy, limits, reservations,
-                        priority=admission_priority,
-                        task_id=getattr(task, "id", None),
-                        status_revision=lease.status_revision)
-                    if decision is None:
-                        decision = _evaluate_github_budget(
-                            policy, limits, now=time.time(),
-                            status_revision=lease.status_revision,
-                            reserved_other=reservations["totals"],
-                            active_reservations=reservations["count"])
-                        decision["_budget_reservation_revision"] = \
-                            reservations["revision"]
+                    decision = _admit_scan_budget(policy, limits, reservations, lease,
+                        admission_priority, getattr(task, "id", None), final_source)
                     if task is not None:
                         decision = _arm_budget_waiter(task, decision, starvation_timeout_seconds=policy.get("starvation_timeout_seconds", 0))
         except _GitHubScanLeaseFailure as exc:
@@ -1534,6 +1550,13 @@ def _reserve_execution_admission(
             # admission; they neither re-read limits nor create reservations.
             _clear_budget_waiter_after_admission(task)
             return admission
+        final_source_cost = None
+        if queue.get("id") == "merge" and budget_route in ("skill", "fallback_targeted"):
+            scan_cost = policy["costs"]["insights"]
+            if any(scan_cost.values()):
+                final_source_cost = scan_cost
+                policy["requested_cost"] = {resource: cost + scan_cost[resource]
+                                            for resource, cost in policy["requested_cost"].items()}
         if not isinstance(lease, _GitHubScanLease):
             raise _GitHubScanLeaseLost(
                 "GitHub execution admission lost its scan lease")
@@ -1584,7 +1607,7 @@ def _reserve_execution_admission(
                 starvation_timeout_seconds=policy.get(
                     "starvation_timeout_seconds", 0),
                 scan_lease_guard=lease.guard,
-                expected_revision=expected_revision)
+                expected_revision=expected_revision, final_source_cost=final_source_cost)
             if not reserved.get("allowed"):
                 decision = _reservation_denied(
                     policy, limits, reserved,

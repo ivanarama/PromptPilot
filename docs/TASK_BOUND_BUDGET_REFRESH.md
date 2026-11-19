@@ -51,3 +51,21 @@ scan estimate does not fit. Therefore a failed command reports
 not claim that the rate cache stayed unchanged. Source data and history remain
 unchanged in either case. Preserve the typed result and follow the task's
 existing continuation/defer procedure.
+
+## Final Source check for MERGE
+
+A costed `merge` queue reserves one additional `insights` scan when it admits a
+`skill` or `fallback_targeted` attempt. Use the following command when that
+attempt needs a fresh Source immediately before its publication gate:
+
+```text
+pp pipelinectl source-refresh --profile <profile-id> --final
+```
+
+The check spends the reservation once, after it obtains the shared scan lease
+and verifies the live resource floors. Other tasks keep their position in the
+queue. Earlier Source observations and `budget-refresh` use ordinary admission.
+For an attempt with an unused reservation, an admitted final scan reports
+`budget.final_source_credit_used: true`. A retry after that scan, including a
+retry after a failed observation, goes through ordinary admission. Older
+attempts without a reservation also use ordinary admission.
