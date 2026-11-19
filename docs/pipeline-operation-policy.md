@@ -151,6 +151,18 @@ The ordinary retry delay is respected and cheaper eligible delivery work can
 proceed. A future starvation window provides another opportunity. Priority,
 scan-lease and fairness deferrals do not themselves reset the baton.
 
+On the ordinary OneBase MERGE queue, set `execution.merge_confirmation` to
+`"bounded-v1"` to confirm an already checked first base-sync. It requires the
+signed recovery election, its matching checkpoint and fresh Source. The executor
+reserves 116 core and 324 GraphQL points, the configured checker allowance
+(`costs.insights.graphql`), and one `costs.insights` Source refresh. With the
+production Source estimate of 50 core/100 GraphQL/0 search the total is
+166 core/524 GraphQL/0 search, before shared floors. Other shapes require fresh
+full-price admission. An uncertain POST keeps a durable fence for that PR and
+HEAD. An idle MERGE turn or an affected fallback may reconcile the existing
+comment with a read-only allowance of 8 core/128 GraphQL/0 search. A verified
+readback clears the fence, and a different signed PR can proceed independently.
+
 ## Item-level human handoffs
 
 The operator release enables `item_blockers` for TRIAGE, REVIEW, MERGE and FIX.
