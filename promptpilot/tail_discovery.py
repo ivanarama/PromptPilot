@@ -1,6 +1,8 @@
 """Discover merged PRs without interpreting reviews or writing to GitHub."""
 
 from datetime import datetime, timedelta, timezone
+import hashlib
+import json
 from uuid import uuid4
 
 from . import tail_github, tail_store
@@ -9,6 +11,7 @@ from .pipeline_errors import PipelineError
 
 _BEGINNING = "1970-01-01T00:00:00Z"
 _SECOND = timedelta(seconds=1)
+_MAX_PAGES = 100
 
 
 def _stamp(value):
@@ -104,8 +107,8 @@ def _accept_page(state, page):
                  verify_pending=page.next_cursor is None)
 
 
-def _finish_pass(repository, state):
-    count, digest = tail_store.pass_snapshot(repository, state["pass_token"])
+def _finish_pass(repository, state, revision):
+    count, digest = tail_store.pass_snapshot(repository, state["pass_token"], revision)
     if count != state["matched"]:
         raise PipelineError("TAIL source returned duplicate PRs during pagination")
     if state["pass_number"] == 1:
@@ -129,7 +132,7 @@ def _finish_pass(repository, state):
 
 
 def discover(gh, config, max_pages):
-    if not 1 <= max_pages <= 100:
+    if not 1 <= max_pages <= _MAX_PAGES:
         raise PipelineError("--max-pages must be between 1 and 100")
     repository, base = config["repository"].lower(), config["base_branch"]
     if not isinstance(base, str) or not base:
@@ -137,27 +140,71 @@ def discover(gh, config, max_pages):
     fingerprint = tail_store.query_fingerprint(repository, base)
     state = tail_store.load_discovery(repository)
     revision = state.pop("revision") if state else None
+    remaining = reset_at = None
+
+    def join_checkpoint(receipt=None):
+        nonlocal state, revision
+        budget = (remaining, reset_at) if remaining is not None else None
+        current = tail_store.load_discovery(repository, budget=budget)
+        if (current is None or current["fingerprint"] != fingerprint
+                or current["generation"] != state["generation"]
+                or (receipt is not None and receipt not in current.get("page_receipts", []))):
+            raise tail_store.TailDiscoveryConflict("TAIL discovery changed during this request")
+        if current["last_error"]:
+            raise PipelineError(current["last_error"])
+        revision = current.pop("revision")
+        state = current
+
+    def advance(observations=(), *, token=None, evidence=None):
+        nonlocal revision
+        receipt = None
+        if evidence is not None:
+            # Bind the actual page to the source revision, including the set,
+            # ordering and next cursor. Rate-limit receipts vary per request.
+            payload = json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode()
+            receipt = [revision, hashlib.sha256(payload).hexdigest()]
+            # Keep up to one full CLI page budget. A worker delayed beyond
+            # that bounded history must retry from the durable checkpoint.
+            state["page_receipts"] = [*state.get("page_receipts", []), receipt][-_MAX_PAGES:]
+        try:
+            revision = tail_store.save_discovery(repository, revision, state, observations, pass_token=token)
+        except tail_store.TailDiscoveryConflict:
+            # Local steps (start/verify) have no outstanding remote page.
+            # Never write our stale cursor or report our uncommitted progress.
+            join_checkpoint(receipt)
+
+    def record_failure():
+        try:
+            tail_store.save_discovery(repository, revision, state)
+        except tail_store.TailDiscoveryConflict:
+            # Keep the winner's cursor. The caller still reports the actual
+            # API/verification failure from this invocation.
+            if remaining is not None:
+                tail_store.load_discovery(repository, budget=(remaining, reset_at))
+
     if not state or state["fingerprint"] != fingerprint or state["state"] == "complete":
         state = _generation(state, repository, base, fingerprint, _stamp(datetime.now(timezone.utc)))
-        revision = tail_store.save_discovery(repository, revision, state)
+        advance()
 
     pages = 0
-    remaining = None
     while state["state"] != "complete":
         if state["verify_pending"]:
             try:
-                _finish_pass(repository, state)
+                _finish_pass(repository, state, revision)
+            except tail_store.TailDiscoveryConflict:
+                join_checkpoint()
+                continue
             except PipelineError as exc:
                 _new_pass(state)
                 state["last_error"] = str(exc)
-                tail_store.save_discovery(repository, revision, state)
+                record_failure()
                 raise
-            revision = tail_store.save_discovery(repository, revision, state)
+            advance()
             continue
         if remaining == 0 or (state.get("budget_remaining") == 0 and
                               state["budget_reset_at"] > _stamp(datetime.now(timezone.utc))):
             state["last_error"] = "TAIL GraphQL budget exhausted"
-            tail_store.save_discovery(repository, revision, state)
+            record_failure()
             raise PipelineError(state["last_error"])
         if pages >= max_pages:
             break
@@ -175,16 +222,16 @@ def discover(gh, config, max_pages):
                     pages -= 1
                 state["mode"] = "enumerate"
                 _new_pass(state)
-                revision = tail_store.save_discovery(repository, revision, state)
+                advance(evidence=["enumerate", str(exc)])
                 continue
             if isinstance(exc, tail_github.InvalidCursor):
                 _new_pass(state)
             # Preserve the last committed cursor for transient transport errors.
             state["last_error"] = str(exc)
-            tail_store.save_discovery(repository, revision, state)
+            record_failure()
             raise
-        remaining = page.remaining
-        state.update(budget_remaining=remaining, budget_reset_at=page.reset_at)
+        remaining, reset_at = page.remaining, page.reset_at
+        state.update(budget_remaining=remaining, budget_reset_at=reset_at)
         state["last_error"] = None
         token = state["pass_token"]
         if state["mode"] == "search" and page.total_count >= 1000:
@@ -195,9 +242,10 @@ def discover(gh, config, max_pages):
             except PipelineError as exc:
                 _new_pass(state)
                 state["last_error"] = str(exc)
-                tail_store.save_discovery(repository, revision, state)
+                record_failure()
                 raise
-        revision = tail_store.save_discovery(repository, revision, state, page.items, pass_token=token)
+        advance(page.items, token=token, evidence=[page.total_count, page.raw_count, page.next_cursor,
+                                                   page.items, page.enumerated])
     return {"action": "tail-discover", "repository": repository, "state": state["state"],
             "generation": state["generation"], "pages": pages,
             "discovery_complete_through": state["discovery_complete_through"]}

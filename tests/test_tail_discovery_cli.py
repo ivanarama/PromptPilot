@@ -298,15 +298,21 @@ def test_rollback_updates_neither_candidates_nor_page_cursor(tail):
     assert len(cli.backlog("--limit", "11", "--after", "100")["candidates"]) == 10
 
 
-def test_two_processes_cannot_both_advance_the_same_page(tail):
+@pytest.mark.parametrize("response", ["same", "changed", "unavailable"])
+def test_overlapping_discoveries_verify_the_page_only_one_committed(tail, response):
     cli, github = tail
     github.nodes = [node(n, "2020-01-01T00:00:00Z") for n in range(1, 202)]
     cli.discover(1)
     slow_request = threading.Event()
     release = threading.Event()
 
-    def delay_first(_result, _connection, _after):
+    def delay_first(result, connection, _after):
         github.change_response = None
+        if response == "changed":
+            # Identical count and continuation, different PR observation.
+            connection["nodes"][0] = dict(connection["nodes"][0], headRefOid="f" * 40)
+        elif response == "unavailable":
+            result["errors"] = [{"message": "fixture read failed"}]
         slow_request.set()
         release.wait(timeout=20)
 
@@ -318,11 +324,55 @@ def test_two_processes_cannot_both_advance_the_same_page(tail):
         finally:
             release.set()
             out, err = child.communicate(timeout=20)
-        assert child.returncode == 2, (out, err)
+        assert child.returncode == (0 if response == "same" else 2), (out, err)
+        observed = json.loads(out)
+        if response == "same":
+            assert observed["state"] == "incomplete" and observed["pages"] == 1
+        elif response == "changed":
+            assert "discovery changed" in observed["error"]
+        else:
+            assert "fixture read failed" in observed["error"]
+    saved = cli.backlog("--after", "100", "--limit", "1")
+    assert saved["candidates"][0]["head"] == github.nodes[100]["headRefOid"]
+    assert saved["discovery"]["revision"] == 3 and saved["discovery"]["scanned"] == 200
     before = len(github.calls)
     cli.finish()
     assert github.calls[before][1]["after"] == "cursor:200"
     assert cli.backlog()["counts"] == {"pending-proof": 201}
+
+
+@pytest.mark.parametrize(("slow_quota", "fast_quota"), [(0, 17), (17, 0), (6, 17)])
+def test_matching_terminal_pages_keep_the_lowest_budget_across_restart(tail, slow_quota, fast_quota):
+    cli, github = tail
+    github.nodes = [node(1, "2020-01-01T00:00:00Z")]
+    assert cli.discover(1)["state"] == "incomplete"
+    ready, release = threading.Event(), threading.Event()
+    reset = utc(datetime.now(timezone.utc) + timedelta(days=1))
+
+    def charge(result, _connection, _cursor):
+        rate = result["data"]["rateLimit"]
+        rate.update(resetAt=reset, remaining=fast_quota if ready.is_set() else slow_quota)
+        if not ready.is_set():
+            ready.set()
+            assert release.wait(timeout=20)
+
+    github.change_response = charge
+    with cli.start("tail-discover", "--max-pages", "1") as slow:
+        try:
+            assert ready.wait(timeout=20)
+            assert cli.discover(1)["state"] == "complete"
+        finally:
+            release.set()
+            out, err = slow.communicate(timeout=30)
+        assert slow.returncode == 0 and json.loads(out)["state"] == "complete", (out, err)
+    github.change_response = None
+    checkpoint = cli.backlog()["discovery"]
+    assert checkpoint["budget_remaining"] == min(slow_quota, fast_quota)
+    assert checkpoint["budget_reset_at"] == reset
+    if checkpoint["budget_remaining"] == 0:
+        before = len(github.calls)
+        assert "budget exhausted" in cli.discover(1, code=2)["error"]
+        assert len(github.calls) == before
 
 
 def test_graphql_error_preserves_partial_backlog_and_checkpoint(tail):

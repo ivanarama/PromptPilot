@@ -60,13 +60,15 @@ def test_public_read_only_positive_inspection_never_enables_checkout_sync(positi
 
 
 @pytest.fixture
-def positive(adapter):
+def positive(adapter, request):
     peer, health, path, report, run = adapter
     positive_readers(health, path)
     value = json.loads(report.read_text(encoding='utf-8'))
     value['blocking'] = []
-    value['tail'] = [dict(kind='issue', title='Follow-up invariant', text='Preserve the source on restart'),
-                     dict(kind='discard', text='No separate change is warranted')]
+    value['tail'] = getattr(request, 'param', [
+        dict(kind='issue', title='Follow-up invariant', text='Preserve the source on restart'),
+        dict(kind='discard', text='No separate change is warranted'),
+    ])
     report.write_text(json.dumps(value), encoding='utf-8')
     code, selected = run('next', 'review')
     assert code == 0 and selected['action'] == 'audit'
@@ -100,12 +102,15 @@ def inspect(run, stage='merge'):
     return run('inspect-routing-positive', '--number', '42', '--stage', stage)
 
 
-def test_durable_tail_reuses_merged_native_positive_source(positive):
-    from promptpilot.tail_admission import classify
+@pytest.fixture
+def durable_positive(positive, isolated_db, monkeypatch):
+    from promptpilot import config, tail_store
 
-    peer, _health, path, _run, _completed = positive
+    peer, _health, path, run, _completed = positive
     merged(peer)
-    config = pp.load_config(str(path))
+    value = json.loads(path.read_text(encoding='utf-8'))
+    path.write_text(json.dumps(dict(value, tail_durable_drain=True)), encoding='utf-8')
+    monkeypatch.setattr(config, 'DB_PATH', isolated_db.DB_PATH)
 
     class Reader:
         def graphql_page(self, owner, repo, number, cursor):
@@ -125,14 +130,62 @@ def test_durable_tail_reuses_merged_native_positive_source(positive):
                              for edge in graph['edges'] if (n := edge['node'])['__typename'] == 'IssueComment')
 
     rest = rest_projection(peer)
-    candidate = dict(pr_number=42, head=rest['head']['sha'], base=rest['base']['ref'], merged_at=rest['merged_at'])
+    candidate = dict(number=42, head=rest['head']['sha'], base=rest['base']['ref'], merged_at=rest['merged_at'])
+    tail_store.save_discovery('owner/repo', None, {}, [candidate], pass_token='first-page')
+    monkeypatch.setattr(pp, 'GitHub', lambda **kwargs: Reader())
+    return peer, run
+
+
+def test_durable_tail_reuses_merged_native_positive_source(durable_positive):
+    peer, run = durable_positive
     before = list(peer.posts)
-    result = classify(Reader(), config, candidate)
+    code, batch = run('tail-next')
+    assert code == 0, batch
+    result, = batch['ready']
     assert result['state'] == 'ready' and result['protocol'] == 'typed'
     assert result['review_id'] == '1000' and result['items'][0]['kind'] == 'issue'
     assert result['items'][0]['text'] == 'Preserve the source on restart'
     assert result['items'][0]['item_sha256'] == sha(dict(kind='issue', title='Follow-up invariant',
                                                         text='Preserve the source on restart'))
+    assert peer.posts == before
+
+
+@pytest.mark.parametrize('label', ['hold', 'no-tail'])
+@pytest.mark.parametrize('positive,kind', [
+    ([], 'empty'),
+    ([dict(kind='issue', title='Follow-up', text='Preserve the source on restart')], 'versioned'),
+], indirect=['positive'])
+def test_durable_typed_completion_under_pause(durable_positive, label, kind):
+    peer, run = durable_positive
+    before = list(peer.posts)
+    code, batch = run('tail-next')
+    assert code == 0, batch
+    observation, = batch['observations']
+    target = ('--number', '42', '--version', observation['version'])
+    pr = peer.current['data']['repository']['pullRequest']
+    pr['labels']['nodes'].append({'name': label})
+
+    if kind == 'versioned':
+        assert observation['state'] == 'ready'
+        assert run('tail-create', *target, '--item', '1')[0] == 2
+        assert run('tail-backlog')[1]['counts'] == {'waiting-policy': 1}
+        marker = (f"<!-- pp:tail-done review-comment={observation['review_id']} "
+                  f"review-updated={observation['review_updated_at']} -->")
+        peer.comments.append(dict(cursor='DONE', node=dict(__typename='IssueComment', id='IC_9000',
+            fullDatabaseId='9000', createdAt=peer.now.isoformat().replace('+00:00', 'Z'),
+            lastEditedAt=None, author={'login': 'owner'}, body=marker)))
+    code, current = run('tail-gate', *target)
+    assert code == 0 and current['completion_kind'] == kind, current
+    assert run('tail-backlog')[1]['completions'] == {kind: 1}
+    assert inspect(run, 'tail')[0] == 2
+
+    peer.comments[0]['node']['lastEditedAt'] = peer.now.isoformat().replace('+00:00', 'Z')
+    command = ('tail-gate', *target) if kind == 'empty' else ('tail-create', *target, '--item', '1')
+    code, failure = run(*command)
+    assert code == 2 and 'edited' in failure['error'], failure
+    code, backlog = run('tail-backlog')
+    assert code == 0 and backlog['counts'] == {'invalid-source': 1} and backlog['completions'] == {}
+    assert backlog['candidates'][0]['last_reason'] == failure['error']
     assert peer.posts == before
 
 

@@ -1,4 +1,5 @@
 """Exercise the public durable TAIL commands against GitHub REST/GraphQL wire fixtures."""
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -31,12 +32,16 @@ class Peer:
         self.issues = []
         self.lock = threading.Lock()
         self.after = None
+        self.discover_together = None
         self.select_together = None
         self.pause_claim = False
         self.claim_visible = threading.Event()
         self.resume = threading.Event()
 
     def reply(self, args, payload):
+        discovery = self.discover_together
+        if discovery is not None and args == ("api", "graphql", "--input", "-"):
+            discovery.wait(60)
         # Hold each selector's first remote read after both loaded their SQLite row.
         barrier = self.select_together
         if barrier is not None and args == ("api", f"repos/{REPO}/pulls/42"):
@@ -228,6 +233,53 @@ def test_tail_next_preserves_quoted_ui_name_from_review_formatter(local_cli):
     assert peer.writes == []
 
 
+@pytest.mark.parametrize("indent", ["    ", "\t"])
+def test_tail_next_keeps_an_indented_list_inside_its_review_item(local_cli, indent):
+    from hashlib import sha256
+
+    run, peer = local_cli
+    source = peer.sources[42]
+    body, _ = pipeline.format_review(
+        {"depth": 0, "head": source["candidate"]["head"]},
+        {"change": "Списки", "checks": ["Просмотр"], "blocking": [],
+         "tail": [{"kind": "issue", "text": f"Сохранить строку\n{indent}2. [выброс] пример",
+                   "title": "Отображение строк"},
+                  {"kind": "discard", "text": "Другой пункт"}]},
+    )
+    source["comments"][0]["body"] = source["snapshot"]["edges"][1]["node"]["body"] = body
+    candidate, = run("tail-next")["ready"]
+    first, second = candidate["items"]
+    raw = "1. [заявка] Сохранить строку 2. [выброс] пример → заголовок: «Отображение строк»"
+    assert first == {"index": 1, "kind": "issue", "title": "Отображение строк",
+                     "text": "Сохранить строку 2. [выброс] пример",
+                     "item_sha256": sha256(raw.encode("utf-8")).hexdigest()}
+    assert (second["index"], second["kind"], second["text"]) == (2, "discard", "Другой пункт")
+    assert peer.writes == []
+
+
+@pytest.mark.parametrize("title_and_next_line", [
+    "«Сохранение записи»\nОтдельный абзац вне пункта",
+    "«Сохранение записи»\n    продолжение → заголовок: «Повтор»",
+    "«Сохранение записи\n    недостающая закрывающая кавычка",
+])
+def test_tail_next_points_to_the_malformed_review_line(local_cli, title_and_next_line):
+    run, peer = local_cli
+    source = peer.sources[42]
+    review = source["comments"][0]
+    body = review["body"].replace("«Сохранение записи»", title_and_next_line)
+    invalid_line = title_and_next_line.splitlines()[-1]
+    review["body"] = source["snapshot"]["edges"][1]["node"]["body"] = body
+    result = run("tail-next")
+    assert result["ready"] == []
+    observation, = result["observations"]
+    assert observation["state"] == "invalid-source"
+    assert observation["parse_error"] == {"review_id": str(review["id"]),
+                                         "line": body.splitlines().index(invalid_line) + 1,
+                                         "text": invalid_line}
+    assert invalid_line not in run("tail-backlog")["candidates"][0]["last_reason"]
+    assert peer.writes == []
+
+
 @pytest.mark.parametrize("event", ["edit", "delete", "override", "hold", "no-tail"])
 @pytest.mark.parametrize("boundary", ["claim", "ref", "intent", "issue"])
 def test_new_source_or_policy_stops_every_pre_create_write(local_cli, event, boundary):
@@ -270,7 +322,7 @@ def wire_bridge(tmp_path_factory, request):
 def http_cli(tmp_path, wire_bridge):
     servers = []
 
-    def start(*sources):
+    def start(*sources, discover=True):
         peer = Peer(*sources)
         errors = []
 
@@ -298,7 +350,8 @@ def http_cli(tmp_path, wire_bridge):
         cli = CLI(tmp_path, f"http://127.0.0.1:{server.server_port}", wire_bridge)
         cli.env["PP_CODEX_APP_SERVER"] = "0"
         enable(cli.config)
-        cli.finish()
+        if discover:
+            cli.finish()
         return cli, peer
 
     yield start
@@ -312,28 +365,32 @@ def http_cli(tmp_path, wire_bridge):
 
 def test_two_cli_processes_share_one_item_lease_and_issue(http_cli):
     merged = utc(datetime.now(timezone.utc) - timedelta(days=35))
-    cli, peer = http_cli(source_fixture(merged_at=merged))
+    cli, peer = http_cli(source_fixture(merged_at=merged), discover=False)
+    peer.discover_together = threading.Barrier(2, action=lambda: setattr(peer, "discover_together", None))
     peer.select_together = threading.Barrier(2)
-    with cli.start("tail-next") as first:
-        second = cli.run("tail-next")
-        out, err = first.communicate(timeout=90)
-        assert first.returncode == 0, (out, err)
-    peer.select_together = None
-    first_selection = json.loads(out)
-    assert first_selection["ready"] == second["ready"]
-    command = selected(cli.run, first_selection)
-    second_command = selected(cli.run, second)
+    after_selection = threading.Barrier(2)
+    after_gate = threading.Barrier(2, action=lambda: setattr(peer, "select_together", None))
     peer.pause_claim = True
-    with cli.start(*command) as child:
+
+    def worker(contender):
+        discovery = cli.discover(5)
+        assert discovery["state"] == "complete"
+        selection = cli.run("tail-next")
+        after_selection.wait(60)
+        command = selected(cli.run, selection)
+        after_gate.wait(60)
+        if not contender:
+            return command, cli.run(*command)
         try:
             assert peer.claim_visible.wait(60), "first worker did not publish its claim"
-            contender = cli.run(*second_command)
-            assert contender["state"] == "active-elsewhere"
+            return command, cli.run(*command)
         finally:
             peer.resume.set()
-        out, err = child.communicate(timeout=180)
-        assert child.returncode == 0, (out, err)
-    assert json.loads(out)["issue"] == cli.run(*command)["issue"] == 2000
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        (command, winner), (second_command, contender) = pool.map(worker, (False, True))
+    assert command == second_command and contender["state"] == "active-elsewhere"
+    assert winner["issue"] == cli.run(*command)["issue"] == 2000
     assert peer.writes == ["claim", "ref", "intent", "issue", "item-done"]
     assert len(peer.issues) == len(peer.refs) == 1
     source = peer.sources[42]
@@ -350,6 +407,38 @@ def test_two_cli_processes_share_one_item_lease_and_issue(http_cli):
                 created=utc(datetime.now(timezone.utc)))
     assert cli.run("tail-gate", *command[1:-2])["completion_kind"] == "versioned"
     assert cli.backlog()["completions"] == {"versioned": 1}
+
+
+@pytest.mark.parametrize("already_done", [False, True])
+def test_concurrent_gate_refuses_a_different_completion(local_cli, monkeypatch, already_done):
+    run, peer = local_cli
+    command = selected(run)
+    gate = ("tail-gate", *command[1:-2])
+    source = peer.sources[42]
+    review = source["comments"][0]
+    marker = f"<!-- pp:tail-done review-comment={review['id']} review-updated={review['updated_at']} -->"
+    if already_done:
+        done = add_comment(source, marker)
+    reply = peer.reply
+
+    def supersede_before_the_local_commit(args, payload):
+        response = reply(args, payload)
+        if args == ("api", f"repos/{REPO}/pulls/1261"):
+            # The outer gate has read the review and all its comments.
+            monkeypatch.setattr(peer, "reply", reply)
+            if already_done:
+                # Same review and completion kind, different proof digest.
+                done["updated_at"] = utc(datetime.now(timezone.utc))
+                source["snapshot"]["edges"][-1]["node"]["lastEditedAt"] = done["updated_at"]
+            else:
+                add_comment(source, marker)
+            assert run(*gate)["completion_kind"] == "versioned"
+        return response
+
+    monkeypatch.setattr(peer, "reply", supersede_before_the_local_commit)
+    assert "candidate changed" in run(*gate, code=2)["error"]
+    assert run("tail-backlog")["completions"] == {"versioned": 1}
+    assert peer.writes == []
 
 
 def test_cli_hold_after_ref_preserves_intent_boundary(http_cli):

@@ -130,7 +130,7 @@ def live(gh, config, number, *, purpose, health=None):
     from .review_routing_snapshot import stable_timeline
     from .review_routing_wire import sha
 
-    if purpose not in {'merge', 'tail', 'cleanup'}:
+    if purpose not in {'merge', 'tail', 'cleanup', 'tail-completion'}:
         raise PipelineError('unknown positive typed REVIEW consumer purpose')
     # Inspecting a proof must not fetch/fast-forward the operator checkout.
     # Preserve the effective config for policy checks; suppress only the
@@ -141,7 +141,9 @@ def live(gh, config, number, *, purpose, health=None):
     merged = purpose != 'merge'
     result = inspect(snapshot, trusted=config['trusted_account'], merged=merged)
     labels = set(snapshot['labels'])
-    if labels & {'hold', 'manual', 'needs-decision', 'changes-requested'}:
+    # The backlog can verify an already completed TAIL under a pause. The
+    # ordinary TAIL gate and all other consumers still honor the live hold.
+    if labels & {'manual', 'needs-decision', 'changes-requested'} or ('hold' in labels and purpose != 'tail-completion'):
         raise PipelineError('positive typed REVIEW entered a stopped route')
     if purpose == 'merge':
         pp.validate_common(snapshot, config, {'head': result['descriptor']['source']['head']})

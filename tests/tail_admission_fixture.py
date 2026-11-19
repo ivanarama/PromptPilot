@@ -6,7 +6,7 @@ import hashlib
 
 def add_edge(source, kind, **node):
     edges = source["snapshot"]["edges"]
-    edges.append({"cursor": f"edge:{len(edges) + 1}", "node": {"__typename": kind, **node}})
+    edges.append({"cursor": f"edge:{node['id']}", "node": {"__typename": kind, **node}})
 
 
 def add_comment(source, body, *, ident=None, login=None, created=None, edited=None):

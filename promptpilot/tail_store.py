@@ -31,26 +31,67 @@ def _checkpoint(row):
     return checkpoint
 
 
-def load_discovery(repository):
+def _checkpoint_payload(checkpoint):
+    # The revision belongs to the SQLite row even if the caller reused a loaded dict.
+    content = {key: value for key, value in checkpoint.items() if key != "revision"}
+    return json.dumps(content, separators=(",", ":"), sort_keys=True, allow_nan=False)
+
+
+def _keep_budget(checkpoint, remaining, reset_at, now):
+    """Merge independent GitHub receipts; an active exhaustion bars further reads."""
+    if remaining is None or not reset_at:
+        return False
+    saved = checkpoint.get("budget_remaining")
+    saved_reset = checkpoint.get("budget_reset_at")
+    if saved is not None and saved_reset:
+        if saved_reset == reset_at and saved <= remaining:
+            return False
+        if saved == 0 and saved_reset > now and (remaining != 0 or saved_reset >= reset_at):
+            return False
+        if saved_reset > reset_at and not (remaining == 0 and reset_at > now):
+            return False
+    checkpoint.update(budget_remaining=remaining, budget_reset_at=reset_at)
+    return True
+
+
+def load_discovery(repository, *, budget=None):
+    """Read the latest checkpoint, optionally recording another actual request's quota."""
     from . import db
 
-    with db._connect() as conn:
+    with db._connect(immediate=budget is not None) as conn:
         row = conn.execute(
             "SELECT revision, checkpoint_json FROM tail_discovery WHERE repository = ?",
             (repository,),
         ).fetchone()
-        return _checkpoint(row) if row is not None else None
+        if row is None:
+            return None
+        checkpoint = _checkpoint(row)
+        if budget is not None:
+            now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            if _keep_budget(checkpoint, *budget, now):
+                # Metering is independent of page CAS. A slow response may
+                # report exhaustion even after another scan finished the page.
+                conn.execute("UPDATE tail_discovery SET checkpoint_json = ? WHERE repository = ?",
+                             (_checkpoint_payload(checkpoint), repository))
+        return checkpoint
 
 
 def save_discovery(repository, expected_revision, checkpoint, observations=(), *, pass_token=None):
     """Commit a checkpoint and its page together, or leave both untouched."""
     from . import db
 
-    # The revision is owned by the transaction even when callers reuse a loaded dict.
-    content = {k: v for k, v in checkpoint.items() if k != "revision"}
-    payload = json.dumps(content, separators=(",", ":"), sort_keys=True, allow_nan=False)
+    content = dict(checkpoint)
     now = db._now()
     with db._connect(immediate=True) as conn:
+        if expected_revision is not None:
+            saved = conn.execute("""SELECT checkpoint_json FROM tail_discovery
+                                    WHERE repository = ? AND revision = ?""",
+                                 (repository, expected_revision)).fetchone()
+            if saved is not None:
+                prior = json.loads(saved["checkpoint_json"])
+                _keep_budget(content, prior.get("budget_remaining"), prior.get("budget_reset_at"),
+                             datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+        payload = _checkpoint_payload(content)
         if expected_revision is None:
             revision = 1
             result = conn.execute(
@@ -84,16 +125,24 @@ def save_discovery(repository, expected_revision, checkpoint, observations=(), *
                      last_observed_at = excluded.last_observed_at, pass_token = excluded.pass_token""",
                 (repository, item["number"], item["merged_at"], item["head"], item["base"], now, pass_token),
             )
+    if content.get("budget_remaining") is not None:
+        checkpoint.update(budget_remaining=content["budget_remaining"], budget_reset_at=content["budget_reset_at"])
     return revision
 
 
-def pass_snapshot(repository, token):
+def pass_snapshot(repository, token, revision):
     """Canonical digest of the observed set, independent of remote page order."""
     from . import db
 
     digest = hashlib.sha256()
     count = 0
     with db._connect() as conn:
+        # Another scanner can already be refreshing pass_token on candidates
+        # for the next pass. Read this checkpoint and its set in one snapshot.
+        conn.execute("BEGIN")
+        if not conn.execute("SELECT 1 FROM tail_discovery WHERE repository = ? AND revision = ?",
+                            (repository, revision)).fetchone():
+            raise TailDiscoveryConflict("TAIL verification checkpoint changed")
         rows = conn.execute(
             """SELECT pr_number, merged_at, head, base FROM tail_candidates
                WHERE repository = ? AND pass_token = ? ORDER BY pr_number""",

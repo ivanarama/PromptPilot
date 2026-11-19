@@ -22,7 +22,7 @@ def _version(row, result):
 def _observation(row, result):
     summary = {"number": row["pr_number"], "state": result["state"],
                "version": _version(row, result)}
-    for key in ("reason", "completion_kind", "review_id", "review_updated_at", "protocol"):
+    for key in ("reason", "completion_kind", "review_id", "review_updated_at", "protocol", "parse_error"):
         if result.get(key) is not None:
             summary[key] = result[key]
     if result["state"] == "ready":
@@ -31,7 +31,21 @@ def _observation(row, result):
 
 
 def _record(row, result):
-    return tail_store.record_result(row, **{k: result[k] for k in _RESULT if k in result})
+    try:
+        return tail_store.record_result(row, **{k: result[k] for k in _RESULT if k in result})
+    except tail_store.TailCandidateConflict:
+        # Both readers may hand off the same remote proof. Neither owns the
+        # item until the GitHub lease elects it. A different completion (or
+        # a re-opened candidate) is a real conflict even within one review.
+        if result["state"] not in ("ready", "resolved"):
+            raise
+        current = tail_store.get_candidate(row["repository"], row["base"], row["pr_number"])
+        if (not current or current["state"] != result["state"]
+                or _version(current, current) != _version(row, result)
+                or current["completion_kind"] != result.get("completion_kind")
+                or current["completion_digest"] != result.get("completion_digest")):
+            raise
+        return current["revision"]
 
 
 def _row(config, number):
@@ -44,10 +58,19 @@ def _row(config, number):
 
 
 def _read(gh, config, row):
-    result = tail_admission.classify(gh, config, row)
-    if result["state"] in ("ready", "resolved") and _version(row, result) is None:
-        raise PipelineError("TAIL admission returned incomplete review evidence")
-    return result
+    try:
+        result = tail_admission.classify(gh, config, row)
+        if result["state"] in ("ready", "resolved") and _version(row, result) is None:
+            raise PipelineError("TAIL admission returned incomplete review evidence")
+        return result
+    except PipelineError as exc:
+        # Every entry point must surface a failed recheck of an old completion.
+        # Preserve the known source and let a concurrent observation stand.
+        try:
+            _record(row, {"state": "invalid-source", "reason": str(exc)})
+        except tail_store.TailCandidateConflict:
+            pass
+        raise
 
 
 def next_candidates(gh, config):
@@ -58,26 +81,10 @@ def next_candidates(gh, config):
             result = _read(gh, config, row)
             _record(row, result)
         except tail_store.TailCandidateConflict:
-            # Another reader may have classified the very same remote proof.
-            # Both entry points can hand it off; only the GitHub lease elects
-            # the process that may create. Changed observations must be reread.
-            current = tail_store.get_candidate(row["repository"], row["base"], row["pr_number"])
-            if (current and current["state"] == result["state"] == "ready"
-                    and _version(row, result) == _version(current, current)):
-                observation = _observation(row, result)
-                ready.append(observation)
-                observations.append(observation)
-                continue
             observations.append({"number": row["pr_number"], "state": "changed-concurrently"})
             continue
         except PipelineError as exc:
-            # Preserve the previous proof, leave the candidate due for a retry,
-            # and allow other PRs in the same bounded batch to proceed.
             result = {"state": "invalid-source", "reason": str(exc)}
-            try:
-                _record(row, result)
-            except tail_store.TailCandidateConflict:
-                pass
             failures.append({"number": row["pr_number"], "reason": str(exc)})
         observation = _observation(row, result)
         observations.append(observation)

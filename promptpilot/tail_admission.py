@@ -18,9 +18,19 @@ class InvalidSource(PipelineError):
     """The current observation cannot prove that this particular source is admissible."""
 
 
+class InvalidTailSection(InvalidSource):
+    def __init__(self, review_id, reason, line=None, text=None):
+        self.location = {"review_id": str(review_id)}
+        where = f"review comment {review_id}"
+        if line is not None:
+            self.location.update(line=line, text=text)
+            where += f", line {line}"
+        super().__init__(f"{where}: {reason}")
+
+
 _TAIL_MARKER = re.compile(r"^<!-- pp:review pp:tail=([0-9]+) -->$", re.M)
-_ITEM = re.compile(r"^[ \t]*([1-9][0-9]*)\. \[(заявка|выброс)\] (.+)$", re.S)
-_TITLE_SEPARATOR = re.compile(r" → заголовок: | — заголовок: | Заголовок: ")
+_ITEM = re.compile(r"^([1-9][0-9]*)\. \[(заявка|выброс)\] (.+)$", re.S)
+_TITLE_SEPARATOR = re.compile(r"(?<=[\x09-\x0d ])(?:(?:→|—)[\x09-\x0d ]+заголовок:|Заголовок:)(?=[\x09-\x0d ])")
 _AFTER_MERGE = positive.LIFECYCLE - {"MergedEvent"}
 
 
@@ -40,55 +50,71 @@ def _sha(value):
         raise InvalidSource("TAIL review is not valid UTF-8") from exc
 
 
-def _items(body):
+def _items(review):
     """Parse exactly the ordinary REVIEW tail section and retain the original item hash."""
-    lines = body.replace("\r\n", "\n").replace("\r", "\n").split("\n")
-    counts = _TAIL_MARKER.findall("\n".join(lines))
+    lines = review["body"].replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    markers = [ix for ix, line in enumerate(lines) if _TAIL_MARKER.fullmatch(line)]
     starts = [ix for ix, line in enumerate(lines) if line == "Хвост:"]
     ends = [ix for ix, line in enumerate(lines) if line.startswith("Вердикт:")]
-    if len(counts) != 1 or len(starts) != 1 or len(ends) != 1 or starts[0] >= ends[0]:
-        raise InvalidSource("TAIL review has no unambiguous tail section and marker")
-    blocks = []
+
+    def invalid(reason, ix):
+        return InvalidTailSection(review["id"], reason, ix + 1, lines[ix])
+
+    for positions, label in ((starts, "Хвост:"), (ends, "Вердикт:"), (markers, "pp:review")):
+        if not positions:
+            raise InvalidTailSection(review["id"], f"TAIL review is missing {label}")
+        if len(positions) > 1:
+            raise invalid(f"TAIL review repeats {label}", positions[1])
+    if starts[0] >= ends[0]:
+        raise invalid("TAIL verdict precedes its tail section", ends[0])
+    item_starts = []
     dash = False
-    for line in lines[starts[0] + 1:ends[0]]:
+    for ix in range(starts[0] + 1, ends[0]):
+        line = lines[ix]
         if not line.strip(" \t"):
             continue
-        if line.strip(" \t") == "—" and not blocks and not dash:
+        if line.strip(" \t") == "—" and not item_starts and not dash:
             dash = True
         elif not dash and _ITEM.fullmatch(line):
-            blocks.append(line)
-        elif not dash and blocks and line.startswith((" ", "\t")):
-            blocks[-1] += "\n" + line
-        else:
-            raise InvalidSource("TAIL review contains an unexpected tail section line")
+            item_starts.append(ix)
+        elif not item_starts or not line.startswith((" ", "\t")):
+            raise invalid("TAIL review contains an unexpected tail section line", ix)
     items = []
-    for index, raw in enumerate(blocks, 1):
+    for index, (start, stop) in enumerate(zip(item_starts, item_starts[1:] + ends), 1):
+        raw = "\n".join(lines[start:stop])
         match = _ITEM.fullmatch(raw)
         number, tag, content = match.groups()
         if number != str(index):
-            raise InvalidSource("TAIL item numbers are not consecutive")
+            raise invalid("TAIL item numbers are not consecutive", start)
         kind = "issue" if tag == "заявка" else "discard"
         title, text = None, normalize_text(content)
         if kind == "issue":
-            splits = list(_TITLE_SEPARATOR.finditer(text))
-            if len(splits) != 1:
-                raise InvalidSource("TAIL issue has no unique title separator")
+            # Locate separators before folding whitespace so an error points
+            # to its physical line even when the item spans several lines.
+            splits = list(_TITLE_SEPARATOR.finditer(content))
+            last_line = start + content.rstrip(" \t\r\n\v\f").count("\n")
+            if not splits:
+                raise invalid("TAIL issue has no unique title separator", last_line)
+            if len(splits) > 1:
+                repeated = start + content.count("\n", 0, splits[1].start())
+                raise invalid("TAIL issue has no unique title separator", repeated)
             sep = splits[0]
-            title = text[sep.end():].strip(" ")
-            text = text[:sep.start()].strip(" ")
+            title = normalize_text(content[sep.end():])
+            text = normalize_text(content[:sep.start()])
             # format_review wraps the entire title, including quoted UI names.
-            quote_pattern = r"«(.+)»\.?" if sep.group() == " → заголовок: " else r"«([^«»]+)»\.?"
+            quote_pattern = r"«(.+)»\.?" if sep.group().startswith("→") else r"«([^«»]+)»\.?"
             quoted = re.fullmatch(quote_pattern, title)
             if quoted:
                 title = quoted.group(1).strip(" ")
-            elif sep.group() == " Заголовок: " or title.startswith("«") or title.endswith("»"):
-                raise InvalidSource("TAIL issue has malformed title quotes")
+            elif sep.group() == "Заголовок:" or title.startswith("«") or title.endswith("»"):
+                raise invalid("TAIL issue has malformed title quotes", last_line)
             if not title or not text:
-                raise InvalidSource("TAIL issue needs a title and task text")
+                raise invalid("TAIL issue needs a title and task text", last_line if text else start)
         items.append(dict(index=index, kind=kind, title=title, text=text,
                           item_sha256=_sha(normalize_text(raw))))
-    if counts[0] != str(sum(item["kind"] == "issue" for item in items)):
-        raise InvalidSource("TAIL review count disagrees with its issue items")
+    marker = markers[0]
+    if _TAIL_MARKER.fullmatch(lines[marker])[1] != str(sum(item["kind"] == "issue" for item in items)):
+        raise invalid("TAIL review count disagrees with its issue items", marker)
     return items
 
 
@@ -233,7 +259,22 @@ def _ordinary(gh, config, snapshot, cut, comments, candidate):
         if (node["__typename"] == "IssueComment" and (node.get("author") or {}).get("login") == trusted
                 and pp.has_review_again(node["body"].replace("\r\n", "\n"))):
             raise InvalidSource("TAIL selected review was superseded by a review request")
-    return protocol, review, _items(review["body"]), epoch_digest
+    return protocol, review, _items(review), epoch_digest
+
+
+def _legacy_done_ids(snapshot, review):
+    comments = (edge["node"] for edge in snapshot["edges"] if edge["node"]["__typename"] == "IssueComment")
+    selected = next(node for node in comments if pp.comment_id(node) == review["id"])
+    version_time = timestamp(review["updated_at"])
+    done = set()
+    # The remaining edges follow the selected publication, including same-second
+    # comments. Edits have no edge of their own, so a tie with an edit is ambiguous.
+    for node in comments:
+        if "<!-- pp:tail-done -->" in node["body"].replace("\r\n", "\n").split("\n"):
+            posted = timestamp(node["createdAt"])
+            if posted > version_time or (posted == version_time and selected["lastEditedAt"] is None):
+                done.add(pp.comment_id(node))
+    return done
 
 
 def classify(gh, config, candidate):
@@ -243,12 +284,13 @@ def classify(gh, config, candidate):
     snapshot = pp.stable_timeline(gh, config, number)
     try:
         cut = _merge(snapshot, pr, config, candidate)
-        if {"hold", "no-tail"}.intersection(snapshot["labels"]):
-            return dict(state="waiting-policy", reason="TAIL paused by PR policy")
+        paused = bool({"hold", "no-tail"}.intersection(snapshot["labels"]))
         comments = _read_comments(gh, config, number, snapshot)
         if positive.has_history(snapshot, config["trusted_account"]):
-            source = positive.live(gh, config, number, purpose="tail")
-            if source["snapshot"]["edges"] != snapshot["edges"] or source["head"] != candidate["head"]:
+            purpose = "tail-completion" if paused else "tail"
+            source = positive.live(gh, config, number, purpose=purpose)
+            if (source["snapshot"]["edges"] != snapshot["edges"] or source["head"] != candidate["head"]
+                    or source["snapshot"]["labels"] != snapshot["labels"]):
                 raise PipelineError("TAIL typed proof changed between independent reads")
             publication = source["source"]["source"]["publication_id"]
             review = next((row for row in comments if str(row["id"]) == str(publication)), None)
@@ -263,11 +305,12 @@ def classify(gh, config, candidate):
         version = dict(review_id=str(review["id"]), review_updated_at=review["updated_at"],
                        review_body_digest=_sha(review["body"]), epoch_digest=epoch_digest)
         marker = f"<!-- pp:tail-done review-comment={review['id']} review-updated={review['updated_at']} -->"
+        legacy_done = _legacy_done_ids(snapshot, review) if protocol == "legacy" else set()
         for row in comments:
             lines = row["body"].replace("\r\n", "\n").split("\n")
             if marker in lines:
                 kind = "versioned"
-            elif protocol == "legacy" and "<!-- pp:tail-done -->" in lines:
+            elif row["id"] in legacy_done:
                 kind = "legacy"
             else:
                 continue
@@ -277,7 +320,11 @@ def classify(gh, config, candidate):
         if not any(item["kind"] == "issue" for item in items):
             return dict(state="resolved", completion_kind="empty", completion_digest=pp.digest(["empty", version]),
                         reason="TAIL selected review has zero issue items", **version)
+        if paused:
+            return dict(state="waiting-policy", reason="TAIL paused by PR policy", **version)
         return dict(state="ready", reason="TAIL selected review has open items", protocol=protocol,
                     review_body=review["body"], title=pr.get("title"), items=items, comments=comments, **version)
+    except InvalidTailSection as exc:
+        return dict(state="invalid-source", reason=str(exc), parse_error=exc.location)
     except InvalidSource as exc:
         return dict(state="invalid-source", reason=str(exc))
