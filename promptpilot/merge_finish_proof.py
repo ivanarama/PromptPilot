@@ -69,6 +69,8 @@ def _git(config, working_dir, *args):
     except (OSError, subprocess.TimeoutExpired, UnicodeError) as exc:
         raise pp.PipelineError("git could not verify the base-sync") from exc
     if result.returncode:
+        if args[0] == "merge-tree" and result.returncode in (1, 129):
+            raise OutsideScope("git cannot reproduce this conflict-free tree")
         raise pp.PipelineError(f"git {args[0]} could not verify the base-sync")
     return result.stdout.strip()
 
@@ -100,15 +102,15 @@ def _tree_proof(config, working_dir, branch, checkpoint):
         _git(config, working_dir, "rev-list", "-n", "1", "--parents", head).split() == [head, old, base],
         "local commit parents differ",
     )
-    _need(
-        _git(config, working_dir, "rev-parse", head + "^{tree}") == tree
-        and _git(config, working_dir, "merge-tree", "--write-tree", "--no-messages", old, base) == tree,
-        "local tree differs from the clean mechanical merge",
-    )
+    _need(_git(config, working_dir, "rev-parse", head + "^{tree}") == tree, "local tree differs")
+    if _git(config, working_dir, "merge-tree", "--write-tree", "--no-messages", old, base) != tree:
+        raise OutsideScope("base-sync required substantive conflict resolution")
 
 
 def _identity(pr, checkpoint):
     repo = checkpoint["repository"]
+    if pr["head"]["repo"]["full_name"] != repo or pr["base"]["sha"] != checkpoint["base"]:
+        raise OutsideScope("fork or subsequent base movement requires ordinary recovery")
     _need(
         pr["number"] == checkpoint["number"]
         and pr["state"] == "open"
@@ -116,8 +118,6 @@ def _identity(pr, checkpoint):
         and pr["draft"] is False
         and pr["base"]["ref"] == "main"
         and pr["base"]["repo"]["full_name"] == repo
-        and pr["base"]["sha"] == checkpoint["base"]
-        and pr["head"]["repo"]["full_name"] == repo
         and pr["head"]["sha"] == checkpoint["to"]
         and isinstance(pr["maintainer_can_modify"], bool),
         "PR identity/base changed",
@@ -155,11 +155,10 @@ def _ci(gh, root, sha):
             seen_ids.add(run_id)
             if name not in found or run_id > found[name]["id"]:
                 found[name] = row
-    _need(set(found) == REQUIRED, "missing required CI")
-    _need(
-        all(run["status"] == "completed" and run["conclusion"] == "success" for run in found.values()),
-        "latest required CI on exact commit is unproved",
-    )
+    if set(found) != REQUIRED or any(
+        run["status"] != "completed" or run["conclusion"] != "success" for run in found.values()
+    ):
+        raise OutsideScope("ordinary recovery must handle incomplete or failed CI")
     return {name: run["id"] for name, run in found.items()}
 
 
@@ -299,11 +298,11 @@ def _observe(gh, config, checkpoint, working_dir, *, verify_tree):
         _tree_proof(config, working_dir, branch, checkpoint)
     main = gh.json("api", root + "/git/ref/heads/main")
     _need(
-        main["ref"] == "refs/heads/main"
-        and main["object"]["type"] == "commit"
-        and main["object"]["sha"] == base,
-        "protected main changed",
+        main["ref"] == "refs/heads/main" and main["object"]["type"] == "commit",
+        "protected main identity is unproved",
     )
+    if main["object"]["sha"] != base:
+        raise OutsideScope("protected main advanced; ordinary ancestry proof required")
     commit = gh.json("api", f"{root}/git/commits/{head}")
     _need(
         commit["sha"] == head
@@ -354,7 +353,12 @@ def confirm(gh, config, checkpoint, *, working_dir, prepare_source, gate, claim_
     # final Source admission, then compare two full proof bundles across it.
     prepare_source()
     validate_attempt()
-    final = _observe(gh, config, checkpoint, working_dir, verify_tree=False)
+    try:
+        final = _observe(gh, config, checkpoint, working_dir, verify_tree=False)
+    except OutsideScope as exc:
+        # A late Source may already have consumed its credit. Do not let a
+        # general provider restart preparation in this same attempt.
+        raise pp.PipelineError("confirmation scope changed after final Source admission") from exc
     _need(final == prepared, "full reviewed state changed across final Source admission")
     snap, identity, checks, done, body = final
     published = False

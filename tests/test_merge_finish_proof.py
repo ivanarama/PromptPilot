@@ -283,6 +283,19 @@ def test_source_rechecked_after_long_preparation(replay):
     assert not replay.gates and not replay.past_send and not replay.posts
 
 
+def test_ordinary_recovery_handoff_only_before_final_source(replay):
+    replay.main = "e" * 40
+    with pytest.raises(finish.OutsideScope):
+        replay.run()
+    assert replay.source_calls == 0
+    replay.main = BASE
+    replay.on_source = lambda: setattr(replay, "main", "e" * 40)
+    with pytest.raises(pp.PipelineError, match="scope changed after final Source") as caught:
+        replay.run()
+    assert not isinstance(caught.value, finish.OutsideScope)
+    assert replay.source_calls == 1 and not replay.gates and not replay.posts
+
+
 @pytest.mark.parametrize("field,value", [("gate_head", "0" * 40), ("stale_after_gate", True)])
 def test_final_gate_binding_is_checked_before_send(replay, field, value):
     setattr(replay, field, value)
