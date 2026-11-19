@@ -95,9 +95,11 @@ and the exact gate file elected for this occurrence. A recovery election on
 the new HEAD can reconstruct a missing record from independently verified
 GitHub evidence after a crash.
 
-A new election for the same recovery HEAD waits for the configured Source
-sampler and its budget deferral before starting a provider. A matching current
-Source and signed election limit the handoff to the canonical post-update
+A signed recovery waiting for Source saves an observation hint for the same task.
+On its next claim, Native compares the remaining snapshot TTL with the profile's
+refresh-ahead interval. If needed, it runs the ordinary budgeted Source scan
+before acquiring the election lease. A matching fresh snapshot from the sampler
+can satisfy this check. The new signed election and Source limit the handoff to the canonical post-update
 checks and confirmation. If a one-use admission hold was already claimed, the
 admitted recovery keeps its normal Source refresh path. A changed target,
 configuration, or conflicting graph follows the repository recovery procedure.
