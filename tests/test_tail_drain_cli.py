@@ -175,6 +175,59 @@ def local_cli(tmp_path, isolated_db, monkeypatch, capsys):
     return run, peer
 
 
+def test_tail_create_publishes_verified_context_without_changing_identity(local_cli, tmp_path):
+    from hashlib import sha256
+
+    run, peer = local_cli
+    selection = run("tail-next")
+    command = selected(run, selection)
+    candidate, = selection["ready"]
+    item, = candidate["items"]
+    path = tmp_path / "проверка main.md"
+    for malformed in (b"\xff", b"\x00", b"<!-- pp:tail-source pr=20 -->", b"pp:tail-drop 1",
+                      "Каноничная суть: подмена".encode(), b"x" * 65_536):
+        path.write_bytes(malformed)
+        assert run(*command, "--context-file", str(path), code=2)["action"] == "error"
+        assert peer.writes == []
+
+    peer.sources[42]["pull"]["title"] = "Форма записи"
+    context = "В src/form.py:17 повторное сохранение очищает поле.\nИзменение теряется после открытия формы."
+    path.write_bytes((context.replace("\n", "\r\n") + "\r\n").encode("utf-8-sig"))
+    assert run(*command, "--context-file", str(path))["state"] == "item-done"
+    issue, = peer.issues
+    assert issue["title"] == item["title"]
+    title_hash = sha256(item["title"].encode()).hexdigest()
+    task_hash = sha256(item["text"].encode()).hexdigest()
+    dedupe = sha256(f"pp-tail-task-v1\ntitle-sha256={title_hash}\ntask-sha256={task_hash}\n".encode()).hexdigest()
+    assert issue["body"] == (
+        "Найдено при ревью PR #42 (Форма записи), в хвост попало как отдельная работа.\n\n"
+        f"Каноничная суть: {item['text']}\n\n{context}\n\n"
+        f"Источник: https://github.com/{REPO}/pull/42#issuecomment-101\n"
+        f"<!-- pp:tail-source pr=42 review-comment=101 review-updated={candidate['review_updated_at']} "
+        f"item=1 item-sha256={item['item_sha256']} dedupe-sha256={dedupe} -->\n"
+        f"<!-- pp:tail-task-v1 title-sha256={title_hash} task-sha256={task_hash} dedupe-sha256={dedupe} -->\n"
+        f"<!-- pp:tail-dedupe sha256={dedupe} -->"
+    )
+    assert list(peer.refs) == [f"refs/heads/pp-tail-dedupe/{dedupe}"]
+
+
+def test_tail_next_preserves_quoted_ui_name_from_review_formatter(local_cli):
+    run, peer = local_cli
+    source = peer.sources[42]
+    title = "Исправить кнопку «Отмена»"
+    body, _ = pipeline.format_review(
+        {"depth": 0, "head": source["candidate"]["head"]},
+        {"change": "Форма", "checks": ["Открытие формы"], "blocking": [],
+         "tail": [{"kind": "issue", "text": "Сохранить изменения", "title": title}]},
+    )
+    source["comments"][0]["body"] = source["snapshot"]["edges"][1]["node"]["body"] = body
+
+    candidate, = run("tail-next")["ready"]
+    item, = candidate["items"]
+    assert item["title"] == title
+    assert peer.writes == []
+
+
 @pytest.mark.parametrize("event", ["edit", "delete", "override", "hold", "no-tail"])
 @pytest.mark.parametrize("boundary", ["claim", "ref", "intent", "issue"])
 def test_new_source_or_policy_stops_every_pre_create_write(local_cli, event, boundary):
@@ -375,3 +428,42 @@ def test_returned_intent_must_still_be_present_before_create(local_cli, monkeypa
     outcome = run(*command)
     assert outcome["state"] == "ambiguous-create"
     assert peer.writes == ["claim", "ref", "intent"]
+
+
+def test_global_task_on_another_pr_reuses_the_created_issue(local_cli):
+    run, peer = local_cli
+    created = run(*selected(run))
+    assert created["state"] == "item-done"
+    first_issue, = peer.issues
+    assert first_issue["number"] == created["issue"]
+    assert "<!-- pp:tail-source pr=42 " in first_issue["body"]
+    prior_writes = len(peer.writes)
+
+    # The following discovery pass finds another merged PR within its overlap.
+    merged = utc(datetime.now(timezone.utc) - timedelta(hours=2))
+    second = source_fixture(number=43, merged_at=merged)
+    peer.sources[43] = second
+    peer.pages.nodes.append({**node(43, merged), "headRefOid": second["candidate"]["head"]})
+    run("tail-discover", "--max-pages", "5")
+    candidate, = [row for row in run("tail-next")["ready"] if row["number"] == 43]
+    target = ("--number", "43", "--version", candidate["version"])
+    assert run("tail-gate", *target)["state"] == "ready"
+    outcome = run("tail-create", *target, "--item", "1")
+    assert outcome["state"] == "item-done" and outcome["issue"] == first_issue["number"]
+    assert peer.writes[prior_writes:] == ["claim", "item-done"]
+    assert len(peer.issues) == peer.writes.count("issue") == 1
+    assert f" issue={first_issue['number']} -->" in second["comments"][-1]["body"]
+
+
+def test_maintainer_drops_exact_item_between_selection_and_creation(local_cli):
+    run, peer = local_cli
+    result = run("tail-next")
+    command = selected(run, result)
+    candidate, = result["ready"]
+    item, = candidate["items"]
+    drop = (f"pp:tail-drop review-comment={candidate['review_id']} review-updated={candidate['review_updated_at']} "
+            f"item={item['index']} item-sha256={item['item_sha256']}")
+    add_comment(peer.sources[42], drop, login="owner", created=utc(datetime.now(timezone.utc)))
+    outcome = run(*command)
+    assert outcome["state"] == "waiting-policy" and outcome["issue"] is None
+    assert peer.writes == [] and peer.issues == []

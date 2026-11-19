@@ -6,6 +6,7 @@ duplicates. This module owns the returned lease, ref and intent for one process.
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import hashlib
+from html import escape
 import json
 import re
 import time
@@ -19,6 +20,27 @@ from .tail_admission import normalize_text
 
 def _sha(text):
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+_BODY_LIMIT = 65_536
+_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029]")
+_RESERVED = re.compile(r"<!--\s*pp:|^[ \t]*(?:pp:|pp-tail-task-v1\b|Каноничная суть:|Источник:|"
+                       r"Reviewed-SHA:|Outcome-Label:|PromptPilot service marker:)", re.M)
+
+
+def read_issue_context(path):
+    if path is None:
+        return ""
+    try:
+        with path.open(encoding="utf-8-sig", newline="") as file:
+            context = file.read(_BODY_LIMIT * 2 + 1).replace("\r\n", "\n")
+    except (OSError, UnicodeError) as exc:
+        raise PipelineError(f"cannot read TAIL context file as UTF-8: {exc}") from exc
+    if len(context) > _BODY_LIMIT:
+        raise PipelineError("TAIL context exceeds the GitHub issue body limit")
+    if _CONTROL.search(context) or _RESERVED.search(context):
+        raise PipelineError("TAIL context contains a control character or reserved protocol line")
+    return context.strip("\n") if context.strip() else ""
 
 
 @dataclass(frozen=True)
@@ -50,6 +72,23 @@ class Item:
     @property
     def dedupe_marker(self):
         return f"<!-- pp:tail-dedupe sha256={self.dedupe} -->"
+
+    def issue_body(self, repo, number, source, context):
+        title = source.get("title")
+        if not isinstance(title, str) or not title.strip() or "\n" in title or _CONTROL.search(title):
+            raise PipelineError("missing or malformed source PR title for the TAIL issue")
+        link = f"https://github.com/{repo}/pull/{number}#issuecomment-{source['review_id']}"
+        paragraphs = [
+            f"Найдено при ревью PR #{number} ({escape(title, quote=False)}), в хвост попало как отдельная работа.",
+            f"Каноничная суть: {self.text}",
+        ]
+        if context and context != self.text:
+            paragraphs.append(context)
+        paragraphs.append(f"Источник: {link}\n{self.source_marker}\n{self.task_marker}\n{self.dedupe_marker}")
+        body = "\n\n".join(paragraphs)
+        if len(body) > _BODY_LIMIT:
+            raise PipelineError("TAIL issue body exceeds the GitHub issue body limit")
+        return body
 
 
 class ItemStop(Exception):
@@ -162,12 +201,13 @@ def _create_ref(gh, repo, sha, ref):
         raise ItemStop("ambiguous-create", f"no owned 201 receipt for {ref}; check for an existing issue") from exc
 
 
-def apply_item(gh, config, row, source, index, recheck):
+def apply_item(gh, config, row, source, index, recheck, context=""):
     number, repo, trusted = row["pr_number"], config["repository"], config["trusted_account"]
     item = Item.selected(number, source, index)
     owner = str(uuid4())
     own_id = own_intent = None
     key = item.key
+    body = None
 
     def comment(body):
         response = post_comment(gh, config, number, body)
@@ -177,7 +217,9 @@ def apply_item(gh, config, row, source, index, recheck):
         return cid
 
     def inspect():
+        nonlocal body
         _, current = recheck()
+        body = item.issue_body(repo, number, current, context)
         return _check_item(current, item, index, trusted)
 
     def owned():
@@ -245,9 +287,6 @@ def apply_item(gh, config, row, source, index, recheck):
         existing = _existing(gh, config, item, stamp)
         owned()
         if existing is None:
-            link = f"https://github.com/{repo}/pull/{number}#issuecomment-{source['review_id']}"
-            body = (f"Найдено при ревью PR #{number}.\n\nКаноничная суть: {item.text}\n\n"
-                    f"Источник: {link}\n{item.source_marker}\n{item.task_marker}\n{item.dedupe_marker}")
             try:
                 result = gh.json("api", f"repos/{repo}/issues", "--method", "POST", "--input", "-",
                                  input_value={"title": item.title, "body": body})

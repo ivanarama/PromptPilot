@@ -104,9 +104,10 @@ def gate(gh, config, number, version):
     return {"action": "tail-gate", **_observation(row, result)}
 
 
-def create(gh, config, number, version, item):
-    from .tail_item import apply_item
+def create(gh, config, number, version, item, context_file=None):
+    from .tail_item import apply_item, read_issue_context
 
+    context = read_issue_context(context_file)
     def recheck():
         row = _row(config, number)
         result = _read(gh, config, row)
@@ -118,7 +119,7 @@ def create(gh, config, number, version, item):
         return row, result
 
     row, source = recheck()
-    outcome = apply_item(gh, config, row, source, item, recheck)
+    outcome = apply_item(gh, config, row, source, item, recheck, context)
     if outcome["state"] in ("ambiguous-create", "active-elsewhere", "invalid-source"):
         # Only update the observation actually examined by this process. A
         # concurrent reclassification must not be undone by a late result.

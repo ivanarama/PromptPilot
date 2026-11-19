@@ -76,7 +76,9 @@ def _items(body):
             sep = splits[0]
             title = text[sep.end():].strip(" ")
             text = text[:sep.start()].strip(" ")
-            quoted = re.fullmatch("«([^«»]+)»\\.?", title)
+            # format_review wraps the entire title, including quoted UI names.
+            quote_pattern = r"«(.+)»\.?" if sep.group() == " → заголовок: " else r"«([^«»]+)»\.?"
+            quoted = re.fullmatch(quote_pattern, title)
             if quoted:
                 title = quoted.group(1).strip(" ")
             elif sep.group() == " Заголовок: " or title.startswith("«") or title.endswith("»"):

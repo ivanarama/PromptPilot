@@ -2877,7 +2877,7 @@ def _tail_command(args, config):
             return tail_drain.next_candidates(gh, config)
         if args.command == "tail-gate":
             return tail_drain.gate(gh, config, args.number, args.version)
-        return tail_drain.create(gh, config, args.number, args.version, args.item)
+        return tail_drain.create(gh, config, args.number, args.version, args.item, args.context_file)
     except sqlite3.Error as exc:
         raise PipelineError(f"TAIL local index: {exc}") from exc
 
@@ -2903,6 +2903,7 @@ def run(argv=None) -> int:
         target.add_argument("--version", required=True, help="source version returned by tail-next")
         if name == "tail-create":
             target.add_argument("--item", type=int, required=True, help="verified issue item selected by the TAIL worker")
+            target.add_argument("--context-file", type=Path, help="UTF-8 explanation from checking the current base branch")
     source_refresh_parser = sub.add_parser("source-refresh")
     source_refresh_parser.add_argument("--profile", required=True)
     source_refresh_parser.add_argument("--final", action="store_true")
