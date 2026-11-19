@@ -291,3 +291,16 @@ def execute(args):
         result = {"state": "refused", "reason": str(exc), "product_mutation_authorized": False}
     print(json.dumps(result, ensure_ascii=False))
     return int(result["state"] == "refused")
+
+
+def pending_key(repository, target=None):
+    prefix = "pipeline_merge_confirmation:pending:v1:" + pp.digest(repository) + ":"
+    return prefix + pp.digest([target["number"], target["head"]]) if target else prefix
+
+
+def blocks_fallback(repository, target):
+    from . import db
+
+    if target:
+        return db.get_setting(pending_key(repository, target)) is not None
+    return db.has_setting_prefix(pending_key(repository))

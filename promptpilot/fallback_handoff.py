@@ -320,7 +320,7 @@ def validate_lease(lease: dict, stage: str) -> None:
                 "pipeline target reservation contradicts fallback lease")
 
 
-def gate(gh, config: dict, stage: str, lease_value: str, *, config_path=None) -> dict:
+def gate(gh, config: dict, stage: str, lease_value: str, *, config_path=None, meter=None) -> dict:
     """Fresh global scheduling gate; zero GitHub writes and no re-election."""
     from . import project_pipeline as pp
 
@@ -336,6 +336,7 @@ def gate(gh, config: dict, stage: str, lease_value: str, *, config_path=None) ->
     check_config()
     checkout = lease.get("health_checkout")
     health = pp.run_health(config, config_path=config_path,
+                          **({"meter": meter} if meter is not None else {}),
                           **({"working_dir": checkout} if checkout is not None else {}))
     check_config()  # run_health may fast-forward and reload the project config
     validate_lease(lease, stage)  # scan time counts toward expiry

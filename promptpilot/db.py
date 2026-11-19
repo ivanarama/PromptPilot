@@ -4147,7 +4147,7 @@ def _pipeline_budget_vector(value, name: str) -> dict:
 
 def _pipeline_final_source_cost(value, queue_id, route, combined_cost):
     credit = _pipeline_budget_vector(value, "final Source cost")
-    if (queue_id != "merge" or route not in ("skill", "fallback_targeted")
+    if (queue_id != "merge" or route not in ("skill", "fallback_targeted", "merge_confirmation")
             or not any(credit.values())
             or any(amount > combined_cost[resource] for resource, amount in credit.items())):
         raise ValueError("invalid final Source credit for execution reservation")
@@ -4245,7 +4245,7 @@ def _active_pipeline_budget_reservations(conn, values: list[dict]) -> tuple[list
 
 
 def _pipeline_source_refresh_state(conn, scope, task_id, profile_id, queue_id, route_costs,
-                                   starvation_timeout_seconds=0):
+                                   starvation_timeout_seconds=0, *, confirmation=False):
     """Read an admitted running attempt without pruning any foreign ledger."""
     from .config import TASK_TIMEOUT
     from .task_identity import task_execution_fingerprint
@@ -4255,7 +4255,7 @@ def _pipeline_source_refresh_state(conn, scope, task_id, profile_id, queue_id, r
     row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
     session = row["session_id"] or row["herdr_pane"] if row is not None else None
     if (row is None or row["status"] != "running" or not row["series_id"]
-            or not isinstance(session, str) or not session
+            or not confirmation and (not isinstance(session, str) or not session)
             or row["machine"] or row["detached"]):
         raise ValueError("source refresh requires a live local Native session")
     series = conn.execute("SELECT paused,ended_at FROM task_series WHERE id=?",
@@ -4274,7 +4274,7 @@ def _pipeline_source_refresh_state(conn, scope, task_id, profile_id, queue_id, r
             or timeout and now >= started.timestamp() + timeout):
         raise ValueError("source refresh attempt lifetime is invalid")
     costs = {route: _pipeline_budget_vector(route_costs[route], f"continuation {route} cost")
-             for route in ("skill", "fallback_targeted")}
+             for route in (("merge_confirmation",) if confirmation else ("skill", "fallback_targeted"))}
     key = _pipeline_github_budget_reservation_key(scope)
     values = _load_pipeline_budget_reservations(
         conn, key)
@@ -4323,7 +4323,8 @@ def pipeline_source_refresh_state(scope, task_id, profile_id, queue_id, route_co
 def _pipeline_source_refresh_guard_matches(conn, guard):
     try:
         observed = _pipeline_source_refresh_state(conn, guard["scope"], guard["task_id"],
-            guard["profile_id"], guard["queue_id"], guard["route_costs"])
+            guard["profile_id"], guard["queue_id"], guard["route_costs"],
+            confirmation=guard["route"] == "merge_confirmation")
         return observed["guard"] == guard
     except (KeyError, TypeError, ValueError, OverflowError):
         return False

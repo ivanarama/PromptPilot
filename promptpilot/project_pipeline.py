@@ -462,7 +462,7 @@ def sync_base_before_health(config: dict, *, working_dir: str | None = None) -> 
 
 
 def run_health(config: dict, *, config_path: str | None = None,
-               working_dir: str | None = None) -> dict:
+               working_dir: str | None = None, meter=None) -> dict:
     synced_base = str(config.get("base_branch") or "main")
     synchronized = sync_base_before_health(config, working_dir=working_dir)
     if synchronized and config_path is not None:
@@ -481,6 +481,8 @@ def run_health(config: dict, *, config_path: str | None = None,
         config.clear()
         config.update(refreshed)
     command = [str(value) for value in config["health_command"]]
+    if meter is not None:
+        command, working_dir = meter.health_command(command, working_dir)
     if command and command[0] in {"go", "go.exe"} and shutil.which(command[0]) is None:
         standard = Path(r"C:\Program Files\Go\bin\go.exe")
         if standard.exists():
@@ -506,6 +508,8 @@ def run_health(config: dict, *, config_path: str | None = None,
     if result.returncode not in (0, 1):
         raise PipelineError((result.stderr or result.stdout or "health command failed").strip())
     try:
+        if meter is not None:
+            return meter.health_result(result.stdout)
         value = json.loads(result.stdout)
     except json.JSONDecodeError as exc:
         # ``go run`` returns 1 when the wrapped health binary exits non-zero.

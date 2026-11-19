@@ -813,6 +813,10 @@ def _budget_policy_for_route(policy: dict, route: str | None) -> dict:
             resource: 0 for resource in policy["minimum_remaining"]}
         selected["cost_accounting"] = False
         return selected
+    if route == "merge_confirmation":
+        from .merge_finish_transport import reservation_cost
+        return dict(policy, budget_route=route, requested_cost=reservation_cost(policy),
+                    cost_accounting=True)
     if route not in _GITHUB_BUDGET_ROUTES:
         raise ValueError(f"неизвестный GitHub budget route: {route}")
     selected = dict(policy)
@@ -1526,7 +1530,7 @@ def _clear_budget_waiter_after_denial(task) -> None:
 def _reserve_execution_admission(
         task, profile_id: str, profile: dict, queue: dict, admission: dict,
         budget_route: str, *, retain_budget: bool,
-        admission_priority: int | None = None) -> dict:
+        admission_priority: int | None = None, fallback_target: dict | None = None) -> dict:
     """Recheck the elected route and optionally reserve its in-flight cost."""
     lease = admission.get("_lease")
     expected_revision = admission.get("_budget_reservation_revision")
@@ -1536,6 +1540,10 @@ def _reserve_execution_admission(
     if type(expected_revision) is not int or expected_revision < 0:
         expected_revision = None
     try:
+        if queue.get("id") == "merge" and budget_route in {"skill", "fallback_targeted"}:
+            from .merge_checkpoint import blocks_fallback
+            if blocks_fallback(profile.get("repository"), fallback_target):
+                raise ValueError("prior MERGE confirmation send needs exact readback before general fallback")
         policy = _github_budget_policy(profile)
         if policy is None:
             _clear_budget_waiter_after_admission(task)
@@ -1551,7 +1559,7 @@ def _reserve_execution_admission(
             _clear_budget_waiter_after_admission(task)
             return admission
         final_source_cost = None
-        if queue.get("id") == "merge" and budget_route in ("skill", "fallback_targeted"):
+        if queue.get("id") == "merge" and budget_route in ("skill", "fallback_targeted", "merge_confirmation"):
             scan_cost = policy["costs"]["insights"]
             if any(scan_cost.values()):
                 final_source_cost = scan_cost
@@ -4197,6 +4205,11 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
             provider_route = "tool"
         elif preflight_action not in {"empty", "wait", "error"} and mode == "auto":
             provider_route = "skill"
+        bounded_confirmation = (merge_checkpoint_hint is not None
+                                and execution.get("merge_confirmation") == "bounded-v1"
+                                and profile.get("github_budget", {}).get("source_cost_protocol") == "source-graphql-cost-v1")
+        if bounded_confirmation:
+            provider_route = "merge_confirmation"
         routed_priority = _post_preflight_admission_priority(
             profile, profile_series, stage, provider_route,
             validated_target_stage, admission.get("priority_one_headroom"))
@@ -4244,12 +4257,35 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
             admission = _reserve_execution_admission(
                 task, profile_id, profile, queue, admission, provider_route,
                 retain_budget=retain_budget,
-                admission_priority=admission_priority)
+                admission_priority=admission_priority,
+                fallback_target=fallback_lease["target"] if fallback_lease else None)
             if not admission.get("allowed"):
                 return _budget_defer_route(
                     admission, profile_id, profile, queue,
                     mode=("tool" if provider_route == "tool" else "skill"),
                     phase="post_preflight", preflight=preflight)
+
+        if bounded_confirmation:
+            if not retain_budget:
+                return {"action":"defer", "mode":"tool", "defer_for":"1m",
+                        "reason":"bounded MERGE confirmation requires retained Native admission"}
+            from . import merge_confirmation
+            finished = merge_confirmation.execute(task, profile_id, profile, queue, admission, command,
+                                               working_dir, preflight, merge_checkpoint_hint)
+            if finished is not None:
+                return finished
+            # The deterministic proof recognized an unsupported shape before an
+            # attempted send. Release its finite reservation and require a fresh
+            # full-price admission before giving the provider its signed handoff.
+            release_execution_admission()
+            admission["_budget_reservation_revision"] = db.pipeline_github_budget_reservations(
+                _GITHUB_SCAN_LEASE_SCOPE)["revision"]
+            admission = _reserve_execution_admission(
+                task, profile_id, profile, queue, admission, "fallback_targeted",
+                retain_budget=retain_budget, admission_priority=admission_priority, fallback_target=fallback_lease["target"])
+            if not admission.get("allowed"):
+                return _budget_defer_route(admission, profile_id, profile, queue, mode="skill",
+                                           phase="post_preflight", preflight=preflight)
 
         # Explicit operator opt-in: an already-reviewed MERGE/cleanup has no
         # content audit left for a model. The same adapter owns every fresh
