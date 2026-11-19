@@ -14,6 +14,12 @@ class TailDiscoveryConflict(PipelineError):
     """Another invocation already committed a newer checkpoint."""
 
 
+def query_fingerprint(repository, base):
+    # A protocol change invalidates both cursor resumption and reported progress.
+    query = json.dumps(["merged-tail-v2", repository, base], ensure_ascii=True)
+    return hashlib.sha256(query.encode("ascii")).hexdigest()
+
+
 def _checkpoint(row):
     checkpoint = json.loads(row["checkpoint_json"])
     checkpoint["revision"] = row["revision"]
@@ -95,12 +101,14 @@ def pass_snapshot(repository, token):
     return count, digest.hexdigest()
 
 
-def backlog(repository, limit=100, after=0):
+def backlog(repository, limit=100, after=0, *, base="main"):
     """Read a consistent bounded page; even an uninitialized store stays read-only."""
     if not 1 <= limit <= 1000 or after < 0:
         raise PipelineError("TAIL backlog requires limit 1..1000 and a nonnegative page key")
+    if not isinstance(base, str) or not base:
+        raise PipelineError("TAIL backlog requires a base branch")
     result = {
-        "repository": repository, "discovery": None, "age_seconds": None,
+        "repository": repository, "base": base, "discovery": None, "age_seconds": None,
         "counts": {}, "candidates": [], "next_after": None,
     }
     # Importing db initializes the schema. Keep inspection read-only even for
@@ -120,7 +128,28 @@ def backlog(repository, limit=100, after=0):
         ).fetchone()
         if row is None:
             return result
+        result["counts"] = dict(conn.execute(
+            "SELECT state, count(*) FROM tail_candidates WHERE repository = ? AND base = ? GROUP BY state",
+            (repository, base),
+        ))
+        rows = conn.execute(
+            """SELECT pr_number, merged_at, head, base, last_observed_at, revision,
+                      state, review_id, review_updated_at, review_body_digest, epoch_digest,
+                      completion_kind, completion_digest, next_check_at, last_reason
+               FROM tail_candidates
+               WHERE repository = ? AND base = ? AND state != 'resolved' AND pr_number > ?
+               ORDER BY pr_number LIMIT ?""",
+            (repository, base, after, limit + 1),
+        ).fetchall()
+        result["candidates"] = [dict(row) for row in rows[:limit]]
+        if len(rows) > limit:
+            result["next_after"] = rows[limit - 1]["pr_number"]
+
+        # A repository keeps one current checkpoint. Old observations survive
+        # a branch or query change; only a compatible scan can attest freshness.
         checkpoint = _checkpoint(row)
+        if checkpoint.get("fingerprint") != query_fingerprint(repository, base):
+            return result
         # The cursor, verification token and seen-node set belong to the
         # checkpoint. Backlog readers need interval bounds and progress only.
         fields = ("revision", "generation", "state", "base", "lower", "upper", "mode", "pass_number",
@@ -136,20 +165,4 @@ def backlog(repository, limit=100, after=0):
             completed = datetime.fromisoformat(completed_at.replace("Z", "+00:00"))
             elapsed = datetime.now(timezone.utc) - completed
             result["age_seconds"] = max(0, int(elapsed.total_seconds()))
-        result["counts"] = dict(conn.execute(
-            "SELECT state, count(*) FROM tail_candidates WHERE repository = ? GROUP BY state",
-            (repository,),
-        ))
-        rows = conn.execute(
-            """SELECT pr_number, merged_at, head, base, last_observed_at, revision,
-                      state, review_id, review_updated_at, review_body_digest, epoch_digest,
-                      completion_kind, completion_digest, next_check_at, last_reason
-               FROM tail_candidates
-               WHERE repository = ? AND state != 'resolved' AND pr_number > ?
-               ORDER BY pr_number LIMIT ?""",
-            (repository, after, limit + 1),
-        ).fetchall()
-        result["candidates"] = [dict(row) for row in rows[:limit]]
-        if len(rows) > limit:
-            result["next_after"] = rows[limit - 1]["pr_number"]
     return result

@@ -247,7 +247,7 @@ class GitHub:
         self.timeout_seconds = timeout_seconds
 
     def run(self, *args: str, input_value=None, allow=(0,),
-            timeout_seconds: int | None = None) -> str:
+            timeout_seconds: int | None = None, graphql_errors: bool = False) -> str:
         data = None
         if input_value is not None:
             data = json.dumps(input_value, ensure_ascii=False)
@@ -263,12 +263,23 @@ class GitHub:
             raise PipelineError(
                 f"GitHub CLI {operation} timed out after {timeout}s") from exc
         if result.returncode not in allow:
+            # gh exits 1 on a GraphQL error even when stdout holds partial
+            # data, including the authoritative rate-limit receipt.
+            if graphql_errors and result.returncode == 1:
+                try:
+                    payload = json.loads(result.stdout)
+                except json.JSONDecodeError:
+                    payload = None
+                if (isinstance(payload, dict) and isinstance(payload.get("errors"), list)
+                        and payload["errors"] and all(isinstance(e, dict) and isinstance(e.get("message"), str)
+                                                      for e in payload["errors"])):
+                    return result.stdout
             message = (result.stderr or result.stdout or f"gh exited {result.returncode}").strip()
             raise PipelineError(message)
         return result.stdout
 
-    def json(self, *args: str, input_value=None):
-        raw = self.run(*args, input_value=input_value)
+    def json(self, *args: str, input_value=None, graphql_errors: bool = False):
+        raw = self.run(*args, input_value=input_value, graphql_errors=graphql_errors)
         try:
             return json.loads(raw)
         except json.JSONDecodeError as exc:
@@ -2835,7 +2846,8 @@ def _tail_command(args, config):
 
     try:
         if args.command == "tail-backlog":
-            return backlog(config["repository"].lower(), limit=args.limit, after=args.after)
+            return backlog(config["repository"].lower(), base=config["base_branch"],
+                           limit=args.limit, after=args.after)
         gh = GitHub(timeout_seconds=config["github_timeout_seconds"])
         return discover(gh, config, args.max_pages)
     except sqlite3.Error as exc:

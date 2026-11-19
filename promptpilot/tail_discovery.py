@@ -1,8 +1,6 @@
 """Discover merged PRs without interpreting reviews or writing to GitHub."""
 
 from datetime import datetime, timedelta, timezone
-import hashlib
-import json
 from uuid import uuid4
 
 from . import tail_github, tail_store
@@ -76,20 +74,23 @@ def _split(state, items):
 
 def _accept_page(state, page):
     scanned = state["scanned"] + page.raw_count
-    if state["source_count"] is not None and state["source_count"] != page.total_count:
+    source_count = state["source_count"] if state["source_count"] is not None else page.total_count
+    # Enumeration walks towards the oldest PR from a fixed first page. New PRs
+    # can increase the live total, but they are behind the saved cursor.
+    if page.total_count < source_count or state["mode"] == "search" and page.total_count != source_count:
         raise PipelineError("TAIL source count changed during pagination")
     if page.next_cursor is not None:
-        if page.next_cursor == state["cursor"] or not page.raw_count or scanned >= page.total_count:
+        if page.next_cursor == state["cursor"] or not page.raw_count or scanned >= source_count:
             raise PipelineError("TAIL source pagination did not advance consistently")
-    elif scanned != page.total_count:
+    elif scanned != source_count:
         raise PipelineError("TAIL source pagination ended before its reported count")
     if state["mode"] == "enumerate":
-        # Validate the entire CREATED_AT-ordered connection, including PRs
-        # outside this merge-time interval. Ties need no server-side ordering.
+        # GitHub returns each backwards page in ascending creation order.
+        # Visit it newest first so adjacent pages share the same ordering.
         last = state.get("last_created_at")
         same_second = set(state.get("same_second", ()))
-        for created_at, number in page.enumerated:
-            if last is not None and created_at < last:
+        for created_at, number in reversed(page.enumerated):
+            if last is not None and created_at > last:
                 raise PipelineError("TAIL enumeration repeated or reordered a page")
             if created_at != last:
                 same_second.clear()
@@ -98,7 +99,7 @@ def _accept_page(state, page):
                 raise PipelineError("TAIL enumeration repeated a pull request")
             same_second.add(number)
         state.update(last_created_at=last, same_second=sorted(same_second))
-    state.update(scanned=scanned, source_count=page.total_count,
+    state.update(scanned=scanned, source_count=source_count,
                  matched=state["matched"] + len(page.items), cursor=page.next_cursor,
                  verify_pending=page.next_cursor is None)
 
@@ -133,9 +134,7 @@ def discover(gh, config, max_pages):
     repository, base = config["repository"].lower(), config["base_branch"]
     if not isinstance(base, str) or not base:
         raise PipelineError("TAIL discovery requires a base branch")
-    # Bump the query version if pagination, ordering, or filters change.
-    query = json.dumps(["merged-tail-v1", repository, base], ensure_ascii=True)
-    fingerprint = hashlib.sha256(query.encode("ascii")).hexdigest()
+    fingerprint = tail_store.query_fingerprint(repository, base)
     state = tail_store.load_discovery(repository)
     revision = state.pop("revision") if state else None
     if not state or state["fingerprint"] != fingerprint or state["state"] == "complete":
@@ -167,12 +166,17 @@ def discover(gh, config, max_pages):
         try:
             page = tail_github.read_page(gh, repository, state["mode"], lower, upper,
                                          state["cursor"], base=base)
-        except tail_github.SearchUnsupported:
-            state["mode"] = "enumerate"
-            _new_pass(state)
-            revision = tail_store.save_discovery(repository, revision, state)
-            continue
         except PipelineError as exc:
+            if isinstance(exc, tail_github.SourceError) and exc.receipt is not None:
+                remaining, reset_at = exc.receipt
+                state.update(budget_remaining=remaining, budget_reset_at=reset_at)
+            if isinstance(exc, tail_github.SearchUnsupported):
+                if not exc.requested:
+                    pages -= 1
+                state["mode"] = "enumerate"
+                _new_pass(state)
+                revision = tail_store.save_discovery(repository, revision, state)
+                continue
             if isinstance(exc, tail_github.InvalidCursor):
                 _new_pass(state)
             # Preserve the last committed cursor for transient transport errors.

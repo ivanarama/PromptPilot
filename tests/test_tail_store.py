@@ -71,16 +71,19 @@ def test_changed_observation_preserves_selected_review_and_completion(tail_db):
 
 def test_backlog_age_tracks_last_complete_scan(tail_db):
     interval = ["2026-01-01T00:00:00Z", "2026-01-30T00:00:00Z"]
+    fingerprint = tail_store.query_fingerprint(REPOSITORY, "main")
     revision = tail_store.save_discovery(REPOSITORY, None, {
-        "state": "incomplete", "pass_token": "internal", "same_second": [1, 2], "intervals": [interval],
+        "base": "main", "fingerprint": fingerprint, "state": "incomplete",
+        "pass_token": "internal", "same_second": [1, 2], "intervals": [interval],
     })
     backlog = tail_store.backlog(REPOSITORY)
     assert backlog["age_seconds"] is None
     assert backlog["discovery"] == {
-        "revision": 1, "state": "incomplete", "current_interval": interval, "pending_intervals": 1,
+        "base": "main", "revision": 1, "state": "incomplete", "current_interval": interval, "pending_intervals": 1,
     }
     completed = datetime.now(timezone.utc) - timedelta(days=30)
     tail_store.save_discovery(REPOSITORY, revision, {
-        "state": "incomplete", "last_error": "rate limit", "last_complete_at": completed.isoformat(),
+        "base": "main", "fingerprint": fingerprint, "state": "incomplete",
+        "last_error": "rate limit", "last_complete_at": completed.isoformat(),
     })
     assert tail_store.backlog(REPOSITORY)["age_seconds"] >= 30 * 86400
