@@ -127,8 +127,9 @@ def _apply(args, env):
         raise ValueError("MERGE checkpoint target differs from the signed ordinary election")
     reading = args.operation == "read"
     recovery = target["stage"] == RECOVERY and target["head"] == args.to
-    if not recovery and (reading or target["stage"] not in {"merge", RECOVERY}
-                         or target["head"] != args.old):
+    # Any validated MERGE stage can update its elected old HEAD if the base advances.
+    # Only recovery elected at the new HEAD can read or reconstruct that transition.
+    if not recovery and (reading or target["head"] != args.old):
         raise ValueError("operation is outside the signed MERGE phase or HEAD")
     with db._connect(immediate=not reading) as conn:
         if reading:

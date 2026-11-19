@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from promptpilot import entrypoint, fallback_handoff, pipeline_insights as pi
+from promptpilot import config, entrypoint, fallback_handoff, pipeline_insights as pi
 from promptpilot.models import TaskCreate
 from tests.test_fallback_handoff import HEAD, health
 from tests.test_merge_final_source import merge_dispatch as merge_dispatch
@@ -55,16 +55,19 @@ def new_claim(f):
     f.task = f.db.get_task(task.id)
 
 
-def start(f, monkeypatch):
+def start(f, monkeypatch, stage="merge"):
     f.profile["queues"][0]["item_blockers"] = True
-    elect(f, monkeypatch, OLD, "merge")
+    elect(f, monkeypatch, OLD, stage)
     route = dispatch(f)
     assert route["action"] == "prompt", route
     return route
 
 
-def test_saved_update_survives_new_claim_and_defers_before_provider(merge_dispatch, monkeypatch, capsys):
+@pytest.mark.parametrize("sampler_interval", [120, 0])
+def test_saved_update_survives_new_claim_and_waits_for_fresh_source(
+        merge_dispatch, monkeypatch, capsys, sampler_interval):
     f = merge_dispatch
+    monkeypatch.setattr(config, "PIPELINE_SNAPSHOT_INTERVAL", sampler_interval)
     initial = start(f, monkeypatch)
     assert run_cli(monkeypatch, capsys, f, initial, "record", marker="wrong")["state"] == "refused"
     assert run_cli(monkeypatch, capsys, f, initial, "record", old="e" * 40)["state"] == "refused"
@@ -76,14 +79,20 @@ def test_saved_update_survives_new_claim_and_defers_before_provider(merge_dispat
     source = elect(f, monkeypatch, HEAD, "integration-merge-recovery")
     source["integration_owner"]["base_sync_candidate"] = {
         "from": OLD, "to": HEAD, "base": BASE, "source": "head_parents"}
-    unavailable = dispatch(f)
-    assert unavailable["action"] == "defer" and "fresh Source" in unavailable["reason"]
-    assert f.db.pipeline_github_budget_reservations("github-default")["count"] == 0
     cached = {"repository": f.profile["repository"], "diagnostics": source,
               "cache": {"profile_hash": pi._profile_fingerprint(f.profile), "complete": True,
-                        "stale": False, "available": True},
+                        "stale": True, "available": True},
               "queues": [{"id": "merge", "membership_complete": True, "items": []}]}
     monkeypatch.setattr(pi, "read_cached", lambda *_: cached)
+    unavailable = dispatch(f)
+    if sampler_interval:
+        assert unavailable["action"] == "defer" and "fresh Source" in unavailable["reason"]
+        assert f.db.pipeline_github_budget_reservations("github-default")["count"] == 0
+    else:
+        assert unavailable["action"] == "prompt" and '"merge_checkpoint"' not in unavailable["prompt"]
+        assert f.db.pipeline_github_budget_reservations("github-default")["count"] == 1
+        new_claim(f)
+    cached["cache"]["stale"] = False
     recovery = dispatch(f)
     assert recovery["action"] == "prompt" and '"merge_checkpoint"' in recovery["prompt"]
     assert run_cli(monkeypatch, capsys, f, recovery, "read") == dict(saved, state="found")
@@ -93,6 +102,22 @@ def test_saved_update_survives_new_claim_and_defers_before_provider(merge_dispat
     source["integration_owner"]["base_sync_candidate"]["base"] = "e" * 40
     changed = dispatch(f)
     assert changed["action"] == "prompt" and '"merge_checkpoint"' not in changed["prompt"]
+
+
+@pytest.mark.parametrize("stage", ["integration-merge-ready", "legacy-integration-merge-ready"])
+def test_another_base_update_after_integration_review(merge_dispatch, monkeypatch, capsys, stage):
+    f = merge_dispatch
+    initial = start(f, monkeypatch, stage)
+    assert run_cli(monkeypatch, capsys, f, initial, "read", head=OLD)["state"] == "refused"
+    assert run_cli(monkeypatch, capsys, f, initial, "record", old="e" * 40)["state"] == "refused"
+    saved = run_cli(monkeypatch, capsys, f, initial, "record")
+    assert saved["state"] == "recorded"
+    new_claim(f)
+    elect(f, monkeypatch, HEAD, "integration-merge-recovery")
+    monkeypatch.setattr(config, "PIPELINE_SNAPSHOT_INTERVAL", 0)
+    recovery = dispatch(f)
+    assert recovery["action"] == "prompt"
+    assert run_cli(monkeypatch, capsys, f, recovery, "read") == dict(saved, state="found")
 
 
 def test_crash_after_push_before_local_record_can_reconstruct_from_fresh_claim(
