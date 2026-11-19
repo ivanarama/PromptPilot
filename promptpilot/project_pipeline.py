@@ -2868,6 +2868,8 @@ def run(argv=None) -> int:
     tail_backlog.add_argument("--json", action="store_true", help="emit JSON (the default)")
     tail_backlog.add_argument("--limit", type=int, default=100)
     tail_backlog.add_argument("--after", type=int, default=0, help="last PR number from the previous page")
+    from . import merge_checkpoint
+    merge_checkpoint.add_arguments(sub.add_parser("merge-checkpoint"))
     source_refresh_parser = sub.add_parser("source-refresh")
     source_refresh_parser.add_argument("--profile", required=True)
     source_refresh_parser.add_argument("--final", action="store_true")
@@ -2909,6 +2911,8 @@ def run(argv=None) -> int:
     complete_lease.add_argument("--lease-file")
     complete_parser.add_argument("--report")
     args = parser.parse_args(argv)
+    if args.command == "merge-checkpoint":
+        return merge_checkpoint.execute(args)
     if args.command in ("source-refresh", "budget-refresh"):
         from .pipeline_source_refresh import run as source_refresh_run
 
