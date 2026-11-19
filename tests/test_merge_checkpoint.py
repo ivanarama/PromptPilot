@@ -145,3 +145,56 @@ def test_crash_after_push_before_local_record_can_reconstruct_from_fresh_claim(
     assert run_cli(monkeypatch, capsys, f, route, "read", head="e" * 40)["state"] == "refused"
     f.db.set_setting(f"cancel_task:{f.task.id}", "1")
     assert run_cli(monkeypatch, capsys, f, route, "read")["state"] == "refused"
+
+@pytest.mark.parametrize("sampler_won", [False, True])
+def test_retry_refreshes_expiring_snapshot_before_signed_next(
+        merge_dispatch, monkeypatch, capsys, sampler_won):
+    from tests.source_cost_fixtures import checker_receipt
+
+    f = merge_dispatch
+    monkeypatch.setattr(config, "PIPELINE_SNAPSHOT_INTERVAL", 120)
+    f.profile["github_budget"]["refresh_ahead_seconds"] = 150
+    initial = start(f, monkeypatch)
+    assert run_cli(monkeypatch, capsys, f, initial, "record")["state"] == "recorded"
+    new_claim(f)
+    source = elect(f, monkeypatch, HEAD, "integration-merge-recovery")
+    source["integration_owner"]["base_sync_candidate"] = {
+        "from": OLD, "to": HEAD, "base": BASE, "source": "head_parents"}
+    cached = {"repository": f.profile["repository"], "diagnostics": source,
+              "cache": {"profile_hash": pi._profile_fingerprint(f.profile), "complete": True,
+                        "stale": True, "available": True, "age_seconds": 298, "ttl_seconds": 300},
+              "queues": [{"id": "merge", "membership_complete": True, "items": []}]}
+    monkeypatch.setattr(pi, "read_cached", lambda *_: cached)
+    assert dispatch(f)["action"] == "defer"
+    assert f.db.pipeline_github_budget_reservations("github-default")["count"] == 0
+    # Native reuses the pending occurrence but claims it with a new start time.
+    old_start = f.task.started_at
+    assert f.db.defer_task(f.task.id, old_start, expected_started_at=old_start)
+    reclaim = f.db.get_next_runnable()
+    assert reclaim.id == f.task.id and reclaim.started_at != old_start
+    f.task = reclaim
+    cached["cache"]["stale"] = False
+    calls = []
+    monkeypatch.setattr(pi, "_run_profile_health_check", lambda *_: calls.append("scan") or checker_receipt(source))
+    original_analyze = pi.analyze
+    def analyze(*args, **kwargs):
+        # Source preparation may race the sampler, but must never hold next's lease.
+        assert getattr(pi._scan_lease_context, "lease", None) is None
+        if sampler_won:
+            cached["cache"]["age_seconds"] = 2
+        latest = original_analyze(*args, **kwargs)
+        assert not latest["cache"].get("refresh_blocked"), latest["cache"]
+        cached["cache"].update(latest["cache"])
+        return latest
+    monkeypatch.setattr(pi, "analyze", analyze)
+    preflight = pi._tool_preflight
+    def delayed_next(*args, **kwargs):
+        calls.append("next")
+        cached["cache"]["age_seconds"] += 55
+        cached["cache"]["stale"] = cached["cache"]["age_seconds"] >= 300
+        return preflight(*args, **kwargs)
+    monkeypatch.setattr(pi, "_tool_preflight", delayed_next)
+
+    route = dispatch(f)
+    assert calls == (["next"] if sampler_won else ["scan", "next"])
+    assert route["action"] == "prompt" and '"merge_checkpoint"' in route["prompt"]

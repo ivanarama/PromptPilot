@@ -8,6 +8,7 @@ import json
 import os
 import re
 import sqlite3
+import time
 from pathlib import Path
 
 from . import fallback_handoff, project_pipeline as pp
@@ -72,6 +73,119 @@ def agrees_with_source(data, lease, checkpoint):
     return (data.get("repository") == checkpoint["repository"]
             and isinstance(candidate, dict) and candidate.get("source") == "head_parents"
             and all(candidate.get(k) == checkpoint[k] for k in ("from", "base", "to")))
+
+
+def _wait_key(task):
+    # One bounded observation per ordinary series, never a cross-task gate.
+    return f"pipeline_merge_source_wait:v1:{task.series_id}"
+
+
+def remember_source_wait(task, profile_hash, checkpoint, *, busy_until=None):
+    from . import db
+    from .task_identity import task_execution_fingerprint
+
+    if not getattr(task, "series_id", None) or not getattr(task, "started_at", None):
+        return
+    marker = {"task": task.id, "execution": task_execution_fingerprint(task),
+              "profile_hash": profile_hash, "checkpoint": checkpoint, "busy_until": busy_until}
+    with db._connect(immediate=True) as conn:
+        conn.execute("""INSERT OR REPLACE INTO settings (key,value)
+                        SELECT ?,? FROM tasks WHERE id=? AND series_id=?
+                        AND status='running' AND started_at=?""",
+                     (_wait_key(task), json.dumps(marker), task.id, task.series_id,
+                      task.started_at.isoformat()))
+
+
+def _live_claim(task):
+    from . import db
+
+    with db._connect() as conn:
+        return conn.execute("""SELECT 1 FROM tasks t JOIN task_series s ON s.id=t.series_id
+            WHERE t.id=? AND s.id=? AND t.status='running' AND t.started_at=?
+              AND s.paused=0 AND s.ended_at IS NULL AND NOT EXISTS (
+                SELECT 1 FROM settings WHERE key IN ('worker_paused',?) AND value='1')""",
+            (task.id, task.series_id, task.started_at.isoformat(), f"cancel_task:{task.id}")).fetchone() is not None
+
+
+def _take_source_wait(task, profile_id, profile_hash):
+    from . import db
+    from .task_identity import task_execution_fingerprint
+
+    if not getattr(task, "series_id", None) or not getattr(task, "started_at", None):
+        return None
+    key = _wait_key(task)
+    raw = db.get_setting(key)
+    if not raw:
+        return None
+    try:
+        marker = json.loads(raw)
+        if (marker["task"] != task.id or marker["profile_hash"] != profile_hash
+                or marker["execution"] != task_execution_fingerprint(task)):
+            return None
+        hint = marker["checkpoint"]
+        with db._connect(immediate=True) as conn:
+            # Consume this exact marker before use. Only a contended Source scan
+            # can put it back, with the same bounded deadline.
+            taken = conn.execute("""DELETE FROM settings WHERE key=? AND value=? AND EXISTS (
+                SELECT 1 FROM tasks WHERE id=? AND status='running' AND started_at=?)""",
+                (key, raw, task.id, task.started_at.isoformat())).rowcount
+            if taken and hint == _load(conn, profile_id, hint, hint["number"], hint["to"]):
+                return marker
+    except (KeyError, TypeError, ValueError):
+        return None
+    return None
+
+
+def prepare_source(task, profile_id, profile):
+    """Prepare the next signed election outside its account-wide preflight lease."""
+    from . import db, pipeline_insights as pi
+    from .pipeline_sampling import refresh_ahead_seconds
+
+    fingerprint = pi._profile_fingerprint(profile)
+    marker = _take_source_wait(task, profile_id, fingerprint)
+    if marker is None:
+        return None
+    checkpoint = marker["checkpoint"]
+    busy_until = marker.get("busy_until")
+    if checkpoint["repository"] != profile.get("repository"):
+        return None
+    if busy_until is not None and (type(busy_until) not in (int, float) or busy_until <= time.time()):
+        return None
+    if not _live_claim(task):
+        return pi._required_snapshot_defer(profile_id, "merge", "MERGE task is no longer active")
+    series = db.list_series()
+    current = pi.read_cached(profile_id, series)
+    target = {"stage": RECOVERY, "number": checkpoint["number"], "head": checkpoint["to"]}
+    lead = refresh_ahead_seconds(profile)
+    state = pi._required_snapshot_state(current, profile, "merge")
+    if state is None and (not agrees_with_source(current, {"target": target}, checkpoint)
+                          or pi._snapshot_has_remaining_ttl(current, lead)):
+        return None
+    # An unavailable/moving scanner yields its real admission deadline; no
+    # provider, final-Source credit, or second lease is held during this scan.
+    try:
+        data = pi.analyze(profile_id, series, use_cache=False, refresh_diagnostics=True,
+                          reuse_fresh=True, snapshot_queue_id="merge", minimum_remaining_seconds=lead)
+        state = pi._required_snapshot_state(data, profile, "merge")
+    except (KeyError, OSError, ValueError, RuntimeError, sqlite3.Error):
+        return pi._required_snapshot_defer(profile_id, "merge", "MERGE Source preparation unavailable")
+    if not _live_claim(task) or pi._profile_fingerprint(pi._profiles().get(profile_id) or {}) != fingerprint:
+        return pi._required_snapshot_defer(profile_id, "merge", "MERGE task or profile changed")
+    if state is None:
+        return None  # signed next owns the target choice, including a new HEAD or an empty queue
+    cache = data.get("cache") or {}
+    blocked = cache.get("refresh_blocked")
+    if blocked == "scan_in_progress":
+        # The sampler owns the shared scan lease. Let other work use the slot
+        # and keep preparing this same election across short, genuine collisions.
+        limit = busy_until if busy_until is not None else time.time() + pi._CACHE_TTL_SECONDS
+        remember_source_wait(task, fingerprint, checkpoint, busy_until=limit)
+    if blocked and cache.get("refresh_deferred_until"):
+        refusal = dict(data.get("github_budget") or {}, state=blocked, allowed=False,
+                       reason=cache.get("refresh_blocked_reason") or state,
+                       defer_until=cache["refresh_deferred_until"])
+        return pi._budget_defer_route(refusal, profile_id, profile, {"id": "merge"})
+    return pi._required_snapshot_defer(profile_id, "merge", state)
 
 
 def bind_election(task, token):

@@ -2653,6 +2653,16 @@ def _required_snapshot_defer(profile_id: str, queue_id: str, state: str) -> dict
             "snapshot_admission": {"state": state}}
 
 
+def _snapshot_has_remaining_ttl(data, minimum_remaining_seconds):
+    if not minimum_remaining_seconds:
+        return True
+    cache = data.get("cache") or {}
+    age, ttl = cache.get("age_seconds"), cache.get("ttl_seconds")
+    return (type(age) in (float, int) and math.isfinite(age) and age >= 0
+            and type(ttl) in (float, int) and math.isfinite(ttl)
+            and ttl - age > minimum_remaining_seconds)
+
+
 def _required_snapshot_state(data, profile: dict, queue_id: str | None) -> str | None:
     cache = data.get("cache") if isinstance(data, dict) else None
     if not isinstance(cache, dict):
@@ -3771,6 +3781,14 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
     command = _tool_command(execution, stage)
     if typed_queue and (stage not in {"review", "fix"} or not command or command[-2:] != ["next", stage]):
         return {"action": "block", "mode": "tool", "reason": "typed routing requires its exact next stage command"}
+    if (stage == "merge" and queue.get("id") == "merge" and mode == "auto"
+            and queue.get("item_blockers") is True and not owned_preflight and not progress_releases):
+        from . import merge_checkpoint
+        from .config import PIPELINE_SNAPSHOT_INTERVAL
+        if PIPELINE_SNAPSHOT_INTERVAL:
+            waiting = merge_checkpoint.prepare_source(task, profile_id, profile)
+            if waiting is not None:
+                return waiting
     with _github_scan_admission(
             profile, f"pipeline preflight {profile_id}/{stage}",
             profile_id=profile_id, budget_route="tool_preflight",
@@ -4162,6 +4180,7 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                     # A verified hold transition has already consumed its single occurrence.
                     # Preserve its normal provider-assisted Source retry instead of stranding the hold.
                     if state is not None and PIPELINE_SNAPSHOT_INTERVAL and not progress_releases:
+                        merge_checkpoint.remember_source_wait(task, _profile_fingerprint(profile), merge_checkpoint_hint)
                         waiting = _required_snapshot_defer(profile_id, queue["id"], state)
                         retry = datetime.now(timezone.utc) + timedelta(seconds=max(30, PIPELINE_SNAPSHOT_INTERVAL))
                         until = _parse_time((current.get("cache") or {}).get("refresh_deferred_until"))
@@ -5506,7 +5525,7 @@ def _analyze_without_budget(profile_id: str, series: list[dict], *,
                             use_cache: bool = True,
                             refresh_diagnostics: bool = False,
                             reuse_fresh: bool = False,
-                            snapshot_queue_id: str | None = None) -> dict:
+                            snapshot_queue_id: str | None = None, minimum_remaining_seconds: int = 0) -> dict:
     profiles = _profiles()
     if profile_id not in profiles:
         raise KeyError(profile_id)
@@ -5529,7 +5548,8 @@ def _analyze_without_budget(profile_id: str, series: list[dict], *,
             # A due task may have observed the old cache before another scan
             # won this lock. Reuse its complete publication, not another scan.
             fresh = read_cached(profile_id, series)
-            if _required_snapshot_state(fresh, profile, snapshot_queue_id) is None:
+            if (_required_snapshot_state(fresh, profile, snapshot_queue_id) is None
+                    and _snapshot_has_remaining_ttl(fresh, minimum_remaining_seconds)):
                 return fresh
         cached, _source, cache_epoch = _cached_entry(profile_id, profile)
         _unused, cache_generation = _cache_snapshot(profile_id)
@@ -5858,7 +5878,7 @@ def _analyze_without_budget(profile_id: str, series: list[dict], *,
 
 def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True,
             refresh_diagnostics: bool = False, reuse_fresh: bool = False,
-            snapshot_queue_id: str | None = None) -> dict:
+            snapshot_queue_id: str | None = None, minimum_remaining_seconds: int = 0) -> dict:
     """Read cached insights or run one budgeted, cross-process live scan."""
     if use_cache:
         return read_cached(profile_id, series)
@@ -5878,7 +5898,8 @@ def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True,
             result = _analyze_without_budget(
                 profile_id, series, use_cache=False,
                 refresh_diagnostics=refresh_diagnostics,
-                **({"reuse_fresh": True, "snapshot_queue_id": snapshot_queue_id} if reuse_fresh else {}))
+                **({"reuse_fresh": True, "snapshot_queue_id": snapshot_queue_id} if reuse_fresh else {}),
+                **({"minimum_remaining_seconds": minimum_remaining_seconds} if minimum_remaining_seconds else {}))
             _ensure_github_scan_lease(renew=True)
         except _GitHubScanLeaseFailure as exc:
             return _budget_blocked_cached(
