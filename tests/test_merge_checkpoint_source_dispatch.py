@@ -1,9 +1,10 @@
 """A pending confirmation can request Source; the next signed election still chooses the PR."""
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 
-from promptpilot import config, fallback_handoff, pipeline_insights as pi
+from promptpilot import config, fallback_handoff, merge_checkpoint, pipeline_insights as pi
 from tests.source_cost_fixtures import observed_rates
 from tests.test_fallback_handoff import HEAD, health
 from tests.test_github_budget import _limits
@@ -80,6 +81,44 @@ def test_budget_denial_before_recovery_election_starts_no_provider(waiting, monk
     route = dispatch(f)
     assert refreshes == ["merge"]
     assert route["action"] == "defer"
+    assert route["defer_policy"] == "hard_not_before"
     assert datetime.fromisoformat(route["defer_until"]).timestamp() >= reset
     assert not f.checks and not f.searches
     assert f.db.pipeline_github_budget_reservations("github-default")["count"] == 0
+
+
+@pytest.mark.parametrize("expired", [False, True])
+def test_contended_scan_keeps_recovery_preparation_for_one_ttl(waiting, monkeypatch, expired):
+    f, snapshot = waiting
+    now = merge_checkpoint.time.time()
+    monkeypatch.setattr(merge_checkpoint, "time", SimpleNamespace(time=lambda: now))
+    assert f.db.acquire_pipeline_scan_lease("github-default", "sampler", 120)["acquired"]
+    preflight = pi._tool_preflight
+    calls = []
+
+    def next_merge(*args, **kwargs):
+        calls.append("next")
+        return preflight(*args, **kwargs)
+
+    monkeypatch.setattr(pi, "_tool_preflight", next_merge)
+    for elapsed in (0, 250):
+        monkeypatch.setattr(merge_checkpoint.time, "time", lambda: now + elapsed)
+        wait = dispatch(f)
+        assert wait["action"] == "defer" and wait["defer_policy"] == "retry"
+        assert wait["github_budget"]["state"] == "scan_in_progress"
+        assert f.db.pipeline_github_budget_reservations("github-default")["count"] == 0
+    assert calls == []
+    assert f.db.release_pipeline_scan_lease("github-default", "sampler")
+
+    snapshot["cache"].pop("refresh_blocked")
+    monkeypatch.setattr(merge_checkpoint.time, "time", lambda: now + (301 if expired else 251))
+
+    def refresh(*args, **kwargs):
+        calls.append("source")
+        snapshot["cache"]["age_seconds"] = 0
+        return snapshot
+
+    monkeypatch.setattr(pi, "analyze", refresh)
+    route = dispatch(f)
+    assert calls == (["next"] if expired else ["source", "next"])
+    assert route["action"] == "prompt" and '"merge_checkpoint"' in route["prompt"]
