@@ -237,6 +237,7 @@ def test_confirm_and_recover_existing_done(replay):
     second = replay.run()
     assert (first["done"], second["done"]) == (888, 888)
     assert first["published"] and not second["published"]
+    assert first["body_sha256"] == second["body_sha256"] == hashlib.sha256(DONE.encode()).hexdigest()
     assert replay.posts == [{"body": DONE}] and len(replay.gates) == 1
 
 
@@ -250,6 +251,7 @@ def test_confirm_and_recover_existing_done(replay):
         lambda g: setattr(g, "ci_error", True),
         lambda g: g.comment(165, INTENT),
         lambda g: g.add("UnlabeledEvent", "stop", label={"name": "ship"}, actor={"login": ACCOUNT}),
+        lambda g: g.add("PullRequestCommit", "duplicate", commit={"oid": OLD}),
         lambda g: g.edges[1]["node"].pop("lastEditedAt"),
         lambda g: g.comment(1010, DONE.replace("previous=none", "previous=404")),
     ],

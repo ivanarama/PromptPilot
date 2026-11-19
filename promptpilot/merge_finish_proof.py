@@ -184,6 +184,15 @@ def _history(gh, config, checkpoint):
     nodes = [edge["node"] for edge in snap["edges"]]
     comments = [node for node in nodes if node["__typename"] == "IssueComment"]
     _need(
+        sum(
+            node.get("commit", {}).get("oid") == old
+            for node in nodes
+            if node["__typename"] == "PullRequestCommit"
+        )
+        == 1,
+        "reviewed source has no unique server commit anchor",
+    )
+    _need(
         len({n["id"] for n in nodes}) == len(nodes)
         and len({e["cursor"] for e in snap["edges"]}) == len(nodes)
         and len({pp.comment_id(n) for n in comments}) == len(comments)
@@ -399,5 +408,6 @@ def confirm(gh, config, checkpoint, *, working_dir, prepare_source, gate, claim_
         "head": head,
         "intent": intent,
         "done": pp.comment_id(done),
+        "body_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
         "published": published,
     }
