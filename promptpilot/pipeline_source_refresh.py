@@ -69,7 +69,9 @@ def _budget_observation_flags():
             "scope": "Native-budget-observation-only"}
 
 
-def refresh(profile_id, environ=None, *, budget_only=False):
+def refresh(profile_id, environ=None, *, budget_only=False, final=False):
+    if final and budget_only:
+        raise ValueError("final Source credit cannot fund a budget observation")
     env = os.environ if environ is None else environ
     raw_id = env.get("PP_TASK_ID", "")
     if (not isinstance(raw_id, str) or not raw_id.isascii() or not raw_id.isdecimal()
@@ -109,7 +111,7 @@ def refresh(profile_id, environ=None, *, budget_only=False):
         with pi._github_scan_admission(profiles[profile_id],
                 f"Native source continuation {profile_id}/{matched[2]['id']}",
                 profile_id=profile_id, budget_route="insights", task=task,
-                publish_refresh_status=not budget_only) as admission:
+                publish_refresh_status=not budget_only, final_source=final) as admission:
             if not admission.get("allowed"):
                 result = {"state": "wait", "source_refreshed": False,
                         "admitted_route": continuation.guard["route"],
@@ -196,9 +198,12 @@ def run(argv=None, *, budget_only=False):
     command = "budget-refresh" if budget_only else "source-refresh"
     parser = argparse.ArgumentParser(prog="pipelinectl " + command, description=__doc__)
     parser.add_argument("--profile", required=True)
+    if not budget_only:
+        parser.add_argument("--final", action="store_true",
+                            help="use the MERGE attempt's reserved final Source check, if available")
     args = parser.parse_args(argv)
     try:
-        result = refresh(args.profile, budget_only=budget_only)
+        result = refresh(args.profile, budget_only=budget_only, final=getattr(args, "final", False))
     except (OSError, sqlite3.Error, KeyError, TypeError, ValueError, RuntimeError) as exc:
         result = {"state": "refused", "source_refreshed": False, "reason": str(exc),
                   "mutable_admission_granted": False}

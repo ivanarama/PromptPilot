@@ -4095,6 +4095,15 @@ def _pipeline_budget_vector(value, name: str) -> dict:
     return result
 
 
+def _pipeline_final_source_cost(value, queue_id, route, combined_cost):
+    credit = _pipeline_budget_vector(value, "final Source cost")
+    if (queue_id != "merge" or route not in ("skill", "fallback_targeted")
+            or not any(credit.values())
+            or any(amount > combined_cost[resource] for resource, amount in credit.items())):
+        raise ValueError("invalid final Source credit for execution reservation")
+    return credit
+
+
 def _load_pipeline_budget_reservations(conn, key: str) -> list[dict]:
     row = conn.execute(
         "SELECT value FROM settings WHERE key = ?", (key,)
@@ -4135,13 +4144,17 @@ def _load_pipeline_budget_reservations(conn, key: str) -> list[dict]:
                 raise ValueError("duplicate reservation ledger item")
             seen_tokens.add(token)
             seen_attempts.add(attempt)
-            result.append({
+            reservation = {
                 "token": token, "task_id": task_id,
                 "task_started_at": started_at,
                 "profile_id": item["profile_id"],
                 "queue_id": item["queue_id"], "route": item["route"],
                 "cost": cost, "created_at": float(item["created_at"]),
-            })
+            }
+            if "final_source_cost" in item:
+                reservation["final_source_cost"] = _pipeline_final_source_cost(
+                    item["final_source_cost"], item["queue_id"], item["route"], cost)
+            result.append(reservation)
         return result
     except (KeyError, OverflowError, TypeError, ValueError,
             json.JSONDecodeError) as exc:
@@ -4224,8 +4237,12 @@ def _pipeline_source_refresh_state(conn, scope, task_id, profile_id, queue_id, r
     own = [r for r in values if r["task_id"] == task_id]
     if (len(own) != 1 or own[0]["task_started_at"] != row["started_at"]
             or own[0]["profile_id"] != profile_id or own[0]["queue_id"] != queue_id
-            or own[0]["route"] not in costs
-            or own[0]["cost"] != costs[own[0]["route"]]):
+            or own[0]["route"] not in costs):
+        raise ValueError("source refresh requires its exact existing execution reservation")
+    credit = own[0].get("final_source_cost")
+    base_cost = costs[own[0]["route"]]
+    if any(own[0]["cost"][r] != base_cost[r] + (credit[r] if credit else 0)
+           for r in base_cost):
         raise ValueError("source refresh requires its exact existing execution reservation")
     active, _changed = _active_pipeline_budget_reservations(conn, values)
     guard = {"scope": scope, "task_id": task_id, "started_at": row["started_at"],
@@ -4233,13 +4250,13 @@ def _pipeline_source_refresh_state(conn, scope, task_id, profile_id, queue_id, r
              "series_id": row["series_id"],
              "priority": row["priority"], "profile_id": profile_id, "queue_id": queue_id,
              "execution_sha256": task_execution_fingerprint(row),
-             "route": own[0]["route"], "cost": dict(own[0]["cost"]),
+             "route": own[0]["route"], "cost": dict(base_cost),
              "route_costs": costs, "token": own[0]["token"]}
     waiting = _pipeline_github_budget_waiter_summary(conn, scope,
         starvation_timeout_seconds=starvation_timeout_seconds, now=now)
     return {"guard": guard, "totals": {r: sum(v["cost"][r] for v in active)
                                         for r in _PIPELINE_GITHUB_BUDGET_RESOURCES},
-            "count": len(active), "items": active,
+            "count": len(active), "items": active, "final_source_cost": credit,
             "revision": _pipeline_github_budget_revision(conn, scope),
             "woken_waiters": {"count": 0, "min_priority": None}, "waiting_waiters": waiting}
 
@@ -4259,6 +4276,31 @@ def _pipeline_source_refresh_guard_matches(conn, guard):
             guard["profile_id"], guard["queue_id"], guard["route_costs"])
         return observed["guard"] == guard
     except (KeyError, TypeError, ValueError, OverflowError):
+        return False
+
+
+def spend_pipeline_final_source_credit(guard, scan_lease_guard, expected_revision, expected_cost) -> bool:
+    """Spend one MERGE Source credit while the bound scan holds the account lease."""
+    if (not isinstance(guard, dict) or not isinstance(scan_lease_guard, dict)
+            or not guard.get("scope") or scan_lease_guard.get("continuation") != guard
+            or scan_lease_guard.get("scope") != guard["scope"]
+            or type(expected_revision) is not int or expected_revision < 0):
+        return False
+    credit = _pipeline_budget_vector(expected_cost, "expected final Source cost")
+    scope = guard["scope"]
+    with _connect(immediate=True) as conn:
+        if (not _pipeline_scan_lease_guard_matches(conn, scan_lease_guard)
+                or _pipeline_github_budget_revision(conn, scope) != expected_revision):
+            return False
+        key = _pipeline_github_budget_reservation_key(scope)
+        values = _load_pipeline_budget_reservations(conn, key)
+        for item in values:
+            if item["token"] == guard["token"] and item.get("final_source_cost") == credit:
+                item["cost"] = dict(guard["cost"])
+                del item["final_source_cost"]
+                _write_pipeline_budget_reservations(conn, key, values)
+                _advance_pipeline_github_budget_revision(conn, scope)
+                return True
         return False
 
 
@@ -4578,7 +4620,8 @@ def reserve_pipeline_github_budget(
         starvation_timeout_seconds: int = 0,
         now: Optional[float] = None,
         scan_lease_guard: Optional[dict] = None,
-        expected_revision: Optional[int] = None) -> dict:
+        expected_revision: Optional[int] = None,
+        final_source_cost: Optional[dict] = None) -> dict:
     """Atomically reserve quota for one exact running task attempt."""
     key = _pipeline_github_budget_reservation_key(scope)
     if not _valid_pipeline_scan_token(token):
@@ -4598,6 +4641,8 @@ def reserve_pipeline_github_budget(
         raise ValueError(
             "expected pipeline budget revision must be a non-negative integer")
     requested = _pipeline_budget_vector(cost, "cost")
+    if final_source_cost is not None:
+        final_source_cost = _pipeline_final_source_cost(final_source_cost, queue_id, route, requested)
     floor = _pipeline_budget_vector(minimum_remaining, "minimum_remaining")
     starvation_timeout_seconds = _pipeline_budget_starvation_timeout(
         starvation_timeout_seconds)
@@ -4664,7 +4709,9 @@ def reserve_pipeline_github_budget(
             item = own[0]
             if (item["task_id"] != task_id
                     or item["task_started_at"] != task_started_at
-                    or item["cost"] != requested or item["route"] != route):
+                    or item["cost"] != requested or item["route"] != route
+                    or item["queue_id"] != queue_id or item["profile_id"] != profile_id
+                    or item.get("final_source_cost") != final_source_cost):
                 raise ValueError("pipeline budget token was reused inconsistently")
             conn.execute(
                 """UPDATE tasks
@@ -4800,12 +4847,15 @@ def reserve_pipeline_github_budget(
                     "effective_after": after, "active_reservations": len(active),
                     "revision": revision}
 
-        active.append({
+        reservation = {
             "token": token, "task_id": task_id,
             "task_started_at": task_started_at, "profile_id": profile_id,
             "queue_id": queue_id, "route": route, "cost": requested,
             "created_at": created_at,
-        })
+        }
+        if final_source_cost is not None:
+            reservation["final_source_cost"] = final_source_cost
+        active.append(reservation)
         _write_pipeline_budget_reservations(conn, key, active)
         revision = _advance_pipeline_github_budget_revision(conn, scope)
         conn.execute(
