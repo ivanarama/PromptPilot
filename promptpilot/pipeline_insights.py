@@ -2653,6 +2653,16 @@ def _required_snapshot_defer(profile_id: str, queue_id: str, state: str) -> dict
             "snapshot_admission": {"state": state}}
 
 
+def _snapshot_has_remaining_ttl(data, minimum_remaining_seconds):
+    if not minimum_remaining_seconds:
+        return True
+    cache = data.get("cache") or {}
+    age, ttl = cache.get("age_seconds"), cache.get("ttl_seconds")
+    return (type(age) in (float, int) and math.isfinite(age) and age >= 0
+            and type(ttl) in (float, int) and math.isfinite(ttl)
+            and ttl - age > minimum_remaining_seconds)
+
+
 def _required_snapshot_state(data, profile: dict, queue_id: str | None) -> str | None:
     cache = data.get("cache") if isinstance(data, dict) else None
     if not isinstance(cache, dict):
@@ -3771,6 +3781,14 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
     command = _tool_command(execution, stage)
     if typed_queue and (stage not in {"review", "fix"} or not command or command[-2:] != ["next", stage]):
         return {"action": "block", "mode": "tool", "reason": "typed routing requires its exact next stage command"}
+    if (stage == "merge" and queue.get("id") == "merge" and mode == "auto"
+            and queue.get("item_blockers") is True and not owned_preflight and not progress_releases):
+        from . import merge_checkpoint
+        from .config import PIPELINE_SNAPSHOT_INTERVAL
+        if PIPELINE_SNAPSHOT_INTERVAL:
+            waiting = merge_checkpoint.prepare_source(task, profile_id, profile)
+            if waiting is not None:
+                return waiting
     with _github_scan_admission(
             profile, f"pipeline preflight {profile_id}/{stage}",
             profile_id=profile_id, budget_route="tool_preflight",
@@ -4062,6 +4080,7 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
         target_reservation = None
         validated_target_stage = None
         fallback_lease = None
+        merge_checkpoint_hint = None
         if owned_preflight and preflight_action in {"audit", "fallback", "recover"}:
             try:
                 from . import project_pipeline
@@ -4117,7 +4136,8 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                     "preflight": preflight,
                 }
         if (preflight_action == "fallback" and "handoff" in preflight
-                and target_reservation is not None):
+                and (target_reservation is not None or (stage == "merge" and mode == "auto"
+                     and queue.get("item_blockers") is True))):
             from .project_pipeline import PipelineError
 
             try:
@@ -4146,6 +4166,29 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                 }
             validated_target_stage = str(
                 (fallback_lease.get("target") or {}).get("stage") or "").lower()
+            if (target_reservation is None and validated_target_stage == "integration-merge-recovery"
+                    and fallback_lease["repository"] == profile.get("repository")):
+                from . import merge_checkpoint
+                from .config import PIPELINE_SNAPSHOT_INTERVAL
+
+                merge_checkpoint_hint = merge_checkpoint.recovery_hint(profile_id, fallback_lease)
+                if merge_checkpoint_hint is not None:
+                    # Re-read after next. Its signed election and this cached observation
+                    # must independently point at the completed branch update.
+                    current = read_cached(profile_id, db.list_series())
+                    state = _required_snapshot_state(current, profile, queue["id"])
+                    # A verified hold transition has already consumed its single occurrence.
+                    # Preserve its normal provider-assisted Source retry instead of stranding the hold.
+                    if state is not None and PIPELINE_SNAPSHOT_INTERVAL and not progress_releases:
+                        merge_checkpoint.remember_source_wait(task, _profile_fingerprint(profile), merge_checkpoint_hint)
+                        waiting = _required_snapshot_defer(profile_id, queue["id"], state)
+                        retry = datetime.now(timezone.utc) + timedelta(seconds=max(30, PIPELINE_SNAPSHOT_INTERVAL))
+                        until = _parse_time((current.get("cache") or {}).get("refresh_deferred_until"))
+                        waiting["defer_until"] = max(until or retry, retry).isoformat()
+                        waiting["reason"] = "MERGE post-update confirmation awaits fresh Source: " + state
+                        return waiting
+                    if state or not merge_checkpoint.agrees_with_source(current, fallback_lease, merge_checkpoint_hint):
+                        merge_checkpoint_hint = None
         provider_route = None
         if preflight_action == "fallback" and mode == "auto":
             provider_route = ("fallback_targeted" if "handoff" in preflight
@@ -4306,6 +4349,9 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                     target = fallback_lease["target"]
                     register_target(task, target["number"], target["head"], "merge",
                                     config_sha256=fallback_lease["config_sha256"])
+                    if target_reservation is None:
+                        from .merge_checkpoint import bind_election
+                        bind_election(task, preflight["handoff"]["lease"])
                 gate_command = [*command[:-2], "gate-fallback", stage,
                                 *_lease_argument(task, preflight["handoff"]["lease"], "gate")]
                 envelope = {"protocol": "promptpilot-fallback-target-v1",
@@ -4321,6 +4367,18 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                         "Не оставляй разрешённую передачу незавершённой ради одной "
                         "диагностики. Отказ scheduling gate не разрешает никаких мутаций. "
                         "Повторное ship не заменяет обязательный source proof.\n\n"
+                    )
+                if merge_checkpoint_hint is not None:
+                    envelope["merge_checkpoint"] = merge_checkpoint_hint
+                    pre_review_guard = (
+                        "This signed recovery claim is for post-update confirmation only. "
+                        "The local checkpoint records an observed branch update. Reconcile its "
+                        "trusted intent, exact live PR, parents, tree and existing done against "
+                        "the canonical MERGE procedure. Resume at post-update proof and confirm "
+                        "or publish done once using all required Source and publication gates. "
+                        "Do not reconstruct or repeat the branch write, rerun the pre-update "
+                        "build, or issue another intent. If proof differs, stop for canonical "
+                        "reconciliation. The checkpoint itself authorizes no mutation.\n\n"
                     )
                 if fallback_lease["target"]["stage"] == "pre-review-validation":
                     pre_review_guard = (
@@ -5467,7 +5525,7 @@ def _analyze_without_budget(profile_id: str, series: list[dict], *,
                             use_cache: bool = True,
                             refresh_diagnostics: bool = False,
                             reuse_fresh: bool = False,
-                            snapshot_queue_id: str | None = None) -> dict:
+                            snapshot_queue_id: str | None = None, minimum_remaining_seconds: int = 0) -> dict:
     profiles = _profiles()
     if profile_id not in profiles:
         raise KeyError(profile_id)
@@ -5490,7 +5548,8 @@ def _analyze_without_budget(profile_id: str, series: list[dict], *,
             # A due task may have observed the old cache before another scan
             # won this lock. Reuse its complete publication, not another scan.
             fresh = read_cached(profile_id, series)
-            if _required_snapshot_state(fresh, profile, snapshot_queue_id) is None:
+            if (_required_snapshot_state(fresh, profile, snapshot_queue_id) is None
+                    and _snapshot_has_remaining_ttl(fresh, minimum_remaining_seconds)):
                 return fresh
         cached, _source, cache_epoch = _cached_entry(profile_id, profile)
         _unused, cache_generation = _cache_snapshot(profile_id)
@@ -5819,7 +5878,7 @@ def _analyze_without_budget(profile_id: str, series: list[dict], *,
 
 def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True,
             refresh_diagnostics: bool = False, reuse_fresh: bool = False,
-            snapshot_queue_id: str | None = None) -> dict:
+            snapshot_queue_id: str | None = None, minimum_remaining_seconds: int = 0) -> dict:
     """Read cached insights or run one budgeted, cross-process live scan."""
     if use_cache:
         return read_cached(profile_id, series)
@@ -5839,7 +5898,8 @@ def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True,
             result = _analyze_without_budget(
                 profile_id, series, use_cache=False,
                 refresh_diagnostics=refresh_diagnostics,
-                **({"reuse_fresh": True, "snapshot_queue_id": snapshot_queue_id} if reuse_fresh else {}))
+                **({"reuse_fresh": True, "snapshot_queue_id": snapshot_queue_id} if reuse_fresh else {}),
+                **({"minimum_remaining_seconds": minimum_remaining_seconds} if minimum_remaining_seconds else {}))
             _ensure_github_scan_lease(renew=True)
         except _GitHubScanLeaseFailure as exc:
             return _budget_blocked_cached(

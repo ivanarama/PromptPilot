@@ -69,3 +69,43 @@ For an attempt with an unused reservation, an admitted final scan reports
 `budget.final_source_credit_used: true`. A retry after that scan, including a
 retry after a failed observation, goes through ordinary admission. Older
 attempts without a reservation also use ordinary admission.
+
+
+## Resuming a confirmed branch update in MERGE
+
+A targeted MERGE using the ordinary signed fallback and item blockers can
+store its confirmed branch update before its final Source observation. Use the
+Native executable from the worker environment and the absolute gate lease file
+from that occurrence's handoff.
+
+```sh
+pp pipelinectl merge-checkpoint record --profile "$profile" --number "$pr" \
+  --from "$old" --base "$second_parent" --to "$new" --tree "$tree" \
+  --intent "$comment_id" --lease-file "$gate_file"
+pp pipelinectl merge-checkpoint read --profile "$profile" --number "$pr" \
+  --to "$new" --lease-file "$recovery_gate_file"
+```
+
+Record only after the repository procedure verifies the trusted immutable
+intent, the updated ref, both actual parents in order and the tree. The intent
+ID is the positive numeric GitHub issue-comment ID. Repeating the same record
+returns the original facts. A conflicting record is refused. Record and read
+require a running task, its original start marker, targeted Native admission
+and the exact gate file elected for this occurrence. A recovery election on
+the new HEAD can reconstruct a missing record from independently verified
+GitHub evidence after a crash.
+
+A signed recovery waiting for Source saves an observation hint for the same task.
+On its next claim, Native compares the remaining snapshot TTL with the profile's
+refresh-ahead interval. If needed, it runs the ordinary budgeted Source scan
+before acquiring the election lease. A matching fresh snapshot from the sampler
+can satisfy this check. The new signed election and Source limit the handoff to the canonical post-update
+checks and confirmation. If a one-use admission hold was already claimed, the
+admitted recovery keeps its normal Source refresh path. A changed target,
+configuration, or conflicting graph follows the repository recovery procedure.
+
+The commands print JSON and exit 0 on `recorded`, `found`, or `missing`.
+Exit 1 with `state: "refused"` reports a runtime refusal. Every result sets
+`product_mutation_authorized` to false. Only the repository procedure can
+validate the original intent, determine whether done already exists, and
+authorize its publication for the exact current HEAD.

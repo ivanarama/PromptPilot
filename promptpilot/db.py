@@ -73,6 +73,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     worktree_branch TEXT,
     note TEXT,
     budget_wait_scope TEXT,
+    merge_checkpoint_gate TEXT,
     budget_wait_started_at TEXT,
     pipeline_priority_restore INTEGER,
     verdict TEXT
@@ -563,6 +564,7 @@ MIGRATIONS = [
     "ALTER TABLE pipeline_target_reservations ADD COLUMN herdr_workspace_id TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE pipeline_target_reservations ADD COLUMN strict_lifetime INTEGER NOT NULL DEFAULT 0 CHECK(strict_lifetime IN (0, 1))",
     "ALTER TABLE tasks ADD COLUMN budget_wait_scope TEXT",
+    "ALTER TABLE tasks ADD COLUMN merge_checkpoint_gate TEXT",
     "CREATE INDEX IF NOT EXISTS idx_tasks_budget_wait ON tasks(budget_wait_scope, status, priority)",
     "ALTER TABLE tasks ADD COLUMN pipeline_priority_restore INTEGER",
     "ALTER TABLE tail_candidates ADD COLUMN classified_revision INTEGER",
