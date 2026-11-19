@@ -813,6 +813,9 @@ def _budget_policy_for_route(policy: dict, route: str | None) -> dict:
             resource: 0 for resource in policy["minimum_remaining"]}
         selected["cost_accounting"] = False
         return selected
+    if route == "merge_receipt":
+        from .merge_finish_transport import RECEIPT_COST
+        return dict(policy, budget_route=route, requested_cost=dict(RECEIPT_COST), cost_accounting=True)
     if route == "merge_confirmation":
         from .merge_finish_transport import reservation_cost
         return dict(policy, budget_route=route, requested_cost=reservation_cost(policy),
@@ -4208,6 +4211,15 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
         bounded_confirmation = (merge_checkpoint_hint is not None
                                 and execution.get("merge_confirmation") == "bounded-v1"
                                 and profile.get("github_budget", {}).get("source_cost_protocol") == "source-graphql-cost-v1")
+        if (stage == "merge" and retain_budget and not bounded_confirmation
+                and (preflight_action in ("wait", "empty") or provider_route in ("skill", "fallback_targeted"))):
+            from .merge_checkpoint import blocks_fallback
+            receipt_target = fallback_lease["target"] if fallback_lease else None
+            if blocks_fallback(profile.get("repository"), receipt_target):
+                from .merge_confirmation_receipt import reconcile
+                repaired = reconcile(task, profile_id, profile, queue, admission, preflight, receipt_target)
+                if repaired is not None:
+                    return repaired
         if bounded_confirmation:
             provider_route = "merge_confirmation"
         routed_priority = _post_preflight_admission_priority(
@@ -5335,7 +5347,7 @@ def _with_persisted_refresh_status(result: dict, profile_id: str,
     # rows without changing the real cache stale/epoch/profile/lease guards.
     # Unknown legacy routes remain conservative.
     route = (status.get("github_budget") or {}).get("budget_route")
-    if route in {"skill", "tool_preflight", "tool", "fallback_targeted"}:
+    if route in {"skill", "tool_preflight", "tool", "fallback_targeted", "merge_confirmation", "merge_receipt"}:
         return result
     raw_defer_until = status.get("refresh_deferred_until")
     defer_until = _parse_time(raw_defer_until)

@@ -14,6 +14,8 @@ from .source_graphql_cost import health_contract, unique_object, validate_receip
 # last POST, direct GET and two full post-publication timeline passes.
 PHASES = {"proof": (64, 128), "gate": (20, 64), "publication": (32, 128)}
 
+RECEIPT_COST = {"core": 8, "graphql": 128, "search": 0}
+
 
 def reservation_cost(policy):
     return {
@@ -26,18 +28,25 @@ def reservation_cost(policy):
 
 
 class Transport:
-    def __init__(self, profile, gh, fence):
+    def __init__(self, profile, gh, fence, *, receipt=False):
         self.profile = profile
         self.backend = gh
         self.fence = fence
-        self.phase = "proof"
-        self.rest = {phase: size[0] for phase, size in PHASES.items()}
-        self.graphql = {phase: ObservationCost(size[1]) for phase, size in PHASES.items()}
+        self.phase = "receipt" if receipt else "proof"
+        phases = {"receipt": (RECEIPT_COST["core"], RECEIPT_COST["graphql"])} if receipt else PHASES
+        self.rest = {phase: size[0] for phase, size in phases.items()}
+        self.graphql = {phase: ObservationCost(size[1]) for phase, size in phases.items()}
         self.health_allowance = profile["github_budget"]["costs"]["insights"]["graphql"]
         self.health_nonce = None
         self.sent = False
         self.authorized_body = None
-        self.actor = health_contract(profile)["trusted_account"]
+        self.actor = (
+            (profile.get("priority_control") or {}).get("trusted_account")
+            if receipt
+            else health_contract(profile)["trusted_account"]
+        )
+        if not self.actor:
+            raise pp.PipelineError("MERGE confirmation needs a bound GitHub identity")
 
     def health_command(self, command, working_dir):
         """Match the signed gate's effective executable, arguments and cwd."""

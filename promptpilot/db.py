@@ -4245,7 +4245,7 @@ def _active_pipeline_budget_reservations(conn, values: list[dict]) -> tuple[list
 
 
 def _pipeline_source_refresh_state(conn, scope, task_id, profile_id, queue_id, route_costs,
-                                   starvation_timeout_seconds=0, *, confirmation=False):
+                                   starvation_timeout_seconds=0, *, bounded_route=None):
     """Read an admitted running attempt without pruning any foreign ledger."""
     from .config import TASK_TIMEOUT
     from .task_identity import task_execution_fingerprint
@@ -4255,7 +4255,7 @@ def _pipeline_source_refresh_state(conn, scope, task_id, profile_id, queue_id, r
     row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
     session = row["session_id"] or row["herdr_pane"] if row is not None else None
     if (row is None or row["status"] != "running" or not row["series_id"]
-            or not confirmation and (not isinstance(session, str) or not session)
+            or bounded_route is None and (not isinstance(session, str) or not session)
             or row["machine"] or row["detached"]):
         raise ValueError("source refresh requires a live local Native session")
     series = conn.execute("SELECT paused,ended_at FROM task_series WHERE id=?",
@@ -4273,8 +4273,11 @@ def _pipeline_source_refresh_state(conn, scope, task_id, profile_id, queue_id, r
     if (started.tzinfo is None or started.timestamp() > now
             or timeout and now >= started.timestamp() + timeout):
         raise ValueError("source refresh attempt lifetime is invalid")
+    if bounded_route not in (None, "merge_confirmation", "merge_receipt"):
+        raise ValueError("unsupported Native-only continuation route")
+    routes = (bounded_route,) if bounded_route else ("skill", "fallback_targeted")
     costs = {route: _pipeline_budget_vector(route_costs[route], f"continuation {route} cost")
-             for route in (("merge_confirmation",) if confirmation else ("skill", "fallback_targeted"))}
+             for route in routes}
     key = _pipeline_github_budget_reservation_key(scope)
     values = _load_pipeline_budget_reservations(
         conn, key)
@@ -4324,7 +4327,7 @@ def _pipeline_source_refresh_guard_matches(conn, guard):
     try:
         observed = _pipeline_source_refresh_state(conn, guard["scope"], guard["task_id"],
             guard["profile_id"], guard["queue_id"], guard["route_costs"],
-            confirmation=guard["route"] == "merge_confirmation")
+            bounded_route=(guard["route"] if guard["route"] in ("merge_confirmation", "merge_receipt") else None))
         return observed["guard"] == guard
     except (KeyError, TypeError, ValueError, OverflowError):
         return False

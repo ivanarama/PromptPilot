@@ -303,4 +303,7 @@ def blocks_fallback(repository, target):
 
     if target:
         return db.get_setting(pending_key(repository, target)) is not None
-    return db.has_setting_prefix(pending_key(repository))
+    prefix = pending_key(repository)
+    with db._connect() as conn:
+        return conn.execute("SELECT 1 FROM settings WHERE key>? AND key<? LIMIT 1",
+                            (prefix, prefix + "g")).fetchone() is not None

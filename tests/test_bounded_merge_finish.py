@@ -292,8 +292,10 @@ def test_uncertain_send_holds_only_its_exact_fallback_through_new_claim(
     f.profile["queues"][0]["execution"].pop("merge_confirmation")
     snapshot["cache"]["profile_hash"] = pi._profile_fingerprint(f.profile)
     monkeypatch.setattr(pi, "_github_rate_limits", lambda: observed_rates(_limits()))
+    monkeypatch.setattr(merge_finish_proof, "observe_receipt", lambda *a, **kw: None)
     retry = dispatch(f)
-    assert retry["action"] == "defer" and "prior MERGE confirmation send" in retry["reason"]
+    assert retry["action"] == "defer" and "not yet visible" in retry["reason"]
+    pi.release_execution_admission()
     other = health("merge")
     target = other["merge_executable"][0]
     target.update(number=43, head="e" * 40)
@@ -324,3 +326,68 @@ def test_confirmation_respects_other_reservations_at_real_floor(recovery):
     result = dispatch(f)
     assert result["action"] == "defer" and result["github_budget"]["state"] == "budget_in_flight"
     assert f.db.pipeline_github_budget_reservations("github-default")["count"] == 1
+
+
+def test_waiting_for_review_reconciles_a_previous_send_without_a_provider(
+    native_recovery, monkeypatch
+):
+    import json
+    from promptpilot import merge_checkpoint, merge_finish_proof
+
+    f, _, project = native_recovery
+    target = {"number": 42, "head": HEAD}
+    key = merge_checkpoint.pending_key(project["repository"], target)
+    record = {
+        "repository": project["repository"],
+        "number": 42,
+        "to": HEAD,
+        "from": OLD,
+        "base": BASE,
+        "tree": "d" * 40,
+        "intent": 101,
+        "body_sha256": "f" * 64,
+    }
+    f.db.set_setting(key, json.dumps(record))
+    seen = []
+
+    def observe(gh, saved, *, config):
+        assert gh.phase == "receipt" and saved == record
+        rows = f.db.pipeline_github_budget_reservations("github-default")
+        assert rows["count"] == 1 and rows["items"][0]["route"] == "merge_receipt"
+        seen.append(saved["number"])
+        return 501
+
+    monkeypatch.setattr(merge_finish_proof, "observe_receipt", observe, raising=False)
+    monkeypatch.setattr(
+        pi,
+        "_tool_preflight",
+        lambda *_: {"action": "wait", "reason": "owner awaits integration review"},
+    )
+    route = dispatch(f)
+    assert seen == [42] and route["action"] == "complete_empty" and route["verdict"] == "ПУСТО"
+    assert f.db.get_setting(key) is None
+
+
+def test_final_source_checker_failure_preserves_causal_stop(native_recovery, monkeypatch):
+    from promptpilot import merge_finish_proof
+
+    f, snapshot, _ = native_recovery
+    monkeypatch.setattr(
+        pi,
+        "_run_profile_health_check",
+        lambda *_: {"checker_failed": True, "summary": "broken checker"},
+    )
+
+    def failing(*a, prepare_source, **kwargs):
+        snapshot["cache"]["stale"] = True
+        prepare_source()
+        pytest.fail("failed checker admitted a mutation")
+
+    monkeypatch.setattr(merge_finish_proof, "confirm", failing)
+    refused = dispatch(f)
+    assert refused["action"] == "defer"
+    event = f.db.get_pipeline_refresh_status("example", strict=True)
+    assert (
+        event["source_checker_failure_revisions"][pi._profile_fingerprint(f.profile)]
+        == event["revision"]
+    )

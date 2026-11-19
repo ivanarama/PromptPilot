@@ -57,7 +57,7 @@ def execute(
             profile_id,
             queue["id"],
             {"merge_confirmation": reserved},
-            confirmation=True,
+            bounded_route="merge_confirmation",
         )
         guard = observed["guard"]
         row = conn.execute(
@@ -191,6 +191,8 @@ def execute(
             previous_meter = account.search_budget
             continuation = Continuation()
             context.continuation = account.continuation = continuation
+            decision = None
+            complete = False
             try:
                 raw = pi._github_rate_limits()
                 reservations = continuation.ledger()
@@ -216,9 +218,35 @@ def execute(
                     or fresh["cache"].get("source") != "live"
                 ):
                     raise pp.PipelineError("final MERGE Source observation did not publish")
+                complete = True
             finally:
-                context.continuation = account.continuation = None
-                account.search_budget = previous_meter
+                try:
+                    if decision is not None and (complete or not decision.get("allowed")):
+                        # End the Source phase while retaining the same scan
+                        # lease for the signed gate. Publish the normal clear
+                        # tombstone or failed-checker watermark under the same
+                        # per-attempt SQLite fence as the observation itself.
+                        status = None if complete else pi._refresh_blocked_status(decision)
+                        failure = decision.get("source_checker_failure_profile_hash")
+                        if failure is not None and (
+                            status is None
+                            or status["refresh_blocked"] != "checker_failed"
+                            or failure != pi._profile_fingerprint(profile)
+                        ):
+                            raise pp.PipelineError("invalid confirmation Source failure identity")
+                        with db._connect(immediate=True) as conn:
+                            ledger(conn)
+                            db._write_pipeline_refresh_status(
+                                conn,
+                                db._pipeline_refresh_status_key(profile_id),
+                                profile["repository"],
+                                status,
+                                db._next_pipeline_refresh_revision(conn),
+                                checker_failure_profile_hash=failure,
+                            )
+                finally:
+                    context.continuation = account.continuation = None
+                    account.search_budget = previous_meter
         accepted_token = require_source()
         native_fence()
         prepared = True
