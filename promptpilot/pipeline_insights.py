@@ -4062,6 +4062,7 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
         target_reservation = None
         validated_target_stage = None
         fallback_lease = None
+        merge_checkpoint_hint = None
         if owned_preflight and preflight_action in {"audit", "fallback", "recover"}:
             try:
                 from . import project_pipeline
@@ -4117,7 +4118,8 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                     "preflight": preflight,
                 }
         if (preflight_action == "fallback" and "handoff" in preflight
-                and target_reservation is not None):
+                and (target_reservation is not None or (stage == "merge" and mode == "auto"
+                     and queue.get("item_blockers") is True))):
             from .project_pipeline import PipelineError
 
             try:
@@ -4146,6 +4148,28 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                 }
             validated_target_stage = str(
                 (fallback_lease.get("target") or {}).get("stage") or "").lower()
+            if (target_reservation is None and validated_target_stage == "integration-merge-recovery"
+                    and fallback_lease["repository"] == profile.get("repository")):
+                from . import merge_checkpoint
+                from .config import PIPELINE_SNAPSHOT_INTERVAL
+
+                merge_checkpoint_hint = merge_checkpoint.recovery_hint(profile_id, fallback_lease)
+                if merge_checkpoint_hint is not None:
+                    # Re-read after next. Its signed election and this cached observation
+                    # must independently point at the completed branch update.
+                    current = read_cached(profile_id, db.list_series())
+                    state = _required_snapshot_state(current, profile, queue["id"])
+                    # A verified hold transition has already consumed its single occurrence.
+                    # Preserve its normal provider-assisted Source retry instead of stranding the hold.
+                    if state is not None and PIPELINE_SNAPSHOT_INTERVAL and not progress_releases:
+                        waiting = _required_snapshot_defer(profile_id, queue["id"], state)
+                        retry = datetime.now(timezone.utc) + timedelta(seconds=max(30, PIPELINE_SNAPSHOT_INTERVAL))
+                        until = _parse_time((current.get("cache") or {}).get("refresh_deferred_until"))
+                        waiting["defer_until"] = max(until or retry, retry).isoformat()
+                        waiting["reason"] = "MERGE post-update confirmation awaits fresh Source: " + state
+                        return waiting
+                    if state or not merge_checkpoint.agrees_with_source(current, fallback_lease, merge_checkpoint_hint):
+                        merge_checkpoint_hint = None
         provider_route = None
         if preflight_action == "fallback" and mode == "auto":
             provider_route = ("fallback_targeted" if "handoff" in preflight
@@ -4306,6 +4330,9 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                     target = fallback_lease["target"]
                     register_target(task, target["number"], target["head"], "merge",
                                     config_sha256=fallback_lease["config_sha256"])
+                    if target_reservation is None:
+                        from .merge_checkpoint import bind_election
+                        bind_election(task, preflight["handoff"]["lease"])
                 gate_command = [*command[:-2], "gate-fallback", stage,
                                 *_lease_argument(task, preflight["handoff"]["lease"], "gate")]
                 envelope = {"protocol": "promptpilot-fallback-target-v1",
@@ -4321,6 +4348,18 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                         "Не оставляй разрешённую передачу незавершённой ради одной "
                         "диагностики. Отказ scheduling gate не разрешает никаких мутаций. "
                         "Повторное ship не заменяет обязательный source proof.\n\n"
+                    )
+                if merge_checkpoint_hint is not None:
+                    envelope["merge_checkpoint"] = merge_checkpoint_hint
+                    pre_review_guard = (
+                        "This signed recovery claim is for post-update confirmation only. "
+                        "The local checkpoint records an observed branch update. Reconcile its "
+                        "trusted intent, exact live PR, parents, tree and existing done against "
+                        "the canonical MERGE procedure. Resume at post-update proof and confirm "
+                        "or publish done once using all required Source and publication gates. "
+                        "Do not reconstruct or repeat the branch write, rerun the pre-update "
+                        "build, or issue another intent. If proof differs, stop for canonical "
+                        "reconciliation. The checkpoint itself authorizes no mutation.\n\n"
                     )
                 if fallback_lease["target"]["stage"] == "pre-review-validation":
                     pre_review_guard = (
