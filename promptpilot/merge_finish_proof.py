@@ -258,6 +258,13 @@ def _history(gh, config, checkpoint):
         )
         ids.append(done["id"])
 
+    _check_addressed(gh, config, number, snap, ids)
+    return snap, saved, dones[0] if dones else None, done_body
+
+
+def _check_addressed(gh, config, number, snap, ids):
+    by_id = {edge["node"]["id"]: edge["node"] for edge in snap["edges"]}
+
     class Addressed:
         def graphql_page(self, owner, name, number, cursor):
             values = {"owner": owner, "name": name, "number": number, "cursor": cursor, "ids": ids}
@@ -276,7 +283,86 @@ def _history(gh, config, checkpoint):
 
     verified = pp.stable_timeline(Addressed(), config, number)
     _need(pp.canonical(verified) == pp.canonical(snap), "full timeline changed during addressed proof")
-    return snap, saved, dones[0] if dones else None, done_body
+
+
+def observe_receipt(gh, record, *, config):
+    """Look up an uncertain send for just its recorded PR, including after REVIEW/merge.
+
+    This only settles the local send journal. The original immutable intent and
+    exact body hash remain required. No current-head or current-label authority
+    is derived from historical events.
+    """
+    if (
+        record.get("repository") != REPOSITORY
+        or config.get("repository") != REPOSITORY
+        or config.get("trusted_account") != TRUSTED
+        or not all(type(record.get(k)) is int and 0 < record[k] < 2**63 for k in ("number", "intent"))
+        or not all(
+            isinstance(record.get(k), str) and re.fullmatch("[0-9a-f]{40}", record[k])
+            for k in ("from", "base", "to", "tree")
+        )
+        or not isinstance(record.get("body_sha256"), str)
+        or not re.fullmatch("[0-9a-f]{64}", record["body_sha256"])
+    ):
+        return None
+    number, intent, old, base, head = (record[k] for k in ("number", "intent", "from", "base", "to"))
+    _need(gh.json("api", "user")["login"] == TRUSTED, "unexpected receipt observation account")
+    snap = pp.stable_timeline(gh, config, number)
+    nodes = [e["node"] for e in snap["edges"]]
+    comments = [n for n in nodes if n["__typename"] == "IssueComment"]
+    intents = [n for n in comments if pp.comment_id(n) == intent]
+    prefix = f"<!-- pp:base-sync-done intent={intent} "
+    dones = [
+        n
+        for n in comments
+        if (n.get("author") or {}).get("login") == TRUSTED
+        and isinstance(n.get("body"), str)
+        and n["body"].startswith(prefix)
+    ]
+    if len(intents) != 1 or len(dones) != 1:
+        return None
+    saved, done = intents[0], dones[0]
+    if (
+        any(
+            n.get("lastEditedAt", True) is not None or (n.get("author") or {}).get("login") != TRUSTED
+            for n in (saved, done)
+        )
+        or not isinstance(done.get("body"), str)
+        or not isinstance(saved.get("body"), str)
+        or hashlib.sha256(done["body"].encode("utf-8")).hexdigest() != record["body_sha256"]
+    ):
+        return None
+    match = re.fullmatch(
+        rf"<!-- pp:base-sync-intent from={old} base={base} review-comment=[1-9][0-9]* "
+        r"claim=[1-9][0-9]* completion=[1-9][0-9]* ship-event=([A-Za-z0-9_=-]+) previous=none -->",
+        saved["body"],
+    )
+    if not match:
+        return None
+    ship = match[1]
+    expected = f"{prefix}from={old} to={head} base={base} previous=none ship-event={ship} -->"
+    order = [n.get("id") for n in nodes]
+    if (
+        done["body"] != expected
+        or not all(isinstance(i, str) and i for i in order)
+        or len(set(order)) != len(order)
+        or not 0 < (pp.comment_id(done) or 0) < 2**63
+        or len([n for n in comments if pp.comment_id(n) == pp.comment_id(done)]) != 1
+        or ship not in order
+        or not order.index(ship) < order.index(saved["id"]) < order.index(done["id"])
+    ):
+        return None
+    ship_event = nodes[order.index(ship)]
+    if (
+        ship_event["__typename"] != "LabeledEvent"
+        or (ship_event.get("actor") or {}).get("login") != TRUSTED
+        or (ship_event.get("label") or {}).get("name") != "ship"
+    ):
+        return None
+    _comment_readback(gh, number, saved, saved["body"])
+    _comment_readback(gh, number, done, expected)
+    _check_addressed(gh, config, number, snap, [ship, saved["id"], done["id"]])
+    return pp.comment_id(done)
 
 
 def _observe(gh, config, checkpoint, working_dir, *, verify_tree):

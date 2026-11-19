@@ -75,6 +75,8 @@ class Replay:
         self.stale_after_gate = False
         self.on_source = lambda: None
         self.source_calls = 0
+        self.current_head = HEAD
+        self.current_state = "OPEN"
 
     def add(self, kind, identifier, **extra):
         self.edges.append(
@@ -94,10 +96,10 @@ class Replay:
 
     def graphql_page(self, owner, name, number, cursor):
         pr = {
-            "headRefOid": HEAD,
+            "headRefOid": self.current_head,
             "baseRefOid": BASE,
             "baseRefName": "main",
-            "state": "OPEN",
+            "state": self.current_state,
             "isDraft": False,
             "labels": {"nodes": [{"name": v} for v in self.labels], "pageInfo": {"hasNextPage": False}},
             "timelineItems": {
@@ -328,3 +330,42 @@ def test_real_git_reproduces_the_remote_tree_without_moving_any_ref(tmp_path, mo
     assert not (checker / ".git" / "FETCH_HEAD").exists()
     with pytest.raises(pp.PipelineError):
         finish._tree_proof(CONFIG, checker, "feature/queue", dict(checkpoint, tree="0" * 40))
+
+
+@pytest.mark.parametrize("merged", [False, True])
+def test_historical_receipt_survives_review_and_later_head(replay, merged):
+    replay.drop_post = True
+    with pytest.raises(pp.PipelineError):
+        replay.run()
+    replay.current_head = "e" * 40
+    replay.labels = ["reviewed"]
+    replay.comment(889, "Documentation quotes the marker: " + DONE)
+    replay.comment(890, DONE)
+    replay.edges[-1]["node"]["author"]["login"] = "untrusted"
+    replay.add("UnlabeledEvent", "unship", label={"name": "ship"}, actor={"login": ACCOUNT})
+    replay.add("PullRequestCommit", "new", commit={"oid": replay.current_head})
+    if merged:
+        replay.current_state = "MERGED"
+        replay.add("MergedEvent", "merged", commit={"oid": "f" * 40})
+    record = dict(CHECKPOINT, body_sha256=hashlib.sha256(DONE.encode()).hexdigest())
+    assert finish.observe_receipt(replay, record, config=CONFIG) == 888
+    assert len(replay.posts) == 1 and len(replay.gates) == 1
+
+
+@pytest.mark.parametrize(
+    "corrupt",
+    [
+        lambda g: g.edges.pop(),
+        lambda g: g.comment(889, DONE),
+        lambda g: g.edges[-1]["node"].update(author={"login": "elsewhere"}),
+        lambda g: g.edges[-1]["node"].update(lastEditedAt="2026-11-20T00:00:00Z"),
+        lambda g: g.edges[-1]["node"].update(body=DONE.replace("intent=164", "intent=165")),
+        lambda g: g.edges.reverse(),
+    ],
+)
+def test_incomplete_historical_receipt_keeps_one_send(replay, corrupt):
+    replay.comment(888, DONE)
+    corrupt(replay)
+    record = dict(CHECKPOINT, body_sha256=hashlib.sha256(DONE.encode()).hexdigest())
+    assert finish.observe_receipt(replay, record, config=CONFIG) is None
+    assert not replay.posts and not replay.gates
