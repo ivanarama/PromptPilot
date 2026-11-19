@@ -301,6 +301,8 @@ def load_config(path: str) -> dict:
     if "/" not in data["repository"] or not isinstance(data["health_command"], list):
         raise PipelineError("invalid repository or health_command")
     data.setdefault("base_branch", "main")
+    if type(data.get("tail_durable_drain", False)) is not bool:
+        raise PipelineError("tail_durable_drain must be a boolean")
     data.setdefault("merge_method", "merge")
     data.setdefault("review_completion_gate", "health")
     data.setdefault("review_lease_seconds", 7200)
@@ -523,29 +525,46 @@ def run_health(config: dict, *, config_path: str | None = None,
 def timeline_pass(gh: GitHub, config: dict, number: int) -> dict:
     owner, name = config["repository"].split("/", 1)
     cursor = None
+    seen = set()
     edges = []
     header = None
     while True:
         payload = gh.graphql_page(owner, name, number, cursor)
-        pr = payload.get("data", {}).get("repository", {}).get("pullRequest")
-        if not pr:
+        if not isinstance(payload, dict) or payload.get("errors"):
+            raise PipelineError("timeline query returned errors or partial data")
+        data = payload.get("data")
+        repo = data.get("repository") if isinstance(data, dict) else None
+        pr = repo.get("pullRequest") if isinstance(repo, dict) else None
+        if not isinstance(pr, dict):
             raise PipelineError(f"PR #{number} not found")
+        connection = pr.get("timelineItems")
+        if (not isinstance(connection, dict) or not isinstance(connection.get("edges"), list)
+                or not isinstance(connection.get("pageInfo"), dict)
+                or type(connection["pageInfo"].get("hasNextPage")) is not bool):
+            raise PipelineError("timeline pagination metadata is incomplete")
         current = {key: pr.get(key) for key in (
             "headRefOid", "baseRefOid", "baseRefName", "state", "isDraft",
         )}
-        current["labels"] = sorted(node["name"] for node in pr["labels"]["nodes"])
-        current["labelsComplete"] = not pr["labels"]["pageInfo"]["hasNextPage"]
+        labels = pr.get("labels")
+        if (not isinstance(labels, dict) or not isinstance(labels.get("nodes"), list)
+                or not all(isinstance(node, dict) and isinstance(node.get("name"), str) for node in labels["nodes"])
+                or not isinstance(labels.get("pageInfo"), dict)
+                or type(labels["pageInfo"].get("hasNextPage")) is not bool):
+            raise PipelineError("timeline label projection is incomplete")
+        current["labels"] = sorted(node["name"] for node in labels["nodes"])
+        current["labelsComplete"] = not labels["pageInfo"]["hasNextPage"]
+        current["updatedAt"] = connection.get("updatedAt")
         if header is None:
             header = current
         elif header != current:
             raise PipelineError("PR changed while timeline was paginated")
-        connection = pr["timelineItems"]
         edges.extend(connection["edges"])
         if not connection["pageInfo"]["hasNextPage"]:
-            return {**header, "updatedAt": connection.get("updatedAt"), "edges": edges}
+            return {**header, "edges": edges}
         cursor = connection["pageInfo"].get("endCursor")
-        if not cursor:
-            raise PipelineError("timeline pagination did not return endCursor")
+        if not isinstance(cursor, str) or not cursor or cursor in seen or not connection["edges"]:
+            raise PipelineError("timeline pagination did not advance")
+        seen.add(cursor)
 
 
 def stable_timeline(gh: GitHub, config: dict, number: int) -> dict:
@@ -2848,8 +2867,17 @@ def _tail_command(args, config):
         if args.command == "tail-backlog":
             return backlog(config["repository"].lower(), base=config["base_branch"],
                            limit=args.limit, after=args.after)
+        if args.command != "tail-discover" and not config.get("tail_durable_drain", False):
+            raise PipelineError("durable TAIL processing is disabled in this config")
         gh = GitHub(timeout_seconds=config["github_timeout_seconds"])
-        return discover(gh, config, args.max_pages)
+        if args.command == "tail-discover":
+            return discover(gh, config, args.max_pages)
+        from . import tail_drain
+        if args.command == "tail-next":
+            return tail_drain.next_candidates(gh, config)
+        if args.command == "tail-gate":
+            return tail_drain.gate(gh, config, args.number, args.version)
+        return tail_drain.create(gh, config, args.number, args.version, args.item, args.context_file)
     except sqlite3.Error as exc:
         raise PipelineError(f"TAIL local index: {exc}") from exc
 
@@ -2868,6 +2896,14 @@ def run(argv=None) -> int:
     tail_backlog.add_argument("--json", action="store_true", help="emit JSON (the default)")
     tail_backlog.add_argument("--limit", type=int, default=100)
     tail_backlog.add_argument("--after", type=int, default=0, help="last PR number from the previous page")
+    sub.add_parser("tail-next", help="classify due PRs for the canonical TAIL procedure")
+    for name in ("tail-gate", "tail-create"):
+        target = sub.add_parser(name)
+        target.add_argument("--number", type=int, required=True)
+        target.add_argument("--version", required=True, help="source version returned by tail-next")
+        if name == "tail-create":
+            target.add_argument("--item", type=int, required=True, help="verified issue item selected by the TAIL worker")
+            target.add_argument("--context-file", type=Path, help="UTF-8 explanation from checking the current base branch")
     from . import merge_checkpoint
     merge_checkpoint.add_arguments(sub.add_parser("merge-checkpoint"))
     source_refresh_parser = sub.add_parser("source-refresh")
@@ -2937,7 +2973,7 @@ def run(argv=None) -> int:
             value = inspect_file(args.report, args.head)
         elif args.command == "capabilities":
             value = capabilities(config)
-        elif args.command in ("tail-backlog", "tail-discover"):
+        elif args.command in ("tail-backlog", "tail-discover", "tail-next", "tail-gate", "tail-create"):
             value = _tail_command(args, config)
         else:
             gh = GitHub()

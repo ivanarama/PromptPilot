@@ -188,6 +188,7 @@ CREATE TABLE IF NOT EXISTS tail_candidates (
     last_observed_at TEXT NOT NULL,
     pass_token TEXT NOT NULL,
     revision INTEGER NOT NULL DEFAULT 1,
+    classified_revision INTEGER,
     state TEXT NOT NULL DEFAULT 'pending-proof',
     review_id TEXT,
     review_updated_at TEXT,
@@ -566,6 +567,13 @@ MIGRATIONS = [
     "ALTER TABLE tasks ADD COLUMN merge_checkpoint_gate TEXT",
     "CREATE INDEX IF NOT EXISTS idx_tasks_budget_wait ON tasks(budget_wait_scope, status, priority)",
     "ALTER TABLE tasks ADD COLUMN pipeline_priority_restore INTEGER",
+    "ALTER TABLE tail_candidates ADD COLUMN classified_revision INTEGER",
+    """CREATE INDEX IF NOT EXISTS idx_tail_candidates_age
+       ON tail_candidates(repository, base, merged_at, pr_number)
+       WHERE classified_revision IS NOT revision OR state IN ('ready', 'pending-proof')""",
+    """CREATE INDEX IF NOT EXISTS idx_tail_candidates_due
+       ON tail_candidates(repository, base, next_check_at, pr_number)
+       WHERE classified_revision = revision AND state != 'ready' AND next_check_at IS NOT NULL""",
     "ALTER TABLE tasks ADD COLUMN budget_wait_started_at TEXT",
     "CREATE INDEX IF NOT EXISTS idx_tasks_budget_wait_fairness ON tasks(budget_wait_scope, status, budget_wait_started_at, priority, id)",
     # 1С-доработка (epf_tools): связь PP-задачи с проектом обработки
@@ -601,6 +609,7 @@ PIPELINE_TARGET_ATTEMPT_SCHEMA_VERSION = "pipeline_target_reservations_attempt_v
 PIPELINE_TARGET_OWNERSHIP_SCHEMA_VERSION = "pipeline_target_reservations_ownership_v3"
 PIPELINE_TARGET_HERDR_SCHEMA_VERSION = "pipeline_target_reservations_herdr_v4"
 TAIL_DISCOVERY_SCHEMA_VERSION = "tail_discovery_v1"
+TAIL_CLASSIFICATION_SCHEMA_VERSION = "tail_classification_v1"
 PIPELINE_BUDGET_WAITER_FAIRNESS_SCHEMA_VERSION = \
     "pipeline_github_budget_waiter_fairness_v1"
 
@@ -724,6 +733,10 @@ def _init_db_once():
         conn.execute(
             "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
             (TAIL_DISCOVERY_SCHEMA_VERSION, _now()),
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+            (TAIL_CLASSIFICATION_SCHEMA_VERSION, _now()),
         )
         fairness_migrated = conn.execute(
             "SELECT 1 FROM schema_migrations WHERE version = ?",
