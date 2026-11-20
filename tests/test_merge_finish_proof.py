@@ -39,6 +39,7 @@ INTENT = (
     f"<!-- pp:base-sync-intent from={OLD} base={BASE} review-comment=101 "
     "claim=102 completion=103 ship-event=ship previous=none -->"
 )
+INTENT_PREAMBLE = "PromptPilot service marker: MERGE base synchronization intent.\n"
 DONE = (
     f"<!-- pp:base-sync-done intent=164 from={OLD} to={HEAD} base={BASE} previous=none ship-event=ship -->"
 )
@@ -241,6 +242,40 @@ def test_confirm_and_recover_existing_done(replay):
     assert first["published"] and not second["published"]
     assert first["body_sha256"] == second["body_sha256"] == hashlib.sha256(DONE.encode()).hexdigest()
     assert replay.posts == [{"body": DONE}] and len(replay.gates) == 1
+
+
+def test_2731_service_comment_and_its_uncertain_delivery_keep_exact_bytes(replay, monkeypatch):
+    intent = replay.edges[-2]["node"]
+    intent["body"] = INTENT_PREAMBLE + INTENT
+    replay.drop_post = True
+    with pytest.raises(pp.PipelineError, match="lost"):
+        replay.run()
+    assert replay.run()["published"] is False and replay.posts == [{"body": DONE}]
+    record = dict(CHECKPOINT, body_sha256=hashlib.sha256(DONE.encode()).hexdigest())
+    assert finish.observe_receipt(replay, record, config=CONFIG) == 888
+    get = replay.json
+
+    def drift(verb, path, *args, **kwargs):
+        value = get(verb, path, *args, **kwargs)
+        if path.endswith("/issues/comments/164"):
+            return dict(value, body=INTENT)
+        return value
+
+    monkeypatch.setattr(replay, "json", drift)
+    with pytest.raises(pp.PipelineError, match="exact UTF-8 readback"):
+        finish.observe_receipt(replay, record, config=CONFIG)
+    with pytest.raises(pp.PipelineError, match="exact UTF-8 readback"):
+        replay.run()
+    assert replay.posts == [{"body": DONE}]
+
+
+def test_only_the_explanatory_line_changes_across_final_source(replay):
+    intent = replay.edges[-2]["node"]
+    intent["body"] = INTENT_PREAMBLE + INTENT
+    replay.on_source = lambda: intent.update(body="Another description.\n" + INTENT)
+    with pytest.raises(pp.PipelineError, match="changed across final Source"):
+        replay.run()
+    assert not replay.posts and not replay.past_send
 
 
 @pytest.mark.parametrize(

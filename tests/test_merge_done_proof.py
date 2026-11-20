@@ -9,6 +9,7 @@ import pytest
 from promptpilot import (
     merge_done_proof as full,
     merge_finish_proof as finish,
+    merge_ship_authorization as lineage,
     project_pipeline as pp,
 )
 from tests.test_base_sync_carry import git, commit
@@ -20,6 +21,8 @@ from tests.test_merge_finish_proof import (
     CONFIG,
     DONE,
     HEAD,
+    INTENT,
+    INTENT_PREAMBLE,
     N,
     OLD,
     TREE,
@@ -113,6 +116,56 @@ def test_first_hop_and_post_readback(replay):
     replay.comment(888, body)
     body, done, after = replay.prepare()
     assert (body, done) == (DONE, 888) and after != before
+    assert not replay.posts
+
+
+def test_verbatim_2731_comment_and_multihop_preparation(replay):
+    # ivanarama/onebase issuecomment-7049065664, including its explanatory first line.
+    actual = (
+        "PromptPilot service marker: MERGE base synchronization intent.\n"
+        "<!-- pp:base-sync-intent from=32c32c993b26795014b93ca7a3546b3969307add "
+        "base=ad337867f31bbdfb54bbe65ccc66d05c7aa1fc69 review-comment=7009432714 claim=7009433577 "
+        "completion=7009435441 ship-event=LE_lADOSKrn-s8AAAABgsRv-c8AAAAIiJB2SA previous=none -->"
+    )
+    assert hashlib.sha256(actual.encode()).hexdigest() == "4c5c522e4213d3a4b05f51d061c8ac7cf326b2dcb4aa809db1344f5e6c48ea65"
+    assert lineage.intent_line(actual)[0] == actual.split("\n")[1]
+    intent = replay.edges[-2]["node"]
+    body, _, fingerprint = replay.prepare()
+    intent["body"] = INTENT_PREAMBLE + INTENT
+    observed, receipt, with_preamble = replay.prepare()
+    assert observed == body and receipt is None and with_preamble != fingerprint
+    replay.add_hop()
+    replay.edges[-2]["node"]["body"] = INTENT_PREAMBLE + replay.edges[-2]["node"]["body"]
+    assert "previous=888" in replay.prepare()[0] and not replay.posts
+
+
+@pytest.mark.parametrize("body", [
+    "> " + INTENT, "    " + INTENT, "`" + INTENT + "`", "~~~md\n" + INTENT + "\n~~~",
+    "````\n```\n" + INTENT + "\n````", "<blockquote>\n" + INTENT + "\n</blockquote>",
+    INTENT + "\n" + INTENT, INTENT + "\n<!-- pp:base-sync-intent malformed -->",
+    INTENT + "\n" + DONE, INTENT + "\npp:review-again", INTENT.replace("claim=102", "claim=0102"),
+    INTENT.replace("from=" + OLD, "from=" + HEAD),
+])
+def test_one_standalone_intent_required_before_recovery(replay, body):
+    replay.edges[-2]["node"]["body"] = body
+    with pytest.raises(pp.PipelineError):
+        replay.prepare()
+    assert not replay.posts
+
+
+def test_full_preparation_requires_identical_explanatory_text_in_rest(replay, monkeypatch):
+    replay.edges[-2]["node"]["body"] = INTENT_PREAMBLE + INTENT
+    get = replay.json
+
+    def drift(verb, path, *args, **kwargs):
+        value = get(verb, path, *args, **kwargs)
+        if path.endswith("/issues/comments/164"):
+            return dict(value, body="Different explanation.\n" + INTENT)
+        return value
+
+    monkeypatch.setattr(replay, "json", drift)
+    with pytest.raises(pp.PipelineError, match="exact UTF-8 readback"):
+        replay.prepare()
     assert not replay.posts
 
 

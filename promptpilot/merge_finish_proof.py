@@ -11,6 +11,7 @@ import re
 import subprocess
 
 from . import base_sync_carry, project_pipeline as pp
+from .merge_ship_authorization import intent_line
 from .review_routing_policy import require_legacy
 
 
@@ -225,9 +226,10 @@ def _history(gh, config, checkpoint):
     if len(intents) != 1 or len(dones) > 1:
         raise OutsideScope("terminal route requires a unique first-hop intent and at most one done")
     saved = intents[0]
+    marker = intent_line(saved["body"])
     _need(
         pp.comment_id(saved) == intent
-        and saved["body"] == intent_body
+        and marker and marker[0] == intent_body
         and saved["lastEditedAt"] is None
         and saved["author"]["login"] == TRUSTED,
         "checkpoint differs from canonical intent",
@@ -338,16 +340,10 @@ def observe_delivery(gh, record, *, config, expected_node_id=None):
     ):
         return None
     general = record.get("proof_kind") == "legacy-general-done-v1"
-    intent_base = "[0-9a-f]{40}" if general else base
-    previous_pattern = r"(none|[1-9][0-9]*)" if general else "(none)"
-    match = re.fullmatch(
-        rf"<!-- pp:base-sync-intent from={old} base={intent_base} review-comment=[1-9][0-9]* "
-        rf"claim=[1-9][0-9]* completion=[1-9][0-9]* ship-event=([A-Za-z0-9_=-]+) previous={previous_pattern} -->",
-        saved["body"],
-    )
-    if not match:
+    marker = intent_line(saved["body"])
+    if not marker or marker[1] != old or (not general and (marker[2] != base or marker[7] != "none")):
         return None
-    ship, previous = match.groups()
+    ship, previous = marker[6], marker[7]
     expected = f"{prefix}from={old} to={head} base={base} previous={previous} ship-event={ship} -->"
     order = [n.get("id") for n in nodes]
     if (

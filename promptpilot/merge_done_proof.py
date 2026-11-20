@@ -342,7 +342,7 @@ def _history(gh, config, cp, pr, main):
     intents = [n for n in comments if pp.comment_id(n) == iid]
     _need(len(intents) == 1, "missing checkpoint intent")
     saved = intents[0]
-    match = lineage._INTENT.fullmatch(saved["body"])
+    match = lineage.intent_line(saved["body"])
     _proven(match and match[1] == old, "invalid checkpoint intent")
     intent_base, review, claim, completion, ship, previous = match.groups()[1:]
     fields = f"from={old} to={head} base={base} previous={previous} ship-event={ship}"
@@ -445,6 +445,7 @@ def _history(gh, config, cp, pr, main):
                     previous != "none"
                     and (
                         lineage._INTENT.fullmatch(protocol)
+                        or lineage.intent_line(n["body"])
                         or lineage._DONE.fullmatch(protocol)
                     ),
                     "unknown protocol marker in source epoch",
