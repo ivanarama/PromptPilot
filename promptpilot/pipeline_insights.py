@@ -4504,6 +4504,9 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                         "--base", "<second_parent>", "--to", "<new>", "--tree", "<tree>",
                         "--intent", "<intent_comment_id>", *gate_command[-2:]]
                     pre_review_guard += (
+                        "При создании нового pp:base-sync-intent отправь ровно одну строку маркера из "
+                        "канонической процедуры. Для существующего intent сохрани полное исходное тело "
+                        "комментария и сверь его без изменений в REST и GraphQL. "
                         "После подтверждённого обновления ветки вызови checkpoint_record_command, подставив "
                         "проверенные SHA и ID комментария. При state=refused сверь причину. "
                         "При выборе нового HEAD восстанови отсутствующую запись после полной сверки. После записи "
