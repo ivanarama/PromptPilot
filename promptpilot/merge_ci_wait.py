@@ -143,7 +143,7 @@ def _observation(record, run, now):
     if run is None:
         return dict(result, state="superseded")
     if run["run_attempt"] > record["attempt"]:
-        return dict(result, state="attempt_changed")
+        return dict(result, state="attempt_changed", current_attempt=run["run_attempt"])
     if run["run_attempt"] < record["attempt"]:
         _require(record["claimed_at"] is not None and run["run_attempt"] == record["attempt"] - 1,
                  "unexpected earlier Actions attempt")
@@ -168,7 +168,11 @@ def _observed(record, observation):
              and observation["run_id"] == record["run_id"] and observation["attempt"] == record["attempt"]
              and math.isfinite(observation["deadline"]) and observation["deadline"] <= record["deadline"],
              "CI readback differs from the saved wait")
-    return dict(record, state=observation["state"], deadline=observation["deadline"])
+    updated = dict(record, state=observation["state"], deadline=observation["deadline"])
+    if observation["state"] == "attempt_changed" and record["claimed_at"] is None:
+        # An external rerun also consumes the per-HEAD allowance.
+        updated["claimed_at"] = time.time()
+    return updated
 
 
 def save_observation(record, observation):
@@ -202,8 +206,11 @@ def defer_time(task, *, conn=None):
             if not row or row[0] != notice["gate"]:
                 return None
             record = _load(reader, notice["repository"], notice)
-            if not record or record["state"] not in WAITING or (record["run_id"], record["attempt"]) != (
-                    notice["run_id"], notice["attempt"]):
+            if not record or (record["run_id"], record["attempt"]) != (notice["run_id"], notice["attempt"]):
+                return None
+            if record["state"] == "success" and record.get("adoption_gate") == notice["gate"]:
+                return datetime.fromtimestamp(min(time.time(), notice["observed_at"]) + 5, timezone.utc)
+            if record["state"] not in WAITING:
                 return None
             when = min(time.time() + POLL_SECONDS, notice["observed_at"] + POLL_SECONDS, record["deadline"])
             return datetime.fromtimestamp(when, timezone.utc)
@@ -275,8 +282,16 @@ def diagnose(gh, config, config_path, number, head):
         _require(active_wait(repo, record) == record
                  and fallback_handoff.config_digest(pp.load_config(config_path)) == record["config_sha256"],
                  "CI journal or configuration changed before the handoff")
-        return fallback_handoff.create(config, health, "merge", queue[0],
-                                       f"Actions run {record['run_id']} attempt {record['attempt']} requires diagnosis")
+        offer = fallback_handoff.create(config, health, "merge", queue[0],
+                                        f"Actions run {record['run_id']} attempt {record['attempt']} requires diagnosis")
+        if observed["state"] == "attempt_changed":
+            current = observed["current_attempt"]
+            lease = fallback_handoff.validate(offer, "merge")
+            lease["ci_attempt_readback"] = {"run_id": record["run_id"], "previous_attempt": record["attempt"],
+                                            "attempt": current}
+            offer["handoff"]["lease"] = pp.encode_signed_lease(lease)
+            offer["ci_current_attempt"] = current
+        return offer
     except (RuntimeError, OSError, KeyError, ValueError, TypeError, sqlite3.Error) as exc:
         return wait(str(exc))
 
@@ -344,8 +359,12 @@ def _apply(args, env):
     record = same or dict(version=1, repository=repo, number=args.number, head=args.head, run_id=args.run_id,
                           attempt=args.attempt, config_sha256=lease["config_sha256"], base_branch=config["base_branch"],
                           claimed_at=None, deadline=time.time() + WAIT_SECONDS)
-    if same and not claiming:
-        _require(args.attempt == same["attempt"], "observe must name the journaled Actions attempt")
+    adopting = bool(same and not claiming and args.attempt != same["attempt"])
+    if adopting:
+        expected = {"run_id": args.run_id, "previous_attempt": same["attempt"], "attempt": args.attempt}
+        _require(same["state"] == "attempt_changed" and args.attempt > same["attempt"]
+                 and lease.get("ci_attempt_readback") == expected,
+                 "observing a new Actions attempt requires its fresh signed diagnosis")
     gh = pp.GitHub(timeout_seconds=config["github_timeout_seconds"])
     run = _status(gh, record)
     now = time.time()
@@ -361,6 +380,9 @@ def _apply(args, env):
         updated = dict(record, state="unknown", attempt=2, workflow_id=run["workflow_id"],
                        claimed_at=now, deadline=now + WAIT_SECONDS)
     else:
+        if adopting:
+            _require(run["run_attempt"] == args.attempt, "diagnosed Actions attempt changed again")
+            record = dict(record, attempt=args.attempt, claimed_at=(record["claimed_at"] or now), adoption_gate=gate)
         if not same:
             _require(run["run_attempt"] == args.attempt, "Actions attempt differs from observation")
             record["workflow_id"] = run["workflow_id"]
@@ -370,13 +392,14 @@ def _apply(args, env):
                 record["claimed_at"] = min(now, _started(run))
         updated = _observed(record, _observation(record, run, now))
 
+    reelect = updated["state"] == "success" and updated.get("adoption_gate") == gate
     with db._connect(immediate=True) as conn:
         _require(guard(conn) == admitted and _load(conn, repo, target) == previous,
                  "MERGE CI record or admission changed concurrently; reread before continuing")
         _put(conn, _key(repo, args.number, args.head), updated)
         _put(conn, f"pipeline_merge_ci_wait:series:v1:{task.series_id}",
              dict(repository=repo, number=args.number, head=args.head))
-        if updated["state"] in WAITING:
+        if updated["state"] in WAITING or reelect:
             _put(conn, _receipt_key(task.series_id),
                  dict(repository=repo, number=args.number, head=args.head, run_id=updated["run_id"],
                       attempt=updated["attempt"], task_id=task_id, started_at=marker, gate=gate, observed_at=now))
@@ -384,7 +407,7 @@ def _apply(args, env):
             conn.execute("DELETE FROM settings WHERE key=?", (_receipt_key(task.series_id),))
     granted = claiming and updated["state"] == "unknown"
     return dict(state="claimed" if granted else updated["state"], run_id=updated["run_id"],
-                attempt=updated["attempt"], deadline=updated["deadline"], send_allowed=granted)
+                attempt=updated["attempt"], deadline=updated["deadline"], send_allowed=granted, reelect=reelect)
 
 
 def add_arguments(parser):

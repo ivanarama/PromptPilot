@@ -74,9 +74,9 @@ def elected(merge_dispatch, monkeypatch, tmp_path, capsys):
     gh = Actions(repo)
     monkeypatch.setattr(pp, "GitHub", lambda **_: gh)
 
-    def call(verb, attempt=1, rid=444):
+    def call(verb, attempt=1, rid=444, *, lease_file=gate):
         argv = ["pp", "pipelinectl", "merge-ci-wait", verb, "--profile", "example", "--number", "42",
-                "--head", HEAD, "--run-id", str(rid), "--attempt", str(attempt), "--lease-file", gate]
+                "--head", HEAD, "--run-id", str(rid), "--attempt", str(attempt), "--lease-file", lease_file]
         monkeypatch.setattr(sys, "argv", argv)
         with pytest.raises(SystemExit) as done:
             entrypoint.main()
@@ -217,6 +217,47 @@ def test_adapter_configuration_matches_the_project_cli(options, expected):
             ci.adapter_config_path(cmd)
     else:
         assert ci.adapter_config_path(cmd) == expected
+
+
+@pytest.mark.parametrize("after_election", ["success", "in_progress", "another_attempt"])
+def test_external_attempt_needs_a_fresh_signed_readback_and_keeps_its_deadline(elected, monkeypatch, after_election):
+    from promptpilot import merge_checkpoint
+
+    e = elected
+    e.gh.run.update(status="in_progress", conclusion=None)
+    first = e.call("observe")
+    e.gh.run.update(run_attempt=2)
+    assert e.call("observe")["state"] == "attempt_changed"
+    assert e.call("observe", 2)["state"] == "refused"
+    assert e.call("claim", rid=999)["state"] == "already_claimed"
+    monkeypatch.setattr(pp, "run_health", lambda *_, **__: health("merge"))
+    monkeypatch.setattr(pp, "pending_merge_intents", lambda *_: [])
+    monkeypatch.setattr(pp, "stable_timeline", lambda *_: {"edges": []})
+    handoff = ci.diagnose(e.gh, pp.load_config(str(e.config_path)), str(e.config_path), 42, HEAD)
+    assert handoff["ci_current_attempt"] == 2
+    lease = fallback_handoff.validate(handoff, "merge")
+    assert lease["ci_attempt_readback"] == {"run_id": 444, "previous_attempt": 1, "attempt": 2}
+    token = handoff["handoff"]["lease"]
+    gate_file = pi._lease_argument(e.f.task, token, "gate")[-1]
+    merge_checkpoint.bind_election(e.f.task, token)
+    if after_election == "another_attempt":
+        e.gh.run.update(run_attempt=3)
+        assert e.call("observe", 3, lease_file=gate_file)["state"] == "refused"
+        assert e.call("observe", 2, lease_file=gate_file)["state"] == "refused"
+        return
+    if after_election == "success":
+        e.gh.run.update(status="completed", conclusion="success")
+    result = e.call("observe", 2, lease_file=gate_file)
+    assert not result["send_allowed"] and result["deadline"] == first["deadline"]
+    assert e.call("claim", rid=999, lease_file=gate_file)["state"] == "already_claimed"
+    e.f.db.mark_completed(e.f.task.id, "ИТОГ: ПУСТО", verdict="ПУСТО")
+    when = ci.defer_time(e.f.task).timestamp()
+    if after_election == "success":
+        assert result["state"] == "success" and result["reelect"] is True
+        assert time.time() < when <= time.time() + 5
+    else:
+        assert result["state"] == "waiting" and result["reelect"] is False
+        assert time.time() + 5 < when <= time.time() + ci.POLL_SECONDS
 
 
 @pytest.mark.parametrize("scenario", ["legacy", "ready-owner", "cleanup", "first-changed", "hold", "typed",
