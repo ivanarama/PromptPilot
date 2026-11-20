@@ -80,9 +80,8 @@ def test_checked_pr_uses_only_the_bounded_executor_at_1094_core(recovery, monkey
     pi.release_execution_admission()
     snapshot["diagnostics"]["integration_owner"]["base_sync_candidate"]["base"] = "e" * 40
     refused = dispatch(f)
-    assert (
-        refused["action"] == "defer" and refused["github_budget"]["requested_cost"]["core"] == 1050
-    )
+    assert refused["action"] == "defer" and "matching fresh Source" in refused["reason"]
+    assert not f.db.pipeline_github_budget_reservations("github-default")["items"]
 
 
 def test_checked_pr_yields_to_aged_waiter(recovery):
@@ -254,7 +253,7 @@ def test_uncertain_send_holds_only_its_exact_fallback_through_new_claim(
 ):
     import hashlib
     import time
-    from promptpilot import fallback_handoff, merge_checkpoint, merge_finish_proof
+    from promptpilot import fallback_handoff, merge_checkpoint, merge_finish_proof, project_pipeline as pp
     from tests.test_fallback_handoff import health
 
     f, snapshot, project = native_recovery
@@ -277,11 +276,18 @@ def test_uncertain_send_holds_only_its_exact_fallback_through_new_claim(
         },
     )
 
+    class UncertainBackend:
+        def json(self, *args, **kwargs):
+            assert args[-4:] == ("--method", "POST", "--input", "-")
+            raise RuntimeError("connection dropped after POST")
+
+    monkeypatch.setattr(pp, "GitHub", lambda **kw: UncertainBackend())
+
     def lose_response(gh, config, checkpoint, *, gate, claim_send, prepare_source, **kwargs):
         prepare_source()
         gate()
         assert claim_send(42, HEAD, 101, digest)
-        raise RuntimeError("connection dropped after POST")
+        return pp.post_comment(gh, config, 42, "exact-comment")
 
     monkeypatch.setattr(merge_finish_proof, "confirm", lose_response)
     route = dispatch(f)
@@ -292,7 +298,7 @@ def test_uncertain_send_holds_only_its_exact_fallback_through_new_claim(
     f.profile["queues"][0]["execution"].pop("merge_confirmation")
     snapshot["cache"]["profile_hash"] = pi._profile_fingerprint(f.profile)
     monkeypatch.setattr(pi, "_github_rate_limits", lambda: observed_rates(_limits()))
-    monkeypatch.setattr(merge_finish_proof, "observe_receipt", lambda *a, **kw: None)
+    monkeypatch.setattr(merge_finish_proof, "observe_delivery", lambda *a, **kw: None)
     retry = dispatch(f)
     assert retry["action"] == "defer" and "not yet visible" in retry["reason"]
     pi.release_execution_admission()
@@ -328,8 +334,9 @@ def test_confirmation_respects_other_reservations_at_real_floor(recovery):
     assert f.db.pipeline_github_budget_reservations("github-default")["count"] == 1
 
 
+@pytest.mark.parametrize("current_head", [True, False])
 def test_waiting_for_review_reconciles_a_previous_send_without_a_provider(
-    native_recovery, monkeypatch
+    native_recovery, monkeypatch, current_head
 ):
     import json
     from promptpilot import merge_checkpoint, merge_finish_proof
@@ -355,16 +362,17 @@ def test_waiting_for_review_reconciles_a_previous_send_without_a_provider(
         rows = f.db.pipeline_github_budget_reservations("github-default")
         assert rows["count"] == 1 and rows["items"][0]["route"] == "merge_receipt"
         seen.append(saved["number"])
-        return 501
+        return 501, current_head
 
-    monkeypatch.setattr(merge_finish_proof, "observe_receipt", observe, raising=False)
+    monkeypatch.setattr(merge_finish_proof, "observe_delivery", observe)
     monkeypatch.setattr(
         pi,
         "_tool_preflight",
         lambda *_: {"action": "wait", "reason": "owner awaits integration review"},
     )
     route = dispatch(f)
-    assert seen == [42] and route["action"] == "complete_empty" and route["verdict"] == "ПУСТО"
+    assert seen == [42] and route["action"] == "complete_empty"
+    assert route["verdict"] == ("ГОТОВО" if current_head else "ПУСТО")
     assert f.db.get_setting(key) is None
 
 

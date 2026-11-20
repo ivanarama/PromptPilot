@@ -126,16 +126,23 @@ def reconcile(task, profile_id, profile, queue, admission, preflight, target):
                 "INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (cursor_key, key)
             )
         gh = Transport(profile, pp.GitHub(), fence, receipt=True)
-        receipt = merge_finish_proof.observe_receipt(
+        delivery = merge_finish_proof.observe_delivery(
             gh, record, config={"repository": repo, "trusted_account": gh.actor}
         )
-        if type(receipt) is not int or receipt <= 0:
-            raise pp.PipelineError("recorded confirmation is not yet visible")
+        if delivery is None:
+            raise pp.PipelineError("recorded confirmation is not yet visible; send outcome unknown. "
+                                   "Only readback is allowed. Inspect the PR timeline if the receipt stays missing.")
+        receipt, current_review = delivery
+        if type(receipt) is not int or receipt <= 0 or type(current_review) is not bool:
+            raise pp.PipelineError("malformed confirmation delivery proof")
         fence()
         with db._connect(immediate=True) as conn:
             guard(conn)
             conn.execute("DELETE FROM settings WHERE key=? AND value=?", (key, raw))
         reason = f"confirmed existing base-sync comment {receipt} on PR #{record['number']}"
+        if current_review:
+            return {"action": "complete_empty", "mode": "tool", "verdict": "ГОТОВО",
+                    "reason": reason + "; integration REVIEW required", "profile_id": profile_id, "queue_id": "merge"}
         if not idle:
             # A new election at full price can now proceed. Never reuse a
             # preflight result which predates this historical reconciliation.

@@ -813,6 +813,9 @@ def _budget_policy_for_route(policy: dict, route: str | None) -> dict:
             resource: 0 for resource in policy["minimum_remaining"]}
         selected["cost_accounting"] = False
         return selected
+    if route == "merge_full_confirmation":
+        return dict(policy, budget_route=route, requested_cost=dict(policy["costs"]["fallback_targeted"]),
+                    cost_accounting=True)
     if route == "merge_receipt":
         from .merge_finish_transport import RECEIPT_COST
         return dict(policy, budget_route=route, requested_cost=dict(RECEIPT_COST), cost_accounting=True)
@@ -1562,7 +1565,7 @@ def _reserve_execution_admission(
             _clear_budget_waiter_after_admission(task)
             return admission
         final_source_cost = None
-        if queue.get("id") == "merge" and budget_route in ("skill", "fallback_targeted", "merge_confirmation"):
+        if queue.get("id") == "merge" and budget_route in ("skill", "fallback_targeted", "merge_confirmation", "merge_full_confirmation"):
             scan_cost = policy["costs"]["insights"]
             if any(scan_cost.values()):
                 final_source_cost = scan_cost
@@ -4092,6 +4095,9 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
         validated_target_stage = None
         fallback_lease = None
         merge_checkpoint_hint = None
+        managed_confirmation = (stage == "merge" and mode == "auto" and queue.get("item_blockers") is True
+            and execution.get("merge_confirmation") == "bounded-v1"
+            and profile.get("github_budget", {}).get("source_cost_protocol") == "source-graphql-cost-v1")
         if owned_preflight and preflight_action in {"audit", "fallback", "recover"}:
             try:
                 from . import project_pipeline
@@ -4183,7 +4189,8 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                 from .config import PIPELINE_SNAPSHOT_INTERVAL
 
                 merge_checkpoint_hint = merge_checkpoint.recovery_hint(profile_id, fallback_lease)
-                if merge_checkpoint_hint is not None:
+                if merge_checkpoint_hint is not None and not merge_checkpoint.blocks_fallback(
+                        profile["repository"], fallback_lease["target"]):
                     # Re-read after next. Its signed election and this cached observation
                     # must independently point at the completed branch update.
                     current = read_cached(profile_id, db.list_series())
@@ -4199,6 +4206,9 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                         waiting["reason"] = "MERGE post-update confirmation awaits fresh Source: " + state
                         return waiting
                     if state or not merge_checkpoint.agrees_with_source(current, fallback_lease, merge_checkpoint_hint):
+                        if managed_confirmation:
+                            return {"action": "defer", "mode": "tool", "defer_for": "2m",
+                                    "reason": "saved MERGE checkpoint awaits matching fresh Source"}
                         merge_checkpoint_hint = None
         provider_route = None
         if preflight_action == "fallback" and mode == "auto":
@@ -4208,10 +4218,8 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
             provider_route = "tool"
         elif preflight_action not in {"empty", "wait", "error"} and mode == "auto":
             provider_route = "skill"
-        bounded_confirmation = (merge_checkpoint_hint is not None
-                                and execution.get("merge_confirmation") == "bounded-v1"
-                                and profile.get("github_budget", {}).get("source_cost_protocol") == "source-graphql-cost-v1")
-        if (stage == "merge" and retain_budget and not bounded_confirmation
+        bounded_confirmation = merge_checkpoint_hint is not None and managed_confirmation
+        if (stage == "merge" and retain_budget
                 and (preflight_action in ("wait", "empty") or provider_route in ("skill", "fallback_targeted"))):
             from .merge_checkpoint import blocks_fallback
             receipt_target = fallback_lease["target"] if fallback_lease else None
@@ -4288,16 +4296,18 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                 return finished
             # The deterministic proof recognized an unsupported shape before an
             # attempted send. Release its finite reservation and require a fresh
-            # full-price admission before giving the provider its signed handoff.
+            # full-price admission for the general proof, under the same signed handoff.
             release_execution_admission()
             admission["_budget_reservation_revision"] = db.pipeline_github_budget_reservations(
                 _GITHUB_SCAN_LEASE_SCOPE)["revision"]
             admission = _reserve_execution_admission(
-                task, profile_id, profile, queue, admission, "fallback_targeted",
-                retain_budget=retain_budget, admission_priority=admission_priority, fallback_target=fallback_lease["target"])
+                task, profile_id, profile, queue, admission, "merge_full_confirmation",
+                retain_budget=True, admission_priority=admission_priority, fallback_target=fallback_lease["target"])
             if not admission.get("allowed"):
-                return _budget_defer_route(admission, profile_id, profile, queue, mode="skill",
+                return _budget_defer_route(admission, profile_id, profile, queue, mode="tool",
                                            phase="post_preflight", preflight=preflight)
+            return merge_confirmation.execute(task, profile_id, profile, queue, admission, command,
+                working_dir, preflight, merge_checkpoint_hint, full=True)
 
         # Explicit operator opt-in: an already-reviewed MERGE/cleanup has no
         # content audit left for a model. The same adapter owns every fresh
@@ -4396,6 +4406,7 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                     from .pipeline_item_holds import register_target
                     target = fallback_lease["target"]
                     register_target(task, target["number"], target["head"], "merge",
+                                    native_done=(managed_confirmation and target_reservation is None),
                                     config_sha256=fallback_lease["config_sha256"],
                                     ordinary_gate=(preflight["handoff"]["lease"] if target_reservation is None else None),
                                     source_token=((progress_data.get("cache") or {}).get("token")
@@ -4438,6 +4449,22 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                         "Do not reconstruct or repeat the branch write, rerun the pre-update "
                         "build, or issue another intent. If proof differs, stop for canonical "
                         "reconciliation. The checkpoint itself authorizes no mutation.\n\n"
+                    )
+                if managed_confirmation and target_reservation is None:
+                    native = _expanded_command(["{python}", "-m", "promptpilot.project_pipeline"], stage)
+                    envelope["checkpoint_record_command"] = [*native, "merge-checkpoint", "record",
+                        "--profile", profile_id, "--number", str(target["number"]), "--from", "<old>",
+                        "--base", "<second_parent>", "--to", "<new>", "--tree", "<tree>",
+                        "--intent", "<intent_comment_id>", *gate_command[-2:]]
+                    pre_review_guard += (
+                        "После подтверждённого обновления ветки вызови checkpoint_record_command, подставив "
+                        "проверенные SHA и ID комментария. При state=refused сверь причину. "
+                        "При выборе нового HEAD восстанови отсутствующую запись после полной сверки. После записи "
+                        "заверши попытку строкой ИТОГ: ПУСТО — ожидание подтверждения обновления ветки. Следующий "
+                        "штатный выбор на новом HEAD владеет отправкой done, его gate и readback. Не публикуй done "
+                        "самостоятельно, не повторяй intent и обновление ветки. Неопределённый результат записи "
+                        "ветки по-прежнему требует канонической сверки. Это правило владения done имеет приоритет "
+                        "над поручением публиковать done в исходном скилле.\n\n"
                     )
                 if fallback_lease["target"]["stage"] == "pre-review-validation":
                     pre_review_guard = (
@@ -5367,7 +5394,7 @@ def _with_persisted_refresh_status(result: dict, profile_id: str,
     # rows without changing the real cache stale/epoch/profile/lease guards.
     # Unknown legacy routes remain conservative.
     route = (status.get("github_budget") or {}).get("budget_route")
-    if route in {"skill", "tool_preflight", "tool", "fallback_targeted", "merge_confirmation", "merge_receipt"}:
+    if route in {"skill", "tool_preflight", "tool", "fallback_targeted", "merge_confirmation", "merge_full_confirmation", "merge_receipt"}:
         return result
     raw_defer_until = status.get("refresh_deferred_until")
     defer_until = _parse_time(raw_defer_until)

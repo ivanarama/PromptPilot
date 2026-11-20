@@ -430,7 +430,8 @@ def register_review_target(task, number, head):
     register_target(task, number, head, "review")
 
 
-def register_target(task, number, head, stage, *, config_sha256=None, ordinary_gate=None, source_token=None):
+def register_target(task, number, head, stage, *, config_sha256=None, ordinary_gate=None, source_token=None,
+                    native_done=False):
     """Remember a validated tool election, never an executor's claimed target."""
     if (stage not in {"review", "merge"}
             or not getattr(task, "series_id", None) or type(number) is not int or number <= 0
@@ -456,6 +457,8 @@ def register_target(task, number, head, stage, *, config_sha256=None, ordinary_g
             "head": head.lower(), "number": number, "started_at": started,
             "gate": digest([started, ordinary_gate]), "source_token": source_token,
         }
+        if native_done:
+            baseline["merge_source_election"]["native_done"] = True
     db.set_setting(MODE + str(task.series_id), "1")
     db.set_setting(key, json.dumps(baseline))
     if db.get_setting(_attempt_key(task.id)):
@@ -523,6 +526,10 @@ def handle_blocker(conn, series_id, task_id, verdict, result):
                 or conn.execute("SELECT value FROM settings WHERE key=?", (BASELINE + str(series_id),)).fetchone())
     if not mode or mode["value"] != "1" or not baseline:
         return False
+    if outcome == "НЕ СМОГ":
+        from .merge_checkpoint import handed_off
+        if handed_off(conn, series_id, task_id, baseline["value"]):
+            return True
     details = db._pipeline_blocker_details(verdict, result)
     if not details:
         return False

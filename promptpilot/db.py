@@ -4146,7 +4146,7 @@ def _pipeline_budget_vector(value, name: str) -> dict:
 
 def _pipeline_final_source_cost(value, queue_id, route, combined_cost):
     credit = _pipeline_budget_vector(value, "final Source cost")
-    if (queue_id != "merge" or route not in ("skill", "fallback_targeted", "merge_confirmation")
+    if (queue_id != "merge" or route not in ("skill", "fallback_targeted", "merge_confirmation", "merge_full_confirmation")
             or not any(credit.values())
             or any(amount > combined_cost[resource] for resource, amount in credit.items())):
         raise ValueError("invalid final Source credit for execution reservation")
@@ -4272,7 +4272,7 @@ def _pipeline_source_refresh_state(conn, scope, task_id, profile_id, queue_id, r
     if (started.tzinfo is None or started.timestamp() > now
             or timeout and now >= started.timestamp() + timeout):
         raise ValueError("source refresh attempt lifetime is invalid")
-    if bounded_route not in (None, "merge_confirmation", "merge_receipt"):
+    if bounded_route not in (None, "merge_confirmation", "merge_full_confirmation", "merge_receipt"):
         raise ValueError("unsupported Native-only continuation route")
     routes = (bounded_route,) if bounded_route else ("skill", "fallback_targeted")
     costs = {route: _pipeline_budget_vector(route_costs[route], f"continuation {route} cost")
@@ -4326,7 +4326,7 @@ def _pipeline_source_refresh_guard_matches(conn, guard):
     try:
         observed = _pipeline_source_refresh_state(conn, guard["scope"], guard["task_id"],
             guard["profile_id"], guard["queue_id"], guard["route_costs"],
-            bounded_route=(guard["route"] if guard["route"] in ("merge_confirmation", "merge_receipt") else None))
+            bounded_route=(guard["route"] if guard["route"] in ("merge_confirmation", "merge_full_confirmation", "merge_receipt") else None))
         return observed["guard"] == guard
     except (KeyError, TypeError, ValueError, OverflowError):
         return False
