@@ -1179,6 +1179,9 @@ def _maybe_recur(task, failed: bool = False):
                else db.parse_recurrence(recurrence))
     if not next_dt:
         return
+    if series and task.verdict == "ПУСТО":
+        from .merge_ci_wait import defer_time
+        next_dt = min(next_dt, defer_time(task) or next_dt)
     from .models import TaskCreate
     # The current series template owns future instructions. A running
     # occurrence keeps its original prompt for audit, while later occurrences
