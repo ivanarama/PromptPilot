@@ -84,7 +84,7 @@ def test_source_wait_recreates_scheduled_occurrence_without_park(attempt, monkey
 
 @pytest.mark.parametrize("fault", ["unobserved", "other-head", "other-attempt", "foreign-source",
     "replaced-target", "incomplete", "reconciled", "human", "ambiguous", "changed-cause", "unknown",
-    "pending-send", "updated-head"])
+    "pending-send", "updated-head", "later-refusal", "later-timeout"])
 def test_unmeasured_or_other_failures_keep_normal_holds(attempt, monkeypatch, capsys, fault):
     f = attempt
     f.data["cache"]["invalidated"] = True
@@ -113,6 +113,14 @@ def test_unmeasured_or_other_failures_keep_normal_holds(attempt, monkeypatch, ca
     if fault == "reconciled":
         f.data["cache"]["invalidated"] = False
         assert observer(f, monkeypatch, capsys)["state"] == "observed"
+    if fault in ("later-refusal", "later-timeout"):
+        if fault == "later-refusal":
+            f.data["diagnostics"]["merge_executable"][0]["head"] = "c" * 40
+        else:
+            def failed_read(*_):
+                raise TimeoutError("cache unavailable")
+            monkeypatch.setattr(pi, "read_cached", failed_read)
+        assert observer(f, monkeypatch, capsys)["state"] == "refused"
     if fault == "human":
         verdict = "НУЖЕН ЧЕЛОВЕК"
     if fault == "ambiguous":

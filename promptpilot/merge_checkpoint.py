@@ -218,10 +218,12 @@ def _gate_file(task_id, path):
     return lease, token
 
 
-def _pre_send_wait(conn, task, lease, gate, profile_id, profile, data):
+def _passive_source_state(conn, lease, profile_id, profile, data):
     from . import pipeline_insights as pi, pipeline_item_holds as holds
 
     target = lease["target"]
+    if not isinstance(data, dict):
+        raise ValueError("passive Source read unavailable")
     health = data.get("diagnostics") or {}
     cache = data.get("cache") or {}
     token = cache.get("token") or {}
@@ -260,29 +262,43 @@ def _pre_send_wait(conn, task, lease, gate, profile_id, profile, data):
     else:
         raise ValueError("unclear Source state")
 
-    # The active baseline names the signed ordinary election and a complete,
-    # fresh Source observed before this attempt's first project mutation.
-    stored = False
+    return state, token
+
+
+def _pre_send_wait(conn, task, lease, gate, profile_id, profile, data):
+    from . import pipeline_item_holds as holds
+
+    target = lease["target"]
+    # Collect this election's exact records, never a successor's baseline.
+    records = {}
     for key in (holds._attempt_key(task.id), holds.BASELINE + str(task.series_id)):
         row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
-        if not row:
-            continue
-        baseline = json.loads(row["value"])
-        if baseline.get("task_id") != task.id:
-            continue
-        proof = baseline.get("merge_source_election") or {}
-        initial = proof.get("source_token") or {}
-        if (proof.get("started_at") != task.started_at.isoformat() or proof.get("gate") != gate
-                or proof.get("number") != target["number"] or proof.get("head") != target["head"]
-                or initial.get("profile_hash") != token["profile_hash"]
-                or type(initial.get("revision")) is not int or initial["revision"] > token["revision"]
-                or type(initial.get("epoch")) is not int or initial["epoch"] > token["epoch"]):
-            raise ValueError("Source is outside this ordinary election")
-        proof["wait"] = state
-        conn.execute("UPDATE settings SET value=? WHERE key=?", (json.dumps(baseline), key))
-        stored = True
-    if not stored:
+        if row:
+            baseline = json.loads(row["value"])
+            proof = baseline.get("merge_source_election") or {}
+            if (baseline.get("task_id") == task.id and proof.get("started_at") == task.started_at.isoformat()
+                    and proof.get("gate") == gate and proof.get("number") == target["number"]
+                    and proof.get("head") == target["head"]):
+                records[key] = baseline
+    if not records:
         raise ValueError("ordinary MERGE election baseline is absent")
+    state, error = None, None
+    try:
+        state, token = _passive_source_state(conn, lease, profile_id, profile, data)
+        for baseline in records.values():
+            initial = baseline["merge_source_election"].get("source_token") or {}
+            if (initial.get("profile_hash") != token["profile_hash"]
+                    or type(initial.get("revision")) is not int or initial["revision"] > token["revision"]
+                    or type(initial.get("epoch")) is not int or initial["epoch"] > token["epoch"]):
+                raise ValueError("Source is outside this ordinary election")
+    except (pp.PipelineError, ValueError, TypeError, KeyError, AttributeError) as exc:
+        state, error = None, str(exc)
+    # An authenticated later refusal also invalidates an earlier wait receipt.
+    for key, baseline in records.items():
+        baseline["merge_source_election"]["wait"] = state
+        conn.execute("UPDATE settings SET value=? WHERE key=?", (json.dumps(baseline), key))
+    if error is not None:
+        return {"state": "refused", "reason": error, "product_mutation_authorized": False}
     result = {"state": "wait" if state else "observed", "reason": state,
               "number": target["number"], "head": target["head"], "product_mutation_authorized": False}
     if state:
@@ -312,7 +328,13 @@ def _apply(args, env):
     if (lease.get("target_reservation") or lease["repository"] != profile.get("repository")
             or target["number"] != args.number or not SHA.fullmatch(args.old if passive else args.to)):
         raise ValueError("MERGE checkpoint target differs from the signed ordinary election")
-    data = pi.read_cached(args.profile, db.list_series()) if passive else None
+    data = None
+    if passive:
+        try:
+            data = pi.read_cached(args.profile, db.list_series())
+        except (OSError, sqlite3.Error, TypeError, ValueError, KeyError, RuntimeError):
+            # Still invalidate any previous observation after fencing the exact attempt.
+            pass
     reading = args.operation == "read"
     recovery = not passive and target["stage"] == RECOVERY and target["head"] == args.to
     # Any validated MERGE stage can update its elected old HEAD if the base advances.
