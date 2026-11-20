@@ -372,6 +372,7 @@ def backlog(repository, limit=100, after=0, *, base="main"):
     result = {
         "repository": repository, "base": base, "discovery": None, "age_seconds": None,
         "oldest_ready_at": None, "last_successful_drain_at": None, "last_drain_failure": None,
+        "recheck_due": None,
         "counts": {}, "completions": {}, "candidates": [], "next_after": None,
     }
     with _read_index() as conn:
@@ -382,7 +383,13 @@ def backlog(repository, limit=100, after=0, *, base="main"):
         ).fetchone()
         if checkpoint_row is None:
             return result
-        candidates, _ = _projection(conn)
+        candidates, has_revision = _projection(conn)
+        if has_revision:
+            result["recheck_due"], = conn.execute(
+                """SELECT count(*) FROM tail_candidates
+                   WHERE repository = ? AND base = ? AND classified_revision = revision
+                     AND state != 'ready' AND next_check_at <= ?""",
+                (repository, base, datetime.now(timezone.utc).isoformat())).fetchone()
         counts = conn.execute(f"""SELECT state, completion_kind, count(*), min(merged_at) FROM ({candidates})
                                   GROUP BY state, completion_kind""", (repository, base))
         for state, kind, count, oldest in counts:

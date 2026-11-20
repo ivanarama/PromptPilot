@@ -109,6 +109,44 @@ def test_last_drain_success_and_refusal_are_read_from_their_own_branch(profile):
     assert tail["complete"] is True  # This does not replace the separate discovery status.
 
 
+def test_fresh_discovery_does_not_revalidate_overdue_completion(profile):
+    source = {"number": 42, "head": "a" * 40, "base": "main", "merged_at": REVIEW["review_updated_at"]}
+    revision = checkpoint(candidates=[source], age=31 * 86400)
+    completion = {"state": "resolved", "completion_kind": "versioned", "completion_digest": "c" * 64}
+    candidate = tail_store.get_candidate(REPOSITORY, "main", 42)
+    tail_store.record_result(candidate, next_check_at=source["merged_at"], **REVIEW, **completion)
+    checkpoint(revision=revision, candidates=[source])
+
+    overdue = read_tail()
+    assert overdue["state"] == "incomplete"
+    assert overdue["recheck_due"] == 1
+    assert all(value is None for value in overdue["counts"].values())
+    assert overdue["completions"]["versioned"] == 1
+
+    candidate = tail_store.get_candidate(REPOSITORY, "main", 42)
+    tail_store.record_result(candidate, **REVIEW, **completion)
+    verified = read_tail()
+    assert verified["complete"] is True
+    assert verified["recheck_due"] == 0
+    assert verified["counts"] == dict(ready=0, waiting=0, invalid=0, ambiguous=0)
+
+
+def test_missing_recheck_total_is_unknown(profile, monkeypatch):
+    checkpoint()
+    original = tail_store.backlog
+
+    def older_backlog(*args, **kwargs):
+        result = original(*args, **kwargs)
+        result.pop("recheck_due", None)
+        return result
+
+    monkeypatch.setattr(tail_store, "backlog", older_backlog)
+    tail = read_tail()
+    assert tail["state"] == "incomplete"
+    assert tail["recheck_due"] is None
+    assert all(value is None for value in tail["counts"].values())
+
+
 def test_storage_failure_does_not_poison_other_pipeline_status(profile, monkeypatch):
     def failed_read(*args, **kwargs):
         raise sqlite3.OperationalError("database is locked")

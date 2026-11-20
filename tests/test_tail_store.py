@@ -129,6 +129,7 @@ def test_local_completion_leaves_residue_only_for_the_proved_version(tail_db, ki
     completed = tail_store.backlog(REPOSITORY)
     assert completed["counts"] == {} and completed["candidates"] == []
     assert completed["completions"] == {kind: 1}
+    assert completed["recheck_due"] == 1
     refresh, = tail_store.due_candidates(REPOSITORY, "main")
     assert refresh["state"] == "resolved"
 
@@ -138,6 +139,7 @@ def test_local_completion_leaves_residue_only_for_the_proved_version(tail_db, ki
                                  **REVIEW)
     reopened = tail_store.backlog(REPOSITORY)
     assert reopened["completions"] == {} and reopened["counts"] == {"pending-proof": 1}
+    assert reopened["recheck_due"] == 0
     assert reopened["candidates"][0]["completion_digest"] is None
     stale, = tail_store.due_candidates(REPOSITORY, "main")
     assert stale["head"] == "f" * 40 and stale["review_id"] == REVIEW["review_id"]
