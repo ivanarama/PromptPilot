@@ -92,8 +92,8 @@ class Item:
 
 
 class ItemStop(Exception):
-    def __init__(self, state, reason, issue=None):
-        self.outcome = {"state": state, "reason": reason, "issue": issue}
+    def __init__(self, state, reason, issue=None, **evidence):
+        self.outcome = {"state": state, "reason": reason, "issue": issue, **evidence}
         super().__init__(reason)
 
 
@@ -101,13 +101,14 @@ _OWNER = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 _TTL = timedelta(minutes=30)
 
 
-def _check_item(source, item, index, trusted):
+def _check_item(source, item, index, trusted, *, for_recovery=False):
     """Read every control record for this exact item, including human withdrawals."""
     comments = sorted((c for c in source["comments"] if c["user"]["login"] == trusted),
                       key=lambda c: (_parse_github_timestamp(c["created_at"], field="created_at"), int(c["id"])))
     key = re.escape(item.key)
     drop = "pp:tail-drop " + item.key.split(" dedupe-sha256=")[0]
     roots, transitions, intents = [], [], []
+    dropped, completions = False, {}
     for comment in comments:
         lines = comment["body"].replace("\r\n", "\n").split("\n")
         if any(re.fullmatch(r"<!-- pp:tail-done(?: review-comment=[0-9]+ review-updated=\S+)? -->", s)
@@ -115,19 +116,31 @@ def _check_item(source, item, index, trusted):
             continue
         for line in lines:
             if line == drop:
-                raise ItemStop("waiting-policy", "the maintainer dropped this version of the item")
+                if not for_recovery:
+                    raise ItemStop("waiting-policy", "the maintainer dropped this version of the item")
+                dropped = True
             legacy = re.fullmatch(r"pp:tail-drop ([1-9][0-9]*(?:,[1-9][0-9]*)*)", line)
             if source["protocol"] == "legacy" and legacy and str(index) in legacy[1].split(","):
-                raise ItemStop("waiting-policy", "the maintainer dropped this legacy item")
+                if not for_recovery:
+                    raise ItemStop("waiting-policy", "the maintainer dropped this legacy item")
+                dropped = True
             done = re.fullmatch(rf"<!-- pp:tail-item-done {key} issue=(none|[1-9][0-9]*) -->", line)
             if done:
                 issue = None if done[1] == "none" else int(done[1])
-                raise ItemStop("item-done", "the exact item already has a completion", issue)
+                if comment.get("tail_edited") or comment["updated_at"] != comment["created_at"]:
+                    raise ItemStop("invalid-source", "edited TAIL item completion")
+                proof_order = (_parse_github_timestamp(source["review_updated_at"], field="review_updated_at"),
+                               int(source["review_id"]))
+                comment_order = (_parse_github_timestamp(comment["created_at"], field="created_at"),
+                                 int(comment["id"]))
+                if comment_order <= proof_order or (source.get("review_edited") and comment_order[0] == proof_order[0]):
+                    raise ItemStop("invalid-source", "TAIL item completion predates the selected review")
+                completions.setdefault(issue, comment)
             root = re.fullmatch(rf"<!-- pp:tail-claim {key} owner=({_OWNER}) -->", line)
             transition = re.fullmatch(rf"<!-- pp:tail-lease {key} previous=([1-9][0-9]*) owner=({_OWNER}) -->", line)
             intent = re.fullmatch(rf"<!-- pp:tail-create-intent {key} lease=([1-9][0-9]*) owner=({_OWNER}) -->", line)
             if root or transition or intent:
-                if comment["updated_at"] != comment["created_at"]:
+                if comment.get("tail_edited") or comment["updated_at"] != comment["created_at"]:
                     raise ItemStop("invalid-source", "edited TAIL ownership record")
                 stamp = _parse_github_timestamp(comment["created_at"], field="created_at")
                 cid = int(comment["id"])
@@ -137,12 +150,18 @@ def _check_item(source, item, index, trusted):
                     transitions.append((cid, transition[2], stamp, int(transition[1])))
                 else:
                     intents.append((cid, intent[2], int(intent[1])))
+    if len(completions) > 1:
+        raise ItemStop("invalid-source", "the exact item has conflicting TAIL completions")
+    if completions:
+        issue, comment = next(iter(completions.items()))
+        raise ItemStop("item-done", "the exact item already has a completion", issue,
+                       completion_id=comment["id"], completed_at=comment["created_at"])
     lease = roots[0][:3] if roots else None
     for cid, owner, stamp, previous in transitions:
         if (lease and previous == lease[0] and (stamp, cid) > (lease[2], lease[0])
                 and (owner == lease[1] or stamp >= lease[2] + _TTL)):
             lease = (cid, owner, stamp)
-    return lease, (roots[0][3] if roots else None), intents
+    return lease, (roots[0][3] if roots else None), intents, dropped
 
 
 def _lookup(gh, config, item, since=None):
@@ -150,11 +169,23 @@ def _lookup(gh, config, item, since=None):
     if since is not None:
         path += "&since=" + quote(since, safe=":-TZ")
     raw = gh.run("api", "--paginate", path, "--jq", ".[]")
-    found = set()
+    return _match_issues(_issue_rows(raw), config, item, exact=since is not None)
+
+
+def _issue_rows(raw):
+    rows = []
     for line in raw.split("\n"):
-        if not line.strip():
-            continue
-        row = json.loads(line)
+        if line.strip():
+            try:
+                rows.append(json.loads(line))
+            except ValueError as exc:
+                raise PipelineError("invalid GitHub issue listing") from exc
+    return rows
+
+
+def _match_issues(rows, config, item, *, exact=False):
+    found = set()
+    for row in rows:
         if not isinstance(row, dict) or "user" not in row:
             raise PipelineError("incomplete GitHub issue listing")
         author = row["user"]
@@ -164,13 +195,15 @@ def _lookup(gh, config, item, since=None):
             raise PipelineError("incomplete GitHub issue author")
         if author["login"] != config["trusted_account"]:
             continue
-        if "body" not in row or not isinstance(row.get("title"), str):
+        if ("body" not in row or row["body"] is not None and not isinstance(row["body"], str)
+                or not isinstance(row.get("title"), str)):
             raise PipelineError("incomplete GitHub issue payload during TAIL deduplication")
         lines = (row["body"] or "").replace("\r\n", "\n").split("\n")
-        if item.source_marker not in lines and (since is not None or item.dedupe_marker not in lines):
+        if item.source_marker not in lines and (exact or item.dedupe_marker not in lines):
             continue
         if (normalize_text(row["title"]) != item.title or lines.count(item.task_marker) != 1
                 or lines.count(item.dedupe_marker) != 1
+                or lines.count(item.source_marker) > 1
                 or [s for s in lines if s.startswith("Каноничная суть: ")] != ["Каноничная суть: " + item.text]
                 or type(row.get("number")) is not int or row["number"] <= 0):
             raise ItemStop("ambiguous-create", "an issue carrying this transaction marker has a damaged payload")
@@ -224,7 +257,7 @@ def apply_item(gh, config, row, source, index, recheck, context=""):
 
     def owned():
         nonlocal own_id
-        lease, root_stamp, intents = inspect()
+        lease, root_stamp, intents, _ = inspect()
         now = datetime.now(timezone.utc)
         if (lease is None or lease[:2] != (own_id, owner) or lease[2] > now
                 or now >= lease[2] + _TTL):
@@ -236,7 +269,7 @@ def apply_item(gh, config, row, source, index, recheck, context=""):
             if intents:
                 raise ItemStop("ambiguous-create", f"lease near expiry after intent {own_intent}")
             own_id = comment(f"<!-- pp:tail-lease {key} previous={own_id} owner={owner} -->")
-            renewed, root_stamp, intents = inspect()
+            renewed, root_stamp, intents, _ = inspect()
             if (intents or renewed is None or renewed[:2] != (own_id, owner)
                     or not timedelta(minutes=5) < renewed[2] + _TTL - datetime.now(timezone.utc) <= _TTL):
                 raise ItemStop("active-elsewhere", "could not verify the returned TAIL lease renewal")
@@ -244,7 +277,7 @@ def apply_item(gh, config, row, source, index, recheck, context=""):
 
     try:
         ensure_identity(gh, config)
-        lease, stamp, intents = inspect()
+        lease, stamp, intents, _ = inspect()
         if intents:
             existing = _existing(gh, config, item, stamp) if stamp else None
             if existing is not None:

@@ -2865,25 +2865,67 @@ def _complete_ordinary_merge(gh, config, lease, *, config_path=None, typed_guard
 def _tail_command(args, config):
     import sqlite3
     from .tail_discovery import discover
-    from .tail_store import backlog
+    from .tail_store import backlog, record_drain_event
+
+    command = args.command
+    repository, base = config["repository"].lower(), config["base_branch"]
 
     try:
-        if args.command == "tail-backlog":
-            return backlog(config["repository"].lower(), base=config["base_branch"],
-                           limit=args.limit, after=args.after)
-        if args.command != "tail-discover" and not config.get("tail_durable_drain", False):
+        if command == "tail-backlog":
+            return backlog(repository, base=base, limit=args.limit, after=args.after)
+        if command not in ("tail-discover", "tail-reconcile") and not config.get("tail_durable_drain", False):
             raise PipelineError("durable TAIL processing is disabled in this config")
         gh = GitHub(timeout_seconds=config["github_timeout_seconds"])
-        if args.command == "tail-discover":
+        if command == "tail-discover":
             return discover(gh, config, args.max_pages)
         from . import tail_drain
-        if args.command == "tail-next":
-            return tail_drain.next_candidates(gh, config)
-        if args.command == "tail-gate":
-            return tail_drain.gate(gh, config, args.number, args.version)
-        return tail_drain.create(gh, config, args.number, args.version, args.item, args.context_file)
+        try:
+            if command == "tail-next":
+                result = tail_drain.next_candidates(gh, config)
+            elif command == "tail-gate":
+                result = tail_drain.gate(gh, config, args.number, args.version)
+            elif command == "tail-reconcile":
+                result = tail_drain.reconcile(gh, config, args.number)
+            else:
+                result = tail_drain.create(gh, config, args.number, args.version, args.item, args.context_file)
+        except PipelineError as exc:
+            try:
+                record_drain_event(repository, base, failure=str(exc))
+            except sqlite3.Error:
+                pass  # Report the original failure to the operator.
+            raise
+        _observe_tail_drain(repository, base, result)
+        return result
     except sqlite3.Error as exc:
         raise PipelineError(f"TAIL local index: {exc}") from exc
+
+
+def _observe_tail_drain(repository, base, result):
+    import sqlite3
+    from .tail_store import record_drain_event
+
+    evidence = [result]
+    for row in result.get("observations", ()):
+        evidence.append(row)
+        evidence.extend(row.get("recovery") or ())
+    failure = next((row.get("reason") or row["state"] for row in evidence
+                    if row.get("state") in ("invalid-source", "ambiguous-create")), None)
+    if result.get("errors"):
+        failure = result["errors"][0].get("reason") or "reconciliation incomplete"
+    try:
+        completions = [row for row in evidence if row.get("state") == "item-done"]
+        stamps = [row["completed_at"] for row in completions if row.get("completed_at")]
+        if result["action"] == "tail-create" and completions and not stamps:
+            record_drain_event(repository, base)
+        elif stamps:
+            latest = max(stamps, key=lambda value: datetime.fromisoformat(value.replace("Z", "+00:00")))
+            record_drain_event(repository, base, completed_at=latest)
+        if failure:
+            record_drain_event(repository, base, failure=failure)
+    except (sqlite3.Error, ValueError) as exc:
+        # A local metrics failure cannot turn an observed issue into an
+        # unknown external result or encourage retry of its creation.
+        result["diagnostics_error"] = f"TAIL local index: {exc}"
 
 
 def run(argv=None) -> int:
@@ -2900,6 +2942,8 @@ def run(argv=None) -> int:
     tail_backlog.add_argument("--json", action="store_true", help="emit JSON (the default)")
     tail_backlog.add_argument("--limit", type=int, default=100)
     tail_backlog.add_argument("--after", type=int, default=0, help="last PR number from the previous page")
+    tail_reconcile = sub.add_parser("tail-reconcile", help="check prior TAIL writes without modifying GitHub")
+    tail_reconcile.add_argument("--number", type=int, help="inspect a specific discovered PR")
     sub.add_parser("tail-next", help="classify due PRs for the canonical TAIL procedure")
     for name in ("tail-gate", "tail-create"):
         target = sub.add_parser(name)
@@ -2983,7 +3027,7 @@ def run(argv=None) -> int:
             value = inspect_file(args.report, args.head)
         elif args.command == "capabilities":
             value = capabilities(config)
-        elif args.command in ("tail-backlog", "tail-discover", "tail-next", "tail-gate", "tail-create"):
+        elif args.command in ("tail-backlog", "tail-discover", "tail-reconcile", "tail-next", "tail-gate", "tail-create"):
             value = _tail_command(args, config)
         else:
             gh = GitHub()

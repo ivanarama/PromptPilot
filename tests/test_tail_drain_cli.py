@@ -34,9 +34,12 @@ class Peer:
         self.after = None
         self.discover_together = None
         self.select_together = None
-        self.pause_claim = False
-        self.claim_visible = threading.Event()
+        self.pause_after_write = None
+        self.write_visible = threading.Event()
         self.resume = threading.Event()
+        self.issue_page_size = None
+        self.issue_pages_read = []
+        self.issue_page_timeout = None
 
     def reply(self, args, payload):
         discovery = self.discover_together
@@ -61,9 +64,9 @@ class Peer:
             if self.after is not None and self.after[0] == observed:
                 change_source(self.sources[42], self.after[1])
                 self.after = None
-        if write == "claim" and self.pause_claim:
-            self.claim_visible.set()
-            assert self.resume.wait(90), "test did not release claim response"
+        if write is not None and write == self.pause_after_write:
+            self.write_visible.set()
+            assert self.resume.wait(90), f"test did not release {write} response"
         return output
 
     def _request(self, args, payload):
@@ -99,6 +102,8 @@ class Peer:
             return json.dumps(add_comment(source, body, created=utc(datetime.now(timezone.utc))))
         if path == "git/ref/heads/main":
             return json.dumps({"object": {"sha": "d" * 40}})
+        if path == "git/matching-refs/heads/pp-tail-dedupe/":
+            return json.dumps([{"ref": ref, "object": {"sha": sha}} for ref, sha in self.refs.items()])
         if path == "git/refs":
             assert "--include" in args and "POST" in args
             ref, sha = payload["ref"], payload["sha"]
@@ -301,10 +306,16 @@ import json, os, sys, urllib.request
 args = sys.argv[1:]
 body = json.load(sys.stdin) if "--input" in args else None
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-request = urllib.request.Request(os.environ["TAIL_TEST_HTTP"],
-                                 data=json.dumps([args, body]).encode())
-with opener.open(request, timeout=100) as response:
-    sys.stdout.buffer.write(response.read())
+page = "1"
+while page:
+    request = urllib.request.Request(os.environ["TAIL_TEST_HTTP"],
+                                     data=json.dumps([args, body]).encode(),
+                                     headers={"X-Tail-Test-Issue-Page": page})
+    with opener.open(request, timeout=100) as response:
+        sys.stdout.buffer.write(response.read())
+        page = response.headers.get("X-Tail-Test-Next-Page")
+        if page:
+            assert "--paginate" in args
 """
 
 
@@ -331,14 +342,32 @@ def http_cli(tmp_path, wire_bridge):
                 try:
                     args, data = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                     result = peer.reply(tuple(args), data).encode("utf-8")
-                    self.send_response(200)
+                    status, result, next_page = self.issue_page(result, args)
+                    self.send_response(status)
+                    if next_page is not None:
+                        self.send_header("X-Tail-Test-Next-Page", str(next_page))
                 except Exception as exc:
                     errors.append(repr(exc))
                     result = repr(exc).encode()
                     self.send_response(500)
                 self.send_header("Content-Length", str(len(result)))
                 self.end_headers()
-                self.wfile.write(result)
+                try:
+                    self.wfile.write(result)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass  # The CLI may stop before the accepted write's response arrives.
+
+            def issue_page(self, result, args):
+                size = peer.issue_page_size
+                if size is None or not any(arg.startswith(f"repos/{REPO}/issues?") for arg in args):
+                    return 200, result, None
+                page = int(self.headers["X-Tail-Test-Issue-Page"])
+                peer.issue_pages_read.append(page)
+                if page == peer.issue_page_timeout:
+                    return 504, b"GitHub issue page timed out", None
+                lines = result.splitlines(keepends=True)
+                start = (page - 1) * size
+                return 200, b"".join(lines[start:start + size]), page + 1 if start + size < len(lines) else None
 
             def log_message(self, *_):
                 pass
@@ -370,7 +399,7 @@ def test_two_cli_processes_share_one_item_lease_and_issue(http_cli):
     peer.select_together = threading.Barrier(2)
     after_selection = threading.Barrier(2)
     after_gate = threading.Barrier(2, action=lambda: setattr(peer, "select_together", None))
-    peer.pause_claim = True
+    peer.pause_after_write = "claim"
 
     def worker(contender):
         discovery = cli.discover(5)
@@ -382,7 +411,7 @@ def test_two_cli_processes_share_one_item_lease_and_issue(http_cli):
         if not contender:
             return command, cli.run(*command)
         try:
-            assert peer.claim_visible.wait(60), "first worker did not publish its claim"
+            assert peer.write_visible.wait(60), "first worker did not publish its claim"
             return command, cli.run(*command)
         finally:
             peer.resume.set()
@@ -450,6 +479,126 @@ def test_cli_hold_after_ref_preserves_intent_boundary(http_cli):
     assert peer.issues == []
 
 
+def crash_after_write(cli, peer, command, boundary):
+    """Stop the CLI while GitHub has accepted the write and withheld its response."""
+    peer.pause_after_write = boundary
+    with cli.start(*command) as child:
+        try:
+            assert peer.write_visible.wait(90), f"CLI did not reach the {boundary} boundary"
+            assert child.poll() is None
+            child.kill()
+            child.wait(timeout=10)
+        finally:
+            peer.resume.set()
+            peer.pause_after_write = None
+            if child.poll() is None:
+                child.kill()
+            child.communicate(timeout=20)
+    assert child.returncode != 0
+
+
+def reconcile_item(cli, number=42):
+    result = cli.run("tail-reconcile", "--number", str(number))
+    assert result["action"] == "tail-reconcile"
+    assert result["errors"] == []
+    observation, = result["observations"]
+    assert observation["number"] == number
+    item, = observation["recovery"]
+    assert item["item"] == 1
+    return item
+
+
+@pytest.mark.parametrize("boundary", ["ref", "intent"])
+def test_restart_does_not_create_from_an_unsettled_remote_fence(http_cli, boundary):
+    sources = [source_fixture()]
+    if boundary == "ref":
+        sources.append(source_fixture(number=43))
+    cli, peer = http_cli(*sources)
+    selection = cli.run("tail-next")
+    command = selected(cli.run, {"ready": [row for row in selection["ready"] if row["number"] == 42]})
+    crash_after_write(cli, peer, command, boundary)
+    writes = ["claim", "ref"] + (["intent"] if boundary == "intent" else [])
+    item = reconcile_item(cli)
+    assert item["state"] == "ambiguous-create" and not item.get("issue")
+    assert item["reason"]
+    if boundary == "intent":
+        assert item["intent"] == peer.sources[42]["comments"][-1]["id"]
+    else:
+        # The second source has the same task but no claim or intent of its own.
+        other = reconcile_item(cli, number=43)
+        assert other["state"] == "ambiguous-create" and not other.get("issue")
+        assert other["ref"] == item["ref"]
+    assert peer.writes == writes and peer.issues == []
+    assert len(peer.refs) == 1
+
+
+def test_restart_under_hold_recovers_issue_on_second_page_without_a_second_write(http_cli):
+    cli, peer = http_cli(source_fixture())
+    command = selected(cli.run)
+    crash_after_write(cli, peer, command, "issue")
+    change_source(peer.sources[42], "hold")
+    peer.issue_page_size = 100
+    peer.issues.extend({"number": i, "title": "Unrelated", "body": "", "user": {"login": "other"}}
+                       for i in range(1, 101))
+    peer.issue_page_timeout = 2
+    incomplete = cli.run("tail-reconcile", "--number", "42")
+    assert incomplete["errors"]
+    assert all(not item.get("issue") for row in incomplete["observations"]
+               for item in row.get("recovery", []))
+    assert peer.issue_pages_read[:2] == [1, 2]
+    assert peer.writes == ["claim", "ref", "intent", "issue"]
+    backlog = cli.backlog()
+    assert backlog["counts"] == {"ambiguous-create": 1}
+    assert backlog["last_drain_failure"]
+    peer.issue_page_timeout = None
+    # The exact issue was visible before the failed page, and is on page two
+    # in the next successful complete search.
+    peer.issues.append(peer.issues.pop(0))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        one = pool.submit(reconcile_item, cli)
+        two = pool.submit(reconcile_item, cli)
+        for worker in (one, two):
+            item = worker.result()
+            assert item["state"] == "existing-issue" and item["issue"] == 2000
+            assert item["intent"] == peer.sources[42]["comments"][-1]["id"]
+    direct = cli.run(*command)
+    assert direct["state"] == "existing-issue" and direct["issue"] == 2000
+    backlog = cli.backlog()
+    assert backlog["counts"] == {"waiting-policy": 1}
+    assert backlog["candidates"][0]["recovery"][0]["issue"] == 2000
+    assert peer.issue_pages_read.count(2) >= 2
+    assert peer.writes == ["claim", "ref", "intent", "issue"]
+    assert [i["number"] for i in peer.issues if i["user"]["login"] == "owner"] == [2000]
+
+
+def test_fresh_database_rediscovers_old_pr_and_recovers_item_done_without_a_write(http_cli):
+    merged = utc(datetime.now(timezone.utc) - timedelta(days=35))
+    cli, peer = http_cli(source_fixture(merged_at=merged))
+    command = selected(cli.run)
+    crash_after_write(cli, peer, command, "item-done")
+    assert cli.database.exists()
+    cli.database = cli.database.parent.with_name("recovered-data") / cli.database.name
+    cli.env["PP_DATA_DIR"] = str(cli.database.parent)
+    assert not cli.database.exists()
+    assert cli.finish()["state"] == "complete"
+    item = reconcile_item(cli)
+    assert item["state"] == "item-done" and item["issue"] == 2000
+    assert peer.writes == ["claim", "ref", "intent", "issue", "item-done"]
+    assert [i["number"] for i in peer.issues] == [2000]
+
+    # A later change to the proof must invalidate the local recovery projection.
+    source = peer.sources[42]
+    done = source["comments"][-1]
+    stamp = datetime.fromisoformat(done["created_at"].replace("Z", "+00:00"))
+    done["updated_at"] = utc(stamp + timedelta(seconds=1))
+    edge = next(edge for edge in source["snapshot"]["edges"] if edge["node"].get("id") == done["node_id"])
+    edge["node"]["lastEditedAt"] = done["updated_at"]
+    unproved = reconcile_item(cli)
+    assert unproved["state"] == "invalid-source" and not unproved.get("issue")
+    assert peer.writes == ["claim", "ref", "intent", "issue", "item-done"]
+
+
 def test_empty_and_legacy_done_survive_restart_without_external_writes(http_cli):
     legacy = source_fixture(protocol="legacy", number=43, merged_at="2026-02-01T00:00:00Z")
     add_comment(legacy, "<!-- pp:tail-done -->")
@@ -463,6 +612,11 @@ def test_empty_and_legacy_done_survive_restart_without_external_writes(http_cli)
     backlog = cli.backlog()
     assert backlog["completions"] == {"empty": 1, "legacy": 1}
     assert backlog["counts"] == {} and backlog["candidates"] == []
+    reconciled = cli.run("tail-reconcile", "--number", "42")
+    assert reconciled["errors"] == []
+    assert {(r["number"], r["completion_kind"]) for r in reconciled["observations"]} == {
+        (42, "empty"),
+    }
     assert peer.writes == []
 
 

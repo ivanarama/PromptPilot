@@ -81,6 +81,7 @@ def test_backlog_age_tracks_last_complete_scan(tail_db):
     assert backlog["age_seconds"] is None
     assert backlog["discovery"] == {
         "base": "main", "revision": 1, "state": "incomplete", "current_interval": interval, "pending_intervals": 1,
+        "uncovered_intervals": [{"lower": interval[0], "upper": interval[1]}],
     }
     completed = datetime.now(timezone.utc) - timedelta(days=30)
     tail_store.save_discovery(REPOSITORY, revision, {
@@ -92,6 +93,31 @@ def test_backlog_age_tracks_last_complete_scan(tail_db):
 
 REVIEW = {"review_id": "123", "review_updated_at": "2026-01-01T00:00:00Z",
           "review_body_digest": "b" * 64, "epoch_digest": "e" * 64}
+
+
+def test_recovery_has_exact_version_and_branch_specific_diagnostics(tail_db):
+    tail_store.save_discovery(REPOSITORY, None, {}, [observation(1)], pass_token="p")
+    row = tail_store.get_candidate(REPOSITORY, "main", 1)
+    recovered = [{"item": 1, "issue": 42, "intent": "7", "state": "existing-issue"}]
+    tail_store.record_result(row, state="waiting-policy", recovery=recovered, **REVIEW)
+    same = tail_store.get_candidate(REPOSITORY, "main", 1)
+    assert same["recovery"] == recovered
+    tail_store.record_result(same, state="ready", **REVIEW)
+    ready = tail_store.backlog(REPOSITORY)
+    assert ready["candidates"][0]["recovery"] == recovered
+    assert ready["oldest_ready_at"] == row["merged_at"]
+
+    tail_store.record_drain_event(REPOSITORY, "main", completed_at="2026-01-02T15:00:00Z")
+    tail_store.record_drain_event(REPOSITORY, "main", completed_at="2026-01-01T14:00:00Z")
+    tail_store.record_drain_event(REPOSITORY, "main", failure="issue lookup incomplete")
+    changed = tail_store.get_candidate(REPOSITORY, "main", 1)
+    tail_store.record_result(changed, state="ready", **dict(REVIEW, review_id="124"))
+    latest = tail_store.backlog(REPOSITORY)
+    assert "recovery" not in latest["candidates"][0]
+    assert latest["last_successful_drain_at"] == "2026-01-02T15:00:00+00:00"
+    assert latest["last_drain_failure"]["reason"] == "issue lookup incomplete"
+    other = tail_store.backlog(REPOSITORY, base="other")
+    assert other["last_successful_drain_at"] is None and other["last_drain_failure"] is None
 
 
 @pytest.mark.parametrize("kind", ["empty", "legacy", "versioned"])

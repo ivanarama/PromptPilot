@@ -3771,6 +3771,28 @@ function pipelineRoutingHtml(routing) {
   return `<div class="pipeline-routing"><h4>Причины остановок и получатели</h4>${view.complete ? '' : '<div>Полная свежая классификация недоступна; отсутствие строк не означает ноль.</div>'}<div class="pipeline-report-meta">Один PR может иметь несколько причин; группы не складываются как число PR.</div>${groups.map(group => `<details open><summary>${esc(group.title)} · ${group.count == null ? 'число неизвестно' : esc(String(group.count))}</summary>${group.truncated ? '<div>Вывод сокращён; полные данные доступны в исходных задачах/REVIEW.</div>' : ''}<ul class="pipeline-report-list">${group.items.map(row).join('')}</ul></details>`).join('')}${view.complete && !groups.length ? '<div>В проверенном снимке нет классифицированных остановок.</div>' : ''}</div>`;
 }
 
+function pipelineTailHtml(tail, queues) {
+  const configured = (queues || []).some(queue => ['tail', 'tail-issues'].includes(queue.id));
+  if (!tail || (tail.state === 'unobserved' && !configured)) return '';
+  const number = value => value == null ? '—' : esc(Number(value).toLocaleString());
+  const stamp = value => value ? esc(new Date(value).toLocaleString()) : '—';
+  const counts = tail.counts || {};
+  const done = tail.completions || {};
+  const intervals = (tail.uncovered_intervals || []).slice(0, 5);
+  const omitted = Number(tail.uncovered_interval_count || 0) - intervals.length;
+  const failure = tail.last_drain_failure;
+  return `<div class="pipeline-report-section"><h3>Сверка очереди замечаний TAIL</h3>
+    ${tail.reason ? `<div class="pipeline-report-meta">${esc(tail.reason)}</div>` : ''}
+    <div>История проверена до ${stamp(tail.discovery_complete_through)} · осталось интервалов ${number(tail.uncovered_interval_count)}</div>
+    ${intervals.length ? `<ul class="pipeline-report-list">${intervals.map(interval => `<li>${stamp(interval.lower)} — ${stamp(interval.upper)}</li>`).join('')}${omitted > 0 ? `<li>Ещё ${number(omitted)}</li>` : ''}</ul>` : ''}
+    <div>Готовы ${number(counts.ready)} · ждут ${number(counts.waiting)} · источник недействителен ${number(counts.invalid)} · результат создания неизвестен ${number(counts.ambiguous)}</div>
+    ${tail.pending_proof ? `<div>Ждут проверки ревью ${number(tail.pending_proof)}</div>` : ''}
+    <div>Завершены · пустое ревью ${number(done.empty)} · старая отметка ${number(done.legacy)} · подтверждённая версия ${number(done.versioned)}</div>
+    <div>Возраст старейшего готового PR ${number(tail.oldest_ready_age_seconds == null ? null : Math.floor(tail.oldest_ready_age_seconds / 60))} мин · последнее подтверждённое завершение ${stamp(tail.last_successful_drain_at)}</div>
+    ${failure ? `<div>Последний отказ ${stamp(failure.at)} · ${esc(failure.reason || '')}</div>` : ''}
+  </div>`;
+}
+
 async function loadPipelineInsights(profile, refresh=false) {
   const box = document.getElementById('pipelineInsights');
   box.innerHTML = refresh
@@ -3986,6 +4008,7 @@ async function loadPipelineInsights(profile, refresh=false) {
         <div class="pipeline-report-meta">«Готово» здесь — итог запуска, не обязательно влитый PR. Отложенные попытки (WIP, бюджет API) не становятся «ПУСТО» и показаны отдельно выше. Данные — из локальной базы PromptPilot.</div>
       </div>
       ${diagnosticHtml}
+      ${pipelineTailHtml(data.tail, data.queues)}
       ${pipelineRoutingHtml(data.routing)}
       <table class="insights-table"><colgroup><col class="insights-col-stage"><col class="insights-col-small"><col class="insights-col-small"><col class="insights-col-capacity"><col class="insights-col-capacity"><col class="insights-col-duration"><col class="insights-col-small"><col class="insights-col-oldest"><col class="insights-col-interval"><col class="insights-col-recommendation"></colgroup><thead><tr><th>Этап</th><th class="num">Очередь</th><th class="num">Δ/ч</th><th class="num">За реплику × активные</th><th class="num">Прогонов</th><th>Средний запуск</th><th>ETA</th><th>Самый старый</th><th>Интервал</th><th>Рекомендация</th></tr></thead><tbody>${rows}</tbody></table>
       ${priorityHtml}
