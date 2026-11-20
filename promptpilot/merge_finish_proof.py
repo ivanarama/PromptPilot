@@ -332,15 +332,18 @@ def observe_receipt(gh, record, *, config):
         or hashlib.sha256(done["body"].encode("utf-8")).hexdigest() != record["body_sha256"]
     ):
         return None
+    general = record.get("proof_kind") == "legacy-general-done-v1"
+    intent_base = "[0-9a-f]{40}" if general else base
+    previous_pattern = r"(none|[1-9][0-9]*)" if general else "(none)"
     match = re.fullmatch(
-        rf"<!-- pp:base-sync-intent from={old} base={base} review-comment=[1-9][0-9]* "
-        r"claim=[1-9][0-9]* completion=[1-9][0-9]* ship-event=([A-Za-z0-9_=-]+) previous=none -->",
+        rf"<!-- pp:base-sync-intent from={old} base={intent_base} review-comment=[1-9][0-9]* "
+        rf"claim=[1-9][0-9]* completion=[1-9][0-9]* ship-event=([A-Za-z0-9_=-]+) previous={previous_pattern} -->",
         saved["body"],
     )
     if not match:
         return None
-    ship = match[1]
-    expected = f"{prefix}from={old} to={head} base={base} previous=none ship-event={ship} -->"
+    ship, previous = match.groups()
+    expected = f"{prefix}from={old} to={head} base={base} previous={previous} ship-event={ship} -->"
     order = [n.get("id") for n in nodes]
     if (
         done["body"] != expected
