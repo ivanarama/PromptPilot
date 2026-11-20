@@ -2576,9 +2576,8 @@ def _pause_pipeline_series_on_repeated_blocker(
     ).fetchone()
     if not current or current["status"] != "completed":
         return _continue_pipeline_recurrence()
-    from .pipeline_item_holds import record
-    if record(conn, series_id, current_task_id, current["verdict"], current["result"]):
-        # Measured item handoffs park the target, not unrelated future work.
+    from .pipeline_item_holds import handle_blocker
+    if handle_blocker(conn, series_id, current_task_id, current["verdict"], current["result"]):
         return _continue_pipeline_recurrence()
     current_details = _pipeline_blocker_details(
         current["verdict"], current["result"])
