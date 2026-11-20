@@ -51,6 +51,19 @@ def _protocol_body(body):
     return '\n'.join(lines)
 
 
+def intent_line(body):
+    """Read an intent alongside prose. Callers retain the entire body for bytewise readback."""
+    # The whole comment is removed when reconstructing the previous epoch.
+    # Never remove another transaction, a review reset, or an HTML example with it.
+    if (body.count('<!--') != 1 or has_review_again(body)
+            or re.search(r'(?i)<(?:pre|code|blockquote|script|style|textarea)(?=[\s>])', body)):
+        return None
+    marker = _INTENT.search(_protocol_body(body))
+    if marker and not any(marker[index].startswith('0') for index in (3, 4, 5, 7)):
+        return marker
+    return None
+
+
 def _need(value,message):
     if not value:raise ShipAuthorizationError(message)
 
