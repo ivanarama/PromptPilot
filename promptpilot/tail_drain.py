@@ -8,7 +8,8 @@ from .pipeline_errors import PipelineError
 
 
 _PROOF = ("review_id", "review_updated_at", "review_body_digest", "epoch_digest")
-_RESULT = ("state", "reason", *_PROOF, "completion_kind", "completion_digest", "next_check_at", "recovery")
+_RESULT = ("state", "reason", *_PROOF, "completion_kind", "completion_digest", "next_check_at",
+           "recovery", "proof_error")
 
 
 def _version(row, result):
@@ -31,6 +32,12 @@ def _observation(row, result):
 
 
 def _record(row, result):
+    prior_error = row.get("proof_error") or {}
+    if "proof_error" not in result and prior_error.get("kind") == "source":
+        result = dict(result, proof_error=None)
+    error = result.get("proof_error")
+    if error:
+        result = dict(result, proof_error={**error, "reason": error["reason"][:1000]})
     try:
         return tail_store.record_result(row, **{k: result[k] for k in _RESULT if k in result})
     except tail_store.TailCandidateConflict:
@@ -44,7 +51,9 @@ def _record(row, result):
                 or _version(current, current) != _version(row, result)
                 or current["completion_kind"] != result.get("completion_kind")
                 or current["completion_digest"] != result.get("completion_digest")
-                or "recovery" in result and current.get("recovery") != result["recovery"]):
+                or "recovery" in result
+                and (current.get("recovery") or []) != (result["recovery"] or [])
+                or "proof_error" in result and current.get("proof_error") != result["proof_error"]):
             raise
         return current["revision"]
 
@@ -67,8 +76,12 @@ def _read(gh, config, row):
     except PipelineError as exc:
         # Every entry point must surface a failed recheck of an old completion.
         # Preserve the known source and let a concurrent observation stand.
+        proof_error = row.get("proof_error") or {}
+        if proof_error.get("kind") != "issue":
+            proof_error = {"kind": "source", "reason": str(exc)}
         try:
-            _record(row, {"state": "invalid-source", "reason": str(exc)})
+            _record(row, {"state": "invalid-source", "reason": str(exc),
+                          "proof_error": proof_error})
         except tail_store.TailCandidateConflict:
             pass
         raise
@@ -174,27 +187,30 @@ def reconcile(gh, config, number=None):
             result = _read(gh, config, row)
             if result["state"] in ("ready", "waiting-policy"):
                 outcomes = []
-                complete = True
+                issue_error = None
                 for index, item, records, outcome in _inspect_items(config, row, result):
                     if outcome is None:
                         outcome, error = tail_recovery.reconcile_item(result, index, item, records, snapshot)
                         if error is not None:
                             errors.append({"number": pr_number, "item": index, "reason": error})
-                            complete = False
+                            issue_error = issue_error or error
                         previous = _recorded_ambiguity(row, _version(row, result), index)
                         if previous is not None and (outcome is None
-                                or outcome["state"] not in ("existing-issue", "ambiguous-create")):
+                                or outcome["state"] not in ("existing-issue", "ambiguous-create", "active-elsewhere")):
                             outcome = previous
                     if outcome is not None:
                         outcomes.append(outcome)
                 needs_recheck = any(item["state"] == "existing-issue"
-                                    or complete and item["state"] == "ambiguous-create" for item in outcomes)
+                                    or issue_error is None and item["state"] == "ambiguous-create" for item in outcomes)
                 if needs_recheck and not _recovery_source_unchanged(gh, config, row, result):
                     reason = "TAIL selected review or controls changed during recovery lookup"
                     result = {"state": "invalid-source", "reason": reason}
                     errors.append({"number": pr_number, "reason": reason})
                 else:
                     result = _project_recovery(row, result, outcomes)
+                result["proof_error"] = {"kind": "issue", "reason": issue_error} if issue_error else None
+            else:
+                result["proof_error"] = None
             _record(row, result)
         except tail_store.TailCandidateConflict:
             observations.append({"number": pr_number, "state": "changed-concurrently"})
@@ -246,13 +262,15 @@ def create(gh, config, number, version, item, context_file=None):
     prior_recovery = (row.get("recovery") or []) if same_version else []
     other_outcomes = [value for value in prior_recovery if value["item"] != item]
     previous = _recorded_ambiguity(row, version, item)
+    recovery_error = None
     if outcome is None and (paused or previous is not None or records[2]):
         snapshot = tail_recovery.RecoverySnapshot(gh, config)
-        outcome, error = tail_recovery.reconcile_item(source, item, identity, records, snapshot)
-        if previous is not None and (outcome is None or outcome["state"] not in ("existing-issue", "ambiguous-create")):
+        outcome, recovery_error = tail_recovery.reconcile_item(source, item, identity, records, snapshot)
+        if previous is not None and (outcome is None or outcome["state"] not in (
+                "existing-issue", "ambiguous-create", "active-elsewhere")):
             outcome = {key: value for key, value in previous.items() if key != "item"}
         if (outcome is not None and outcome["state"] in ("existing-issue", "ambiguous-create")
-                and error is None and not _recovery_source_unchanged(gh, config, row, source)):
+                and recovery_error is None and not _recovery_source_unchanged(gh, config, row, source)):
             reason = "TAIL selected review or controls changed during recovery lookup"
             _record(row, {"state": "invalid-source", "reason": reason})
             raise PipelineError(reason)
@@ -268,6 +286,8 @@ def create(gh, config, number, version, item, context_file=None):
         if failure is not None:
             projection = dict(source, state=state, reason=failure["reason"])
             break
+    if recovery_error:
+        projection = dict(projection, proof_error={"kind": "issue", "reason": recovery_error})
     # Only update the observation actually examined by this process. A
     # concurrent reclassification must not be undone by a late result.
     try:

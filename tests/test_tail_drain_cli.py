@@ -508,6 +508,33 @@ def reconcile_item(cli, number=42):
     return item
 
 
+def expire_tail_claim(source):
+    claim = next(c for c in source["comments"] if c["body"].startswith("<!-- pp:tail-claim "))
+    node = next(edge["node"] for edge in source["snapshot"]["edges"]
+                if edge["node"].get("id") == claim["node_id"])
+    expired = utc(datetime.now(timezone.utc) - timedelta(minutes=31))
+    claim.update(created_at=expired, updated_at=expired)
+    node["createdAt"] = expired
+
+
+def test_reconcile_defers_to_an_active_writer_after_ref(http_cli):
+    cli, peer = http_cli(source_fixture())
+    command = selected(cli.run)
+    peer.pause_after_write = "ref"
+    with cli.start(*command) as writer:
+        try:
+            assert peer.write_visible.wait(90)
+            item = reconcile_item(cli)
+            assert item["state"] == "active-elsewhere" and not item.get("issue")
+            assert peer.writes == ["claim", "ref"]
+        finally:
+            peer.resume.set()
+            out, err = writer.communicate(timeout=100)
+    assert writer.returncode == 0, (out, err)
+    assert json.loads(out)["issue"] == 2000
+    assert len(peer.issues) == 1
+
+
 @pytest.mark.parametrize("boundary", ["ref", "intent"])
 def test_restart_does_not_create_from_an_unsettled_remote_fence(http_cli, boundary):
     sources = [source_fixture()]
@@ -518,6 +545,8 @@ def test_restart_does_not_create_from_an_unsettled_remote_fence(http_cli, bounda
     command = selected(cli.run, {"ready": [row for row in selection["ready"] if row["number"] == 42]})
     crash_after_write(cli, peer, command, boundary)
     writes = ["claim", "ref"] + (["intent"] if boundary == "intent" else [])
+    assert reconcile_item(cli)["state"] == "active-elsewhere"
+    expire_tail_claim(peer.sources[42])
     item = reconcile_item(cli)
     assert item["state"] == "ambiguous-create" and not item.get("issue")
     assert item["reason"]
@@ -549,6 +578,7 @@ def test_restart_under_hold_recovers_issue_on_second_page_without_a_second_write
     assert peer.writes == ["claim", "ref", "intent", "issue"]
     backlog = cli.backlog()
     assert backlog["counts"] == {"ambiguous-create": 1}
+    assert backlog["proof_unavailable_count"] == 1
     assert backlog["last_drain_failure"]
     peer.issue_page_timeout = None
     # The exact issue was visible before the failed page, and is on page two
@@ -566,6 +596,7 @@ def test_restart_under_hold_recovers_issue_on_second_page_without_a_second_write
     assert direct["state"] == "existing-issue" and direct["issue"] == 2000
     backlog = cli.backlog()
     assert backlog["counts"] == {"waiting-policy": 1}
+    assert backlog["proof_unavailable_count"] == 0
     assert backlog["candidates"][0]["recovery"][0]["issue"] == 2000
     assert peer.issue_pages_read.count(2) >= 2
     assert peer.writes == ["claim", "ref", "intent", "issue"]

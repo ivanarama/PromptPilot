@@ -81,6 +81,7 @@ def inspect_item(config, row, source, index):
 def reconcile_item(source, index, item, records, snapshot):
     lease, _, intents, dropped = records
     paused = source["state"] == "waiting-policy" or dropped
+    active = lease is not None and datetime.now(timezone.utc) < lease[2] + _TTL
     ref = _REF_PREFIX + item.dedupe
     intent = intents[0][0] if intents else None
     evidence = {"item": index, "intent": intent, "ref": ref}
@@ -90,9 +91,10 @@ def reconcile_item(source, index, item, records, snapshot):
             if existing is not None:
                 return {**evidence, "state": "existing-issue", "issue": existing,
                         "reason": "found the issue for the interrupted TAIL item"}, None
-            reason = (f"no issue proved for create-intent {intent}" if intent is not None
-                      else f"no issue proved for the existing dedupe ref {ref}")
-            return {**evidence, "state": "ambiguous-create", "reason": reason}, None
+            if not active:
+                reason = (f"no issue proved for create-intent {intent}" if intent is not None
+                          else f"no issue proved for the existing dedupe ref {ref}")
+                return {**evidence, "state": "ambiguous-create", "reason": reason}, None
     except ItemStop as stop:
         return {**evidence, **stop.outcome}, None
     except PipelineError as exc:
@@ -100,7 +102,7 @@ def reconcile_item(source, index, item, records, snapshot):
 
     if dropped:
         return {"item": index, "state": "waiting-policy", "reason": "the maintainer dropped this item"}, None
-    if lease is not None and datetime.now(timezone.utc) < lease[2] + _TTL:
-        return {"item": index, "state": "active-elsewhere",
+    if active:
+        return {**evidence, "state": "active-elsewhere",
                 "reason": "an unexpired item lease belongs to another process"}, None
     return None, None

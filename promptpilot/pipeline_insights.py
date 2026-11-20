@@ -5289,7 +5289,7 @@ def _tail_diagnostics(profile: dict, now: datetime) -> dict:
         "complete": False, "repository": repository, "base": base,
         "discovery_complete_through": None, "discovery_age_seconds": None,
         "uncovered_intervals": None, "uncovered_interval_count": None, "pending_proof": None,
-        "recheck_due": None,
+        "recheck_due": None, "proof_unavailable_count": None,
         "counts": dict.fromkeys(states), "completions": dict.fromkeys(completion_kinds),
         "oldest_ready_age_seconds": None, "last_successful_drain_at": None,
         "last_drain_failure": None,
@@ -5311,8 +5311,11 @@ def _tail_diagnostics(profile: dict, now: datetime) -> dict:
     age = (now - covered_through).total_seconds() if covered_through is not None else None
     pending = backlog["counts"].get("pending-proof", 0)
     recheck_due = backlog.get("recheck_due")
+    proof_unavailable_count = backlog.get("proof_unavailable_count")
     if discovery.get("last_error"):
         state, reason = "unavailable", "Сверка TAIL не выполнена. " + discovery["last_error"]
+    elif proof_unavailable_count:
+        state, reason = "unavailable", "Сверка TAIL не выполнена. Доказательство недоступно для части PR"
     elif (discovery.get("state") != "complete" or discovery.get("pending_intervals")
           or discovery.get("verify_pending") or not discovery.get("discovery_complete_through")):
         state, reason = "incomplete", "Обход истории TAIL ещё не завершён"
@@ -5338,6 +5341,7 @@ def _tail_diagnostics(profile: dict, now: datetime) -> dict:
         uncovered_interval_count=discovery.get("pending_intervals"),
         pending_proof=pending or default_count,
         recheck_due=recheck_due or default_count,
+        proof_unavailable_count=proof_unavailable_count or default_count,
         counts={key: sum(backlog["counts"].get(name, 0) for name in names) or default_count
                 for key, names in states.items()},
         completions={key: backlog["completions"].get(key) or default_count for key in completion_kinds},

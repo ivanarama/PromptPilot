@@ -109,6 +109,40 @@ def test_last_drain_success_and_refusal_are_read_from_their_own_branch(profile):
     assert tail["complete"] is True  # This does not replace the separate discovery status.
 
 
+def test_failed_candidate_proof_is_unavailable_until_that_proof_is_rechecked(profile):
+    candidates = [{"number": number, "head": "a" * 40, "base": "main",
+                   "merged_at": REVIEW["review_updated_at"]} for number in (42, 43)]
+    checkpoint(candidates=candidates)
+    timeout = {"kind": "issue", "reason": "GitHub pagination timed out"}
+
+    def record(number, state, **proof):
+        candidate = tail_store.get_candidate(REPOSITORY, "main", number)
+        tail_store.record_result(candidate, state=state, **REVIEW, **proof)
+
+    record(42, "ambiguous-create", proof_error=timeout)
+    record(43, "ready", proof_error=None)
+    tail_store.record_drain_event(REPOSITORY, "main", failure=timeout["reason"])
+    tail_store.record_drain_event(REPOSITORY, "main")
+
+    failed = read_tail()
+    assert failed["state"] == "unavailable" and failed["complete"] is False
+    assert failed["reason"].startswith("Сверка TAIL не выполнена.")
+    assert failed["proof_unavailable_count"] == 1
+    assert failed["counts"] == dict(ready=1, waiting=None, invalid=None, ambiguous=1)
+
+    record(42, "ambiguous-create")  # Reading the review alone does not check issue ownership.
+    row = tail_store.get_candidate(REPOSITORY, "main", 42)
+    assert row["proof_error"] == timeout
+    assert read_tail()["proof_unavailable_count"] == 1
+
+    record(42, "invalid-source", proof_error=None)  # The source was read and proved invalid.
+    verified = read_tail()
+    assert verified["complete"] is True
+    assert verified["counts"] == dict(ready=1, waiting=0, invalid=1, ambiguous=0)
+    assert verified["proof_unavailable_count"] == 0
+    assert verified["last_drain_failure"]["reason"] == timeout["reason"]
+
+
 def test_fresh_discovery_does_not_revalidate_overdue_completion(profile):
     source = {"number": 42, "head": "a" * 40, "base": "main", "merged_at": REVIEW["review_updated_at"]}
     revision = checkpoint(candidates=[source], age=31 * 86400)

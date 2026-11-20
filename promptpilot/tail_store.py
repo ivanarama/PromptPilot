@@ -180,6 +180,7 @@ def _projection(conn):
     has_revision = "classified_revision" in columns
     current = "classified_revision = revision" if has_revision else "0"
     recovery = f"CASE WHEN {current} THEN recovery_json END" if "recovery_json" in columns else "NULL"
+    proof_error = f"CASE WHEN {current} THEN proof_error END" if "proof_error" in columns else "NULL"
     select = f"""SELECT repository, pr_number, base, head, merged_at, last_observed_at, revision,
                       CASE WHEN {current} THEN state ELSE 'pending-proof' END AS state,
                       review_id, review_updated_at, review_body_digest, epoch_digest,
@@ -187,19 +188,20 @@ def _projection(conn):
                       CASE WHEN {current} THEN completion_digest END AS completion_digest,
                       CASE WHEN {current} THEN next_check_at END AS next_check_at,
                       CASE WHEN {current} THEN last_reason END AS last_reason,
-                      {recovery} AS recovery_json
+                      {recovery} AS recovery_json, {proof_error} AS proof_error
                FROM tail_candidates WHERE repository = ? AND base = ?"""
     return select, has_revision
 
 
 def _candidate(row):
     candidate = dict(row)
-    evidence = candidate.pop("recovery_json")
-    if evidence is not None:
-        try:
-            candidate["recovery"] = json.loads(evidence)
-        except ValueError as exc:
-            raise sqlite3.DatabaseError("invalid local TAIL recovery evidence") from exc
+    for column, key in (("recovery_json", "recovery"), ("proof_error", "proof_error")):
+        evidence = candidate.pop(column)
+        if evidence is not None:
+            try:
+                candidate[key] = json.loads(evidence)
+            except ValueError as exc:
+                raise sqlite3.DatabaseError(f"invalid local TAIL {key} evidence") from exc
     return candidate
 
 
@@ -245,9 +247,12 @@ def due_candidates(repository, base, limit=5):
     return [_candidate(row) for row in primary[:limit - retry_slots] + retries[:retry_slots]]
 
 
+_KEEP_PROOF_ERROR = object()
+
+
 def record_result(candidate, *, state, reason=None, review_id=None, review_updated_at=None,
                   review_body_digest=None, epoch_digest=None, completion_kind=None,
-                  completion_digest=None, next_check_at=None, recovery=None):
+                  completion_digest=None, next_check_at=None, recovery=None, proof_error=_KEEP_PROOF_ERROR):
     """CAS the classifier's result for the observed PR and append its public metadata locally."""
     from . import db
 
@@ -280,6 +285,15 @@ def record_result(candidate, *, state, reason=None, review_id=None, review_updat
         json.dumps(recovery, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
         if recovery else None
     )
+    # A plain source classification does not verify an earlier failed issue lookup.
+    if proof_error is _KEEP_PROOF_ERROR:
+        proof_error = candidate.get("proof_error")
+    if proof_error is not None:
+        if (not isinstance(proof_error, dict) or proof_error.get("kind") not in {"source", "issue"}
+                or not isinstance(proof_error.get("reason"), str) or not proof_error["reason"]):
+            raise PipelineError("invalid TAIL proof error")
+        proof_error = json.dumps({"kind": proof_error["kind"], "reason": proof_error["reason"][:1000]},
+                                 separators=(",", ":"), ensure_ascii=False)
 
     now = datetime.now(timezone.utc)
     if next_check_at is not None:
@@ -300,10 +314,12 @@ def record_result(candidate, *, state, reason=None, review_id=None, review_updat
             UPDATE tail_candidates SET revision = ?, classified_revision = ?, state = ?,
                 review_id = coalesce(?, review_id), review_updated_at = coalesce(?, review_updated_at),
                 review_body_digest = coalesce(?, review_body_digest), epoch_digest = coalesce(?, epoch_digest),
-                completion_kind = ?, completion_digest = ?, next_check_at = ?, last_reason = ?, recovery_json = ?
+                completion_kind = ?, completion_digest = ?, next_check_at = ?, last_reason = ?, recovery_json = ?,
+                proof_error = ?
             WHERE repository = ? AND base = ? AND pr_number = ? AND head = ? AND merged_at = ?
               AND revision = ?""",
-            (revision, revision, state, *version, completion_kind, completion_digest, next_check_at, reason, recovery_json,
+            (revision, revision, state, *version, completion_kind, completion_digest, next_check_at,
+             reason, recovery_json, proof_error,
              candidate["repository"], candidate["base"], candidate["pr_number"], candidate["head"],
              candidate["merged_at"], candidate["revision"]))
         if result.rowcount != 1:
@@ -372,7 +388,7 @@ def backlog(repository, limit=100, after=0, *, base="main"):
     result = {
         "repository": repository, "base": base, "discovery": None, "age_seconds": None,
         "oldest_ready_at": None, "last_successful_drain_at": None, "last_drain_failure": None,
-        "recheck_due": None,
+        "recheck_due": None, "proof_unavailable_count": None,
         "counts": {}, "completions": {}, "candidates": [], "next_after": None,
     }
     with _read_index() as conn:
@@ -390,9 +406,12 @@ def backlog(repository, limit=100, after=0, *, base="main"):
                    WHERE repository = ? AND base = ? AND classified_revision = revision
                      AND state != 'ready' AND next_check_at <= ?""",
                 (repository, base, datetime.now(timezone.utc).isoformat())).fetchone()
-        counts = conn.execute(f"""SELECT state, completion_kind, count(*), min(merged_at) FROM ({candidates})
+        result["proof_unavailable_count"] = 0
+        counts = conn.execute(f"""SELECT state, completion_kind, count(*), min(merged_at), count(proof_error)
+                                  FROM ({candidates})
                                   GROUP BY state, completion_kind""", (repository, base))
-        for state, kind, count, oldest in counts:
+        for state, kind, count, oldest, unavailable_count in counts:
+            result["proof_unavailable_count"] += unavailable_count
             if state == "resolved":
                 result["completions"][kind] = count
             else:

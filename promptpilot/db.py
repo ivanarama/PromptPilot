@@ -199,6 +199,7 @@ CREATE TABLE IF NOT EXISTS tail_candidates (
     next_check_at TEXT,
     last_reason TEXT,
     recovery_json TEXT,
+    proof_error TEXT,
     PRIMARY KEY (repository, pr_number)
 );
 CREATE INDEX IF NOT EXISTS idx_tail_candidates_pass
@@ -570,6 +571,7 @@ MIGRATIONS = [
     "ALTER TABLE tasks ADD COLUMN pipeline_priority_restore INTEGER",
     "ALTER TABLE tail_candidates ADD COLUMN classified_revision INTEGER",
     "ALTER TABLE tail_candidates ADD COLUMN recovery_json TEXT",
+    "ALTER TABLE tail_candidates ADD COLUMN proof_error TEXT",
     """CREATE INDEX IF NOT EXISTS idx_tail_candidates_age
        ON tail_candidates(repository, base, merged_at, pr_number)
        WHERE classified_revision IS NOT revision OR state IN ('ready', 'pending-proof')""",
