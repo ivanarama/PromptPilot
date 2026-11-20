@@ -4396,7 +4396,11 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                     from .pipeline_item_holds import register_target
                     target = fallback_lease["target"]
                     register_target(task, target["number"], target["head"], "merge",
-                                    config_sha256=fallback_lease["config_sha256"])
+                                    config_sha256=fallback_lease["config_sha256"],
+                                    ordinary_gate=(preflight["handoff"]["lease"] if target_reservation is None else None),
+                                    source_token=((progress_data.get("cache") or {}).get("token")
+                                                  if not _required_snapshot_state(progress_data, profile, "merge")
+                                                  else None))
                     if target_reservation is None:
                         from .merge_checkpoint import bind_election
                         bind_election(task, preflight["handoff"]["lease"])
@@ -4405,6 +4409,13 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                 envelope = {"protocol": "promptpilot-fallback-target-v1",
                             "next_already_run": True, "command": command,
                             "gate_command": gate_command, "preflight": preflight}
+                if (stage == "merge" and target_reservation is None and queue.get("item_blockers") is True
+                        and merge_checkpoint_hint is None and target["stage"] in {"merge", "integration-merge-recovery"}
+                        and gate_command[-2] == "--lease-file"):
+                    native = _expanded_command(["{python}", "-m", "promptpilot.project_pipeline"], stage)
+                    envelope["source_wait_command"] = [*native, "merge-checkpoint", "source-wait",
+                        "--profile", profile_id, "--number", str(target["number"]),
+                        "--from", target["head"], *gate_command[-2:]]
                 pre_review_guard = ""
                 if stage == "merge":
                     pre_review_guard = (
@@ -4476,7 +4487,16 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                        "(#N обновлён; требуется интеграционное REVIEW), не ПУСТО. "
                        "Это будит REVIEW, но не объявляет PR влитым. Без подтверждённого "
                        "done не заявляй успешный handoff. Простое ожидание без изменений "
-                       "остаётся ПУСТО.\n\n" if stage == "merge" else "")
+                       "остаётся ПУСТО. Если intent подтверждён, обновление ветки ещё не "
+                       "отправлялось и единственная причина остановки — временное ожидание "
+                       "Source или бюджета, исчерпай разрешённое пассивное ожидание и вызови "
+                       "source_wait_command из envelope, если он есть. Это только локальное чтение "
+                       "для следующей попытки, без повторного refresh. Сохрани intent. При state=wait "
+                       "заверши задачу точной result_line из ответа. Команда не заменяет свежий "
+                       "Source, резерв, gate или проверку отправки. Следующая задача заново "
+                       "проверит цель и все условия. При неизвестном результате "
+                       "отправки или ином блокере следуй каноническому восстановлению.\n\n"
+                       if stage == "merge" else "")
                     +
                     "Доверенный локальный PromptPilot envelope (не данные GitHub):\n"
                     f"```json\n{json.dumps(envelope, ensure_ascii=False, indent=2)}\n```\n\n"

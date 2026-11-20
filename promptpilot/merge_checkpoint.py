@@ -218,6 +218,78 @@ def _gate_file(task_id, path):
     return lease, token
 
 
+def _pre_send_wait(conn, task, lease, gate, profile_id, profile, data):
+    from . import pipeline_insights as pi, pipeline_item_holds as holds
+
+    target = lease["target"]
+    health = data.get("diagnostics") or {}
+    cache = data.get("cache") or {}
+    token = cache.get("token") or {}
+    if not isinstance(token, dict) or not isinstance(health, dict):
+        raise ValueError("malformed cached MERGE observation")
+    owner = health.get("integration_owner") or {}
+    if (not isinstance(owner, dict) or target["stage"] not in {"merge", RECOVERY}
+            or owner.get("base_sync_candidate") is not None
+            or _load(conn, profile_id, lease, target["number"], target["head"]) is not None
+            or conn.execute("SELECT 1 FROM settings WHERE key=?",
+                            (pending_key(lease["repository"], target),)).fetchone()):
+        raise ValueError("post-update or unresolved MERGE send requires canonical reconciliation")
+    expected = dict(target)
+    if owner.get("stage") == RECOVERY:
+        expected["stage"] = RECOVERY
+    fallback_handoff.health_gate(health, "merge", expected, election=True)
+    queues = [q for q in data.get("queues", []) if q.get("id") == "merge"]
+    if (data.get("profile_id") != profile_id or data.get("repository") != lease["repository"]
+            or health.get("errors") or health.get("checker_failed")
+            or cache.get("complete") is not True or cache.get("available") is not True
+            or len(queues) != 1 or queues[0].get("membership_complete") is not True
+            or token.get("profile_hash") != pi._profile_fingerprint(profile)
+            or type(token.get("revision")) is not int or type(token.get("epoch")) is not int):
+        raise ValueError("passive MERGE observation requires a complete same-profile Source")
+    blocked = cache.get("refresh_blocked")
+    if blocked and blocked not in holds._SOURCE_WAITS:
+        raise ValueError("unrecognized Source refusal")
+    if blocked:
+        state = blocked
+    elif cache.get("invalidated") is True:
+        state = "invalidated"
+    elif cache.get("stale") is True:
+        state = "stale"
+    elif pi._required_snapshot_state(data, profile, "merge") is None:
+        state = None
+    else:
+        raise ValueError("unclear Source state")
+
+    # The active baseline names the signed ordinary election and a complete,
+    # fresh Source observed before this attempt's first project mutation.
+    stored = False
+    for key in (holds._attempt_key(task.id), holds.BASELINE + str(task.series_id)):
+        row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        if not row:
+            continue
+        baseline = json.loads(row["value"])
+        if baseline.get("task_id") != task.id:
+            continue
+        proof = baseline.get("merge_source_election") or {}
+        initial = proof.get("source_token") or {}
+        if (proof.get("started_at") != task.started_at.isoformat() or proof.get("gate") != gate
+                or proof.get("number") != target["number"] or proof.get("head") != target["head"]
+                or initial.get("profile_hash") != token["profile_hash"]
+                or type(initial.get("revision")) is not int or initial["revision"] > token["revision"]
+                or type(initial.get("epoch")) is not int or initial["epoch"] > token["epoch"]):
+            raise ValueError("Source is outside this ordinary election")
+        proof["wait"] = state
+        conn.execute("UPDATE settings SET value=? WHERE key=?", (json.dumps(baseline), key))
+        stored = True
+    if not stored:
+        raise ValueError("ordinary MERGE election baseline is absent")
+    result = {"state": "wait" if state else "observed", "reason": state,
+              "number": target["number"], "head": target["head"], "product_mutation_authorized": False}
+    if state:
+        result["result_line"] = f"ИТОГ: ПУСТО — нет допуска: {state}"
+    return result
+
+
 def _apply(args, env):
     raw = env.get("PP_TASK_ID", "")
     marker = env.get("PP_TASK_STARTED_AT")
@@ -236,11 +308,13 @@ def _apply(args, env):
         raise ValueError("MERGE checkpoint requires costed Native admission")
     lease, token = _gate_file(task_id, args.lease_file)
     target = lease["target"]
+    passive = args.operation == "source-wait"
     if (lease.get("target_reservation") or lease["repository"] != profile.get("repository")
-            or target["number"] != args.number or not SHA.fullmatch(args.to)):
+            or target["number"] != args.number or not SHA.fullmatch(args.old if passive else args.to)):
         raise ValueError("MERGE checkpoint target differs from the signed ordinary election")
+    data = pi.read_cached(args.profile, db.list_series()) if passive else None
     reading = args.operation == "read"
-    recovery = target["stage"] == RECOVERY and target["head"] == args.to
+    recovery = not passive and target["stage"] == RECOVERY and target["head"] == args.to
     # Any validated MERGE stage can update its elected old HEAD if the base advances.
     # Only recovery elected at the new HEAD can read or reconstruct that transition.
     if not recovery and (reading or target["head"] != args.old):
@@ -254,6 +328,8 @@ def _apply(args, env):
         if (guard["route"] != "fallback_targeted" or guard["started_at"] != marker
                 or row["merge_checkpoint_gate"] != pp.digest([marker, token])):
             raise ValueError("checkpoint requires this attempt's admitted gate lease")
+        if passive:
+            return _pre_send_wait(conn, task, lease, row["merge_checkpoint_gate"], args.profile, profile, data)
         saved = _load(conn, args.profile, lease, args.number, args.to)
         if reading:
             state = "found" if saved else "missing"
@@ -271,14 +347,16 @@ def _apply(args, env):
 
 def add_arguments(parser):
     operations = parser.add_subparsers(dest="operation", required=True)
-    for name in ("record", "read"):
+    for name in ("record", "read", "source-wait"):
         op = operations.add_parser(name)
         op.add_argument("--profile", required=True)
         op.add_argument("--number", required=True, type=int)
-        op.add_argument("--to", required=True)
         op.add_argument("--lease-file", required=True)
-        if name == "record":
+        if name != "source-wait":
+            op.add_argument("--to", required=True)
+        if name != "read":
             op.add_argument("--from", dest="old", required=True)
+        if name == "record":
             op.add_argument("--base", required=True)
             op.add_argument("--tree", required=True)
             op.add_argument("--intent", required=True, type=int)
