@@ -27,19 +27,31 @@ def reservation_cost(policy):
     }  # two live account observations at the final gate
 
 
+def full_phases(policy):
+    """The general proof has the ordinary fallback's allowance; hold back the gate and receipt."""
+    cost = policy["costs"]["fallback_targeted"]
+    core = cost["core"] - PHASES["gate"][0] - PHASES["publication"][0]
+    graphql = (cost["graphql"] - policy["costs"]["insights"]["graphql"] - 4
+               - PHASES["gate"][1] - PHASES["publication"][1])
+    if core < 1 or graphql < 1:
+        raise pp.PipelineError("ordinary MERGE budget cannot fund confirmation and its gate/readback")
+    return {**PHASES, "proof": (core, graphql)}
+
+
 class Transport:
-    def __init__(self, profile, gh, fence, *, receipt=False):
+    def __init__(self, profile, gh, fence, *, receipt=False, phases=None):
         self.profile = profile
         self.backend = gh
         self.fence = fence
         self.phase = "receipt" if receipt else "proof"
-        phases = {"receipt": (RECEIPT_COST["core"], RECEIPT_COST["graphql"])} if receipt else PHASES
+        phases = {"receipt": (RECEIPT_COST["core"], RECEIPT_COST["graphql"])} if receipt else (phases or PHASES)
         self.rest = {phase: size[0] for phase, size in phases.items()}
         self.graphql = {phase: ObservationCost(size[1]) for phase, size in phases.items()}
         self.health_allowance = profile["github_budget"]["costs"]["insights"]["graphql"]
         self.health_nonce = None
         self.sent = False
         self.authorized_body = None
+        self.commit_send = None
         self.actor = (
             (profile.get("priority_control") or {}).get("trusted_account")
             if receipt
@@ -103,11 +115,16 @@ class Transport:
         )
         return value
 
-    def _rest(self, *args, input_value=None):
+    def _rest(self, *args, input_value=None, sending=False):
         self.fence()
         if self.rest[self.phase] <= 0:
             raise pp.PipelineError("confirmation REST page allowance exhausted")
         self.rest[self.phase] -= 1
+        if sending:
+            # Commit after every local check. From this point a crash or a lost
+            # response is indistinguishable from an accepted GitHub comment.
+            self.commit_send()
+            self.sent = True
         return self.backend.json(
             "api",
             *args,
@@ -172,6 +189,7 @@ class Transport:
             self.phase == "publication"
             and not self.sent
             and self.authorized_body is not None
+            and self.commit_send is not None
             and args[2:] == ("--method", "POST", "--input", "-")
             and path == f"repos/{self.profile['repository']}/issues/{self.number}/comments"
             and isinstance(input_value, dict)
@@ -179,8 +197,7 @@ class Transport:
             and hashlib.sha256(input_value["body"].encode("utf-8")).hexdigest()
             == self.authorized_body
         ):
-            self.sent = True
-            return self._rest(*args[1:], input_value=input_value)
+            return self._rest(*args[1:], input_value=input_value, sending=True)
         raise pp.PipelineError("unsupported confirmation write or REST options")
 
     def run(self, *args, **kwargs):

@@ -14,8 +14,12 @@ from . import (
     pipeline_insights as pi,
 )
 from . import project_pipeline as pp
-from .merge_finish_transport import PHASES, Transport, reservation_cost
+from .merge_finish_transport import PHASES, Transport, full_phases, reservation_cost
 from .task_identity import task_execution_fingerprint
+
+
+class SourceChanged(pp.PipelineError):
+    """A fresh election must rebind the published Source before sending."""
 
 
 def execute(
@@ -28,10 +32,13 @@ def execute(
     working_dir,
     handoff,
     checkpoint,
+    *,
+    full=False,
 ):
     scope = pi._GITHUB_SCAN_LEASE_SCOPE
     budget = pi._github_budget_policy(profile)
-    reserved = reservation_cost(budget)
+    route = "merge_full_confirmation" if full else "merge_confirmation"
+    reserved = budget["costs"]["fallback_targeted"] if full else reservation_cost(budget)
     account = admission["_lease"]
     reservation = getattr(pi._execution_budget_context, "reservation", None)
     target = handoff["target"]
@@ -48,6 +55,7 @@ def execute(
     accepted_token = None
     prepared = False
     source_called = False
+    gate_called = False
 
     def ledger(conn):
         observed = db._pipeline_source_refresh_state(
@@ -56,8 +64,8 @@ def execute(
             task.id,
             profile_id,
             queue["id"],
-            {"merge_confirmation": reserved},
-            bounded_route="merge_confirmation",
+            {route: reserved},
+            bounded_route=route,
         )
         guard = observed["guard"]
         row = conn.execute(
@@ -96,7 +104,7 @@ def execute(
                 or int(revision[0]) != accepted_token["revision"]
                 or not 0 <= time.time() - accepted_token["generated_at"] < pi._CACHE_TTL_SECONDS
             ):
-                raise pp.PipelineError("MERGE confirmation lost its published Source token")
+                raise SourceChanged("MERGE confirmation lost its published Source token")
         return observed
 
     def native_fence():
@@ -117,7 +125,7 @@ def execute(
         if pi._required_snapshot_state(
             current, profile, "merge"
         ) or not merge_checkpoint.agrees_with_source(current, lease, checkpoint):
-            raise pp.PipelineError("MERGE confirmation Source expired or owner changed")
+            raise SourceChanged("MERGE confirmation Source expired or owner changed")
         member = next(q for q in current["queues"] if q["id"] == "merge")
         runtime = current.get("runtime") or {}
         if (
@@ -146,7 +154,7 @@ def execute(
             or accepted_token is not None
             and token != accepted_token
         ):
-            raise pp.PipelineError("MERGE confirmation Source token changed")
+            raise SourceChanged("MERGE confirmation Source token changed")
         return token
 
     def fence():
@@ -252,9 +260,9 @@ def execute(
         prepared = True
 
     def gate():
-        nonlocal denied
-        if not prepared:
-            raise pp.PipelineError("late Source verification is absent")
+        nonlocal denied, gate_called
+        if not prepared or gate_called:
+            raise pp.PipelineError("late Source verification is absent or the scheduling gate was already used")
         require_source()
         fence()
         # We already paid for proof. Only the independently capped gate and
@@ -274,7 +282,7 @@ def execute(
             "graphql": PHASES["gate"][1] + PHASES["publication"][1] + transport.health_allowance,
         }
         policy = pi._budget_policy_for_route(
-            pi._with_shared_budget_floor(budget), "merge_confirmation"
+            pi._with_shared_budget_floor(budget), route
         )
         policy = pi._with_execution_snapshot_floor(
             pi._budget_policy_for_admission_priority(policy, task.priority)
@@ -294,6 +302,7 @@ def execute(
             denied = decision
             raise pp.PipelineError(decision["state"])
         transport.phase = "gate"
+        gate_called = True
         result = fallback_handoff.gate(
             transport, config, "merge", token, config_path=path, meter=transport
         )
@@ -303,7 +312,6 @@ def execute(
         return result
 
     def claim(number, head, intent, body_sha256):
-        nonlocal sent_already
         fence()
         if (
             (number, head, intent) != (target["number"], target["head"], checkpoint["intent"])
@@ -311,6 +319,12 @@ def execute(
             or not re.fullmatch("[a-f0-9]{64}", body_sha256)
         ):
             raise pp.PipelineError("MERGE confirmation send identity differs")
+        transport.authorized_body = body_sha256
+        transport.commit_send = lambda: commit_send(body_sha256)
+        return True
+
+    def commit_send(body_sha256):
+        nonlocal sent_already
         with db._connect(immediate=True) as conn:
             ledger(conn)
             created = conn.execute(
@@ -318,9 +332,8 @@ def execute(
                 (key, json.dumps(dict(pending_id, body_sha256=body_sha256))),
             ).rowcount
         sent_already = True
-        if created:
-            transport.authorized_body = body_sha256
-        return created == 1
+        if not created:
+            raise pp.PipelineError("previous MERGE confirmation send requires receipt readback")
 
     try:
         lease = fallback_handoff.validate(handoff, "merge")
@@ -333,6 +346,7 @@ def execute(
             sent_already = True
             if any(previous[k] != v for k, v in pending_id.items()):
                 raise pp.PipelineError("another MERGE confirmation send awaits readback")
+            raise pp.PipelineError("a previous MERGE confirmation send awaits readback")
         # The operator's election config is rebound by its signed content hash.
         # No path or executable from the PR, provider or checkpoint is accepted.
         if (
@@ -349,11 +363,14 @@ def execute(
         config = pp.load_config(path)
         merge_checkpoint.bind_election(task, token)
         fence()
-        transport = Transport(
-            profile, pp.GitHub(timeout_seconds=config["github_timeout_seconds"]), fence
-        )
+        transport = Transport(profile, pp.GitHub(timeout_seconds=config["github_timeout_seconds"]), fence,
+                              phases=full_phases(budget) if full else PHASES)
         transport.number = checkpoint["number"]
-        result = merge_finish_proof.confirm(
+        confirm = merge_finish_proof.confirm
+        if full:
+            from .merge_done_publish import confirm
+            pending_id["proof_kind"] = "legacy-general-done-v1"
+        result = confirm(
             transport,
             config,
             checkpoint,
@@ -392,9 +409,15 @@ def execute(
             "completion": result,
             "reason": f"confirmed base-sync for PR #{target['number']}; integration REVIEW required",
         }
+    except SourceChanged as exc:
+        return {"action": "defer", "mode": "tool", "defer_for": "2m", "profile_id": profile_id,
+                "queue_id": "merge", "reason": str(exc),
+                "state": "receipt-readback" if sent_already else "re-elect-before-send"}
     except merge_finish_proof.OutsideScope as exc:
-        if not sent_already:
+        if not full and not source_called and not sent_already:
             return None
+        if full and not sent_already:
+            return _proof_block(task, profile_id, checkpoint, exc)
         reason = str(exc)
     except (
         OSError,
@@ -405,6 +428,22 @@ def execute(
         TypeError,
         IndexError,
     ) as exc:
+        if full and not sent_already:
+            from .merge_done_proof import UnsupportedProof
+            if isinstance(exc, UnsupportedProof):
+                try:
+                    if accepted_token is None:
+                        accepted_token = require_source()
+                    fence()
+                except SourceChanged as lost:
+                    return {"action": "defer", "mode": "tool", "defer_for": "2m",
+                            "profile_id": profile_id, "queue_id": "merge", "state": "re-elect-before-send",
+                            "reason": str(lost)}
+                except (OSError, sqlite3.Error, ValueError, RuntimeError, KeyError, TypeError) as lost:
+                    return {"action": "defer", "mode": "tool", "defer_for": "2m",
+                            "reason": "MERGE confirmation lost admission: " + pi._bounded_defer_text(lost)}
+                else:
+                    return _proof_block(task, profile_id, checkpoint, exc)
         reason = str(exc)
     if denied:
         return pi._budget_defer_route(
@@ -422,3 +461,11 @@ def execute(
         "defer_for": "2m",
         "reason": "MERGE confirmation stopped: " + pi._bounded_defer_text(reason),
     }
+
+
+def _proof_block(task, profile_id, checkpoint, exc):
+    from .pipeline_item_holds import register_target
+
+    register_target(task, checkpoint["number"], checkpoint["to"], "merge", config_sha256=checkpoint["config_sha256"])
+    return {"action": "block", "mode": "tool", "profile_id": profile_id, "queue_id": "merge",
+            "reason": f"#{checkpoint['number']} — cannot verify pushed base-sync: " + pi._bounded_defer_text(exc)}

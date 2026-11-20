@@ -80,9 +80,8 @@ def test_checked_pr_uses_only_the_bounded_executor_at_1094_core(recovery, monkey
     pi.release_execution_admission()
     snapshot["diagnostics"]["integration_owner"]["base_sync_candidate"]["base"] = "e" * 40
     refused = dispatch(f)
-    assert (
-        refused["action"] == "defer" and refused["github_budget"]["requested_cost"]["core"] == 1050
-    )
+    assert refused["action"] == "defer" and "matching fresh Source" in refused["reason"]
+    assert not f.db.pipeline_github_budget_reservations("github-default")["items"]
 
 
 def test_checked_pr_yields_to_aged_waiter(recovery):
@@ -254,7 +253,7 @@ def test_uncertain_send_holds_only_its_exact_fallback_through_new_claim(
 ):
     import hashlib
     import time
-    from promptpilot import fallback_handoff, merge_checkpoint, merge_finish_proof
+    from promptpilot import fallback_handoff, merge_checkpoint, merge_finish_proof, project_pipeline as pp
     from tests.test_fallback_handoff import health
 
     f, snapshot, project = native_recovery
@@ -277,11 +276,18 @@ def test_uncertain_send_holds_only_its_exact_fallback_through_new_claim(
         },
     )
 
+    class UncertainBackend:
+        def json(self, *args, **kwargs):
+            assert args[-4:] == ("--method", "POST", "--input", "-")
+            raise RuntimeError("connection dropped after POST")
+
+    monkeypatch.setattr(pp, "GitHub", lambda **kw: UncertainBackend())
+
     def lose_response(gh, config, checkpoint, *, gate, claim_send, prepare_source, **kwargs):
         prepare_source()
         gate()
         assert claim_send(42, HEAD, 101, digest)
-        raise RuntimeError("connection dropped after POST")
+        return pp.post_comment(gh, config, 42, "exact-comment")
 
     monkeypatch.setattr(merge_finish_proof, "confirm", lose_response)
     route = dispatch(f)

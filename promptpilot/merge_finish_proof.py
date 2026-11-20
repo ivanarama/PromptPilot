@@ -285,7 +285,7 @@ def _check_addressed(gh, config, number, snap, ids):
     _need(pp.canonical(verified) == pp.canonical(snap), "full timeline changed during addressed proof")
 
 
-def observe_receipt(gh, record, *, config):
+def observe_receipt(gh, record, *, config, expected_node_id=None):
     """Look up an uncertain send for just its recorded PR, including after REVIEW/merge.
 
     This only settles the local send journal. The original immutable intent and
@@ -347,6 +347,7 @@ def observe_receipt(gh, record, *, config):
     order = [n.get("id") for n in nodes]
     if (
         done["body"] != expected
+        or expected_node_id is not None and done["id"] != expected_node_id
         or not all(isinstance(i, str) and i for i in order)
         or len(set(order)) != len(order)
         or not 0 < (pp.comment_id(done) or 0) < 2**63

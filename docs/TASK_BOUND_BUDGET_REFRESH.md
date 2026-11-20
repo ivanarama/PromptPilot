@@ -95,6 +95,14 @@ and the exact gate file elected for this occurrence. A recovery election on
 the new HEAD can reconstruct a missing record from independently verified
 GitHub evidence after a crash.
 
+For an ordinary OneBase queue with `execution.merge_confirmation: "bounded-v1"`,
+the scheduler supplies the worker's `checkpoint_record_command`. A successful
+record returns `next_step: "native-confirmation"` and a terminal `result_line`.
+Return that line after the record. Native owns the done comment on the next
+signed election for the updated HEAD. The transfer is stored together with the
+checkpoint, so interruption after recording also leaves the next election eligible.
+An explicit human decision and previously parked items keep their usual admission rules.
+
 A signed recovery waiting for Source saves an observation hint for the same task.
 On its next claim, Native compares the remaining snapshot TTL with the profile's
 refresh-ahead interval. If needed, it runs the ordinary budgeted Source scan
@@ -106,6 +114,6 @@ configuration, or conflicting graph follows the repository recovery procedure.
 
 The commands print JSON and exit 0 on `recorded`, `found`, or `missing`.
 Exit 1 with `state: "refused"` reports a runtime refusal. Every result sets
-`product_mutation_authorized` to false. Only the repository procedure can
-validate the original intent, determine whether done already exists, and
-authorize its publication for the exact current HEAD.
+`product_mutation_authorized` to false. The final executor independently
+verifies the original intent, the actual push, the applicable CI evidence,
+and any existing done before its scheduling gate and journaled publication.

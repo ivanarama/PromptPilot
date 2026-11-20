@@ -364,7 +364,50 @@ def _apply(args, env):
                 key = _key(args.profile, lease["repository"], args.number, args.to, lease["config_sha256"])
                 conn.execute("INSERT INTO settings (key,value) VALUES (?,?)", (key, json.dumps(facts)))
             saved, state = facts, "recorded"
-    return {"state": state, "checkpoint": saved, "product_mutation_authorized": False}
+            transferred = _handoff(conn, task, lease, row["merge_checkpoint_gate"], facts)
+    result = {"state": state, "checkpoint": saved, "product_mutation_authorized": False}
+    if not reading and transferred:
+        result.update(next_step="native-confirmation", result_line="ИТОГ: ПУСТО — ожидание подтверждения обновления ветки")
+    return result
+
+
+def _handoff(conn, task, lease, gate, facts):
+    """Transfer only the managed ordinary attempt. A new native election re-proves every fact."""
+    from . import pipeline_item_holds as holds
+    target = lease["target"]
+    transferred = False
+    for key in (holds._attempt_key(task.id), holds.BASELINE + str(task.series_id)):
+        row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        if row is None:
+            continue
+        measured = json.loads(row["value"])
+        election = measured.get("merge_source_election") or {}
+        if (measured.get("task_id") != task.id or election.get("native_done") is not True
+                or election.get("started_at") != task.started_at.isoformat() or election.get("gate") != gate
+                or (election.get("number"), election.get("head")) != (target["number"], target["head"])):
+            continue
+        election["handoff"] = facts
+        conn.execute("UPDATE settings SET value=? WHERE key=?", (json.dumps(measured), key))
+        transferred = True
+    return transferred
+
+
+def handed_off(conn, series_id, task_id, raw):
+    """Only this attempt's recorded transfer may skip creation of a failure hold."""
+    try:
+        measured = json.loads(raw)
+        election = measured["merge_source_election"]
+        checkpoint = election["handoff"]
+        target = measured["review_target"]
+        task = conn.execute("SELECT series_id,started_at,merge_checkpoint_gate FROM tasks WHERE id=?", (task_id,)).fetchone()
+        return bool(task and task["series_id"] == series_id and measured["task_id"] == task_id
+                    and election["native_done"] is True and task["started_at"] == election["started_at"]
+                    and task["merge_checkpoint_gate"] and task["merge_checkpoint_gate"] == election["gate"]
+                    and target == {"stage": "merge", "number": checkpoint["number"], "head": election["head"]}
+                    and election["number"] == checkpoint["number"] and election["head"] in (checkpoint["from"], checkpoint["to"])
+                    and _load(conn, checkpoint["profile"], checkpoint, checkpoint["number"], checkpoint["to"]) == checkpoint)
+    except (ValueError, TypeError, KeyError):
+        return False
 
 
 def add_arguments(parser):
