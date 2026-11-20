@@ -122,7 +122,10 @@ def durable_positive(positive, isolated_db, monkeypatch):
                 result['labels'] = peer.current['data']['repository']['pullRequest']['labels']['nodes']
             return result
 
-        def run(self, *args):
+        def run(self, *args, timeout_seconds=None):
+            if args == ('api', 'repos/owner/repo/git/matching-refs/heads/pp-tail-dedupe/'):
+                assert 0 < timeout_seconds <= 15
+                return '[]'
             assert args == ('api', '--paginate', 'repos/owner/repo/issues/42/comments?per_page=100', '--jq', '.[]')
             graph = peer.json('api', 'graphql')['data']['repository']['pullRequest']['timelineItems']
             return '\n'.join(json.dumps({'id': int(n['fullDatabaseId']), 'user': n['author'], 'body': n['body'],

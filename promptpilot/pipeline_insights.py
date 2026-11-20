@@ -5274,7 +5274,8 @@ def _tail_diagnostics(profile: dict, now: datetime) -> dict:
     from . import tail_store
     from .pipeline_errors import PipelineError
 
-    repository = profile["repository"].lower()
+    repository = profile.get("repository")
+    repository = repository.strip().lower() if isinstance(repository, str) else None
     base = profile.get("base_branch", "main")
     states = {
         "ready": ("ready",),
@@ -5293,6 +5294,8 @@ def _tail_diagnostics(profile: dict, now: datetime) -> dict:
         "oldest_ready_age_seconds": None, "last_successful_drain_at": None,
         "last_drain_failure": None,
     }
+    if not repository:
+        return result
     try:
         backlog = tail_store.backlog(repository, limit=1, base=base)
         oldest_ready = _parse_time(backlog.get("oldest_ready_at"))

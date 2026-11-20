@@ -849,6 +849,8 @@ def test_cached_dashboard_health_is_red_for_invalid_replica_set(
     assert result["health"]["label"] == "невалидная конфигурация реплик"
     assert "review" in result["health"]["reason"]
     assert result["queues"][0]["task_error"] == series[0]["next_error"]
+    assert result["tail"]["state"] == "unobserved"
+    assert result["tail"]["repository"] is None
 
 
 def test_replica_set_is_invalid_when_worker_has_too_few_slots(
