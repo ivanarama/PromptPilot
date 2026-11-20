@@ -24,6 +24,8 @@ TERMINAL = {"success", "failed", "timeout", "superseded", "attempt_changed"}
 PENDING = {"queued", "in_progress", "waiting", "pending", "requested"}
 FAILURES = {"failure", "timed_out", "cancelled"}
 WORKFLOW = ".github/workflows/ci.yml"
+ORDINARY_STAGES = {"merge", "integration-merge-ready", "legacy-integration-merge-ready"}
+UNRESOLVED = {"failed", "timeout", "attempt_changed"}
 
 
 def _require(condition, reason):
@@ -221,6 +223,64 @@ def _check_failure(gh, record, config):
              "no failed required check in the exact original attempt")
 
 
+def adapter_config_path(command):
+    _require(command and command[-2:] == ["next", "merge"], "expected the configured MERGE adapter")
+    options = command[:-2]
+    flags = [index for index, arg in enumerate(options) if arg == "--config" or arg.startswith("--config=")]
+    _require(len(flags) <= 1, "ambiguous MERGE adapter config")
+    if not flags:
+        return "pipelinectl.json"
+    index = flags[0]
+    if options[index] == "--config":
+        _require(index + 1 < len(options), "MERGE adapter config path is missing")
+        path = options[index + 1]
+    else:
+        path = options[index].partition("=")[2]
+    _require(path and not path.startswith("-"), "invalid MERGE adapter config path")
+    return path
+
+
+def diagnose(gh, config, config_path, number, head):
+    """Elect a signed ordinary fallback after an exact CI run needs investigation."""
+    from .review_routing_policy import require_legacy
+
+    def wait(reason, state="unavailable"):
+        return {"action": "wait", "number": number, "state": state, "reason": reason}
+
+    try:
+        _require(_id(number) and merge_checkpoint.SHA.fullmatch(head), "invalid CI target")
+        _require(number not in pp.admission_exclusions() and pp._configured_replica_count() == 1,
+                 "CI diagnosis requires an available ordinary MERGE target")
+        repo = config["repository"]
+        record = active_wait(repo, {"number": number, "head": head})
+        _require(record and record["state"] in UNRESOLVED, "no unresolved exact Actions attempt")
+        _require(config.get("fallback_handoff") == "target-v1"
+                 and record["config_sha256"] == fallback_handoff.config_digest(config),
+                 "CI diagnosis config no longer matches its exact Actions journal")
+        pp.ensure_identity(gh, config)
+        _require(not pp.pending_merge_intents(gh, config), "pending merge cleanup takes precedence")
+        health = pp.run_health(config, config_path=config_path)
+        _require(fallback_handoff.config_digest(config) == record["config_sha256"],
+                 "MERGE configuration changed during diagnosis")
+        fallback_handoff.validate_health(health)
+        queue = health["merge_executable"]
+        _require(queue and queue[0]["number"] == number and queue[0]["head"] == head
+                 and queue[0]["stage"] in ORDINARY_STAGES,
+                 "the first executable MERGE target changed")
+        observed = observe_run(gh, record)
+        if observed["state"] != record["state"]:
+            _require(save_observation(record, observed), "CI journal changed during diagnosis")
+            return wait("Actions readback changed, re-elect before diagnosis", observed["state"])
+        require_legacy(gh, config, number)
+        _require(active_wait(repo, record) == record
+                 and fallback_handoff.config_digest(pp.load_config(config_path)) == record["config_sha256"],
+                 "CI journal or configuration changed before the handoff")
+        return fallback_handoff.create(config, health, "merge", queue[0],
+                                       f"Actions run {record['run_id']} attempt {record['attempt']} requires diagnosis")
+    except (RuntimeError, OSError, KeyError, ValueError, TypeError, sqlite3.Error) as exc:
+        return wait(str(exc))
+
+
 def _apply(args, env):
     from . import db, pipeline_insights as pi
 
@@ -245,13 +305,11 @@ def _apply(args, env):
     lease, token = merge_checkpoint._gate_file(task_id, args.lease_file)
     repo, target = lease["repository"], lease["target"]
     _require(not lease.get("target_reservation") and repo == profile["repository"]
-             and target["stage"] in {"merge", "integration-merge-ready", "legacy-integration-merge-ready"}
+             and target["stage"] in ORDINARY_STAGES
              and (args.number, args.head) == (target["number"], target["head"]),
              "CI wait target differs from the signed ordinary election")
     command = pi._tool_command(queue["execution"], "merge")
-    _require(command and command.count("--config") == 1 and command[-2:] == ["next", "merge"],
-             "MERGE CI needs its configured project adapter")
-    path = Path(command[command.index("--config") + 1])
+    path = Path(adapter_config_path(command))
     if not path.is_absolute():
         path = Path(task.working_dir or ".").resolve() / path
     config = pp.load_config(str(path))

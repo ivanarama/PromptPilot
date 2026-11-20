@@ -40,6 +40,8 @@ class Actions:
     def json(self, method, path):
         assert method == "api"
         self.requests.append(path)
+        if path == "user":
+            return {"login": "owner"}
         if path == self.prefix + "/pulls/42":
             return self.pr
         if path == f"{self.prefix}/actions/runs/{self.run['id']}":
@@ -58,7 +60,8 @@ def elected(merge_dispatch, monkeypatch, tmp_path, capsys):
     path = tmp_path / "pipelinectl.json"
     repo = f.profile["repository"]
     path.write_text(json.dumps({"repository": repo, "trusted_account": "owner",
-                                "health_command": ["health"], "required_checks": ["e2e"]}), encoding="utf-8")
+                                "health_command": ["health"], "required_checks": ["e2e"],
+                                "fallback_handoff": "target-v1"}), encoding="utf-8")
     queue["execution"].update(merge_confirmation="bounded-v1", command=["pipeline", "--config", str(path), "next", "merge"])
     live = health("merge")
     handoff = fallback_handoff.create(pp.load_config(str(path)), live, "merge", live["merge_executable"][0], "audit")
@@ -82,7 +85,8 @@ def elected(merge_dispatch, monkeypatch, tmp_path, capsys):
         assert result["product_mutation_authorized"] is False
         return result
 
-    return SimpleNamespace(f=f, gh=gh, repo=repo, target={"number": 42, "head": HEAD}, call=call, gate=gate)
+    return SimpleNamespace(f=f, gh=gh, repo=repo, target={"number": 42, "head": HEAD}, call=call, gate=gate,
+                           config_path=path)
 
 
 def test_one_shot_survives_unknown_send_and_late_terminal_readback(elected):
@@ -91,6 +95,7 @@ def test_one_shot_survives_unknown_send_and_late_terminal_readback(elected):
     assert first["state"] == "claimed" and first["send_allowed"] is True and first["attempt"] == 2
     assert ci.active_wait(e.repo, e.target) == ci.series_wait(e.f.task.series_id, e.repo)
     assert ci.defer_time(e.f.task) is None
+
     assert e.call("observe", 2)["state"] == "unknown"  # process died on either side of send
     second = e.call("claim", rid=999)
     assert (second["state"], second["send_allowed"], second["run_id"]) == ("already_claimed", False, 444)
@@ -200,3 +205,62 @@ def test_restart_of_external_attempt_does_not_resend_or_merge_another_head(elect
     assert outcome["state"] == expected and ci.save_observation(record, outcome)
     assert ci.active_wait(e.repo, dict(e.target, head="f" * 40)) is None
     assert ci.defer_time(e.f.task) is None
+
+@pytest.mark.parametrize(("options", "expected"), [
+    ([], "pipelinectl.json"), (["--config", "custom.json"], "custom.json"), (["--config=project"], "project"),
+    (["--config", "a", "--config=b"], None), (["--config"], None), (["--config="], None),
+])
+def test_adapter_configuration_matches_the_project_cli(options, expected):
+    cmd = ["pipelinectl", *options, "next", "merge"]
+    if expected is None:
+        with pytest.raises(pp.PipelineError):
+            ci.adapter_config_path(cmd)
+    else:
+        assert ci.adapter_config_path(cmd) == expected
+
+
+@pytest.mark.parametrize("scenario", ["legacy", "ready-owner", "cleanup", "first-changed", "hold", "typed",
+                                     "config", "green", "excluded", "pending"])
+def test_elects_exact_ci_diagnosis_with_the_normal_signed_gate_only(elected, monkeypatch, capsys, scenario):
+    from promptpilot import review_routing_adapter
+
+    e = elected
+    if scenario == "pending":
+        e.gh.run.update(status="in_progress", conclusion=None)
+    state = e.call("observe")["state"]
+    assert state == ("waiting" if scenario == "pending" else "failed")
+    source = health("integration-merge-ready" if scenario == "ready-owner" else "merge")
+    if scenario == "first-changed":
+        source["merge_executable"].insert(0, dict(source["merge_executable"][0], number=100))
+    if scenario == "hold":
+        e.gh.pr["labels"].append({"name": "manual"})
+    if scenario == "green":
+        e.gh.run.update(conclusion="success")
+    if scenario == "excluded":
+        monkeypatch.setenv("PP_PIPELINE_EXCLUDED_NUMBERS", "[42]")
+
+    def run_health(config, *, config_path):
+        assert config_path == str(e.config_path)
+        if scenario == "config":
+            config["base_branch"] = "other"
+        return source
+
+    monkeypatch.setattr(pp, "pending_merge_intents", lambda *_: [{"number": 9}] if scenario == "cleanup" else [])
+    monkeypatch.setattr(pp, "run_health", run_health)
+    monkeypatch.setattr(review_routing_adapter, "journal_directory", lambda *_: e.config_path.parent / "routing")
+    marker = {"node": {"__typename": "IssueComment", "author": {"login": "owner"},
+                       "body": "<!-- pp:review-routing-start -->"}}
+    monkeypatch.setattr(pp, "stable_timeline", lambda *_: {"edges": [marker] if scenario == "typed" else []})
+    argv = ["pp", "pipelinectl", "--config", str(e.config_path), "merge-ci-diagnose", "--number", "42", "--head", HEAD]
+    monkeypatch.setattr(sys, "argv", argv)
+    with pytest.raises(SystemExit) as done:
+        entrypoint.main()
+    assert done.value.code == 0
+    result = json.loads(capsys.readouterr().out)
+    if scenario in {"legacy", "ready-owner"}:
+        lease = fallback_handoff.validate(result, "merge")
+        assert lease["repository"] == e.repo and lease["target"] == fallback_handoff.identity(source["merge_executable"][0])
+        assert not lease.get("target_reservation")
+    else:
+        expected = {"hold": "superseded", "green": "success"}.get(scenario, "unavailable")
+        assert result["action"] == "wait" and result["state"] == expected and "handoff" not in result

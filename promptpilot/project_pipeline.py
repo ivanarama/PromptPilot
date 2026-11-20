@@ -2911,6 +2911,9 @@ def run(argv=None) -> int:
     from . import merge_checkpoint, merge_ci_wait
     merge_checkpoint.add_arguments(sub.add_parser("merge-checkpoint"))
     merge_ci_wait.add_arguments(sub.add_parser("merge-ci-wait"))
+    diagnose_parser = sub.add_parser("merge-ci-diagnose")
+    diagnose_parser.add_argument("--number", type=int, required=True)
+    diagnose_parser.add_argument("--head", required=True)
     source_refresh_parser = sub.add_parser("source-refresh")
     source_refresh_parser.add_argument("--profile", required=True)
     source_refresh_parser.add_argument("--final", action="store_true")
@@ -3001,6 +3004,8 @@ def run(argv=None) -> int:
             elif args.command == "inspect-merge-progress":
                 from .merge_admission_progress import observe
                 value = observe(gh, config, args.config, args.number, args.head)
+            elif args.command == "merge-ci-diagnose":
+                value = merge_ci_wait.diagnose(gh, config, args.config, args.number, args.head)
             elif args.command == "next":
                 if args.stage == "review":
                     value = next_review(gh, config, config_path=args.config)
