@@ -2908,8 +2908,9 @@ def run(argv=None) -> int:
         if name == "tail-create":
             target.add_argument("--item", type=int, required=True, help="verified issue item selected by the TAIL worker")
             target.add_argument("--context-file", type=Path, help="UTF-8 explanation from checking the current base branch")
-    from . import merge_checkpoint
+    from . import merge_checkpoint, merge_ci_wait
     merge_checkpoint.add_arguments(sub.add_parser("merge-checkpoint"))
+    merge_ci_wait.add_arguments(sub.add_parser("merge-ci-wait"))
     source_refresh_parser = sub.add_parser("source-refresh")
     source_refresh_parser.add_argument("--profile", required=True)
     source_refresh_parser.add_argument("--final", action="store_true")
@@ -2953,6 +2954,8 @@ def run(argv=None) -> int:
     args = parser.parse_args(argv)
     if args.command == "merge-checkpoint":
         return merge_checkpoint.execute(args)
+    if args.command == "merge-ci-wait":
+        return merge_ci_wait.execute(args)
     if args.command in ("source-refresh", "budget-refresh"):
         from .pipeline_source_refresh import run as source_refresh_run
 
