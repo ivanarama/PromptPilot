@@ -352,6 +352,18 @@ def test_historical_receipt_survives_review_and_later_head(replay, merged):
     assert len(replay.posts) == 1 and len(replay.gates) == 1
 
 
+@pytest.mark.parametrize(("state", "head", "current"), [
+    ("OPEN", HEAD, True), ("OPEN", "e" * 40, False), ("CLOSED", HEAD, False), ("MERGED", HEAD, False),
+])
+def test_delivery_uses_live_pr_header_for_review_handoff(replay, state, head, current):
+    replay.comment(888, DONE)
+    replay.current_head = head
+    replay.current_state = state
+    record = dict(CHECKPOINT, body_sha256=hashlib.sha256(DONE.encode()).hexdigest())
+    assert finish.observe_delivery(replay, record, config=CONFIG) == (888, current)
+    assert not replay.posts and not replay.gates
+
+
 @pytest.mark.parametrize(
     "corrupt",
     [

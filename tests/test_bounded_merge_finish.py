@@ -298,7 +298,7 @@ def test_uncertain_send_holds_only_its_exact_fallback_through_new_claim(
     f.profile["queues"][0]["execution"].pop("merge_confirmation")
     snapshot["cache"]["profile_hash"] = pi._profile_fingerprint(f.profile)
     monkeypatch.setattr(pi, "_github_rate_limits", lambda: observed_rates(_limits()))
-    monkeypatch.setattr(merge_finish_proof, "observe_receipt", lambda *a, **kw: None)
+    monkeypatch.setattr(merge_finish_proof, "observe_delivery", lambda *a, **kw: None)
     retry = dispatch(f)
     assert retry["action"] == "defer" and "not yet visible" in retry["reason"]
     pi.release_execution_admission()
@@ -334,8 +334,9 @@ def test_confirmation_respects_other_reservations_at_real_floor(recovery):
     assert f.db.pipeline_github_budget_reservations("github-default")["count"] == 1
 
 
+@pytest.mark.parametrize("current_head", [True, False])
 def test_waiting_for_review_reconciles_a_previous_send_without_a_provider(
-    native_recovery, monkeypatch
+    native_recovery, monkeypatch, current_head
 ):
     import json
     from promptpilot import merge_checkpoint, merge_finish_proof
@@ -361,16 +362,17 @@ def test_waiting_for_review_reconciles_a_previous_send_without_a_provider(
         rows = f.db.pipeline_github_budget_reservations("github-default")
         assert rows["count"] == 1 and rows["items"][0]["route"] == "merge_receipt"
         seen.append(saved["number"])
-        return 501
+        return 501, current_head
 
-    monkeypatch.setattr(merge_finish_proof, "observe_receipt", observe, raising=False)
+    monkeypatch.setattr(merge_finish_proof, "observe_delivery", observe)
     monkeypatch.setattr(
         pi,
         "_tool_preflight",
         lambda *_: {"action": "wait", "reason": "owner awaits integration review"},
     )
     route = dispatch(f)
-    assert seen == [42] and route["action"] == "complete_empty" and route["verdict"] == "ПУСТО"
+    assert seen == [42] and route["action"] == "complete_empty"
+    assert route["verdict"] == ("ГОТОВО" if current_head else "ПУСТО")
     assert f.db.get_setting(key) is None
 
 

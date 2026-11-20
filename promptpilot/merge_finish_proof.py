@@ -286,6 +286,11 @@ def _check_addressed(gh, config, number, snap, ids):
 
 
 def observe_receipt(gh, record, *, config, expected_node_id=None):
+    receipt = observe_delivery(gh, record, config=config, expected_node_id=expected_node_id)
+    return receipt[0] if receipt else None
+
+
+def observe_delivery(gh, record, *, config, expected_node_id=None):
     """Look up an uncertain send for just its recorded PR, including after REVIEW/merge.
 
     This only settles the local send journal. The original immutable intent and
@@ -366,7 +371,10 @@ def observe_receipt(gh, record, *, config, expected_node_id=None):
     _comment_readback(gh, number, saved, saved["body"])
     _comment_readback(gh, number, done, expected)
     _check_addressed(gh, config, number, snap, [ship, saved["id"], done["id"]])
-    return pp.comment_id(done)
+    state, current_head = snap.get("state"), snap.get("headRefOid")
+    _need(state in {"OPEN", "CLOSED", "MERGED"} and isinstance(current_head, str)
+          and re.fullmatch("[0-9a-f]{40}", current_head), "incomplete receipt PR state")
+    return pp.comment_id(done), state == "OPEN" and current_head == head
 
 
 def _observe(gh, config, checkpoint, working_dir, *, verify_tree):

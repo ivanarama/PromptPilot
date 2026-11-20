@@ -118,7 +118,7 @@ def test_full_recovery_commits_only_at_http_and_reconciles_lost_response(native_
     assert sent == [body] and len(set(gates)) == 2 and f.db.get_setting(key)
     new_claim(f)
     snapshot["queues"][0]["task_id"] = f.task.id
-    monkeypatch.setattr(merge_finish_proof, "observe_receipt", lambda *_a, **_kw: 502)
+    monkeypatch.setattr(merge_finish_proof, "observe_delivery", lambda *_a, **_kw: (502, True))
     third = dispatch(f)
     assert third["action"] == "complete_empty" and third["verdict"] == "ГОТОВО", third
     assert sent == [body] and len(gates) == 2 and not f.db.get_setting(key)
