@@ -113,7 +113,15 @@ def poll(task, profile_id, profile, queue, admission, record, preflight=None):
     label = f"PR #{record['number']} Actions run {record['run_id']} attempt {record['attempt']}"
     try:
         fence()
-        observation = ci.observe_run(pp.GitHub(timeout_seconds=15), record)
+        try:
+            observation = ci.observe_run(pp.GitHub(timeout_seconds=15), record)
+        except (RuntimeError, OSError, ValueError, KeyError, TypeError):
+            if time.time() < record["deadline"]:
+                raise
+            # This is a local deadline, not a failed CI conclusion. A fresh
+            # signed diagnosis must still obtain the real run before any write.
+            observation = {"state": "timeout", "run_id": record["run_id"], "attempt": record["attempt"],
+                           "deadline": record["deadline"]}
         fence()
         if not ci.save_observation(record, observation):
             return dict(route, defer_until=reselect_at(), reason=f"{label}: CI journal changed, re-elect")

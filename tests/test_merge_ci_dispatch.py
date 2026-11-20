@@ -92,6 +92,22 @@ def test_unsigned_skill_cannot_reissue_an_ambiguous_send(elected, monkeypatch):
     assert result["action"] == "defer" and "targeted election" in result["reason"], result
 
 
+def test_unavailable_readback_at_deadline_preserves_the_claim_for_diagnosis(elected, monkeypatch):
+    e = elected
+    finish(e)
+    record = merge_ci_wait.active_wait(e.repo, e.target)
+    assert merge_ci_wait.save_observation(record, {"state": "unknown", "run_id": record["run_id"],
+                                                  "attempt": record["attempt"], "deadline": 1})
+    monkeypatch.setattr(pi, "read_cached", lambda *_: cached(e.f))
+    def offline(*args):
+        raise pp.PipelineError("readback unavailable")
+    monkeypatch.setattr(e.gh, "json", offline)
+    result = dispatch(e.f)
+    assert result["action"] == "defer" and "timeout" in result["reason"], result
+    saved = merge_ci_wait.active_wait(e.repo, e.target)
+    assert saved["state"] == "timeout" and saved["claimed_at"] == record["claimed_at"]
+
+
 def test_failed_saved_attempt_enters_signed_diagnosis_when_another_run_is_green(elected, monkeypatch):
     e = elected
     finish(e)
