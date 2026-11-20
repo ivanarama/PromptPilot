@@ -4194,6 +4194,8 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                     # Re-read after next. Its signed election and this cached observation
                     # must independently point at the completed branch update.
                     current = read_cached(profile_id, db.list_series())
+                    if managed_confirmation:
+                        current = merge_checkpoint.confirmation_source(current, profile_id, profile, admission)
                     state = _required_snapshot_state(current, profile, queue["id"])
                     # A verified hold transition has already consumed its single occurrence.
                     # Preserve its normal provider-assisted Source retry instead of stranding the hold.

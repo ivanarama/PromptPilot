@@ -75,6 +75,56 @@ def agrees_with_source(data, lease, checkpoint):
             and all(candidate.get(k) == checkpoint[k] for k in ("from", "base", "to")))
 
 
+def confirmation_source(data, profile_id, profile, admission):
+    """A busy sampler can coexist with this election's still-current publication."""
+    from . import db, pipeline_insights as pi
+
+    cache = data.get("cache") or {}
+    if cache.get("refresh_blocked") != "scan_in_progress":
+        return data
+    lease = admission.get("_lease")
+    if (admission.get("allowed") is not True or lease is None
+            or getattr(pi._scan_lease_context, "lease", None) is not lease
+            or lease.scope != pi._GITHUB_SCAN_LEASE_SCOPE or lease.lost or lease.unavailable
+            or type(lease.status_revision) is not int or lease.status_revision <= 0):
+        return data
+    guard = pi._wake_cache_guard(profile_id, profile, cache)
+    if not guard or not 0 <= time.time() - guard["generated_at"] < pi._CACHE_TTL_SECONDS:
+        return data
+    try:
+        with db._connect() as conn:
+            conn.execute("BEGIN")
+            if (not db._pipeline_scan_lease_guard_matches(conn, lease.guard)
+                    or not db._pipeline_cache_guard_matches(conn, guard)):
+                return data
+            row = conn.execute("SELECT value FROM settings WHERE key=?",
+                               (db._pipeline_refresh_status_key(profile_id),)).fetchone()
+            if not row:
+                return data
+            event = json.loads(row[0])
+            status = event["status"]
+            budget = status["github_budget"]
+            # Successful acquisitions and busy observations receive unique,
+            # ordered revisions in the same SQLite writer transaction. A busy
+            # decision newer than this still-owned lease observed this owner.
+            if (event["version"] != 1 or event["repository"] != profile["repository"]
+                    or type(event["revision"]) is not int or event["revision"] <= lease.status_revision
+                    or status["refresh_blocked"] != "scan_in_progress"
+                    or status["refresh_deferred_until"] != cache.get("refresh_deferred_until")
+                    or budget["state"] != "scan_in_progress" or budget["allowed"] is not False
+                    or budget["budget_route"] != "insights" or budget["lease_scope"] != lease.scope
+                    or pi._source_checker_failure_revision(event, profile) >
+                       pi._source_checker_verified_revision(data, event)):
+                return data
+    except (OSError, sqlite3.Error, KeyError, AttributeError, TypeError, ValueError):
+        return data
+    # The caller still checks complete/current queue, checker, owner and graph.
+    # Leave the shared cache and the dashboard's explanation unchanged.
+    result_cache = dict(cache)
+    result_cache.pop("refresh_blocked")
+    return dict(data, cache=result_cache)
+
+
 def _wait_key(task):
     # One bounded observation per ordinary series, never a cross-task gate.
     return f"pipeline_merge_source_wait:v1:{task.series_id}"
