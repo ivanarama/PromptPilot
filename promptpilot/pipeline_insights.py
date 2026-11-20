@@ -4236,12 +4236,12 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
         if ci_wait_enabled and target_reservation is None and merge_checkpoint_hint is None:
             from . import merge_ci_wait
             ci_record = merge_ci_dispatch.elected_wait(task, profile["repository"], preflight, fallback_lease)
-            if ci_record and (ci_record["state"] in merge_ci_wait.WAITING or fallback_lease is None):
+            if ci_record and (ci_record["state"] in merge_ci_wait.WAITING
+                              or ci_record["state"] == "attempt_changed" or fallback_lease is None):
                 if not retain_budget:
                     return {"action": "defer", "mode": "tool", "defer_for": "2m",
                             "reason": "MERGE CI readback requires retained Native admission"}
-                if (ci_record["state"] in merge_ci_wait.UNRESOLVED
-                        and fallback_lease is None and not positive_claim):
+                if ci_record["state"] in merge_ci_wait.UNRESOLVED and not positive_claim:
                     diagnostic, deferred = merge_ci_dispatch.diagnose(
                         task, profile_id, profile, queue, admission, execution, command,
                         working_dir, ci_record, exclusions)
@@ -4498,7 +4498,7 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                     if (ci_wait_enabled and target["stage"] in merge_ci_wait.ORDINARY_STAGES
                             and gate_command[-2] == "--lease-file"):
                         pre_review_guard += merge_ci_dispatch.add_command(
-                            envelope, native, profile_id, target, gate_command[-1], ci_record)
+                            envelope, native, profile_id, fallback_lease, gate_command[-1], ci_record)
                     envelope["checkpoint_record_command"] = [*native, "merge-checkpoint", "record",
                         "--profile", profile_id, "--number", str(target["number"]), "--from", "<old>",
                         "--base", "<second_parent>", "--to", "<new>", "--tree", "<tree>",

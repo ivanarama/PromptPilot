@@ -3,7 +3,6 @@
 import json
 import sqlite3
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 
 from . import db, merge_ci_wait as ci, pipeline_insights as pi, project_pipeline as pp
@@ -72,7 +71,7 @@ def diagnose(task, profile_id, profile, queue, admission, execution, command, wo
                 return response, None
         if response.get("action") == "wait" and response.get("state") in {"success", "superseded"}:
             return None, {"action": "defer", "mode": "tool", "defer_until":
-                          datetime.fromtimestamp(time.time() + 5, timezone.utc).isoformat(),
+                          pi._defer_at(time.time() + 5),
                           "reason": f"MERGE CI {response['state']}; re-elect for fresh checks"}
         reason = response.get("reason") or response.get("error") or "conflicting diagnostic target"
     except (RuntimeError, KeyError, TypeError, ValueError, OSError) as exc:
@@ -108,8 +107,6 @@ def poll(task, profile_id, profile, queue, admission, record, preflight=None):
                 raise pp.PipelineError("MERGE CI readback lost its task or account reservation")
 
     route = {"action": "defer", "mode": "tool", "profile_id": profile_id, "queue_id": queue["id"]}
-    def reselect_at():
-        return datetime.fromtimestamp(time.time() + 5, timezone.utc).isoformat()
     label = f"PR #{record['number']} Actions run {record['run_id']} attempt {record['attempt']}"
     try:
         fence()
@@ -124,7 +121,7 @@ def poll(task, profile_id, profile, queue, admission, record, preflight=None):
                            "deadline": record["deadline"]}
         fence()
         if not ci.save_observation(record, observation):
-            return dict(route, defer_until=reselect_at(), reason=f"{label}: CI journal changed, re-elect")
+            return dict(route, defer_until=pi._defer_at(time.time() + 5), reason=f"{label}: CI journal changed, re-elect")
     except (RuntimeError, OSError, ValueError, KeyError, TypeError, sqlite3.Error) as exc:
         return dict(route, defer_for="2m", defer_policy="hard_not_before",
                     reason=f"{label}: CI readback unavailable: {pi._bounded_defer_text(exc)}")
@@ -132,20 +129,25 @@ def poll(task, profile_id, profile, queue, admission, record, preflight=None):
     if state in ci.WAITING:
         until = min(time.time() + ci.POLL_SECONDS, observation["deadline"])
         return dict(route, reason=f"{label}: {state}", defer_policy="hard_not_before",
-                    defer_until=datetime.fromtimestamp(until, timezone.utc).isoformat())
+                    defer_until=pi._defer_at(until))
     if state == record["state"]:
         return dict(route, defer_for="2m", defer_policy="hard_not_before",
                     reason=f"{label}: {state}, awaiting a compatible fresh election")
-    return dict(route, defer_until=reselect_at(), reason=f"{label}: {state}, re-elect for fresh checks")
+    return dict(route, defer_until=pi._defer_at(time.time() + 5), reason=f"{label}: {state}, re-elect for fresh checks")
 
 
-def add_command(envelope, native, profile_id, target, gate_file, record):
+def add_command(envelope, native, profile_id, lease, gate_file, record):
+    target = lease["target"]
     envelope["ci_wait_command"] = [*native, "merge-ci-wait", "<operation>", "--profile", profile_id,
         "--number", str(target["number"]), "--head", target["head"],
         "--run-id", "<run_id>", "--attempt", "<attempt>", "--lease-file", gate_file]
     if record:
         envelope["ci_wait_record"] = {key: record[key] for key in
                                       ("run_id", "attempt", "state", "deadline", "claimed_at")}
+    readback = lease.get("ci_attempt_readback")
+    if (readback and record and record["state"] == "attempt_changed"
+            and readback["run_id"] == record["run_id"] and readback["previous_attempt"] == record["attempt"]):
+        envelope["ci_current_attempt"] = readback["attempt"]
     return (
         "Для §4 канонического MERGE действует управляемое ожидание CI. Выбери точный CI run и attempt. "
         "При наличии ci_wait_record продолжай с его run_id и attempt. При выполняющемся CI вызови "
@@ -158,5 +160,7 @@ def add_command(envelope, native, profile_id, target, gate_file, record):
         "попытки. При неясном ответе, отказе или ранее занятом claim повторная отправка запрещена. "
         "Готовый CI требует всех штатных восьми проверок и новой проверки актуальности перед записью. "
         "При failed или timeout пройди штатную диагностику именно этой попытки. При смене HEAD, "
-        "попытки, потере ship или отказе команды остановись для новой сверки.\n\n"
+        "попытки, потере ship или отказе команды остановись для новой сверки. Если новое подписанное "
+        "назначение содержит ci_current_attempt, выполни только observe с этим номером попытки для того же "
+        "run_id. Срок ожидания сохраняется. Даже при success закончи ИТОГ: ПУСТО для нового выбора цели.\n\n"
     )
