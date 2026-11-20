@@ -2783,7 +2783,7 @@ def repair_active_series_occurrences(
             ).fetchone() is not None:
                 continue
             latest = conn.execute(
-                """SELECT id, status, completed_at FROM tasks WHERE series_id = ?
+                """SELECT * FROM tasks WHERE series_id = ?
                    ORDER BY id DESC LIMIT 1""",
                 (series_id,),
             ).fetchone()
@@ -2804,6 +2804,11 @@ def repair_active_series_occurrences(
             recurrence = _effective_series_recurrence(dict(series), anchor)
             scheduled_at = (datetime.now(timezone.utc) if has_wake
                             else parse_recurrence(recurrence, now=anchor))
+            if scheduled_at and not has_wake and latest["verdict"] == "ПУСТО":
+                from .merge_ci_wait import defer_time
+                hint = defer_time(_row_to_task(latest), conn=conn)
+                if hint is not None:
+                    scheduled_at = min(scheduled_at, hint)
             if (scheduled_at is not None and _recreate_series_occurrence(
                     conn, series_id, series, scheduled_at)):
                 # The immediate repaired occurrence itself satisfies a wake
@@ -4272,7 +4277,7 @@ def _pipeline_source_refresh_state(conn, scope, task_id, profile_id, queue_id, r
     if (started.tzinfo is None or started.timestamp() > now
             or timeout and now >= started.timestamp() + timeout):
         raise ValueError("source refresh attempt lifetime is invalid")
-    if bounded_route not in (None, "merge_confirmation", "merge_full_confirmation", "merge_receipt"):
+    if bounded_route not in (None, "merge_confirmation", "merge_full_confirmation", "merge_receipt", "merge_ci_poll"):
         raise ValueError("unsupported Native-only continuation route")
     routes = (bounded_route,) if bounded_route else ("skill", "fallback_targeted")
     costs = {route: _pipeline_budget_vector(route_costs[route], f"continuation {route} cost")
@@ -4326,7 +4331,7 @@ def _pipeline_source_refresh_guard_matches(conn, guard):
     try:
         observed = _pipeline_source_refresh_state(conn, guard["scope"], guard["task_id"],
             guard["profile_id"], guard["queue_id"], guard["route_costs"],
-            bounded_route=(guard["route"] if guard["route"] in ("merge_confirmation", "merge_full_confirmation", "merge_receipt") else None))
+            bounded_route=(guard["route"] if guard["route"] in ("merge_confirmation", "merge_full_confirmation", "merge_receipt", "merge_ci_poll") else None))
         return observed["guard"] == guard
     except (KeyError, TypeError, ValueError, OverflowError):
         return False
