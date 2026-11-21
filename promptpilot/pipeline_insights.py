@@ -5107,6 +5107,7 @@ def _refresh_local_state(result: dict, profile: dict, series: list[dict], *,
     """Overlay a saved GitHub snapshot with current, quota-free local state."""
     data = copy.deepcopy(result)
     now = datetime.now(timezone.utc)
+    data["tail"] = _tail_diagnostics(profile, now)
     diagnostics = data.get("diagnostics")
     target_hours = float(profile.get("target_clear_hours", 8))
     priority_settings = _priority_settings(profile)
@@ -5266,6 +5267,90 @@ def _refresh_local_state(result: dict, profile: dict, series: list[dict], *,
     data["delivery_flow"] = delivery_flow.summarize(
         data, matching_series, now, paused=db.is_paused())
     return data
+
+
+def _tail_diagnostics(profile: dict, now: datetime) -> dict:
+    """Report the local TAIL projection independently of the GitHub snapshot."""
+    from . import tail_store
+    from .pipeline_errors import PipelineError
+
+    repository = profile.get("repository")
+    repository = repository.strip().lower() if isinstance(repository, str) else None
+    base = profile.get("base_branch", "main")
+    states = {
+        "ready": ("ready",),
+        "waiting": ("waiting-policy", "active-elsewhere"),
+        "invalid": ("invalid-source",),
+        "ambiguous": ("ambiguous-create",),
+    }
+    completion_kinds = ("empty", "legacy", "versioned")
+    result = {
+        "state": "unobserved", "reason": "Сверка TAIL ещё не выполнена для этой ветки",
+        "complete": False, "repository": repository, "base": base,
+        "discovery_complete_through": None, "discovery_age_seconds": None,
+        "uncovered_intervals": None, "uncovered_interval_count": None, "pending_proof": None,
+        "recheck_due": None, "proof_unavailable_count": None,
+        "counts": dict.fromkeys(states), "completions": dict.fromkeys(completion_kinds),
+        "oldest_ready_age_seconds": None, "last_successful_drain_at": None,
+        "last_drain_failure": None,
+    }
+    if not repository:
+        return result
+    try:
+        backlog = tail_store.backlog(repository, limit=1, base=base)
+        oldest_ready = _parse_time(backlog.get("oldest_ready_at"))
+        discovery = backlog.get("discovery")
+        completed_at = _parse_time((discovery or {}).get("last_complete_at"))
+        covered_through = _parse_time((discovery or {}).get("discovery_complete_through"))
+    except (OSError, PipelineError, sqlite3.Error, TypeError, ValueError):
+        result.update(state="unavailable", reason="Сверка TAIL не выполнена. Локальная очередь недоступна")
+        return result
+    if discovery is None:
+        return result
+
+    age = (now - covered_through).total_seconds() if covered_through is not None else None
+    pending = backlog["counts"].get("pending-proof", 0)
+    recheck_due = backlog.get("recheck_due")
+    proof_unavailable_count = backlog.get("proof_unavailable_count")
+    if discovery.get("last_error"):
+        state, reason = "unavailable", "Сверка TAIL не выполнена. " + discovery["last_error"]
+    elif proof_unavailable_count:
+        state, reason = "unavailable", "Сверка TAIL не выполнена. Доказательство недоступно для части PR"
+    elif (discovery.get("state") != "complete" or discovery.get("pending_intervals")
+          or discovery.get("verify_pending") or not discovery.get("discovery_complete_through")):
+        state, reason = "incomplete", "Обход истории TAIL ещё не завершён"
+    elif (age is None or not 0 <= age < _CACHE_TTL_SECONDS or completed_at is None
+          or not 0 <= (now - completed_at).total_seconds() < _CACHE_TTL_SECONDS):
+        state, reason = "stale", "Сведения об обходе истории TAIL устарели"
+    elif pending:
+        state, reason = "incomplete", "Ещё не проверены некоторые замечания из очереди TAIL"
+    elif recheck_due is None:
+        state, reason = "incomplete", "Актуальность сохранённых результатов TAIL не подтверждена"
+    elif recheck_due != 0:
+        state, reason = "incomplete", "Сохранённые результаты TAIL требуют повторной сверки"
+    else:
+        state, reason = "complete", None
+
+    complete = state == "complete"
+    default_count = 0 if complete else None
+    result.update(
+        state=state, reason=reason, complete=complete,
+        discovery_complete_through=discovery.get("discovery_complete_through"),
+        discovery_age_seconds=max(0, int(age)) if age is not None else None,
+        uncovered_intervals=discovery.get("uncovered_intervals"),
+        uncovered_interval_count=discovery.get("pending_intervals"),
+        pending_proof=pending or default_count,
+        recheck_due=recheck_due or default_count,
+        proof_unavailable_count=proof_unavailable_count or default_count,
+        counts={key: sum(backlog["counts"].get(name, 0) for name in names) or default_count
+                for key, names in states.items()},
+        completions={key: backlog["completions"].get(key) or default_count for key in completion_kinds},
+        oldest_ready_age_seconds=(max(0, int((now - oldest_ready).total_seconds()))
+                                  if oldest_ready is not None else None),
+        last_successful_drain_at=backlog.get("last_successful_drain_at"),
+        last_drain_failure=backlog.get("last_drain_failure"),
+    )
+    return result
 
 
 def _snapshot_fallback(profile_id: str, profile: dict,

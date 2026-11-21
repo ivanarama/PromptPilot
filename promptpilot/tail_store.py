@@ -19,6 +19,61 @@ class TailCandidateConflict(PipelineError):
     """Discovery or another classifier changed the candidate during the remote read."""
 
 
+@contextmanager
+def item_writer(repository, number):
+    """Exclude other local item writers without holding the main index's writer lock."""
+    identity = json.dumps([repository, number], separators=(",", ":"))
+    name = hashlib.sha256(identity.encode("ascii")).hexdigest()
+    path = config.DB_PATH.parent / "tail-writers" / (name + ".sqlite3")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(path), timeout=0, isolation_level=None)
+    except (OSError, sqlite3.Error) as exc:
+        raise PipelineError(f"TAIL item writer lock unavailable: {exc}") from exc
+    with closing(conn):
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError as exc:
+            code = getattr(exc, "sqlite_errorcode", None)
+            busy = ((code is not None and (code & 0xff) in (5, 6))
+                    or (code is None and str(exc).lower() in {"database is locked", "database table is locked"}))
+            if not busy:
+                raise PipelineError(f"TAIL item writer lock unavailable: {exc}") from exc
+            yield False
+        else:
+            # Closing the auxiliary connection releases the lock on exit or
+            # process death. The file itself remains in the shared data dir.
+            yield True
+
+
+def _restore_key(repository, number, version, item):
+    identity = json.dumps([repository, number, version, item], separators=(",", ":"))
+    return "tail-restore-v1:" + hashlib.sha256(identity.encode("ascii")).hexdigest()
+
+
+def pending_restore(repository, number, version, item):
+    from . import db
+
+    with db._connect() as conn:
+        return conn.execute("SELECT 1 FROM settings WHERE key = ?",
+                            (_restore_key(repository, number, version, item),)).fetchone() is not None
+
+
+def restore_attempt(repository, number, version, item, issue, *, confirmed=False):
+    """Fence a marker POST whose outcome may still be unknown on restart."""
+    from . import db
+
+    key = _restore_key(repository, number, version, item)
+    with db._connect(immediate=True) as conn:
+        if confirmed:
+            conn.execute("DELETE FROM settings WHERE key = ? AND value = ?", (key, str(issue)))
+            return
+        inserted = conn.execute("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING",
+                                (key, str(issue))).rowcount
+        if inserted != 1:
+            raise PipelineError("previous TAIL marker write is unconfirmed; verify the exact item-done before retry")
+
+
 def query_fingerprint(repository, base):
     # A protocol change invalidates both cursor resumption and reported progress.
     query = json.dumps(["merged-tail-v2", repository, base], ensure_ascii=True)
@@ -176,18 +231,33 @@ def _projection(conn):
     # Stage A already recorded local observations but did not classify them.
     # Expose a changed observation as pending until its exact revision is
     # checked again. Keep the previously selected review available for diagnosis.
-    has_revision = any(row["name"] == "classified_revision" for row in conn.execute(
-        "PRAGMA table_info(tail_candidates)"))
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(tail_candidates)")}
+    has_revision = "classified_revision" in columns
     current = "classified_revision = revision" if has_revision else "0"
+    recovery = f"CASE WHEN {current} THEN recovery_json END" if "recovery_json" in columns else "NULL"
+    proof_error = f"CASE WHEN {current} THEN proof_error END" if "proof_error" in columns else "NULL"
     select = f"""SELECT repository, pr_number, base, head, merged_at, last_observed_at, revision,
                       CASE WHEN {current} THEN state ELSE 'pending-proof' END AS state,
                       review_id, review_updated_at, review_body_digest, epoch_digest,
                       CASE WHEN {current} THEN completion_kind END AS completion_kind,
                       CASE WHEN {current} THEN completion_digest END AS completion_digest,
                       CASE WHEN {current} THEN next_check_at END AS next_check_at,
-                      CASE WHEN {current} THEN last_reason END AS last_reason
+                      CASE WHEN {current} THEN last_reason END AS last_reason,
+                      {recovery} AS recovery_json, {proof_error} AS proof_error
                FROM tail_candidates WHERE repository = ? AND base = ?"""
     return select, has_revision
+
+
+def _candidate(row):
+    candidate = dict(row)
+    for column, key in (("recovery_json", "recovery"), ("proof_error", "proof_error")):
+        evidence = candidate.pop(column)
+        if evidence is not None:
+            try:
+                candidate[key] = json.loads(evidence)
+            except ValueError as exc:
+                raise sqlite3.DatabaseError(f"invalid local TAIL {key} evidence") from exc
+    return candidate
 
 
 def get_candidate(repository, base, number):
@@ -197,7 +267,7 @@ def get_candidate(repository, base, number):
             return None
         candidates, _ = _projection(conn)
         row = conn.execute(candidates + " AND pr_number = ?", (repository, base, number)).fetchone()
-        return dict(row) if row is not None else None
+        return _candidate(row) if row is not None else None
 
 
 def due_candidates(repository, base, limit=5):
@@ -211,7 +281,7 @@ def due_candidates(repository, base, limit=5):
         candidates, has_revision = _projection(conn)
         if not has_revision:
             rows = conn.execute(candidates + " ORDER BY merged_at, pr_number LIMIT ?", (repository, base, limit))
-            return [dict(row) for row in rows]
+            return [_candidate(row) for row in rows]
         # Filter on the stored columns so SQLite can walk the two bounded
         # indexes instead of sorting eligible work from the full archive.
         primary = conn.execute(candidates + """
@@ -225,16 +295,19 @@ def due_candidates(repository, base, limit=5):
     if limit == 1 and primary and retries:
         due = datetime.fromisoformat(retries[0]["next_check_at"])
         merged = datetime.fromisoformat(primary[0]["merged_at"].replace("Z", "+00:00"))
-        return [dict(retries[0] if due < merged else primary[0])]
+        return [_candidate(retries[0] if due < merged else primary[0])]
     # Reserve one place for a due retry, then use spare capacity if fresh
     # work runs out. Failed checks move their next_check_at forward.
     retry_slots = min(len(retries), max(1, limit - len(primary)))
-    return [dict(row) for row in primary[:limit - retry_slots] + retries[:retry_slots]]
+    return [_candidate(row) for row in primary[:limit - retry_slots] + retries[:retry_slots]]
+
+
+_KEEP_PROOF_ERROR = object()
 
 
 def record_result(candidate, *, state, reason=None, review_id=None, review_updated_at=None,
                   review_body_digest=None, epoch_digest=None, completion_kind=None,
-                  completion_digest=None, next_check_at=None):
+                  completion_digest=None, next_check_at=None, recovery=None, proof_error=_KEEP_PROOF_ERROR):
     """CAS the classifier's result for the observed PR and append its public metadata locally."""
     from . import db
 
@@ -254,6 +327,28 @@ def record_result(candidate, *, state, reason=None, review_id=None, review_updat
             raise PipelineError("TAIL resolution requires an exact completion proof")
     elif completion_kind is not None or completion_digest is not None:
         raise PipelineError("unfinished TAIL candidate cannot have a completion proof")
+    # An ordinary check of the same review can coexist with a verified
+    # recovery observation. A changed or unprovable review cannot inherit it.
+    if recovery is None and known and state != "invalid-source":
+        prior = tuple(candidate.get(key) for key in
+                      ("review_id", "review_updated_at", "review_body_digest", "epoch_digest"))
+        if prior == version:
+            recovery = candidate.get("recovery")
+    if recovery is not None and not known:
+        raise PipelineError("TAIL recovery requires a complete selected review version")
+    recovery_json = (
+        json.dumps(recovery, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+        if recovery else None
+    )
+    # A plain source classification does not verify an earlier failed issue lookup.
+    if proof_error is _KEEP_PROOF_ERROR:
+        proof_error = candidate.get("proof_error")
+    if proof_error is not None:
+        if (not isinstance(proof_error, dict) or proof_error.get("kind") not in {"source", "issue"}
+                or not isinstance(proof_error.get("reason"), str) or not proof_error["reason"]):
+            raise PipelineError("invalid TAIL proof error")
+        proof_error = json.dumps({"kind": proof_error["kind"], "reason": proof_error["reason"][:1000]},
+                                 separators=(",", ":"), ensure_ascii=False)
 
     now = datetime.now(timezone.utc)
     if next_check_at is not None:
@@ -274,10 +369,12 @@ def record_result(candidate, *, state, reason=None, review_id=None, review_updat
             UPDATE tail_candidates SET revision = ?, classified_revision = ?, state = ?,
                 review_id = coalesce(?, review_id), review_updated_at = coalesce(?, review_updated_at),
                 review_body_digest = coalesce(?, review_body_digest), epoch_digest = coalesce(?, epoch_digest),
-                completion_kind = ?, completion_digest = ?, next_check_at = ?, last_reason = ?
+                completion_kind = ?, completion_digest = ?, next_check_at = ?, last_reason = ?, recovery_json = ?,
+                proof_error = ?
             WHERE repository = ? AND base = ? AND pr_number = ? AND head = ? AND merged_at = ?
               AND revision = ?""",
-            (revision, revision, state, *version, completion_kind, completion_digest, next_check_at, reason,
+            (revision, revision, state, *version, completion_kind, completion_digest, next_check_at,
+             reason, recovery_json, proof_error,
              candidate["repository"], candidate["base"], candidate["pr_number"], candidate["head"],
              candidate["merged_at"], candidate["revision"]))
         if result.rowcount != 1:
@@ -294,6 +391,49 @@ def record_result(candidate, *, state, reason=None, review_id=None, review_updat
     return revision
 
 
+def _drain_key(repository, base):
+    return "tail-drain-v1:" + query_fingerprint(repository, base)
+
+
+def _drain_info(conn, repository, base):
+    # Some old indexes predate the rest of the operator database.
+    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='settings'").fetchone():
+        return {}
+    row = conn.execute("SELECT value FROM settings WHERE key = ?", (_drain_key(repository, base),)).fetchone()
+    if row is None:
+        return {}
+    try:
+        info = json.loads(row["value"])
+        if isinstance(info, dict):
+            return info
+    except ValueError:
+        pass
+    raise sqlite3.DatabaseError("invalid local TAIL drain diagnostics")
+
+
+def record_drain_event(repository, base, *, failure=None, completed_at=None):
+    """Keep the latest verified completion and latest failure independently."""
+    from . import db
+
+    with db._connect(immediate=True) as conn:
+        info = _drain_info(conn, repository, base)
+        now = datetime.now(timezone.utc).isoformat()
+        if failure is None:
+            if completed_at is not None:
+                stamp = datetime.fromisoformat(completed_at.replace("Z", "+00:00"))
+                if stamp.tzinfo is None:
+                    raise sqlite3.DatabaseError("TAIL completion is missing its timezone")
+                now = stamp.astimezone(timezone.utc).isoformat()
+            previous = info.get("last_successful_drain_at")
+            if previous is None or datetime.fromisoformat(previous) < datetime.fromisoformat(now):
+                info["last_successful_drain_at"] = now
+        else:
+            info["last_drain_failure"] = {"at": now, "reason": str(failure)[:1000]}
+        conn.execute("""INSERT INTO settings (key, value) VALUES (?, ?)
+                       ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+                     (_drain_key(repository, base), json.dumps(info, separators=(",", ":"))))
+
+
 def backlog(repository, limit=100, after=0, *, base="main"):
     """Read a consistent bounded page; even an uninitialized store stays read-only."""
     if not 1 <= limit <= 1000 or after < 0:
@@ -302,34 +442,51 @@ def backlog(repository, limit=100, after=0, *, base="main"):
         raise PipelineError("TAIL backlog requires a base branch")
     result = {
         "repository": repository, "base": base, "discovery": None, "age_seconds": None,
+        "oldest_ready_at": None, "last_successful_drain_at": None, "last_drain_failure": None,
+        "recheck_due": None, "proof_unavailable_count": None,
         "counts": {}, "completions": {}, "candidates": [], "next_after": None,
     }
     with _read_index() as conn:
         if conn is None:
             return result
-        row = conn.execute(
+        checkpoint_row = conn.execute(
             "SELECT * FROM tail_discovery WHERE repository = ?", (repository,),
         ).fetchone()
-        if row is None:
+        if checkpoint_row is None:
             return result
-        candidates, _ = _projection(conn)
-        counts = conn.execute(f"""SELECT state, completion_kind, count(*) FROM ({candidates})
+        candidates, has_revision = _projection(conn)
+        if has_revision:
+            result["recheck_due"], = conn.execute(
+                """SELECT count(*) FROM tail_candidates
+                   WHERE repository = ? AND base = ? AND classified_revision = revision
+                     AND state != 'ready' AND next_check_at <= ?""",
+                (repository, base, datetime.now(timezone.utc).isoformat())).fetchone()
+        result["proof_unavailable_count"] = 0
+        counts = conn.execute(f"""SELECT state, completion_kind, count(*), min(merged_at), count(proof_error)
+                                  FROM ({candidates})
                                   GROUP BY state, completion_kind""", (repository, base))
-        for state, kind, count in counts:
+        for state, kind, count, oldest, unavailable_count in counts:
+            result["proof_unavailable_count"] += unavailable_count
             if state == "resolved":
                 result["completions"][kind] = count
             else:
                 result["counts"][state] = count
+                if state == "ready":
+                    result["oldest_ready_at"] = oldest
         rows = conn.execute(f"""SELECT * FROM ({candidates})
                                 WHERE state != 'resolved' AND pr_number > ?
                                 ORDER BY pr_number LIMIT ?""", (repository, base, after, limit + 1)).fetchall()
-        result["candidates"] = [{key: row[key] for key in row.keys() if key != "repository"} for row in rows[:limit]]
+        for row in rows[:limit]:
+            candidate = _candidate(row)
+            del candidate["repository"]
+            result["candidates"].append(candidate)
+        result.update(_drain_info(conn, repository, base))
         if len(rows) > limit:
             result["next_after"] = rows[limit - 1]["pr_number"]
 
         # A repository keeps one current checkpoint. Old observations survive
         # a branch or query change; only a compatible scan can attest freshness.
-        checkpoint = _checkpoint(row)
+        checkpoint = _checkpoint(checkpoint_row)
         if checkpoint.get("fingerprint") != query_fingerprint(repository, base):
             return result
         # The cursor, verification token and seen-node set belong to the
@@ -341,6 +498,9 @@ def backlog(repository, limit=100, after=0, *, base="main"):
         intervals = checkpoint.get("intervals", [])
         progress["current_interval"] = intervals[-1] if intervals else None
         progress["pending_intervals"] = len(intervals)
+        progress["uncovered_intervals"] = [
+            {"lower": lower, "upper": upper} for lower, upper in intervals[-100:][::-1]
+        ]
         result["discovery"] = progress
         completed_at = progress.get("last_complete_at")
         if completed_at:

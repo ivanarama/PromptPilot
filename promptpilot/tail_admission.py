@@ -146,7 +146,7 @@ def _read_comments(gh, config, number, snapshot):
                 or timestamp(node["lastEditedAt"] or node["createdAt"]) != timestamp(row.get("updated_at"))):
             raise PipelineError("TAIL REST comments and stable timeline disagree")
         if login == config["trusted_account"]:
-            comments.append(row)
+            comments.append(dict(row, tail_edited=node["lastEditedAt"] is not None))
     if graph:
         raise PipelineError("TAIL REST comments omit timeline entries")
     return comments
@@ -314,16 +314,19 @@ def classify(gh, config, candidate):
                 kind = "legacy"
             else:
                 continue
+            # GitHub cannot establish when an edited comment gained the marker.
+            completed_at = None if row["tail_edited"] else row["created_at"]
             return dict(state="resolved", completion_kind=kind,
                         completion_digest=pp.digest([kind, version, row["id"], row["updated_at"]]),
-                        reason="TAIL completion verified", **version)
+                        completed_at=completed_at, reason="TAIL completion verified", **version)
         if not any(item["kind"] == "issue" for item in items):
             return dict(state="resolved", completion_kind="empty", completion_digest=pp.digest(["empty", version]),
                         reason="TAIL selected review has zero issue items", **version)
+        source = dict(protocol=protocol, review_body=review["body"], review_edited=review["tail_edited"], title=pr.get("title"),
+                      items=items, comments=comments, **version)
         if paused:
-            return dict(state="waiting-policy", reason="TAIL paused by PR policy", **version)
-        return dict(state="ready", reason="TAIL selected review has open items", protocol=protocol,
-                    review_body=review["body"], title=pr.get("title"), items=items, comments=comments, **version)
+            return dict(state="waiting-policy", reason="TAIL paused by PR policy", **source)
+        return dict(state="ready", reason="TAIL selected review has open items", **source)
     except InvalidTailSection as exc:
         return dict(state="invalid-source", reason=str(exc), parse_error=exc.location)
     except InvalidSource as exc:
