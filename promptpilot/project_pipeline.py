@@ -2886,6 +2886,8 @@ def _tail_command(args, config):
                 result = tail_drain.gate(gh, config, args.number, args.version)
             elif command == "tail-reconcile":
                 result = tail_drain.reconcile(gh, config, args.number)
+            elif command == "tail-restore":
+                result = tail_drain.restore(gh, config, args.number, args.version, args.item, args.issue)
             else:
                 result = tail_drain.create(gh, config, args.number, args.version, args.item, args.context_file)
         except PipelineError as exc:
@@ -2945,13 +2947,16 @@ def run(argv=None) -> int:
     tail_reconcile = sub.add_parser("tail-reconcile", help="check prior TAIL writes without modifying GitHub")
     tail_reconcile.add_argument("--number", type=int, help="inspect a specific discovered PR")
     sub.add_parser("tail-next", help="classify due PRs for the canonical TAIL procedure")
-    for name in ("tail-gate", "tail-create"):
+    for name in ("tail-gate", "tail-create", "tail-restore"):
         target = sub.add_parser(name)
         target.add_argument("--number", type=int, required=True)
-        target.add_argument("--version", required=True, help="source version returned by tail-next")
-        if name == "tail-create":
+        target.add_argument("--version", required=True, help="source version returned by tail-next or tail-reconcile")
+        if name in ("tail-create", "tail-restore"):
             target.add_argument("--item", type=int, required=True, help="verified issue item selected by the TAIL worker")
+        if name == "tail-create":
             target.add_argument("--context-file", type=Path, help="UTF-8 explanation from checking the current base branch")
+        if name == "tail-restore":
+            target.add_argument("--issue", type=int, required=True, help="existing GitHub issue for the exact source")
     from . import merge_checkpoint, merge_ci_wait
     merge_checkpoint.add_arguments(sub.add_parser("merge-checkpoint"))
     merge_ci_wait.add_arguments(sub.add_parser("merge-ci-wait"))
@@ -3027,7 +3032,8 @@ def run(argv=None) -> int:
             value = inspect_file(args.report, args.head)
         elif args.command == "capabilities":
             value = capabilities(config)
-        elif args.command in ("tail-backlog", "tail-discover", "tail-reconcile", "tail-next", "tail-gate", "tail-create"):
+        elif args.command in ("tail-backlog", "tail-discover", "tail-reconcile", "tail-next", "tail-gate",
+                              "tail-create", "tail-restore"):
             value = _tail_command(args, config)
         else:
             gh = GitHub()

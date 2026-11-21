@@ -78,10 +78,14 @@ def inspect_item(config, row, source, index):
     return item, records, None
 
 
+def lease_active(lease):
+    return lease is not None and datetime.now(timezone.utc) < lease[2] + _TTL
+
+
 def reconcile_item(source, index, item, records, snapshot):
     lease, _, intents, dropped = records
     paused = source["state"] == "waiting-policy" or dropped
-    active = lease is not None and datetime.now(timezone.utc) < lease[2] + _TTL
+    active = lease_active(lease)
     ref = _REF_PREFIX + item.dedupe
     intent = intents[0][0] if intents else None
     evidence = {"item": index, "intent": intent, "ref": ref}
@@ -89,7 +93,9 @@ def reconcile_item(source, index, item, records, snapshot):
         if intent is not None or snapshot.has_ref(ref):
             existing = snapshot.lookup(item, exact=paused)
             if existing is not None:
+                exact_source = paused or snapshot.lookup(item, exact=True) == existing
                 return {**evidence, "state": "existing-issue", "issue": existing,
+                        "exact_source": exact_source, "restore_ready": exact_source and not active,
                         "reason": "found the issue for the interrupted TAIL item"}, None
             if not active:
                 reason = (f"no issue proved for create-intent {intent}" if intent is not None

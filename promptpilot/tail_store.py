@@ -19,6 +19,61 @@ class TailCandidateConflict(PipelineError):
     """Discovery or another classifier changed the candidate during the remote read."""
 
 
+@contextmanager
+def item_writer(repository, number):
+    """Exclude other local item writers without holding the main index's writer lock."""
+    identity = json.dumps([repository, number], separators=(",", ":"))
+    name = hashlib.sha256(identity.encode("ascii")).hexdigest()
+    path = config.DB_PATH.parent / "tail-writers" / (name + ".sqlite3")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(path), timeout=0, isolation_level=None)
+    except (OSError, sqlite3.Error) as exc:
+        raise PipelineError(f"TAIL item writer lock unavailable: {exc}") from exc
+    with closing(conn):
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError as exc:
+            code = getattr(exc, "sqlite_errorcode", None)
+            busy = ((code is not None and (code & 0xff) in (5, 6))
+                    or (code is None and str(exc).lower() in {"database is locked", "database table is locked"}))
+            if not busy:
+                raise PipelineError(f"TAIL item writer lock unavailable: {exc}") from exc
+            yield False
+        else:
+            # Closing the auxiliary connection releases the lock on exit or
+            # process death. The file itself remains in the shared data dir.
+            yield True
+
+
+def _restore_key(repository, number, version, item):
+    identity = json.dumps([repository, number, version, item], separators=(",", ":"))
+    return "tail-restore-v1:" + hashlib.sha256(identity.encode("ascii")).hexdigest()
+
+
+def pending_restore(repository, number, version, item):
+    from . import db
+
+    with db._connect() as conn:
+        return conn.execute("SELECT 1 FROM settings WHERE key = ?",
+                            (_restore_key(repository, number, version, item),)).fetchone() is not None
+
+
+def restore_attempt(repository, number, version, item, issue, *, confirmed=False):
+    """Fence a marker POST whose outcome may still be unknown on restart."""
+    from . import db
+
+    key = _restore_key(repository, number, version, item)
+    with db._connect(immediate=True) as conn:
+        if confirmed:
+            conn.execute("DELETE FROM settings WHERE key = ? AND value = ?", (key, str(issue)))
+            return
+        inserted = conn.execute("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING",
+                                (key, str(issue))).rowcount
+        if inserted != 1:
+            raise PipelineError("previous TAIL marker write is unconfirmed; verify the exact item-done before retry")
+
+
 def query_fingerprint(repository, base):
     # A protocol change invalidates both cursor resumption and reported progress.
     query = json.dumps(["merged-tail-v2", repository, base], ensure_ascii=True)

@@ -35,6 +35,7 @@ class Peer:
         self.discover_together = None
         self.select_together = None
         self.pause_after_write = None
+        self.pause_before_item_done = False
         self.write_visible = threading.Event()
         self.resume = threading.Event()
         self.issue_page_size = None
@@ -49,6 +50,10 @@ class Peer:
         barrier = self.select_together
         if barrier is not None and args == ("api", f"repos/{REPO}/pulls/42"):
             barrier.wait(60)
+        if (self.pause_before_item_done and payload
+                and (payload.get("body") or "").startswith("<!-- pp:tail-item-done ")):
+            self.write_visible.set()
+            assert self.resume.wait(90), "test did not release item-done POST"
         with self.lock:
             before = len(self.writes)
             output = self._request(args, payload)
@@ -58,9 +63,8 @@ class Peer:
                 observed = "authenticated"
             elif args == ("api", f"repos/{REPO}/git/ref/heads/main"):
                 observed = "base-read"
-            elif (self.writes[-1:] == ["intent"]
-                  and f"repos/{REPO}/issues?state=all&per_page=100" in args):
-                observed = "post-intent-dedupe-read"
+            elif self.writes and f"repos/{REPO}/issues?state=all&per_page=100" in args:
+                observed = f"post-{self.writes[-1]}-dedupe-read"
             if self.after is not None and self.after[0] == observed:
                 change_source(self.sources[42], self.after[1])
                 self.after = None
@@ -481,6 +485,8 @@ def test_cli_hold_after_ref_preserves_intent_boundary(http_cli):
 
 def crash_after_write(cli, peer, command, boundary):
     """Stop the CLI while GitHub has accepted the write and withheld its response."""
+    peer.write_visible.clear()
+    peer.resume.clear()
     peer.pause_after_write = boundary
     with cli.start(*command) as child:
         try:
@@ -601,6 +607,129 @@ def test_restart_under_hold_recovers_issue_on_second_page_without_a_second_write
     assert peer.issue_pages_read.count(2) >= 2
     assert peer.writes == ["claim", "ref", "intent", "issue"]
     assert [i["number"] for i in peer.issues if i["user"]["login"] == "owner"] == [2000]
+
+
+def test_tail_restore_serializes_writers_under_hold(http_cli):
+    cli, peer = http_cli(source_fixture())
+    create = selected(cli.run)
+    restore = ("tail-restore", *create[1:], "--issue", "2000")
+    crash_after_write(cli, peer, create, "issue")
+    change_source(peer.sources[42], "hold")
+    known = reconcile_item(cli)
+    assert known["issue"] == 2000 and known["exact_source"] is True
+    assert known["restore_ready"] is False
+    assert cli.run(*restore)["state"] == "active-elsewhere"
+    assert peer.writes == ["claim", "ref", "intent", "issue"]
+    expire_tail_claim(peer.sources[42])
+    assert reconcile_item(cli)["restore_ready"] is True
+
+    peer.write_visible.clear()
+    peer.resume.clear()
+    peer.pause_before_item_done = True
+    with cli.start(*restore) as writer:
+        try:
+            assert peer.write_visible.wait(90)
+            assert cli.run(*restore)["state"] == "active-elsewhere"
+            assert peer.writes == ["claim", "ref", "intent", "issue"]
+        finally:
+            peer.pause_before_item_done = False
+            peer.resume.set()
+            out, err = writer.communicate(timeout=120)
+    assert writer.returncode == 0, (out, err)
+    written = json.loads(out)
+    assert written["state"] == "item-done" and written["issue"] == 2000
+    assert written["already_present"] is False
+
+    replay = cli.run(*restore)
+    assert replay["state"] == "item-done" and replay["already_present"] is True
+    assert replay["completion_id"] == written["completion_id"]
+    source_marker = next(line for line in peer.issues[0]["body"].splitlines()
+                         if line.startswith("<!-- pp:tail-source pr=42 "))
+    expected = source_marker.replace("pp:tail-source pr=42 ", "pp:tail-item-done ", 1)
+    assert peer.sources[42]["comments"][-1]["body"] == expected.removesuffix(" -->") + " issue=2000 -->"
+    assert peer.writes == ["claim", "ref", "intent", "issue", "item-done"]
+    assert [i["number"] for i in peer.issues] == [2000]
+    assert cli.backlog()["completions"] == {"versioned": 1}
+
+
+def test_tail_restore_recovers_a_committed_marker_after_restart_under_no_tail(http_cli):
+    cli, peer = http_cli(source_fixture())
+    create = selected(cli.run)
+    restore = ("tail-restore", *create[1:], "--issue", "2000")
+    crash_after_write(cli, peer, create, "issue")
+    change_source(peer.sources[42], "no-tail")
+    expire_tail_claim(peer.sources[42])
+    crash_after_write(cli, peer, restore, "item-done")
+
+    result = cli.run(*restore)
+    assert result["state"] == "item-done" and result["issue"] == 2000
+    assert result["already_present"] is True
+    assert result["completion_id"] == peer.sources[42]["comments"][-1]["id"]
+    assert peer.writes == ["claim", "ref", "intent", "issue", "item-done"]
+    assert [i["number"] for i in peer.issues] == [2000]
+    assert cli.backlog()["completions"] == {"versioned": 1}
+
+
+def test_tail_restore_requires_opt_in_and_the_current_exact_issue(local_cli, tmp_path):
+    run, peer = local_cli
+    create = selected(run)
+    restore = ("tail-restore", *create[1:], "--issue", "2000")
+    peer.after = ("issue", "hold")
+    assert run(*create)["state"] == "existing-issue"
+    expire_tail_claim(peer.sources[42])
+
+    config_path = tmp_path / "pipelinectl.json"
+    settings = json.loads(config_path.read_text(encoding="utf-8"))
+    config_path.write_text(json.dumps({**settings, "tail_durable_drain": False}), encoding="utf-8")
+    assert run(*restore, code=2)["action"] == "error"
+    config_path.write_text(json.dumps(settings), encoding="utf-8")
+    assert run("tail-restore", "--number", "42", "--version", "a" * 64,
+               "--item", "1", "--issue", "2000", code=2)["action"] == "error"
+    assert run(*restore[:-1], "2001", code=2)["action"] == "error"
+    issue, = peer.issues
+    body = issue["body"]
+    issue["body"] = body.replace("<!-- pp:tail-source pr=42 ", "<!-- pp:tail-source pr=43 ", 1)
+    assert run(*restore, code=2)["action"] == "error"
+    issue["body"] = body
+    peer.after = ("post-issue-dedupe-read", "edit")
+    assert run(*restore, code=2)["action"] == "error"
+    assert peer.after is None
+    assert peer.writes == ["claim", "ref", "intent", "issue"]
+
+
+def test_tail_restore_does_not_retry_an_unconfirmed_marker_write(local_cli, monkeypatch):
+    run, peer = local_cli
+    create = selected(run)
+    restore = ("tail-restore", *create[1:], "--issue", "2000")
+    peer.after = ("issue", "hold")
+    assert run(*create)["state"] == "existing-issue"
+    expire_tail_claim(peer.sources[42])
+    request = peer._request
+    attempts = []
+
+    def lose_marker_response(args, payload):
+        if payload and (payload.get("body") or "").startswith("<!-- pp:tail-item-done "):
+            attempts.append(args)
+            raise PipelineError("timeout with no observed marker")
+        return request(args, payload)
+
+    monkeypatch.setattr(peer, "_request", lose_marker_response)
+    assert run(*restore, code=2)["action"] == "error"
+    assert "previous TAIL marker write is unconfirmed" in run(*restore, code=2)["error"]
+    observed, = run("tail-reconcile", "--number", "42")["observations"]
+    known, = observed["recovery"]
+    assert known["issue"] == 2000 and known["restore_ready"] is False
+    assert "previous TAIL marker write is unconfirmed" in known["reason"]
+    # A new issue number with the same exact-source marker cannot bypass the
+    # unknown result of the previous POST for this item.
+    peer.issues[0]["number"] = 2001
+    assert run(*restore[:-1], "2001", code=2)["action"] == "error"
+    source = peer.sources[42]
+    source["pull"]["labels"].clear()
+    source["snapshot"]["labels"].clear()
+    assert "previous TAIL marker write is unconfirmed" in run(*create, code=2)["error"]
+    assert len(attempts) == 1
+    assert peer.writes == ["claim", "ref", "intent", "issue"]
 
 
 def test_fresh_database_rediscovers_old_pr_and_recovers_item_done_without_a_write(http_cli):

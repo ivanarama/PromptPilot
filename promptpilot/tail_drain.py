@@ -191,6 +191,11 @@ def reconcile(gh, config, number=None):
                 for index, item, records, outcome in _inspect_items(config, row, result):
                     if outcome is None:
                         outcome, error = tail_recovery.reconcile_item(result, index, item, records, snapshot)
+                        if (outcome and outcome.get("restore_ready")
+                                and tail_store.pending_restore(row["repository"], pr_number,
+                                                               _version(row, result), index)):
+                            outcome = dict(outcome, restore_ready=False,
+                                           reason="previous TAIL marker write is unconfirmed")
                         if error is not None:
                             errors.append({"number": pr_number, "item": index, "reason": error})
                             issue_error = issue_error or error
@@ -236,6 +241,19 @@ def _project_recovery(row, source, outcomes):
 
 
 def create(gh, config, number, version, item, context_file=None):
+    row = _row(config, number)
+    with tail_store.item_writer(row["repository"], number) as acquired:
+        if not acquired:
+            return _busy_writer("tail-create", number, item)
+        return _create(gh, config, number, version, item, context_file)
+
+
+def _busy_writer(action, number, item):
+    return {"action": action, "number": number, "item": item, "state": "active-elsewhere",
+            "reason": "another process holds the local TAIL writer lock for this PR"}
+
+
+def _create(gh, config, number, version, item, context_file):
     from .tail_item import apply_item, read_issue_context
 
     context = read_issue_context(context_file)
@@ -257,6 +275,8 @@ def create(gh, config, number, version, item, context_file=None):
         raise PipelineError(source.get("reason") or source["state"])
     _require_same(row, source, version)
     identity, records, outcome = tail_recovery.inspect_item(config, row, source, item)
+    if outcome is None and tail_store.pending_restore(row["repository"], number, version, item):
+        raise PipelineError("previous TAIL marker write is unconfirmed; verify it through tail-restore")
     paused = source["state"] == "waiting-policy"
     same_version = _version(row, row) == version
     prior_recovery = (row.get("recovery") or []) if same_version else []
@@ -295,3 +315,50 @@ def create(gh, config, number, version, item, context_file=None):
     except tail_store.TailCandidateConflict:
         pass
     return {"action": "tail-create", "number": number, "item": item, **outcome}
+
+
+def restore(gh, config, number, version, item, issue):
+    """Finish a previously created issue through the shared local writer."""
+    from .tail_restore import restore_item
+
+    row = _row(config, number)
+    repository = row["repository"]
+    with tail_store.item_writer(repository, number) as acquired:
+        if not acquired:
+            return _busy_writer("tail-restore", number, item)
+        return _restore(gh, config, number, version, item, issue, restore_item, repository)
+
+
+def _restore(gh, config, number, version, item, issue, restore_item, repository):
+    latest = None
+
+    def recheck():
+        nonlocal latest
+        row = _row(config, number)
+        source = _read(gh, config, row)
+        _require_same(row, source, version)
+        if source["state"] not in ("ready", "waiting-policy"):
+            raise PipelineError(source.get("reason") or source["state"])
+        latest = row, source
+        return latest
+
+    def before_publish():
+        tail_store.restore_attempt(repository, number, version, item, issue)
+
+    outcome = restore_item(gh, config, number, item, issue, recheck, before_publish)
+    if outcome["state"] == "item-done":
+        row, source = latest
+        tail_store.restore_attempt(repository, number, version, item, issue, confirmed=True)
+        prior = (row.get("recovery") or []) if _version(row, row) == version else []
+        known = {entry["item"]: entry for entry in prior if entry["state"] != "item-done"}
+        for index, _, _, observed in _inspect_items(config, row, source):
+            if observed is not None:
+                known[index] = observed
+        result = _project_recovery(row, source, [known[index] for index in sorted(known)])
+        if result["state"] == "resolved":
+            result["proof_error"] = None
+        try:
+            _record(row, result)
+        except tail_store.TailCandidateConflict:
+            pass  # A later index observation cannot undo the confirmed GitHub marker.
+    return {"action": "tail-restore", "number": number, "item": item, **outcome}
