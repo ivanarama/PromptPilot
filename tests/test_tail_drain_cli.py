@@ -649,7 +649,9 @@ def test_tail_restore_serializes_writers_under_hold(http_cli):
     assert peer.sources[42]["comments"][-1]["body"] == expected.removesuffix(" -->") + " issue=2000 -->"
     assert peer.writes == ["claim", "ref", "intent", "issue", "item-done"]
     assert [i["number"] for i in peer.issues] == [2000]
-    assert cli.backlog()["completions"] == {"versioned": 1}
+    backlog = cli.backlog()
+    assert backlog["counts"] == {"waiting-policy": 1}
+    assert backlog["completions"] == {}
 
 
 def test_tail_restore_recovers_a_committed_marker_after_restart_under_no_tail(http_cli):
@@ -667,7 +669,53 @@ def test_tail_restore_recovers_a_committed_marker_after_restart_under_no_tail(ht
     assert result["completion_id"] == peer.sources[42]["comments"][-1]["id"]
     assert peer.writes == ["claim", "ref", "intent", "issue", "item-done"]
     assert [i["number"] for i in peer.issues] == [2000]
-    assert cli.backlog()["completions"] == {"versioned": 1}
+    backlog = cli.backlog()
+    assert backlog["counts"] == {"waiting-policy": 1}
+    assert backlog["completions"] == {}
+
+
+def test_drain_can_finalize_after_item_done_crash_and_pause(http_cli):
+    source = source_fixture()
+    cli, peer = http_cli(source)
+    create = selected(cli.run)
+    target = create[1:-2]
+    crash_after_write(cli, peer, create, "item-done")
+    writes = ["claim", "ref", "intent", "issue", "item-done"]
+    assert peer.writes == writes
+    assert not any("<!-- pp:tail-done " in comment["body"] for comment in source["comments"])
+
+    change_source(source, "hold")
+    paused, = cli.run("tail-reconcile", "--number", "42")["observations"]
+    item, = paused["recovery"]
+    assert item["state"] == "item-done" and item["issue"] == 2000
+    assert paused["state"] == "waiting-policy"
+    assert cli.run("tail-next")["ready"] == []
+    assert "paused" in cli.run("tail-gate", *target, code=2)["error"]
+    backlog = cli.backlog()
+    assert backlog["counts"] == {"waiting-policy": 1} and backlog["completions"] == {}
+
+    source["pull"]["labels"].remove({"name": "hold"})
+    source["snapshot"]["labels"].remove("hold")
+    # Ask for this PR explicitly so the test need not wait for policy backoff.
+    resumed, = cli.run("tail-reconcile", "--number", "42")["observations"]
+    ready, = cli.run("tail-next")["ready"]
+    assert resumed["state"] == ready["state"] == "ready"
+    assert ready["version"] == resumed["version"] == paused["version"] == target[-1]
+    assert ready["recovery"] == [item]
+    assert cli.run("tail-gate", *target)["state"] == "ready"
+    assert cli.run(*create)["state"] == "item-done"
+    assert peer.writes == writes
+    assert [issue["number"] for issue in peer.issues] == [2000]
+
+    # The canonical worker writes the shared report after verifying every item.
+    review = source["comments"][0]
+    add_comment(source, f"<!-- pp:tail-done review-comment={review['id']} review-updated={review['updated_at']} -->",
+                created=utc(datetime.now(timezone.utc)))
+    final = cli.run("tail-gate", *target)
+    assert final["state"] == "resolved" and final["completion_kind"] == "versioned"
+    backlog = cli.backlog()
+    assert backlog["counts"] == {} and backlog["completions"] == {"versioned": 1}
+    assert cli.run("tail-next")["ready"] == []
 
 
 def test_tail_restore_requires_opt_in_and_the_current_exact_issue(local_cli, tmp_path):

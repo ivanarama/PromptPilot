@@ -87,16 +87,16 @@ def _read(gh, config, row):
         raise
 
 
-def _project_terminal_items(row, source, outcomes):
+def _project_item_evidence(source, outcomes):
     invalid = next((item for item in outcomes if item["state"] == "invalid-source"), None)
     if invalid:
         return dict(source, state="invalid-source", reason=invalid["reason"], recovery=outcomes)
     issue_count = sum(item["kind"] == "issue" for item in source.get("items", ()))
     if issue_count and len(outcomes) == issue_count and all(item["state"] == "item-done" for item in outcomes):
-        proof = [_version(row, source), [[item["item"], item["issue"], item["completion_id"]] for item in outcomes]]
-        digest = hashlib.sha256(json.dumps(proof, separators=(",", ":")).encode("ascii")).hexdigest()
-        return dict(source, state="resolved", completion_kind="versioned", completion_digest=digest,
-                    reason="TAIL item completions verified", recovery=outcomes)
+        # Item markers settle every item, but only admission can verify the
+        # review-wide tail-done. Keep the PR eligible to publish it after pause.
+        reason = "TAIL awaiting versioned tail-done" if source["state"] == "ready" else source["reason"]
+        return dict(source, reason=reason, recovery=outcomes, proof_error=None)
     return source
 
 
@@ -108,9 +108,10 @@ def _inspect_items(config, row, source):
 
 
 def _selection(config, row, result):
-    result = _project_terminal_items(
-        row, result, [outcome for _, _, _, outcome in _inspect_items(config, row, result) if outcome is not None])
-    if (result["state"] in ("ready", "waiting-policy") and row["state"] == "ambiguous-create"
+    result = _project_item_evidence(
+        result, [outcome for _, _, _, outcome in _inspect_items(config, row, result) if outcome is not None])
+    if (result["state"] in ("ready", "waiting-policy") and "recovery" not in result
+            and row["state"] == "ambiguous-create"
             and _version(row, row) == _version(row, result)):
         # A fresh admission check does not establish whether an interrupted
         # create succeeded. Preserve its wait until a reconciliation can look.
@@ -212,7 +213,7 @@ def reconcile(gh, config, number=None):
                     result = {"state": "invalid-source", "reason": reason}
                     errors.append({"number": pr_number, "reason": reason})
                 else:
-                    result = _project_recovery(row, result, outcomes)
+                    result = _project_recovery(result, outcomes)
                 result["proof_error"] = {"kind": "issue", "reason": issue_error} if issue_error else None
             else:
                 result["proof_error"] = None
@@ -227,8 +228,8 @@ def reconcile(gh, config, number=None):
     return {"action": "tail-reconcile", "observations": observations, "errors": errors}
 
 
-def _project_recovery(row, source, outcomes):
-    result = _project_terminal_items(row, source, outcomes)
+def _project_recovery(source, outcomes):
+    result = _project_item_evidence(source, outcomes)
     ambiguous = next((item for item in outcomes if item["state"] == "ambiguous-create"), None)
     if ambiguous and result["state"] in ("ready", "waiting-policy"):
         result = dict(result, state="ambiguous-create", reason=ambiguous["reason"])
@@ -354,9 +355,7 @@ def _restore(gh, config, number, version, item, issue, restore_item, repository)
         for index, _, _, observed in _inspect_items(config, row, source):
             if observed is not None:
                 known[index] = observed
-        result = _project_recovery(row, source, [known[index] for index in sorted(known)])
-        if result["state"] == "resolved":
-            result["proof_error"] = None
+        result = _project_recovery(source, [known[index] for index in sorted(known)])
         try:
             _record(row, result)
         except tail_store.TailCandidateConflict:
