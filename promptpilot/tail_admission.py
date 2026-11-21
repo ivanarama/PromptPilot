@@ -314,9 +314,11 @@ def classify(gh, config, candidate):
                 kind = "legacy"
             else:
                 continue
+            # GitHub cannot establish when an edited comment gained the marker.
+            completed_at = None if row["tail_edited"] else row["created_at"]
             return dict(state="resolved", completion_kind=kind,
                         completion_digest=pp.digest([kind, version, row["id"], row["updated_at"]]),
-                        reason="TAIL completion verified", **version)
+                        completed_at=completed_at, reason="TAIL completion verified", **version)
         if not any(item["kind"] == "issue" for item in items):
             return dict(state="resolved", completion_kind="empty", completion_digest=pp.digest(["empty", version]),
                         reason="TAIL selected review has zero issue items", **version)

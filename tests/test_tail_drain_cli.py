@@ -718,6 +718,51 @@ def test_drain_can_finalize_after_item_done_crash_and_pause(http_cli):
     assert cli.run("tail-next")["ready"] == []
 
 
+@pytest.mark.parametrize("edited", [False, True])
+def test_confirmed_drain_clears_previous_issue_lookup_error(local_cli, monkeypatch, edited):
+    run, peer = local_cli
+    create = selected(run)
+    target = create[1:-2]
+    peer.after = ("issue", "hold")
+    assert run(*create)["state"] == "existing-issue"
+
+    request = peer._request
+
+    def unavailable_issue_list(args, payload):
+        if f"repos/{REPO}/issues?state=all&per_page=100" in args:
+            raise PipelineError("issue listing timed out")
+        return request(args, payload)
+
+    with monkeypatch.context() as failed:
+        failed.setattr(peer, "_request", unavailable_issue_list)
+        incomplete = run("tail-reconcile", "--number", "42")
+    assert incomplete["errors"][0]["reason"] == "issue listing timed out"
+    assert run("tail-backlog")["proof_unavailable_count"] == 1
+    run("tail-gate", *target, code=2)
+    assert run("tail-backlog")["proof_unavailable_count"] == 1
+
+    source = peer.sources[42]
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    created_at = utc(now)
+    issue, = peer.issues
+    source_marker = next(line for line in issue["body"].splitlines() if line.startswith("<!-- pp:tail-source "))
+    item_done = source_marker.replace("pp:tail-source pr=42 ", "pp:tail-item-done ", 1)
+    add_comment(source, item_done.removesuffix(" -->") + " issue=2000 -->", created=created_at)
+    review = source["comments"][0]
+    add_comment(source, f"<!-- pp:tail-done review-comment={review['id']} review-updated={review['updated_at']} -->",
+                created=created_at, edited=utc(now + timedelta(seconds=1)) if edited else None)
+
+    result = run("tail-gate", *target)
+    assert result["state"] == "resolved" and result["completion_kind"] == "versioned"
+    assert result.get("completed_at") == (None if edited else created_at)
+    backlog = run("tail-backlog")
+    assert backlog["completions"] == {"versioned": 1} and backlog["counts"] == {}
+    assert backlog["proof_unavailable_count"] == 0
+    assert backlog["last_drain_failure"]["reason"] == "issue listing timed out"
+    assert backlog["last_successful_drain_at"] == (None if edited else now.isoformat())
+    assert peer.writes == ["claim", "ref", "intent", "issue"]
+
+
 def test_tail_restore_requires_opt_in_and_the_current_exact_issue(local_cli, tmp_path):
     run, peer = local_cli
     create = selected(run)
@@ -809,17 +854,21 @@ def test_fresh_database_rediscovers_old_pr_and_recovers_item_done_without_a_writ
 
 def test_empty_and_legacy_done_survive_restart_without_external_writes(http_cli):
     legacy = source_fixture(protocol="legacy", number=43, merged_at="2026-02-01T00:00:00Z")
-    add_comment(legacy, "<!-- pp:tail-done -->")
+    marker = add_comment(legacy, "<!-- pp:tail-done -->")
     cli, peer = http_cli(source_fixture(items=[]), legacy)
     result = cli.run("tail-next")
     assert result["ready"] == []
     assert {(r["number"], r["completion_kind"]) for r in result["observations"]} == {
         (42, "empty"), (43, "legacy"),
     }
+    observed = {row["number"]: row for row in result["observations"]}
+    assert "completed_at" not in observed[42]
+    assert observed[43]["completed_at"] == marker["created_at"]
     assert cli.run("tail-next")["ready"] == []
     backlog = cli.backlog()
     assert backlog["completions"] == {"empty": 1, "legacy": 1}
     assert backlog["counts"] == {} and backlog["candidates"] == []
+    assert backlog["last_successful_drain_at"] == "2026-02-01T00:00:00+00:00"
     reconciled = cli.run("tail-reconcile", "--number", "42")
     assert reconciled["errors"] == []
     assert {(r["number"], r["completion_kind"]) for r in reconciled["observations"]} == {

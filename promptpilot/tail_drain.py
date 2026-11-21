@@ -23,7 +23,8 @@ def _version(row, result):
 def _observation(row, result):
     summary = {"number": row["pr_number"], "state": result["state"],
                "version": _version(row, result)}
-    for key in ("reason", "completion_kind", "review_id", "review_updated_at", "protocol", "parse_error", "recovery"):
+    for key in ("reason", "completion_kind", "completed_at", "review_id", "review_updated_at",
+                "protocol", "parse_error", "recovery"):
         if result.get(key) is not None:
             summary[key] = result[key]
     if result["state"] == "ready":
@@ -33,7 +34,8 @@ def _observation(row, result):
 
 def _record(row, result):
     prior_error = row.get("proof_error") or {}
-    if "proof_error" not in result and prior_error.get("kind") == "source":
+    if "proof_error" not in result and (result["state"] == "resolved" or prior_error.get("kind") == "source"):
+        # A proved completion needs no further lookup of individual issues.
         result = dict(result, proof_error=None)
     error = result.get("proof_error")
     if error:

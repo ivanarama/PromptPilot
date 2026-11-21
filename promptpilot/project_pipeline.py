@@ -2915,13 +2915,18 @@ def _observe_tail_drain(repository, base, result):
     if result.get("errors"):
         failure = result["errors"][0].get("reason") or "reconciliation incomplete"
     try:
-        completions = [row for row in evidence if row.get("state") == "item-done"]
-        stamps = [row["completed_at"] for row in completions if row.get("completed_at")]
-        if result["action"] == "tail-create" and completions and not stamps:
-            record_drain_event(repository, base)
-        elif stamps:
+        stamps = [
+            row["completed_at"] for row in evidence
+            if row.get("completed_at") and (
+                row.get("state") == "item-done"
+                or (row.get("state") == "resolved" and row.get("completion_kind") in ("legacy", "versioned"))
+            )
+        ]
+        if stamps:
             latest = max(stamps, key=lambda value: datetime.fromisoformat(value.replace("Z", "+00:00")))
             record_drain_event(repository, base, completed_at=latest)
+        elif result["action"] == "tail-create" and result.get("state") == "item-done":
+            record_drain_event(repository, base)
         if failure:
             record_drain_event(repository, base, failure=failure)
     except (sqlite3.Error, ValueError) as exc:
