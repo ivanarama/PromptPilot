@@ -1,6 +1,7 @@
 """Full legacy post-push proof with live transport and object-store boundaries replaced separately."""
 
 import hashlib
+import json
 import os
 from pathlib import Path
 
@@ -385,3 +386,281 @@ def test_pinned_canonical_checker_with_historical_2712():
     ]
     with pytest.raises(full.UnsupportedProof):
         full._check_document({}, checkout, b"CHANGELOG.md", inputs, inputs[0])
+
+
+def test_real_git_enrolled_conflict_requires_both_parents_and_exact_blobs(tmp_path):
+    git(tmp_path, "init", "-b", "main")
+    git(tmp_path, "config", "core.autocrlf", "false")
+    commit(tmp_path, "initial", code="initial\n", untouched="safe\n")
+    git(tmp_path, "checkout", "-b", "feature")
+    old = commit(tmp_path, "feature", code="feature\n")
+    git(tmp_path, "checkout", "main")
+    base = commit(tmp_path, "base", code="main\n")
+    (tmp_path / "code").write_bytes(b"accepted\n")
+    git(tmp_path, "add", "code")
+    tree = git(tmp_path, "write-tree")
+    head = git(tmp_path, "commit-tree", tree, "-p", old, "-p", base, "-m", "merge")
+    files = {
+        "code": {
+            key: "100644 blob " + git(tmp_path, "rev-parse", revision + ":code")
+            for key, revision in (("source", old), ("main", base), ("resolved", tree))
+        }
+    }
+    with pytest.raises(full.UnsupportedProof, match="unsupported conflict"):
+        full._tree({}, tmp_path, old, base, head, tree)
+    full._tree({}, tmp_path, old, base, head, tree, {"conflicts": files})
+    for key in files["code"]:
+        different = {"code": dict(files["code"], **{key: "100644 blob " + "a" * 40})}
+        with pytest.raises(full.UnsupportedProof, match="actual conflict set or blobs"):
+            full._tree({}, tmp_path, old, base, head, tree, {"conflicts": different})
+    with pytest.raises(full.UnsupportedProof, match="actual conflict set or blobs"):
+        full._tree(
+            {},
+            tmp_path,
+            old,
+            base,
+            head,
+            tree,
+            {"conflicts": dict(files, extra=files["code"])},
+        )
+    (tmp_path / "untouched").write_bytes(b"extra edit\n")
+    git(tmp_path, "add", "untouched")
+    extra_tree = git(tmp_path, "write-tree")
+    extra_head = git(
+        tmp_path, "commit-tree", extra_tree, "-p", old, "-p", base, "-m", "merge"
+    )
+    with pytest.raises(full.UnsupportedProof, match="outside the exact conflict"):
+        full._tree(
+            {}, tmp_path, old, base, extra_head, extra_tree, {"conflicts": files}
+        )
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        None,
+        "manifest-bytes",
+        "wrong-parent",
+        "different-body",
+        "after-intent",
+        "rest-authority",
+        "missing-pins",
+        "edited",
+        "foreign",
+        "wrong-pr",
+        "unbound-approval",
+        "duplicate-approval",
+        "reverse-order",
+        "inside-checkout",
+        "late-stop",
+        "stop-before-intent",
+        "new-stop-label",
+        "foreign-unpark",
+        "resume",
+        "competing-intent",
+    ],
+)
+@pytest.mark.parametrize("before_intent", [True, False])
+def test_operator_enrollment_replays_public_decisions_before_intent(
+    replay, monkeypatch, tmp_path, fault, before_intent
+):
+    # This PR and its conflict path are independent of the historical production incident.
+    state = tmp_path / "operator"
+    checkout = tmp_path if fault == "inside-checkout" else tmp_path / "checkout"
+    monkeypatch.setenv("PP_PIPELINE_STATE_DIR", str(state))
+    folder = state / "merge-resolutions" / CONFIG["repository"] / str(N)
+    folder.mkdir(parents=True)
+    files = {
+        "src/config.ini": {
+            "source": "100644 blob " + OLD,
+            "main": "100644 blob " + BASE,
+            "resolved": "100644 blob " + HEAD,
+        }
+    }
+    manifest = dict(
+        repository=CONFIG["repository"],
+        pull_request=N,
+        source=OLD,
+        main=BASE,
+        tree=TREE,
+        conflicts=files,
+    )
+    if fault == "wrong-parent":
+        manifest["source"] = BASE
+    if fault == "wrong-pr":
+        manifest["pull_request"] += 1
+    content = json.dumps(manifest, indent=2).encode()
+    signature = hashlib.sha256(content).hexdigest()
+    (folder / (signature + ".json")).write_bytes(
+        content + (b" " if fault == "manifest-bytes" else b"")
+    )
+    ids = [149, 150]
+    bodies = [
+        f"Approve {OLD} {BASE} {TREE} resolution {signature}",
+        f"Retry {OLD} {BASE} {TREE}.",
+    ]
+    if fault == "missing-pins":
+        bodies[0] = bodies[0].replace(signature, "")
+    approvals = []
+    for cid, body in zip(ids, bodies):
+        replay.comment(cid, body)
+        approvals.append(
+            {"id": cid, "body_sha256": hashlib.sha256(body.encode()).hexdigest()}
+        )
+    if fault == "different-body":
+        replay.edges[-1]["node"]["body"] += " changed"
+    if fault == "edited":
+        replay.edges[-1]["node"]["lastEditedAt"] = "2026-11-19T14:00:00Z"
+    if fault == "foreign":
+        replay.edges[-1]["node"]["author"]["login"] = "other"
+    if fault == "duplicate-approval":
+        approvals.append(approvals[0])
+    if fault == "reverse-order":
+        approvals.reverse()
+    if fault == "unbound-approval":
+        approvals[0]["id"] = 151
+    if fault != "after-intent":
+        replay.edges[-4:] = replay.edges[-2:] + replay.edges[-4:-2]
+    if fault in {"late-stop", "stop-before-intent"}:
+        replay.comment(152, "Please stop this integration.")
+        if fault == "stop-before-intent":
+            replay.edges.insert(-2, replay.edges.pop())
+    if fault in {None, "resume", "new-stop-label", "foreign-unpark"}:
+        replay.add(
+            "LabeledEvent" if fault == "new-stop-label" else "UnlabeledEvent",
+            "park",
+            label={"name": "needs-decision"},
+            actor={"login": "other" if fault == "foreign-unpark" else ACCOUNT},
+        )
+        replay.edges.insert(-2, replay.edges.pop())
+    if fault == "competing-intent":
+        replay.comment(153, INTENT.replace("claim=102", "claim=106"))
+    (folder / (TREE + ".json")).write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "resolution_sha256": signature,
+                "approvals": approvals,
+            }
+        ),
+        encoding="utf-8",
+    )
+    original = replay.json
+    if before_intent:
+        replay.current_head = OLD
+        replay.edges[:] = [
+            e
+            for e in replay.edges
+            if e["node"]["id"] != "B"
+            and (
+                e["node"]["id"] != "C164"
+                or fault in {"after-intent", "resume", "competing-intent"}
+            )
+        ]
+
+    def rest(verb, path, *args, **kwargs):
+        value = original(verb, path, *args, **kwargs)
+        if before_intent and path.endswith(f"/pulls/{N}"):
+            value["head"]["sha"] = OLD
+        if path.endswith(tuple("/issues/comments/" + str(cid) for cid in ids)):
+            value.update(
+                author_association="MEMBER" if fault == "rest-authority" else "OWNER",
+                created_at="2026-11-19T13:59:00Z",
+                updated_at="2026-11-19T13:59:00Z",
+            )
+        return value
+
+    monkeypatch.setattr(replay, "json", rest)
+    tree_inputs = []
+    monkeypatch.setattr(full, "_tree", lambda *args: tree_inputs.append(args[-1]))
+    monkeypatch.setattr(full, "_prepared_index", lambda *args: None)
+    monkeypatch.setattr(
+        full, "_tree_contents", lambda *args: tree_inputs.append(args[-1])
+    )
+
+    def prove():
+        if before_intent:
+            return full.prepare_before_intent(
+                replay,
+                CONFIG,
+                number=N,
+                source=OLD,
+                base=BASE,
+                tree=TREE,
+                working_dir=checkout,
+            )
+        return full.prepare(replay, CONFIG, replay.cp, working_dir=checkout)
+
+    if fault in {None, "resume"}:
+        result = prove()
+        if before_intent:
+            assert result == dict(
+                repository=CONFIG["repository"],
+                number=N,
+                source=OLD,
+                base=BASE,
+                tree=TREE,
+                resolution_sha256=signature,
+            )
+        else:
+            assert result[:2] == (DONE, None)
+        assert tree_inputs[0]["conflicts"] == files
+        assert all(
+            any(path.endswith("/issues/comments/" + str(cid)) for path in replay.calls)
+            for cid in ids
+        )
+    else:
+        with pytest.raises(pp.PipelineError):
+            prove()
+    assert not replay.posts
+
+
+@pytest.mark.parametrize("conflict", [True, False])
+def test_pre_intent_validates_real_index_and_single_merge_head_without_network(
+    tmp_path, monkeypatch, conflict
+):
+    monkeypatch.setenv("PP_PIPELINE_STATE_DIR", str(tmp_path / "unused"))
+    git(tmp_path, "init", "-b", "main")
+    git(tmp_path, "config", "core.autocrlf", "false")
+    commit(tmp_path, "initial", data="initial\n")
+    git(tmp_path, "checkout", "-b", "feature")
+    old = commit(tmp_path, "feature", data="ours\n")
+    git(tmp_path, "checkout", "main")
+    base = commit(tmp_path, "base", **{"data" if conflict else "other": "theirs\n"})
+    git(tmp_path, "checkout", "feature")
+    if conflict:
+        with pytest.raises(AssertionError, match="CONFLICT"):
+            git(tmp_path, "merge", "--no-commit", "--no-ff", base)
+        (tmp_path / "data").write_bytes(b"both\n")
+        git(tmp_path, "add", "data")
+    else:
+        git(tmp_path, "merge", "--no-commit", "--no-ff", base)
+    tree = git(tmp_path, "write-tree")
+
+    def preflight():
+        return full.prepare_before_intent(
+            None,
+            CONFIG,
+            number=N,
+            source=old,
+            base=base,
+            tree=tree,
+            working_dir=tmp_path,
+        )
+
+    if conflict:
+        with pytest.raises(full.UnsupportedProof, match="unsupported conflict"):
+            preflight()
+    else:
+        assert preflight()["resolution_sha256"] is None
+    assert git(tmp_path, "rev-parse", "HEAD") == old
+    (tmp_path / ".git" / "MERGE_HEAD").write_text(
+        base + "\n" + old + "\n", encoding="ascii"
+    )
+    with pytest.raises(pp.PipelineError, match="single MERGE_HEAD"):
+        preflight()
+    (tmp_path / ".git" / "MERGE_HEAD").write_text(base + "\n", encoding="ascii")
+    (tmp_path / "extra").write_bytes(b"unexpected\n")
+    git(tmp_path, "add", "extra")
+    with pytest.raises(pp.PipelineError, match="index tree differs"):
+        preflight()

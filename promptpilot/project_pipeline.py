@@ -2930,6 +2930,12 @@ def run(argv=None) -> int:
     progress_parser = sub.add_parser("inspect-merge-progress")
     progress_parser.add_argument("--number", required=True, type=int)
     progress_parser.add_argument("--head", required=True)
+    prepared = sub.add_parser("inspect-prepared-merge", help="verify a conflicted merge index before publishing intent")
+    prepared.add_argument("--number", type=int, required=True)
+    prepared.add_argument("--source", required=True)
+    prepared.add_argument("--base", required=True)
+    prepared.add_argument("--tree", required=True)
+    prepared.add_argument("--working-dir", type=Path, required=True)
     next_parser = sub.add_parser("next")
     next_parser.add_argument("stage", choices=("review", "merge", "fix"))
     gate_parser = sub.add_parser("gate-fallback")
@@ -3001,6 +3007,17 @@ def run(argv=None) -> int:
             elif args.command == "inspect-routing-positive":
                 from .review_routing_positive import live
                 value = live(gh, config, args.number, purpose=args.stage)
+            elif args.command == "inspect-prepared-merge":
+                from . import merge_done_proof
+                try:
+                    result = merge_done_proof.prepare_before_intent(
+                        gh, config, number=args.number, source=args.source, base=args.base,
+                        tree=args.tree, working_dir=args.working_dir)
+                except merge_done_proof.UnsupportedProof as exc:
+                    print(json.dumps({"state": "needs-resolution", "number": args.number,
+                                      "reason": str(exc), "product_mutation_authorized": False}, ensure_ascii=False))
+                    return 1
+                value = dict(result, state="verified", product_mutation_authorized=False)
             elif args.command == "inspect-merge-progress":
                 from .merge_admission_progress import observe
                 value = observe(gh, config, args.config, args.number, args.head)

@@ -16,6 +16,29 @@ from tests.test_merge_final_source import merge_dispatch as merge_dispatch
 from tests.test_pipeline_source_refresh import continuation as continuation, targeted_merge as targeted_merge
 
 
+@pytest.mark.parametrize(("outcome", "code"), [("verified", 0), ("needs-resolution", 1), ("error", 2)])
+def test_inspect_prepared_merge_reports_actionable_status(monkeypatch, tmp_path, capsys, outcome, code):
+    monkeypatch.setattr(pp, "load_config", lambda _: {})
+    monkeypatch.setattr(pp, "GitHub", lambda: None)
+
+    def inspect(gh, config, **inputs):
+        assert inputs == dict(number=42, source=OLD, base=BASE, tree=TREE, working_dir=tmp_path)
+        if outcome == "needs-resolution":
+            raise merge_done_proof.UnsupportedProof("conflict needs enrollment")
+        if outcome == "error":
+            raise pp.PipelineError("could not read GitHub")
+        return {"tree": TREE, "number": 42}
+
+    monkeypatch.setattr(merge_done_proof, "prepare_before_intent", inspect)
+    assert pp.run(["inspect-prepared-merge", "--number", "42", "--source", OLD, "--base", BASE,
+                   "--tree", TREE, "--working-dir", str(tmp_path)]) == code
+    value = json.loads(capsys.readouterr().out)
+    if outcome == "error":
+        assert value["action"] == "error"
+    else:
+        assert value["state"] == outcome and value["product_mutation_authorized"] is False
+
+
 @pytest.mark.parametrize(("managed", "record", "verdict", "held"), [
     (True, True, "НЕ СМОГ", False), (False, True, "НЕ СМОГ", True),
     (True, False, "НЕ СМОГ", True), (True, True, "НУЖЕН ЧЕЛОВЕК", True),
@@ -38,6 +61,7 @@ def test_recovery_reconstructs_checkpoint_then_provider_stops(merge_dispatch, mo
     assert route["action"] == "prompt" and route["target"]["head"] == HEAD
     if managed:
         assert "checkpoint_record_command" in route["prompt"] and "Не публикуй done" in route["prompt"]
+        assert "prepared_tree_check_command" in route["prompt"] and "inspect-prepared-merge" in route["prompt"]
     if record:
         saved = run_cli(monkeypatch, capsys, f, route, "record")
         assert saved["state"] == "recorded" and (saved.get("next_step") == "native-confirmation") == managed

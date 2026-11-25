@@ -1,6 +1,7 @@
 """Re-observe an already-pushed legacy base sync. No method here publishes."""
 
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -14,7 +15,7 @@ from . import (
     merge_ship_authorization as lineage,
 )
 from . import project_pipeline as pp
-from .review_routing_policy import require_legacy
+from .review_routing_policy import _file_bytes, require_legacy
 
 
 _need = narrow._need
@@ -22,6 +23,7 @@ _SHA = re.compile(r"[0-9a-f]{40}")
 _ROOT = "repos/" + narrow.REPOSITORY
 _REMOTE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+")
 _DOCS = {b"CHANGELOG.md", b"docs/features.md"}
+_SHA256 = re.compile(r"[0-9a-f]{64}")
 
 
 class UnsupportedProof(pp.PipelineError):
@@ -137,13 +139,154 @@ def _check_document(config, working_dir, path, stages, result_oid):
         raise UnsupportedProof("trusted mergecheck rejected the conflict resolution")
 
 
-def _tree(config, working_dir, old, base, head, tree):
+def _enrolled_resolution(config, working_dir, cp):
+    """Load the operator's exact decision pins and original owner-referenced manifest.
+
+    Enroll outside the checkout, under the pipeline state directory, in
+    merge-resolutions/<owner>/<repo>/<pr>/<tree>.json. This version-1 record
+    lists resolution_sha256 and ordered approvals (id, body_sha256). Store
+    the original manifest bytes alongside it as <resolution_sha256>.json.
+    The operator checks the meaning of the decisions before enrollment.
+    A PR body, a checkpoint, and a path supplied by a comment cannot enroll it.
+    """
+    directory = (
+        pp._merge_comment_index_path(config).parent
+        / "merge-resolutions"
+        / cp["repository"]
+        / str(cp["number"])
+    )
+    index = directory / (cp["tree"] + ".json")
+    try:
+        if not index.exists():
+            return None
+        checkout = Path(working_dir).resolve()
+
+        def read(path):
+            _proven(
+                not path.resolve().is_relative_to(checkout),
+                "resolution enrollment must be an operator file outside the checkout",
+            )
+            try:
+                return _file_bytes(path)
+            except pp.PipelineError as exc:
+                raise UnsupportedProof(
+                    "enrolled resolution evidence is not a bounded regular file"
+                ) from exc
+
+        entry = json.loads(read(index))
+        _proven(
+            isinstance(entry, dict)
+            and set(entry) == {"version", "resolution_sha256", "approvals"}
+            and type(entry["version"]) is int
+            and entry["version"] == 1
+            and isinstance(entry["resolution_sha256"], str)
+            and _SHA256.fullmatch(entry["resolution_sha256"]),
+            "invalid resolution enrollment",
+        )
+        approvals = entry["approvals"]
+        _proven(
+            isinstance(approvals, list)
+            and 0 < len(approvals) <= 16
+            and all(
+                isinstance(a, dict)
+                and set(a) == {"id", "body_sha256"}
+                and type(a["id"]) is int
+                and 0 < a["id"] < 2**63
+                and isinstance(a["body_sha256"], str)
+                and _SHA256.fullmatch(a["body_sha256"])
+                for a in approvals
+            )
+            and len({a["id"] for a in approvals}) == len(approvals),
+            "invalid resolution decision pins",
+        )
+        raw = read(directory / (entry["resolution_sha256"] + ".json"))
+        _proven(
+            hashlib.sha256(raw).hexdigest() == entry["resolution_sha256"],
+            "enrolled resolution manifest bytes differ",
+        )
+        manifest = json.loads(raw)
+        _proven(
+            isinstance(manifest, dict)
+            and manifest.get("repository") == cp["repository"]
+            and type(manifest.get("pull_request")) is int
+            and manifest["pull_request"] == cp["number"]
+            and manifest.get("source") == cp["from"]
+            and manifest.get("main") == cp["base"]
+            and manifest.get("tree") == cp["tree"]
+            and isinstance(manifest.get("conflicts"), dict)
+            and manifest["conflicts"],
+            "enrolled resolution manifest identifies a different merge",
+        )
+        return dict(entry, conflicts=manifest["conflicts"])
+    except (ValueError, OSError) as exc:
+        raise UnsupportedProof("cannot read enrolled resolution evidence") from exc
+
+
+def _resolution_approvals(gh, cp, resolution, nodes, order, after, before, protocol):
+    comments = {pp.comment_id(n): n for n in nodes if n["__typename"] == "IssueComment"}
+    ids = []
+    for approval in resolution["approvals"]:
+        node = comments.get(approval["id"])
+        _proven(
+            node
+            and after < order[node["id"]] < before
+            and node["author"]["login"] == narrow.TRUSTED
+            and node["lastEditedAt"] is None
+            and hashlib.sha256(node["body"].encode()).hexdigest()
+            == approval["body_sha256"],
+            "resolution decision absent, edited or outside the reviewed pre-intent history",
+        )
+        pins = {cp["from"], cp["base"], cp["tree"]}
+        if not ids:
+            pins.add(resolution["resolution_sha256"])
+        hashes = re.findall(r"(?<![0-9a-f])[0-9a-f]{40,64}(?![0-9a-f])", node["body"])
+        _proven(
+            pins.issubset(hashes),
+            "owner decision does not identify the exact resolution",
+        )
+        value = narrow._comment_readback(gh, cp["number"], node, node["body"])
+        _proven(
+            value.get("author_association") == "OWNER"
+            and node["createdAt"] == value.get("created_at") == value.get("updated_at"),
+            "owner resolution decision readback differs",
+        )
+        ids.append(node["id"])
+        after = order[node["id"]]
+    # An owner can stop or supersede an approval in ordinary prose. Only
+    # the canonical transaction's separately checked markers are expected.
+    for node in nodes[after + 1 :]:
+        kind = node["__typename"]
+        if kind == "IssueComment" and node["id"] not in protocol:
+            actor = (node.get("author") or {}).get("login")
+            _proven(
+                actor and actor != narrow.TRUSTED,
+                "new owner or unattributed comment after the enrolled resolution decision",
+            )
+        if kind in ("LabeledEvent", "UnlabeledEvent") and node["label"]["name"] in {
+            "hold",
+            "manual",
+            "needs-decision",
+            "changes-requested",
+        }:
+            _proven(
+                kind == "UnlabeledEvent"
+                and (node.get("actor") or {}).get("login") == narrow.TRUSTED,
+                "new stop or untrusted removal after the enrolled resolution decision",
+            )
+    return ids
+
+
+def _tree(config, working_dir, old, base, head, tree, resolution=None):
     git = lambda *args: narrow._git(config, working_dir, *args)
     _need(
         git("rev-list", "-n", "1", "--parents", head).split() == [head, old, base]
         and git("rev-parse", head + "^{tree}") == tree,
         "local parents/tree differ from checkpoint",
     )
+    _tree_contents(config, working_dir, old, base, tree, resolution)
+
+
+def _tree_contents(config, working_dir, old, base, tree, resolution):
     rc, data = _git_bytes(
         config,
         working_dir,
@@ -160,14 +303,17 @@ def _tree(config, working_dir, old, base, head, tree):
     _need(_SHA.fullmatch(automatic), "invalid automatic tree")
     if rc == 0:
         _proven(
-            not items and automatic == tree,
+            not items and automatic == tree and resolution is None,
             "pushed tree differs from conflict-free merge",
         )
         return
     conflicts = {}
     for row in items:
         match = re.fullmatch(rb"100644 ([a-f0-9]{40}) ([123])\t(.+)", row)
-        _proven(match and match[3] in _DOCS, "unsupported conflict or file mode")
+        _proven(
+            match and (match[3] in _DOCS or resolution is not None),
+            "unsupported conflict or file mode",
+        )
         group = conflicts.setdefault(match[3], {})
         stage = int(match[2])
         _proven(stage not in group, "duplicate conflict stage")
@@ -187,15 +333,54 @@ def _tree(config, working_dir, old, base, head, tree):
         conflicts and set(delta.rstrip(b"\0").split(b"\0")) == set(conflicts),
         "pushed tree changes paths outside the exact conflict set",
     )
+    observed = {}
     for path, group in conflicts.items():
         _proven(set(group) == {1, 2, 3}, "incomplete conflict stages")
-        entry = git("ls-tree", tree, "--", path.decode("ascii"))
-        match = re.fullmatch(
-            r"100644 blob ([a-f0-9]{40})\t" + re.escape(path.decode("ascii")), entry
-        )
+        try:
+            name = path.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise UnsupportedProof("unsupported conflict filename encoding") from exc
+
+        def blob_at(revision):
+            _, entry = _git_bytes(
+                config,
+                working_dir,
+                "ls-tree",
+                "-z",
+                revision,
+                "--",
+                ":(literal)" + name,
+            )
+            return re.fullmatch(
+                rb"100644 blob ([a-f0-9]{40})\t" + re.escape(path) + rb"\x00", entry
+            )
+
+        match = blob_at(tree)
         _proven(match, "changed file mode or missing conflict result")
-        _check_document(
-            config, working_dir, path, [group[i] for i in (1, 2, 3)], match[1]
+        result_oid = match[1].decode("ascii")
+        if resolution is not None:
+            for parent, stage in ((old, 2), (base, 3)):
+                entry = blob_at(parent)
+                _proven(
+                    entry and entry[1].decode("ascii") == group[stage],
+                    "conflict stage differs from regular file at parent path",
+                )
+            observed[name] = {
+                key: "100644 blob " + oid
+                for key, oid in (
+                    ("source", group[2]),
+                    ("main", group[3]),
+                    ("resolved", result_oid),
+                )
+            }
+        if path in _DOCS:
+            _check_document(
+                config, working_dir, path, [group[i] for i in (1, 2, 3)], result_oid
+            )
+    if resolution is not None:
+        _proven(
+            observed == resolution["conflicts"],
+            "actual conflict set or blobs differ from owner resolution",
         )
 
 
@@ -319,7 +504,7 @@ def _new_checks(gh, head):
     return sorted(found.values())
 
 
-def _history(gh, config, cp, pr, main):
+def _history(gh, config, cp, pr, main, resolution):
     old, base, head, iid, number = (
         cp[k] for k in ("from", "base", "to", "intent", "number")
     )
@@ -423,6 +608,19 @@ def _history(gh, config, cp, pr, main):
         and (done is None or order[done["id"]] > order[saved["id"]]),
         "intent or receipt outside approved epoch",
     )
+    if resolution is not None:
+        ids.extend(
+            _resolution_approvals(
+                gh,
+                cp,
+                resolution,
+                nodes,
+                order,
+                max(order[ship], order[proof["completion_node"]]),
+                order[saved["id"]],
+                exclude,
+            )
+        )
     for n in nodes[order[info["anchor_id"]] + 1 :]:
         if n["__typename"] == "IssueComment" and n["id"] not in exclude:
             protocol = lineage._protocol_body(n["body"])
@@ -473,6 +671,181 @@ def _history(gh, config, cp, pr, main):
     return snap, chain, intent_base, body, pp.comment_id(done) if done else None
 
 
+def _prepared_index(config, working_dir, source, base, tree):
+    git = lambda *args: narrow._git(config, working_dir, *args)
+    merge_head_path = Path(
+        git("rev-parse", "--path-format=absolute", "--git-path", "MERGE_HEAD")
+    )
+    _need(
+        merge_head_path.is_absolute() and merge_head_path.is_file(),
+        "prepared merge has no MERGE_HEAD",
+    )
+    _need(
+        git("rev-parse", "HEAD") == source
+        and _file_bytes(merge_head_path).splitlines() == [base.encode()]
+        and git("write-tree") == tree,
+        "prepared merge HEAD, single MERGE_HEAD or index tree differs",
+    )
+
+
+def prepare_before_intent(gh, config, *, number, source, base, tree, working_dir):
+    """Check the resolved Git index using the same rules as later receipt recovery."""
+    _need(
+        config.get("repository") == narrow.REPOSITORY
+        and config.get("trusted_account") == narrow.TRUSTED
+        and config.get("base_branch") == "main"
+        and set(config.get("required_checks", ())) == narrow.REQUIRED
+        and type(number) is int
+        and 0 < number < 2**63
+        and Path(working_dir).is_absolute()
+        and all(
+            isinstance(oid, str) and _SHA.fullmatch(oid) for oid in (source, base, tree)
+        )
+        and source != base,
+        "invalid pre-intent resolution route",
+    )
+    cp = {
+        "repository": narrow.REPOSITORY,
+        "number": number,
+        "from": source,
+        "to": source,
+        "base": base,
+        "tree": tree,
+    }
+    _prepared_index(config, working_dir, source, base, tree)
+    resolution = _enrolled_resolution(config, working_dir, cp)
+    _tree_contents(config, working_dir, source, base, tree, resolution)
+    if resolution is not None:
+        pull = f"{_ROOT}/pulls/{number}"
+        ref = f"{_ROOT}/git/ref/heads/main"
+        _need(
+            gh.json("api", "user")["login"] == narrow.TRUSTED,
+            "unexpected authenticated user",
+        )
+        pr = gh.json("api", pull)
+        identity = _identity(pr, cp)
+        main = gh.json("api", ref)
+        _need(
+            main["ref"] == "refs/heads/main"
+            and main["object"]["type"] == "commit"
+            and main["object"]["sha"] == base,
+            "protected main changed before intent",
+        )
+        snap = pp.stable_timeline(gh, config, number)
+        pp.validate_common(snap, config, {"head": source})
+        _need(
+            snap["baseRefOid"] == identity[3] and snap["labels"] == identity[5],
+            "REST and GraphQL PR identity differ",
+        )
+        require_legacy(gh, config, number, snapshot=snap)
+        nodes = [edge["node"] for edge in lineage._full_edges(snap)]
+        order = {n["id"]: i for i, n in enumerate(nodes)}
+        intents = [
+            n
+            for n in nodes
+            if n["__typename"] == "IssueComment"
+            and any(
+                m[1] == source
+                for m in lineage._INTENT.finditer(lineage._protocol_body(n["body"]))
+            )
+        ]
+        _proven(len(intents) <= 1, "competing pre-push intents exist for this source")
+        saved = intents[0] if intents else None
+        protocol = {n["id"] for n in intents}
+        reviewed = dict(
+            snap, edges=[e for e in snap["edges"] if e["node"]["id"] not in protocol]
+        )
+        info = pp.epoch(reviewed, narrow.TRUSTED)
+        pp.validate_epoch_safety(info, narrow.TRUSTED)
+        anchors = [
+            n["id"]
+            for n in nodes
+            if n["__typename"] == "PullRequestCommit" and n["commit"]["oid"] == source
+        ]
+        proof = pp.proof(info, source, narrow.TRUSTED)
+        _need(
+            anchors == [info["anchor_id"]] and proof and proof["outcome"] == "reviewed",
+            "enrolled resolution needs the current reviewed source",
+        )
+        ship = next(
+            (
+                n["id"]
+                for n in reversed(nodes)
+                if n["__typename"] == "LabeledEvent" and n["label"]["name"] == "ship"
+            ),
+            None,
+        )
+        _proven(ship is not None, "enrolled resolution has no source ship event")
+        if saved:
+            marker = lineage.intent_line(saved["body"])
+            expected = (
+                source,
+                base,
+                *(str(proof[k]) for k in ("review_id", "claim_id", "completion_id")),
+                ship,
+            )
+            _proven(
+                marker
+                and marker.groups()[:6] == expected
+                and (saved.get("author") or {}).get("login") == narrow.TRUSTED
+                and saved["lastEditedAt"] is None,
+                "existing intent differs from exact source, base, review or ship",
+            )
+            if marker[7] == "none":
+                _proven(
+                    pp.trusted_ship_authorized(info, narrow.TRUSTED),
+                    "existing intent has no trusted direct ship",
+                )
+            else:
+                previous = lineage.current_lineage_candidate(reviewed, narrow.TRUSTED)
+                _proven(
+                    previous and str(previous["hops"][-1]["done_id"]) == marker[7],
+                    "existing intent has an unproven previous receipt",
+                )
+                _previous(gh, config, reviewed, pr, main, marker[7], ship)
+            narrow._comment_readback(gh, number, saved, saved["body"])
+        else:
+            _proven(
+                pp.current_ship_authorized(gh, config, number, snap, info=info),
+                "enrolled resolution needs current trusted ship",
+            )
+        ids = [
+            anchors[0],
+            proof["review_node"],
+            proof["claim_node"],
+            proof["completion_node"],
+            ship,
+        ]
+        ids.extend(
+            _resolution_approvals(
+                gh,
+                cp,
+                resolution,
+                nodes,
+                order,
+                max(order[ship], order[proof["completion_node"]]),
+                order[saved["id"]] if saved else len(nodes),
+                protocol,
+            )
+        )
+        ids.extend(protocol)
+        narrow._check_addressed(gh, config, number, snap, ids)
+        _need(
+            _identity(gh.json("api", pull), cp) == identity
+            and gh.json("api", ref) == main,
+            "remote identity changed before intent",
+        )
+    _prepared_index(config, working_dir, source, base, tree)
+    return {
+        "repository": narrow.REPOSITORY,
+        "number": number,
+        "source": source,
+        "base": base,
+        "tree": tree,
+        "resolution_sha256": resolution["resolution_sha256"] if resolution else None,
+    }
+
+
 def prepare(gh, config, checkpoint, *, working_dir):
     """Return exact body, observed receipt ID, and digest of the live pre-send evidence."""
     cp = checkpoint
@@ -521,7 +894,8 @@ def prepare(gh, config, checkpoint, *, working_dir):
     commit = gh.json("api", f"{_ROOT}/git/commits/{head}")
     lineage._commit_identity(commit, head, old, base)
     _need(commit["tree"]["sha"] == tree, "REST tree differs from checkpoint")
-    _tree(config, working_dir, old, base, head, tree)
+    resolution = _enrolled_resolution(config, working_dir, cp)
+    _tree(config, working_dir, old, base, head, tree, resolution)
     protection = gh.json("api", f"{_ROOT}/branches/main/protection")[
         "required_status_checks"
     ]
@@ -536,7 +910,9 @@ def prepare(gh, config, checkpoint, *, working_dir):
             "reviewed source CI8 is incomplete or has not passed"
         ) from exc
     checks = [source_checks, _new_checks(gh, head)]
-    snap, chain, intent_base, body, done = _history(gh, config, cp, pr, main)
+    snap, chain, intent_base, body, done = _history(
+        gh, config, cp, pr, main, resolution
+    )
     for earlier, later in ((intent_base, base), (base, tip)):
         if earlier != later:
             narrow._git(
@@ -563,6 +939,7 @@ def prepare(gh, config, checkpoint, *, working_dir):
                 chain,
                 intent_base,
                 body,
+                *([resolution] if resolution is not None else []),
             ]
         ),
     )
