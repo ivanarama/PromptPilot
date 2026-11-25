@@ -2234,6 +2234,21 @@ def merge_review_proof(gh, config, number, snapshot, *, health=None, merged=Fals
     return proof(epoch(snapshot, config['trusted_account']), snapshot['headRefOid'], config['trusted_account'])
 
 
+def ordinary_merge_ready(gh, config, status, checks, snapshot, intent=None):
+    ready, reason = checks_ready(config, checks)
+    if not ready:
+        return False, reason
+    state, mergeable = status.get("mergeStateStatus"), status.get("mergeable")
+    if mergeable == "MERGEABLE" and state == "CLEAN":
+        return True, reason
+    reason = f"mergeStateStatus={state}, mergeable={mergeable}"
+    if mergeable == "MERGEABLE" and state == "UNSTABLE" and intent is not None:
+        from .reserved_merge_checks import verify_optional_bench
+        ok, detail = verify_optional_bench(gh, config, intent, snapshot, status.get("body") or "")
+        return ok, f"{reason}: {detail}"
+    return False, reason
+
+
 def pending_merge_action(gh: GitHub, config: dict, intent: dict) -> dict:
     pr = gh.json("api", f"repos/{config['repository']}/pulls/{intent['number']}")
     if pr.get("merged") is True:
@@ -2270,15 +2285,18 @@ def pending_merge_action(gh: GitHub, config: dict, intent: dict) -> dict:
     if (hashlib.sha256(body.encode("utf-8")).hexdigest() != intent["body_sha256"] or
             same_repo_closing_issues(body, config["repository"]) != intent["issues"]):
         return {"action": "fallback", "reason": "merge cleanup payload changed"}
-    ready, reason = checks_ready(config, checks)
-    if status.get("mergeStateStatus") != "CLEAN" or status.get("mergeable") != "MERGEABLE" or not ready:
+    ready, reason = ordinary_merge_ready(gh, config, status, checks, snapshot, intent)
+    if not ready:
         return {"action": "wait", "reason": reason, "number": intent["number"]}
     lease = {"version": 1, "stage": "merge", "repository": config["repository"],
              "number": intent["number"], "head": intent["head"],
              "snapshot": digest(snapshot), "proof": established, "intent": intent}
-    return {"action": "merge", "target": {"number": intent["number"], "head": intent["head"]},
-            "lease": encode_lease(lease),
-            "complete": "run the same command with: complete merge --lease <lease>"}
+    result = {"action": "merge", "target": {"number": intent["number"], "head": intent["head"]},
+              "lease": encode_lease(lease),
+              "complete": "run the same command with: complete merge --lease <lease>"}
+    if status.get("mergeStateStatus") == "UNSTABLE":
+        result["warning"] = reason
+    return result
 
 
 def _base_sync_owner_action(gh: GitHub, config: dict, owner: dict) -> dict | None:
@@ -2551,7 +2569,7 @@ def _barrier_blocks_merge(health: dict, lease: dict) -> bool:
                 and all(item.get("pr") == lease.get("number") for item in barriers))
 
 
-def _ready_owner_action(gh: GitHub, config: dict, health: dict) -> dict | None:
+def _ready_owner_action(gh: GitHub, config: dict, health: dict, *, intent=None) -> dict | None:
     """No branch update and no inferred carry: exact-HEAD ready owner only.
 
     A fresh current-epoch trusted ship permits direct completion; historical
@@ -2572,19 +2590,26 @@ def _ready_owner_action(gh: GitHub, config: dict, health: dict) -> dict | None:
     status, checks = pr_checks(gh, config, number)
     if checks_in_progress(config, checks):
         return {"action": "wait", "number": number, "reason": "required CI checks are still running"}
-    if status.get("mergeStateStatus") != "CLEAN" or status.get("mergeable") != "MERGEABLE":
+    if intent is not None and (intent["head"] != head or intent["number"] != number):
+        return None
+    ready, reason = ordinary_merge_ready(gh, config, status, checks, snapshot, intent)
+    if not ready:
+        if intent is not None:
+            return {"action": "wait", "number": number, "reason": reason}
         return None
     info = epoch(snapshot, config["trusted_account"])
     validate_epoch_safety(info, config["trusted_account"])
     established = proof(info, head, config["trusted_account"])
     if (not established or established.get("outcome") != "reviewed"
-            or not current_ship_authorized(gh, config, number, snapshot, info=info)
-            or not checks_ready(config, checks)[0]):
+            or not current_ship_authorized(gh, config, number, snapshot, info=info)):
         return None
     lease = {"version": 1, "stage": "merge", "repository": config["repository"],
              "number": number, "head": head, "snapshot": digest(snapshot),
              "proof": established, "ready_owner": True, "owner_stage": owner["stage"]}
-    return {"action": "merge", "target": owner, "lease": encode_lease(lease)}
+    result = {"action": "merge", "target": owner, "lease": encode_lease(lease)}
+    if status.get("mergeStateStatus") == "UNSTABLE":
+        result["warning"] = reason
+    return result
 
 
 def next_merge(gh: GitHub, config: dict, *, config_path: str | None = None) -> dict:
@@ -2595,7 +2620,10 @@ def next_merge(gh: GitHub, config: dict, *, config_path: str | None = None) -> d
             health = run_health(config, config_path=config_path)
             owner = health.get("integration_owner") or {}
             if owner.get("number") == pending[0].get("number") and health.get("state") != "red":
-                ready = _ready_owner_action(gh, config, health)
+                existing = None if action.get("carry") == "proven" else pending[0]
+                ready = _ready_owner_action(gh, config, health, intent=existing)
+                if ready and ready.get("action") == "wait":
+                    return ready
                 if ready and ready.get("action") == "merge":
                     lease = decode_lease(ready["lease"])
                     lease["intent"] = pending[0]
@@ -2790,8 +2818,11 @@ def _complete_ordinary_merge(gh, config, lease, *, config_path=None, typed_guard
                                    intent=lease.get('intent')):
         raise PipelineError("trusted ship changed before cleanup intent")
     status, checks = pr_checks(gh, config, lease["number"])
-    ready, reason = checks_ready(config, checks)
-    if status.get("mergeStateStatus") != "CLEAN" or status.get("mergeable") != "MERGEABLE" or not ready:
+    # Only an authenticated reservation already present when this request
+    # started can resume through an isolated optional bench failure.
+    existing_intent = lease.get("intent") if typed_guard is None else None
+    ready, reason = ordinary_merge_ready(gh, config, status, checks, snapshot, existing_intent)
+    if not ready:
         raise PipelineError(f"merge is no longer ready: {reason}")
     body = status.get("body") or ""
 
@@ -2844,8 +2875,8 @@ def _complete_ordinary_merge(gh, config, lease, *, config_path=None, typed_guard
         if health.get("state") == "red" or _barrier_blocks_merge(health, lease):
             raise PipelineError("integration owner changed after cleanup intent")
     status, checks = pr_checks(gh, config, lease["number"])
-    ready, reason = checks_ready(config, checks)
-    if status.get("mergeStateStatus") != "CLEAN" or status.get("mergeable") != "MERGEABLE" or not ready:
+    ready, reason = ordinary_merge_ready(gh, config, status, checks, snapshot, existing_intent)
+    if not ready:
         raise PipelineError(f"merge is no longer ready after cleanup intent: {reason}")
     current_body = status.get("body") or ""
     if (hashlib.sha256(current_body.encode("utf-8")).hexdigest() != intent["body_sha256"] or
@@ -2859,7 +2890,10 @@ def _complete_ordinary_merge(gh, config, lease, *, config_path=None, typed_guard
                      input_value={"merge_method": config["merge_method"], "sha": lease["head"]})
     if result.get("merged") is not True:
         raise PipelineError(result.get("message") or "GitHub did not confirm merge")
-    return recover_merge_cleanup(gh, config, intent)
+    completed = recover_merge_cleanup(gh, config, intent)
+    if status.get("mergeStateStatus") == "UNSTABLE":
+        completed["warning"] = reason
+    return completed
 
 
 def _tail_command(args, config):
