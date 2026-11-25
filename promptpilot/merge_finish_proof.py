@@ -174,6 +174,7 @@ def _comment_readback(gh, number, node, body):
         and value["body"].encode("utf-8") == body.encode("utf-8"),
         "comment author, location, identity or exact UTF-8 readback differs",
     )
+    return value
 
 
 def _history(gh, config, checkpoint):
