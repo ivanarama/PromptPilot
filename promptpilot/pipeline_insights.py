@@ -3651,10 +3651,10 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
         _clear_budget_waiter_after_admission(task)
         return {"action": "prompt", "mode": "skill", "prompt": fallback_prompt}
     profile_id, profile, queue = matched
-    from .pipeline_item_holds import (prepare, claim_progress_attempt, released_progress,
+    from .pipeline_item_holds import (prepare, claim_progress_attempt, released_progress, recovery_hold_wait,
                                       progress_attempt_blocked, unproved_progress_hold)
     from .merge_progress_probe import measurements
-    from . import merge_ci_dispatch
+    from . import merge_ci_dispatch, merge_ci_wait
     progress_scope = (queue.get("item_blockers") is True
         and str((queue.get("execution") or {}).get("stage") or queue.get("id") or "").lower() == "merge")
     progress_data = read_cached(profile_id, db.list_series()) if queue.get("item_blockers") is True else {}
@@ -4212,6 +4212,12 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                 merge_checkpoint_hint = merge_checkpoint.recovery_hint(profile_id, fallback_lease)
                 if merge_checkpoint_hint is not None and not merge_checkpoint.blocks_fallback(
                         profile["repository"], fallback_lease["target"]):
+                    # An incomplete initial snapshot cannot supply exclusions. A fresh
+                    # signed election can still identify the exact held head before proof.
+                    if managed_confirmation and not progress_releases:
+                        hold_wait = recovery_hold_wait(task, fallback_lease["target"])
+                        if hold_wait:
+                            return hold_wait
                     # Re-read after next. Its signed election and this cached observation
                     # must independently point at the completed branch update.
                     current = read_cached(profile_id, db.list_series())
@@ -4234,7 +4240,6 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                                     "reason": "saved MERGE checkpoint awaits matching fresh Source"}
                         merge_checkpoint_hint = None
         if ci_wait_enabled and target_reservation is None and merge_checkpoint_hint is None:
-            from . import merge_ci_wait
             ci_record = merge_ci_dispatch.elected_wait(task, profile["repository"], preflight, fallback_lease)
             if ci_record and (ci_record["state"] in merge_ci_wait.WAITING
                               or ci_record["state"] == "attempt_changed" or fallback_lease is None):
@@ -4408,6 +4413,12 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
         preflight.get("reason") or preflight.get("error") or preflight_action
     )
     if preflight_action in {"empty", "wait"}:
+        if managed_confirmation and preflight_action == "wait" and preflight.get("number") in exclusions:
+            owner = (progress_data.get("diagnostics") or {}).get("integration_owner")
+            if isinstance(owner, dict) and owner.get("number") == preflight["number"]:
+                hold_wait = recovery_hold_wait(task, owner)
+                if hold_wait:
+                    return hold_wait
         preflight_verdict = str(preflight.get("verdict") or "ПУСТО").strip() or "ПУСТО"
         # Only a validated targeted fallback route can authorize the silent,
         # immediate stale outcome.  An ordinary project tool returning
@@ -4495,6 +4506,22 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                     )
                 if managed_confirmation and target_reservation is None:
                     native = _expanded_command(["{python}", "-m", "promptpilot.project_pipeline"], stage)
+                    if merge_checkpoint_hint is None and target["stage"] in {"merge", "integration-merge-recovery"}:
+                        adapter_config = Path(merge_ci_wait.adapter_config_path(command))
+                        if not adapter_config.is_absolute():
+                            adapter_config = (Path(working_dir or os.getcwd()) / adapter_config).resolve()
+                        envelope["prepared_tree_check_command"] = [
+                            *native, "--config", str(adapter_config), "inspect-prepared-merge",
+                            "--number", str(target["number"]), "--source", target["head"],
+                            "--base", "<planned_base>", "--tree", "<index_tree>", "--working-dir", "<merge_worktree>"]
+                        pre_review_guard += (
+                            "После разрешения конфликтов и git add, до выбора или публикации base-sync-intent, "
+                            "выполни prepared_tree_check_command с точным MERGE_HEAD, git write-tree и абсолютным "
+                            "путём временного worktree. Продолжай только при state=verified с теми же входами. "
+                            "При needs-resolution до публикации передай причину и PR по штатной процедуре решения "
+                            "конфликта. При ошибке команды сообщи НЕ СМОГ. Для уже опубликованной ветки выполняй "
+                            "процедуру восстановления по checkpoint.\n\n"
+                        )
                     if (ci_wait_enabled and target["stage"] in merge_ci_wait.ORDINARY_STAGES
                             and gate_command[-2] == "--lease-file"):
                         pre_review_guard += merge_ci_dispatch.add_command(

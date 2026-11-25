@@ -1,3 +1,6 @@
+import json
+import time
+
 import pytest
 
 from promptpilot import pipeline_insights as pi
@@ -90,6 +93,57 @@ def test_checked_pr_yields_to_aged_waiter(recovery):
     route = dispatch(f)
     assert route["action"] == "defer" and route["github_budget"]["state"] == "fairness_waiter"
     assert f.db.pipeline_github_budget_reservations("github-default")["count"] == 0
+
+
+@pytest.mark.parametrize("stale", [True, False], ids=["signed-recovery", "excluded-owner-wait"])
+def test_exact_held_owner_reports_reason_and_rechecks_after_resolution(recovery, monkeypatch, stale):
+    from promptpilot import merge_confirmation, pipeline_item_holds
+
+    f, snapshot = recovery
+    key = pipeline_item_holds.PREFIX + str(f.task.series_id)
+    reason = "#42 — cannot verify pushed base-sync"
+    record = json.dumps({"42": {"stage": "merge", "head": HEAD, "at": time.time(),
+                                "reason": reason, "task_id": 100}})
+    f.db.set_setting(key, record)
+    snapshot["cache"]["stale"] = stale
+    original = pi._tool_preflight
+    probes, confirmations = [], []
+
+    def probe(*args, env_extra=None):
+        probes.append(env_extra)
+        if env_extra:
+            assert json.loads(env_extra["PP_PIPELINE_EXCLUDED_NUMBERS"]) == [42]
+            return {"action": "wait", "number": 42, "reason": "single-flight owner awaits human resolution"}
+        return original(*args)
+
+    def confirm(*args, **kwargs):
+        confirmations.append(1)
+        return {"action": "complete_empty", "verdict": "ГОТОВО"}
+
+    monkeypatch.setattr(pi, "_tool_preflight", probe)
+    monkeypatch.setattr(merge_confirmation, "execute", confirm)
+    wait = dispatch(f)
+    assert wait["action"] == "defer" and wait["defer_for"] == "10m"
+    assert reason in wait["reason"] and HEAD[:8] in wait["reason"]
+    assert bool(probes[0]) is not stale and len(probes) == 1
+    assert not confirmations and f.db.get_setting(key) == record
+    assert f.db.pipeline_github_budget_reservations("github-default")["count"] == 0
+
+    f.db.set_setting(key, "{}")
+    snapshot["cache"]["stale"] = False
+    assert dispatch(f)["verdict"] == "ГОТОВО"
+    assert len(probes) == 2 and confirmations == [1]
+
+
+@pytest.mark.parametrize("head,age", [(OLD, 0), (HEAD, 24 * 3600)])
+def test_other_head_or_expired_hold_does_not_block_confirmation(recovery, monkeypatch, head, age):
+    from promptpilot import merge_confirmation, pipeline_item_holds
+
+    f, _ = recovery
+    key = pipeline_item_holds.PREFIX + str(f.task.series_id)
+    f.db.set_setting(key, json.dumps({"42": {"stage": "merge", "head": head, "at": time.time() - age}}))
+    monkeypatch.setattr(merge_confirmation, "execute", lambda *_: {"action": "complete_empty", "verdict": "ГОТОВО"})
+    assert dispatch(f)["verdict"] == "ГОТОВО"
 
 
 @pytest.fixture

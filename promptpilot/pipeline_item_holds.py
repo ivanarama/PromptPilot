@@ -299,6 +299,27 @@ def released_progress(task):
         return {}
 
 
+def recovery_hold_wait(task, target):
+    """Recheck a single-flight recovery election against its durable exact-head hold."""
+    if not isinstance(target, dict) or target.get("stage") != "integration-merge-recovery":
+        return None
+    number, head = target.get("number"), target.get("head")
+    if (type(number) is not int or number <= 0 or not isinstance(head, str)
+            or not re.fullmatch(r"[0-9a-f]{40}", head)):
+        return None
+    try:
+        holds = json.loads(db.get_setting(PREFIX + str(task.series_id)) or "{}")
+    except (TypeError, ValueError):
+        return None
+    hold = holds.get(str(number)) if isinstance(holds, dict) else None
+    if (not isinstance(hold, dict) or hold.get("stage") != "merge" or hold.get("head") != head
+            or type(hold.get("at")) not in {int, float} or not 0 <= time.time() - hold["at"] < TTL):
+        return None
+    reason = " ".join(str(hold.get("reason") or "").split())[:240]
+    return {"action": "defer", "mode": "tool", "defer_for": "10m",
+            "reason": f"Слияние ждёт решения по PR #{number} ({head[:8]}). {reason}".rstrip()}
+
+
 def progress_attempt_blocked(task, data):
     """A racing second claimed task must stop before even calling next."""
     if not _task_identity(task):
