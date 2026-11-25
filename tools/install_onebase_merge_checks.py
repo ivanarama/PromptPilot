@@ -26,14 +26,13 @@ def sha(data):
 
 def note(path, digest):
     return (
-        f"{MARKER} For ordinary native base-sync checks use {path} (SHA256 {digest}) "
-        "under the operator-pinned Python with -IB. Verify the file first. In the prepared "
-        "worktree invoke it once per applicable fixed check with --number N --expect-source SHA "
+        f"{MARKER} For ordinary native base-sync that requires go build ./... or go vet ./..., use "
+        f"{path} (SHA256 {digest}) under the operator-pinned Python with -IB. Verify the file first. "
+        "From the prepared worktree run each matching command with --number N --expect-source SHA "
         "--expect-base SHA --expect-tree SHA --expect-go goVERSION --expect-node vVERSION "
-        "--check build|packages|ui|vet|trade|modules|diff and --artifacts NEW_EXTERNAL_DIR. "
-        "Supply exact required packages using repeated --package and required race using --race. "
-        "Use the actual task's pinned tool versions. Inspect retained raw logs and classify skips "
-        "on both executed and reused results. Only use a prior completed check if the runner "
+        "--check build (or --check vet) --artifacts NEW_EXTERNAL_DIR. Supply the actual task's tool versions. "
+        "Use the existing full test runners for UI, package tests and additional checks. Inspect the raw "
+        "logs for executed and reused results. Only use a prior completed check if the runner "
         "accepts it on a retry after a pre-publication GitHub Source wait. Run every additional "
         "required check. On fresh_required (exit 3), unavailable runner, or unverified evidence "
         "execute the original full check. A test failure fails the check. Explicit fresh-run and "
