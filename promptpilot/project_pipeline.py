@@ -1700,86 +1700,77 @@ def next_fix(gh: GitHub, config: dict, *, config_path: str | None = None) -> dic
     return fix_handoff.create(config, health, candidate, reservation)
 
 
-def _elect_review_candidate(config: dict, health: dict,
-                            candidates: list[dict]) -> tuple[dict | None, dict | None, dict]:
-    """Reserve the first free candidate and preserve queue order atomically."""
+def _elect_review_candidate(config: dict, health: dict, candidates: list[dict],
+                            admissible=lambda _item: True) -> tuple[dict | None, dict | None, dict]:
+    """Select the first admissible free target, preserving an existing task's election."""
     replicas = _configured_replica_count()
     typed_owned_task = (config.get('technical_handoff', {}).get('enabled') is True
                         and _pipeline_task_id(required=False) is not None)
-    if replicas == 1 and not typed_owned_task:
-        return candidates[0], None, health
-    if (config.get("review_completion_gate") != "target-v1"
-            or config.get("fallback_handoff") != "target-v1"):
-        raise PipelineError(
-            "replicated REVIEW requires review_completion_gate and "
-            "fallback_handoff to be target-v1")
-    task_id = _pipeline_task_id(required=True)
-    task_started_at = _pipeline_task_started_at(required=True)
-    ownership_kind = _provider_ownership_kind(required=True)
-    from . import db as scheduler_db
-
+    needs_reservation = replicas > 1 or typed_owned_task
     unavailable = set()
-    selected = None
-    reservation = None
-    candidate_keys = [_target_key(candidate) for candidate in candidates]
-    own = next((item for item in scheduler_db.list_pipeline_target_reservations(
-        repository=config["repository"])
-                if int(item["task_id"]) == task_id), None)
-    if own is not None:
-        own_key = (own["stage"], int(own["number"]), own["head"])
-        if own_key not in candidate_keys:
-            # One task means one immutable election envelope. A repeated next
-            # after HEAD/eligibility changed must not delete the old fence and
-            # silently start reviewing a different PR.
+    busy_numbers = set()
+    own = None
+    if needs_reservation:
+        if (config.get("review_completion_gate") != "target-v1"
+                or config.get("fallback_handoff") != "target-v1"):
             raise PipelineError(
-                "existing pipeline target reservation is no longer eligible; "
-                "start a new task")
-        selected_index = candidate_keys.index(own_key)
-        selected = candidates[selected_index]
-        unavailable.update(candidate_keys[:selected_index])
-        reservation = scheduler_db.reserve_pipeline_target(
-            config["repository"], own["stage"], int(own["number"]), own["head"],
-            task_id, int(config.get(
-                "target_reservation_ttl_seconds",
-                config.get("review_lease_seconds", 7200),
-            )),
-            task_started_at=task_started_at,
-            ownership_kind=ownership_kind,
-            **({'strict_lifetime': True} if typed_owned_task else {}),
-        )
-        if reservation is not None:
-            return selected, reservation, _review_health_without_targets(
-                health, unavailable)
-        # The listed lease may have expired and been taken between the read
-        # and the renewal transaction. This task already observed an exact
-        # target, so it must not silently retarget within the same envelope.
-        raise PipelineError(
-            "existing pipeline target reservation was lost; start a new task")
-    for candidate in candidates:
-        target_stage, number, head = _target_key(candidate)
-        reservation = scheduler_db.reserve_pipeline_target(
-            config["repository"], target_stage, number, head, task_id,
-            int(config.get(
-                "target_reservation_ttl_seconds",
-                config.get("review_lease_seconds", 7200),
-            )),
-            task_started_at=task_started_at,
-            ownership_kind=ownership_kind,
-            **({'strict_lifetime': True} if typed_owned_task else {}),
-        )
-        if reservation is not None:
-            selected = candidate
-            break
-        unavailable.add((target_stage, number, head))
-    if selected is None:
-        return None, None, health
+                "replicated REVIEW requires review_completion_gate and "
+                "fallback_handoff to be target-v1")
+        task_id = _pipeline_task_id(required=True)
+        task_started_at = _pipeline_task_started_at(required=True)
+        ownership_kind = _provider_ownership_kind(required=True)
+        from . import db as scheduler_db
 
-    # fallback_target's election proof expects its target at the head of the
-    # executable queue. Targets skipped solely because another local replica
-    # owns them are removed from this immutable health view. The later fallback
-    # gate uses the fresh global allowlist in membership mode, not this filter.
-    return selected, reservation, _review_health_without_targets(
-        health, unavailable)
+        candidate_keys = [_target_key(candidate) for candidate in candidates]
+        reservations = scheduler_db.list_pipeline_target_reservations(repository=config["repository"])
+        for row in reservations:
+            if int(row["task_id"]) == task_id:
+                own = row
+            else:
+                busy_numbers.add(row["number"])
+        if own is not None:
+            own_key = (own["stage"], int(own["number"]), own["head"])
+            if own_key not in candidate_keys:
+                raise PipelineError(
+                    "existing pipeline target reservation is no longer eligible; start a new task")
+            index = candidate_keys.index(own_key)
+            unavailable.update(candidate_keys[:index])
+            candidates = [candidates[index]]
+
+    owner = health.get("integration_owner") or {}
+    for candidate in candidates:
+        number = candidate["number"]
+        if number in busy_numbers:
+            unavailable.add(_target_key(candidate))
+            continue
+        if not admissible(candidate):
+            # Only fresh, independent content targets can yield to a later PR.
+            if own is not None or candidate.get("stage") != "review" or number == owner.get("number"):
+                break
+            unavailable.add(_target_key(candidate))
+            continue
+        reservation = None
+        if needs_reservation:
+            stage, number, head = _target_key(candidate)
+            reservation = scheduler_db.reserve_pipeline_target(
+                config["repository"], stage, number, head, task_id,
+                int(config.get("target_reservation_ttl_seconds",
+                               config.get("review_lease_seconds", 7200))),
+                task_started_at=task_started_at,
+                ownership_kind=ownership_kind,
+                **({'strict_lifetime': True} if typed_owned_task else {}),
+            )
+            if reservation is None:
+                if own is not None:
+                    raise PipelineError(
+                        "existing pipeline target reservation was lost; start a new task")
+                unavailable.add((stage, number, head))
+                continue
+        # Targeted fallback proves first position in this election. Later publication
+        # gates still check the elected target against fresh authoritative state.
+        view = _review_health_without_targets(health, unavailable) if unavailable else health
+        return candidate, reservation, view
+    return None, None, health
 
 
 def fallback_target(config: dict, health: dict, stage: str, target: dict, reason: str,
@@ -1874,23 +1865,45 @@ def next_review(gh: GitHub, config: dict, *, config_path: str | None = None) -> 
     candidates = candidates + parallel
     if not candidates:
         return {"action": "empty", "verdict": "ПУСТО", "reason": review_empty_reason(health)}
+    from .review_routing_policy import off_fence
+
+    first_fence = None
+
+    def admissible(candidate):
+        nonlocal first_fence
+        if routing_policy["enabled"] and candidate.get("stage") == "review":
+            return True
+        fence = off_fence(gh, config, candidate["number"])
+        if fence is None:
+            return True
+        if first_fence is None:
+            first_fence = fence
+        return False
+
     item, reservation, election_health = _elect_review_candidate(
-        config, health, candidates)
+        config, health, candidates, admissible)
     if item is None:
+        if first_fence is not None:
+            return first_fence
         return {
             "action": "wait", "verdict": "ПУСТО",
             "reason": "all current REVIEW targets are reserved by other replicas",
         }
-    if not routing_policy['enabled'] or item.get('stage')!='review':
-        from .review_routing_policy import off_fence
-        fenced = off_fence(gh, config, item['number'])
-        if fenced is not None:
-            return fenced
+    parallel_selected = any(_target_key(item) == _target_key(selected) for selected in parallel)
+    result = _dispatch_review(gh, config, item, reservation, election_health,
+                              config_path=config_path, typed=routing_policy["enabled"],
+                              parallel_selected=parallel_selected)
+    if first_fence and result["action"] == "fallback" and "handoff" not in result:
+        # A legacy full-skill fallback can pick the original, fenced queue head.
+        return first_fence
+    return result
+
+
+def _dispatch_review(gh, config, item, reservation, election_health, *,
+                     config_path, typed, parallel_selected):
     replica_count = _configured_replica_count()
     if replica_count > 1 and reservation is None:
         raise PipelineError("replicated REVIEW election did not reserve its target")
-    parallel_selected = any(_target_key(item) == _target_key(selected)
-                            for selected in parallel)
     if item.get("stage") == "pre-review-validation":
         if config.get("fallback_handoff") != "target-v1":
             raise PipelineError(
@@ -1902,7 +1915,7 @@ def next_review(gh: GitHub, config: dict, *, config_path: str | None = None) -> 
         )
     if item.get("stage") != "review":
         reason = "integration/base-sync state requires the full skill"
-        carry = _owner_carry(gh, config, health, item)
+        carry = _owner_carry(gh, config, election_health, item)
         if carry and carry["verdict"] in {"proven", "pending"}:
             return {"action": "wait", "verdict": "ПУСТО", "number": item["number"],
                     "reason": "base-sync carry: MERGE merges this owner without a new "
@@ -1913,12 +1926,12 @@ def next_review(gh: GitHub, config: dict, *, config_path: str | None = None) -> 
             config, election_health, "review", item, reason,
             reservation=reservation,
         )
-    if routing_policy['enabled']:
+    if typed:
         from .review_routing_adapter import next_review as next_typed_review
-        typed = next_typed_review(gh, config, config_path=config_path, item=item,
+        response = next_typed_review(gh, config, config_path=config_path, item=item,
                                   reservation=reservation, health=election_health)
-        if typed is not None:
-            return typed
+        if response is not None:
+            return response
     completion_gate = config.get("review_completion_gate", "health")
     if completion_gate == "target-v1" and not content_review_elected(
             election_health, item):
