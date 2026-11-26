@@ -40,10 +40,29 @@ def test_receipt_from_publish_to_next_attempt(tmp_path, monkeypatch, capsys):
     claim = ["claim-report", *BASE, "--comments", str(comments)]
     assert runner.main(claim) == 0
     assert runner.main(claim) == 2
-    published = dict(id=123, user={"login": "ivanarama"}, body=report.read_bytes().decode(),
+    published = dict(id=123, node_id="IC_fixture", user={"login": "ivanarama"}, body=report.read_bytes().decode(),
                      created_at="created", updated_at="created")
     comments.write_text(json.dumps([[published]]))
     read = ["read", *BASE, "--comments", str(comments)]
+    assert runner.main(read) == 2
+    graph_path = root / "report-node.json"
+    graph = dict(__typename="IssueComment", id=published["node_id"], fullDatabaseId="123",
+                 lastEditedAt=None, author={"login": "ivanarama"}, body=published["body"],
+                 pullRequest={"number": 17, "repository": {"nameWithOwner": "ivanarama/onebase"}})
+    read += ["--report-node", str(graph_path)]
+    for bad in ({"lastEditedAt": published["created_at"]}, {"id": "IC_other"},
+                {"fullDatabaseId": "124"}, {"__typename": "PullRequestReviewComment"},
+                {"author": {"login": "other"}}, {"body": "different"},
+                {"pullRequest": {**graph["pullRequest"], "number": 18}},
+                {"pullRequest": {"number": 17, "repository": {"nameWithOwner": "other/onebase"}}}):
+        graph_path.write_text(json.dumps({"data": {"node": {**graph, **bad}}}))
+        assert runner.main(read) == 2
+    missing_edit_field = {k: v for k, v in graph.items() if k != "lastEditedAt"}
+    for response in ({"data": {"node": missing_edit_field}},
+                     {"data": {"node": graph}, "errors": [{"message": "partial result"}]}):
+        graph_path.write_text(json.dumps(response))
+        assert runner.main(read) == 2
+    graph_path.write_text(json.dumps({"data": {"node": graph}}))
     assert runner.main(read) == 0
     assert json.loads(capsys.readouterr().out.splitlines()[-1])["verified_report_id"] == 123
     assert runner.main(claim) == 2
@@ -52,7 +71,8 @@ def test_receipt_from_publish_to_next_attempt(tmp_path, monkeypatch, capsys):
         comments.write_text(json.dumps([bad]))
         assert runner.main(read) == 2
     comments.write_text(json.dumps([[{**published, "user": {"login": "untrusted"}}]]))
-    assert runner.main(read) == 0
+    assert runner.main(read) == 2
+    assert runner.main(["read", *BASE, "--comments", str(comments)]) == 0
     assert json.loads(capsys.readouterr().out.splitlines()[-1])["verified_report_id"] is None
     assert runner.main(["read", *BASE]) == 0
     assert json.loads(capsys.readouterr().out.splitlines()[-1])["report_post_claimed"]

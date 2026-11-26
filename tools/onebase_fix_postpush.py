@@ -80,7 +80,7 @@ def put_once(path, data):
         os.unlink(temp)
 
 
-def report_state(root, record, comments):
+def report_state(root, record, comments, pr, graph):
     # The normal FIX gate obtains and validates the complete paginated REST read.
     pages = json.loads(artifact(root, comments).read_bytes())
     if not isinstance(pages, list) or not pages or not all(isinstance(page, list) for page in pages):
@@ -100,10 +100,27 @@ def report_state(root, record, comments):
                     or hashlib.sha256(body.encode("utf-8")).hexdigest() != record["report_sha256"]
                     or type(comment.get("id")) is not int or comment["id"] <= 0):
                 raise ValueError("conflicting or edited report for this HEAD; human readback required")
-            matches.append(comment["id"])
+            matches.append(comment)
     if len(matches) > 1:
         raise ValueError("duplicate reports for this HEAD; human readback required")
-    return matches[0] if matches else None
+    if not matches:
+        if graph is not None:
+            raise ValueError("GraphQL report has no matching REST comment")
+        return None
+    comment = matches[0]
+    if graph is None:
+        raise ValueError("REST report requires --report-node from a current GraphQL node read")
+    response = json.loads(artifact(root, graph).read_bytes())
+    node = response["data"]["node"]
+    if (response.get("errors") or not isinstance(node, dict) or node.get("__typename") != "IssueComment"
+            or not isinstance(comment.get("node_id"), str) or not comment["node_id"]
+            or node["id"] != comment["node_id"] or str(node["fullDatabaseId"]) != str(comment["id"])
+            or node["lastEditedAt"] is not None or node["author"]["login"] != comment["user"]["login"]
+            or node["body"] != comment["body"]
+            or type(node["pullRequest"]["number"]) is not int or node["pullRequest"]["number"] != pr
+            or node["pullRequest"]["repository"]["nameWithOwner"] != "ivanarama/onebase"):
+        raise ValueError("GraphQL report differs, was edited, or belongs to another PR")
+    return comment["id"]
 
 
 def receipt(root, args):
@@ -124,7 +141,11 @@ def receipt(root, args):
         record = json.loads(path.read_bytes())
         if record != evidence(root, args.head, record["manifest"], record["report"]):
             raise ValueError("original report or manifest changed")
-    report_id = report_state(root, record, args.comments) if getattr(args, "comments", None) else None
+    report_id = None
+    if getattr(args, "comments", None):
+        report_id = report_state(root, record, args.comments, args.pr, args.report_node)
+    elif getattr(args, "report_node", None):
+        raise ValueError("--report-node requires the matching REST --comments read")
     if args.action == "claim-report":
         if report_id is not None or not put_once(intent, record["report_sha256"].encode()):
             raise ValueError("report already exists or POST was claimed; reconcile by reading GitHub")
@@ -212,6 +233,8 @@ def main(argv=None):
         command.add_argument("--head", required=True)
         if name in {"read", "claim-report"}:
             command.add_argument("--comments", type=Path, required=name == "claim-report")
+            command.add_argument("--report-node", type=Path,
+                                 help="GraphQL node(id: REST node_id) response for an existing report")
         if name == "record":
             command.add_argument("--report", required=True, type=Path)
             command.add_argument("--manifest", required=True, type=Path)
