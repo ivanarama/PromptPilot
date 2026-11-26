@@ -64,6 +64,10 @@ class _Refused(Exception):
     """A carry condition is not proven: take the ordinary REVIEW route."""
 
 
+class ShipBeforeReview(_Refused):
+    """The source ship predates the verdict and cannot carry its review."""
+
+
 class _Pending(Exception):
     """Not proven yet, but may become proven without anyone acting (CI runs)."""
 
@@ -179,10 +183,10 @@ def timeline_facts(snapshot: dict, trusted: str, from_sha: str, to_sha: str,
     if (latest.get("__typename") != "LabeledEvent"
             or (latest.get("actor") or {}).get("login") != trusted):
         raise _Refused("the latest ship transition is not a trusted ship")
-    if ship_at <= review_at:
-        raise _Refused("trusted ship was set before the review of the reviewed version")
     if not latest.get("id"):
         raise _Refused("the ship event has no node id")
+    if ship_at <= review_at:
+        raise ShipBeforeReview("trusted ship was set before the review of the reviewed version")
     return {"from_info": from_info, "from_proof": established, "ship_event": latest["id"]}
 
 

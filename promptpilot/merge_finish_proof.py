@@ -206,6 +206,10 @@ def _history(gh, config, checkpoint):
     )
     try:
         facts = base_sync_carry.timeline_facts(snap, TRUSTED, old, head, base)
+    except base_sync_carry.ShipBeforeReview as exc:
+        # The general proof can confirm the push using the intent's original
+        # ship. Its receipt sends the new HEAD to integration REVIEW.
+        raise OutsideScope(str(exc)) from exc
     except base_sync_carry._Refused as exc:
         raise pp.PipelineError(str(exc)) from exc
     proof, epoch, ship = facts["from_proof"], facts["from_info"], facts["ship_event"]
