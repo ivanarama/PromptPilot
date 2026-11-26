@@ -3341,7 +3341,7 @@ def wake_series_once(series_id: Optional[int], latch_key: str,
 
 
 def wake_series_group_once(series_ids: list[int], latch_key: str,
-                           fingerprint: Optional[str], *, cache_guard: dict) -> list[int]:
+                           fingerprint: Optional[str], *, cache_guard: dict, expected_setting: tuple[str, str] | None = None) -> list[int]:
     """Atomically apply one diagnostic wake to every configured replica."""
     normalized = []
     for value in series_ids:
@@ -3352,6 +3352,9 @@ def wake_series_group_once(series_ids: list[int], latch_key: str,
             "SELECT value FROM settings WHERE key = 'worker_paused'"
         ).fetchone()
         if paused and paused["value"] == "1":
+            return []
+        if expected_setting is not None and not conn.execute(
+                "SELECT 1 FROM settings WHERE key=? AND value=?", expected_setting).fetchone():
             return []
         if not _pipeline_cache_guard_matches(conn, cache_guard):
             return []
