@@ -94,40 +94,40 @@ def qualify(path, source, digest, install):
     return path.is_file()
 
 
-def bind(db, working_dir, binding, action):
+def bind(db, working_dir, binding, action, *, series=SERIES, title=TITLE, transform_prompt=transform):
     write = action in {"apply", "rollback"}
     db.execute("BEGIN IMMEDIATE" if write else "BEGIN")
     try:
         row = db.execute(
             "SELECT prompt FROM task_series WHERE id=? AND title=? AND working_dir=? AND ended_at IS NULL",
-            (SERIES, TITLE, str(working_dir)),
+            (series, title, str(working_dir)),
         ).fetchone()
         if not row:
-            raise ValueError("active native OneBase MERGE series missing")
-        target = transform(row[0], binding, action == "rollback")
+            raise ValueError("expected active native OneBase series missing")
+        target = transform_prompt(row[0], binding, action == "rollback")
         changes = []
         for task, prompt, directory in db.execute(
-            "SELECT id,prompt,working_dir FROM tasks WHERE " + PENDING + " ORDER BY id", (SERIES,)
+            "SELECT id,prompt,working_dir FROM tasks WHERE " + PENDING + " ORDER BY id", (series,)
         ).fetchall():
             if directory != str(working_dir):
                 raise ValueError(f"unexpected working directory for pending task {task}")
-            updated = transform(prompt, binding, action == "rollback")
+            updated = transform_prompt(prompt, binding, action == "rollback")
             if updated != prompt:
                 changes.append(task)
                 if write and db.execute(
                     "UPDATE tasks SET prompt=? WHERE id=? AND prompt=? AND " + PENDING,
-                    (updated, task, prompt, SERIES),
+                    (updated, task, prompt, series),
                 ).rowcount != 1:
                     raise ValueError(f"pending task {task} changed")
         series_changed = target != row[0]
         if action == "verify" and (series_changed or changes):
-            raise ValueError("MERGE binding is incomplete")
+            raise ValueError("series binding is incomplete")
         if write and series_changed:
             if db.execute(
                 "UPDATE task_series SET prompt=?,updated_at=? WHERE id=? AND prompt=? AND ended_at IS NULL",
-                (target, datetime.now(timezone.utc).isoformat(), SERIES, row[0]),
+                (target, datetime.now(timezone.utc).isoformat(), series, row[0]),
             ).rowcount != 1:
-                raise ValueError("MERGE series changed")
+                raise ValueError("series changed")
         if write:
             db.commit()
         else:
