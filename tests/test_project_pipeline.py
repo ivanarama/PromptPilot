@@ -628,7 +628,7 @@ def test_opt_in_parallel_content_review_uses_native_target_gate(tmp_path, monkey
     monkeypatch.setattr(pp, "run_health", lambda *_args, **_kwargs: health)
     monkeypatch.setattr(pp, "stable_timeline", lambda *_args: snapshot())
 
-    def elect(_config, _health, candidates):
+    def elect(_config, _health, candidates, _admissible):
         assert [item["number"] for item in candidates] == [10, 42]
         return content, {"token": "reserved"}, health
 
@@ -696,7 +696,7 @@ def test_disabled_or_unsupported_parallel_optin_keeps_integration_owner(
         health["parallel_review_candidates"] = [content]
     monkeypatch.setattr(pp, "run_health", lambda *_args, **_kwargs: health)
 
-    def elect(_config, _health, candidates):
+    def elect(_config, _health, candidates, _admissible):
         assert candidates == [owner]
         return owner, {"token": "reserved"}, health
 
