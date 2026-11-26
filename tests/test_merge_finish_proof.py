@@ -183,13 +183,14 @@ class Replay:
             return {"id": 888, "node_id": "C888", "body": input_value["body"], "user": {"login": ACCOUNT}}
         raise AssertionError(f"unexpected endpoint {endpoint}")
 
-    def run(self):
+    def run(self, confirm=finish.confirm):
         def gate():
             self.gates.append(True)
             return {
                 "action": "validated",
                 "stage": "merge",
                 "repository": REPO,
+                "mutation_authorized": False,
                 "target": {"number": N, "head": self.gate_head, "stage": "integration-merge-recovery"},
             }
 
@@ -214,7 +215,7 @@ class Replay:
             self.source_calls += 1
             self.on_source()
 
-        return finish.confirm(
+        return confirm(
             self,
             CONFIG,
             CHECKPOINT,

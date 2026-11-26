@@ -9,6 +9,7 @@ import pytest
 
 from promptpilot import (
     merge_done_proof as full,
+    merge_done_publish,
     merge_finish_proof as finish,
     merge_ship_authorization as lineage,
     project_pipeline as pp,
@@ -118,6 +119,24 @@ def test_first_hop_and_post_readback(replay):
     body, done, after = replay.prepare()
     assert (body, done) == (DONE, 888) and after != before
     assert not replay.posts
+
+
+def test_ship_before_review_hands_off_to_full_confirmation(replay, monkeypatch):
+    # #2761: the trusted ship is still the one recorded by the later intent.
+    ship = next(edge for edge in replay.edges if edge["node"]["id"] == "ship")
+    replay.edges.remove(ship)
+    replay.edges.insert(1, ship)
+    monkeypatch.setattr(finish, "_tree_proof", lambda *args: None)
+    monkeypatch.setattr(finish, "_verify_remote", lambda *args: None)
+    with pytest.raises(finish.OutsideScope, match="before the review"):
+        replay.run()
+    assert not replay.source_calls and not replay.gates and not replay.posts
+
+    assert replay.run(confirm=merge_done_publish.confirm)["published"] is True
+    assert replay.run(confirm=merge_done_publish.confirm)["published"] is False
+    assert replay.posts == [{"body": DONE}] and len(replay.gates) == 1
+    current = pp.stable_timeline(replay, CONFIG, N)
+    assert pp.proof(pp.epoch(current, ACCOUNT), HEAD, ACCOUNT) is None
 
 
 def test_verbatim_2731_comment_and_multihop_preparation(replay):
