@@ -2746,6 +2746,11 @@ def dispatch_gate(task) -> dict | None:
                     return _required_snapshot_defer(
                         profile_id, queue_config["id"], "cached read failed")
                 raise
+            from . import merge_pre_intent_wait
+            if merge_pre_intent_wait.enabled(queue_config, profile):
+                _, waiting = merge_pre_intent_wait.dispatch(task, profile_id, profile, data)
+                if waiting is not None:
+                    return waiting
             cache = data.get("cache") or {} if isinstance(data, dict) else {}
             if ((require_snapshot and _required_snapshot_state(data, profile, queue_config["id"]) is not None)
                     or (isinstance(config.get("backpressure"), dict)
@@ -3665,6 +3670,12 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
     ci_configured = merge_ci_dispatch.enabled(queue, profile)
     pending_ci = (merge_ci_dispatch.source_wait(task, profile, progress_data)
                   if ci_configured and retain_budget else None)
+    from . import merge_pre_intent_wait
+    pre_intent_resume = None
+    if retain_budget and merge_pre_intent_wait.enabled(queue, profile):
+        pre_intent_resume, waiting = merge_pre_intent_wait.dispatch(task, profile_id, profile, progress_data)
+        if waiting is not None:
+            return waiting
     progress = measurements(sys.modules[__name__], task, profile_id, profile, queue, progress_data,
                             working_dir) if progress_scope and not pending_ci else {}
     if progress_scope and unproved_progress_hold(task, progress_data, progress):
@@ -4506,6 +4517,29 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                     )
                 if managed_confirmation and target_reservation is None:
                     native = _expanded_command(["{python}", "-m", "promptpilot.project_pipeline"], stage)
+                    if (target["stage"] == "merge" and merge_pre_intent_wait.enabled(queue, profile)
+                            and "source_wait_command" in envelope
+                            and merge_checkpoint_hint is None):
+                        before = list(envelope["source_wait_command"])
+                        before[before.index("source-wait")] = "before-intent-wait"
+                        envelope["before_intent_wait_command"] = [*before, "--base", "<planned_base>"]
+                        pre_review_guard += (
+                            "Если до первого gate и публикации intent единственная причина остановки "
+                            "scan_in_progress или invalidated, выполни before_intent_wait_command "
+                            "с проверенным SHA защищённой main. При state=wait сразу заверши точной "
+                            "result_line. При state=observed повторно сверь свежий Source и все финальные условия. "
+                            "Команда читает локальный Source, не запускай ещё один refresh. "
+                            "После gate, intent или попытки записи ветки действует обычная сверка.\n\n")
+                        if (pre_intent_resume and pre_intent_resume["target"] == target
+                                and pre_intent_resume["config_sha256"] == fallback_lease["config_sha256"]):
+                            envelope["before_intent_resume"] = {"number": target["number"], "head": target["head"],
+                                                                "planned_base": pre_intent_resume["base"]}
+                            pre_review_guard += (
+                                "Новый Source опубликован. Предыдущий запуск остановился перед intent. "
+                                "Сверь текущую защищённую main с planned_base. Подтверди отсутствие intent, "
+                                "текущие HEAD, REVIEW, ship, CI, Source, бюджет и новую gate_command перед "
+                                "записью. При изменившейся базе пересчитай план по обычной процедуре. "
+                                "Сохранённое ожидание не разрешает никаких операций.\n\n")
                     if merge_checkpoint_hint is None and target["stage"] in {"merge", "integration-merge-recovery"}:
                         adapter_config = Path(merge_ci_wait.adapter_config_path(command))
                         if not adapter_config.is_absolute():
@@ -6041,11 +6075,15 @@ def _analyze_without_budget(profile_id: str, series: list[dict], *,
                 _reconcile_adaptive_cadence(
                     item, matching, backlog,
                     publication_guard=publication_guard)
-        return _refresh_local_state(
+        data = _refresh_local_state(
             result, profile, series, source="live",
             generated_at=float(result["generated_at"]), entry_epoch=cache_epoch,
             entry_revision=refresh_revision, current_epoch=_cache_epoch(),
         )
+        from . import merge_pre_intent_wait
+        if profile_still_current and any(merge_pre_intent_wait.enabled(q, profile) for q in profile.get("queues", [])):
+            merge_pre_intent_wait.wake(profile_id, profile, data)
+        return data
 
 
 def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True,
