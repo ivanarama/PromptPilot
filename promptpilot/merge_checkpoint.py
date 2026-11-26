@@ -374,7 +374,7 @@ def _apply(args, env):
         raise ValueError("MERGE checkpoint requires costed Native admission")
     lease, token = _gate_file(task_id, args.lease_file)
     target = lease["target"]
-    passive = args.operation == "source-wait"
+    passive = args.operation in {"source-wait", "before-intent-wait"}
     if (lease.get("target_reservation") or lease["repository"] != profile.get("repository")
             or target["number"] != args.number or not SHA.fullmatch(args.old if passive else args.to)):
         raise ValueError("MERGE checkpoint target differs from the signed ordinary election")
@@ -400,6 +400,12 @@ def _apply(args, env):
         if (guard["route"] != "fallback_targeted" or guard["started_at"] != marker
                 or row["merge_checkpoint_gate"] != pp.digest([marker, token])):
             raise ValueError("checkpoint requires this attempt's admitted gate lease")
+        if args.operation == "before-intent-wait":
+            from . import merge_pre_intent_wait
+            if not merge_pre_intent_wait.enabled(matched[2], profile):
+                raise ValueError("pre-intent Source waiting is not enabled for this queue")
+            return merge_pre_intent_wait.observe(conn, task, lease, row["merge_checkpoint_gate"],
+                                                 args.profile, profile, data, args.base)
         if passive:
             return _pre_send_wait(conn, task, lease, row["merge_checkpoint_gate"], args.profile, profile, data)
         saved = _load(conn, args.profile, lease, args.number, args.to)
@@ -462,17 +468,18 @@ def handed_off(conn, series_id, task_id, raw):
 
 def add_arguments(parser):
     operations = parser.add_subparsers(dest="operation", required=True)
-    for name in ("record", "read", "source-wait"):
+    for name in ("record", "read", "source-wait", "before-intent-wait"):
         op = operations.add_parser(name)
         op.add_argument("--profile", required=True)
         op.add_argument("--number", required=True, type=int)
         op.add_argument("--lease-file", required=True)
-        if name != "source-wait":
+        if name in {"record", "read"}:
             op.add_argument("--to", required=True)
         if name != "read":
             op.add_argument("--from", dest="old", required=True)
-        if name == "record":
+        if name in {"record", "before-intent-wait"}:
             op.add_argument("--base", required=True)
+        if name == "record":
             op.add_argument("--tree", required=True)
             op.add_argument("--intent", required=True, type=int)
 
@@ -480,6 +487,9 @@ def add_arguments(parser):
 def execute(args):
     try:
         result = _apply(args, os.environ)
+        if args.operation == "before-intent-wait" and result["state"] == "wait":
+            from . import merge_pre_intent_wait
+            merge_pre_intent_wait.catch_up(args.profile)
     except (pp.PipelineError, ValueError, KeyError, TypeError, OSError, sqlite3.Error) as exc:
         result = {"state": "refused", "reason": str(exc), "product_mutation_authorized": False}
     print(json.dumps(result, ensure_ascii=False))
