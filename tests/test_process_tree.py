@@ -424,7 +424,8 @@ def test_rate_limit_is_not_requeued_when_owned_close_is_unverified(monkeypatch):
                 "tab": {"tab_id": "tab-1"},
             }}, ""
         if args[:2] == ["agent", "start"]:
-            return 0, {"result": {"agent": {"agent_status": "idle"}}}, ""
+            return 0, {"result": {"agent": {"agent_status": "idle", "pane_id": "pane-1",
+                                            "terminal_id": "terminal", "state_change_seq": 1}}}, ""
         if args[:2] == ["agent", "prompt"]:
             submitted.append(args[3])
             return 0, {"result": {"agent": {"agent_status": "done"}}}, ""
