@@ -4291,6 +4291,29 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                 repaired = reconcile(task, profile_id, profile, queue, admission, preflight, receipt_target)
                 if repaired is not None:
                     return repaired
+        merge_wait_token = None
+        if (stage == "merge" and provider_route == "fallback_targeted" and target_reservation is None
+                and queue.get("item_blockers") is True and merge_checkpoint_hint is None
+                and validated_target_stage in {"merge", "integration-merge-recovery"}
+                and type(getattr(task, "id", None)) is int and task.id > 0):
+            from . import merge_checkpoint
+            # Exclusions are sampled before signed next. Preserve a matching baseline;
+            # a fresh local publication may also have arrived while next was running.
+            source = progress_data
+            state = merge_checkpoint.election_source_state(source, profile_id, profile, fallback_lease)
+            if state:
+                try:
+                    source = read_cached(profile_id, db.list_series())
+                    source = merge_checkpoint.confirmation_source(source, profile_id, profile, admission)
+                    state = merge_checkpoint.election_source_state(source, profile_id, profile, fallback_lease)
+                except (OSError, sqlite3.Error, KeyError, ValueError, TypeError, RuntimeError):
+                    state = "MERGE election Source unavailable"
+            if state is None:
+                merge_wait_token = source["cache"]["token"]
+            elif isinstance(queue.get("dispatch_gate"), dict) and not progress_releases:
+                return _required_snapshot_defer(profile_id, "merge", state)
+            # Keep the ordinary provider for ungated queues and a recovery that
+            # already consumed its one progress attempt. Only the observer is optional.
         if bounded_confirmation:
             provider_route = "merge_confirmation"
         routed_priority = _post_preflight_admission_priority(
@@ -4478,9 +4501,7 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                                     native_done=(managed_confirmation and target_reservation is None),
                                     config_sha256=fallback_lease["config_sha256"],
                                     ordinary_gate=(preflight["handoff"]["lease"] if target_reservation is None else None),
-                                    source_token=((progress_data.get("cache") or {}).get("token")
-                                                  if not _required_snapshot_state(progress_data, profile, "merge")
-                                                  else None))
+                                    source_token=merge_wait_token)
                     if target_reservation is None:
                         from .merge_checkpoint import bind_election
                         bind_election(task, preflight["handoff"]["lease"])
@@ -4489,9 +4510,7 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                 envelope = {"protocol": "promptpilot-fallback-target-v1",
                             "next_already_run": True, "command": command,
                             "gate_command": gate_command, "preflight": preflight}
-                if (stage == "merge" and target_reservation is None and queue.get("item_blockers") is True
-                        and merge_checkpoint_hint is None and target["stage"] in {"merge", "integration-merge-recovery"}
-                        and gate_command[-2] == "--lease-file"):
+                if merge_wait_token is not None and gate_command[-2] == "--lease-file":
                     native = _expanded_command(["{python}", "-m", "promptpilot.project_pipeline"], stage)
                     envelope["source_wait_command"] = [*native, "merge-checkpoint", "source-wait",
                         "--profile", profile_id, "--number", str(target["number"]),
