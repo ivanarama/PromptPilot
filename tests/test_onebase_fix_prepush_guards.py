@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+import sqlite3
 
 import pytest
 
@@ -88,3 +89,51 @@ def test_changed_remote_branch_or_original_bundle_cannot_resume(case):
     with pytest.raises(ValueError):
         runner.read(case.root, case.read_args, *attempt)
     assert not list(case.root.rglob("push-attempt.json"))
+
+
+@pytest.mark.parametrize("fault", [None, "head", "session", "prompt", "token", "observation", "election",
+                                   "cache-replaced", "current-head"])
+def test_reused_initial_source_binds_live_election_and_native_attempt(case, fault, monkeypatch):
+    from promptpilot.task_identity import task_execution_fingerprint
+
+    task, started = prepare(case)
+    case.c.row_factory = sqlite3.Row
+    row = case.c.execute("SELECT * FROM tasks WHERE id=?", (task,)).fetchone()
+    binding = [task, started, row["session_id"], None, str(task), task_execution_fingerprint(row),
+               row["series_id"], row["priority"]]
+    source = case.source_value(task, started, case.now - 100)
+    source.update(state="reused", source_refreshed=False, source_reused=True,
+                  existing_execution_reservation_reused=True, mutable_admission_granted=False,
+                  observed_at=case.now - 25, attempt_binding_sha256=runner.digest(runner.encode(binding)),
+                  fix_pr_heads={str(case.pr): case.source})
+    source["cache"]["source"] = "durable"
+    live = {"profile_id": "onebase", "repository": runner.REPO, "cache": dict(source["cache"]),
+            "diagnostics": {"exit_code": 0, "fix_candidates": [dict(stage="review", number=case.pr, head=case.source)]},
+            "queues": [dict(id="fix", membership_complete=True, admission_items=[
+                dict(kind="pr", number=case.pr, key=f"pr:{case.pr}", labels=["changes-requested"],
+                     url=f"https://github.com/{runner.REPO}/pull/{case.pr}")])]}
+    monkeypatch.setattr(runner, "read_cached_fix_queue", lambda: live)
+    update(case.read_args.selection, task_id=task, task_started_at=started, snapshot_token=source["snapshot_token"])
+    if fault == "head":
+        source["fix_pr_heads"][str(case.pr)] = "c" * 40
+    elif fault in {"session", "prompt"}:
+        col = {"session": "session_id", "prompt": "prompt"}[fault]
+        case.c.execute(f"UPDATE tasks SET {col}='other' WHERE id=?", (task,))
+        case.c.commit()
+    elif fault == "token":
+        source["attempt_binding_sha256"] = "c" * 64
+    elif fault == "observation":
+        source["observed_at"] = case.now - 65
+    elif fault == "election":
+        update(case.read_args.selection, snapshot_token={})
+    elif fault == "cache-replaced":
+        live["cache"]["token"] = dict(source["snapshot_token"], revision=4)
+    elif fault == "current-head":
+        live["diagnostics"]["fix_candidates"][0]["head"] = "e" * 40
+    update(case.read_args.source_receipt, **source)
+    if fault:
+        with pytest.raises(ValueError):
+            runner.read(case.root, case.read_args, task, started)
+    else:
+        ticket = runner.read(case.root, case.read_args, task, started)
+        assert ticket["state"] == "candidate" and ticket["publication_authorized"] is False

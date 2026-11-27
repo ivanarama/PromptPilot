@@ -78,12 +78,12 @@ def _refusal(error):
             "mutable_admission_granted": False}
 
 
-def refresh(profile_id, environ=None, *, budget_only=False, final=False):
+def refresh(profile_id, environ=None, *, budget_only=False, final=False, reuse_fix_cache_only=False):
     # The Source meter can replace its decision after a committed debit.
     # Keep the actual spend independent of that later observation outcome.
     final_source_spend = {}
     try:
-        result = _refresh(profile_id, environ, budget_only, final, final_source_spend)
+        result = _refresh(profile_id, environ, budget_only, final, final_source_spend, reuse_fix_cache_only)
     except _REFRESH_ERRORS as error:
         if not final_source_spend:
             raise
@@ -93,7 +93,9 @@ def refresh(profile_id, environ=None, *, budget_only=False, final=False):
     return result
 
 
-def _refresh(profile_id, environ, budget_only, final, final_source_spend):
+def _refresh(profile_id, environ, budget_only, final, final_source_spend, reuse_fix_cache_only):
+    if reuse_fix_cache_only and (budget_only or final):
+        raise ValueError("cached FIX Source is only an initial Source observation")
     if final and budget_only:
         raise ValueError("final Source credit cannot fund a budget observation")
     env = os.environ if environ is None else environ
@@ -126,6 +128,12 @@ def _refresh(profile_id, environ, budget_only, final, final_source_spend):
     previous = getattr(pi._scan_lease_context, "continuation", None)
     if previous is not None:
         raise ValueError("nested Native source refresh is forbidden")
+    if reuse_fix_cache_only:
+        if pi._queue_replica_count(matched[2]) != 1 or any(env.get(k) for k in (
+                "PP_PIPELINE_REPLICAS", "PP_PIPELINE_TARGET_TOKEN", "PP_PROVIDER_OWNERSHIP_KIND")):
+            raise ValueError("cached FIX Source requires an ordinary single worker")
+        from .fix_cached_source import observe
+        return observe(continuation, profiles[profile_id])
     pi._scan_lease_context.continuation = continuation
     try:
         # INSIGHTS pays its own configured scan estimate against the normal
@@ -223,11 +231,15 @@ def run(argv=None, *, budget_only=False):
     parser = argparse.ArgumentParser(prog="pipelinectl " + command, description=__doc__)
     parser.add_argument("--profile", required=True)
     if not budget_only:
-        parser.add_argument("--final", action="store_true",
+        mode = parser.add_mutually_exclusive_group()
+        mode.add_argument("--final", action="store_true",
                             help="use the MERGE attempt's reserved final Source check, if available")
+        mode.add_argument("--reuse-fix-cache-only", action="store_true",
+                          help="observe a current FIX publication without starting a scan")
     args = parser.parse_args(argv)
     try:
-        result = refresh(args.profile, budget_only=budget_only, final=getattr(args, "final", False))
+        result = refresh(args.profile, budget_only=budget_only, final=getattr(args, "final", False),
+                         reuse_fix_cache_only=getattr(args, "reuse_fix_cache_only", False))
     except _REFRESH_ERRORS as exc:
         result = _refusal(exc)
         if budget_only:
@@ -245,7 +257,9 @@ def run(argv=None, *, budget_only=False):
     print(json.dumps(result, ensure_ascii=False, default=str))
     if budget_only:
         return 0 if result.get("rate_snapshot_refreshed") is True else 3 if result["state"] == "wait" else 2
-    return 0 if result.get("source_refreshed") is True else 3 if result["state"] == "wait" else 2
+    if result.get("source_refreshed") is True or result.get("source_reused") is True:
+        return 0
+    return 3 if result["state"] == "wait" else 2
 
 
 if __name__ == "__main__":
