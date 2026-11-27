@@ -1596,10 +1596,15 @@ def _execute_task_body(task, admission_complete=None, workorder_check=None):
             if gate["action"] == "defer":
                 next_run = _pipeline_defer_time(gate)
                 if next_run:
-                    _retry_sqlite_busy(
-                        lambda: _defer_task(task, next_run, reason),
+                    hint = gate.get("source_wait")
+                    deferred = _retry_sqlite_busy(
+                        lambda: _defer_task(task, next_run, reason, source_wait=hint),
                         f"отложить pipeline-задачу #{task.id}",
                     )
+                    if deferred and hint:
+                        from . import fix_source_wait
+                        # The scan may have published before the waiting task became pending.
+                        fix_source_wait.wake_cached(gate["profile_id"])
                     print(f"  -> Deferred without agent: {reason}")
                     return
                 print("  !! invalid pipeline defer time", flush=True)
