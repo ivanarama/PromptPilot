@@ -180,16 +180,93 @@ def test_real_cached_source_invalidation_is_bound_to_new_attempt(
     monkeypatch.setenv("PP_TASK_STARTED_AT", f.task.started_at.isoformat())
     monkeypatch.setattr(pi, "_github_search", lambda *_: pytest.fail("passive read searched GitHub"))
     monkeypatch.setattr(pi, "_github_rate_limits", lambda: pytest.fail("passive read refreshed rates"))
-    if not invalidated_before_election:
-        f.db.increment_int_setting(pi._CACHE_EPOCH_KEY)
-    result = observer(f, monkeypatch, capsys)
-    assert result["state"] == ("refused" if invalidated_before_election else "wait"), result
+    if invalidated_before_election:
+        assert "source_wait_command" not in f.envelope
+        return
+    f.db.increment_int_setting(pi._CACHE_EPOCH_KEY)
+    assert observer(f, monkeypatch, capsys)["state"] == "wait"
+
+
+@pytest.mark.parametrize("confirmation", [False, True])
+@pytest.mark.parametrize("publication", ["matching", "recovery", "other-head", "still-invalidated"])
+def test_managed_merge_binds_publication_at_signed_dispatch(
+        merge_dispatch, monkeypatch, capsys, publication, confirmation):
+    f = merge_dispatch
+    queue = f.profile["queues"][0]
+    queue["item_blockers"] = True
+    if confirmation:
+        queue["execution"]["merge_confirmation"] = "bounded-v1"
+    queue["dispatch_gate"] = {"skip_when_empty": True} if confirmation else {"require_fresh_snapshot": True}
+    stage = "integration-merge-recovery" if publication == "recovery" else "merge"
+    health = elect(f, monkeypatch, OLD, stage)
+    next_command = pi._tool_preflight
+
+    def publish(snapshot):
+        _, generation = pi._cache_snapshot("example")
+        revision = f.db.increment_int_setting(pi._refresh_revision_key("example"))
+        assert pi._publish_cache("example", f.profile, generation, pi._cache_epoch(), revision, {
+            "profile_id": "example", "repository": f.profile["repository"], "generated_at": time.time(),
+            "queues": [{"id": "merge", "membership_complete": True, "backlog": 1,
+                        "items": [{"kind": "pr", "number": 42, "updated_at": OLD}]}],
+            "diagnostics": snapshot})
+
+    publish(health)
+    f.db.increment_int_setting(pi._CACHE_EPOCH_KEY)
+    calls = []
+
+    def signed_next(*args):
+        calls.append("next")
+        if publication != "still-invalidated":
+            if publication == "other-head":
+                health["merge_executable"][0]["head"] = "d" * 40
+            publish(health)
+        return next_command(*args)
+
+    monkeypatch.setattr(pi, "_tool_preflight", signed_next)
+    route = pi.execution_route(f.task, f.task.prompt, retain_budget=True)
+    assert calls == ["next"]
+    if publication in {"still-invalidated", "other-head"}:
+        assert route["action"] == "defer" and "snapshot_admission" in route, route
+        assert f.db.pipeline_github_budget_reservations("github-default")["count"] == 0
+        with f.db._connect() as conn:
+            assert conn.execute("select merge_checkpoint_gate from tasks where id=?", (f.task.id,)).fetchone()[0] is None
+        return
+
+    assert route["action"] == "prompt", route
+    f.envelope = json.loads(route["prompt"].split("```json\n")[-1].split("\n```")[0])
+    monkeypatch.setenv("PP_TASK_ID", str(f.task.id))
+    monkeypatch.setenv("PP_TASK_STARTED_AT", f.task.started_at.isoformat())
+    f.db.increment_int_setting(pi._CACHE_EPOCH_KEY)
+    got = observer(f, monkeypatch, capsys)
+    assert got["state"] == "wait" and got["reason"] == "invalidated", got
+    assert finish(f, "НЕ СМОГ", "#42 — нет допуска: invalidated") == [f.task.series_id]
+    assert not f.db.get_series(f.task.series_id)["paused"]
+
+
+@pytest.mark.parametrize("retain,costed", [(False, True), (True, False), (True, True)])
+def test_legacy_merge_without_required_source_keeps_its_provider(
+        merge_dispatch, monkeypatch, retain, costed):
+    f = merge_dispatch
+    queue = f.profile["queues"][0]
+    queue.update(item_blockers=True, dispatch_gate={"skip_when_empty": True})
+    if not costed:
+        del f.profile["github_budget"]
+        del f.profile["health_check"]["source_graphql_cost"]
+    elect(f, monkeypatch, OLD, "merge")
+    route = pi.execution_route(f.task, f.task.prompt, retain_budget=retain)
+    assert route["action"] == "prompt", route
+    envelope = json.loads(route["prompt"].split("```json\n")[-1].split("\n```")[0])
+    assert "gate_command" in envelope and "source_wait_command" not in envelope
 
 
 def test_frozen_observer_uses_running_native_executable(merge_dispatch, monkeypatch):
     f = merge_dispatch
     f.profile["queues"][0]["item_blockers"] = True
-    elect(f, monkeypatch, OLD, "merge")
+    health = elect(f, monkeypatch, OLD, "merge")
+    cache = pi._cache_metadata("durable", time.time(), 2, 3, 2, pi._profile_fingerprint(f.profile))
+    monkeypatch.setattr(pi, "read_cached", lambda *_: {
+        "profile_id": "example", "repository": f.profile["repository"], "diagnostics": health, "cache": cache,
+        "queues": [{"id": "merge", "membership_complete": True, "backlog": 1, "items": []}]})
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     route = pi.execution_route(f.task, f.task.prompt, retain_budget=True)
     envelope = json.loads(route["prompt"].split("```json\n")[-1].split("\n```")[0])

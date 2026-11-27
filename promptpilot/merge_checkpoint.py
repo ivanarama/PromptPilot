@@ -125,6 +125,29 @@ def confirmation_source(data, profile_id, profile, admission):
     return dict(data, cache=result_cache)
 
 
+def election_source_state(data, profile_id, profile, lease):
+    """Require a fresh local publication matching the ordinary signed election."""
+    from . import pipeline_insights as pi
+
+    state = pi._required_snapshot_state(data, profile, "merge")
+    if state:
+        return state
+    token = data["cache"].get("token")
+    if (data.get("profile_id") != profile_id or data.get("repository") != lease["repository"]
+            or lease["repository"] != profile.get("repository") or not isinstance(token, dict)
+            or token.get("profile_hash") != pi._profile_fingerprint(profile)
+            or type(token.get("revision")) is not int or type(token.get("epoch")) is not int):
+        return "MERGE Source has no matching publication token"
+    health = data.get("diagnostics")
+    if not isinstance(health, dict) or health.get("errors") or health.get("checker_failed"):
+        return "MERGE Source checker unavailable"
+    try:
+        fallback_handoff.health_gate(health, "merge", lease["target"], election=True)
+    except pp.PipelineError as exc:
+        return str(exc)
+    return None
+
+
 def _wait_key(task):
     # One bounded observation per ordinary series, never a cross-task gate.
     return f"pipeline_merge_source_wait:v1:{task.series_id}"
