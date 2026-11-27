@@ -1,11 +1,17 @@
 import hashlib
+from datetime import datetime, timezone
+from io import BytesIO
 import json
 from pathlib import Path
 import sqlite3
+import time
 from urllib.error import HTTPError
 
 import pytest
 
+from promptpilot import db
+from promptpilot.models import TaskCreate
+from promptpilot.task_identity import task_execution_fingerprint
 from tools import install_onebase_fix_postpush as installer
 from tools import onebase_fix_postpush as runner
 
@@ -119,6 +125,88 @@ def test_passive_recovery_from_timeout_and_contention():
     result, requests = run_observer(prior, [TimeoutError(), blocked, good])
     assert requests == [0, 50, 80]
     assert result["fresh_snapshot"] == good["cache"]["token"] and not result["publication_authorized"]
+
+
+@pytest.fixture
+def reused_fix_source(tmp_path, monkeypatch):
+    directory = tmp_path / ".promptpilot"
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(db, "DB_DIR", directory)
+    monkeypatch.setattr(db, "DB_PATH", directory / "promptpilot.db")
+    db.init_db()
+    db.create_task(TaskCreate(prompt="other series", recurrence="1h"))
+    task = db.create_task(TaskCreate(prompt="Обычный FIX", recurrence="1h", priority=1, task_timeout=7200))
+    now = time.time()
+    started = datetime.fromtimestamp(now - 500, timezone.utc).isoformat()
+    with db._connect() as conn:
+        conn.execute("UPDATE tasks SET started_at=?,status='running',session_id='session' WHERE id=?", (started, task.id))
+        row = conn.execute("SELECT * FROM tasks WHERE id=?", (task.id,)).fetchone()
+    cost = {"core": 1200, "search": 12, "graphql": 1000}
+    reservation = {"task_id": task.id, "task_started_at": started, "profile_id": "onebase", "queue_id": "fix",
+                   "route": "skill", "token": "original reservation", "cost": cost}
+    db.set_setting(db._pipeline_github_budget_reservation_key("github-default"),
+                   json.dumps({"version": 1, "reservations": [reservation]}))
+    binding = [task.id, started, row["session_id"], row["herdr_pane"], reservation["token"],
+               task_execution_fingerprint(row), row["series_id"], row["priority"]]
+    digest = hashlib.sha256(json.dumps(binding, separators=(",", ":")).encode()).hexdigest()
+    prior, good = sources()
+    old = dict(prior["snapshot_token"], generated_at=now - 490)
+    good["cache"]["generated_at"] = good["cache"]["token"]["generated_at"] = now - 5
+    cache = dict(good["cache"], token=old, generated_at=old["generated_at"])
+    prior.update(state="reused", source_reused=True, source_refreshed=False, task_id=task.id, task_started_at=started,
+                 scope="Native-source-observation-only", mutable_admission_granted=False, product_mutation_authorized=False,
+                 admitted_route="skill", existing_execution_reservation_reused=True, existing_skill_reservation_reused=True,
+                 cache=cache, snapshot_token=old, observed_at=now - 450, fix_pr_heads={"17": SOURCE},
+                 attempt_binding_sha256=digest)
+    return prior, good
+
+
+def test_reused_original_can_observe_after_expiry_with_only_worker_task_id(reused_fix_source, tmp_path, monkeypatch, capsys):
+    prior, good = reused_fix_source
+    path = tmp_path / "source.json"
+    path.write_text(json.dumps(prior), encoding="utf-8")
+    monkeypatch.setenv("PP_TASK_ID", str(prior["task_id"]))
+    monkeypatch.delenv("PP_TASK_STARTED_AT", raising=False)
+    class LocalCache:
+        def open(self, url, timeout):
+            assert url == runner.CACHE_URL and url.endswith("?refresh=false")
+            return BytesIO(json.dumps(good).encode())
+    monkeypatch.setattr(runner, "build_opener", lambda *_args: LocalCache())
+    assert runner.main(["observe", "--source-receipt", str(path), "--seconds", "30"]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["fresh_snapshot"] == good["cache"]["token"] and result["publication_authorized"] is False
+    monkeypatch.setenv("PP_TASK_STARTED_AT", "another attempt")
+    assert runner.main(["observe", "--source-receipt", str(path), "--seconds", "30"]) == 2
+
+
+@pytest.mark.parametrize("fault", ["at-expiry", "future", "other-binding", "wrong-route", "partial", "session-change",
+                                   "changed-prompt", "reservation-released"])
+def test_cached_observer_requires_original_freshness_and_current_attempt(reused_fix_source, fault):
+    prior, good = reused_fix_source
+    deferred = fault in {"session-change", "changed-prompt", "reservation-released"}
+    if fault == "at-expiry":
+        prior["observed_at"] = prior["snapshot_token"]["generated_at"] + 300
+    elif fault == "future":
+        prior["snapshot_token"]["generated_at"] = prior["cache"]["generated_at"] = time.time() + 5
+        prior["observed_at"] = time.time() + 10
+    elif fault == "other-binding":
+        prior["attempt_binding_sha256"] = "c" * 64
+    elif fault == "wrong-route":
+        prior["admitted_route"] = "fallback_targeted"
+    elif fault == "partial":
+        prior["cache"]["complete"] = False
+    def read(timeout):
+        assert deferred, "invalid receipt reached the local observer"
+        with db._connect() as conn:
+            if fault == "session-change":
+                conn.execute("UPDATE tasks SET session_id='next' WHERE id=?", (prior["task_id"],))
+            elif fault == "changed-prompt":
+                conn.execute("UPDATE tasks SET prompt='different' WHERE id=?", (prior["task_id"],))
+            elif fault == "reservation-released":
+                conn.execute("DELETE FROM settings WHERE key=?", (db._pipeline_github_budget_reservation_key("github-default"),))
+        return good
+    with pytest.raises(ValueError):
+        runner.observe(prior, prior["task_id"], prior["task_started_at"], 30, read=read)
 
 
 def test_timeout_of_whole_window_then_new_native_attempt():

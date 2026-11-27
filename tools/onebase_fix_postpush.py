@@ -3,6 +3,8 @@
 These operations cannot authorize or perform a GitHub write.
 """
 import argparse
+from contextlib import closing
+from datetime import datetime
 import hashlib
 import http.client
 import json
@@ -10,6 +12,7 @@ import math
 import os
 from pathlib import Path
 import re
+import sqlite3
 import sys
 import tempfile
 import time
@@ -168,9 +171,80 @@ def valid_stamp(value):
     return type(value) in (int, float) and math.isfinite(value)
 
 
+def running_fix_binding(task, started, observed, now):
+    """Reproduce the binding issued by Native from the live session and its existing reservation."""
+    database = Path.home() / ".promptpilot" / "promptpilot.db"
+    prefix = "pipeline_github_budget_reservations:v1:"
+    with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=3)) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("BEGIN")
+        row = conn.execute(
+            """SELECT t.* FROM tasks t JOIN task_series s ON s.id=t.series_id
+               WHERE t.id=? AND t.started_at=? AND t.status='running' AND s.id=2
+                 AND NOT s.paused AND s.ended_at IS NULL AND NOT COALESCE(t.detached,0) AND COALESCE(t.machine,'')=''
+                 AND (t.session_id<>'' OR t.herdr_pane<>'')""", (task, started)).fetchone()
+        controls = dict(conn.execute("SELECT key,value FROM settings WHERE key IN ('worker_paused',?)",
+                                     (f"cancel_task:{task}",)))
+        start = datetime.fromisoformat(started)
+        if (not row or start.tzinfo is None or not start.timestamp() <= observed <= now
+                or (row["task_timeout"] and now >= start.timestamp() + row["task_timeout"])
+                or controls.get("worker_paused", "0") != "0" or controls.get(f"cancel_task:{task}") == "1"):
+            raise ValueError("cached Source no longer belongs to a running FIX attempt")
+        own = []
+        for key, value in conn.execute("SELECT key,value FROM settings WHERE substr(key,1,?)=?",
+                                       (len(prefix), prefix)):
+            ledger = json.loads(value)
+            if ledger["version"] != 1:
+                raise ValueError("unknown Native reservation format")
+            own.extend((key, r) for r in ledger["reservations"] if r["task_id"] == task)
+        scope = prefix + hashlib.sha256(b"github-default").hexdigest()
+        if len(own) != 1 or own[0][0] != scope:
+            raise ValueError("cached Source no longer has the original FIX reservation")
+        reservation = own[0][1]
+        if (reservation["task_started_at"] != started or reservation["profile_id"] != "onebase"
+                or reservation["queue_id"] != "fix" or reservation["route"] != "skill"
+                or not isinstance(reservation["token"], str) or not reservation["token"]):
+            raise ValueError("cached Source no longer has the original FIX reservation")
+        # This standalone runs under Python -I outside the Native install.
+        # Match task_identity.task_execution_fingerprint's exact field set.
+        execution = {k: row[k] for k in ("prompt", "working_dir", "provider", "model", "effort", "rights",
+            "skip_permissions", "machine", "detached", "herdr_target", "worktree", "worktree_path",
+            "worktree_branch", "task_timeout")}
+        for key in ("skip_permissions", "detached", "worktree"):
+            if execution[key] is not None:
+                execution[key] = int(execution[key])
+        execution_sha = hashlib.sha256(json.dumps(execution, sort_keys=True, ensure_ascii=False,
+                                                  separators=(",", ":")).encode()).hexdigest()
+        binding = [task, started, row["session_id"], row["herdr_pane"], reservation["token"],
+                   execution_sha, row["series_id"], row["priority"]]
+        return hashlib.sha256(json.dumps(binding, separators=(",", ":")).encode()).hexdigest()
+
+
+def check_reused_source(prior, token, task, started, now):
+    cache = prior["cache"]
+    observed = prior["observed_at"]
+    heads = prior.get("fix_pr_heads")
+    if (prior.get("state") != "reused" or prior.get("source_refreshed") is not False
+            or prior.get("source_reused") is not True or prior.get("admitted_route") != "skill"
+            or prior.get("existing_execution_reservation_reused") is not True
+            or prior.get("existing_skill_reservation_reused") is not True
+            or prior.get("scope") != "Native-source-observation-only" or prior.get("mutable_admission_granted") is not False
+            or prior.get("product_mutation_authorized") is not False
+            or cache.get("source") != "durable" or cache.get("available") is not True or cache.get("complete") is not True
+            or cache.get("stale") is not False or cache.get("invalidated") is not False or cache.get("refresh_blocked")
+            or cache.get("token") != token or cache.get("profile_hash") != token["profile_hash"]
+            or cache.get("generated_at") != token["generated_at"] or cache.get("ttl_seconds") != 300
+            or not isinstance(heads, dict) or not heads
+            or not all(re.fullmatch(r"[1-9][0-9]*", number) and re.fullmatch(SHA, head) for number, head in heads.items())
+            or token["revision"] <= 0 or not valid_stamp(observed) or not 0 <= observed - token["generated_at"] < 300
+            or prior.get("attempt_binding_sha256") != running_fix_binding(task, started, observed, now)):
+        raise ValueError("invalid cached Source receipt for this FIX attempt")
+
+
 def observe(prior, task, started, seconds, read=read_cache,
             clock=time.monotonic, now=time.time, sleep=time.sleep):
-    if not (prior.get("state") == "refreshed" and prior.get("source_refreshed") is True
+    reused = prior.get("state") == "reused" or prior.get("source_reused") is True
+    if not ((reused or (prior.get("state") == "refreshed" and prior.get("source_refreshed") is True))
             and type(prior.get("task_id")) is int and prior["task_id"] == task
             and task > 0 and started and prior.get("task_started_at") == started
             and prior.get("native_session_bound") is True and prior.get("profile_id") == "onebase"
@@ -181,6 +255,8 @@ def observe(prior, task, started, seconds, read=read_cache,
     if (not re.fullmatch(DIGEST, expected) or not valid_stamp(original["generated_at"])
             or any(type(original.get(k)) is not int or original[k] < 0 for k in ("epoch", "revision"))):
         raise ValueError("invalid source receipt")
+    if reused:
+        check_reused_source(prior, original, task, started, now())
     deadline = clock() + seconds
     attempts = 0
     while clock() < deadline:
@@ -217,6 +293,8 @@ def observe(prior, task, started, seconds, read=read_cache,
                     and (token["revision"] > original["revision"] or token == original)
                     and stamp >= original["generated_at"] and 0 <= now() - stamp < 300
                     and clock() < deadline):
+                if reused:
+                    check_reused_source(prior, original, task, started, now())
                 return {"fresh_snapshot": token, "attempts": attempts, "publication_authorized": False}
         if deadline - clock() <= 30:
             break
@@ -244,14 +322,19 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         if args.action == "observe":
-            value = observe(json.loads(args.source_receipt.read_bytes()), int(os.environ["PP_TASK_ID"]),
-                            os.environ["PP_TASK_STARTED_AT"], args.seconds)
+            prior = json.loads(args.source_receipt.read_bytes())
+            started = os.environ.get("PP_TASK_STARTED_AT")
+            if not started and prior.get("state") == "reused":
+                # Older ordinary workers only export the task ID. The DB check
+                # validates this hint against the actual running start/session.
+                started = prior.get("task_started_at")
+            value = observe(prior, int(os.environ["PP_TASK_ID"]), started, args.seconds)
             print(json.dumps(value))
             return 0 if value["fresh_snapshot"] else 3
         result = receipt(Path.home() / ".promptpilot" / "fix-runs", args)
         print(json.dumps(result))
         return 0
-    except (OSError, ValueError, KeyError, TypeError, AttributeError, http.client.HTTPException) as exc:
+    except (OSError, sqlite3.Error, ValueError, KeyError, TypeError, AttributeError, http.client.HTTPException) as exc:
         print(str(exc), file=sys.stderr)
         return 2
 
