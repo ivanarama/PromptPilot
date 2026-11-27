@@ -135,6 +135,84 @@ def test_wait_next_election_and_only_one_claim(case):
     assert fix.read(r.root, r.read_args, 2, r.new_start)["state"] == "reconcile"
 
 
+@pytest.fixture
+def passive_reader(case, monkeypatch):
+    r = case
+    a = r.read_args
+    original = r.source_value(2, r.new_start, r.now - 301)
+    write(a.source_receipt, original)
+    token = original["snapshot_token"]
+    observed = dict(token, revision=token["revision"] + 1, generated_at=r.now - 20)
+    latest = dict(observed, revision=observed["revision"] + 1, generated_at=r.now - 10)
+    cache = dict(original["cache"], source="memory", generated_at=latest["generated_at"], token=latest)
+    item = dict(number=r.pr, kind="pr", key=f"pr:{r.pr}", url=f"https://github.com/{fix.REPO}/pull/{r.pr}",
+                labels=["changes-requested"])
+    report = dict(profile_id="onebase", repository=fix.REPO, cache=cache,
+                  queues=[dict(id="fix", membership_complete=True, admission_items=[item])])
+    monkeypatch.setattr(fix, "read_cached_fix_queue", lambda: report)
+    monkeypatch.setattr(Path, "home", lambda: r.root.parent.parent)
+    monkeypatch.setenv("PP_TASK_ID", "2")
+    monkeypatch.setenv("PP_TASK_STARTED_AT", r.new_start)
+    folder = r.root.parent / "onebase-fix-passive-observations" / ("2-" + fix.digest(r.new_start.encode())[:24])
+    folder.mkdir(parents=True)
+    binding = dict(task=2, started=r.new_start, original=token, native=fix.native(r.root, 2, r.new_start),
+                   source_sha256=fix.file_hash(a.source_receipt))
+    write(folder/"observe.intent.json", binding)
+    witness = dict(binding=binding, fresh_snapshot=observed, publication_authorized=False)
+    result = write(folder/"observe.result.json", witness)
+    election = dict(r.selection, task_id=2, task_started_at=r.new_start, snapshot_token=latest)
+    write(a.selection, election)
+    argv = ["read", "--pr", str(r.pr), "--source", r.source, "--selection", str(a.selection),
+            "--source-receipt", str(a.source_receipt), "--budget-receipt", str(a.budget_receipt), "--pr-read", str(a.pr_read)]
+    return NS(argv=argv, witness=witness, result=result, report=report, election=election)
+
+
+def test_passive_read_after_original_expiry(case, passive_reader, capsys):
+    r, p = case, passive_reader
+    assert fix.main(p.argv) == 2
+    assert "requires fresh Source" in capsys.readouterr().err
+    assert fix.main([*p.argv, "--passive-source"]) == 0
+    assert json.loads(capsys.readouterr().out) == {"state":"missing", **fix.FLAGS}
+    fix.capture(r.root, r.capture_args, 1, r.old_start)
+    r.finish()
+    assert fix.main([*p.argv, "--passive-source"]) == 0
+    recovered = json.loads(capsys.readouterr().out)
+    assert recovered["candidate"] == r.head and recovered["publication_authorized"] is False
+
+
+@pytest.mark.parametrize("defect", ["cross-task", "different-receipt", "different-profile", "regressed-revision",
+                                    "stale", "invalidated", "election", "queue", "changed-head", "budget"])
+def test_passive_read_requires_current_bound_election(case, passive_reader, defect, capsys):
+    r, p = case, passive_reader
+    if defect == "cross-task":
+        p.witness["binding"]["task"] = 1
+    elif defect == "different-receipt":
+        r.read_args.source_receipt.write_bytes(r.read_args.source_receipt.read_bytes() + b" ")
+    elif defect == "different-profile":
+        p.witness["fresh_snapshot"]["profile_hash"] = "f" * 64
+    elif defect == "regressed-revision":
+        p.witness["fresh_snapshot"]["revision"] = 0
+    elif defect == "stale":
+        p.report["cache"]["generated_at"] = p.report["cache"]["token"]["generated_at"] = r.now - 300
+    elif defect == "invalidated":
+        p.report["cache"]["invalidated"] = True
+    elif defect == "election":
+        p.election["snapshot_token"] = p.witness["fresh_snapshot"]
+    elif defect == "queue":
+        p.report["queues"][0]["admission_items"] = []
+    elif defect == "changed-head":
+        current = json.loads(r.read_args.pr_read.read_bytes())
+        current["head"]["sha"] = "a" * 40
+        write(r.read_args.pr_read, current)
+    elif defect == "budget":
+        write(r.read_args.budget_receipt, dict(r.ready(2, r.new_start), ready=False))
+    write(p.result, p.witness)
+    write(r.read_args.selection, p.election)
+    assert fix.main([*p.argv, "--passive-source"]) == 2
+    assert json.loads(capsys.readouterr().err)["state"] == "refused"
+    assert not list(r.root.rglob("task-2.json"))
+
+
 def test_seed_requires_operator_pin_and_clean_origin(case, monkeypatch):
     r = case
     data = fix.evidence(r.root, r.outcome)
