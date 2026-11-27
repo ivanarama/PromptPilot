@@ -196,7 +196,7 @@ def test_managed_merge_binds_publication_at_signed_dispatch(
     queue["item_blockers"] = True
     if confirmation:
         queue["execution"]["merge_confirmation"] = "bounded-v1"
-    queue["dispatch_gate"] = {"skip_when_empty": True}
+    queue["dispatch_gate"] = {"skip_when_empty": True} if confirmation else {"require_fresh_snapshot": True}
     stage = "integration-merge-recovery" if publication == "recovery" else "merge"
     health = elect(f, monkeypatch, OLD, stage)
     next_command = pi._tool_preflight
@@ -241,6 +241,22 @@ def test_managed_merge_binds_publication_at_signed_dispatch(
     assert got["state"] == "wait" and got["reason"] == "invalidated", got
     assert finish(f, "НЕ СМОГ", "#42 — нет допуска: invalidated") == [f.task.series_id]
     assert not f.db.get_series(f.task.series_id)["paused"]
+
+
+@pytest.mark.parametrize("retain,costed", [(False, True), (True, False), (True, True)])
+def test_legacy_merge_without_required_source_keeps_its_provider(
+        merge_dispatch, monkeypatch, retain, costed):
+    f = merge_dispatch
+    queue = f.profile["queues"][0]
+    queue.update(item_blockers=True, dispatch_gate={"skip_when_empty": True})
+    if not costed:
+        del f.profile["github_budget"]
+        del f.profile["health_check"]["source_graphql_cost"]
+    elect(f, monkeypatch, OLD, "merge")
+    route = pi.execution_route(f.task, f.task.prompt, retain_budget=retain)
+    assert route["action"] == "prompt", route
+    envelope = json.loads(route["prompt"].split("```json\n")[-1].split("\n```")[0])
+    assert "gate_command" in envelope and "source_wait_command" not in envelope
 
 
 def test_frozen_observer_uses_running_native_executable(merge_dispatch, monkeypatch):

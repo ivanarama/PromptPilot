@@ -4295,6 +4295,7 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
         if (stage == "merge" and provider_route == "fallback_targeted" and target_reservation is None
                 and queue.get("item_blockers") is True and merge_checkpoint_hint is None
                 and validated_target_stage in {"merge", "integration-merge-recovery"}
+                and retain_budget and (_github_budget_policy(profile) or {}).get("costs")
                 and type(getattr(task, "id", None)) is int and task.id > 0):
             from . import merge_checkpoint
             # Exclusions are sampled before signed next. Preserve a matching baseline;
@@ -4310,10 +4311,13 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                     state = "MERGE election Source unavailable"
             if state is None:
                 merge_wait_token = source["cache"]["token"]
-            elif isinstance(queue.get("dispatch_gate"), dict) and not progress_releases:
-                return _required_snapshot_defer(profile_id, "merge", state)
-            # Keep the ordinary provider for ungated queues and a recovery that
-            # already consumed its one progress attempt. Only the observer is optional.
+            else:
+                gate = queue.get("dispatch_gate") or {}
+                if (not progress_releases and isinstance(gate, dict) and gate
+                        and (gate.get("require_fresh_snapshot") is True or managed_confirmation)):
+                    return _required_snapshot_defer(profile_id, "merge", state)
+                # Keep the provider for legacy queues and a recovery that already
+                # consumed its sole attempt. Only the unusable observer is omitted.
         if bounded_confirmation:
             provider_route = "merge_confirmation"
         routed_priority = _post_preflight_admission_priority(
