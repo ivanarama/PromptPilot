@@ -346,7 +346,8 @@ def test_herdr_deduplicates_permission_flag_and_forwards_pipeline_paths(
                 "tab": {"tab_id": "tab-42"},
             }}, ""
         if args[:2] == ["agent", "start"]:
-            return 0, {"result": {"agent": {"agent_status": "idle"}}}, ""
+            return 0, {"result": {"agent": {"agent_status": "idle", "pane_id": "pane-42",
+                                            "terminal_id": "terminal", "state_change_seq": 1}}}, ""
         if args[:2] == ["agent", "prompt"]:
             submitted.append(args[3])
             return 0, {"result": {"agent": {"agent_status": "done"}}}, ""

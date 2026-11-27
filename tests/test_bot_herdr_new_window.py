@@ -143,7 +143,9 @@ def test_new_window_with_new_folder_preserves_agent_folder_and_keep_pane(wizard,
     assert "new_herdr_target" not in wizard.user_data
     choices = wizard.user_data["herdr_new_providers"]
     event = update(f"hnew_i:{choices.index('codex')}")
-    assert asyncio.run(bot.cb_herdr_new_agent(event, wizard)) == bot.ASK_DIR
+    assert asyncio.run(bot.cb_herdr_new_agent(event, wizard)) == bot.ASK_MODEL
+    assert any(b.callback_data == "model_manual" for b in buttons(event.callback_query))
+    assert asyncio.run(bot.add_task_got_model(update("model:"), wizard)) == bot.ASK_DIR
     route = wizard.user_data["new_provider"]
     provider = config.load_providers()[route]
     assert provider["executor"] == "herdr"

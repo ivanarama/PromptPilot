@@ -30,7 +30,7 @@ from telegram import (
     ReplyKeyboardRemove,
     Update,
 )
-from telegram.error import BadRequest
+from telegram.error import BadRequest, NetworkError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -47,7 +47,7 @@ from .config import (
     ensure_herdr_launch_provider, herdr_launch_kind,
     get_provider_models, get_proxy_url, get_skills, load_machines, load_providers,
     load_providers_detailed, mask_proxy_url, pickable_providers,
-    PROJECTS_ROOT, TASK_PASSWORD, EFFORT_LEVELS,
+    PROJECTS_ROOT, TASK_PASSWORD, provider_effort_levels, provider_is_codex,
 )
 from .models import TaskCreate
 from .tg_auth import authorize_user, is_authorized, list_authorized, load_allowed_phones
@@ -325,7 +325,7 @@ def _pw_grant(user_id: int):
 
 
 _WIZARD_KEYS = ("new_prompt", "new_provider", "new_priority", "new_dir", "new_schedule",
-                "new_recurrence", "new_detached", "new_keep_pane", "new_model", "new_effort",
+                "new_recurrence", "new_detached", "new_keep_pane", "new_model", "new_effort", "edit_model_from_extras",
                 "new_skip_permissions", "new_skill_name", "new_herdr_target", "new_machine",
                 "new_worktree", "pw_attempts", "model_list", "herdr_targets", "herdr_new_providers",
                 "last_settings", "dir_base", "dir_subs", "dir_page", "dir_hist",
@@ -1571,7 +1571,7 @@ def _last_settings_line(last: dict) -> str:
 
 
 async def _ask_machine_or_provider(send, context):
-    machines = load_machines()
+    machines = await asyncio.to_thread(load_machines)
     if machines:
         buttons = [[InlineKeyboardButton("💻 Локально", callback_data="machine:")]]
         buttons += [[InlineKeyboardButton(f"🖥 {n} ({m.get('host')})", callback_data=f"machine:{n}")]
@@ -1579,7 +1579,7 @@ async def _ask_machine_or_provider(send, context):
         await send("Где выполнить задачу?", reply_markup=InlineKeyboardMarkup(buttons))
         return ASK_MACHINE
 
-    buttons = _provider_buttons()
+    buttons = await asyncio.to_thread(_provider_buttons)
     buttons.append([InlineKeyboardButton(f"⬛ По умолчанию ({DEFAULT_CLI})", callback_data="pickprov:")])
     await send("Выберите провайдера:", reply_markup=InlineKeyboardMarkup(buttons))
     return ASK_PROVIDER
@@ -1588,7 +1588,7 @@ async def _ask_machine_or_provider(send, context):
 async def _after_prompt(message, context: ContextTypes.DEFAULT_TYPE):
     # The user almost always runs the next task with the same provider and
     # folder — offer last time's settings before walking every step again.
-    last = _load_last_settings(message.chat_id)
+    last = await asyncio.to_thread(_load_last_settings, message.chat_id)
     if last and (last.get("new_herdr_target") or not load_providers().get(
             last.get("new_provider") or DEFAULT_CLI, {}).get("session_target")):
         context.user_data["last_settings"] = last
@@ -1702,11 +1702,24 @@ async def cb_last_use(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await _show_confirm(query.edit_message_text, context)
 
 
+async def _ack_wizard_callback(query):
+    try:
+        await asyncio.wait_for(query.answer(), timeout=2)
+    except BadRequest as exc:
+        message = str(exc).lower()
+        if "query is too old" not in message and "query id is invalid" not in message:
+            raise
+        logger.debug("Telegram callback expired before acknowledgement: %s", exc)
+    except (asyncio.TimeoutError, NetworkError) as exc:
+        logger.debug("Telegram callback acknowledgement failed: %s", exc)
+
+
 async def cb_last_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await _ack_wizard_callback(query)
+    next_state = await _ask_machine_or_provider(query.edit_message_text, context)
     context.user_data.pop("last_settings", None)
-    return await _ask_machine_or_provider(query.edit_message_text, context)
+    return next_state
 
 
 _MODELS_PER_PAGE = 12
@@ -1722,7 +1735,7 @@ def _model_labels(models):
     return [m if counts[s] > 1 else s for s, m in zip(short, models)]
 
 
-def _model_keyboard(models, page: int = 0) -> InlineKeyboardMarkup:
+def _model_keyboard(models, page: int = 0, *, back: bool = False) -> InlineKeyboardMarkup:
     """Model picker over the full list, selected by index — no 64-byte
     callback_data limit and nothing silently dropped — paginated past 12.
 
@@ -1758,6 +1771,8 @@ def _model_keyboard(models, page: int = 0) -> InlineKeyboardMarkup:
     if nav:
         buttons.append(nav)
     buttons.append([InlineKeyboardButton("✏️ Ввести id вручную", callback_data="model_manual")])
+    if back:
+        buttons.append([InlineKeyboardButton(BACK_LABEL, callback_data="model_back")])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -1800,13 +1815,21 @@ async def add_task_got_provider(update: Update, context: ContextTypes.DEFAULT_TY
     return await _ask_provider_model(query, context)
 
 
+async def _wizard_models(context):
+    ud = context.user_data
+    provider = ud.get("new_provider") or DEFAULT_CLI
+    if ud.get("new_machine"):
+        return await asyncio.to_thread(get_provider_models, provider, local=False)
+    return await asyncio.to_thread(get_provider_models, provider)
+
+
 async def _ask_provider_model(query, context):
-    import asyncio
-    provider = context.user_data.get("new_provider")
-    models = await asyncio.to_thread(get_provider_models, provider or DEFAULT_CLI)
-    if models:
-        context.user_data["model_list"] = models
+    ud = context.user_data
+    cfg = load_providers().get(ud.get("new_provider") or DEFAULT_CLI, {})
+    models = await _wizard_models(context)
+    if models or provider_is_codex(cfg):
         await query.edit_message_text("Выберите модель:", reply_markup=_model_keyboard(models))
+        ud["model_list"] = models
         return ASK_MODEL
 
     return await _ask_dir(query, context)
@@ -1859,7 +1882,7 @@ def _herdr_new_choices(machine=None):
 
 async def cb_herdr_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    choices = _herdr_new_choices(context.user_data.get("new_machine"))
+    choices = await asyncio.to_thread(_herdr_new_choices, context.user_data.get("new_machine"))
     if not choices:
         await query.answer("Нет доступных агентов для нового окна Herdr на этой машине.", show_alert=True)
         return ASK_HERDR_TARGET
@@ -1941,13 +1964,24 @@ async def _confirm_herdr_target(query, context):
     return await _show_confirm(query.edit_message_text, context)
 
 
+async def _apply_wizard_model(query, context, model):
+    ud = context.user_data
+    previous = ud.get("new_model")
+    ud["new_model"] = model
+    if not ud.pop("edit_model_from_extras", False):
+        return await _ask_dir(query, context)
+    effort = ud.get("new_effort")
+    if model != previous and effort and effort not in await asyncio.to_thread(_wizard_effort_levels, context):
+        ud.pop("new_effort", None)
+    return await _show_extras(query.edit_message_text, context)
+
+
 async def add_task_got_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """«По умолчанию» (and legacy model:<id> buttons from old messages)."""
     query = update.callback_query
-    await query.answer()
+    await _ack_wizard_callback(query)
     model = query.data.split(":", 1)[1] or None
-    context.user_data["new_model"] = model
-    return await _ask_dir(query, context)
+    return await _apply_wizard_model(query, context, model)
 
 
 async def add_task_got_model_idx(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1957,64 +1991,64 @@ async def add_task_got_model_idx(update: Update, context: ContextTypes.DEFAULT_T
     if idx >= len(models):
         await query.answer("Список устарел — выберите модель заново.", show_alert=True)
         return ASK_MODEL
-    await query.answer()
-    context.user_data["new_model"] = models[idx]
-    return await _ask_dir(query, context)
+    await _ack_wizard_callback(query)
+    return await _apply_wizard_model(query, context, models[idx])
 
 
 async def cb_model_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await _ack_wizard_callback(query)
     models = context.user_data.get("model_list") or []
     if models:
         page = int(query.data.split(":")[1])
-        await query.edit_message_reply_markup(reply_markup=_model_keyboard(models, page))
+        await query.edit_message_reply_markup(reply_markup=_model_keyboard(
+            models, page, back=bool(context.user_data.get("edit_model_from_extras"))))
     return ASK_MODEL
 
 
 async def cb_model_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await _ack_wizard_callback(query)
+    back = InlineKeyboardMarkup([[InlineKeyboardButton(BACK_LABEL, callback_data="model_back")]]) \
+        if context.user_data.get("edit_model_from_extras") else None
     await query.edit_message_text(
         "Введите id модели текстом (например `opencode/big-pickle`)\n"
         "или /skip — модель по умолчанию:",
         parse_mode="Markdown",
+        reply_markup=back,
     )
     return ASK_MODEL
 
 
 async def add_task_got_model_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["new_model"] = update.message.text.strip() or None
-    return await _ask_dir(_MsgSend(update.message), context)
+    return await _apply_wizard_model(_MsgSend(update.message), context, update.message.text.strip() or None)
 
 
 async def add_task_skip_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["new_model"] = None
-    return await _ask_dir(_MsgSend(update.message), context)
+    return await _apply_wizard_model(_MsgSend(update.message), context, None)
 
 
 def _list_projects():
     """Return sorted list of immediate subdirectories under PROJECTS_ROOT."""
-    if not PROJECTS_ROOT:
-        return []
-    try:
-        return sorted(
-            d for d in os.listdir(PROJECTS_ROOT)
-            if os.path.isdir(os.path.join(PROJECTS_ROOT, d)) and not d.startswith(".")
-        )
-    except OSError:
-        return []
+    return _list_subdirs(PROJECTS_ROOT) if PROJECTS_ROOT else []
 
 
 def _list_subdirs(parent_path):
     """Return sorted list of immediate subdirectories inside *parent_path*."""
+    directories = []
     try:
-        return sorted(
-            d for d in os.listdir(parent_path)
-            if os.path.isdir(os.path.join(parent_path, d)) and not d.startswith(".")
-        )
+        with os.scandir(parent_path) as entries:
+            for entry in entries:
+                if entry.name.startswith("."):
+                    continue
+                try:
+                    if entry.is_dir():
+                        directories.append(entry.name)
+                except OSError:
+                    continue
     except OSError:
         return []
+    return sorted(directories)
 
 
 def _list_projects_with_skills():
@@ -2099,14 +2133,15 @@ def _resolve_local_dir(context, text):
     return os.path.abspath(path)
 
 
-def _dir_screen(context):
+def _dir_screen(context, subs=None):
     """(text, keyboard) for the catalog picker at user_data['dir_base'].
 
     Navigation state lives in user_data and buttons carry indexes into
     dir_subs: a path in callback_data would hit Telegram's 64-byte limit on
     any deep tree. Depth is unlimited (the old picker stopped at 2 levels)."""
     base = context.user_data.get("dir_base") or PROJECTS_ROOT
-    subs = _list_subdirs(base)
+    if subs is None:
+        subs = _list_subdirs(base)
     context.user_data["dir_base"] = base
     context.user_data["dir_subs"] = subs
 
@@ -2121,12 +2156,7 @@ def _dir_screen(context):
         buttons.append([InlineKeyboardButton("✅ Выбрать эту папку", callback_data="dir_here")])
     row = []
     for i in range(start, min(start + _DIRS_PER_PAGE, len(subs))):
-        name = subs[i]
-        if _list_subdirs(os.path.join(base, name)):
-            # has children → opens; a leaf is picked with a single tap
-            row.append(InlineKeyboardButton(f"{name} 📁", callback_data=f"dirn:{i}"))
-        else:
-            row.append(InlineKeyboardButton(name, callback_data=f"dirp:{i}"))
+        row.append(InlineKeyboardButton(subs[i], callback_data=f"dirn:{i}"))
         if len(row) == 2:
             buttons.append(row)
             row = []
@@ -2155,6 +2185,12 @@ def _dir_screen(context):
     return text, InlineKeyboardMarkup(buttons)
 
 
+async def _read_dir_screen(context):
+    base = context.user_data.get("dir_base") or PROJECTS_ROOT
+    subs = await asyncio.to_thread(_list_subdirs, base)
+    return _dir_screen(context, subs)
+
+
 async def _ask_dir(query, context):
     # Directory pre-filled (e.g. from project skills picker) — skip dir step
     if "new_dir" in context.user_data:
@@ -2163,10 +2199,11 @@ async def _ask_dir(query, context):
         await query.edit_message_text(f"Директория: `{_esc_code(label)}`", parse_mode="MarkdownV2")
         return await _after_dir_from_query(query, context)
 
-    if _list_projects():
+    projects = await asyncio.to_thread(_list_projects)
+    if projects:
         context.user_data["dir_base"] = PROJECTS_ROOT
         context.user_data["dir_page"] = 0
-        text, kb = _dir_screen(context)
+        text, kb = _dir_screen(context, projects)
         await query.edit_message_text(text, reply_markup=kb)
         return ASK_DIR
 
@@ -2175,7 +2212,7 @@ async def _ask_dir(query, context):
     # an absolute path on a phone keyboard.
     machine = context.user_data.get("new_machine")
     try:
-        hist = db.recent_working_dirs(limit=8, machine=machine)
+        hist = await asyncio.to_thread(db.recent_working_dirs, limit=8, machine=machine)
     except Exception:
         hist = []
     if hist:
@@ -2209,17 +2246,21 @@ async def _pick_dir(query, context, full_path):
 async def cb_dir_nav(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Open a subdirectory (dirn:<idx> into dir_subs)."""
     query = update.callback_query
-    await query.answer()
+    await _ack_wizard_callback(query)
     subs = context.user_data.get("dir_subs") or []
     idx = int(query.data.split(":")[1])
     if idx >= len(subs):
-        text, kb = _dir_screen(context)  # stale buttons — re-render
+        text, kb = await _read_dir_screen(context)  # stale buttons — re-render
         await query.edit_message_text(text, reply_markup=kb)
         return ASK_DIR
     base = context.user_data.get("dir_base") or PROJECTS_ROOT
-    context.user_data["dir_base"] = os.path.join(base, subs[idx])
+    selected = os.path.join(base, subs[idx])
+    children = await asyncio.to_thread(_list_subdirs, selected)
+    if not children:
+        return await _pick_dir(query, context, selected)
+    context.user_data["dir_base"] = selected
     context.user_data["dir_page"] = 0
-    text, kb = _dir_screen(context)
+    text, kb = _dir_screen(context, children)
     await query.edit_message_text(text, reply_markup=kb)
     return ASK_DIR
 
@@ -2232,35 +2273,35 @@ async def cb_dir_pick_idx(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if idx >= len(subs):
         await query.answer("Список устарел — выберите заново.", show_alert=True)
         return ASK_DIR
-    await query.answer()
+    await _ack_wizard_callback(query)
     base = context.user_data.get("dir_base") or PROJECTS_ROOT
     return await _pick_dir(query, context, os.path.join(base, subs[idx]))
 
 
 async def cb_dir_here(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await _ack_wizard_callback(query)
     base = context.user_data.get("dir_base") or PROJECTS_ROOT
     return await _pick_dir(query, context, base)
 
 
 async def cb_dir_up(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await _ack_wizard_callback(query)
     base = context.user_data.get("dir_base") or PROJECTS_ROOT
     if os.path.abspath(base) != os.path.abspath(PROJECTS_ROOT):
         context.user_data["dir_base"] = os.path.dirname(base)
         context.user_data["dir_page"] = 0
-    text, kb = _dir_screen(context)
+    text, kb = await _read_dir_screen(context)
     await query.edit_message_text(text, reply_markup=kb)
     return ASK_DIR
 
 
 async def cb_dir_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await _ack_wizard_callback(query)
     context.user_data["dir_page"] = int(query.data.split(":")[1])
-    text, kb = _dir_screen(context)
+    text, kb = await _read_dir_screen(context)
     await query.edit_message_text(text, reply_markup=kb)
     return ASK_DIR
 
@@ -2273,14 +2314,14 @@ async def cb_dir_hist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if idx >= len(hist):
         await query.answer("Список устарел — выберите заново.", show_alert=True)
         return ASK_DIR
-    await query.answer()
+    await _ack_wizard_callback(query)
     return await _pick_dir(query, context, hist[idx])
 
 
 async def add_task_got_dir_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """__skip__ / __manual__ (and legacy dir:<name> buttons in old messages)."""
     query = update.callback_query
-    await query.answer()
+    await _ack_wizard_callback(query)
     value = query.data.split(":", 1)[1]
 
     if value == "__skip__":
@@ -2333,7 +2374,7 @@ async def cb_dir_create_start(update: Update, context: ContextTypes.DEFAULT_TYPE
     if context.user_data.get("new_machine"):
         await query.answer("Создание папки доступно для локальной машины.", show_alert=True)
         return None
-    await query.answer()
+    await _ack_wizard_callback(query)
     base = context.user_data.get("dir_base") or PROJECTS_ROOT or os.path.expanduser("~")
     context.user_data["dir_create_base"] = base
     context.user_data.pop("dir_create_path", None)
@@ -2385,11 +2426,11 @@ async def cb_dir_create_confirm(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def cb_dir_create_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await _ack_wizard_callback(query)
     for key in ("dir_create_base", "dir_create_path", "dir_create_token"):
         context.user_data.pop(key, None)
     if context.user_data.get("dir_base"):
-        text, kb = _dir_screen(context)
+        text, kb = await _read_dir_screen(context)
         await query.edit_message_text(text, reply_markup=kb)
         return ASK_DIR
     return await _ask_dir(query, context)
@@ -2436,9 +2477,7 @@ def _wizard_summary(context) -> str:
         prompt = prompt[:200] + "…"
     provider = ud.get("new_provider")
     prov = _provider_label(provider) if provider else f"{DEFAULT_CLI} (по умолчанию)"
-    model = f" · {ud['new_model']}" if ud.get("new_model") else ""
-    if ud.get("new_effort"):
-        model += f" · эффорт {ud['new_effort']}"
+    cfg = load_providers().get(provider or DEFAULT_CLI, {})
     lines = [
         "Проверьте задачу:",
         "",
@@ -2449,12 +2488,16 @@ def _wizard_summary(context) -> str:
         lines.append(_attachments_summary_line(attachments))
     lines += [
         "",
-        f"🔌 {prov}{model} · 💻 {ud.get('new_machine') or 'локально'}",
+        f"🔌 {prov} · 💻 {ud.get('new_machine') or 'локально'}",
     ]
+    if _wizard_model_editable(ud, cfg):
+        lines.append(f"Модель · {ud.get('new_model') or 'по умолчанию'}")
+    if not ud.get("new_herdr_target") and cfg.get("supports_effort"):
+        lines.append(f"Усилие рассуждений · {_effort_label(ud.get('new_effort'))}")
     if ud.get("new_herdr_target"):
         lines.append(f"🖥 Сессия: {ud['new_herdr_target']}")
     else:
-        if load_providers().get(provider or DEFAULT_CLI, {}).get("executor") == "herdr":
+        if cfg.get("executor") == "herdr":
             lines.append("🖥 Новое окно Herdr")
         lines.append(f"📂 {ud.get('new_dir') or 'директория не указана'}")
     sched = ud.get("new_schedule")
@@ -2506,7 +2549,7 @@ async def _show_confirm(send, context):
 @require_auth
 async def cb_wiz_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await _ack_wizard_callback(query)
     if context.user_data.get("new_attachments") and context.user_data.get("new_machine"):
         # Файлы скачаны на этот хост — удалённый агент их не увидит; запускать
         # молча значило бы потерять вложения.
@@ -2599,22 +2642,34 @@ _EXTRAS_TEXT = (
 )
 
 
-def _provider_supports_effort(name: str) -> bool:
-    return bool(load_providers().get(name, {}).get("supports_effort"))
+def _wizard_model_editable(ud, cfg) -> bool:
+    return not ud.get("new_herdr_target") and bool(
+        ud.get("new_model") or cfg.get("models") or cfg.get("supports_skills") or provider_is_codex(cfg))
 
 
-def _effort_keyboard(provider: str) -> InlineKeyboardMarkup:
-    """Уровни эффорта; «по умолчанию» подписан уровнем провайдера, если он есть."""
+def _wizard_effort_levels(context):
+    ud = context.user_data
+    provider = load_providers().get(ud.get("new_provider") or DEFAULT_CLI, {})
+    return provider_effort_levels(provider, ud.get("new_model"), local=not ud.get("new_machine"))
+
+
+def _effort_label(level):
+    return {"xhigh": "Extra High (xhigh)", "max": "Max", "ultra": "Ultra"}.get(level, level or "по умолчанию")
+
+
+def _effort_keyboard(provider: str, levels) -> InlineKeyboardMarkup:
     inherited = load_providers().get(provider, {}).get("effort")
-    default_label = f"По умолчанию ({inherited})" if inherited else "По умолчанию"
-    rows = [[InlineKeyboardButton(l, callback_data=f"eff:{l}")] for l in EFFORT_LEVELS]
+    default_label = f"По умолчанию ({_effort_label(inherited)})" if inherited else "По умолчанию"
+    rows = [[InlineKeyboardButton(_effort_label(level), callback_data=f"eff:{level}")] for level in levels]
     rows.append([InlineKeyboardButton(default_label, callback_data="eff:")])
+    rows.append([InlineKeyboardButton(BACK_LABEL, callback_data="eff_back")])
     return InlineKeyboardMarkup(rows)
 
 
 def _extras_keyboard(context) -> InlineKeyboardMarkup:
     ud = context.user_data
     provider = ud.get("new_provider") or DEFAULT_CLI
+    cfg = load_providers().get(provider, {})
     rows = [
         [InlineKeyboardButton(f"Приоритет: {ud.get('new_priority', 5)}", callback_data="ex_pri")],
         [InlineKeyboardButton(
@@ -2622,10 +2677,12 @@ def _extras_keyboard(context) -> InlineKeyboardMarkup:
             callback_data="ex_perms")],
         [InlineKeyboardButton(f"Повтор: {ud.get('new_recurrence') or 'нет'}", callback_data="ex_rec")],
     ]
-    # Показываем настройку только там, где PromptPilot умеет передать её CLI.
-    if _provider_supports_effort(provider):
+    if _wizard_model_editable(ud, cfg):
         rows.append([InlineKeyboardButton(
-            f"Эффорт: {ud.get('new_effort') or 'по умолчанию'}", callback_data="ex_eff")])
+            f"Модель · {ud.get('new_model') or 'по умолчанию'}", callback_data="ex_model")])
+    if not ud.get("new_herdr_target") and cfg.get("supports_effort"):
+        rows.append([InlineKeyboardButton(
+            f"Усилие рассуждений · {_effort_label(ud.get('new_effort'))}", callback_data="ex_eff")])
     rows += [
         [InlineKeyboardButton(
             "Запуск: фоновый (не ждать)" if ud.get("new_detached") else "Запуск: ждать результата",
@@ -2636,7 +2693,7 @@ def _extras_keyboard(context) -> InlineKeyboardMarkup:
             "🌿 Worktree: да" if ud.get("new_worktree") else "🌿 Worktree: нет",
             callback_data="ex_wt")])
     if not ud.get("new_herdr_target") and \
-            load_providers().get(provider, {}).get("executor") == "herdr":
+            cfg.get("executor") == "herdr":
         rows.append([InlineKeyboardButton(
             "Панель: оставить открытой" if ud.get("new_keep_pane", True) else "Панель: закрыть после",
             callback_data="ex_keep")])
@@ -2651,7 +2708,7 @@ async def _show_extras(send, context):
 
 async def cb_extras_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await _ack_wizard_callback(query)
     return await _show_extras(query.edit_message_text, context)
 
 
@@ -2681,26 +2738,56 @@ async def cb_extras_recurrence(update: Update, context: ContextTypes.DEFAULT_TYP
     return ASK_RECURRENCE
 
 
+async def cb_extras_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await _ack_wizard_callback(query)
+    ud = context.user_data
+    provider = ud.get("new_provider") or DEFAULT_CLI
+    if not _wizard_model_editable(ud, load_providers().get(provider, {})):
+        return await _show_extras(query.edit_message_text, context)
+    models = await _wizard_models(context)
+    await query.edit_message_text("Выберите модель:", reply_markup=_model_keyboard(models, back=True))
+    ud["model_list"] = models
+    ud["edit_model_from_extras"] = True
+    return ASK_MODEL
+
+
+async def cb_extras_model_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await _ack_wizard_callback(query)
+    if not context.user_data.pop("edit_model_from_extras", False):
+        return ASK_MODEL
+    return await _show_extras(query.edit_message_text, context)
+
+
 async def cb_extras_effort(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await _ack_wizard_callback(query)
     provider = context.user_data.get("new_provider") or DEFAULT_CLI
+    levels = await asyncio.to_thread(_wizard_effort_levels, context)
     await query.edit_message_text(
-        "Усилие рассуждений. Дороже — дольше и качественнее:",
-        reply_markup=_effort_keyboard(provider))
+        "Выберите усилие рассуждений:", reply_markup=_effort_keyboard(provider, levels))
     return ASK_EFFORT
 
 
 async def cb_effort_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
-    context.user_data["new_effort"] = query.data.split(":", 1)[1] or None
+    await _ack_wizard_callback(query)
+    level = query.data.split(":", 1)[1] or None
+    if level:
+        levels = await asyncio.to_thread(_wizard_effort_levels, context)
+        if level not in levels:
+            provider = context.user_data.get("new_provider") or DEFAULT_CLI
+            await query.edit_message_text("Выберите доступное усилие рассуждений:",
+                                          reply_markup=_effort_keyboard(provider, levels))
+            return ASK_EFFORT
+    context.user_data["new_effort"] = level
     return await _show_extras(query.edit_message_text, context)
 
 
 async def cb_extras_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await _ack_wizard_callback(query)
     return await _show_confirm(query.edit_message_text, context)
 
 
@@ -4422,13 +4509,12 @@ async def _notify_loop(bot):
     undeliverable messages (user blocked the bot, chat gone) are marked done so
     they don't retry every 10s forever.
     """
-    import asyncio
     from telegram.error import BadRequest, Forbidden
     while True:
         await asyncio.sleep(10)
         # Free-form queued notifications (e.g. herdr agent blocked mid-task)
         try:
-            notes = db.get_unsent_notifications()
+            notes = await asyncio.to_thread(db.get_unsent_notifications)
         except Exception as e:
             logger.warning("notify: чтение очереди уведомлений упало: %s", e)
             continue
@@ -4444,15 +4530,15 @@ async def _notify_loop(bot):
                         logger.warning("task %s result file rejected: %s", note['task_id'], exc)
                         await bot.send_message(chat_id=note["tg_chat_id"],
                                                text="⚠️ Файл результата не приложен. Попросите агента подготовить его для отправки повторно.")
-                    db.mark_notification_sent(note["id"])
+                    await asyncio.to_thread(db.mark_notification_sent, note["id"])
                     continue
                 kb = None
                 note_text = note["message"]
                 if note.get("kind") == "codex.question":
-                    record = db.get_setting(codex_telegram.QUESTION_PREFIX + note_text)
+                    record = await asyncio.to_thread(db.get_setting, codex_telegram.QUESTION_PREFIX + note_text)
                     record = json.loads(record) if record else None
                     if not record or record.get("used") or record["expires_at"] < time.time():
-                        db.mark_notification_sent(note["id"])
+                        await asyncio.to_thread(db.mark_notification_sent, note["id"])
                         continue
                     note_text, kb = codex_telegram.question_message(record, note["message"])
                 elif note.get("kind") == "codex.done":
@@ -4479,17 +4565,17 @@ async def _notify_loop(bot):
                                 InlineKeyboardButton("❓ Открыть вопрос", callback_data=f"hd_question:{ref}")]])
                 await bot.send_message(chat_id=note["tg_chat_id"], text=_clip(note_text),
                                        reply_markup=kb)
-                db.mark_notification_sent(note["id"])
+                await asyncio.to_thread(db.mark_notification_sent, note["id"])
             except (Forbidden, BadRequest) as e:
                 logger.warning("notify %s: постоянная ошибка (%s) — помечаю отправленным", note["id"], e)
                 try:
-                    db.mark_notification_sent(note["id"])
+                    await asyncio.to_thread(db.mark_notification_sent, note["id"])
                 except Exception:
                     pass
             except Exception as e:
                 logger.warning("Failed to send notification %s: %s", note["id"], e)
         try:
-            pending = db.get_pending_notifications()
+            pending = await asyncio.to_thread(db.get_pending_notifications)
         except Exception as e:
             logger.warning("notify: чтение задач для уведомления упало: %s", e)
             continue
@@ -4500,7 +4586,7 @@ async def _notify_loop(bot):
                 # Telegram success ping is suppressed. Invalid/generic stale
                 # text is normalized to НЕ СМОГ before it reaches this point.
                 if _silent_completion(task):
-                    db.mark_notified(task.id)
+                    await asyncio.to_thread(db.mark_notified, task.id)
                     continue
                 if task.status.value == "completed":
                     icon, status_word = "✅", "выполнена"
@@ -4545,9 +4631,9 @@ async def _notify_loop(bot):
                                            reply_markup=note_kb)
                 file_notes = _result_file_notifications(task) if task.status.value == "completed" else []
                 if file_notes:
-                    db.mark_notified_with_files(task, file_notes)
+                    await asyncio.to_thread(db.mark_notified_with_files, task, file_notes)
                 else:
-                    db.mark_notified(task.id)
+                    await asyncio.to_thread(db.mark_notified, task.id)
                 if task.status.value == "completed":
                     # 1С-доработка: у задач из /epf собираем и присылаем .epf.
                     # Для обычных задач get_epf_job_by_task пуст — это no-op.
@@ -4558,7 +4644,7 @@ async def _notify_loop(bot):
             except (Forbidden, BadRequest) as e:
                 logger.warning("notify task %s: постоянная ошибка (%s) — помечаю уведомлённым", task.id, e)
                 try:
-                    db.mark_notified(task.id)
+                    await asyncio.to_thread(db.mark_notified, task.id)
                 except Exception:
                     pass
             except Exception as e:
@@ -5027,6 +5113,8 @@ def run_bot():
             ],
             ASK_PROVIDER: [
                 CallbackQueryHandler(add_task_got_provider, pattern=r"^pickprov:"),
+                # A restart can restore the provider step while the model card is visible.
+                CallbackQueryHandler(cb_last_edit, pattern=r"^model(?:_i:|_pg:|_manual$|:)"),
                 att_midway,
             ],
             ASK_MACHINE: [
@@ -5049,6 +5137,7 @@ def run_bot():
                 CallbackQueryHandler(add_task_got_model_idx, pattern=r"^model_i:\d+$"),
                 CallbackQueryHandler(cb_model_page, pattern=r"^model_pg:\d+$"),
                 CallbackQueryHandler(cb_model_manual, pattern=r"^model_manual$"),
+                CallbackQueryHandler(cb_extras_model_back, pattern=r"^model_back$"),
                 CallbackQueryHandler(add_task_got_model, pattern=r"^model:"),
                 CommandHandler("skip", add_task_skip_model),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, add_task_got_model_text),
@@ -5093,11 +5182,13 @@ def run_bot():
                 CallbackQueryHandler(cb_extras_toggle, pattern=r"^ex_(perms|wt|det|keep)$"),
                 CallbackQueryHandler(cb_extras_recurrence, pattern=r"^ex_rec$"),
                 CallbackQueryHandler(cb_extras_effort, pattern=r"^ex_eff$"),
+                CallbackQueryHandler(cb_extras_model, pattern=r"^ex_model$"),
                 CallbackQueryHandler(cb_extras_done, pattern=r"^ex_done$"),
                 att_midway,
             ],
             ASK_EFFORT: [
                 CallbackQueryHandler(cb_effort_pick, pattern=r"^eff:"),
+                CallbackQueryHandler(cb_extras_open, pattern=r"^eff_back$"),
                 att_midway,
             ],
             ASK_PRIORITY: [

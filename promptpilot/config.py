@@ -468,7 +468,7 @@ def _provider_entry(name: str, custom: dict, cmd: str = None, description: str =
         entry["args"] = args
     # Эффорт хранится полем, а не флагом в cmd/args: так его видно в форме и в
     # списке провайдеров, и он одинаково работает для обоих типов провайдеров.
-    if (effort or "").strip().lower() in EFFORT_LEVELS:
+    if resolve_effort({"kind": kind, "cmd": cmd}, effort):
         entry["effort"] = effort.strip().lower()
     if executor:
         entry["executor"] = executor
@@ -707,6 +707,7 @@ def remove_provider(name: str) -> bool:
 # Уровни усилия рассуждений Claude Code (--effort), от дешёвого к дорогому —
 # в этом же порядке они стоят в селектах UI и в клавиатуре бота.
 EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+CODEX_EFFORT_LEVELS = (*EFFORT_LEVELS, "ultra")
 
 
 def provider_is_claude(cfg: dict) -> bool:
@@ -738,6 +739,50 @@ def provider_is_codex(cfg: dict) -> bool:
     return cmd_runs_codex(cfg.get("cmd") or "")
 
 
+def codex_home(provider_cfg: dict) -> Path:
+    configured = (provider_cfg.get("env") or {}).get("CODEX_HOME") or os.environ.get("CODEX_HOME")
+    return Path(configured).expanduser() if configured else Path.home() / ".codex"
+
+
+def codex_user_settings(home: Path) -> dict:
+    try:
+        with (home / "config.toml").open("rb") as settings:
+            import tomllib
+            return tomllib.load(settings)
+    except FileNotFoundError:
+        return {}
+
+
+def _codex_catalog(home: Path) -> list[dict]:
+    try:
+        catalog = json.loads((home / "models_cache.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    models = catalog.get("models") if isinstance(catalog, dict) else None
+    if not isinstance(models, list):
+        return []
+    return [item for item in models if isinstance(item, dict)]
+
+
+def provider_effort_levels(provider_cfg: dict, model: str = None, *, local: bool = True) -> tuple:
+    """Use the local Codex catalog when it identifies the selected model."""
+    if not local or not provider_is_codex(provider_cfg):
+        return EFFORT_LEVELS
+    home = codex_home(provider_cfg)
+    if not model:
+        try:
+            model = codex_user_settings(home).get("model")
+        except (ImportError, OSError, ValueError):
+            return EFFORT_LEVELS
+    for item in _codex_catalog(home):
+        levels = item.get("supported_reasoning_levels")
+        if item.get("slug") != model or not isinstance(levels, list):
+            continue
+        supported = [level.get("effort") for level in levels if isinstance(level, dict)]
+        return tuple(level for level in CODEX_EFFORT_LEVELS if level in supported) or EFFORT_LEVELS
+    return EFFORT_LEVELS
+
+
 def resolve_effort(provider_cfg: dict, task_effort: str = None) -> str:
     """Эффорт запуска: задача → провайдер → дефолт CLI (пустая строка).
 
@@ -748,7 +793,8 @@ def resolve_effort(provider_cfg: dict, task_effort: str = None) -> str:
     хуже, чем отработать на дефолте.
     """
     value = (task_effort or provider_cfg.get("effort") or "").strip().lower()
-    return value if value in EFFORT_LEVELS else ""
+    levels = CODEX_EFFORT_LEVELS if provider_is_codex(provider_cfg) else EFFORT_LEVELS
+    return value if value in levels else ""
 
 
 RIGHTS_LEVELS = ("none", "read", "write", "full")
@@ -1088,17 +1134,24 @@ def fetch_available_models(base_url: str = None, token: str = None):
     return data
 
 
-def get_provider_models(provider: str) -> list:
+def get_provider_models(provider: str, *, local: bool = True) -> list:
     """Models to offer for a provider in the UI/bot pickers.
 
     An explicit `models` list on the provider wins. Otherwise, for a Claude-type
     provider (supports_skills), try dynamic discovery against THAT provider's
-    endpoint, falling back to the sonnet/opus/haiku tiers. Non-Claude providers
-    without an explicit list get nothing (no model picker).
+    endpoint, falling back to the sonnet/opus/haiku tiers. Local Codex
+    providers can also read the catalog that the CLI has cached for its account.
     """
     info = load_providers().get(provider, {})
     if "models" in info:
         return list(info["models"])
+    if local and provider_is_codex(info):
+        models = _codex_catalog(codex_home(info))
+        return list(dict.fromkeys(
+            model["slug"] for model in models
+            if isinstance(model.get("slug"), str) and model["slug"]
+            and model.get("visibility", "list") == "list"
+        ))
     if info.get("supports_skills", False):
         penv = info.get("env") or {}
         base = penv.get("ANTHROPIC_BASE_URL") or os.environ.get("ANTHROPIC_BASE_URL", "")
