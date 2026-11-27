@@ -100,7 +100,8 @@ def test_codex_commentary_and_transient_done_do_not_complete_task(monkeypatch, t
         if args[:2] == ["tab", "create"]:
             return 0, {"result": {"root_pane": {"pane_id": "w1:p1"}, "tab": {"tab_id": "w1:t1"}}}, ""
         if args[:2] == ["agent", "start"]:
-            return 0, {}, ""
+            return 0, {"result": {"agent": {"agent_status": "idle", "pane_id": "w1:p1",
+                                            "terminal_id": "terminal", "state_change_seq": 1}}}, ""
         if args[:2] == ["agent", "get"]:
             if submitted:
                 current[:] = next(phases)

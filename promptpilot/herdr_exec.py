@@ -33,12 +33,16 @@ Semantics notes:
 
 import json
 import os
+from pathlib import Path
+import platform
 import re
+import shutil
 import subprocess
+import threading
 import time
 import uuid
 
-from . import worktree
+from . import codex_rollout, worktree
 from .config import (HERDR_BIN, HERDR_KEEP_PANE, HERDR_READ_LINES, HERDR_START_TIMEOUT_MS,
                      HERDR_WORKTREE_TIMEOUT_SECONDS, guard_enabled,
                      guard_settings_file, resolve_effort, rights_args)
@@ -663,7 +667,7 @@ def _wait_settled(name, until_args, deadline, cancel_check, host=None):
 
 
 def _wait_codex_reply(name, prompt, marker, deadline, cancel_check,
-                      on_blocked=None, host=None, observer=None):
+                      on_blocked=None, host=None, observer=None, rollout=None):
     """A terminal state is only a hint; require this request's final marker.
 
     Codex can look idle between commentary and tool calls. It can also finish
@@ -677,6 +681,13 @@ def _wait_codex_reply(name, prompt, marker, deadline, cancel_check,
         now = time.monotonic()
         if deadline and blocked_since is None and now > deadline:
             return "__timeout__", ""
+        if rollout is not None:
+            answer = rollout.poll()
+            if answer is not None:
+                from .codex_bridge import VerifiedReply
+                if answer:
+                    return "done", VerifiedReply(answer)
+                return "__error__", "Codex completed this task without a final answer"
         turn = None
         if observer:
             from . import codex_app_server, codex_bridge
@@ -719,24 +730,124 @@ def _wait_codex_reply(name, prompt, marker, deadline, cancel_check,
             idle_since = None
             time.sleep(2)
             continue
-        rc, _, raw = _read_turn_screen(name, prompt, host)
+        if rollout is not None and state in {"working", "blocked"}:
+            idle_since = None
+            time.sleep(2)
+            continue
+        if rollout is not None:
+            rc, _, raw = _run(["agent", "read", name, "--source", "visible", "--format", "text"], host=host)
+        else:
+            rc, _, raw = _read_turn_screen(name, prompt, host)
         if rc != 0:
             return "__error__", raw
         cleaned = _trim_transcript(raw, prompt)
         if state in {"idle", "done"}:
             # Provider errors cannot emit our marker, but still have to reach
             # the caller's existing quota/environment failure handling.
-            if (_retry_reason(cleaned) or _looks_env_failure(cleaned)
-                    or (cleaned and cleaned.splitlines()[-1].strip() == marker)):
+            if rollout is None and (_retry_reason(cleaned) or _looks_env_failure(cleaned)
+                                    or (cleaned and cleaned.splitlines()[-1].strip() == marker)):
                 return state, raw
+            startup = any(line.lstrip().startswith("Waiting for startup") for line in raw.splitlines())
+            idle_grace = 120 if startup else WORKFLOW_IDLE_GRACE_SECONDS
             if idle_since is None:
                 idle_since = now
-            elif now - idle_since >= WORKFLOW_IDLE_GRACE_SECONDS:
-                return "__error__", ("Codex completion is unconfirmed: no final reply marker "
+            elif now - idle_since >= idle_grace:
+                proof = "native completion record" if rollout else "final reply marker"
+                return "__error__", (f"Codex completion is unconfirmed: no {proof} "
                                      "after a stable idle state. The pane may still be working.")
         else:
             idle_since = None
         time.sleep(2)
+
+
+_PROJECT_WORKSPACE_LOCK = threading.Lock()
+
+
+def _windows_codex_pane_path(path: str) -> str:
+    """Expose the native executable to Herdr when npm only exposes its shim."""
+    executable = shutil.which("codex.exe", path=path)
+    if not executable:
+        shim = shutil.which("codex.cmd", path=path)
+        arch = {"amd64": "x64", "x86_64": "x64", "arm64": "arm64", "aarch64": "arm64"}.get(
+            platform.machine().lower())
+        if not shim or not arch:
+            return ""
+        npm_modules = Path(shim).parent / "node_modules" / "@openai"
+        package = f"codex-win32-{arch}"
+        for root in (npm_modules / "codex" / "node_modules" / "@openai", npm_modules):
+            executable = next((p for p in (root / package / "vendor").glob("*/bin/codex.exe")
+                               if p.is_file()), None)
+            if executable:
+                break
+    if not executable:
+        return ""
+    native_dir = str(Path(executable).parent)
+    if codex_rollout.windows_path(path.split(os.pathsep, 1)[0]) == codex_rollout.windows_path(native_dir):
+        return path
+    return os.pathsep.join((native_dir, path))
+
+
+def _create_task_tab(cwd, name, env_args, host, *, project_workspace=False):
+    cmd = ["tab", "create", "--label", name, "--no-focus", *env_args]
+    if cwd:
+        cmd += ["--cwd", cwd]
+    if not project_workspace or host or not cwd or not os.path.isabs(cwd):
+        return _run(cmd, host=host)
+
+    normalize = codex_rollout.windows_path if os.name == "nt" else os.path.normpath
+    path = normalize(cwd)
+    label = os.path.basename(os.path.normpath(cwd)) or cwd
+    with _PROJECT_WORKSPACE_LOCK:
+        rc, data, raw = _run(["workspace", "list"])
+        if rc:
+            return rc, data, raw
+        workspaces = _dig(data, "result", "workspaces", default=[])
+        for workspace in workspaces:
+            checkout = (workspace.get("worktree") or {}).get("checkout_path")
+            if checkout and normalize(checkout) == path:
+                return _run([*cmd, "--workspace", workspace["workspace_id"]])
+        for workspace in workspaces:
+            if str(workspace.get("label", "")).casefold() != label.casefold() or workspace.get("worktree"):
+                continue
+            rc, data, _ = _run(["pane", "list", "--workspace", workspace["workspace_id"]])
+            if rc == 0 and any(pane.get("cwd") and normalize(pane["cwd"]) == path
+                               for pane in _dig(data, "result", "panes", default=[])):
+                return _run([*cmd, "--workspace", workspace["workspace_id"]])
+        rc, data, raw = _run(["workspace", "create", "--cwd", cwd, "--label", label,
+                              "--no-focus", *env_args])
+        if rc == 0 and (root_tab := _dig(data, "result", "workspace", "active_tab_id")):
+            _run(["tab", "rename", root_tab, name])
+        return rc, data, raw
+
+
+def _submit_owned_windows_codex(name, pane_id, prompt, started, cancel_check):
+    """Submit at most once and recover a swallowed Enter in the same idle pane."""
+    terminal = started.get("terminal_id")
+    sequence = started.get("state_change_seq")
+    status = started.get("agent_status")
+    if (not terminal or type(sequence) is not int or started.get("pane_id") != pane_id
+            or status not in {"idle", "done"}):
+        return "__error__", "Codex startup did not identify an idle owned pane"
+    if cancel_check and cancel_check():
+        return "__cancel__", ""
+    rc, data, raw = _run(["agent", "prompt", name, prompt, "--wait", "--until", "working",
+                          "--timeout", "7000"])
+    if rc == 0 or _error_code(data) == "timeout":
+        return _agent_status(data) or "working", raw
+    if _error_code(data) != "agent_prompt_stalled":
+        return "__error__", raw
+
+    rc, data, raw = _run(["agent", "get", name])
+    current = _dig(data, "result", "agent", default={})
+    if rc or current.get("pane_id") != pane_id or current.get("terminal_id") != terminal:
+        return "__error__", "Codex pane changed before submission could be confirmed"
+    if current.get("state_change_seq") != sequence or current.get("agent_status") != status:
+        return current.get("agent_status") or "working", raw
+    if cancel_check and cancel_check():
+        return "__cancel__", ""
+    # Right flushes Codex's paste burst before Enter (herdrdev/herdr#3961).
+    rc, _, raw = _run(["agent", "send-keys", name, "right", "enter"])
+    return ("__error__", raw) if rc else ("working", "")
 
 
 def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
@@ -878,6 +989,13 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
             # Scheduler identity is reserved per claimed attempt. A stale
             # provider-level setting must never retag this owned session.
             apply_task_markers(tab_env, task)
+            if os.name == "nt" and not host and provider_cfg.get("kind") == "codex":
+                path_key = next((key for key in tab_env if key.upper() == "PATH"), "PATH")
+                native_path = _windows_codex_pane_path(tab_env.get(path_key, os.environ.get("PATH", "")))
+                if native_path:
+                    tab_env[path_key] = native_path
+                if os.environ.get("CODEX_HOME"):
+                    tab_env.setdefault("CODEX_HOME", os.environ["CODEX_HOME"])
             env_args = [part for key, value in tab_env.items()
                         for part in ("--env", f"{key}={value}")]
 
@@ -891,6 +1009,7 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
                 workspace_id, repo_root, wt_copied = wt["workspace_id"], wt["root"], wt["copied"]
                 if on_worktree:
                     on_worktree(wt["path"], wt["branch"])
+                cwd = wt["path"]
                 if env_args:
                     # `worktree create` takes no --env, so the agent gets its
                     # own tab inside that workspace to receive the provider's.
@@ -900,13 +1019,13 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
                 else:
                     rc, data, raw = 0, wt["data"], ""
             else:
-                tab_cmd = ["tab", "create", "--label", name, "--no-focus", *env_args]
-                if cwd:
-                    tab_cmd += ["--cwd", cwd]
-                rc, data, raw = _run(tab_cmd, host=host)
+                rc, data, raw = _create_task_tab(
+                    cwd, name, env_args, host,
+                    project_workspace=bool(getattr(task, "tg_chat_id", None)))
 
             pane_id = _dig(data, "result", "root_pane", "pane_id")
-            tab_id = _dig(data, "result", "tab", "tab_id")
+            tab_id = (_dig(data, "result", "tab", "tab_id")
+                      or _dig(data, "result", "workspace", "active_tab_id"))
             if rc != 0 or not pane_id or not tab_id:
                 outcome["error"] = f"herdr tab create failed: {raw}"
                 return outcome
@@ -973,7 +1092,14 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
         # Start the agent, forwarding per-task flags to its CLI.
         # (target mode: the agent is already running — nothing to start)
         kind = target_kind or provider_cfg.get("kind", "claude")
-        if not task.detached:
+        agent_args = list(provider_cfg.get("args") or [])
+        rollout = None
+        journal = None
+        local_windows_codex = os.name == "nt" and kind == "codex" and not host and not target
+        if (local_windows_codex and getattr(task, "tg_chat_id", None)
+                and not task.detached and not requires_verdict and not task.session_id):
+            journal, prompt = codex_rollout.prepare_prompt(task, provider_cfg, prompt, agent_args)
+        if journal is None and not task.detached:
             if kind == "codex" and not requires_verdict:
                 completion_marker = "PP-REPLY-END:" + uuid.uuid4().hex
                 prompt += ("\n\n<promptpilot-completion>\n"
@@ -982,8 +1108,6 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
                            "Do not emit it in progress updates or tool output:\n"
                            + completion_marker + "\n</promptpilot-completion>")
             prompt = _with_turn_marker(prompt)
-        # provider-level extra CLI args (e.g. ["--effort", "max"] for claude)
-        agent_args = list(provider_cfg.get("args") or [])
         if task.model:
             agent_args += ["--model", task.model]
         # Эффорт полем провайдера/задачи — но если он уже вписан в «доп.
@@ -991,6 +1115,8 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
         eff = resolve_effort(provider_cfg, task.effort)
         if eff and kind == "claude" and "--effort" not in agent_args:
             agent_args += ["--effort", eff]
+        if eff and kind == "codex" and not any("model_reasoning_effort" in arg for arg in agent_args):
+            agent_args += ["-c", f'model_reasoning_effort="{eff}"']
         if task.session_id:
             agent_args += ["--resume", task.session_id]
         rights = getattr(task, "rights", None)
@@ -1011,6 +1137,7 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
             settings = guard_settings_file()
             if settings:
                 agent_args += ["--settings", settings]
+        launched_at = time.time()
         if not target:
             cmd = ["agent", "start", name, "--kind", kind, "--pane", pane_id,
                    "--timeout", str(HERDR_START_TIMEOUT_MS)]
@@ -1029,6 +1156,16 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
                 outcome["error"] = f"{message}\n{close_error}" if close_error else message
                 return outcome
 
+        started_agent = _dig(data, "result", "agent", default={}) if local_windows_codex else {}
+
+        if journal is not None:
+            rc, data, raw = _run(["pane", "process-info", "--pane", pane_id])
+            pid = codex_rollout.foreground_pid(_dig(data, "result", "process_info", default={}))
+            if rc or pid is None:
+                return fail("Could not identify the new Codex process before sending the task")
+            rollout_cwd = started_agent.get("cwd") or os.path.abspath(cwd)
+            rollout = codex_rollout.Rollout(journal, pid, launched_at, rollout_cwd, prompt)
+
         if on_started:
             on_started(pane_id)
 
@@ -1040,13 +1177,20 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
                     agent = _dig(agent_data, "result", "agent", default={})
                     observer = codex_bridge.observe(agent, _turn_marker(prompt), host)
 
-        # Detached: submit the prompt, confirm it landed, leave the pane open.
-        if task.detached:
-            rc, data, raw = _run(["agent", "prompt", name, prompt,
-                                  "--wait", "--until", "working", "--timeout", "15000"],
-                                 host=host)
-            if rc != 0 and _error_code(data) not in ("timeout", "agent_prompt_stalled"):
-                return fail(f"herdr agent prompt failed: {raw}")
+        deadline = time.monotonic() + timeout if timeout else None
+        if local_windows_codex:
+            state, raw = _submit_owned_windows_codex(name, pane_id, prompt, started_agent, cancel_check)
+
+        if task.detached and (not local_windows_codex or state != "__cancel__"):
+            if local_windows_codex:
+                if state == "__error__":
+                    return fail(f"herdr Codex submit failed: {raw}")
+            else:
+                rc, data, raw = _run(["agent", "prompt", name, prompt,
+                                      "--wait", "--until", "working", "--timeout", "15000"],
+                                     host=host)
+                if rc != 0 and _error_code(data) not in ("timeout", "agent_prompt_stalled"):
+                    return fail(f"herdr agent prompt failed: {raw}")
             outcome["ok"] = True
             outcome["output"] = (f"Отправлено в сессию {name} (панель {pane_id})" if target
                                  else f"Запущен в herdr (панель {pane_id}) — подключись командой: {attach}")
@@ -1055,54 +1199,54 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
                                                              outcome["worktree_branch"], wt_copied)
             return outcome
 
-        # Submit the prompt. Waits are chunked (10s) so a user cancel or the
-        # task timeout stays responsive; the herdr-side 10s "timeout" error
-        # here just means "agent still working". On agent_prompt_stalled: if
-        # the agent is already working the prompt DID land (resubmit would
-        # double it) — wait instead.
-        deadline = time.monotonic() + timeout if timeout else None
-        prompt_cmd = ["agent", "prompt", name, prompt, "--wait", "--timeout", "10000"]
-        if observer:
-            prompt_cmd += ["--until", "working"]
-        state = ""
-        for attempt in range(1, PROMPT_STALL_RETRIES + 1):
-            rc, data, raw = _run(prompt_cmd, host=host)
-            if rc == 0:
-                state = _agent_status(data)
-                break
-            code = _error_code(data)
-            if code == "timeout":
-                # prompt landed, agent is busy — fall into the chunked wait
-                if observer:
-                    state = "working"
-                else:
+        if not local_windows_codex:
+            # Submit the prompt. Waits are chunked (10s) so a user cancel or the
+            # task timeout stays responsive; the herdr-side 10s "timeout" error
+            # here just means "agent still working". On agent_prompt_stalled: if
+            # the agent is already working the prompt DID land (resubmit would
+            # double it) — wait instead.
+            prompt_cmd = ["agent", "prompt", name, prompt, "--wait", "--timeout", "10000"]
+            if observer:
+                prompt_cmd += ["--until", "working"]
+            state = ""
+            for attempt in range(1, PROMPT_STALL_RETRIES + 1):
+                rc, data, raw = _run(prompt_cmd, host=host)
+                if rc == 0:
+                    state = _agent_status(data)
+                    break
+                code = _error_code(data)
+                if code == "timeout":
+                    # prompt landed, agent is busy — fall into the chunked wait
+                    if observer:
+                        state = "working"
+                    else:
+                        state, raw = _wait_settled(name, [], deadline, cancel_check, host)
+                    break
+                if code != "agent_prompt_stalled":
+                    return fail(f"herdr agent prompt failed: {raw}")
+                rc2, data2, _ = _run(["agent", "get", name], host=host)
+                if rc2 == 0 and _agent_status(data2) == "working":
+                    if observer:
+                        state = "working"
+                    else:
+                        state, raw = _wait_settled(name, [], deadline, cancel_check, host)
+                    break
+                # The text may be sitting unsent in the input box — some agent
+                # builds swallow the submit key right after the paste. Press Enter
+                # rather than re-sending: a resend would type the prompt twice.
+                # A changed state_change_seq proves the submit landed.
+                seq_before = _dig(data2, "result", "agent", "state_change_seq", default=-1)
+                _run(["agent", "send-keys", name, "enter"], host=host)
+                time.sleep(2)
+                rc3, data3, _ = _run(["agent", "get", name], host=host)
+                if rc3 == 0 and (_agent_status(data3) != "idle"
+                                 or _dig(data3, "result", "agent", "state_change_seq",
+                                         default=-1) != seq_before):
                     state, raw = _wait_settled(name, [], deadline, cancel_check, host)
-                break
-            if code != "agent_prompt_stalled":
-                return fail(f"herdr agent prompt failed: {raw}")
-            rc2, data2, _ = _run(["agent", "get", name], host=host)
-            if rc2 == 0 and _agent_status(data2) == "working":
-                if observer:
-                    state = "working"
-                else:
-                    state, raw = _wait_settled(name, [], deadline, cancel_check, host)
-                break
-            # The text may be sitting unsent in the input box — some agent
-            # builds swallow the submit key right after the paste. Press Enter
-            # rather than re-sending: a resend would type the prompt twice.
-            # A changed state_change_seq proves the submit landed.
-            seq_before = _dig(data2, "result", "agent", "state_change_seq", default=-1)
-            _run(["agent", "send-keys", name, "enter"], host=host)
-            time.sleep(2)
-            rc3, data3, _ = _run(["agent", "get", name], host=host)
-            if rc3 == 0 and (_agent_status(data3) != "idle"
-                             or _dig(data3, "result", "agent", "state_change_seq",
-                                     default=-1) != seq_before):
-                state, raw = _wait_settled(name, [], deadline, cancel_check, host)
-                break
-            if attempt == PROMPT_STALL_RETRIES:
-                return fail(f"herdr: prompt stalled after {attempt} attempts: {raw}")
-            time.sleep(2)
+                    break
+                if attempt == PROMPT_STALL_RETRIES:
+                    return fail(f"herdr: prompt stalled after {attempt} attempts: {raw}")
+                time.sleep(2)
 
         # blocked = waiting for a human (permission dialog etc.) — no deadline.
         blocked_since = None
@@ -1116,10 +1260,10 @@ def run_in_herdr(task, provider_cfg: dict, on_blocked=None, timeout: int = None,
         if deadline and blocked_since is not None:
             deadline += max(0, time.monotonic() - blocked_since)
 
-        if completion_marker and state not in {"__cancel__", "__timeout__", "__error__"}:
+        if (completion_marker or rollout is not None) and state not in {"__cancel__", "__timeout__", "__error__"}:
             state, raw = _wait_codex_reply(
                 name, prompt, completion_marker, deadline, cancel_check,
-                on_blocked=on_blocked, host=host, observer=observer,
+                on_blocked=on_blocked, host=host, observer=observer, rollout=rollout,
             )
         if state not in {"__cancel__", "__timeout__", "__error__"}:
             state, raw = _stabilize_workflow_completion(
