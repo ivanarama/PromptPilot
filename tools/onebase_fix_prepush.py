@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from urllib.request import HTTPRedirectHandler, ProxyHandler, build_opener
 
 
 SHA = re.compile("[0-9a-f]{40}")
@@ -159,6 +160,55 @@ def source_token(source, task, started):
             and all(type(token[k]) is int and token[k] >= 0 for k in ("epoch", "revision")),
             "expected this ordinary FIX attempt's successful native Source receipt")
     return token
+
+
+class _NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, *args):
+        return None
+
+
+def read_cached_fix_queue():
+    opener = build_opener(ProxyHandler({}), _NoRedirect())
+    with opener.open("http://127.0.0.1:8420/api/pipeline-insights/onebase?refresh=false", timeout=10) as response:
+        return json.load(response)
+
+
+def passive_source_token(root, source_file, original, task, started, guard, election, pr):
+    """Confirm the task's single passive observation against its current election and the live local cache."""
+    records = root.parent / "onebase-fix-passive-observations" / f"{task}-{digest(started.encode())[:24]}"
+    source_bytes = private(root, source_file).read_bytes()
+    require(source_token(json.loads(source_bytes), task, started) == original, "original Source receipt changed")
+    binding = {"task": task, "started": started, "native": guard,
+               "source_sha256": digest(source_bytes), "original": original}
+    witness = read_json(root.parent, records / "observe.result.json")
+    require(read_json(root.parent, records / "observe.intent.json") == binding
+            and witness["binding"] == binding and witness["publication_authorized"] is False,
+            "passive Source does not belong to this FIX occurrence")
+    observed = witness["fresh_snapshot"]
+    report = read_cached_fix_queue()
+    cache = report["cache"]
+    latest = cache["token"]
+    require(report["repository"] == REPO and report["profile_id"] == "onebase"
+            and cache["source"] in ("memory", "durable") and cache["available"] is True and cache["complete"] is True
+            and cache["stale"] is False and cache["invalidated"] is False and not cache.get("refresh_blocked")
+            and cache["ttl_seconds"] == 300 and cache["generated_at"] == latest["generated_at"]
+            and 0 <= time.time() - latest["generated_at"] < 300, "current FIX cache is unavailable or stale")
+    require(isinstance(observed, dict)
+            and original["profile_hash"] == observed["profile_hash"] == latest["profile_hash"] == cache["profile_hash"]
+            and all(type(token[k]) is int for k in ("epoch", "revision") for token in (observed, latest))
+            and all(original[k] <= observed[k] <= latest[k] for k in ("epoch", "revision", "generated_at")),
+            "passive Source does not continue this occurrence's original snapshot")
+    require(election.get("task_id") == task and election.get("task_started_at") == started
+            and election.get("snapshot_token") == latest, "repeat the FIX election on the current snapshot")
+    queues = [q for q in report["queues"] if q["id"] == "fix"]
+    require(len(queues) == 1 and queues[0]["membership_complete"] is True, "incomplete FIX queue")
+    items = [i for i in queues[0]["admission_items"] if i["kind"] == "pr" and i["number"] == pr]
+    require(len(items) == 1 and items[0]["key"] == f"pr:{pr}"
+            and items[0]["url"] == f"https://github.com/{REPO}/pull/{pr}"
+            and "changes-requested" in items[0]["labels"] and not {"ship", "hold", "manual"}.intersection(items[0]["labels"]),
+            "PR is no longer admitted to the FIX queue")
+    require(native(root, task, started) == guard, "FIX execution or reservation changed during passive readback")
+    return latest
 
 
 def budget_now(budget, task, started, profile, now):
@@ -370,10 +420,14 @@ def matching_record(root, folder, selection, task, started, token, current):
 
 def read(root, args, task, started):
     guard = native(root, task, started)
-    selection = selected(read_json(root, args.selection), args.pr, args.source)
+    election = read_json(root, args.selection)
+    selection = selected(election, args.pr, args.source)
     folder = directory(root, selection)
     token = source_token(read_json(root, args.source_receipt), task, started)
-    require(0 <= time.time() - token["generated_at"] < 300, "current election requires fresh Source")
+    if getattr(args, "passive_source", False):
+        token = passive_source_token(root, args.source_receipt, token, task, started, guard, election, args.pr)
+    else:
+        require(0 <= time.time() - token["generated_at"] < 300, "current election requires fresh Source")
     budget_now(read_json(root, args.budget_receipt), task, started, token["profile_hash"], time.time())
     current = refs(read_json(root, args.pr_read), args.pr, args.source)
     intent = folder.parent / "push-attempt.json"
@@ -450,6 +504,9 @@ def main(argv=None):
     bootstrap.add_argument("--outcome", type=Path, required=True)
     bootstrap.add_argument("--legacy-sha256", required=True)
     resume = sub.add_parser("read")
+    resume.add_argument("--passive-source", action="store_true", help=(
+        "Use this occurrence's recorded one-time passive observation and repeated election. "
+        "Bind selection.task_id, task_started_at and snapshot_token to the current cached FIX queue."))
     resume.add_argument("--pr", type=int, required=True)
     resume.add_argument("--source", required=True)
     for key in ("selection", "source-receipt", "budget-receipt", "pr-read"):
