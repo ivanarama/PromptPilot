@@ -2746,7 +2746,7 @@ def dispatch_gate(task) -> dict | None:
                     return _required_snapshot_defer(
                         profile_id, queue_config["id"], "cached read failed")
                 raise
-            from . import merge_pre_intent_wait
+            from . import fix_source_wait, merge_pre_intent_wait
             if merge_pre_intent_wait.enabled(queue_config, profile):
                 _, waiting = merge_pre_intent_wait.dispatch(task, profile_id, profile, data)
                 if waiting is not None:
@@ -2778,7 +2778,11 @@ def dispatch_gate(task) -> dict | None:
                 except Exception:
                     state = "snapshot revalidation failed"
                 if state is not None:
-                    return _required_snapshot_defer(profile_id, queue_config["id"], state)
+                    gate = _required_snapshot_defer(profile_id, queue_config["id"], state)
+                    hint = fix_source_wait.wait_hint(profile_id, profile, queue_config, data, state)
+                    if hint:
+                        gate["source_wait"] = hint
+                    return gate
             # A stale/partial empty snapshot must never complete a live stage as
             # empty, and stale diagnostics must not defer it. The project-owned
             # preflight remains the authoritative fallback.
@@ -6080,9 +6084,11 @@ def _analyze_without_budget(profile_id: str, series: list[dict], *,
             generated_at=float(result["generated_at"]), entry_epoch=cache_epoch,
             entry_revision=refresh_revision, current_epoch=_cache_epoch(),
         )
-        from . import merge_pre_intent_wait
-        if profile_still_current and any(merge_pre_intent_wait.enabled(q, profile) for q in profile.get("queues", [])):
-            merge_pre_intent_wait.wake(profile_id, profile, data)
+        if profile_still_current:
+            from . import fix_source_wait, merge_pre_intent_wait
+            fix_source_wait.wake(profile_id, profile, data, series)
+            if any(merge_pre_intent_wait.enabled(q, profile) for q in profile.get("queues", [])):
+                merge_pre_intent_wait.wake(profile_id, profile, data)
         return data
 
 

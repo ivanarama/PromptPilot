@@ -12,6 +12,7 @@ from contextlib import contextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+from . import fix_source_wait
 from .config import DB_DIR, DB_PATH
 from .models import (
     FindingStatus,
@@ -80,6 +81,24 @@ CREATE TABLE IF NOT EXISTS tasks (
     ,series_id INTEGER REFERENCES task_series(id)
     ,rights TEXT
 );
+
+-- Waiting for a FIX queue snapshot does not reserve GitHub budget.
+CREATE TABLE IF NOT EXISTS pipeline_fix_source_waits (
+    task_id INTEGER PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+    series_id INTEGER NOT NULL,
+    profile_hash TEXT NOT NULL,
+    execution TEXT NOT NULL,
+    waiting_since TEXT NOT NULL,
+    seen_revision INTEGER NOT NULL,
+    seen_epoch INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    ready_guard TEXT
+);
+CREATE TRIGGER IF NOT EXISTS pipeline_fix_source_wait_finished
+AFTER UPDATE OF status ON tasks WHEN NEW.status NOT IN ('pending','running')
+BEGIN
+    DELETE FROM pipeline_fix_source_waits WHERE task_id=NEW.id;
+END;
 
 CREATE TABLE IF NOT EXISTS task_token_usage (
     task_id INTEGER PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
@@ -1522,7 +1541,8 @@ def get_next_runnable(
         # task is found — a hard LIMIT could hide a free task behind a wall of
         # conflicting ones. Rows are materialised before any UPDATE so claiming
         # one doesn't disturb the iteration.
-        limit_clause = "" if (busy or order_key_fn is not None
+        source_task_id = fix_source_wait.preferred(conn, now)
+        limit_clause = "" if (busy or order_key_fn is not None or source_task_id is not None
                               or fairness_task_id is not None) else " LIMIT 1"
         rows = conn.execute(
             f"""SELECT * FROM tasks
@@ -1544,8 +1564,9 @@ def get_next_runnable(
             if order_key_fn is not None and policy_rank is None:
                 continue
             fairness_rank = 0 if task.id == fairness_task_id else 1
-            candidates.append(((fairness_rank, policy_rank), position, task))
-        if order_key_fn is not None or fairness_task_id is not None:
+            source_rank = 0 if task.id == source_task_id else 1
+            candidates.append(((fairness_rank, source_rank, policy_rank), position, task))
+        if order_key_fn is not None or fairness_task_id is not None or source_task_id is not None:
             candidates.sort(key=lambda item: (item[0], item[1]))
         for _rank, _position, task in candidates:
             started_at = _now()
@@ -1556,6 +1577,8 @@ def get_next_runnable(
                 (started_at, task.id),
             )
             if cur.rowcount:
+                if task.id == source_task_id:
+                    conn.execute("UPDATE pipeline_fix_source_waits SET ready_guard=NULL WHERE task_id=?", (task.id,))
                 return get_task(task.id, conn=conn)
         return None
 
@@ -1788,6 +1811,7 @@ def defer_task(task_id: int, next_run_at: datetime, reason: str = None,
                *, hard_not_before: bool = False,
                budget_wait_scope: str | None = None,
                budget_wait_revision: int | None = None,
+               source_wait: dict | None = None,
                expected_started_at=None) -> bool:
     """Return a claimed task to pending without consuming a retry attempt.
 
@@ -1818,7 +1842,7 @@ def defer_task(task_id: int, next_run_at: datetime, reason: str = None,
     elif budget_wait_revision is not None:
         raise ValueError("budget wait revision requires a scope")
     deadline = _to_utc_iso(next_run_at)
-    with _connect(immediate=budget_wait_scope is not None) as conn:
+    with _connect(immediate=budget_wait_scope is not None or source_wait is not None) as conn:
         # Close the release-before-defer race. If the reservation ledger moved
         # after admission observed contention, the sole wake may already have
         # happened. Requeue immediately, but preserve the durable priority
@@ -1851,6 +1875,10 @@ def defer_task(task_id: int, next_run_at: datetime, reason: str = None,
             values,
         )
         if cur.rowcount:
+            if source_wait is not None and not hard_not_before and budget_wait_scope is None:
+                fix_source_wait.record(conn, task_id, source_wait, reason)
+            else:
+                conn.execute("DELETE FROM pipeline_fix_source_waits WHERE task_id=?", (task_id,))
             _drop_cancel_flag(conn, task_id)
             _release_task_pipeline_targets(conn, task_id, attempt)
         return cur.rowcount > 0
@@ -1927,6 +1955,8 @@ def update_priority(task_id: int, priority: int) -> bool:
                WHERE id = ? AND status IN ('pending', 'rate_limited')""",
             (priority, _now(), task_id),
         )
+        if cur.rowcount:
+            conn.execute("DELETE FROM pipeline_fix_source_waits WHERE task_id=?", (task_id,))
         return cur.rowcount > 0
 
 
@@ -3530,6 +3560,8 @@ def update_task_fields(task_id: int, fields: dict) -> bool:
             "WHERE id = ? AND status IN ('pending', 'rate_limited')",
             (*values, task_id),
         )
+        if cur.rowcount and (explicit_reschedule or "priority" in fields):
+            conn.execute("DELETE FROM pipeline_fix_source_waits WHERE task_id=?", (task_id,))
         return cur.rowcount > 0
 
 
@@ -4917,6 +4949,7 @@ def reserve_pipeline_github_budget(
         if final_source_cost is not None:
             reservation["final_source_cost"] = final_source_cost
         active.append(reservation)
+        conn.execute("DELETE FROM pipeline_fix_source_waits WHERE task_id=?", (task_id,))
         _write_pipeline_budget_reservations(conn, key, active)
         revision = _advance_pipeline_github_budget_revision(conn, scope)
         conn.execute(
