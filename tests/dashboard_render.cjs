@@ -33,6 +33,21 @@ const context = {
 vm.createContext(context);
 vm.runInContext(html.slice(helpersStart, helpersEnd), context);
 vm.runInContext(renderer, context);
+assert.equal(context.pipelineTailHtml({state: 'unobserved'}, []), '');
+const partialTail = context.pipelineTailHtml({
+  state: 'incomplete', reason: 'Пауза <hold>', counts: {waiting: 2},
+  completions: {legacy: 1}, uncovered_intervals: [], uncovered_interval_count: 2,
+  recheck_due: 1,
+  last_drain_failure: {at: '2026-11-20T10:00:00Z', reason: '<script>unsafe</script>'},
+}, []);
+assert.match(partialTail, /Пауза &lt;hold&gt;/);
+assert.match(partialTail, /осталось интервалов 2/);
+assert.match(partialTail, /Готовы — · ждут 2/);
+assert.match(partialTail, /старая отметка 1/);
+assert.match(partialTail, /Ждут повторной сверки 1/);
+assert.match(partialTail, /&lt;script&gt;unsafe&lt;\/script&gt;/);
+const emptyTail = context.pipelineTailHtml({state: 'complete', counts: {ready: 0}}, []);
+assert.match(emptyTail, /Готовы 0/);
 (async () => {
   await context.loadPipelineReport('example');
   assert.match(box.innerHTML, /Что происходит сейчас/);
