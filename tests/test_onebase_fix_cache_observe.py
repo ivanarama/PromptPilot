@@ -32,6 +32,7 @@ def attempt(tmp_path):
                  native_admission_granted=False, mutable_admission_granted=False,
                  receipt_id="budget", rate_observed_at=now - 8, generated_at=now - 2)
     inst = SimpleNamespace(root=root, data_dir=tmp_path, db=tmp_path / "promptpilot.db", prepush=pre,
+                           priority_read=Mock(return_value=False),
                            working_dir=tmp_path, series=7, identity=Mock(return_value=(task, started, binding)),
                            verify_worker=Mock(), checked_origin=Mock())
     return inst, source, value, ready

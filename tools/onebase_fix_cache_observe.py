@@ -86,13 +86,16 @@ def observe_once(installation, source, seconds, *, budget, observe, budget_recei
             raise ValueError("passive result does not belong to this observation")
         return previous
     read = observe(prior, task, started, seconds, database=installation.db,
-                   series_id=installation.series, working_dir=installation.working_dir)
+                   series_id=installation.series, working_dir=installation.working_dir,
+                   priority_read=installation.priority_read)
     installation.verify_worker()
     if installation.identity() != identity or pre.private(installation.root, source).read_bytes() != raw:
         raise ValueError("running FIX or original Source changed during the observation")
     if read["publication_authorized"] is not False:
         raise ValueError("unexpected publication authority in passive observation")
     value = dict(binding=ticket, fresh_snapshot=read["fresh_snapshot"], publication_authorized=False)
+    if read.get("refresh_blocked") == "priority_waiter":
+        value["refresh_blocked"] = "priority_waiter"
     if not pre.unique(result, value):
         raise ValueError("duplicate observation result")
     return value

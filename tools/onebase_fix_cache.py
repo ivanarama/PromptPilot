@@ -98,7 +98,8 @@ def run_initial(guard, installed, args):
         executable = Path(cache["path"])
         marker = guard.pin_binary(cache)
         got = subprocess.run([str(executable), "pipelinectl", "source-refresh", "--profile", "onebase",
-                              "--reuse-fix-cache-only"], stdout=subprocess.PIPE, env=child_environment(installed),
+                              "--reuse-fix-cache-only", "--allow-deferred-insights-read"],
+                             stdout=subprocess.PIPE, env=child_environment(installed),
                              timeout=35, check=False)
         guard.still_pinned(executable, marker)
         still_current()

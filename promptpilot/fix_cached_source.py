@@ -120,8 +120,6 @@ def observe(continuation, profile, *, allow_deferred_insights_read=False):
             # This attempt already owns its skill reservation. Check its existing
             # publication without asking for the separately deferred scan.
             snapshot = dict(report, cache=cache)
-            cache = dict(cache, refresh_blocked=blocked, refresh_budget={
-                "budget_route": "insights", "state": blocked, "allowed": False})
         elif blocked:
             # Never pass arbitrary contents of persisted status into the journal.
             if blocked == "low":
@@ -177,11 +175,17 @@ def observe(continuation, profile, *, allow_deferred_insights_read=False):
             return _miss("publication_changed")
     binding = [guard[k] for k in ("task_id", "started_at", "session_id", "herdr_pane", "token",
                                   "execution_sha256", "series_id", "priority")]
-    return {"state": "reused", "source_refreshed": False, "source_reused": True,
-            "profile_id": profile_id, "queue_id": "fix", "admitted_route": "skill",
-            "task_id": guard["task_id"], "task_started_at": guard["started_at"], "native_session_bound": True,
-            "existing_execution_reservation_reused": True, "existing_skill_reservation_reused": True,
-            "attempt_binding_sha256": hashlib.sha256(json.dumps(binding, separators=(",", ":")).encode()).hexdigest(),
-            "observed_at": observed_at, "cache": cache, "snapshot_token": cache["token"], "fix_pr_heads": heads,
-            "scope": "Native-source-observation-only", "mutable_admission_granted": False,
-            "product_mutation_authorized": False}
+    receipt = {"state": "reused", "source_refreshed": False, "source_reused": True,
+               "profile_id": profile_id, "queue_id": "fix", "admitted_route": "skill",
+               "task_id": guard["task_id"], "task_started_at": guard["started_at"], "native_session_bound": True,
+               "existing_execution_reservation_reused": True, "existing_skill_reservation_reused": True,
+               "attempt_binding_sha256": hashlib.sha256(json.dumps(binding, separators=(",", ":")).encode()).hexdigest(),
+               "observed_at": observed_at, "cache": cache, "snapshot_token": cache["token"], "fix_pr_heads": heads,
+               "scope": "Native-source-observation-only", "mutable_admission_granted": False,
+               "product_mutation_authorized": False}
+    if blocked == "priority_waiter":
+        # Cache describes the checked publication. The later admission decision
+        # belongs to the next scan and remains visible on the original receipt.
+        receipt["deferred_refresh"] = {"refresh_blocked": blocked, "refresh_budget": {
+            "budget_route": "insights", "state": blocked, "allowed": False}}
+    return receipt

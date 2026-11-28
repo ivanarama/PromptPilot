@@ -89,14 +89,15 @@ def test_shared_full_publication_costs_no_scan_and_preserves_executing_lease(pub
     assert f.db.get_setting(reserve_key) == before and len(f.db.list_pipeline_snapshots("example")) == 1
     assert f.db.get_setting(scan_key) == scan
     assert f.db.get_pipeline_refresh_status("example") == event
+    assert not result["cache"].get("refresh_blocked") and "refresh_budget" not in result["cache"]
     if deferred:
-        assert result["cache"]["refresh_blocked"] == "priority_waiter"
-        assert result["cache"]["refresh_budget"] == {"budget_route": "insights", "state": "priority_waiter", "allowed": False}
+        assert result["deferred_refresh"] == {"refresh_blocked": "priority_waiter", "refresh_budget": {
+            "budget_route": "insights", "state": "priority_waiter", "allowed": False}}
         # Other consumers still observe the denial on this same publication.
         live = pi.read_cached("example", f.db.list_series())
         assert pi._required_snapshot_state(live, f.profile, "fix") == "refresh_blocked=priority_waiter"
     else:
-        assert not result["cache"].get("refresh_blocked")
+        assert "deferred_refresh" not in result
 
 
 @pytest.mark.parametrize(("fault", "reason"), [
