@@ -2967,6 +2967,8 @@ def run(argv=None) -> int:
     source_refresh_parser.add_argument("--reuse-fix-cache-only", action="store_true")
     budget_refresh_parser = sub.add_parser("budget-refresh")
     budget_refresh_parser.add_argument("--profile", required=True)
+    from . import pipeline_budget_status
+    pipeline_budget_status.add_arguments(sub.add_parser("budget-status", help="read the locally observed budget for an existing FIX skill"))
     routing_parser = sub.add_parser("validate-routing-report")
     routing_parser.add_argument("--report", required=True)
     routing_parser.add_argument("--head", required=True)
@@ -3009,6 +3011,8 @@ def run(argv=None) -> int:
     complete_lease.add_argument("--lease-file")
     complete_parser.add_argument("--report")
     args = parser.parse_args(argv)
+    if args.command == "budget-status":
+        return pipeline_budget_status.execute(args)
     if args.command == "merge-checkpoint":
         return merge_checkpoint.execute(args)
     if args.command == "merge-ci-wait":

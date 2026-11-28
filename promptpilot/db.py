@@ -5,6 +5,7 @@ import json
 import math
 import re
 import sqlite3
+import threading
 import time
 import unicodedata
 import uuid
@@ -13,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from . import fix_source_wait
-from .config import DB_DIR, DB_PATH
+from .config import DB_DIR, DB_PATH, DB_OBSERVATION_ONLY
 from .models import (
     FindingStatus,
     Stats,
@@ -670,7 +671,15 @@ def _row_to_task(row: sqlite3.Row) -> TaskInDB:
 
 
 @contextmanager
-def _connect(immediate: bool = False):
+def _connect(immediate: bool = False, *, initializing=False):
+    global _deferred_init
+    if DB_OBSERVATION_ONLY.get():
+        raise RuntimeError("a passive observation cannot open a writable connection")
+    if _deferred_init and not initializing:
+        with _deferred_init_lock:
+            if _deferred_init:
+                init_db()
+                _deferred_init = False
     DB_DIR.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(DB_PATH), timeout=10)
     try:
@@ -692,7 +701,7 @@ INIT_DB_BUSY_DELAYS = (0.1, 0.5, 1.0, 2.0, 4.0)
 
 
 def _init_db_once():
-    with _connect() as conn:
+    with _connect(initializing=True) as conn:
         # Journal mode is persistent database state, not a per-connection
         # setting. Reasserting it on every connection needlessly turns an
         # otherwise read-only open into a lock-taking operation and can make a
@@ -4674,11 +4683,13 @@ def record_pipeline_github_rate_snapshot(
 
 def get_pipeline_github_rate_snapshot(scope: str) -> Optional[dict]:
     """Return the last locally observed GitHub limits without network I/O."""
-    key = _pipeline_github_rate_snapshot_key(scope)
     with _connect() as conn:
-        row = conn.execute(
-            "SELECT value FROM settings WHERE key = ?", (key,)
-        ).fetchone()
+        return _read_pipeline_github_rate_snapshot(conn, scope)
+
+
+def _read_pipeline_github_rate_snapshot(conn, scope: str) -> Optional[dict]:
+    key = _pipeline_github_rate_snapshot_key(scope)
+    row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
     if row is None:
         return None
     try:
@@ -6645,5 +6656,9 @@ def list_workflow_events(workflow_id: str, after_seq: int = 0,
         return [_row_to_workflow_event(row) for row in rows]
 
 
-# Auto-init on import
-init_db()
+# Preserve normal startup. If a passive observer imported us first, initialize
+# on the first ordinary connection, including for callers sharing the process.
+_deferred_init = DB_OBSERVATION_ONLY.get()
+_deferred_init_lock = threading.Lock()
+if not _deferred_init:
+    init_db()

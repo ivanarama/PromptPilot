@@ -1,6 +1,7 @@
 """Configuration settings."""
 
 import json
+from contextvars import ContextVar
 import functools
 import threading
 import os
@@ -151,6 +152,9 @@ def _read_json_file(path: "Path"):
 # Database
 DB_DIR = Path(os.environ.get("PP_DATA_DIR", Path.home() / ".promptpilot"))
 DB_PATH = DB_DIR / "promptpilot.db"
+# Passive commands may import the policy and ledger readers before a writable
+# Native service runs. Their first import must not initialize or migrate SQLite.
+DB_OBSERVATION_ONLY = ContextVar("db_observation_only", default=False)
 
 # Worker
 POLL_INTERVAL = _int_env("PP_POLL_INTERVAL", 5)

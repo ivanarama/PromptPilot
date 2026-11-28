@@ -667,7 +667,7 @@ def _github_budget_policy(profile: dict) -> dict | None:
     return policy
 
 
-def _with_shared_budget_floor(policy: dict) -> dict:
+def _with_shared_budget_floor(policy: dict, profiles: dict | None = None) -> dict:
     """Use the strongest hard reserve of every profile sharing this account."""
     floor = dict(policy["minimum_remaining"])
     priority_one_headroom = dict(policy["priority_one_headroom"])
@@ -677,7 +677,7 @@ def _with_shared_budget_floor(policy: dict) -> dict:
     starvation_timeouts = []
     if policy.get("starvation_timeout_seconds", 0) > 0:
         starvation_timeouts.append(policy["starvation_timeout_seconds"])
-    for configured_profile in _profiles().values():
+    for configured_profile in (_profiles() if profiles is None else profiles).values():
         candidate = _github_budget_policy(configured_profile)
         if candidate is None or candidate["lease_scope"] != policy["lease_scope"]:
             continue

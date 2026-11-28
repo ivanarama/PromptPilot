@@ -87,28 +87,28 @@ def same_or_new(path, value):
         require(path.read_bytes() == encode(value), "conflicting evidence for this election")
 
 
-def task_env(root):
+def task_env(root, *, series_id=2):
     task = os.environ.get("PP_TASK_ID", "")
     started = os.environ.get("PP_TASK_STARTED_AT")
     require(re.fullmatch("[1-9][0-9]{0,18}", task), "requires the native FIX worker environment")
     if not started:
         with closing(sqlite3.connect((root.parent / "promptpilot.db").as_uri() + "?mode=ro", uri=True)) as conn:
-            row = conn.execute("SELECT started_at FROM tasks WHERE id=? AND series_id=2 AND status='running'",
-                               (int(task),)).fetchone()
+            row = conn.execute("SELECT started_at FROM tasks WHERE id=? AND series_id=? AND status='running'",
+                               (int(task), series_id)).fetchone()
             require(row and row[0], "ordinary FIX task is not running")
             started = row[0]
     return int(task), started
 
 
-def native(root, task, started, *, origin=None, source_binding=None):
+def native(root, task, started, *, origin=None, source_binding=None, series_id=2, working_dir=None):
     """Bind the private hint to an actual local invocation, and preserve the normal guards."""
     database = root.parent / "promptpilot.db"
     with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=3)) as conn:
         conn.row_factory = sqlite3.Row
         conn.execute("BEGIN")
-        row = conn.execute("SELECT * FROM tasks WHERE id=? AND series_id=2", (task,)).fetchone()
-        series = conn.execute("SELECT * FROM task_series WHERE id=2").fetchone()
-        directory = str(root.parent.parent / "Projects/onebase-automation/fix")
+        row = conn.execute("SELECT * FROM tasks WHERE id=? AND series_id=?", (task, series_id)).fetchone()
+        series = conn.execute("SELECT * FROM task_series WHERE id=?", (series_id,)).fetchone()
+        directory = str(working_dir or root.parent.parent / "Projects/onebase-automation/fix")
         require(series and series["title"] == "OneBase - FIX - исправление одобренного"
                 and series["working_dir"] == directory and row and row["working_dir"] == directory
                 and row["started_at"] == started and (row["session_id"] or row["herdr_pane"])
@@ -201,8 +201,9 @@ def read_cached_fix_queue():
         return json.load(response)
 
 
-def current_fix_token(pr, head=None):
-    report = read_cached_fix_queue()
+def current_fix_token(pr, head=None, *, report=None):
+    if report is None:
+        report = read_cached_fix_queue()
     cache = report["cache"]
     latest = cache["token"]
     require(report["repository"] == REPO and report["profile_id"] == "onebase"
@@ -220,7 +221,7 @@ def current_fix_token(pr, head=None):
             "PR is no longer admitted to the FIX queue")
     if head is not None:
         diagnostics = report["diagnostics"]
-        heads = [item["head"] for item in diagnostics["fix_candidates"]
+        heads = [(item.get("head") or item.get("source_head")) for item in diagnostics["fix_candidates"]
                  if item["stage"] in ("review", "fix-pr") and item["number"] == pr]
         require(diagnostics.get("exit_code") == 0 and not diagnostics.get("errors")
                 and not diagnostics.get("checker_failed") and heads == [head]
@@ -229,19 +230,29 @@ def current_fix_token(pr, head=None):
     return latest
 
 
+def passive_records(root, task, started):
+    return root.parent / "onebase-fix-passive-observations" / f"{task}-{digest(started.encode())[:24]}"
+
+
+def passive_result(root, source_bytes, original, task, started, guard):
+    """Read the immutable result of the one observation opened by this attempt."""
+    records = passive_records(root, task, started)
+    binding = {"task": task, "started": started, "native": guard,
+               "source_sha256": digest(source_bytes), "original": original}
+    require(read_json(root.parent, records / "observe.intent.json") == binding,
+            "passive Source does not belong to this FIX occurrence")
+    witness = read_json(root.parent, records / "observe.result.json")
+    require(witness["binding"] == binding and witness["publication_authorized"] is False,
+            "passive Source does not belong to this FIX occurrence")
+    return witness["fresh_snapshot"]
+
+
 def passive_source_token(root, source_file, original, task, started, guard, election, pr):
     """Confirm the task's single passive observation against its current election and the live local cache."""
-    records = root.parent / "onebase-fix-passive-observations" / f"{task}-{digest(started.encode())[:24]}"
     source_bytes = private(root, source_file).read_bytes()
     source = json.loads(source_bytes)
     require(source_token(source, task, started) == original, "original Source receipt changed")
-    binding = {"task": task, "started": started, "native": guard,
-               "source_sha256": digest(source_bytes), "original": original}
-    witness = read_json(root.parent, records / "observe.result.json")
-    require(read_json(root.parent, records / "observe.intent.json") == binding
-            and witness["binding"] == binding and witness["publication_authorized"] is False,
-            "passive Source does not belong to this FIX occurrence")
-    observed = witness["fresh_snapshot"]
+    observed = passive_result(root, source_bytes, original, task, started, guard)
     latest = current_fix_token(pr, election["head"] if source["state"] == "reused" else None)
     require(isinstance(observed, dict)
             and original["profile_hash"] == observed["profile_hash"] == latest["profile_hash"]
@@ -254,12 +265,12 @@ def passive_source_token(root, source_file, original, task, started, guard, elec
     return latest
 
 
-def budget_now(budget, task, started, profile, now):
+def budget_now(budget, task, started, profile, now, *, series_id=2):
     require(budget["budget_observation_scope"] == "running-budget-policy-v4" and budget["proof_kind"] == "running"
             and budget["state"] == "ready" and budget["ready"] is True
             and budget["profile_hash"] == profile and budget["task_id"] == task
             and budget["started_at"] == started and budget["profile_id"] == "onebase"
-            and budget["queue_id"] == "fix" and budget["series_id"] == 2
+            and budget["queue_id"] == "fix" and budget["series_id"] == series_id
             and budget["decision"]["allowed"] is True and budget["decision"]["budget_route"] == "skill"
             and budget["native_admission_granted"] is False and budget["mutable_admission_granted"] is False
             and budget["receipt_id"] and 0 <= now - budget["rate_observed_at"] < 60

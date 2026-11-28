@@ -39,22 +39,43 @@ def _pr_heads(report):
     return heads
 
 
-def _validate_checker(profile, report, observed_at, ttl):
+def _miss(code):
+    # Existing launchers match the human-readable reason exactly before scanning.
+    return {"state": "wait", "reason": "fresh FIX cache unavailable", "cache_miss_reason": code,
+            "source_reused": False, "source_refreshed": False,
+            "mutable_admission_granted": False, "product_mutation_authorized": False}
+
+
+def _snapshot_time_miss(stamp, now):
+    if type(stamp) not in (int, float) or not stamp >= 0:
+        return "snapshot_invalid"
+    if stamp > now:
+        return "snapshot_from_future"
+    if now - stamp >= pi._CACHE_TTL_SECONDS:
+        return "snapshot_expired"
+    return None
+
+
+def _checker_miss(profile, report, observed_at, ttl):
     diagnostics = report["diagnostics"]
     stamp = report["diagnostics_generated_at"]
-    if (type(stamp) not in (int, float) or not 0 <= observed_at - stamp < ttl
-            or type(diagnostics.get("exit_code")) is not int or diagnostics["exit_code"] != 0):
-        raise ValueError("fresh successful FIX checker required")
+    if type(stamp) not in (int, float) or not 0 <= stamp <= observed_at:
+        return "checker_proof_invalid"
+    if observed_at - stamp >= ttl:
+        return "checker_expired"
+    if type(diagnostics.get("exit_code")) is not int or diagnostics["exit_code"] != 0:
+        return "checker_failed"
     usage = report["source_search_usage"]
     if usage["successful_observation_cost_proved"] is not True or usage["uncertain_cost"] is not False:
-        raise ValueError("unproved Source publication")
+        return "checker_proof_invalid"
     contract = health_contract(profile)
     receipt = diagnostics["source_graphql_usage"]
     validate_receipt(receipt, contract, nonce=receipt["nonce"], allowance=receipt["allowance"])
     proof = {"executable_sha256": contract["executable_sha256"], "receipt_sha256": digest(receipt)}
     if (diagnostics["source_graphql_cost_proof"] != proof
             or any(usage["health_cost_provenance"][key] != value for key, value in proof.items())):
-        raise ValueError("checker proof differs from its published provenance")
+        return "checker_proof_invalid"
+    return None
 
 
 def observe(continuation, profile):
@@ -73,34 +94,61 @@ def observe(continuation, profile):
     revision_key = pi._published_profile_revision_key(profile_id)
     keys = (status_key, profile_key, revision_key)
     initial = db.get_settings_snapshot([cache_key, *keys])
-    wait = {"state": "wait", "reason": "fresh FIX cache unavailable", "source_reused": False,
-            "source_refreshed": False, "mutable_admission_granted": False, "product_mutation_authorized": False}
+    if cache_key not in initial:
+        if initial.get(profile_key) not in (None, profile_hash):
+            return _miss("profile_changed")
+        return _miss("snapshot_missing")
     try:
         payload = json.loads(initial[cache_key])
         stamp, epoch, revision = (payload[k] for k in ("generated_at", "epoch", "revision"))
         report = payload["result"]
         if (type(payload["version"]) is not int or payload["version"] != pi._CACHE_SCHEMA_VERSION
-                or payload["profile_id"] != profile_id or payload["profile_hash"] != profile_hash
-                or payload["repository"] != profile["repository"] or report["generated_at"] != stamp
-                or initial[profile_key] != profile_hash or initial[revision_key] != str(revision)
-                or type(epoch) is not int or epoch < 0 or type(revision) is not int or revision <= 0
-                or type(stamp) not in (int, float) or not 0 <= time.time() - stamp < pi._CACHE_TTL_SECONDS
-                or not pi._cache_matches_profile(report, profile_id, profile)
+                or report["generated_at"] != stamp or type(epoch) is not int or epoch < 0
+                or type(revision) is not int or revision <= 0):
+            return _miss("snapshot_invalid")
+        if (payload["profile_id"] != profile_id or payload["profile_hash"] != profile_hash
+                or payload["repository"] != profile["repository"] or initial[profile_key] != profile_hash
+                or report["profile_id"] != profile_id or report["repository"] != profile["repository"]):
+            return _miss("profile_changed")
+        if initial[revision_key] != str(revision):
+            return _miss("publication_changed")
+        time_miss = _snapshot_time_miss(stamp, time.time())
+        if time_miss:
+            return _miss(time_miss)
+        if (not pi._cache_matches_profile(report, profile_id, profile)
                 or not all(q["membership_complete"] is True for q in report["queues"])):
-            return wait
+            return _miss("queue_incomplete")
         cache = pi._cache_metadata("durable", stamp, epoch, revision, epoch, profile_hash)
         report = pi._with_persisted_refresh_status(dict(report, cache=cache), profile_id, profile)
-        if report.get("cache", {}).get("refresh_blocked") == "checker_state_unavailable":
+        blocked = report["cache"].get("refresh_blocked")
+        if blocked == "checker_state_unavailable":
             raise RuntimeError("cannot verify the durable FIX checker status")
-        if pi._required_snapshot_state(report, profile, "fix") is not None:
-            return wait
+        if blocked:
+            # Never pass arbitrary contents of persisted status into the journal.
+            if blocked == "low":
+                return _miss("budget_low")
+            if blocked in ("checker_failed", "scan_in_progress", "budget_in_flight", "priority_waiter",
+                           "fairness_waiter", "rate_snapshot_stale"):
+                return _miss(blocked)
+            return _miss("refresh_blocked")
+        state = pi._required_snapshot_state(report, profile, "fix")
+        if state is not None:
+            return _miss("checker_failed" if state in ("checker failed", "checker unavailable") else "snapshot_invalid")
+    except (KeyError, TypeError, ValueError, AttributeError, OverflowError):
+        return _miss("snapshot_invalid")
+    try:
         checker_ttl = min(pi._CACHE_TTL_SECONDS, int(profile["health_check"].get("cache_seconds", 1800)))
-        _validate_checker(profile, report, time.time(), checker_ttl)
+        checker_miss = _checker_miss(profile, report, time.time(), checker_ttl)
+        if checker_miss:
+            return _miss(checker_miss)
+    except (KeyError, TypeError, ValueError, AttributeError, OverflowError):
+        return _miss("checker_proof_invalid")
+    try:
         heads = _pr_heads(report)
-        if not heads:
-            return wait
     except (KeyError, TypeError, ValueError, AttributeError, OverflowError, pp.PipelineError):
-        return wait
+        return _miss("candidate_invalid")
+    if not heads:
+        return _miss("no_eligible_pr")
     # A newer checker refusal, publication, session or reservation can arrive
     # while we verify the durable data and the pinned checker on disk.
     continuation.ledger()
@@ -113,11 +161,19 @@ def observe(continuation, profile):
         observed_at = time.time()
         if (any(current.get(k) != initial.get(k) for k in keys)
                 or not conn.execute("SELECT 1 FROM settings WHERE key=? AND value=?",
-                                    (cache_key, initial[cache_key])).fetchone()
-                or not 0 <= observed_at - stamp < pi._CACHE_TTL_SECONDS
-                or not 0 <= observed_at - report["diagnostics_generated_at"] < checker_ttl
-                or not db._pipeline_cache_guard_matches(conn, pi._wake_cache_guard(profile_id, profile, cache))):
-            return wait
+                                    (cache_key, initial[cache_key])).fetchone()):
+            return _miss("publication_changed")
+        time_miss = _snapshot_time_miss(stamp, observed_at)
+        if time_miss:
+            return _miss(time_miss)
+        if not 0 <= observed_at - report["diagnostics_generated_at"] < checker_ttl:
+            return _miss("checker_expired")
+        if not db._pipeline_cache_guard_matches(conn, pi._wake_cache_guard(profile_id, profile, cache)):
+            # A complete cached publication can remain visible after invalidation.
+            row = conn.execute("SELECT value FROM settings WHERE key=?", (pi._CACHE_EPOCH_KEY,)).fetchone()
+            if (row[0] if row else "0") != str(epoch):
+                return _miss("snapshot_invalidated")
+            return _miss("publication_changed")
     binding = [guard[k] for k in ("task_id", "started_at", "session_id", "herdr_pane", "token",
                                   "execution_sha256", "series_id", "priority")]
     return {"state": "reused", "source_refreshed": False, "source_reused": True,
