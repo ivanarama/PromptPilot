@@ -1,5 +1,5 @@
 """Exercise the opt-in CLI against a publication from an independent sampler."""
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import sqlite3
@@ -61,6 +61,7 @@ def test_shared_full_publication_costs_no_scan_and_preserves_executing_lease(pub
     assert result["source_refreshed"] is False and result["source_reused"] is True
     assert result["cache"]["source"] == "durable" and result["snapshot_token"] == token
     assert token["generated_at"] < started.timestamp() <= result["observed_at"]
+    assert "cache_miss_reason" not in result
     assert result["fix_pr_heads"] == {"42": "a" * 40}
     current = f.db.get_task(f.task.id)
     expected = [current.id, started.isoformat(), current.session_id, current.herdr_pane, "admitted",
@@ -71,10 +72,19 @@ def test_shared_full_publication_costs_no_scan_and_preserves_executing_lease(pub
     assert f.db.get_setting(scan_key) == scan
 
 
-@pytest.mark.parametrize("fault", ["missing", "partial", "expired", "future", "checker-expired",
-    "checker-hash", "unreadable-status", "status-db-error", "profile", "epoch", "global-revision", "namespace-revision",
-    "ambiguous-head", "unknown-head", "held", "wrong-url", "issue-only", "body-race", "cancel-race"])
-def test_unusable_cache_does_not_scan_or_issue_a_receipt(published, monkeypatch, capsys, fault):
+@pytest.mark.parametrize(("fault", "reason"), [
+    ("missing", "snapshot_missing"), ("schema", "snapshot_invalid"),
+    ("partial", "queue_incomplete"), ("expired", "snapshot_expired"),
+    ("future", "snapshot_from_future"), ("checker-expired", "checker_expired"),
+    ("checker-hash", "checker_proof_invalid"), ("checker-failed", "checker_failed"),
+    ("unreadable-status", None), ("status-db-error", None), ("profile", "profile_changed"),
+    ("epoch", "snapshot_invalidated"), ("global-revision", "publication_changed"),
+    ("namespace-revision", "publication_changed"), ("ambiguous-head", "candidate_invalid"),
+    ("unknown-head", "candidate_invalid"), ("held", "no_eligible_pr"),
+    ("wrong-url", "no_eligible_pr"), ("issue-only", "no_eligible_pr"),
+    ("body-race", "publication_changed"), ("cancel-race", None),
+])
+def test_unusable_cache_does_not_scan_or_issue_a_receipt(published, monkeypatch, capsys, fault, reason):
     f, key, token, _ = published
     db = f.db
     value = json.loads(db.get_setting(key))
@@ -82,6 +92,10 @@ def test_unusable_cache_does_not_scan_or_issue_a_receipt(published, monkeypatch,
     if fault == "missing":
         with db._connect() as conn:
             conn.execute("DELETE FROM settings WHERE key=?", (key,))
+    elif fault == "schema":
+        value["version"] = 0
+    elif fault == "checker-failed":
+        report["diagnostics"]["checker_failed"] = True
     elif fault == "partial":
         report["queues"][0]["membership_complete"] = False
     elif fault in {"expired", "future"}:
@@ -128,11 +142,34 @@ def test_unusable_cache_does_not_scan_or_issue_a_receipt(published, monkeypatch,
         db.set_setting(key, json.dumps(value))
     monkeypatch.setattr(pi, "_github_scan_admission", lambda *a, **k: pytest.fail("cache miss must not scan"))
     status, result = run_cli(capsys)
-    refused = fault in {"cancel-race", "unreadable-status", "status-db-error"}
+    refused = reason is None
     assert status == (2 if refused else 3)
     assert result["state"] == ("refused" if refused else "wait")
     assert not result.get("source_reused") and not result.get("snapshot_token")
     assert result["source_refreshed"] is False and result["mutable_admission_granted"] is False
+    if refused:
+        assert "cache_miss_reason" not in result
+    else:
+        assert result["reason"] == "fresh FIX cache unavailable"
+        assert result["cache_miss_reason"] == reason
+
+
+@pytest.mark.parametrize(("blocked", "reason"), [
+    ("scan_in_progress", "scan_in_progress"), ("budget_in_flight", "budget_in_flight"),
+    ("low", "budget_low"), ("priority_waiter", "priority_waiter"),
+    ("fairness_waiter", "fairness_waiter"), ("rate_snapshot_stale", "rate_snapshot_stale"),
+    ("arbitrary-private-value", "refresh_blocked"),
+])
+def test_persisted_refresh_status_returns_only_known_reason_codes(published, capsys, blocked, reason):
+    f, _, _, _ = published
+    assert f.db.publish_pipeline_refresh_status("example", "owner/example", {
+        "refresh_blocked": blocked, "refresh_blocked_reason": "arbitrary-private-description",
+        "refresh_deferred_until": (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(),
+    })
+    status, result = run_cli(capsys)
+    assert status == 3 and result["state"] == "wait"
+    assert result["reason"] == "fresh FIX cache unavailable" and result["cache_miss_reason"] == reason
+    assert "arbitrary-private" not in json.dumps(result)
 
 
 @pytest.mark.parametrize("fault", ["replica", "ownership", "existing-target", "wrong-start", "missing-reservation"])
@@ -154,6 +191,7 @@ def test_cached_source_refuses_other_worker_modes_and_attempts(published, monkey
     monkeypatch.setattr(pi, "_github_scan_admission", lambda *a, **k: pytest.fail("unexpected scan"))
     status, result = run_cli(capsys)
     assert status == 2 and result["state"] == "refused" and not result.get("snapshot_token")
+    assert "cache_miss_reason" not in result
 
 
 def test_cache_miss_leaves_the_existing_active_refresh_available(published, capsys):

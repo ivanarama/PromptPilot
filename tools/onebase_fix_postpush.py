@@ -171,22 +171,23 @@ def valid_stamp(value):
     return type(value) in (int, float) and math.isfinite(value)
 
 
-def running_fix_binding(task, started, observed, now):
+def running_fix_binding(task, started, observed, now, *, database=None, series_id=2, working_dir=None):
     """Reproduce the binding issued by Native from the live session and its existing reservation."""
-    database = Path.home() / ".promptpilot" / "promptpilot.db"
+    database = database or Path.home() / ".promptpilot" / "promptpilot.db"
     prefix = "pipeline_github_budget_reservations:v1:"
     with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=3)) as conn:
         conn.row_factory = sqlite3.Row
         conn.execute("BEGIN")
         row = conn.execute(
             """SELECT t.* FROM tasks t JOIN task_series s ON s.id=t.series_id
-               WHERE t.id=? AND t.started_at=? AND t.status='running' AND s.id=2
+               WHERE t.id=? AND t.started_at=? AND t.status='running' AND s.id=?
                  AND NOT s.paused AND s.ended_at IS NULL AND NOT COALESCE(t.detached,0) AND COALESCE(t.machine,'')=''
-                 AND (t.session_id<>'' OR t.herdr_pane<>'')""", (task, started)).fetchone()
+                 AND (t.session_id<>'' OR t.herdr_pane<>'')""", (task, started, series_id)).fetchone()
         controls = dict(conn.execute("SELECT key,value FROM settings WHERE key IN ('worker_paused',?)",
                                      (f"cancel_task:{task}",)))
         start = datetime.fromisoformat(started)
-        if (not row or start.tzinfo is None or not start.timestamp() <= observed <= now
+        if (not row or (working_dir is not None and row["working_dir"] != str(working_dir))
+                or start.tzinfo is None or not start.timestamp() <= observed <= now
                 or (row["task_timeout"] and now >= start.timestamp() + row["task_timeout"])
                 or controls.get("worker_paused", "0") != "0" or controls.get(f"cancel_task:{task}") == "1"):
             raise ValueError("cached Source no longer belongs to a running FIX attempt")
@@ -220,7 +221,7 @@ def running_fix_binding(task, started, observed, now):
         return hashlib.sha256(json.dumps(binding, separators=(",", ":")).encode()).hexdigest()
 
 
-def check_reused_source(prior, token, task, started, now):
+def check_reused_source(prior, token, task, started, now, *, database=None, series_id=2, working_dir=None):
     cache = prior["cache"]
     observed = prior["observed_at"]
     heads = prior.get("fix_pr_heads")
@@ -237,12 +238,13 @@ def check_reused_source(prior, token, task, started, now):
             or not isinstance(heads, dict) or not heads
             or not all(re.fullmatch(r"[1-9][0-9]*", number) and re.fullmatch(SHA, head) for number, head in heads.items())
             or token["revision"] <= 0 or not valid_stamp(observed) or not 0 <= observed - token["generated_at"] < 300
-            or prior.get("attempt_binding_sha256") != running_fix_binding(task, started, observed, now)):
+            or prior.get("attempt_binding_sha256") != running_fix_binding(
+                task, started, observed, now, database=database, series_id=series_id, working_dir=working_dir)):
         raise ValueError("invalid cached Source receipt for this FIX attempt")
 
 
 def observe(prior, task, started, seconds, read=read_cache,
-            clock=time.monotonic, now=time.time, sleep=time.sleep):
+            clock=time.monotonic, now=time.time, sleep=time.sleep, *, database=None, series_id=2, working_dir=None):
     reused = prior.get("state") == "reused" or prior.get("source_reused") is True
     if not ((reused or (prior.get("state") == "refreshed" and prior.get("source_refreshed") is True))
             and type(prior.get("task_id")) is int and prior["task_id"] == task
@@ -256,7 +258,8 @@ def observe(prior, task, started, seconds, read=read_cache,
             or any(type(original.get(k)) is not int or original[k] < 0 for k in ("epoch", "revision"))):
         raise ValueError("invalid source receipt")
     if reused:
-        check_reused_source(prior, original, task, started, now())
+        check_reused_source(prior, original, task, started, now(),
+                            database=database, series_id=series_id, working_dir=working_dir)
     deadline = clock() + seconds
     attempts = 0
     while clock() < deadline:
@@ -294,7 +297,8 @@ def observe(prior, task, started, seconds, read=read_cache,
                     and stamp >= original["generated_at"] and 0 <= now() - stamp < 300
                     and clock() < deadline):
                 if reused:
-                    check_reused_source(prior, original, task, started, now())
+                    check_reused_source(prior, original, task, started, now(),
+                                        database=database, series_id=series_id, working_dir=working_dir)
                 return {"fresh_snapshot": token, "attempts": attempts, "publication_authorized": False}
         if deadline - clock() <= 30:
             break

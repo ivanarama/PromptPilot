@@ -1,0 +1,47 @@
+{
+  "busy_retry_seconds": 120,
+  "costs": {
+    "fallback_targeted": {
+      "core": 1000,
+      "graphql": 1000,
+      "search": 8
+    },
+    "insights": {
+      "core": 50,
+      "graphql": 100,
+      "search": 0
+    },
+    "skill": {
+      "core": 1200,
+      "graphql": 1000,
+      "search": 12
+    },
+    "tool": {
+      "core": 900,
+      "graphql": 600,
+      "search": 5
+    },
+    "tool_preflight": {
+      "core": 600,
+      "graphql": 150,
+      "search": 4
+    }
+  },
+  "essential_snapshot_headroom": true,
+  "lease_seconds": 900,
+  "minimum_remaining": {
+    "core": 250,
+    "graphql": 100,
+    "search": 2
+  },
+  "priority_one_headroom": {
+    "core": 1200,
+    "graphql": 1000,
+    "search": 12
+  },
+  "refresh_ahead_seconds": 150,
+  "reset_grace_seconds": 60,
+  "source_cost_protocol": "source-graphql-cost-v1",
+  "starvation_timeout_seconds": 900,
+  "unavailable_retry_seconds": 300
+}
