@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import re
 import sqlite3
 import stat
 import subprocess
@@ -72,6 +73,7 @@ class Installation:
         pinned_bytes(Path(__file__).resolve(), files["onebase_fix_cache_guard.py"])
         self.prepush = pinned_module(config_path.with_name("onebase_fix_prepush.py"),
                                      files["onebase_fix_prepush.py"])
+        self.cost = pinned_module(config_path.with_name("source_graphql_cost.py"), files["source_graphql_cost.py"])
         self.data_dir = Path(self.config["data_dir"])
         self.series = self.config["series_id"]
         self.working_dir = Path(self.config["working_dir"])
@@ -142,6 +144,8 @@ class Installation:
         witness = {"native": guard, "source_sha256": sha256(raw), "binding": bound,
                    "value_sha256": sha256(self.prepush.encode(value)), "decision": "reused",
                    "at": time.time()}
+        if "deferred_refresh" in value:
+            witness["refresh_blocked"] = value["deferred_refresh"]["refresh_blocked"]
         require(self.prepush.unique(self.evidence_dir(identity) / "source.json", witness),
                 "initial Source already issued for this attempt")
 
@@ -152,6 +156,7 @@ class Installation:
         witness = self.prepush.read_json(self.data_dir, self.evidence_dir(current) / "source.json")
         require(prior["state"] == "reused" and witness["native"] == current[2]
                 and witness["binding"] == prior["attempt_binding_sha256"]
+                and witness.get("refresh_blocked") == prior.get("deferred_refresh", {}).get("refresh_blocked")
                 and witness["value_sha256"] == sha256(self.prepush.encode(prior)),
                 "cached Source differs from the original observation")
         return witness
@@ -213,6 +218,42 @@ class Installation:
                 and not report.get("errors"), "wrong profile or failed Source checker")
         return report
 
+    def priority_read(self, report, original_token, *, now=None):
+        """Observe this same publication while the independent insights scan yields."""
+        cache = report["cache"]
+        if not self.prepush.priority_scan_deferred(cache) or cache.get("token") != original_token:
+            return False
+        profile_hash = original_token["profile_hash"]
+        config_raw = self.profiles_path.read_bytes()
+        profiles = json.loads(config_raw)
+        profile = profiles.get("profiles", profiles)["onebase"]
+        key = "pipeline_insights_cache:v1:onebase:" + profile_hash
+        status = "pipeline_github_refresh_status:v1:" + sha256(b"onebase")
+        expected = {
+            "pipeline_insights_cache_epoch:v1": str(original_token["epoch"]),
+            "pipeline_insights_published_revision:v1:onebase:" + profile_hash: str(original_token["revision"]),
+            "pipeline_insights_published_profile:v1:onebase": profile_hash,
+            "pipeline_insights_published_profile_revision:v1:onebase": str(original_token["revision"]),
+        }
+        keys = [*expected, key, status]
+        query = "SELECT key,value FROM settings WHERE key IN (?,?,?,?,?,?)"
+        with closing(sqlite3.connect(self.db.as_uri() + "?mode=ro", uri=True, timeout=2)) as conn:
+            stored = dict(conn.execute(query, keys))
+            if (any(stored.get(k, "0" if k == "pipeline_insights_cache_epoch:v1" else None) != v
+                    for k, v in expected.items()) or key not in stored or status not in stored):
+                return False
+            event = json.loads(stored[status])
+            publication = json.loads(stored[key])
+            observed = time.time() if now is None else now
+            if not priority_publication(report, original_token, profile, publication, event, self.cost, observed):
+                return False
+            # Recheck the event and publication after reading the pinned checker artifacts.
+            finish = time.time() if now is None else now
+            return (0 <= finish - original_token["generated_at"] < 300
+                    and 0 <= finish - report["diagnostics_generated_at"] < checker_ttl(profile)
+                    and self.profiles_path.read_bytes() == config_raw
+                    and dict(conn.execute(query, keys)) == stored)
+
     def bind(self, source_bytes, selection, prdata):
         source = json.loads(source_bytes)
         identity = self.identity()
@@ -224,7 +265,10 @@ class Installation:
         later = selection["snapshot_token"] != original
         self.prepush.check_source_election(source, selection, *identity[:2], passive=later)
         report = self.current_report()
-        token = self.prepush.current_fix_token(number, head, report=report)
+        # These two legacy, owner-scoped rework operators require a clear
+        # current Source before any claim. They read the same original receipt.
+        priority = None if number in (2279, 2280) else lambda r: self.priority_read(r, original)
+        token = self.prepush.current_fix_token(number, head, report=report, priority_read=priority)
         stamp = report["diagnostics_generated_at"]
         require(type(stamp) in (int, float) and 0 <= time.time() - stamp < 300
                 and selection["snapshot_token"] == token
@@ -280,6 +324,77 @@ class Installation:
         require(item["key"] == f"issue:{number}" and item["url"] == url, "issue absent from FIX queue")
         self.check_target(identity, number, selection.get("eligibility_digest"))
         return "issue_requires_live_source"
+
+
+def checker_ttl(profile):
+    return min(300, int(profile["health_check"].get("cache_seconds", 1800)))
+
+
+def priority_publication(report, token, profile, publication, event, cost, now):
+    """Validate the immutable Source and its authoritative deferred-scan decision."""
+    repository = "ivanarama/onebase"
+    cache = report["cache"]
+    profile_hash = token["profile_hash"]
+    namespace = {k: v for k, v in profile.items() if k != "github_budget"}
+    protocol = profile["github_budget"].get("source_cost_protocol")
+    if (protocol != cost.PROTOCOL or profile.get("repository") != repository
+            or profile["priority_control"].get("trusted_account") != "ivanarama"
+            or cost.digest({"profile": namespace, "source_cost_protocol": protocol}) != profile_hash):
+        return False
+    stamp = token["generated_at"]
+    if (type(stamp) not in (int, float) or not 0 <= now - stamp < 300
+            or type(token["epoch"]) is not int or token["epoch"] < 0
+            or type(token["revision"]) is not int or token["revision"] < 1
+            or report.get("profile_id") != "onebase" or report.get("repository") != repository
+            or report.get("errors") or report["diagnostics"].get("errors") or report["diagnostics"].get("checker_failed")
+            or cache.get("source") not in ("durable", "memory") or cache.get("available") is not True
+            or cache.get("complete") is not True or cache.get("invalidated") is not False
+            or cache.get("stale") is not False or cache.get("ttl_seconds") != 300
+            or cache.get("profile_hash") != profile_hash or cache.get("generated_at") != stamp
+            or cache.get("token") != token or cache.get("refresh_blocked") != "priority_waiter"):
+        return False
+    if (publication.get("version") != 1 or publication.get("profile_id") != "onebase"
+            or publication.get("repository") != repository or any(publication.get(k) != v for k, v in token.items())):
+        return False
+    result = publication["result"]
+    if (result.get("errors") or any(result[k] != report[k] for k in
+            ("profile_id", "repository", "diagnostics", "diagnostics_generated_at", "source_search_usage"))
+            or result.get("generated_at") != stamp or report.get("generated_at") != stamp):
+        return False
+    # Queue runtime fields are recalculated by the loopback endpoint. Compare
+    # the original membership and its completeness for every configured queue.
+    def memberships(queues):
+        return {q["id"]: q["admission_items"] for q in queues if q["membership_complete"] is True}
+    members = memberships(result["queues"])
+    if (members.keys() != {q["id"] for q in profile["queues"]} or "fix" not in members
+            or len(members) != len(result["queues"]) or len(members) != len(report["queues"])
+            or members != memberships(report["queues"])):
+        return False
+    revision = event["revision"]
+    if (event.get("version") != 1 or type(revision) is not int or revision <= 0
+            or event.get("repository") != repository or not isinstance(event.get("status"), dict)):
+        return False
+    status = event["status"]
+    if (status.get("refresh_blocked") != "priority_waiter" or any(
+            not isinstance(budget, dict) or budget.get("budget_route") != "insights"
+            or budget.get("state") != "priority_waiter" or budget.get("allowed") is not False
+            for budget in (cache.get("refresh_budget"), status.get("github_budget")))):
+        return False
+    until = status.get("refresh_deferred_until")
+    if not isinstance(until, str) or cache.get("refresh_deferred_until") != until:
+        return False
+    deadline = datetime.fromisoformat(until.replace("Z", "+00:00"))
+    if deadline.tzinfo is None or now >= deadline.timestamp():
+        return False
+    failures = event.get("source_checker_failure_revisions", {})
+    if failures is None:
+        failures = {}
+    verified = result.get("source_checker_verified_failure_revision", 0)
+    if (not isinstance(failures, dict) or type(verified) is not int or not 0 <= verified <= revision
+            or any(not re.fullmatch("[0-9a-f]{64}", k) or type(v) is not int or not 0 < v <= revision
+                   for k, v in failures.items()) or failures.get(profile_hash, 0) > verified):
+        return False
+    return cost.checker_miss(profile, result, now, checker_ttl(profile)) is None
 
 
 def continues_publication(earlier, later):

@@ -93,3 +93,25 @@ def validate_receipt(receipt, expected, *, nonce, allowance):
 
 def validate_refusal(receipt, expected, *, nonce, allowance):
     return _validate(receipt,expected,nonce=nonce,allowance=allowance,refusal=True)
+
+
+def checker_miss(profile, report, observed_at, ttl):
+    diagnostics = report["diagnostics"]
+    stamp = report["diagnostics_generated_at"]
+    if type(stamp) not in (int, float) or not 0 <= stamp <= observed_at:
+        return "checker_proof_invalid"
+    if observed_at - stamp >= ttl:
+        return "checker_expired"
+    if type(diagnostics.get("exit_code")) is not int or diagnostics["exit_code"] != 0:
+        return "checker_failed"
+    usage = report["source_search_usage"]
+    if usage["successful_observation_cost_proved"] is not True or usage["uncertain_cost"] is not False:
+        return "checker_proof_invalid"
+    contract = health_contract(profile)
+    receipt = diagnostics["source_graphql_usage"]
+    validate_receipt(receipt, contract, nonce=receipt["nonce"], allowance=receipt["allowance"])
+    proof = {"executable_sha256": contract["executable_sha256"], "receipt_sha256": digest(receipt)}
+    if (diagnostics["source_graphql_cost_proof"] != proof
+            or any(usage["health_cost_provenance"][key] != value for key, value in proof.items())):
+        return "checker_proof_invalid"
+    return None

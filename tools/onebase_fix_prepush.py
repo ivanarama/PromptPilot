@@ -151,6 +151,22 @@ def native(root, task, started, *, origin=None, source_binding=None, series_id=2
         return digest(encode([{k: row[k] for k in keys}, own[0][1]]))
 
 
+def priority_scan_deferred(cache):
+    budget = cache.get("refresh_budget")
+    return (cache.get("refresh_blocked") == "priority_waiter" and isinstance(budget, dict)
+            and budget.get("budget_route") == "insights" and budget.get("state") == "priority_waiter"
+            and budget.get("allowed") is False)
+
+
+def valid_deferred_receipt(source):
+    if "deferred_refresh" not in source:
+        return True
+    deferred = source["deferred_refresh"]
+    return (source.get("state") == "reused" and isinstance(deferred, dict)
+            and set(deferred) == {"refresh_blocked", "refresh_budget"} and priority_scan_deferred(deferred)
+            and set(deferred["refresh_budget"]) == {"state", "budget_route", "allowed"})
+
+
 def source_token(source, task, started):
     token = source["snapshot_token"]
     cache = source["cache"]
@@ -173,7 +189,7 @@ def source_token(source, task, started):
             and source["task_started_at"] == started and source["product_mutation_authorized"] is False
             and source["scope"] == "Native-source-observation-only"
             and cache["available"] is True and cache["complete"] is True and cache["stale"] is False
-            and cache["invalidated"] is False and not cache.get("refresh_blocked")
+            and cache["invalidated"] is False and not cache.get("refresh_blocked") and valid_deferred_receipt(source)
             and cache["token"] == token and cache["generated_at"] == token["generated_at"]
             and cache["ttl_seconds"] == 300 and cache["profile_hash"] == token["profile_hash"]
             and DIGEST.fullmatch(token["profile_hash"])
@@ -201,14 +217,15 @@ def read_cached_fix_queue():
         return json.load(response)
 
 
-def current_fix_token(pr, head=None, *, report=None):
+def current_fix_token(pr, head=None, *, report=None, priority_read=None):
     if report is None:
         report = read_cached_fix_queue()
     cache = report["cache"]
     latest = cache["token"]
     require(report["repository"] == REPO and report["profile_id"] == "onebase"
             and cache["source"] in ("memory", "durable") and cache["available"] is True and cache["complete"] is True
-            and cache["stale"] is False and cache["invalidated"] is False and not cache.get("refresh_blocked")
+            and cache["stale"] is False and cache["invalidated"] is False
+            and (not cache.get("refresh_blocked") or (priority_read and priority_read(report)))
             and cache["ttl_seconds"] == 300 and cache["generated_at"] == latest["generated_at"]
             and 0 <= time.time() - latest["generated_at"] < 300, "current FIX cache is unavailable or stale")
     require(latest["profile_hash"] == cache["profile_hash"], "current FIX cache profile changed")

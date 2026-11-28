@@ -204,3 +204,29 @@ def test_modified_profile_pin_or_pending_drift_fails_closed(tmp_path):
     profile.write_text(json.dumps(record), encoding="utf-8")
     assert "budget policy differs" in mac.cli("verify", *args, ok=False)
     assert mac.sql("SELECT prompt FROM tasks") == [(busted,)]
+
+
+def test_existing_v1_manifest_can_be_verified_after_rollback(tmp_path):
+    mac = Station(tmp_path)
+    new = mac.release()
+    cfg = json.loads(new[1].read_bytes())
+    cfg["version"] = 1
+    del cfg["files"]["source_graphql_cost.py"], cfg["files"]["onebase_fix_lint_source.py"]
+    raw = (json.dumps(cfg, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode()
+    sign = hashlib.sha256(raw).hexdigest()
+    folder = new[1].parent.with_name(sign)
+    folder.mkdir()
+    conf = folder / "config.json"
+    conf.write_bytes(raw)
+    for name in cfg["files"]:
+        (folder / name).write_bytes(new[1].with_name(name).read_bytes())
+
+    old = ["--config", conf, "--config-sha", sign]
+    mac.cli("apply", *old)
+    before = mac.sql("SELECT prompt FROM task_series")
+    assert "background insights scan yielded" not in before[0][0]
+    mac.cli("apply", *new)
+    assert "background insights scan yielded" in mac.sql("SELECT prompt FROM task_series")[0][0]
+    mac.rollback(new)
+    assert mac.cli("verify", *old)["state"] == "verified"
+    assert mac.sql("SELECT prompt FROM task_series") == before

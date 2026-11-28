@@ -1,4 +1,5 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+import copy
 import json
 import os
 import sqlite3
@@ -9,6 +10,8 @@ from types import SimpleNamespace as NS
 import pytest
 
 from promptpilot.task_identity import task_execution_fingerprint
+from promptpilot import db, pipeline_insights as pi, source_graphql_cost as cost
+from tests.source_cost_fixtures import declare_checker
 from tools import onebase_fix_cache as launcher
 from tools import onebase_fix_cache_guard as guard
 from tools import onebase_fix_cache_observe as late
@@ -76,7 +79,8 @@ def runtime(case, tmp_path, monkeypatch):
 
     def native(command, **kwargs):
         calls.append(command)
-        assert command[-1] == "--reuse-fix-cache-only" and kwargs["env"]["PP_DATA_DIR"] == str(installed.data_dir)
+        assert command[-2:] == ["--reuse-fix-cache-only", "--allow-deferred-insights-read"]
+        assert kwargs["env"]["PP_DATA_DIR"] == str(installed.data_dir)
         assert kwargs["env"]["PP_PIPELINE_PROFILES"] == str(installed.profiles_path)
         code, response = responses.pop(0)
         return subprocess.CompletedProcess(command, code, stdout=json.dumps(response).encode())
@@ -131,6 +135,143 @@ def test_fallback_after_hit_rechecks_live_election_and_publication(runtime, case
     case.c.commit()
     with pytest.raises(ValueError, match="another FIX attempt"):
         r.inst.checked_origin(r.source)
+
+
+def test_deferred_scan_can_bind_and_observe_the_same_verified_publication(runtime, case, tmp_path, capsysbinary,
+                                                                        monkeypatch):
+    r = runtime
+    profile = {"repository": prepush.REPO, "queues": [{"id": "fix"}],
+               "health_check": {"cache_seconds": 300}, "github_budget": {}}
+    declare_checker(profile, tmp_path)
+    profile["priority_control"]["trusted_account"] = "ivanarama"
+    fingerprint = pi._profile_fingerprint(profile)
+    r.inst.profiles_path.write_text(json.dumps({"profiles": {"onebase": profile}}))
+    r.inst.cost = cost
+    token = dict(r.source["snapshot_token"], profile_hash=fingerprint, revision=4, epoch=1)
+    scan = {"budget_route": "insights", "state": "priority_waiter", "allowed": False}
+    until = datetime.fromtimestamp(case.now+180, timezone.utc).isoformat()
+    r.source["cache"].update(token=token, profile_hash=fingerprint)
+    r.source["deferred_refresh"] = dict(refresh_blocked="priority_waiter", refresh_budget=scan)
+    r.live["cache"].update(token=token, profile_hash=fingerprint, refresh_blocked="priority_waiter",
+                           refresh_budget=scan, refresh_deferred_until=until)
+    r.source["snapshot_token"] = r.select["snapshot_token"] = token
+    r.live["generated_at"] = token["generated_at"]
+    contract = cost.health_contract(profile)
+    checker = {k: contract[k] for k in ("protocol", "repo", "contract_sha256", "trusted_account")}
+    checker.update(nonce="0"*32, allowance=10, charged_upper_bound=2, observed_actual_cost=2, physical_attempts=2,
+                   preview_attempts=1, data_attempts=1, unproved_attempts=0, uncertain_cost=False, complete=True)
+    proof = dict(executable_sha256=contract["executable_sha256"], receipt_sha256=cost.digest(checker))
+    r.live["diagnostics"].update(source_graphql_usage=checker, source_graphql_cost_proof=proof)
+    r.live["source_search_usage"] = dict(successful_observation_cost_proved=True, uncertain_cost=False,
+                                        health_cost_provenance=proof)
+    publication = dict(token, version=1, repository=prepush.REPO, profile_id="onebase",
+                       result=copy.deepcopy(r.live))
+    refresh = dict(version=1, repository=prepush.REPO, revision=3,
+                   status=dict(refresh_blocked="priority_waiter", github_budget=scan, refresh_deferred_until=until))
+    status_key = db._pipeline_refresh_status_key("onebase")
+    cache_key = pi._cache_key("onebase", fingerprint)
+    records = {cache_key: json.dumps(publication), status_key: json.dumps(refresh),
+               pi._CACHE_EPOCH_KEY: str(token["epoch"]), pi._published_profile_key("onebase"): fingerprint,
+               pi._published_profile_revision_key("onebase"): str(token["revision"]),
+               pi._published_revision_key("onebase", fingerprint): str(token["revision"])}
+    case.c.executemany("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", records.items())
+    case.c.commit()
+
+    r.responses.append((0, r.source))
+    assert launcher.run_initial(guard, r.inst, r.args) == 0
+    raw = capsysbinary.readouterr().out
+    parsed = json.loads(raw)
+    assert not parsed["cache"].get("refresh_blocked") and parsed["deferred_refresh"] == r.source["deferred_refresh"]
+    r.inst.bind(raw, r.select, r.pr)
+    # Each mutation still checks the unmodified live scan/Source and budget.
+    with pytest.raises(ValueError, match="cache is unavailable"):
+        prepush.current_fix_token(case.pr, case.source, report=r.live)
+    with pytest.raises(ValueError, match="currently refused"):
+        r.inst.fallback_reason(raw, r.select, r.pr, r.inst.identity())
+
+    receipt = r.inst.root / "initial.stdout"
+    receipt.write_bytes(raw)
+    ready = json.loads(case.read_args.budget_receipt.read_bytes())
+    ready.update(series_id=r.inst.series, profile_hash=fingerprint)
+    def observe(*args, **kwargs):
+        return post.observe(*args, **kwargs, read=lambda _: r.live, now=lambda: case.now)
+    observed = late.observe_once(r.inst, receipt, 30, budget=lambda: ready, observe=observe)
+    assert observed["fresh_snapshot"] == token and observed["refresh_blocked"] == "priority_waiter"
+    assert observed["publication_authorized"] is False
+    assert len(r.calls) == 1 and launcher.journal_report(r.inst.journal)["full_scan_claims"] == 0
+
+    # Repeat against the same SQLite publication. A selected target does not gain
+    # credit for a different publication, route, check or current epoch.
+    assert not r.inst.priority_read(r.live, dict(token, revision=2))
+    assert not r.inst.priority_read(r.live, token, now=token["generated_at"]+300)
+    fake_live = copy.deepcopy(r.live)
+    fake_live["queues"][0]["admission_items"][0]["labels"] = ["ship"]
+    assert not r.inst.priority_read(fake_live, token)
+    # Both the loopback report and durable publication can contain stale or
+    # damaged checker evidence. Matching them does not validate that evidence.
+    for fault in ("stale_checker", "wrong_checker_proof"):
+        raw = copy.deepcopy(publication)
+        candidate = raw["result"]
+        if fault == "stale_checker":
+            candidate["diagnostics_generated_at"] = case.now - 301
+        else:
+            candidate["diagnostics"]["source_graphql_cost_proof"]["receipt_sha256"] = "f" * 64
+        assert not guard.priority_publication(candidate, token, profile, raw, refresh, cost, case.now)
+    for blocked, route, allowed in (("fairness_waiter","insights",False), ("priority_waiter","skill",False),
+                                    ("priority_waiter","insights",0), ("priority_waiter","insights",True)):
+        event = dict(refresh, status=dict(refresh_blocked=blocked, refresh_deferred_until=until,
+                     github_budget=dict(state=blocked,budget_route=route,allowed=allowed)))
+        case.c.execute("UPDATE settings SET value=? WHERE key=?", (json.dumps(event), status_key))
+        case.c.commit()
+        assert not r.inst.priority_read(r.live, token)
+    case.c.execute("UPDATE settings SET value=? WHERE key=?", (records[status_key], status_key))
+    case.c.execute("UPDATE settings SET value=? WHERE key=?", ("2", pi._CACHE_EPOCH_KEY))
+    case.c.commit()
+    assert not r.inst.priority_read(r.live, token)
+    case.c.execute("UPDATE settings SET value=? WHERE key=?", (records[pi._CACHE_EPOCH_KEY], pi._CACHE_EPOCH_KEY))
+    case.c.commit()
+    check = cost.checker_miss
+    def invalidate_during_check(*args):
+        case.c.execute("UPDATE settings SET value=? WHERE key=?", ("2", pi._CACHE_EPOCH_KEY))
+        case.c.commit()
+        return check(*args)
+    monkeypatch.setattr(cost, "checker_miss", invalidate_during_check)
+    assert not r.inst.priority_read(r.live, token)
+
+
+@pytest.mark.parametrize("number", [2279, 2280])
+def test_legacy_scoped_pr_needs_clear_live_source_with_original_receipt(runtime, case, capsysbinary,
+                                                                         monkeypatch, number):
+    r = runtime
+    url = f"https://github.com/{prepush.REPO}/pull/{number}"
+    r.source["fix_pr_heads"] = {str(number): case.source}
+    r.select.update(number=number)
+    r.pr.update(number=number, html_url=url)
+    r.live["queues"][0]["admission_items"][0].update(number=number, key=f"pr:{number}", url=url)
+    r.live["diagnostics"]["fix_candidates"][0].update(number=number)
+    fact = dict(refresh_blocked="priority_waiter", refresh_budget=dict(budget_route="insights",
+                                                                       state="priority_waiter", allowed=False))
+    r.source["deferred_refresh"] = fact
+    r.responses.append((0, r.source))
+    assert launcher.run_initial(guard, r.inst, r.args) == 0
+    raw = capsysbinary.readouterr().out
+    receipt = json.loads(raw)
+    # Legacy source_token consumes the original cache availability and allows
+    # extensions outside cache. A later live admission still uses its own state.
+    assert not receipt["cache"].get("refresh_blocked") and receipt["deferred_refresh"] == fact
+    task, started, _ = r.inst.identity()
+    assert prepush.source_token(receipt, task, started) == receipt["snapshot_token"]
+    for bad_fact in (None, {}, {**fact, "refresh_budget": {**fact["refresh_budget"], "allowed": 0}},
+                     {**fact, "unexpected": True}):
+        with pytest.raises(ValueError):
+            prepush.source_token(dict(receipt, deferred_refresh=bad_fact), task, started)
+    monkeypatch.setattr(r.inst, "priority_read", lambda *args: pytest.fail("legacy owner gate changed"))
+    r.live["cache"].update(fact)
+    with pytest.raises(ValueError, match="cache is unavailable"):
+        r.inst.bind(raw, r.select, r.pr)
+    r.live["cache"].update(refresh_blocked=None, refresh_budget=None)
+    r.inst.bind(raw, r.select, r.pr)
+    assert len(r.calls) == 1 and launcher.journal_report(r.inst.journal)["full_scan_claims"] == 0
 
 
 @pytest.mark.parametrize("fault", [None, "unobserved", "wrong-attempt", "rolled-back", "old-observation",

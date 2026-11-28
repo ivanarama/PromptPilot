@@ -7,7 +7,7 @@ import time
 
 import pytest
 
-from promptpilot import pipeline_insights as pi, pipeline_source_refresh as source
+from promptpilot import pipeline_insights as pi, pipeline_source_refresh as source, project_pipeline
 from promptpilot.task_identity import task_execution_fingerprint
 from tests.source_cost_fixtures import checker_receipt
 from tests.test_github_budget import _limits
@@ -43,19 +43,37 @@ def published(continuation, monkeypatch):
     return f, key, report["cache"]["token"], started
 
 
-def run_cli(capsys):
-    status = source.run(["--profile", "example", "--reuse-fix-cache-only"])
+def run_cli(capsys, *, allow_deferred=True):
+    args = ["source-refresh", "--profile", "example", "--reuse-fix-cache-only"]
+    if allow_deferred:
+        args.append("--allow-deferred-insights-read")
+    status = project_pipeline.run(args)
     return status, json.loads(capsys.readouterr().out)
 
 
-def test_shared_full_publication_costs_no_scan_and_preserves_executing_lease(published, capsys, monkeypatch):
+def publish_priority_scan_wait(f, **budget):
+    decision = {"state": "priority_waiter", "allowed": False, "budget_route": "insights",
+                "defer_until": (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()}
+    value = pi._refresh_blocked_status(decision)
+    value["github_budget"].update(budget)
+    assert f.db.publish_pipeline_refresh_status("example", f.profile["repository"], value)
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+def test_shared_full_publication_costs_no_scan_and_preserves_executing_lease(published, capsys, monkeypatch, deferred):
     f, _, token, started = published
     reserve_key = f.db._pipeline_github_budget_reservation_key("github-default")
     before = f.db.get_setting(reserve_key)
     assert f.db.acquire_pipeline_scan_lease("github-default", "another-process", 180)["acquired"]
     scan_key = f.db._pipeline_scan_lease_key("github-default")
     scan = f.db.get_setting(scan_key)
+    if deferred:
+        publish_priority_scan_wait(f)
+    event = f.db.get_pipeline_refresh_status("example")
     monkeypatch.setattr(pi, "_github_scan_admission", lambda *a, **k: pytest.fail("cache read requested a scan"))
+    if deferred:
+        status, legacy = run_cli(capsys, allow_deferred=False)
+        assert status == 3 and legacy["cache_miss_reason"] == "priority_waiter"
     status, result = run_cli(capsys)
     assert status == 0 and result["state"] == "reused"
     assert result["source_refreshed"] is False and result["source_reused"] is True
@@ -70,6 +88,16 @@ def test_shared_full_publication_costs_no_scan_and_preserves_executing_lease(pub
     assert result["mutable_admission_granted"] is False and result["product_mutation_authorized"] is False
     assert f.db.get_setting(reserve_key) == before and len(f.db.list_pipeline_snapshots("example")) == 1
     assert f.db.get_setting(scan_key) == scan
+    assert f.db.get_pipeline_refresh_status("example") == event
+    assert not result["cache"].get("refresh_blocked") and "refresh_budget" not in result["cache"]
+    if deferred:
+        assert result["deferred_refresh"] == {"refresh_blocked": "priority_waiter", "refresh_budget": {
+            "budget_route": "insights", "state": "priority_waiter", "allowed": False}}
+        # Other consumers still observe the denial on this same publication.
+        live = pi.read_cached("example", f.db.list_series())
+        assert pi._required_snapshot_state(live, f.profile, "fix") == "refresh_blocked=priority_waiter"
+    else:
+        assert "deferred_refresh" not in result
 
 
 @pytest.mark.parametrize(("fault", "reason"), [
@@ -83,12 +111,16 @@ def test_shared_full_publication_costs_no_scan_and_preserves_executing_lease(pub
     ("unknown-head", "candidate_invalid"), ("held", "no_eligible_pr"),
     ("wrong-url", "no_eligible_pr"), ("issue-only", "no_eligible_pr"),
     ("body-race", "publication_changed"), ("cancel-race", None),
+    ("status-race", "publication_changed"), ("checker-latch", "checker_failed"),
 ])
-def test_unusable_cache_does_not_scan_or_issue_a_receipt(published, monkeypatch, capsys, fault, reason):
+@pytest.mark.parametrize("deferred", [False, True])
+def test_unusable_cache_does_not_scan_or_issue_a_receipt(published, monkeypatch, capsys, fault, reason, deferred):
     f, key, token, _ = published
     db = f.db
     value = json.loads(db.get_setting(key))
     report = value["result"]
+    if deferred:
+        publish_priority_scan_wait(f)
     if fault == "missing":
         with db._connect() as conn:
             conn.execute("DELETE FROM settings WHERE key=?", (key,))
@@ -96,6 +128,10 @@ def test_unusable_cache_does_not_scan_or_issue_a_receipt(published, monkeypatch,
         value["version"] = 0
     elif fault == "checker-failed":
         report["diagnostics"]["checker_failed"] = True
+    elif fault == "checker-latch":
+        event = db.get_pipeline_refresh_status("example")
+        event["source_checker_failure_revisions"] = {pi._profile_fingerprint(f.profile): event["revision"]}
+        db.set_setting(db._pipeline_refresh_status_key("example"), json.dumps(event))
     elif fault == "partial":
         report["queues"][0]["membership_complete"] = False
     elif fault in {"expired", "future"}:
@@ -129,14 +165,17 @@ def test_unusable_cache_does_not_scan_or_issue_a_receipt(published, monkeypatch,
         report["queues"][0]["admission_items"][0]["url"] += "0"
     elif fault == "issue-only":
         report["diagnostics"]["fix_candidates"] = [dict(stage="fix-issue", number=42, eligibility_digest="b" * 40)]
-    elif fault in {"body-race", "cancel-race"}:
+    elif fault in {"body-race", "cancel-race", "status-race"}:
         original = pi._with_persisted_refresh_status
         def race(*args):
+            observed = original(*args)
             if fault == "body-race":
                 db.set_setting(key, json.dumps(dict(value, extra="replaced")))
+            elif fault == "status-race":
+                assert db.publish_pipeline_refresh_status("example", f.profile["repository"], None)
             else:
                 db.set_setting(f"cancel_task:{f.task.id}", "1")
-            return original(*args)
+            return observed
         monkeypatch.setattr(pi, "_with_persisted_refresh_status", race)
     if fault != "missing":
         db.set_setting(key, json.dumps(value))
@@ -170,6 +209,27 @@ def test_persisted_refresh_status_returns_only_known_reason_codes(published, cap
     assert status == 3 and result["state"] == "wait"
     assert result["reason"] == "fresh FIX cache unavailable" and result["cache_miss_reason"] == reason
     assert "arbitrary-private" not in json.dumps(result)
+
+
+@pytest.mark.parametrize("override", [
+    {"allowed": True}, {"allowed": 0}, {"state": "fairness_waiter"}, {"budget_route": "unclassified"},
+])
+def test_ambiguous_or_contradictory_priority_status_waits(published, capsys, override):
+    f, _, _, _ = published
+    publish_priority_scan_wait(f, **override)
+    status, result = run_cli(capsys)
+    assert status == 3 and result["cache_miss_reason"] == "priority_waiter"
+    assert not result["source_reused"] and "snapshot_token" not in result
+
+
+@pytest.mark.parametrize("args", [[], ["--final"]])
+def test_deferred_insights_read_cannot_be_an_active_source_request(capsys, args):
+    assert project_pipeline.run(["source-refresh", "--profile", "example", "--allow-deferred-insights-read", *args]) == 2
+    result = json.loads(capsys.readouterr().out)
+    assert result["state"] == "refused" and result["source_refreshed"] is False
+    assert "--reuse-fix-cache-only" in result["reason"]
+    with pytest.raises(ValueError, match="only an initial"):
+        source.refresh("example", budget_only=True, reuse_fix_cache_only=True, allow_deferred_insights_read=True)
 
 
 @pytest.mark.parametrize("fault", ["replica", "ownership", "existing-target", "wrong-start", "missing-reservation"])

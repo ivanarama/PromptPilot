@@ -225,6 +225,16 @@ def check_reused_source(prior, token, task, started, now, *, database=None, seri
     cache = prior["cache"]
     observed = prior["observed_at"]
     heads = prior.get("fix_pr_heads")
+    # The original, attempt-bound Native receipt records why a *new scan* was
+    # deferred. Current publication and budget decisions are made independently.
+    if "deferred_refresh" in prior:
+        deferred = prior["deferred_refresh"]
+        budget = deferred.get("refresh_budget") if isinstance(deferred, dict) else None
+        if (not isinstance(budget, dict) or set(deferred) != {"refresh_blocked","refresh_budget"}
+                or set(budget) != {"budget_route","state","allowed"} or deferred["refresh_blocked"] != "priority_waiter"
+                or budget["budget_route"] != "insights" or budget["state"] != "priority_waiter"
+                or budget["allowed"] is not False):
+            raise ValueError("invalid deferred scan in cached Source receipt")
     if (prior.get("state") != "reused" or prior.get("source_refreshed") is not False
             or prior.get("source_reused") is not True or prior.get("admitted_route") != "skill"
             or prior.get("existing_execution_reservation_reused") is not True
@@ -244,8 +254,11 @@ def check_reused_source(prior, token, task, started, now, *, database=None, seri
 
 
 def observe(prior, task, started, seconds, read=read_cache,
-            clock=time.monotonic, now=time.time, sleep=time.sleep, *, database=None, series_id=2, working_dir=None):
+            clock=time.monotonic, now=time.time, sleep=time.sleep, *, database=None, series_id=2, working_dir=None,
+            priority_read=None):
     reused = prior.get("state") == "reused" or prior.get("source_reused") is True
+    if "deferred_refresh" in prior and not reused:
+        raise ValueError("unexpected deferred scan in active Source receipt")
     if not ((reused or (prior.get("state") == "refreshed" and prior.get("source_refreshed") is True))
             and type(prior.get("task_id")) is int and prior["task_id"] == task
             and task > 0 and started and prior.get("task_started_at") == started
@@ -288,18 +301,23 @@ def observe(prior, task, started, seconds, read=read_cache,
             stamp = token.get("generated_at")
             if (cache.get("available") is True and cache.get("complete") is True
                     and cache.get("stale") is False and cache.get("invalidated") is False
-                    and not cache.get("refresh_blocked") and cache.get("source") in ("durable", "memory")
+                    and cache.get("source") in ("durable", "memory")
                     and token.get("profile_hash") == expected and type(token.get("epoch")) is int
                     and type(token.get("revision")) is int and valid_stamp(stamp)
                     and cache.get("generated_at") == stamp and cache.get("ttl_seconds") == 300
                     and token["epoch"] >= original["epoch"] and token["revision"] >= original["revision"]
                     and (token["revision"] > original["revision"] or token == original)
                     and stamp >= original["generated_at"] and 0 <= now() - stamp < 300
+                    and (not blocked or (blocked == "priority_waiter" and priority_read
+                                         and priority_read(report, original)))
                     and clock() < deadline):
                 if reused:
                     check_reused_source(prior, original, task, started, now(),
                                         database=database, series_id=series_id, working_dir=working_dir)
-                return {"fresh_snapshot": token, "attempts": attempts, "publication_authorized": False}
+                observed = {"fresh_snapshot": token, "attempts": attempts, "publication_authorized": False}
+                if blocked:
+                    observed["refresh_blocked"] = blocked
+                return observed
         if deadline - clock() <= 30:
             break
         sleep(30)

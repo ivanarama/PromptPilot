@@ -22,13 +22,14 @@ import tempfile
 TOOLS = Path(__file__).resolve().parent
 PRODUCTION_BUDGET_SHA = "4581b1924a8daf50e68ff41cc00f6c3f454810b440aa88e110c833ab0c0149fd"
 TITLE = "OneBase - FIX - исправление одобренного"
-FILES = (
+V1_FILES = (
     "onebase_fix_cache.py",
     "onebase_fix_cache_guard.py",
     "onebase_fix_cache_observe.py",
     "onebase_fix_prepush.py",
     "onebase_fix_postpush.py",
 )
+FILES = (*V1_FILES, "source_graphql_cost.py", "onebase_fix_lint_source.py")
 BEGIN, END = "<!-- onebase-fix-cache -->", "<!-- /onebase-fix-cache -->"
 OLD_BEGIN = "<!-- onebase-fix-source-binding-20261126 -->"
 OLD_END = "<!-- /onebase-fix-source-binding-20261126 -->"
@@ -261,6 +262,8 @@ def bootstrap(args):
 
 
 def prepare(args):
+    from tools.onebase_fix_lint_source import discover_scope
+
     data, work = (
         args.data_dir.expanduser().resolve(strict=True),
         args.working_dir.expanduser().resolve(strict=True),
@@ -296,8 +299,8 @@ def prepare(args):
         check=True,
     )
     need(
-        b"--reuse-fix-cache-only" in caps.stdout,
-        "cache Native does not implement initial FIX observation",
+        b"--reuse-fix-cache-only" in caps.stdout and b"--allow-deferred-insights-read" in caps.stdout,
+        "cache Native does not implement priority-aware read-only FIX observation",
     )
     caps = subprocess.run(
         [cached["path"], "pipelinectl", "budget-status", "--help"],
@@ -310,10 +313,12 @@ def prepare(args):
         "cache Native does not implement the task-bound running budget check",
     )
     # Python sources have the same Git bytes in checkouts using LF or CRLF.
-    assets = {name: (TOOLS / name).read_text(encoding="utf-8").encode("utf-8") for name in FILES}
+    sources = {name: TOOLS / name for name in FILES}
+    sources["source_graphql_cost.py"] = TOOLS.parent / "promptpilot" / "source_graphql_cost.py"
+    assets = {name: path.read_text(encoding="utf-8").encode("utf-8") for name, path in sources.items()}
     python = Path(sys.executable).resolve(strict=True)
     config = {
-        "version": 1,
+        "version": 2,
         "data_dir": str(data),
         "working_dir": str(work),
         "series_id": row["id"],
@@ -328,6 +333,9 @@ def prepare(args):
         config["worker_plist"] = str(args.worker_plist.expanduser().resolve(strict=True))
     if args.legacy_runtime_guard:
         config["legacy_runtime_guard"] = pin(args.legacy_runtime_guard, args.legacy_runtime_guard_sha256)
+    lint_scope = discover_scope(row["prompt"])
+    if lint_scope is not None:
+        config["lint_source_scope"] = lint_scope
     assets["config.json"] = json_bytes(config)
     sign = sha(assets["config.json"])
     parent = data / ROOT
@@ -367,10 +375,11 @@ def read_release(conf, sign):
     raw = conf.read_bytes()
     need(sha(raw) == sign, "release config changed")
     cfg = json.loads(raw)
+    layouts = {1: V1_FILES, 2: FILES}
     need(
-        cfg["version"] == 1
+        type(cfg["version"]) is int and cfg["version"] in layouts
         and conf == Path(cfg["data_dir"]) / ROOT / sign / "config.json"
-        and set(cfg["files"]) == set(FILES),
+        and set(cfg["files"]) == set(layouts[cfg["version"]]),
         "release layout does not match the config",
     )
     check_profile(Path(cfg["profiles_path"]), cfg["budget_policy_sha256"])
@@ -417,6 +426,9 @@ def note(cfg, conf, sign):
             f"({cfg['files'][FILES[0]]}) and config ({sign}). Run in the original worker session and "
             "save the original stdout, stderr and exit status in the task's private fix-runs directory:",
             command(FILES[0]),
+            *(["A reused receipt may record that a background insights scan yielded to a priority waiter. "
+               "Use the validated snapshot only within this FIX observation. The scan remains deferred."]
+              if cfg["version"] >= 2 else []),
             "An active refreshed result follows the existing Source procedure. On state=reused with "
             "source_reused=true and source_refreshed=false run the unchanged ordinary election once. "
             "Record the task ID, actual start and snapshot_token in its normalized selection. Obtain the live "
@@ -537,6 +549,8 @@ def replace(prompt, edits, undo=False):
 
 
 def manage(action, data, work, sign, *, cfg=None, conf=None, adopt=None):
+    from tools.onebase_fix_lint_source import discover_scope, scoped_bindings, subject_line
+
     write = action in {"apply", "rollback"}
     with closing(connection(data, write)) as c:
         c.execute("BEGIN IMMEDIATE" if write else "BEGIN")
@@ -565,6 +579,11 @@ def manage(action, data, work, sign, *, cfg=None, conf=None, adopt=None):
             pending = {
                 t["id"]: t["prompt"] for t in live if t["editable"] and str(t["id"]) not in state["exempt"]
             }
+            if top and top.get("lint_paragraph_sha256"):
+                for prompt in (row["prompt"], *pending.values()):
+                    line = subject_line(prompt)
+                    need(line and sha(line.encode()) == top["lint_paragraph_sha256"],
+                         "installed scoped lint instructions changed")
             if action == "rollback":
                 if not top or top["sha"] != sign:
                     need(
@@ -577,6 +596,9 @@ def manage(action, data, work, sign, *, cfg=None, conf=None, adopt=None):
                 updates = {i: replace(p, edits, True) for i, p in pending.items()}
             else:
                 target = note(cfg, conf, sign)
+                if cfg["version"] >= 2:
+                    need(discover_scope(row["prompt"]) == cfg.get("lint_source_scope"),
+                         "scoped lint instructions changed since preparation")
                 if top and top["sha"] == sign:
                     need(current == target, "release instructions changed")
                     replace(row["prompt"], top["edits"], True)
@@ -589,6 +611,9 @@ def manage(action, data, work, sign, *, cfg=None, conf=None, adopt=None):
                         )
                         if actual == target:
                             replace(t["prompt"], top["edits"], True)
+                            if cfg["version"] >= 2:
+                                need(discover_scope(t["prompt"]) == cfg.get("lint_source_scope"),
+                                     "live FIX scoped lint instructions differ from the release")
                     return {"state": "verified", "series_id": sid, "changed": False}
                 need(action != "verify", "release is not applied")
                 if current and not top:
@@ -604,6 +629,10 @@ def manage(action, data, work, sign, *, cfg=None, conf=None, adopt=None):
                         "existing Source binding requires its exact --replace-block-sha",
                     )
                 edits = changes_for(row["prompt"], current, target)
+                if cfg["version"] >= 2:
+                    edits.extend(scoped_bindings(row["prompt"], conf, sign))
+                elif top and top.get("lint_paragraph_sha256"):
+                    raise ValueError("use rollback to restore the previous scoped lint instructions")
                 updated = replace(row["prompt"], edits)
                 updates = {}
                 for i, p in pending.items():
@@ -613,6 +642,9 @@ def manage(action, data, work, sign, *, cfg=None, conf=None, adopt=None):
                         binding(p) == current,
                         f"pending FIX {i} has a different Source binding",
                     )
+                    if cfg["version"] >= 2:
+                        need(discover_scope(p) == cfg.get("lint_source_scope"),
+                             f"pending FIX {i} has different scoped lint instructions")
                     updates[i] = replace(p, edits)
                 if action == "preview":
                     return {
@@ -661,7 +693,10 @@ def manage(action, data, work, sign, *, cfg=None, conf=None, adopt=None):
                 hist.pop()
                 state["rolled_back"] = sign
             else:
-                hist.append({"sha": sign, "block": target, "edits": edits})
+                entry = {"sha": sign, "block": target, "edits": edits}
+                if cfg.get("lint_source_scope"):
+                    entry["lint_paragraph_sha256"] = sha(subject_line(updated).encode())
+                hist.append(entry)
                 state.pop("rolled_back", None)
             c.execute(
                 "INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",

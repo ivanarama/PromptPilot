@@ -78,12 +78,14 @@ def _refusal(error):
             "mutable_admission_granted": False}
 
 
-def refresh(profile_id, environ=None, *, budget_only=False, final=False, reuse_fix_cache_only=False):
+def refresh(profile_id, environ=None, *, budget_only=False, final=False, reuse_fix_cache_only=False,
+            allow_deferred_insights_read=False):
     # The Source meter can replace its decision after a committed debit.
     # Keep the actual spend independent of that later observation outcome.
     final_source_spend = {}
     try:
-        result = _refresh(profile_id, environ, budget_only, final, final_source_spend, reuse_fix_cache_only)
+        result = _refresh(profile_id, environ, budget_only, final, final_source_spend, reuse_fix_cache_only,
+                          allow_deferred_insights_read)
     except _REFRESH_ERRORS as error:
         if not final_source_spend:
             raise
@@ -93,7 +95,10 @@ def refresh(profile_id, environ=None, *, budget_only=False, final=False, reuse_f
     return result
 
 
-def _refresh(profile_id, environ, budget_only, final, final_source_spend, reuse_fix_cache_only):
+def _refresh(profile_id, environ, budget_only, final, final_source_spend, reuse_fix_cache_only,
+             allow_deferred_insights_read):
+    if allow_deferred_insights_read and not reuse_fix_cache_only:
+        raise ValueError("a deferred insights read requires --reuse-fix-cache-only")
     if reuse_fix_cache_only and (budget_only or final):
         raise ValueError("cached FIX Source is only an initial Source observation")
     if final and budget_only:
@@ -133,7 +138,7 @@ def _refresh(profile_id, environ, budget_only, final, final_source_spend, reuse_
                 "PP_PIPELINE_REPLICAS", "PP_PIPELINE_TARGET_TOKEN", "PP_PROVIDER_OWNERSHIP_KIND")):
             raise ValueError("cached FIX Source requires an ordinary single worker")
         from .fix_cached_source import observe
-        return observe(continuation, profiles[profile_id])
+        return observe(continuation, profiles[profile_id], allow_deferred_insights_read=allow_deferred_insights_read)
     pi._scan_lease_context.continuation = continuation
     try:
         # INSIGHTS pays its own configured scan estimate against the normal
@@ -236,10 +241,13 @@ def run(argv=None, *, budget_only=False):
                             help="use the MERGE attempt's reserved final Source check, if available")
         mode.add_argument("--reuse-fix-cache-only", action="store_true",
                           help="observe a current FIX publication without starting a scan")
+        parser.add_argument("--allow-deferred-insights-read", action="store_true",
+                            help="with --reuse-fix-cache-only, read a publication while its next scan yields priority")
     args = parser.parse_args(argv)
     try:
         result = refresh(args.profile, budget_only=budget_only, final=getattr(args, "final", False),
-                         reuse_fix_cache_only=getattr(args, "reuse_fix_cache_only", False))
+                         reuse_fix_cache_only=getattr(args, "reuse_fix_cache_only", False),
+                         allow_deferred_insights_read=getattr(args, "allow_deferred_insights_read", False))
     except _REFRESH_ERRORS as exc:
         result = _refusal(exc)
         if budget_only:
