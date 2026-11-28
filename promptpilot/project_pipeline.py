@@ -2965,6 +2965,7 @@ def run(argv=None) -> int:
     source_refresh_parser.add_argument("--profile", required=True)
     source_refresh_parser.add_argument("--final", action="store_true")
     source_refresh_parser.add_argument("--reuse-fix-cache-only", action="store_true")
+    source_refresh_parser.add_argument("--allow-deferred-insights-read", action="store_true")
     budget_refresh_parser = sub.add_parser("budget-refresh")
     budget_refresh_parser.add_argument("--profile", required=True)
     from . import pipeline_budget_status
@@ -3025,6 +3026,8 @@ def run(argv=None) -> int:
             arguments.append("--final")
         if getattr(args, "reuse_fix_cache_only", False):
             arguments.append("--reuse-fix-cache-only")
+        if getattr(args, "allow_deferred_insights_read", False):
+            arguments.append("--allow-deferred-insights-read")
         return source_refresh_run(arguments, budget_only=args.command == "budget-refresh")
     try:
         if getattr(args, "lease_file", None):

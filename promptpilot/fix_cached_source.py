@@ -4,7 +4,7 @@ import json
 import time
 
 from . import db, pipeline_insights as pi, project_pipeline as pp
-from .source_graphql_cost import digest, health_contract, validate_receipt
+from .source_graphql_cost import checker_miss as _checker_miss
 
 
 def _pr_heads(report):
@@ -46,6 +46,20 @@ def _miss(code):
             "mutable_admission_granted": False, "product_mutation_authorized": False}
 
 
+def _denied_priority_scan(raw_status, repository):
+    """Only the persisted insights decision can distinguish a scan denial from a FIX gate."""
+    if raw_status is None:
+        return False
+    event = json.loads(raw_status)
+    status = event["status"]
+    if (event["repository"] != repository or not isinstance(status, dict)
+            or status.get("refresh_blocked") != "priority_waiter"):
+        return False
+    budget = status.get("github_budget")
+    return (isinstance(budget, dict) and budget.get("budget_route") == "insights"
+            and budget.get("state") == "priority_waiter" and budget.get("allowed") is False)
+
+
 def _snapshot_time_miss(stamp, now):
     if type(stamp) not in (int, float) or not stamp >= 0:
         return "snapshot_invalid"
@@ -56,29 +70,7 @@ def _snapshot_time_miss(stamp, now):
     return None
 
 
-def _checker_miss(profile, report, observed_at, ttl):
-    diagnostics = report["diagnostics"]
-    stamp = report["diagnostics_generated_at"]
-    if type(stamp) not in (int, float) or not 0 <= stamp <= observed_at:
-        return "checker_proof_invalid"
-    if observed_at - stamp >= ttl:
-        return "checker_expired"
-    if type(diagnostics.get("exit_code")) is not int or diagnostics["exit_code"] != 0:
-        return "checker_failed"
-    usage = report["source_search_usage"]
-    if usage["successful_observation_cost_proved"] is not True or usage["uncertain_cost"] is not False:
-        return "checker_proof_invalid"
-    contract = health_contract(profile)
-    receipt = diagnostics["source_graphql_usage"]
-    validate_receipt(receipt, contract, nonce=receipt["nonce"], allowance=receipt["allowance"])
-    proof = {"executable_sha256": contract["executable_sha256"], "receipt_sha256": digest(receipt)}
-    if (diagnostics["source_graphql_cost_proof"] != proof
-            or any(usage["health_cost_provenance"][key] != value for key, value in proof.items())):
-        return "checker_proof_invalid"
-    return None
-
-
-def observe(continuation, profile):
+def observe(continuation, profile, *, allow_deferred_insights_read=False):
     guard = continuation.guard
     if continuation.queue_id != "fix" or guard["route"] != "skill":
         raise ValueError("cached FIX Source requires an ordinary FIX skill reservation")
@@ -123,7 +115,14 @@ def observe(continuation, profile):
         blocked = report["cache"].get("refresh_blocked")
         if blocked == "checker_state_unavailable":
             raise RuntimeError("cannot verify the durable FIX checker status")
-        if blocked:
+        if (allow_deferred_insights_read and blocked == "priority_waiter"
+                and _denied_priority_scan(initial.get(status_key), profile["repository"])):
+            # This attempt already owns its skill reservation. Check its existing
+            # publication without asking for the separately deferred scan.
+            snapshot = dict(report, cache=cache)
+            cache = dict(cache, refresh_blocked=blocked, refresh_budget={
+                "budget_route": "insights", "state": blocked, "allowed": False})
+        elif blocked:
             # Never pass arbitrary contents of persisted status into the journal.
             if blocked == "low":
                 return _miss("budget_low")
@@ -131,7 +130,9 @@ def observe(continuation, profile):
                            "fairness_waiter", "rate_snapshot_stale"):
                 return _miss(blocked)
             return _miss("refresh_blocked")
-        state = pi._required_snapshot_state(report, profile, "fix")
+        else:
+            snapshot = report
+        state = pi._required_snapshot_state(snapshot, profile, "fix")
         if state is not None:
             return _miss("checker_failed" if state in ("checker failed", "checker unavailable") else "snapshot_invalid")
     except (KeyError, TypeError, ValueError, AttributeError, OverflowError):
